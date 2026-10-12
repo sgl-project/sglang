@@ -516,6 +516,7 @@ def _causal_swa_page_indices_kernel(
     rt_stride,
     swa_window,
     padded_width,
+    map_len,
     HAS_SWA_REPLAY_START: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -537,6 +538,8 @@ def _causal_swa_page_indices_kernel(
         full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
             tl.int64
         )
+        # a negative slot wraps like torch indexing; HIP callers pass unset -1 slots
+        full_loc = tl.where(full_loc < 0, full_loc + map_len, full_loc)
         swa = tl.load(full_to_swa_ptr + full_loc, mask=valid, other=-1).to(tl.int32)
         tl.store(out_base + k, tl.where(valid, swa, -1), mask=kmask)
 
@@ -573,6 +576,7 @@ def build_causal_swa_page_indices_triton(
         req_to_token.stride(0),
         swa_window,
         padded_width,
+        full_to_swa_mapping.shape[0],
         HAS_SWA_REPLAY_START=has_swa_replay_start,
         BLOCK_K=BLOCK_K,
     )

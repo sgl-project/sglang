@@ -65,7 +65,14 @@ def fill_all_compressed_indices(
     )
 
 
-@triton.jit(do_not_specialize=["bs", "num_write_tokens", "c128_cur_max_seq_len"])
+@triton.jit(
+    do_not_specialize=[
+        "bs",
+        "num_write_tokens",
+        "c128_cur_max_seq_len",
+        "c128_page_indices_width",
+    ]
+)
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,
     positions_ptr,
@@ -84,6 +91,7 @@ def _init_compressed_attn_metadata_kernel(
     num_write_tokens,
     max_pages,
     c128_cur_max_seq_len,
+    c128_page_indices_width,
     c128_page_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
@@ -120,10 +128,12 @@ def _init_compressed_attn_metadata_kernel(
     tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
 
     if COMPUTE_PAGE_INDICES:
-        page_indices_base = batch_id * c128_cur_max_seq_len
-        for block_start in tl.range(0, c128_cur_max_seq_len, BLOCK_SIZE):
+        # rows are c128_page_indices_width >= c128_cur_max_seq_len wide; the
+        # columns past c128_cur_max_seq_len are -1 padding
+        page_indices_base = batch_id * c128_page_indices_width
+        for block_start in tl.range(0, c128_page_indices_width, BLOCK_SIZE):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < c128_cur_max_seq_len
+            mask = offsets < c128_page_indices_width
 
             page_idx = offsets // c128_page_size
             offset_in_page = offsets % c128_page_size
@@ -137,7 +147,9 @@ def _init_compressed_attn_metadata_kernel(
 
             c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page
 
-            valid_mask = offsets < c128_seq_lens_raw
+            valid_mask = (offsets < c128_seq_lens_raw) & (
+                offsets < c128_cur_max_seq_len
+            )
             c_page_indices_vals = tl.where(valid_mask, c_page_indices_vals, -1)
 
             tl.store(
@@ -154,6 +166,7 @@ def _init_compressed_attn_metadata_triton(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    page_indices_align: int = 1,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -165,6 +178,8 @@ def _init_compressed_attn_metadata_triton(
     torch.Tensor,
     Optional[torch.Tensor],
 ]:
+    """page_indices_align > 1 pads the c128 page indices' last dim to a multiple of
+    it with -1 in the same launch (F.pad(..., value=-1) of the unaligned result)."""
     bs = seq_lens.shape[0]
     # CP may add padding rows to the attention metadata, but those rows have
     # no cache-write locations. Keep the write buffers unpadded and mask those
@@ -195,14 +210,18 @@ def _init_compressed_attn_metadata_triton(
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_cur_max_seq_len = c128_page_size * max_pages
+        c128_page_indices_width = (
+            triton.cdiv(c128_cur_max_seq_len, page_indices_align) * page_indices_align
+        )
         c128_page_indices = torch.empty(
-            bs, c128_cur_max_seq_len, dtype=torch.int32, device=device
+            bs, c128_page_indices_width, dtype=torch.int32, device=device
         )
         BLOCK_SIZE = triton.next_power_of_2(max(c128_page_size, 64))
     else:
         max_pages = 0
         c128_page_size = 1
         c128_cur_max_seq_len = 0
+        c128_page_indices_width = 0
         c128_page_indices = None
         BLOCK_SIZE = 64
         if page_table is None:
@@ -231,6 +250,7 @@ def _init_compressed_attn_metadata_triton(
         num_write_tokens,
         max_pages,
         c128_cur_max_seq_len,
+        c128_page_indices_width,
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,
@@ -256,6 +276,7 @@ def init_compression_metadata(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    page_indices_align: int = 1,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -274,6 +295,7 @@ def init_compression_metadata(
         page_table,
         page_size,
         compute_page_indices,
+        page_indices_align,
     )
 
 

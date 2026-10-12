@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.attention.deepseek_v4_rope import apply_rotary_emb_copy_into
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
@@ -64,7 +65,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 def apply_rotary_emb(
@@ -194,6 +196,16 @@ class DSparkAttention(MqaAttentionBase):
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
             if self._use_fast_kernel and not _is_npu:
+                if (
+                    q_out is not None
+                    and _is_hip
+                    and apply_rotary_emb_copy_into(
+                        q, q_out, self.freqs_cis, positions, self.rope_head_dim
+                    )
+                    is not None
+                ):
+                    # the rope and the copy into the padded q in one launch
+                    return q_out
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
                     None,
@@ -900,9 +912,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
-            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
+            # The FlashMLA writer reads an explicit KV row stride (ROCm build too), so
+            # views are fine.
             allow_strided_output=(
-                get_platform().is_blackwell
+                (get_platform().is_blackwell or get_platform().is_hip)
                 and not is_unified_kv_triton()
                 and not pool.uniform_fp8
             ),

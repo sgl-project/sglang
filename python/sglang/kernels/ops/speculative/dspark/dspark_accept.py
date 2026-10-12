@@ -810,13 +810,27 @@ def finalize_accept_lens_triton(
     correct_len: torch.Tensor,
     cap_trim_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
+    out: Optional[FinalizeAcceptLensResult] = None,
 ) -> FinalizeAcceptLensResult:
+    """out: contiguous [bs] destinations (commit_lens and cap_trim_lens int32,
+    new_seq_lens any integer dtype) written in place of fresh tensors, as if the
+    results were copy_'d into them."""
     bs = correct_len.shape[0]
     device = correct_len.device
 
-    commit_lens = torch.empty(bs, dtype=torch.int32, device=device)
-    new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
-    cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
+    if out is None:
+        commit_lens = torch.empty(bs, dtype=torch.int32, device=device)
+        new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
+        cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
+    else:
+        commit_lens, new_seq_lens, cap_trim_out = (
+            out.commit_lens,
+            out.new_seq_lens,
+            out.cap_trim_lens,
+        )
+        for t in (commit_lens, new_seq_lens, cap_trim_out):
+            assert t.shape == (bs,) and t.is_contiguous(), t.shape
+        assert commit_lens.dtype == cap_trim_out.dtype == torch.int32
     BLOCK = 256
     _finalize_accept_lens_kernel[(triton.cdiv(bs, BLOCK),)](
         correct_len,

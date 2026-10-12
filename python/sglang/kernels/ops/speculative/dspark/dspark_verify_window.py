@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -894,14 +896,22 @@ def build_out_tokens_triton(
     bonus: torch.Tensor,
     verify_num_draft_tokens: int,
     gamma: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """out: a contiguous [bs, verify_num_draft_tokens] int64 destination to write
+    instead of a fresh tensor."""
     bs = draft_tokens.shape[0]
     T = verify_num_draft_tokens
     device = draft_tokens.device
     draft_tokens = draft_tokens.to(torch.int64).contiguous()
-    correct_len_i = correct_len.to(torch.int64).contiguous()
+    # the kernel narrows the lengths to int32 itself
+    correct_len_i = correct_len.contiguous()
     bonus_i = bonus.to(torch.int64).contiguous()
-    out = torch.empty((bs, T), dtype=torch.int64, device=device)
+    if out is None:
+        out = torch.empty((bs, T), dtype=torch.int64, device=device)
+    else:
+        assert out.shape == (bs, T) and out.is_contiguous(), out.shape
+        assert out.dtype == torch.int64, out.dtype
     n_out = bs * T
     BLOCK = 256
     grid = (triton.cdiv(n_out, BLOCK),)
