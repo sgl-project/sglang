@@ -16,7 +16,7 @@ is unfinished, which no other mode does.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
@@ -32,20 +32,28 @@ class LoopSpec:
     enter: Callable[[Scheduler], None]
     # Plans the next step.
     plan: Callable[[Scheduler], Optional[ScheduleBatch]]
-    # Hands the PD queues' new work over after intake; returns what arrived.
-    take_arrivals: Optional[Callable[[Scheduler], Optional[List]]] = None
+    # Advances the PD queues after intake; the requests they have ready join
+    # the waiting queue.
+    advance_pd_queues: Optional[Callable[[Scheduler], None]] = None
     # PD decode: query the prefill DP ranks before intake.
     prefetch_prefill_dp_ranks: bool = False
     # Commits the due step before a launch that must not overlap it; returns
     # whether it disabled the overlap.
     commit_before_launch: Optional[Callable[[Scheduler, ScheduleBatch], bool]] = None
+    # PD prefill: when staging is on, ask decode to allocate the batch's
+    # staging before its forward.
     prefetch_staging: bool = False
-    # Updates the running rows at a launch; a mode that sets it also drops
-    # the finished rows after the commit.
+    # Updates the running rows at a launch.
     rows_at_launch: Optional[Callable[[Scheduler, ScheduleBatch], None]] = None
+    # Drops the rows a commit finished, after the commit of an iteration that
+    # launched a step or runs overlapped.
+    leave_finished_rows: bool = False
+    # Runs after the commit (PD prefill: polls the KV transfers in flight).
     after_commit: Optional[Callable[[Scheduler], None]] = None
-    # Delayed sampling of an overlapped step runs only for generation models.
-    sample_only_for_generation: bool = False
+    # Skips the delayed sample of an overlapped step for a non-generation model.
+    skip_sample_for_non_generation: bool = False
+    # Runs the busy-time memory self-check at the step end when
+    # SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY is set.
     strict_mem_check: bool = False
 
 
@@ -66,8 +74,8 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         if self._engine_paused:
             self._record_scheduler_state_for_paused_engine()
             continue
-        if spec.take_arrivals:
-            spec.take_arrivals(self)
+        if spec.advance_pd_queues:
+            spec.advance_pd_queues(self)
 
         # Plan and launch
         batch = spec.plan(self)
@@ -94,14 +102,16 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         # commits only the step it launched. The readers between steps (in PD
         # decode, preallocation and the prebuilt join) then see only the rows
         # still decoding.
-        if spec.rows_at_launch and (overlapped or batch):
+        if spec.leave_finished_rows and (overlapped or batch):
             self.leave_finished_rows(self.decoding_batch)
         if spec.after_commit:
             spec.after_commit(self)
 
         # Run sample of the current batch
         # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-        if overlapped and (not spec.sample_only_for_generation or self.is_generation):
+        if overlapped and (
+            not spec.skip_sample_for_non_generation or self.is_generation
+        ):
             self.launch_batch_sample_if_needed(batch_result, batch)
 
         # Update last_batch
@@ -165,13 +175,11 @@ def _enter_pd_decode_overlap(self: Scheduler) -> None:
     self.last_batch: Optional[ScheduleBatch] = None
 
 
-# Arrivals: the work the PD queues hand over after intake.
+# PD queues: the requests they have ready after intake.
 
 
-def _take_bootstrapped(self: Scheduler) -> List:
-    bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-    self.waiting_queue.extend(bootstrapped_reqs)
-    return bootstrapped_reqs
+def _admit_bootstrapped(self: Scheduler) -> None:
+    self.waiting_queue.extend(self.disagg_prefill_bootstrap_queue.pop_bootstrapped())
 
 
 def _process_decode_queue(self: Scheduler) -> None:
@@ -262,6 +270,7 @@ NORMAL_LOOP = LoopSpec(
     enter=_enter_normal,
     plan=_plan,
     rows_at_launch=_update_rows,
+    leave_finished_rows=True,
     strict_mem_check=True,
 )
 
@@ -271,14 +280,15 @@ OVERLAP_LOOP = LoopSpec(
     plan=_plan,
     commit_before_launch=_commit_if_overlap_disabled,
     rows_at_launch=_update_rows,
-    sample_only_for_generation=True,
+    leave_finished_rows=True,
+    skip_sample_for_non_generation=True,
     strict_mem_check=True,
 )
 
 PD_PREFILL_LOOP = LoopSpec(
     enter=_enter_pd,
     plan=_plan_pd_prefill,
-    take_arrivals=_take_bootstrapped,
+    advance_pd_queues=_admit_bootstrapped,
     prefetch_staging=True,
     after_commit=_process_prefill_inflight_queue,
 )
@@ -286,16 +296,18 @@ PD_PREFILL_LOOP = LoopSpec(
 PD_DECODE_LOOP = LoopSpec(
     enter=_enter_pd,
     plan=_plan_pd_decode,
-    take_arrivals=_process_decode_queue,
+    advance_pd_queues=_process_decode_queue,
     prefetch_prefill_dp_ranks=True,
     rows_at_launch=_absorb_decode_step,
+    leave_finished_rows=True,
 )
 
 PD_DECODE_OVERLAP_LOOP = LoopSpec(
     enter=_enter_pd_decode_overlap,
     plan=_plan_pd_decode,
-    take_arrivals=_process_decode_queue,
+    advance_pd_queues=_process_decode_queue,
     prefetch_prefill_dp_ranks=True,
     commit_before_launch=_commit_if_overlap_disabled_pd_decode,
     rows_at_launch=_absorb_decode_step,
+    leave_finished_rows=True,
 )
