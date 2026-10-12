@@ -1304,6 +1304,10 @@ class Scheduler(
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
+        # Set by the event loops that join a launched step's finished-prefill
+        # rows into the running rows at launch and drop finished rows at
+        # commit; the other loops do both at the top of the next plan.
+        self.rows_join_at_launch = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1955,6 +1959,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         self.inflight_steps = InflightQueue(depth=0)
+        self.rows_join_at_launch = True
         while True:
             if self.gracefully_exit:
                 break
@@ -1966,17 +1971,17 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
+            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                self._update_rows_at_launch(batch)
                 self.inflight_steps.push(batch, result)
                 self._commit_due_step()
+                self.leave_finished_rows(self.decoding_batch)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -1995,6 +2000,7 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
         self.inflight_steps = InflightQueue(depth=1)
+        self.rows_join_at_launch = True
 
         while True:
             if self.gracefully_exit:
@@ -2007,9 +2013,7 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
+            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
@@ -2035,6 +2039,7 @@ class Scheduler(
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.inflight_steps.push(batch.copy(), batch_result)
+                self._update_rows_at_launch(batch)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2048,6 +2053,10 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+            # Rows whose finish a commit observed leave here, after the
+            # launch: a decode step copied from the rows takes back its run
+            # writes first. This also covers the commit made before the launch.
+            self.leave_finished_rows(self.decoding_batch)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2062,6 +2071,15 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _update_rows_at_launch(self, batch: ScheduleBatch) -> None:
+        """The running rows after a launch: they take back what a decode step
+        copied from them rebound in its run, and the rows whose last prefill
+        chunk the step ran join them. HiSparse rows join at the next plan,
+        once staged; dLLM rows never decode."""
+        self.decoding_batch.absorb()
+        if not self.enable_hisparse and self.dllm_config is None:
+            self.decoding_batch.join_launched(batch)
 
     def _commit_due_step(self) -> None:
         record = self.inflight_steps.pop_due()
@@ -3772,10 +3790,15 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
-        self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
+        self,
+        decoding_batch: DecodingBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
-        # The last decode step from these rows has run and committed (overlap
-        # commits a copy of it), so the rows take back what its run rebound.
+        """Plan the next step. A loop that does not join at launch passes the
+        step it launched last, whose finished-prefill rows join here."""
+        # For a loop that does not take them back at launch: the last decode
+        # step from these rows has run and committed, so the rows take back
+        # what its run and commit rebound.
         decoding_batch.absorb()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
@@ -3833,7 +3856,8 @@ class Scheduler(
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
         # live rows. Runs after the last_batch join and outside it, so finished
-        # rows leave even when no new batch arrives (e.g. traffic stops).
+        # rows leave even when no new batch arrives (e.g. traffic stops). The
+        # loops that join at launch dropped them at commit already.
         self.leave_finished_rows(decoding_batch)
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_plan_start(decoding_batch.rows)
@@ -4006,7 +4030,8 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         decoding_batch: DecodingBatch,
     ) -> NextBatchPlan:
-        # The rows object; a mixed step parks the rows only after its last read.
+        # The rows object; a mixed step that parks the rows does so after its
+        # last read.
         running_batch = decoding_batch.rows
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -4307,7 +4332,10 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                decoding_batch.park_for_mix()
+                if not self.rows_join_at_launch:
+                    # The rows run inside the mixed step, which the next plan
+                    # joins back. A loop that joins at launch keeps them.
+                    decoding_batch.park_for_mix()
 
         return NextBatchPlan(batch_to_run=new_batch, running_batch=decoding_batch.rows)
 
@@ -5647,11 +5675,11 @@ class Scheduler(
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
             # All scheduler state (running_batch, last_batch, chunked_req,
-            # inflight_steps) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
+            # inflight_steps) is left untouched. On resume, the event loop
+            # handles any last_batch merge, chunked_req cleanup, and overlap
+            # result processing through the standard code paths. This avoids
+            # duplicating batch manipulation logic and the accounting bugs
+            # that come with it.
             return
 
         if self.enable_overlap and len(self.inflight_steps) > 0:
@@ -6037,6 +6065,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
+    scheduler.rows_join_at_launch = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
