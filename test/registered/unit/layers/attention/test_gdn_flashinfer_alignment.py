@@ -3,7 +3,7 @@ from unittest import mock
 
 import torch
 
-from sglang.kernels.jit.cute_aot_cache import JITCache
+from sglang.kernels.jit.cute_aot_cache import JITCache, persistent_compile_cache
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
     _FlashInferGDNCache,
@@ -430,6 +430,23 @@ class TestFlashInferGDNCache(unittest.TestCase):
         second[other_key] = compiled
         assert second.get(other_key) is compiled
         assert other_key not in aot
+
+        # Pure compile factories (e.g. the DSA indexer's LayerNorm) use the
+        # same cache through a decorator, without serializing launch state.
+        with mock.patch(
+            "sglang.kernels.jit.cute_aot_cache.get_jit_cache", return_value=JITCache()
+        ):
+            factory = mock.Mock(return_value=compiled)
+            cached = persistent_compile_cache("test", source_paths=())(factory)
+            assert cached(128, dtype="bf16") is compiled
+            assert cached(128, dtype="bf16") is compiled
+            factory.assert_called_once()
+            restored = persistent_compile_cache("test", source_paths=())(
+                mock.Mock(side_effect=AssertionError("unexpected compilation"))
+            )
+            assert restored(128, dtype="bf16") is compiled
+            cached(256, dtype="bf16")
+            assert factory.call_count == 2
 
 
 if __name__ == "__main__":

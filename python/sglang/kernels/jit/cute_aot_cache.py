@@ -17,7 +17,7 @@ import platform
 import sys
 import time
 from collections.abc import Callable, Sequence
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Hashable, TypeAlias
 
@@ -427,3 +427,28 @@ def get_jit_cache(
         return path
 
     return JITPersistentCache(resolve_cache_path, enable_tvm_ffi=enable_tvm_ffi)
+
+
+def persistent_compile_cache(
+    name: str, *, source_paths: Sequence[str | os.PathLike[str]]
+):
+    """Cache a pure, TVM-FFI CuTe compile factory with hashable arguments.
+
+    The factory must return only the compiled callable, not tensors, streams,
+    workspaces or a Python launch wrapper. Include its source dependencies in
+    ``source_paths`` so changes invalidate previously exported objects.
+    """
+
+    def decorate(factory):
+        cache = get_jit_cache(name, source_paths=source_paths)
+
+        @wraps(factory)
+        def wrapped(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            if key not in cache:
+                cache[key] = factory(*args, **kwargs)
+            return cache[key]
+
+        return wrapped
+
+    return decorate
