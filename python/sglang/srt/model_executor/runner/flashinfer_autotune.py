@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.unquant import bf16_low_m_autotune_enabled
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -127,7 +127,7 @@ def should_run_flashinfer_autotune(
         moe_needs_autotune
         or fp4_gemm_needs_autotune
         or fp8_gemm_needs_autotune
-        or bf16_low_m_autotune_enabled()
+        or get_bf16_gemm_backend().is_cutedsl()
     ):
         return False
 
