@@ -45,20 +45,32 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     # This hook runs before speculative defaults and NEXTN alias resolution.
     # Native MTP keeps the target's CP/TP placement; other draft architectures
     # have their own topology and model-boundary contracts.
-    if cfg.speculative_algorithm is not None and (
-        model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration"
-        or cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
-        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
-        or cfg.speculative_eagle_topk not in (None, 1)
+    algorithm = (cfg.speculative_algorithm or "").upper()
+    native_mtp = (
+        algorithm in ("EAGLE", "NEXTN")
+        and cfg.speculative_draft_model_path in (None, cfg.model_path)
+        and cfg.speculative_eagle_topk in (None, 1)
+    )
+    if algorithm and not (native_mtp or algorithm == "DFLASH"):
+        raise ValueError(
+            "CP/TP group sharing supports native MTP with top-k 1 or DFLASH."
+        )
+
+    if cfg.disaggregation_mode != "null" and not (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and algorithm == "DFLASH"
+        and cfg.pp_size == cfg.dp_size == cfg.ep_size == 1
     ):
-        raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
+        raise ValueError(
+            "CP/TP-sharing PD supports Mooncake DFLASH prefill with DP=PP=EP=1."
+        )
 
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
     }
     for flag, enabled in unsupported.items():
         if enabled:
