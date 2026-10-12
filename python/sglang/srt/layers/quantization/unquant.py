@@ -69,6 +69,9 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
+# AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
+# initialize_bf16_gemm_config turns this off on gfx95 in deterministic mode.
+_use_aiter_unquant = _use_aiter
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -80,14 +83,6 @@ _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
 _A16W16_TRITON_NARROW_K = 512
 _A16W16_TRITON_NARROW_K_MAX_M = 512
-
-
-def _use_aiter_unquant() -> bool:
-    # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
-    # deterministic inference keeps these layers on the batch-invariant path on gfx95.
-    if not (_use_aiter and _is_gfx95):
-        return _use_aiter
-    return not get_exec().deterministic.enable_deterministic_inference
 
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -252,6 +247,11 @@ def initialize_bf16_gemm_config() -> None:
     global _prefer_direct
     global _run_direct_dense
     global _enable_bf16_splitk_gemm
+    global _use_aiter_unquant
+
+    _use_aiter_unquant = _use_aiter and not (
+        _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
+    )
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -473,10 +473,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
-    def __init__(self):
-        super().__init__()
-        self.use_aiter = _use_aiter_unquant()
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -523,7 +519,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif self.use_aiter and type(layer.weight.data) is torch.Tensor:
+        elif _use_aiter_unquant and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
@@ -688,8 +684,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
-        self.use_aiter = _use_aiter_unquant()
-        if _use_aiter and not self.use_aiter and get_moe_runner_backend().is_aiter():
+        if (
+            _use_aiter
+            and not _use_aiter_unquant
+            and get_moe_runner_backend().is_aiter()
+        ):
             raise ValueError(
                 "--moe-runner-backend aiter is batch-size dependent and cannot be "
                 "combined with --enable-deterministic-inference on gfx95"
@@ -774,7 +773,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
-            self.use_aiter
+            _use_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
@@ -1062,7 +1061,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
-            self.use_aiter
+            _use_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
