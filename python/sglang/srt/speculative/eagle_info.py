@@ -119,8 +119,8 @@ class EagleVerifyInput(SpecInput):
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        # Tiled over token blocks, sized from the mean live KV length while the
-        # sum is still a host int.
+        # Tiled over token blocks, sized from the length sum (an upper bound on
+        # the longest live row) while it is still a host int.
         num_token_blocks = spec_kv_index_token_blocks(
             table_width=translator.req_to_token.size(1),
             kv_lens_sum=paged_kernel_lens_sum,

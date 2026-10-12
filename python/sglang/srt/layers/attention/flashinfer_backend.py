@@ -2427,7 +2427,8 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
-        # Blocks from the mean live length (capped by the draft window), not the table width.
+        # Blocks from the length sum (upper bound on the longest live row),
+        # capped by the draft window, not from the table width.
         num_token_blocks = spec_kv_index_token_blocks(
             table_width=self.max_context_len,
             kv_lens_sum=seq_lens_sum,
