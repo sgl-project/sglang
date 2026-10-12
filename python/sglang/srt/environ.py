@@ -1770,6 +1770,12 @@ class Envs:
     # per-expert MoE LoRA factors and install them with one copy per module
     # instead of one per expert. Not compatible with streamed-LoRA checksums.
     SGLANG_OPT_LORA_FAST_STREAMED_LOAD = EnvBool(False)
+    # Decode MoE-LoRA for adapters whose experts share the outer factors (one
+    # gate/up LoRA A, one down LoRA B): shrink the shared side once per token
+    # instead of once per (token, expert) block. Applies up to MAX_PAIRS
+    # (token, expert) pairs; larger batches keep the per-expert path.
+    SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE = EnvBool(False)
+    SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS = EnvInt(512)
 
     # ===================================================================
     # Kimi K3

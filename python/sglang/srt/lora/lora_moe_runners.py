@@ -29,6 +29,7 @@ from typing import Callable
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
@@ -203,6 +204,28 @@ class LoRAHooks:
     ) = None
 
 
+_SHARED_OUTER_DECODE = envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE.get()
+_SHARED_OUTER_DECODE_MAX_PAIRS = (
+    envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS.get()
+)
+
+
+def _use_shared_outer_decode_path(lora_info: LoRAInfo, topk_ids: torch.Tensor) -> bool:
+    """Decode-sized batches of a shared-outer adapter take the per-token-shrink
+    path (sglang.kernels.ops.moe.shared_outer_moe_lora) instead of the
+    per-expert fused_moe_lora."""
+    return (
+        _SHARED_OUTER_DECODE
+        and lora_info.experts_shared_outer_loras
+        and not lora_info.lora_use_virtual_experts
+        and not lora_info.fully_sharded
+        and lora_info.token_lora_mapping is not None
+        and topk_ids.numel() <= _SHARED_OUTER_DECODE_MAX_PAIRS
+        and lora_info.gate_up_lora_a_weights.shape[1] == 1
+        and lora_info.down_lora_b_weights.shape[1] == 1
+    )
+
+
 def _compute_lora_alignment(
     topk_ids: torch.Tensor,
     lora_info: LoRAInfo,
@@ -328,6 +351,26 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
+    if sorted_token_ids_reshaped is None and _use_shared_outer_decode_path(
+        lora_info, topk_ids
+    ):
+        from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+            shared_outer_gate_up_lora_add,
+        )
+
+        assert gate_up_a.shape[2] == 2 * r, (
+            "shared-outer decode path expects gated gate_up LoRA"
+        )
+        shared_outer_gate_up_lora_add(
+            intermediate_cache,
+            hidden_states,
+            gate_up_a,
+            gate_up_b,
+            topk_ids,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+        )
+        return
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
 
@@ -434,6 +477,25 @@ def _add_lora_down_delta(
     )
     if inter_size != intermediate_input.shape[-1]:
         intermediate_input = intermediate_input[:, :inter_size]
+    if sorted_token_ids_reshaped is None and _use_shared_outer_decode_path(
+        lora_info, topk_ids
+    ):
+        from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+            shared_outer_down_lora_add,
+        )
+
+        shared_outer_down_lora_add(
+            intermediate_cache,
+            intermediate_input,
+            down_lora_a,
+            down_lora_b,
+            topk_ids,
+            topk_weights,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+            mul_routed_weight=True,
+        )
+        return
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         # fused_moe_lora requires B's expert_dim to match A's; expand the
         # shared B view.
@@ -520,6 +582,9 @@ def build_lora_hooks(
     lora_ids: torch.Tensor | None = None
 
     if lora_info.lora_use_virtual_experts:
+        token_lora_mapping = lora_info.token_lora_mapping
+    elif _use_shared_outer_decode_path(lora_info, topk_ids):
+        # no per-expert alignment needed
         token_lora_mapping = lora_info.token_lora_mapping
     else:
         (
