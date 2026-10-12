@@ -303,6 +303,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            first_decode_row = batch.first_decode_row
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 should_commit_output = (
@@ -365,8 +366,7 @@ class SchedulerBatchResultProcessor:
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and i >= first_decode_row
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
@@ -374,7 +374,7 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                        if i >= first_decode_row:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
@@ -382,7 +382,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif i < first_decode_row:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

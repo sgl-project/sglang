@@ -352,7 +352,6 @@ class SchedulerDllmMixin:
         )
         new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode
-        new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
         from sglang.srt.managers.scheduler_components.metrics_reporter import (

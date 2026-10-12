@@ -66,6 +66,8 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(batch.prefix_lens, [s - 1 for s in seq_lens])
         self.assertEqual(batch.extend_lens, [1] * len(seq_lens))
         self.assertEqual(batch.extend_num_tokens, len(seq_lens))
+        # Every row of a converted step is a decode row.
+        self.assertEqual(batch.num_decode_rows, len(seq_lens))
         for req, seq_len in zip(batch.reqs, seq_lens, strict=True):
             self.assertEqual(req.extend_end, seq_len)
         # What the attention path actually consumes: arange(prefix, prefix+len)

@@ -11,7 +11,7 @@ genuine single-token decode step mixed into the batch, so it was misrouted to
 decode. The decode path ignores the batch's real token and feeds the model its
 own stored prediction from the previous chunk -> the true last prompt token is
 silently dropped and generation is conditioned on a corrupted prompt. The
-correct discriminator is ``batch.decoding_reqs``, not the chunk length.
+correct discriminator is ``batch.num_decode_rows``, not the chunk length.
 
 The routing decision was duplicated across the sync and async paths (the bug
 therefore existed in both). It now lives in the shared
@@ -185,12 +185,13 @@ class _FakeReq:
 
 
 class _FakeBatch:
-    def __init__(self, forward_mode, reqs, extend_lens, decoding_reqs=None):
+    def __init__(self, forward_mode, reqs, extend_lens, num_decode_rows=0):
         total = sum(extend_lens)
         self.forward_mode = forward_mode
         self.reqs = reqs
         self.extend_lens = list(extend_lens)
-        self.decoding_reqs = decoding_reqs
+        self.num_decode_rows = num_decode_rows
+        self.first_decode_row = len(reqs) - num_decode_rows
         self.sampling_info = None
         self.return_logprob = False
         # Arbitrary but correctly-sized token / slot arrays.
@@ -255,7 +256,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", set()), "continuation")
 
-    def test_route_seen_and_in_decoding_reqs_is_decode(self):
+    def test_route_seen_and_in_decoding_rids_is_decode(self):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
 
@@ -278,16 +279,16 @@ class TestMlxExtendRouting(CustomTestCase):
 
     # ---------- sync path: _forward_batch_generation_mlx ----------
 
-    def _run_sync(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
+    def _run_sync(self, reqs, extend_lens, known_rids, num_decode_rows, forward_mode):
         worker = self._worker(known_rids)
-        batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
+        batch = _FakeBatch(forward_mode, reqs, extend_lens, num_decode_rows)
         result = worker._forward_batch_generation_mlx(batch)
         assert result.next_token_ids.numel() == len(reqs)
         return worker._mlx_runner
 
     def test_sync_one_token_continuation_routes_to_extend(self):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
-        runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
+        runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, 0, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         # Untruncated (extend_end None) => final chunk => logits required.
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
@@ -301,28 +302,28 @@ class TestMlxExtendRouting(CustomTestCase):
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
         req.extend_end = 4  # 4 < 8: non-final
-        runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
+        runner = self._run_sync([req], [4], {"r1"}, 0, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
 
     def test_sync_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
-        runner = self._run_sync([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
+        runner = self._run_sync([p, d], [4, 1], {"d1"}, 1, ForwardMode.MIXED)
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
 
     # ---------- async path: _async_extend_batch ----------
 
-    def _run_async(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
+    def _run_async(self, reqs, extend_lens, known_rids, num_decode_rows, forward_mode):
         worker = self._worker(known_rids)
-        batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
+        batch = _FakeBatch(forward_mode, reqs, extend_lens, num_decode_rows)
         launch = worker._async_extend_batch(batch)
         return worker._mlx_runner, launch
 
     def test_async_one_token_continuation_routes_to_extend(self):
         """THE REGRESSION (async): a 1-token continuation must extend, not decode."""
         runner, launch = self._run_async(
-            [_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND
+            [_FakeReq("r1")], [1], {"r1"}, 0, ForwardMode.EXTEND
         )
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
@@ -334,7 +335,7 @@ class TestMlxExtendRouting(CustomTestCase):
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
         req.extend_end = 4
-        runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
+        runner, _ = self._run_async([req], [4], {"r1"}, 0, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
 
@@ -356,7 +357,7 @@ class TestMlxExtendRouting(CustomTestCase):
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
-        runner, launch = self._run_async([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
+        runner, launch = self._run_async([p, d], [4, 1], {"d1"}, 1, ForwardMode.MIXED)
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
         self.assertIsNotNone(launch.decode)  # pending mixed decode present

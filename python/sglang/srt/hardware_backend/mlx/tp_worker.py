@@ -201,7 +201,7 @@ class MlxTpModelWorker(TpModelWorker):
 
         * ``"prefill"``      -- not seen before; start a fresh prefill.
         * ``"decode"``       -- a genuine single-token decode step mixed into
-          this batch (present in ``batch.decoding_reqs``).
+          this batch (a row at or past ``batch.first_decode_row``).
         * ``"continuation"`` -- a chunked-prefill continuation.  Routing keys on
           request state, **not** ``seq_len``: a final continuation chunk can be
           exactly one token, which must still extend.  Routing it as a decode
@@ -482,7 +482,7 @@ class MlxTpModelWorker(TpModelWorker):
         mixed_decode_rids: list[str] = []
         # Genuine decode steps mixed into this extend batch; see
         # _route_extend_request.
-        decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
+        decoding_rids = {r.rid for r in reqs[batch.first_decode_row :]}
 
         for i, req in enumerate(reqs):
             seq_len = extend_seq_lens[i]
