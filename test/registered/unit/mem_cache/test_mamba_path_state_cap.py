@@ -300,7 +300,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         attempts = []
 
         def fail_once(*args, **kwargs):
-            attempts.append(args)
+            attempts.append(list(kwargs["node_ids"]))
             if len(attempts) == 1:
                 return None
             return real_backup(*args, **kwargs)
@@ -310,7 +310,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
             cache.flush_pending_backups()
         leaf = next(iter(ancestor.children.values()))
         self.assertEqual(
-            [list(a[0]) for a in attempts],
+            attempts,
             [[ancestor.id, leaf.id], [ancestor.id], [leaf.id]],
         )
         cache.writing_check(write_back=True)

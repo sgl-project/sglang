@@ -1614,13 +1614,26 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         written = 0
         for node_id in action.node_ids:
-            spec = self._build_node_backup_spec(node_id, lock_params=None)
-            if spec is None:
+            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            # Overlapping chain actions may revisit nodes with Full KV already
+            # backed up. Skip only when no transfer remains.
+            if device_value.numel() == 0 and not comp_xfers:
                 continue
-            node_written = self._backup_specs([spec], write_back=write_back)
-            if node_written is None:
+            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            host_indices = self._execute_kv_backup(
+                node_id, device_value, comp_xfers, sidecar_xfers
+            )
+            if host_indices is None:
                 return 0
-            written = node_written
+            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+            lock_params = None
+            if not write_back:
+                lock_params = self.inc_lock_ref(node_id).to_dec_params()
+            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+            self._track_write_through_node(
+                node_id, lock_params, publish_node_ids=publish_node_ids
+            )
+            written = len(host_indices)
         return written
 
     def _build_node_backup_spec(
@@ -1647,10 +1660,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full KV tokens written, or None if host alloc fails (locks stay held)."""
         device_value, comp_xfers, groups = self._merge_backup_transfers(specs)
         host_indices = self._execute_kv_backup(
-            [spec.node_id for spec in specs],
+            -1,
             device_value,
             comp_xfers,
             self._build_backup_sidecar(device_value, comp_xfers),
+            node_ids=[spec.node_id for spec in specs],
         )
         if host_indices is None:
             return None
@@ -1722,8 +1736,10 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_ids, device_value, comp_xfers, sidecar_xfers):
-        """Allocate host slots and queue one D->H op that acks every node_ids entry."""
+    def _execute_kv_backup(
+        self, node_id, device_value, comp_xfers, sidecar_xfers, *, node_ids=None
+    ):
+        """Allocate host slots and queue a single-node or batched D->H backup."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
         if (
@@ -1739,7 +1755,11 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, extra_pools=aux_xfers or None, flush=False, node_ids=node_ids
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            flush=False,
+            node_ids=node_ids,
         )
 
     def _track_write_through_node(
@@ -3407,7 +3427,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            self._drain_queued_backups()
+            if self.queued_backups:
+                self._drain_queued_backups()
             cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
