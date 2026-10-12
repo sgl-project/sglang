@@ -4507,7 +4507,7 @@ class Scheduler(
                 batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode batches contribute 0.
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
@@ -4936,8 +4936,6 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 

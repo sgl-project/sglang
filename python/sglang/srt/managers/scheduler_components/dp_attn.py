@@ -60,15 +60,11 @@ def _spec_input_cuda_graph_compatible(
 ) -> bool:
     """Return the local speculative-draft graph admission bit.
 
-    None/idle/prebuilt inputs stay permissive so an active rank with complete
+    None/idle inputs stay permissive so an active rank with complete
     runtime state can still use graphs. Any active incompatible input is
     min-reduced by ``MLPSyncBatchInfo`` and forces every DP rank eager.
     """
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     spec_info = local_batch.spec_info
     return spec_info is None or spec_info.cuda_graph_compatible
@@ -344,11 +340,7 @@ def _local_decode_cuda_graph_vote(
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
         return False
-    return (
-        local_batch is None
-        or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    )
+    return local_batch is None or local_batch.forward_mode.is_decode_or_idle()
 
 
 def _local_prefill_cuda_graph_vote(
@@ -444,11 +436,7 @@ def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
     attention: one query per decode row over its committed length (spec
     batches have no CPU seq_lens at schedule time), the chunk formula for
     prefill."""
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_prebuilt()
-        or local_batch.forward_mode.is_idle()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         return 0
     if local_batch.forward_mode.is_decode():
         return _decode_total_seq_lens(local_batch)
@@ -463,7 +451,7 @@ class DPSyncWaitCarry:
     then for the running batch); the first gather absorbs the cross-rank
     arrival skew but yields no batch to record on. Only batch-less gathers carry: an iteration
     that ends with no batch drops the carry in Scheduler.on_idle, and a step
-    that runs a batch without recording (prebuilt, health check) drops it too,
+    that runs a batch without recording (a health-check probe) drops it too,
     so an idle engine's gathers never pile onto the first busy step.
     """
 
@@ -490,11 +478,7 @@ def prepare_mlp_sync_batch_raw(
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_prebuilt()
-        or local_batch.forward_mode.is_idle()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
