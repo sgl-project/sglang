@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import msgspec
 import torch
@@ -43,10 +44,15 @@ class StsDataRecorder:
         self.flush_every = int(flush_every)
         self._logits_buffer: list[torch.Tensor] = []
         self._prefix_mask_buffer: list[torch.Tensor] = []
+        self._observed_mask_buffer: list[torch.Tensor] = []
         self._shard_ct = 0
 
     def record(
-        self, *, confidence_raw: torch.Tensor, num_correct_drafts: torch.Tensor
+        self,
+        *,
+        confidence_raw: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        verify_lens: Optional[torch.Tensor] = None,
     ) -> None:
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
         positions = torch.arange(self.gamma).view(1, -1)
@@ -54,8 +60,19 @@ class StsDataRecorder:
             num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1, 1)
         )
         prefix_mask = (positions < counts).to(torch.float32)
+        if verify_lens is None:
+            observed_mask = torch.ones_like(prefix_mask)
+        else:
+            # A verify window of length L checks only its first L - 1 drafts.
+            # Later positions are unobserved for every row: keeping only rows
+            # rejected inside the window would bias them toward rejection.
+            caps = (
+                verify_lens.detach().to(device="cpu", dtype=torch.int64).view(-1, 1) - 1
+            )
+            observed_mask = (positions < caps).to(torch.float32)
         self._logits_buffer.append(logits)
         self._prefix_mask_buffer.append(prefix_mask)
+        self._observed_mask_buffer.append(observed_mask)
         if len(self._logits_buffer) >= self.flush_every:
             self.flush()
 
@@ -68,9 +85,11 @@ class StsDataRecorder:
             {
                 "logits": torch.cat(self._logits_buffer, dim=0),
                 "prefix_mask": torch.cat(self._prefix_mask_buffer, dim=0),
+                "observed_mask": torch.cat(self._observed_mask_buffer, dim=0),
             },
             shard_path,
         )
         self._logits_buffer.clear()
         self._prefix_mask_buffer.clear()
+        self._observed_mask_buffer.clear()
         self._shard_ct += 1

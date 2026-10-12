@@ -51,12 +51,16 @@ def fit_sts_temperatures(
     prefix_mask: torch.Tensor,
     grid: torch.Tensor,
     num_bins: int = 15,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> dict[str, list[float]]:
     logits = logits.to(torch.float64)
     prefix_mask = prefix_mask.to(torch.float64)
     num_samples, gamma = logits.shape
     if num_samples == 0:
         raise ValueError("fit_sts_temperatures requires at least one sample.")
+    if observed_mask is None:
+        observed_mask = torch.ones_like(prefix_mask)
+    observed_mask = observed_mask.bool()
     grid_values = grid.to(torch.float64).tolist()
 
     temperatures: list[float] = []
@@ -67,12 +71,18 @@ def fit_sts_temperatures(
     survival_fitted = torch.ones(num_samples, dtype=torch.float64)
     for position in range(gamma):
         position_logits = logits[:, position]
-        position_target = prefix_mask[:, position]
+        # Score only samples whose prefix outcome at this position was observed.
+        observed = observed_mask[:, position]
+        if not bool(observed.any()):
+            raise ValueError(
+                f"No observed acceptance outcome at draft position {position}."
+            )
+        position_target = prefix_mask[observed, position]
 
         survival_at_one = survival_at_one * torch.sigmoid(position_logits)
         ece_before.append(
             expected_calibration_error(
-                probs=survival_at_one,
+                probs=survival_at_one[observed],
                 targets=position_target,
                 num_bins=num_bins,
             )
@@ -83,14 +93,16 @@ def fit_sts_temperatures(
             position_logits / best_temperature
         )
         best_ece = expected_calibration_error(
-            probs=best_survival, targets=position_target, num_bins=num_bins
+            probs=best_survival[observed],
+            targets=position_target,
+            num_bins=num_bins,
         )
         for temperature in grid_values[1:]:
             candidate_survival = survival_fitted * torch.sigmoid(
                 position_logits / temperature
             )
             candidate_ece = expected_calibration_error(
-                probs=candidate_survival,
+                probs=candidate_survival[observed],
                 targets=position_target,
                 num_bins=num_bins,
             )
@@ -110,22 +122,33 @@ def fit_sts_temperatures(
     }
 
 
-def load_collected_shards(*, data_glob: str) -> tuple[torch.Tensor, torch.Tensor]:
+def load_collected_shards(
+    *, data_glob: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shard_paths = sorted(glob.glob(data_glob))
     if not shard_paths:
         raise ValueError(f"No STS data shards matched {data_glob!r}.")
 
     logits_shards: list[torch.Tensor] = []
     prefix_mask_shards: list[torch.Tensor] = []
+    observed_mask_shards: list[torch.Tensor] = []
     shard_gamma: Optional[int] = None
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu")
         shard_logits = shard["logits"]
         shard_prefix_mask = shard["prefix_mask"]
-        if shard_logits.shape != shard_prefix_mask.shape:
+        # Shards without a mask are treated as fully observed.
+        shard_observed_mask = shard.get("observed_mask")
+        if shard_observed_mask is None:
+            shard_observed_mask = torch.ones_like(shard_prefix_mask)
+        if not (
+            shard_logits.shape == shard_prefix_mask.shape == shard_observed_mask.shape
+        ):
             raise ValueError(
-                f"Shard {shard_path!r} logits / prefix_mask shape mismatch: "
-                f"{tuple(shard_logits.shape)} vs {tuple(shard_prefix_mask.shape)}."
+                f"Shard {shard_path!r} logits / prefix_mask / observed_mask shape "
+                f"mismatch: {tuple(shard_logits.shape)} vs "
+                f"{tuple(shard_prefix_mask.shape)} vs "
+                f"{tuple(shard_observed_mask.shape)}."
             )
         if shard_gamma is None:
             shard_gamma = int(shard_logits.shape[1])
@@ -136,8 +159,13 @@ def load_collected_shards(*, data_glob: str) -> tuple[torch.Tensor, torch.Tensor
             )
         logits_shards.append(shard_logits)
         prefix_mask_shards.append(shard_prefix_mask)
+        observed_mask_shards.append(shard_observed_mask)
 
-    return torch.cat(logits_shards, dim=0), torch.cat(prefix_mask_shards, dim=0)
+    return (
+        torch.cat(logits_shards, dim=0),
+        torch.cat(prefix_mask_shards, dim=0),
+        torch.cat(observed_mask_shards, dim=0),
+    )
 
 
 def fit(
@@ -147,7 +175,7 @@ def fit(
     num_bins: int = 15,
     gamma: Optional[int] = None,
 ) -> None:
-    logits, prefix_mask = load_collected_shards(data_glob=data_glob)
+    logits, prefix_mask, observed_mask = load_collected_shards(data_glob=data_glob)
     resolved_gamma = int(logits.shape[1])
     if gamma is not None and gamma != resolved_gamma:
         raise ValueError(
@@ -160,6 +188,7 @@ def fit(
         prefix_mask=prefix_mask,
         grid=default_temperature_grid(),
         num_bins=num_bins,
+        observed_mask=observed_mask,
     )
     calibration = DSparkStsCalibration(
         temperatures=result["temperatures"],
@@ -193,7 +222,7 @@ def main() -> None:
         "--data-glob",
         required=True,
         help="Glob of collected .pt shards, each a dict with [n, gamma] "
-        "'logits' and 'prefix_mask' tensors.",
+        "'logits', 'prefix_mask' and (optional) 'observed_mask' tensors.",
     )
     parser.add_argument(
         "--out",
