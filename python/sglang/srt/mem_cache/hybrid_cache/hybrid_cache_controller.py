@@ -1000,21 +1000,16 @@ class HybridCacheController(BaseHiCacheController):
             assert len(device_indices) == len(host_indices)
         elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
-        elif isinstance(full_allocator, PageInterleavePoolAllocator):
-            # Loaded pages keep the owners their host copies were backed up
-            # under; host slots share the device placement (CPU, no sync).
-            start_class = (
-                int(host_indices[0])
-                // full_allocator.page_size
-                % full_allocator.shard_size
-            )
-            device_indices = full_allocator.alloc_cyclic(
-                start_class=start_class, need_size=len(host_indices)
-            )
-            if device_indices is None:
-                return None
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            if isinstance(full_allocator, PageInterleavePoolAllocator):
+                # Loaded pages keep their host copies' owners; host slots share
+                # the device placement, so the first page id gives the class.
+                device_indices = full_allocator.alloc_cyclic(
+                    start_class=int(host_indices[0]) // full_allocator.page_size,
+                    need_size=len(host_indices),
+                )
+            else:
+                device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
 
