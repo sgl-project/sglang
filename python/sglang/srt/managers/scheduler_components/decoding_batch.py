@@ -6,8 +6,9 @@ except PrefillAdder's priority preemption, which filters the rows in place.
 keep it, so a reference to ``rows`` stays valid across them.
 
 Under get_next_batch_to_run a decode step is a copy of the rows, and ``absorb``
-takes back what its run and commit rebound before the next plan. PD decode and
-pdmux still launch the rows themselves.
+takes back what its run and commit rebound before the next plan. The PD decode
+normal and overlap loops launch such a copy too, and take it back at launch.
+The pipeline PD decode loop and pdmux still launch the rows themselves.
 
 The normal and overlap loops join and leave at launch and commit
 (``rows_join_at_launch``), so between their steps the rows are exactly the

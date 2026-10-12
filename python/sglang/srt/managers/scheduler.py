@@ -1308,6 +1308,9 @@ class Scheduler(
         # rows into the running rows at launch and drop finished rows at
         # commit; the other loops do both at the top of the next plan.
         self.rows_join_at_launch = False
+        # Set by the PD decode loops that launch a copy of the running rows as
+        # their decode step; the pipeline PD decode loop launches the rows.
+        self.disagg_decode_launches_copy = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -6072,6 +6075,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
     scheduler.rows_join_at_launch = False
+    scheduler.disagg_decode_launches_copy = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

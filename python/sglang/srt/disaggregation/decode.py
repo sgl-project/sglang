@@ -2995,6 +2995,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
         self.inflight_steps = InflightQueue(depth=0)
+        self.disagg_decode_launches_copy = True
 
         while True:
             if self.gracefully_exit:
@@ -3027,6 +3028,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                # The rows take back what their decode step's run rebound.
+                self.decoding_batch.absorb()
                 self.inflight_steps.push(batch, result)
                 self._commit_due_step()
             else:
@@ -3043,6 +3046,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.inflight_steps = InflightQueue(depth=1)
+        self.disagg_decode_launches_copy = True
         self.last_batch: Optional[ScheduleBatch] = None
         if self.recv_skipper is not None:
             self.recv_skipper.on_launch(None)
@@ -3087,6 +3091,8 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.inflight_steps.push(batch.copy(), batch_result)
+                # The rows take back what their decode step's run rebound.
+                self.decoding_batch.absorb()
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -3137,6 +3143,18 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             running_batch = self.update_running_batch(decoding_batch)
             ret = running_batch if not running_batch.is_empty() else None
+            if ret is not None and self.disagg_decode_launches_copy:
+                ret = decoding_batch.decode_step()
+
+        if self.disagg_decode_launches_copy and self.last_batch is not None:
+            # The step launched last stays last_batch until the loop launches
+            # the next one, and the idle checks and request queries read its
+            # requests. It is a copy of the rows, or an idle step without
+            # requests: it drops the requests that have left the rows since,
+            # by a finish or a retract. Filter only its request list; the rows
+            # share its sampling and spec objects.
+            row_ids = set(map(id, decoding_batch.rows.reqs))
+            self.last_batch.reqs = [r for r in self.last_batch.reqs if id(r) in row_ids]
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
