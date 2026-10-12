@@ -418,8 +418,7 @@ class BeamAttention(nn.Module):
                     config.num_attention_heads * self.head_dim,
                 ],
                 bias=False,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("qkv_gate_proj", prefix),
             )
         else:
@@ -430,8 +429,7 @@ class BeamAttention(nn.Module):
                 config.num_key_value_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
             self.gate_proj = ColumnParallelLinear(
@@ -439,8 +437,7 @@ class BeamAttention(nn.Module):
                 config.num_attention_heads * self.head_dim,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("gate_proj", prefix),
             )
         self.attention_gate = BeamAttentionGateOp()
@@ -451,8 +448,7 @@ class BeamAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             use_dp_attention_reduce=True,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -760,7 +756,7 @@ class BeamModel(nn.Module):
             VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=get_parallel().enable_dp_attention,
+                use_attn_tp_group=get_parallel().attn_dp_enabled,
                 prefix=add_prefix("embed_tokens", prefix),
             )
             if self.pp_group.is_first_rank
