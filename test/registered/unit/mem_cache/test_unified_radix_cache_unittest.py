@@ -5190,7 +5190,7 @@ class UnifiedRadixCacheSuite:
         cons.sanity_check()
 
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
-        """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
+        """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         self._skip_unsupported_hicache_test()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
@@ -5285,12 +5285,13 @@ class UnifiedRadixCacheSuite:
         dispatched = {}
 
         def capture_swa_mapping():
-            load = next(iter(cons.buffer_pipeline.ongoing_buffer_load_back.values()))
-            swa_xfer = next(t for t in load.aux_xfers if t.name == PoolName.SWA)
+            load = cons.cache_controller.load_queue[-1]
+            swa_xfer = next(t for t in load.pool_transfers if t.name == PoolName.SWA)
             dispatched["device"] = swa_xfer.device_indices.clone()
-            full_window = masked_full[-len(swa_xfer.device_indices) :]
-            old_window = mapping_before[-len(swa_xfer.device_indices) :]
-            expected = torch.where(old_window > 0, old_window, swa_xfer.device_indices)
+            full_window = masked_full[-window_tokens:]
+            old_window = mapping_before[-window_tokens:]
+            expected = old_window.clone()
+            expected[old_window <= 0] = swa_xfer.device_indices
             self.assertTrue(
                 torch.equal(
                     cons_alloc.full_to_swa_index_mapping[full_window],
@@ -5308,7 +5309,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), 0)
         self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
-        self.assertEqual(len(dispatched["device"]), window_tokens)
+        self.assertEqual(len(dispatched["device"]), window_tokens - live_tail)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0)
         k, v = self._snapshot_full_kv(cons_alloc, masked_full)
         self.assertTrue(torch.equal(k, masked_kv[0]))

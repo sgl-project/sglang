@@ -1459,12 +1459,20 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    @property
+    def auxiliary_swa_host_hit_length(self) -> int:
+        plan = self.staged_prefetch_plan
+        return (
+            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+        )
+
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
             self.host_hit_length > 0
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
+            or self.auxiliary_swa_host_hit_length > 0
         )
 
     def materialized_host_hit_len(self) -> int:
