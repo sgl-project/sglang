@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingModelConfig,
     InklingVisionConfig,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -99,29 +100,20 @@ STACKED_DENSE_PARAMS_MAPPING = [
     ("down_proj", "down_proj", None),
 ]
 
-# Online RL weight-sync streams routed experts one at a time as FULL (unsharded)
-# per-expert tensors named `...mlp.experts.{j}.gate_proj/up_proj/down_proj.weight`.
-# Disk checkpoints only ever carry the fused w13_weight/w2_weight, so this pattern
-# never fires on the ordinary loading path.
+# Online RL updates use full per-expert gate/up/down tensors; disk checkpoints
+# contain fused w13/w2 weights and do not match this pattern.
 _PER_EXPERT_WEIGHT_RE = re.compile(
     r"^(?P<pfx>.+\.mlp\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
 
 
 def _shard_full_to_local(
-    loaded_weight: torch.Tensor, dst: torch.Tensor, dim: int
+    loaded_weight: torch.Tensor, dst: torch.Tensor, dim: int, *, tp_rank: int
 ) -> torch.Tensor:
-    """Slice a FULL (unsharded) per-expert weight to this MoE-TP rank's shard along `dim`.
-
-    The online weight-sync ships full per-expert tensors (parallelism-agnostic HF
-    layout); sglang owns its own MoE-TP sharding, so narrow here per
-    get_parallel().moe_tp_rank. With TP1 the dims already match and this is the
-    identity, so the ordinary path is byte-for-byte unchanged.
-    """
+    """Shard full HF per-expert updates with the owning module's MoE TP rank."""
     if loaded_weight.shape[dim] == dst.shape[dim]:
         return loaded_weight
-    rank = get_parallel().moe_tp_rank
-    return loaded_weight.narrow(dim, rank * dst.shape[dim], dst.shape[dim])
+    return loaded_weight.narrow(dim, tp_rank * dst.shape[dim], dst.shape[dim])
 
 
 KV_REPLICATED_SUFFIXES = (
@@ -199,8 +191,7 @@ class InklingDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 fused=True,
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
                 tp_group=get_parallel().attn_tp_group,
                 use_dp_attention_reduce=True,
             )
@@ -1238,12 +1229,10 @@ class InklingForConditionalGeneration(nn.Module):
             return False
         param = params_dict[name]
         if loaded_weight.shape != param.shape:
-            # shared experts shard over the full tp group; routed over moe_tp
-            tp_rank = (
-                get_parallel().tp_rank
-                if ".shared_experts" in name
-                else get_parallel().moe_tp_rank
-            )
+            # Both routed and shared modules own their constructed TP layout.
+            module = self.get_submodule(name.rsplit(".", 1)[0])
+            module = getattr(module, "base_layer", module)
+            tp_rank = module.moe_tp_rank
             for dim in range(loaded_weight.ndim):
                 if loaded_weight.shape[dim] == param.shape[dim]:
                     continue
@@ -1297,10 +1286,8 @@ class InklingForConditionalGeneration(nn.Module):
         hold only its contiguous slice (the fused loader shards the intermediate dim only).
         No-op when EP is off or for replicated shared-expert tensors.
         """
-        ep_size = get_parallel().moe_ep_size
         if (
-            ep_size <= 1
-            or ".experts." not in name
+            ".experts." not in name
             # per-expert RL sync tensors do their own EP remap in _load_per_expert_param;
             # a full per-expert tensor whose dim 0 happens to equal n_routed_experts must
             # not be pre-narrowed here.
@@ -1309,8 +1296,17 @@ class InklingForConditionalGeneration(nn.Module):
             or loaded_weight.shape[0] != self.text_config.n_routed_experts
         ):
             return loaded_weight
-        local = self.text_config.n_routed_experts // ep_size
-        start = get_parallel().moe_ep_rank * local
+        prefix = name.split(".experts.", 1)[0] + ".experts"
+        try:
+            module = self.get_submodule(prefix)
+        except AttributeError:
+            # Checkpoints may contain a layer absent from this model.
+            return loaded_weight
+        module = getattr(module, "base_layer", module)
+        if module.moe_ep_size <= 1:
+            return loaded_weight
+        local = self.text_config.n_routed_experts // module.moe_ep_size
+        start = module.moe_ep_rank * local
         return loaded_weight.narrow(0, start, local).contiguous()
 
     def _load_fused_moe_param(
@@ -1403,10 +1399,10 @@ class InklingForConditionalGeneration(nn.Module):
                 f"per-expert RL weight-sync does not support the trtllm MoE layout ({target}); "
                 "serve RL rollouts with the triton MoE runner"
             )
-        ep_size = get_parallel().moe_ep_size
+        ep_size = moe.moe_ep_size
         if ep_size > 1:
             local = self.text_config.n_routed_experts // ep_size
-            first = get_parallel().moe_ep_rank * local
+            first = moe.moe_ep_rank * local
             if not (first <= eid < first + local):
                 loaded_params.add(target)  # another rank owns this expert
                 return True
@@ -1415,7 +1411,9 @@ class InklingForConditionalGeneration(nn.Module):
             dst = params_dict[target].data[
                 eid
             ]  # [H, I_local]; shard intermediate (dim 1)
-            dst.copy_(_shard_full_to_local(loaded_weight, dst, dim=1))
+            dst.copy_(
+                _shard_full_to_local(loaded_weight, dst, dim=1, tp_rank=moe.moe_tp_rank)
+            )
         else:
             w13 = params_dict[target].data[
                 eid
@@ -1429,12 +1427,15 @@ class InklingForConditionalGeneration(nn.Module):
                 dst = w13[idx * half : (idx + 1) * half]  # contiguous [gate || up]
             else:
                 dst = w13[idx::2]  # Inkling-interleaved rows
-            dst.copy_(_shard_full_to_local(loaded_weight, dst, dim=0))
+            dst.copy_(
+                _shard_full_to_local(loaded_weight, dst, dim=0, tp_rank=moe.moe_tp_rank)
+            )
         loaded_params.add(target)
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         loaded_params: Set[str] = set()
         embed_tokens_weight: Optional[torch.Tensor] = None
 
@@ -1455,19 +1456,12 @@ class InklingForConditionalGeneration(nn.Module):
 
             if any(name.endswith(suffix) for suffix in KV_REPLICATED_SUFFIXES):
                 layer_id = get_layer_id(name)
-                if layer_id is not None:
-                    num_kv_heads, head_dim = (
-                        (
-                            self.text_config.swa_num_key_value_heads,
-                            self.text_config.swa_head_dim,
-                        )
-                        if layer_id in set(self.text_config.local_layer_ids)
-                        else (
-                            self.text_config.num_key_value_heads,
-                            self.text_config.head_dim,
-                        )
-                    )
-                    attn_tp_size = get_parallel().attn_tp_size
+                attention = modules_dict.get(name.rsplit(".", 2)[0])
+                if layer_id is not None and attention is not None:
+                    qkvr = getattr(attention.qkvr, "base_layer", attention.qkvr)
+                    num_kv_heads = qkvr.inkling_num_kv_heads
+                    head_dim = qkvr.inkling_head_dim
+                    attn_tp_size = get_group_rank_size(qkvr.tp_group)[1]
                     if (
                         attn_tp_size > num_kv_heads
                         and loaded_weight.shape[0] == num_kv_heads * head_dim
@@ -1481,7 +1475,9 @@ class InklingForConditionalGeneration(nn.Module):
                                 .reshape(attn_tp_size * head_dim, -1)
                             )
                         else:
-                            kv_head_idx = get_parallel().attn_tp_rank // replicas
+                            kv_head_idx = (
+                                get_group_rank_size(qkvr.tp_group)[0] // replicas
+                            )
                             loaded_weight = loaded_weight.narrow(
                                 0, kv_head_idx * head_dim, head_dim
                             )
@@ -1518,7 +1514,9 @@ class InklingForConditionalGeneration(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_parallel().attn_tp_rank * shard_size
+                        projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
+                        projection = getattr(projection, "base_layer", projection)
+                        start = get_group_rank_size(projection.tp_group)[0] * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     if lora_compatible_layout_enabled():
                         # Local interleaved rows -> [gate||up] so contiguous swiglu and
@@ -1592,18 +1590,21 @@ class InklingForConditionalGeneration(nn.Module):
                 continue
 
             if ".experts.w13_weight" in name:
+                experts = modules_dict.get(name.rsplit(".", 1)[0])
+                experts = getattr(experts, "base_layer", experts)
                 # bf16 routed layers run the stock FusedMoE forward (not moe_tp_forward)
                 # under --enable-lora, or natively on trtllm_routed for UNQUANTIZED
                 # checkpoints: de-interleave per moe_tp block for the stock weight prep.
                 if (
-                    loaded_weight.dtype != torch.uint8
+                    experts is not None
+                    and loaded_weight.dtype != torch.uint8
                     and self.text_config.inference_moe_w13_interleaved
                     and (
                         lora_compatible_layout_enabled()
                         or bf16_routed_uses_stock_fused_moe(self.quant_config)
                     )
                 ):
-                    tp = get_parallel().moe_tp_size
+                    tp = experts.moe_tp_size
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2
@@ -1627,16 +1628,19 @@ class InklingForConditionalGeneration(nn.Module):
                 ):
                     continue
             if ".shared_experts.shared_w13_weight" in name:
+                experts = modules_dict.get(name.rsplit(".", 1)[0])
+                experts = getattr(experts, "base_layer", experts)
                 # InklingSharedFusedMoE's bf16 path needs contiguous [gate||up] w13 for the
                 # SRT runner's silu_and_mul, unlike the interleaved bmm/moe_tp_forward paths.
                 # Per-rank blocks are sized by the FULL tp group (InklingSharedFusedMoE always
                 # shards over it at EP=1), NOT moe_tp (= tp/ep, wrong under --ep-size > 1).
                 if (
-                    loaded_weight.dtype != torch.uint8
+                    experts is not None
+                    and loaded_weight.dtype != torch.uint8
                     and self.text_config.inference_moe_w13_interleaved
                     and use_inkling_shared_fused_moe()
                 ):
-                    tp = get_parallel().tp_size
+                    tp = experts.moe_tp_size
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2
@@ -1909,6 +1913,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
@@ -1955,7 +1960,9 @@ class InklingForConditionalGenerationMTP(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_parallel().attn_tp_rank * shard_size
+                        projection = modules_dict[sgl_name.rsplit(".", 1)[0]]
+                        projection = getattr(projection, "base_layer", projection)
+                        start = get_group_rank_size(projection.tp_group)[0] * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     default_weight_loader(param, loaded_weight)
                     loaded_params.add(sgl_name)

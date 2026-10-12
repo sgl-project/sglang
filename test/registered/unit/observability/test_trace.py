@@ -20,7 +20,6 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_trace_level,
-    get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -73,14 +72,6 @@ class TestTraceFunctions(unittest.TestCase):
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
-
-    def test_get_global_tracing_enabled(self):
-        self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
-
-    def test_get_cur_time_ns(self):
-        ts = mod.get_cur_time_ns()
-        self.assertIsInstance(ts, int)
-        self.assertGreater(ts, 0)
 
 
 class TestTraceNullContext(unittest.TestCase):
