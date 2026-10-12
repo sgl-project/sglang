@@ -1971,7 +1971,9 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
+            plan = self.get_next_batch_to_run(
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
+            )
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
@@ -2013,7 +2015,9 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
+            plan = self.get_next_batch_to_run(
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
+            )
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
@@ -3790,12 +3794,10 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
-        self,
-        decoding_batch: DecodingBatch,
-        last_batch: Optional[ScheduleBatch] = None,
+        self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        """Plan the next step. A loop that does not join at launch passes the
-        step it launched last, whose finished-prefill rows join here."""
+        """Plan the next step. last_batch is the step launched last; under a
+        loop that does not join at launch, its finished-prefill rows join here."""
         # For a loop that does not take them back at launch: the last decode
         # step from these rows has run and committed, so the rows take back
         # what its run and commit rebound.
@@ -3834,9 +3836,16 @@ class Scheduler(
                 decoding_batch.join(new_batch)
                 decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
-        # A step without prefill rows is a decode step, or its DP extend view:
-        # its rows are the running rows, and the leave below drops the finished.
-        if not self.enable_hisparse and last_batch and last_batch.has_prefill_rows():
+        # The step launched last stays last_batch until the loop launches the
+        # next one, and the idle checks and request queries read its requests,
+        # so it drops here the requests that leave the rows.
+        if last_batch is not None and not last_batch.has_prefill_rows():
+            # A decode step, or its DP extend view: a copy of the running rows,
+            # which have dropped their finished rows by the leave below. Filter
+            # only its request list; the rows share its sampling and spec
+            # objects.
+            last_batch.reqs = [r for r in last_batch.reqs if not r.finished()]
+        elif not self.enable_hisparse and last_batch:
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -3845,13 +3854,22 @@ class Scheduler(
             if self.dllm_config is not None and last_batch.reqs:
                 reqs_to_exclude.update(last_batch.reqs)
 
-            # Filter batch
-            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
+            if self.rows_join_at_launch:
+                # Its rows joined at launch, through a copy that shares its
+                # sampling and spec objects: filter only its request list.
+                last_batch.reqs = [
+                    r
+                    for r in last_batch.reqs
+                    if not r.finished() and r not in reqs_to_exclude
+                ]
+            else:
+                # Filter batch
+                last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
-            # Merge a copy of the new batch into the running batch: the launched
-            # step never becomes the running rows.
-            if not last_batch.is_empty():
-                decoding_batch.join(last_batch.shallow_copy())
+                # Merge a copy of the new batch into the running batch: the
+                # launched step never becomes the running rows.
+                if not last_batch.is_empty():
+                    decoding_batch.join(last_batch.shallow_copy())
 
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only

@@ -105,8 +105,9 @@ class _Loop:
             if len(self.readers) > len(steps):
                 raise _StopLoop
 
-        def get_next_batch_to_run(decoding_batch):
+        def get_next_batch_to_run(decoding_batch, last_batch):
             test.assertIs(decoding_batch, s.decoding_batch)
+            test.assertIs(last_batch, s.last_batch)
             batch, finished = next(plans)
             if batch is not None:
                 finishes[id(batch)] = finished

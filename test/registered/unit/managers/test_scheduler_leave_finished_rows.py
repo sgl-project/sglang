@@ -1,5 +1,6 @@
 """Finished running rows leave at the top of the next plan: before admission,
-and in PD decode before preallocation."""
+and in PD decode before preallocation. The step launched last, which readers
+between steps see as last_batch, drops them at that plan too."""
 
 import copy
 import unittest
@@ -15,6 +16,7 @@ from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -34,7 +36,9 @@ class _Batch:
 
     def __init__(self, reqs, extend=False):
         self.reqs = list(reqs)
-        self.forward_mode = SimpleNamespace(is_extend=lambda: extend)
+        self.forward_mode = SimpleNamespace(
+            is_extend=lambda: extend, is_mixed=lambda: False
+        )
         self.has_prefill_rows = lambda: extend
         self.chunked_req = None
         self.is_prefill_only = False
@@ -78,6 +82,7 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
+        s.rows_join_at_launch = False
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
@@ -154,6 +159,60 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=new)
         self.assertIsNot(plan.running_batch, new)
         self.assertEqual(_rids(plan.running_batch), ["new"])
+
+
+class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
+    """The normal loop commits a step whose only row finishes, then plans
+    nothing: on_idle must find the scheduler idle, as it resets the decode
+    token ratio and runs the idle checks there."""
+
+    def _run(self, rows, first_step):
+        s = TestLeaveBeforeAdmission._scheduler(self)
+        s.decoding_batch = DecodingBatch(_Batch(rows))
+        s.gracefully_exit = False
+        s._engine_paused = False
+        s.enable_overlap = False
+        s.last_batch = None
+        s.waiting_queue = []
+        s.grammar_manager = SimpleNamespace(grammar_queue=[])
+        s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        s.enable_hierarchical_cache = False
+        s.enable_lmcache = False
+        plans = iter([first_step, None])
+        s.get_new_batch_prefill = lambda decoding_batch: NextBatchPlan(
+            batch_to_run=next(plans), running_batch=decoding_batch.rows
+        )
+        s.run_batch = Mock()
+
+        def process_batch_result(batch, result):
+            for r in batch.reqs:
+                r.done = True
+
+        s.process_batch_result = process_batch_result
+        iterations = []
+
+        def ingest_requests():
+            iterations.append(None)
+            if len(iterations) > 2:
+                raise _StopLoop
+
+        s.ingest_requests = ingest_requests
+        idle_seen = []
+        s.on_idle = lambda: idle_seen.append(request_queries.is_idle(s))
+        with published_topology(role="scheduler"), self.assertRaises(_StopLoop):
+            Scheduler.event_loop_normal(s)
+        return idle_seen
+
+    def test_after_a_decode_step(self):
+        # The decode step is a copy of the rows; the rows dropped the row at
+        # the commit, and the copy, still last_batch, drops it at the plan.
+        self.assertEqual(self._run(rows=[_Req("a")], first_step=None), [True])
+
+    def test_after_a_prefill_step(self):
+        # The row joined the rows at launch and left them at the commit; the
+        # prefill step, still last_batch, drops it at the plan.
+        step = _Batch([_Req("a")], extend=True)
+        self.assertEqual(self._run(rows=[], first_step=step), [True])
 
 
 class TestLeaveBeforeDecodePrealloc(unittest.TestCase):

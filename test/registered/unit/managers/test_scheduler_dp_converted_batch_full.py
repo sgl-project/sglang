@@ -26,7 +26,7 @@ class _RunningBatch:
     """Running rows whose decode step DP attention converts to extend."""
 
     def __init__(self, num_reqs):
-        self.reqs = [SimpleNamespace(finished=False) for _ in range(num_reqs)]
+        self.reqs = [SimpleNamespace(finished=lambda: False) for _ in range(num_reqs)]
         self.forward_mode = _DECODE
         self.num_decode_rows = 0
         self.chunked_req = None
@@ -53,7 +53,7 @@ class _RunningBatch:
 
     def filter_batch(self, reqs_to_exclude=()):
         self.reqs = [
-            r for r in self.reqs if not r.finished and r not in reqs_to_exclude
+            r for r in self.reqs if not r.finished() and r not in reqs_to_exclude
         ]
 
     def merge_batch(self, other):
@@ -105,11 +105,14 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         self.assertIs(running.forward_mode, _DECODE)
 
         # Step N+1: one row finished; the converted step comes back as
-        # last_batch and is not joined: its rows are the running rows.
-        running.reqs[0].finished = True
+        # last_batch and is not joined: its rows are the running rows. It
+        # drops the finished row with them.
+        running.reqs[0].finished = lambda: True
+        converted = plan.batch_to_run
         plan = s.get_next_batch_to_run(
-            decoding_batch=decoding_batch, last_batch=plan.batch_to_run
+            decoding_batch=decoding_batch, last_batch=converted
         )
+        self.assertEqual(converted.batch_size(), 2)
 
         self.assertEqual(len(seen), 2)
         self.assertIs(seen[-1], running)
