@@ -777,6 +777,10 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         with (
             patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
             patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+                return_value=False,
+            ),
+            patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
                 return_value=(MagicMock(), MagicMock()),
             ),

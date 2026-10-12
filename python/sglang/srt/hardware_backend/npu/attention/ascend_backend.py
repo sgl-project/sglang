@@ -540,8 +540,10 @@ class AscendAttnBackend(AttentionBackend):
         max_context_size = forward_batch.max_seq_len_override
         if max_context_size is None:
             return None
-        if not 0 < max_context_size <= min(
-            self.max_context_len, self.req_to_token.shape[1]
+        if (
+            not 0
+            < max_context_size
+            <= min(self.max_context_len, self.req_to_token.shape[1])
         ):
             raise ValueError(
                 "Prefill CUDA graph max context size must fit the model and "

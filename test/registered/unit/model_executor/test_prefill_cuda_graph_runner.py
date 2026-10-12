@@ -1,6 +1,7 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -115,6 +116,12 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        contexts.enter_context(get_context().parallel.override(dcp_enabled=False))
+
     def test_full_backend_accepts_mixed_chunks(self):
         """Full pads the token and request axes and refreshes attention
         metadata on every replay, so the mixed-chunk startup guard must not
