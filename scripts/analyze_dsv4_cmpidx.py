@@ -256,8 +256,8 @@ def report_lhid(rows):
     report_group(rows, "md5", "LHID")
 
 
-def _lhid_hpos(rec):
-    """Parse ``hpos=[pos:md5|pos:md5|..]`` into ``{abs_pos: md5}``.
+def _lhid_hpos(rec, field="hpos"):
+    """Parse ``<field>=[pos:md5|pos:md5|..]`` into ``{abs_pos: md5}``.
 
     ``hpos`` (S252) is the per-ABSOLUTE-POSITION single-row hash of a layer's
     output hidden state, emitted in the WINDOWED mode (both ``DSV4_DUMP_MIN_POS``
@@ -265,8 +265,11 @@ def _lhid_hpos(rec):
     (MISS prefill ntok=17523 vs HIT ntok=1139) and ``blkx`` keys by c128 block, so
     only ``hpos`` aligns a MISS and a HIT at the SAME absolute position for the
     per-layer sweep. Mirrors the ``[IDXIN]`` ``qpos=`` template.
+
+    ``field`` selects the source key so the SAME parser serves the ``[XIN]``
+    ``xpos=`` field (S253); default ``"hpos"`` keeps the [LHID] caller unchanged.
     """
-    v = rec.get("hpos")
+    v = rec.get(field)
     if not v:
         return {}
     s = str(v).strip()
@@ -318,6 +321,150 @@ def report_lhid_pos(rows):
         print(f"     pos={p} layer={ly}  hashes={s}")
     if len(div) > MAX_DIFF_SHOWN:
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
+XIN_POS_RUNBOOK = (
+    "[XIN-POS-RUNBOOK] per-absolute-position indexer input x hash "
+    "(window around P*):\n"
+    "  DSV4_DUMP_XIN=<layer> DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=<win_lo> DSV4_DUMP_MAX_POS=<win_hi> "
+    "<serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_cmpidx.log\n"
+    "  xpos=[pos:md5|pos2:md5|..] is emitted by the backend under the "
+    "DSV4_DUMP_XIN gate, in WINDOWED mode (both DSV4_DUMP_MIN_POS and "
+    "DSV4_DUMP_MAX_POS set)"
+)
+
+
+def _xin_xpos(rec):
+    """Parse ``xpos=[pos:md5|..]`` into ``{abs_pos: md5}`` (S253).
+
+    ``xpos`` is the per-ABSOLUTE-POSITION single-row hash of the c4-indexer INPUT
+    ``x`` (the ``[XIN]`` probe). The whole-tensor ``md5`` is shape-confounded
+    (MISS full prefill ntok=17523 vs HIT suffix ntok=1139) and a multi-row batch
+    mixes rows, so only ``xpos`` aligns a MISS and a HIT at the SAME absolute
+    position. Mirrors ``_lhid_hpos`` ([LHID] ``hpos=``, S252).
+    """
+    return _lhid_hpos(rec, "xpos")
+
+
+def _xin_by_layer(group):
+    """``{layer: {pos: md5}}`` of one request's [XIN] ``xpos`` rows.
+
+    The FIRST row carrying an absolute position wins (one x hash per position).
+    """
+    out = defaultdict(dict)
+    for r in group:
+        ly = _int(r, "layer")
+        for pos, h in _xin_xpos(r).items():
+            out[ly].setdefault(pos, h)
+    return out
+
+
+def report_xin_pos(xin_rows, c4pos_rows, idxin_rows):
+    """``[XIN-POS]`` MISS-vs-HIT indexer input x hash per absolute position.
+
+    The whole-tensor [XIN] ``md5`` is shape-confounded (MISS prefill ntok=17523
+    vs HIT ntok=1139) and a multi-row batch mixes rows, so it cannot answer "did
+    the indexer INPUT x change at the SAME absolute position". This report uses
+    the backend per-position ``xpos=[pos:md5|..]`` field:
+
+      * requests are split by the [C4POS] ``first`` label (``first==0`` MISS,
+        ``first>0`` HIT), falling back to the [IDXIN] ``sps`` rule / largest
+        ``ntok`` -- the SOURCE used is printed;
+      * at every (layer, absolute position) reached by BOTH a MISS and a HIT, the
+        single-row ``xpos`` hash is compared -> ``X_SAME`` / ``X_DIFF``;
+      * ``X_DIFF`` localises the divergence to the indexer input at that layer
+        (the origin is at/above x); ``X_SAME`` pushes it DOWNSTREAM of x;
+      * a two-MISS control verifies two MISS requests agree at a shared position
+        (MISS vs MISS MUST be identical) and WARNS when they do not.
+    """
+    print("\n== [XIN-POS] indexer input x per absolute position ==")
+    if not xin_rows:
+        print("  [XIN-POS] no [XIN] rows")
+        return
+    if not any("xpos" in r for r in xin_rows):
+        print("  [XIN-POS] [XIN] has no per-position `xpos=` field -> cannot "
+              "compare x at absolute positions. Re-run with the backend field "
+              "(DSV4_DUMP_XIN=<layer>) and a WINDOW (set DSV4_DUMP_MIN_POS and "
+              "DSV4_DUMP_MAX_POS): the backend emits `xpos=[pos:md5|..]`.")
+        print(XIN_POS_RUNBOOK)
+        return
+    xin_reqs = _c4pos_requests(xin_rows)
+    source, miss_idx, hit_idx, note = _cmp_aligned_roles(
+        xin_reqs, c4pos_rows, idxin_rows)
+    print(f"  [XIN-POS] split_source={source} miss_req={miss_idx} "
+          f"hit_req={hit_idx}")
+    print(f"  [XIN-POS] rules: {note}")
+    if not miss_idx or not hit_idx:
+        print("  [XIN-POS] need >=1 MISS (first==0) and >=1 HIT (first>0) with "
+              "DIFFERENT labels; none")
+        print(XIN_POS_RUNBOOK)
+        return
+
+    miss_maps = [_xin_by_layer(xin_reqs[i]) for i in miss_idx]
+    hit_maps = [_xin_by_layer(xin_reqs[i]) for i in hit_idx]
+
+    def _hit_pos(ly, pos):
+        for hm in hit_maps:
+            if ly in hm and pos in hm[ly]:
+                return hm[ly][pos]
+        return None
+
+    results = []  # (layer, pos, miss_hash, hit_hash, same)
+    for ly in sorted(miss_maps[0]):
+        for pos in sorted(miss_maps[0][ly]):
+            mhash = miss_maps[0][ly][pos]
+            hhash = _hit_pos(ly, pos)
+            if hhash is None:
+                continue
+            results.append((ly, pos, mhash, hhash, mhash == hhash))
+    diffs = [r for r in results if not r[4]]
+    print(f"  [XIN-POS] positions_compared={len(results)} "
+          f"same={len(results) - len(diffs)} diff={len(diffs)}")
+    ordered = diffs + [r for r in results if r[4]]
+    for ly, pos, mhash, hhash, same in ordered[:MAX_ALIGNED_SHOWN]:
+        verdict = "X_SAME" if same else "X_DIFF"
+        print(f"  [XIN-POS] layer={ly} pos={pos} X_miss={mhash} X_hit={hhash} "
+              f"=> {verdict}")
+    if len(ordered) > MAX_ALIGNED_SHOWN:
+        print(f"  ... {len(ordered) - MAX_ALIGNED_SHOWN} more positions")
+    print(f"  [XIN-POS] VERDICT {'X_SAME' if not diffs else 'X_DIFF'}")
+    if not diffs:
+        print("  -> indexer input x is IDENTICAL MISS vs HIT at every shared "
+              "absolute position; the divergence is DOWNSTREAM of x")
+    else:
+        print("  -> indexer input x DIFFERS MISS vs HIT at the SAME absolute "
+              "position: the origin is at/above this layer's x")
+
+    # Two-MISS control: two MISS requests must agree at every shared position.
+    if len(miss_maps) >= 2:
+        base = miss_maps[0]
+        ctl_pos = ctl_same = ctl_diff = 0
+        first_bad = None
+        for ly in sorted(base):
+            for pos in sorted(base[ly]):
+                if not all(ly in m and pos in m[ly] for m in miss_maps[1:]):
+                    continue
+                ctl_pos += 1
+                hashes = {m[ly][pos] for m in miss_maps}
+                if len(hashes) == 1:
+                    ctl_same += 1
+                else:
+                    ctl_diff += 1
+                    if first_bad is None:
+                        first_bad = (ly, pos)
+        if ctl_pos == 0:
+            print("  [XIN-POS] two-MISS control: no position shared by both "
+                  "MISS requests (cannot sanity-check)")
+        elif ctl_diff == 0:
+            print(f"  [XIN-POS] two-MISS control: IDENTICAL at all {ctl_pos} "
+                  f"shared position(s) (sanity OK)")
+        else:
+            print(f"  [XIN-POS] WARN two-MISS control: {ctl_diff}/{ctl_pos} "
+                  f"shared position(s) DIFFER between two MISS requests "
+                  f"(first layer={first_bad[0]} pos={first_bad[1]})")
+    print(XIN_POS_RUNBOOK)
 
 
 def _parse_blkx(rec, field="blkx"):
@@ -3032,6 +3179,10 @@ def main(path):
             print("  ---- [LHID] per-c128-block ----")
             report_blkx(rows, "LHID")
             continue
+        if tag == "XIN":
+            print("\n== [XIN] c4-indexer input x (order-independent) ==")
+            report_xin_pos(rows, recs.get("C4POS", []), recs.get("IDXIN", []))
+            # fall through to the whole-tensor segment compare below as well
         if tag == "C128X":
             print("\n== [C128X] c128 compressor input x (per-block) ==")
             report_blkx(rows, "C128X")
@@ -3617,6 +3768,29 @@ def _selftest():
         lhid_out = _run_main(lhid_diff)
         lhid_same_out = _run_main(lhid_same)
 
+        # --- [XIN-POS] per-absolute-position indexer input x hash (S253) ---
+        # Two MISS (first==0) + one HIT (first==16384) of layer 0 share xpos at
+        # pos 17598: X1 all equal -> X_SAME (+ two-MISS control OK); X2 the HIT
+        # differs at 17598 (ab -> ef) -> X_DIFF at the SAME absolute position.
+        def _xin_line(ly, ntok, xpos):
+            return (f"[XIN] layer={ly} lastpos=17598 ntok={ntok} "
+                    f"shape=({ntok}, 128) md5=full xpos={xpos}")
+
+        _xp_ok = "[17598:ab|17599:cd]"
+        _xp_bad = "[17598:ef|17599:cd]"
+        xin_same = [
+            CHAT, _c4pos_first(0, 0), _xin_line(0, 17523, _xp_ok),
+            CHAT, _c4pos_first(0, 0), _xin_line(0, 17523, _xp_ok),
+            CHAT, _c4pos_first(16384, 0), _xin_line(0, 1139, _xp_ok),
+        ]
+        xin_diff = [
+            CHAT, _c4pos_first(0, 0), _xin_line(0, 17523, _xp_ok),
+            CHAT, _c4pos_first(0, 0), _xin_line(0, 17523, _xp_ok),
+            CHAT, _c4pos_first(16384, 0), _xin_line(0, 1139, _xp_bad),
+        ]
+        xin_out = _run_main(xin_same)
+        xin_diff_out = _run_main(xin_diff)
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -3830,6 +4004,19 @@ def _selftest():
              and "layer=3" in lhid_out),
             ("[LHID-POS] identical layers -> no divergence",
              "no per-position divergence" in lhid_same_out),
+            ("[XIN-POS] xpos parsed per absolute position",
+             _xin_xpos({"xpos": "[17598:ab|17599:cd]"})
+             == {17598: "ab", 17599: "cd"}),
+            ("[XIN-POS] X_SAME + two-MISS control OK",
+             "split_source=c4pos" in xin_out
+             and "=> X_SAME" in xin_out
+             and "two-MISS control: IDENTICAL" in xin_out
+             and "=> X_DIFF" not in xin_out),
+            ("[XIN-POS] X_DIFF at the SAME absolute position",
+             "=> X_DIFF" in xin_diff_out
+             and "pos=17598" in xin_diff_out
+             and "X_miss=ab" in xin_diff_out
+             and "X_hit=ef" in xin_diff_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:

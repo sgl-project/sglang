@@ -2163,9 +2163,42 @@ class C4IndexerAscendBackendMixin:
         if _want(dump_xin):
             try:
                 xt = x.detach().contiguous().to("cpu")
+                # S253: per-ABSOLUTE-POSITION single-row hash ('xpos='), mirroring
+                # the [LHID] 'hpos=' template (S252, deepseek_v4.py). The
+                # whole-tensor 'md5' above is shape-confounded (MISS full-prefill
+                # ntok=17523 vs HIT suffix ntok=1139) and a multi-row batch mixes
+                # rows, so it CANNOT align a MISS and a HIT at the SAME absolute
+                # position. 'xpos=[pos:md5|..]' hashes the x row whose absolute
+                # position == p for every p in [DSV4_DUMP_MIN_POS,
+                # DSV4_DUMP_MAX_POS], so MISS-vs-HIT is compared at the SAME
+                # absolute position. Emitted only in the WINDOWED mode (both
+                # bounds set) to keep an unbounded dump cheap; purely
+                # additive/read-only, same DSV4_DUMP_XIN gate.
+                _xpos = ""
+                try:
+                    _x_lo_e = os.environ.get("DSV4_DUMP_MIN_POS")
+                    _x_hi_e = os.environ.get("DSV4_DUMP_MAX_POS")
+                    if _x_lo_e is not None and _x_hi_e is not None:
+                        _xlo = int(_x_lo_e)
+                        _xhi = int(_x_hi_e)
+                        _xp = (
+                            forward_batch.positions.reshape(-1)
+                            .to(torch.int64)
+                            .cpu()
+                        )
+                        if _xp.numel() == xt.shape[0]:
+                            _xparts = [
+                                f"{int(_xp[_r])}:{_md5(xt[_r])}"
+                                for _r in range(_xp.numel())
+                                if _xlo <= int(_xp[_r]) <= _xhi
+                            ]
+                            _xpos = " xpos=[" + "|".join(_xparts) + "]"
+                except Exception:
+                    _xpos = " xpos=[err]"
                 print(
                     f"[XIN] layer={layer_id} lastpos={lastpos} "
-                    f"ntok={int(xt.shape[0])} shape={tuple(xt.shape)} md5={_md5(xt)}",
+                    f"ntok={int(xt.shape[0])} shape={tuple(xt.shape)} md5={_md5(xt)}"
+                    f"{_xpos}",
                     flush=True,
                 )
             except Exception as exc:
