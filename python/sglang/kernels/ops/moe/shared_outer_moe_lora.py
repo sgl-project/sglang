@@ -23,6 +23,16 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
+# Fold the per-pair down shrink into the down expand: every H-block program
+# recomputes its pair's rank-r shrink with _so_pair_shrink_kernel's arithmetic
+# (a few KB of A per program), one launch instead of two.
+_DOWN_FUSED = envs.SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES.get()
+# Above this many (token, expert) pairs the fused down kernel uses wider H blocks.
+_DOWN_FUSED_NARROW_PAIRS = 64
+_SO_BLOCK_H = 256
+
 
 @triton.jit
 def _so_token_shrink_kernel(
@@ -239,31 +249,95 @@ def _so_down_expand_kernel(
     tl.store(o, (ov + d).to(out_ptr.dtype.element_ty), mask=mh)
 
 
-def shared_outer_gate_up_lora_add(
-    out: torch.Tensor,  # [M, top_k, 2 * N_pad], in place
-    x: torch.Tensor,  # [M, H]
-    gate_up_a: torch.Tensor,  # [L, 1, 2r, H] (shared over experts)
-    gate_up_b: torch.Tensor,  # [L, E, 2N, r]
-    topk_ids: torch.Tensor,  # [M, top_k]
-    token_lora_mapping: torch.Tensor,  # [>= M] int, -1 = no adapter
-    adapter_enabled: torch.Tensor,  # [L] int
-) -> None:
-    M, top_k, two_npad = out.shape
-    r2 = gate_up_a.shape[2]
-    r = r2 // 2
-    n = gate_up_b.shape[2] // 2
-    npad = two_npad // 2
-    H = x.shape[1]
-    assert (
-        gate_up_a.shape[1] == 1
-        and r == triton.next_power_of_2(r)
-        and gate_up_b.shape[3] == r
+@triton.jit
+def _so_down_fused_kernel(
+    out_ptr,
+    in_ptr,
+    a_ptr,
+    b_ptr,
+    w_ptr,
+    topk_ids_ptr,
+    map_ptr,
+    en_ptr,
+    N,
+    H,
+    stride_op,
+    stride_ip,
+    stride_al,
+    stride_ae,
+    stride_ar,
+    stride_an,
+    stride_bl,
+    stride_bh,
+    stride_br,
+    TOPK: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MUL_W: tl.constexpr,
+):
+    p = tl.program_id(0)
+    hb = tl.program_id(1)
+    m = p // TOPK
+    offs_r = tl.arange(0, R)
+    lora = tl.load(map_ptr + m)
+    if lora < 0:
+        return
+    if tl.load(en_ptr + lora) == 0:
+        return
+    e = tl.load(topk_ids_ptr + p)
+    if e < 0:
+        return
+    # shrink t = bf16(A_down[e] @ inter_p), as _so_pair_shrink_kernel
+    a_base = a_ptr + lora * stride_al + e.to(tl.int64) * stride_ae
+    acc = tl.zeros([R], dtype=tl.float32)
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mn = offs_n < N
+        xv = tl.load(in_ptr + p * stride_ip + offs_n, mask=mn, other=0.0).to(tl.float32)
+        av = tl.load(
+            a_base + offs_r[:, None] * stride_ar + offs_n[None, :] * stride_an,
+            mask=mn[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(av * xv[None, :], axis=1)
+    t = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+    # expand of this H block, as _so_down_expand_kernel
+    offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    mh = offs_h < H
+    b = tl.load(
+        b_ptr
+        + lora * stride_bl
+        + offs_h[:, None] * stride_bh
+        + offs_r[None, :] * stride_br,
+        mask=mh[:, None],
+        other=0.0,
     )
-    assert out.stride(2) == 1 and x.stride(1) == 1
-    block_h = 256
-    nsplit = triton.cdiv(H, block_h)
-    # fp32 partials; rows of skipped tokens are never read
-    s = torch.empty((M, nsplit, r2), dtype=torch.float32, device=out.device)
+    d = tl.sum(b.to(tl.float32) * t[None, :], axis=1)
+    if MUL_W:
+        d = d * tl.load(w_ptr + p).to(tl.float32)
+    d = d.to(out_ptr.dtype.element_ty).to(tl.float32)
+    o = out_ptr + p * stride_op + offs_h
+    ov = tl.load(o, mask=mh, other=0.0).to(tl.float32)
+    tl.store(o, (ov + d).to(out_ptr.dtype.element_ty), mask=mh)
+
+
+def shared_outer_gate_up_shrink(
+    x: torch.Tensor,  # [M, H]
+    gate_up_a: torch.Tensor,  # [L, 1, 2r, H]
+    token_lora_mapping: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    s: torch.Tensor = None,  # optional preallocated [M, cdiv(H, 256), 2r] fp32
+) -> torch.Tensor:
+    """The token shrink alone: split-H fp32 partials of A_gu @ x_m (consumed by
+    the gate|up expand). Depends only on x, so a caller may run it on a side
+    stream next to the gate|up GEMM."""
+    M, H = x.shape
+    r2 = gate_up_a.shape[2]
+    nsplit = triton.cdiv(H, _SO_BLOCK_H)
+    assert x.stride(1) == 1
+    if s is None:
+        s = torch.empty((M, nsplit, r2), dtype=torch.float32, device=x.device)
     _so_token_shrink_kernel[(M, nsplit)](
         x,
         gate_up_a,
@@ -278,9 +352,44 @@ def shared_outer_gate_up_lora_add(
         s.stride(0),
         s.stride(1),
         R2=r2,
-        BLOCK_H=block_h,
+        BLOCK_H=_SO_BLOCK_H,
         num_warps=4,
     )
+    return s
+
+
+def shared_outer_gate_up_lora_add(
+    out: torch.Tensor,  # [M, top_k, 2 * N_pad], in place
+    x: torch.Tensor,  # [M, H]
+    gate_up_a: torch.Tensor,  # [L, 1, 2r, H] (shared over experts)
+    gate_up_b: torch.Tensor,  # [L, E, 2N, r]
+    topk_ids: torch.Tensor,  # [M, top_k]
+    token_lora_mapping: torch.Tensor,  # [>= M] int, -1 = no adapter
+    adapter_enabled: torch.Tensor,  # [L] int
+    shrink: torch.Tensor = None,  # precomputed shared_outer_gate_up_shrink partials
+) -> None:
+    M, top_k, two_npad = out.shape
+    r2 = gate_up_a.shape[2]
+    r = r2 // 2
+    n = gate_up_b.shape[2] // 2
+    npad = two_npad // 2
+    H = x.shape[1]
+    assert (
+        gate_up_a.shape[1] == 1
+        and r == triton.next_power_of_2(r)
+        and gate_up_b.shape[3] == r
+    )
+    assert out.stride(2) == 1 and x.stride(1) == 1
+    nsplit = triton.cdiv(H, _SO_BLOCK_H)
+    if shrink is not None:
+        assert shrink.shape == (M, nsplit, r2)
+        s = shrink
+    else:
+        # fp32 partials; rows of skipped tokens are never read
+        s = torch.empty((M, nsplit, r2), dtype=torch.float32, device=out.device)
+        shared_outer_gate_up_shrink(
+            x, gate_up_a, token_lora_mapping, adapter_enabled, s=s
+        )
     tids = topk_ids.reshape(-1)
     block_n = 64
     _so_gate_up_expand_kernel[(M * top_k, triton.cdiv(n, block_n))](
@@ -327,10 +436,43 @@ def shared_outer_down_lora_add(
     )
     assert out.stride(2) == 1 and inter.stride(1) == 1 and topk_weights.is_contiguous()
     P = M * top_k
+    tids = topk_ids.reshape(-1)
+    if _DOWN_FUSED:
+        out2 = out.view(P, H)
+        # every H block recomputes its pair's shrink: wider blocks once there
+        # are enough pairs to fill the GPU
+        block_h = 256 if P <= _DOWN_FUSED_NARROW_PAIRS else 512
+        _so_down_fused_kernel[(P, triton.cdiv(H, block_h))](
+            out2,
+            inter,
+            down_a,
+            down_b,
+            topk_weights.reshape(-1),
+            tids,
+            token_lora_mapping,
+            adapter_enabled,
+            n,
+            H,
+            out2.stride(0),
+            inter.stride(0),
+            down_a.stride(0),
+            down_a.stride(1),
+            down_a.stride(2),
+            down_a.stride(3),
+            down_b.stride(0),
+            down_b.stride(2),
+            down_b.stride(3),
+            TOPK=top_k,
+            R=r,
+            BLOCK_N=128,
+            BLOCK_H=block_h,
+            MUL_W=mul_routed_weight,
+            num_warps=4,
+        )
+        return
     t = torch.empty(
         (P, r), dtype=out.dtype, device=out.device
     )  # rows of skipped pairs are never read
-    tids = topk_ids.reshape(-1)
     _so_pair_shrink_kernel[(P,)](
         inter,
         down_a,

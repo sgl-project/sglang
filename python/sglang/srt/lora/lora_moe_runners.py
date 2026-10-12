@@ -208,6 +208,56 @@ _SHARED_OUTER_DECODE = envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE.get()
 _SHARED_OUTER_DECODE_MAX_PAIRS = (
     envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS.get()
 )
+# Launch the shared-outer token shrink (it depends only on the MoE input) on a
+# side stream when the hooks are built, so it runs next to the router alignment
+# and the gate|up GEMM; the gate|up hook joins it and expands.
+_SHARED_OUTER_SHRINK_OVERLAP = envs.SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES.get()
+_SHARED_OUTER_SHRINK_KEY = "shared_outer_shrink"
+_shrink_side_streams: dict = {}
+
+
+def _start_shared_outer_shrink(hidden_states: torch.Tensor, lora_info: LoRAInfo):
+    """(partials, side stream, operands) for the token shrink launched on the
+    side stream, or None to keep the in-order path."""
+    from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+        shared_outer_gate_up_shrink,
+    )
+
+    side = _shrink_side_streams.get(hidden_states.device)
+    if side is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None  # create it during warmup, not inside a capture
+        side = torch.cuda.Stream(device=hidden_states.device)
+        _shrink_side_streams[hidden_states.device] = side
+    gate_up_a = lora_info.gate_up_lora_a_weights
+    M, H = hidden_states.shape
+    # allocate on the consumer (main) stream, as the CUDA-graph allocator expects
+    s = torch.empty(
+        (M, -(-H // 256), gate_up_a.shape[2]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    side.wait_stream(torch.cuda.current_stream(hidden_states.device))
+    with torch.cuda.stream(side):
+        shared_outer_gate_up_shrink(
+            hidden_states,
+            gate_up_a,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+            s=s,
+        )
+    # the operands stay referenced (in the hooks' cache) until the gate|up hook
+    # joins the side stream
+    return (
+        s,
+        side,
+        (
+            hidden_states,
+            gate_up_a,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+        ),
+    )
 
 
 def _use_shared_outer_decode_path(lora_info: LoRAInfo, topk_ids: torch.Tensor) -> bool:
@@ -361,6 +411,13 @@ def _add_lora_gate_up_delta(
         assert gate_up_a.shape[2] == 2 * r, (
             "shared-outer decode path expects gated gate_up LoRA"
         )
+        pre = (
+            routing_cache.pop(_SHARED_OUTER_SHRINK_KEY, None)
+            if routing_cache is not None
+            else None
+        )
+        if pre is not None:
+            torch.cuda.current_stream(hidden_states.device).wait_stream(pre[1])
         shared_outer_gate_up_lora_add(
             intermediate_cache,
             hidden_states,
@@ -369,6 +426,7 @@ def _add_lora_gate_up_delta(
             topk_ids,
             lora_info.token_lora_mapping,
             lora_info.adapter_enabled,
+            shrink=pre[0] if pre is not None else None,
         )
         return
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
@@ -575,6 +633,7 @@ def build_lora_hooks(
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
+    shared_outer_shrink = None
     token_lora_mapping: torch.Tensor | None = None
     sorted_token_ids_reshaped: torch.Tensor | None = None
     expert_ids_reshaped: torch.Tensor | None = None
@@ -586,6 +645,12 @@ def build_lora_hooks(
     elif _use_shared_outer_decode_path(lora_info, topk_ids):
         # no per-expert alignment needed
         token_lora_mapping = lora_info.token_lora_mapping
+        if (
+            _SHARED_OUTER_SHRINK_OVERLAP
+            and hidden_states.dim() == 2
+            and hidden_states.stride(1) == 1
+        ):
+            shared_outer_shrink = _start_shared_outer_shrink(hidden_states, lora_info)
     else:
         (
             sorted_token_ids_reshaped,
@@ -596,6 +661,8 @@ def build_lora_hooks(
 
     # Shared routing cache: gate_up and down reuse routing for same (num_experts, shared_outer, block_size)
     routing_cache: dict = {}
+    if shared_outer_shrink is not None:
+        routing_cache[_SHARED_OUTER_SHRINK_KEY] = shared_outer_shrink
 
     def after_gate_up(
         hidden_states: torch.Tensor,

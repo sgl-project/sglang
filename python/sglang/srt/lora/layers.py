@@ -32,6 +32,8 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 # Batched slicing of packed per-expert MoE LoRA factors, and pass-through of
 # factors the streamed-adapter stash already cut to this rank's TP shard.
 _LORA_FAST_STREAMED_LOAD = envs.SGLANG_OPT_LORA_FAST_STREAMED_LOAD.get()
+# Decode LoRA launch reduction (fused shrink+expand, LoRA-A side-stream overlap).
+_LORA_DECODE_FUSED_LAUNCHES = envs.SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES.get()
 
 
 def unwrap_lora_layer(module: nn.Module) -> nn.Module:
@@ -829,6 +831,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        lora_output = self.lora_backend.run_lora_ab_fused(
+            x, self.A_buffer, self.B_buffer, base_output
+        )
+        if lora_output is not None:
+            return lora_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -994,10 +1001,19 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
+    def start_lora_a_overlap(self, x: torch.Tensor) -> None:
+        if self.lora_backend.supports_lora_a_overlap:
+            self.lora_backend.start_lora_a_overlap(
+                x, self.A_buffer, num_slices=1 if self.first_output_dim == 0 else 2
+            )
+
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        lora_active = self.lora_active
+        if lora_active and _LORA_DECODE_FUSED_LAUNCHES:
+            self.start_lora_a_overlap(x)
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-        if self.lora_active:
+        if lora_active:
             output = self.apply_lora(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias

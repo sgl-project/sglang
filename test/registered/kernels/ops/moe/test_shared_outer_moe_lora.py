@@ -6,6 +6,7 @@ fused_moe_lora path's rounding points."""
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import shared_outer_moe_lora
 from sglang.srt.lora import lora_moe_runners
 from sglang.srt.lora.lora_moe_runners import LoRAInfo, build_lora_hooks
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -152,6 +153,57 @@ def test_path_selection(monkeypatch):
     monkeypatch.setattr(lora_moe_runners, "_SHARED_OUTER_DECODE", False)
     monkeypatch.setattr(lora_moe_runners, "_SHARED_OUTER_DECODE_MAX_PAIRS", 8 * TOP_K)
     assert not lora_moe_runners._use_shared_outer_decode_path(info, topk_ids)
+
+
+def _run_with_launch_fusions(monkeypatch, case, *, fused: bool, gemm=None):
+    """Shared-outer hooks with the fused down kernel and the side-stream token
+    shrink on or off; ``gemm`` stands in for the gate|up GEMM between them."""
+    monkeypatch.setattr(lora_moe_runners, "_SHARED_OUTER_DECODE", True)
+    monkeypatch.setattr(lora_moe_runners, "_SHARED_OUTER_SHRINK_OVERLAP", fused)
+    monkeypatch.setattr(shared_outer_moe_lora, "_DOWN_FUSED", fused)
+    cache1, cache3 = case["cache1"].clone(), case["cache3"].clone()
+    hooks = build_lora_hooks(case["x"], case["info"], case["topk_ids"])
+    if gemm is not None:
+        gemm()
+    hooks.after_gate_up(case["x"], cache1, case["topk_weights"], case["topk_ids"])
+    hooks.after_down(case["inter"], cache3, case["topk_weights"], case["topk_ids"])
+    return cache1, cache3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 4, 8, 16, 32])
+def test_launch_fusions_bit_equal(monkeypatch, m: int):
+    """SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES keeps the shared-outer path's bits:
+    the fused down kernel (narrow and wide H blocks) and the token shrink on a
+    side stream next to a busy main stream, eager and under a CUDA graph."""
+    case = _make_case(m, seed=100 + m, no_lora_rows=m // 4)
+    weight = torch.ones(4096, H, device="cuda", dtype=torch.bfloat16)
+    scratch = []
+
+    def gemm():
+        # main-stream allocations and writes while the shrink is in flight
+        scratch[:] = [torch.full((m * 4096,), 7.0, device="cuda") for _ in range(8)]
+        torch.nn.functional.linear(case["x"], weight)
+
+    ref = _run_with_launch_fusions(monkeypatch, case, fused=False)
+    got = _run_with_launch_fusions(monkeypatch, case, fused=True, gemm=gemm)
+    assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+
+    def step():
+        return _run_with_launch_fusions(monkeypatch, case, fused=True, gemm=gemm)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()  # warmup creates the shrink side stream outside the capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(ref[0], graph_out[0]) and torch.equal(ref[1], graph_out[1])
+    assert all(bool((s == 7.0).all()) for s in scratch)
 
 
 if __name__ == "__main__":

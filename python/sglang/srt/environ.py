@@ -1776,6 +1776,11 @@ class Envs:
     # (token, expert) pairs; larger batches keep the per-expert path.
     SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE = EnvBool(False)
     SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS = EnvInt(512)
+    # Fewer decode LoRA launches (triton backend): split-K LoRA-A for large K,
+    # fused shrink+expand kernels, LoRA-A on a side stream next to the base GEMM,
+    # and for SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE a fused down shrink+expand
+    # and the token shrink on a side stream next to the MoE gate|up GEMM.
+    SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES = EnvBool(False)
 
     # ===================================================================
     # Kimi K3

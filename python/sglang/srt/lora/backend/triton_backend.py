@@ -3,10 +3,16 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.gemm import lora_decode_fused
 from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
 from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
 from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.gemm.sgemm_lora_a import (
+    _sgemm_lora_a_fwd_splitk,
+    sgemm_lora_a_fwd,
+    splitk_applies,
+    splitk_partial_shape,
+)
 from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -208,6 +214,9 @@ class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
     supports_dp_attention = True
     supports_prefill_cuda_graph = True
+    # At decode, a layer's LoRA-A may run on a side stream next to its base GEMM;
+    # the layer's next LoRA call with the same A joins it.
+    supports_lora_a_overlap = lora_decode_fused.DECODE_FUSED_LAUNCHES
 
     def __init__(
         self,
@@ -225,6 +234,10 @@ class TritonLoRABackend(BaseLoRABackend):
         self.cuda_graph_global_sgemm_batch_info: LoRABatchInfo | None = None
         self.has_global_active_lora = False
         self._no_lora_weight_index = 0
+        # (weights data_ptr, output, side stream, side-stream operands kept alive);
+        # UnoCublasLoRABackend keeps its own pending LoRA-A under the same name
+        self._pending_lora_a = None
+        self._lora_a_side_streams = {}
 
     def reset_batch_state(self):
         super().reset_batch_state()
@@ -277,6 +290,64 @@ class TritonLoRABackend(BaseLoRABackend):
             return self.global_sgemm_batch_info or batch_info
         return self.sgemm_batch_info or batch_info
 
+    def start_lora_a_overlap(
+        self, x: torch.Tensor, weights: torch.Tensor, *, num_slices: int = 1
+    ) -> None:
+        """Launch a decode LoRA-A (stock or split-K) on the side stream before
+        the base GEMM; the layer's next LoRA call with the same A
+        (run_lora_a_sgemm / run_gate_up_lora / run_qkv_lora) joins it and only
+        runs the expand. Anything not eligible keeps the in-order path."""
+        if self._pending_lora_a is not None:
+            # unconsumed (unexpected): join and drop, stay in order
+            self._consume_lora_a(None)
+        sgemm_info = self._sgemm_info()
+        if not lora_decode_fused.lora_a_overlap_eligible(x, weights, sgemm_info):
+            return
+        main = torch.cuda.current_stream(x.device)
+        side = self._lora_a_side_streams.get(x.device)
+        if side is None:
+            if torch.cuda.is_current_stream_capturing():
+                return  # create it during warmup, not inside a capture
+            side = torch.cuda.Stream(device=x.device)
+            self._lora_a_side_streams[x.device] = side
+        # allocate on the consumer (main) stream, as the CUDA-graph allocator expects
+        output = torch.empty(
+            (x.shape[0], weights.shape[-2]), dtype=x.dtype, device=x.device
+        )
+        splitk = splitk_applies(weights, sgemm_info)
+        partial = (
+            torch.empty(
+                splitk_partial_shape(x, weights), dtype=torch.float32, device=x.device
+            )
+            if splitk
+            else None
+        )
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            if splitk:
+                _sgemm_lora_a_fwd_splitk(
+                    x, weights, sgemm_info, num_slices, output=output, partial=partial
+                )
+            else:
+                sgemm_lora_a_fwd(
+                    x, weights, sgemm_info, stack_num=num_slices, output=output
+                )
+        # Keep every side-stream operand referenced until the main stream joins:
+        # the caching allocator and the CUDA-graph pool only see main-stream uses,
+        # so a released buffer could be reallocated while the side stream writes it.
+        self._pending_lora_a = (weights.data_ptr(), output, side, (x, weights, partial))
+
+    def _consume_lora_a(
+        self, weights: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        pending = self._pending_lora_a
+        if pending is None:
+            return None
+        self._pending_lora_a = None
+        ptr, output, side, _keepalive = pending
+        torch.cuda.current_stream(output.device).wait_stream(side)
+        return output if weights is not None and ptr == weights.data_ptr() else None
+
     def run_lora_a_sgemm(
         self,
         x: torch.Tensor,
@@ -286,6 +357,10 @@ class TritonLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if self._pending_lora_a is not None and pruned_batch_info is None:
+            output = self._consume_lora_a(weights)
+            if output is not None:
+                return output
         return sgemm_lora_a_fwd(
             x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
         )
@@ -301,6 +376,26 @@ class TritonLoRABackend(BaseLoRABackend):
     ) -> torch.Tensor:
         return sgemm_lora_b_fwd(
             x, weights, self._sgemm_info(pruned_batch_info), base_output
+        )
+
+    def run_lora_ab_fused(
+        self,
+        x: torch.Tensor,
+        weights_a: torch.Tensor,
+        weights_b: torch.Tensor,
+        base_output: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Shrink+expand of a single-slice LoRA in one launch at decode, or None
+        for the two-kernel path."""
+        if self._pending_lora_a is not None:
+            return None  # an overlapped LoRA-A is waiting for run_lora_a_sgemm
+        sgemm_info = self._sgemm_info()
+        if not lora_decode_fused.small_k_ab_eligible(
+            x, weights_a, weights_b, sgemm_info, base_output
+        ):
+            return None
+        return lora_decode_fused.small_k_ab_fwd(
+            x, weights_a, weights_b, sgemm_info, base_output
         )
 
     def run_qkv_lora(
@@ -322,6 +417,34 @@ class TritonLoRABackend(BaseLoRABackend):
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         sgemm_info = self._sgemm_info()
+        lora_a_output = (
+            self._consume_lora_a(qkv_lora_a)
+            if self._pending_lora_a is not None
+            else None
+        )
+        if lora_a_output is not None:
+            return qkv_lora_b_fwd(
+                lora_a_output,
+                qkv_lora_b,
+                sgemm_info,
+                output_offset,
+                max_qkv_out_dim,
+                base_output,
+                n_slices=n_slices,
+            )
+        if base_output is not None and lora_decode_fused.splitk_ab_eligible(
+            x, qkv_lora_a, sgemm_info
+        ):
+            return lora_decode_fused.splitk_ab_fwd(
+                x,
+                qkv_lora_a,
+                qkv_lora_b,
+                sgemm_info,
+                output_offset,
+                max_qkv_out_dim,
+                n_slices,
+                base_output,
+            )
         lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
@@ -351,6 +474,32 @@ class TritonLoRABackend(BaseLoRABackend):
         output_dim = gate_up_lora_b.shape[-2] // 2
 
         sgemm_info = self._sgemm_info()
+        lora_a_output = (
+            self._consume_lora_a(gate_up_lora_a)
+            if self._pending_lora_a is not None
+            else None
+        )
+        if lora_a_output is not None:
+            return gate_up_lora_b_fwd(
+                lora_a_output, gate_up_lora_b, sgemm_info, output_dim, base_output
+            )
+        output_offset = kwargs.get("output_offset")
+        if (
+            base_output is not None
+            and output_offset is not None
+            and output_offset.numel() == 3
+            and lora_decode_fused.splitk_ab_eligible(x, gate_up_lora_a, sgemm_info)
+        ):
+            return lora_decode_fused.splitk_ab_fwd(
+                x,
+                gate_up_lora_a,
+                gate_up_lora_b,
+                sgemm_info,
+                output_offset,
+                output_dim,
+                2,
+                base_output,
+            )
         # lora_a_output: (s, 2 * r)
         lora_a_output = sgemm_lora_a_fwd(x, gate_up_lora_a, sgemm_info, stack_num=2)
         lora_output = gate_up_lora_b_fwd(
