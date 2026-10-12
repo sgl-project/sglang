@@ -427,9 +427,18 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         return json.dumps(
             msgspec_to_builtins(
-                build_server_info(
-                    self.tokenizer_manager.server_args, self.scheduler_info
-                )
+                {
+                    **build_server_info(
+                        self.tokenizer_manager.server_args, self.scheduler_info
+                    ),
+                    # Older servers and text-only models drop media silently,
+                    # so clients check this list before they send it.
+                    "grpc_features": (
+                        ["multimodal_inputs"]
+                        if self.tokenizer_manager.mm_processor is not None
+                        else []
+                    ),
+                }
             ),
             default=str,
         )
