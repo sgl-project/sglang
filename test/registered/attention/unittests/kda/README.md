@@ -33,14 +33,18 @@ Columns are runner modes; rows are the linear-attention kernel backend. Cells us
 
 ## FlashInfer Prefill Contract
 
+Safe-gate KDA models default to FlashInfer prefill on SM100/SM103. Explicit
+`--linear-attn-prefill-backend` choices take precedence. Other hardware, unbounded
+gates, deterministic inference, TBO, and full prefill CUDA graphs retain Triton.
+
 FlashInfer prefill execution requires SM100/SM103,
 BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
 128-D heads, and a finite negative safe-gate lower bound.
 FlashInfer validates this tensor contract when the kernel runs, including
 during server warmup. Radix-cache checkpoints require a positive mamba chunk
 size divisible by 32. Incompatible intervals are rejected at backend
-initialization; FlashInfer rejects unbounded gates during warmup, so original
-Kimi Linear should use Triton prefill.
+initialization; explicit FlashInfer selection rejects unbounded gates during
+warmup. Original Kimi Linear retains Triton prefill by default.
 
 The backend maps radix-cache checkpoint destinations once per tracked batch,
 before layer execution. The adapter consumes raw gate/beta projections and
