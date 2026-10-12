@@ -157,6 +157,20 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Snapshot before worker selection inserts the incoming prompt.
+    pub fn prefill_cost_snapshot(
+        &self,
+        worker: &dyn Worker,
+        text: &str,
+    ) -> Option<super::tree::PrefixMatchResult> {
+        let tree = self
+            .trees
+            .get(&tree_key_for_worker(worker))?
+            .value()
+            .clone();
+        Some(tree.prefix_match_with_counts(text))
+    }
+
     /// Set mesh sync manager (can be called after construction)
     pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
         self.mesh_sync = mesh_sync.clone();
@@ -560,6 +574,42 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn prefill_cost_snapshot_precedes_insert_and_counts_characters() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        )];
+        policy.init_workers(&workers);
+        let text = "你好abcdef";
+        let before = policy
+            .prefill_cost_snapshot(workers[0].as_ref(), text)
+            .unwrap();
+        assert_eq!(before.matched_char_count, 0);
+        assert_eq!(before.input_char_count, 8);
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let after = policy
+            .prefill_cost_snapshot(workers[0].as_ref(), text)
+            .unwrap();
+        assert_eq!(after.matched_char_count, 8);
+        // The owned snapshot must not start counting the request's own insertion.
+        assert_eq!(before.matched_char_count, 0);
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {

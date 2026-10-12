@@ -398,7 +398,7 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
+                        let (prefill, decode, uncached_fraction) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.model_id,
@@ -437,10 +437,17 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        // Always overwrite client estimates, even when estimation is disabled.
+                        let mut cost_headers = headers.cloned().unwrap_or_default();
+                        cost_headers.insert(
+                            "x-smg-prefill-uncached-fraction",
+                            HeaderValue::from_str(&uncached_fraction.to_string())
+                                .expect("bounded fraction is a valid header"),
+                        );
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
-                                headers,
+                                Some(&cost_headers),
                                 json_request,
                                 context,
                                 Arc::clone(&prefill),
@@ -980,7 +987,7 @@ impl PDRouter {
         request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, f64), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -1018,6 +1025,20 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
+        let cost_snapshot = if std::env::var("SMG_PD_DECODE_HRRN").as_deref() == Ok("1") {
+            prefill_policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .and_then(|policy| {
+                    prefill_workers.first().and_then(|worker| {
+                        request_text
+                            .and_then(|text| policy.prefill_cost_snapshot(worker.as_ref(), text))
+                    })
+                })
+        } else {
+            None
+        };
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
@@ -1053,7 +1074,15 @@ impl PDRouter {
             decode_policy.name(),
         );
 
-        Ok((prefill, decode))
+        let uncached_fraction = cost_snapshot.map_or(1.0, |m| {
+            if m.tenant.as_ref() == prefill.url() && m.input_char_count > 0 {
+                m.input_char_count.saturating_sub(m.matched_char_count) as f64
+                    / m.input_char_count as f64
+            } else {
+                1.0
+            }
+        });
+        Ok((prefill, decode, uncached_fraction))
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1467,7 +1496,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
+        let (prefill, decode, _) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1868,7 +1897,8 @@ mod tests {
         let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
+        let (prefill, _decode, fraction) = result.unwrap();
+        assert_eq!(fraction, 1.0);
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
