@@ -9,10 +9,6 @@ on:
       sgl_kernel:
         required: true
         type: string
-      rust_ext_artifact:
-        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
-        type: string
-        default: ''
       runner_config:
         required: true
         type: string
@@ -107,10 +103,6 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -138,7 +130,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -177,10 +169,6 @@ jobs:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
-
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -247,10 +235,6 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -291,11 +275,14 @@ jobs:
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
+      - name: Record retry deadline
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -313,17 +300,13 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 45
+        timeout-minutes: 55
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
@@ -347,7 +330,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -387,10 +370,6 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -412,7 +391,7 @@ jobs:
         with:
           artifact-suffix: component-accuracy
 
-  multimodal-gen-test-1-b200:
+  multimodal-gen-test-4-gpu-b200:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
@@ -436,16 +415,17 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: 20
         env:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run VAE parallel-group regression
+        timeout-minutes: 10
+        run: |
+          python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -504,10 +484,6 @@ jobs:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
-
-      - uses: ./.github/actions/download-rust-ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20

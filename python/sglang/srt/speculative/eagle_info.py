@@ -1,10 +1,11 @@
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -15,7 +16,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -30,6 +33,11 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    prepared_out_cache_loc: Optional[torch.Tensor] = None
+    prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The iteration's plan when the draft planned the verify window
+    # (`prepared_out_cache_loc`); verify and draft extend take it.
+    kv_loc_plan: Optional[KVLocPlan] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -81,13 +89,19 @@ class EagleVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
-        batch_size = len(req_pool_indices)
+        batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
@@ -102,19 +116,15 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        translator.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -175,8 +185,20 @@ class EagleDraftInput(SpecInput):
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
 
+    # False when this input is missing model-required state for graph replay.
+    # DP attention synchronizes the bit across ranks before the worker runs.
+    cuda_graph_compatible: bool = True
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.draft_probs is not None:
+            self.draft_probs = pad_tensor_to_size(self.draft_probs, batch_size)
 
     @classmethod
     def create_idle_input(
@@ -227,12 +249,23 @@ class EagleDraftInput(SpecInput):
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            self_was_empty = len(self.future_indices) == 0
+            spec_info_is_empty = len(spec_info.future_indices) == 0
+            if self_was_empty:
+                self.cuda_graph_compatible = spec_info.cuda_graph_compatible
+                self.future_dsa_topk_indices_available = (
+                    spec_info.future_dsa_topk_indices_available
+                )
+            elif not spec_info_is_empty:
+                self.cuda_graph_compatible = (
+                    self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+                )
+                self.future_dsa_topk_indices_available = (
+                    self.future_dsa_topk_indices_available
+                    and spec_info.future_dsa_topk_indices_available
+                )
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
-            )
-            self.future_dsa_topk_indices_available = (
-                self.future_dsa_topk_indices_available
-                and spec_info.future_dsa_topk_indices_available
             )
             return
 
@@ -240,6 +273,7 @@ class EagleDraftInput(SpecInput):
         # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
         # for STANDALONE all non-idle inputs also have None hidden_states.
         if len(self.topk_index) == 0:
+            self.cuda_graph_compatible = spec_info.cuda_graph_compatible
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
@@ -249,6 +283,9 @@ class EagleDraftInput(SpecInput):
             return
         if len(spec_info.topk_index) == 0:
             return
+        self.cuda_graph_compatible = (
+            self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+        )
         if self.hidden_states is not None and spec_info.hidden_states is not None:
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], axis=0
@@ -326,6 +363,19 @@ class EagleDraftExtendInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.num_correct_drafts is not None:
+            self.num_correct_drafts = pad_tensor_to_size(
+                self.num_correct_drafts, batch_size
+            )
+            self.num_accept_tokens = pad_tensor_to_size(
+                self.num_accept_tokens, batch_size
+            )
+
     @classmethod
     def create_idle_input(
         cls,
@@ -352,11 +402,16 @@ class EagleDraftExtendInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
+        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
+        draft-extend window."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -377,13 +432,12 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        translator.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None

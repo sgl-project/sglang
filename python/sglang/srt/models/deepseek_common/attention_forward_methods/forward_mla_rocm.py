@@ -20,13 +20,13 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
@@ -42,6 +42,8 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -64,7 +66,12 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sglang.srt.utils import (
+    BumpAllocator,
+    cdiv,
+    get_bool_env_var,
+    get_device_core_count,
+)
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -137,7 +144,43 @@ if _use_aiter_gfx95:
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
-    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+    from sglang.srt.layers.rocm_linear_utils import (
+        fused_fp8_bmm_rope_cat_and_cache_mla,
+        fused_qk_rope_cat_and_cache_mla,
+    )
+
+
+_ABSORB_BMM_DECODE_MAX_M = 256
+_absorb_bmm_num_cu = 0
+
+
+def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
+    """Return decode tile settings, or None outside the decode row limit."""
+    global _absorb_bmm_num_cu
+    if m <= 0 or m > _ABSORB_BMM_DECODE_MAX_M:
+        return None
+    if not _absorb_bmm_num_cu:
+        _absorb_bmm_num_cu = get_device_core_count()
+    num_cu = _absorb_bmm_num_cu
+    m_tiles_16 = cdiv(m, 16)
+    block_n = 128
+    while block_n > 32 and 4 * heads * m_tiles_16 * cdiv(n, block_n) < 3 * num_cu:
+        block_n //= 2
+    n_tiles = cdiv(n, block_n)
+    block_m = 16
+    while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
+        block_m *= 2
+    workgroups = heads * cdiv(m, block_m) * n_tiles
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": max(1, cdiv(workgroups, num_cu)),
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+    }
 
 
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
@@ -191,6 +234,9 @@ def rocm_absorb_q_bmm(
                     transpose_bm=False,  # (B, M, N)
                     transpose_bm_in=True,  # (M, B, K)
                     dtype=torch.bfloat16,
+                    config=_absorb_bmm_config(
+                        q_nope.shape[1], q_nope.shape[0], attn.w_kc.shape[2]
+                    ),
                 )
             )
         else:
@@ -249,6 +295,9 @@ def rocm_absorb_v_bmm(
                 transpose_bm=True,
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
+                config=_absorb_bmm_config(
+                    attn.num_local_heads, attn_output.shape[0], attn.w_vc.shape[-1]
+                ),
             )
         elif not is_in_tc_piecewise_cuda_graph():
             # Same (batch, heads, dim) layout as the quantized paths above, so the
@@ -348,10 +397,84 @@ def _fused_rope_cat_and_cache(
         q_nope_out.dtype
         if attn.kv_cache_dtype == "fp8_e4m3"
         and attn.current_attention_backend == "aiter"
+        and q_nope_out.shape[-2] == 12
         else kv_cache_dtype
     )
+    kv_pool = get_token_to_kv_pool()
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    # AITER reads slot_mapping with stride 1, including on the resident path.
+    out_cache_loc = out_cache_loc.contiguous()
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
+        out_cache_loc,
+        positions,
+        attn.rotary_emb.cos_cache,
+        attn.rotary_emb.sin_cache,
+        attn.attn_mqa.k_scale,
+        attn.rotary_emb.is_neox_style,
+        q_out_dtype=q_out_dtype,
+    )
+
+
+def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+    """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
+
+    Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
+    ``_fused_rope_cat_and_cache`` in core -- and at decode shapes each fills
+    well under half the CUs, so a fused grid runs them side by side instead of
+    back to back. Every term below mirrors a branch one of those two would
+    otherwise have taken, so the fused path is only chosen where it is exactly
+    equivalent.
+
+    The caller adds one more term it alone can see: DCP q replication splits the
+    absorb across a different weight, which this kernel does not carry.
+
+    DCP is excluded outright: its decode phase all-gathers q_nope_out and q_pe
+    before core runs, and this path has no q_nope_out to hand it -- the absorb
+    has not happened yet.
+    """
+    return (
+        _use_aiter_gfx95
+        and not get_parallel().dcp_enabled
+        and attn.w_kc.dtype == torch.float8_e4m3fn
+        and attn.rotary_emb is not None
+        and attn._skip_rope_for_dsa_tilelang_fused()
+        and attn.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        and not attn.use_deep_gemm_bmm
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(attn)
+    )
+
+
+def _fused_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """q absorb + RoPE + concat + KV-cache write in one AITER kernel.
+
+    Takes q_nope un-absorbed: the BMM ``rocm_absorb_q_bmm`` would have done is
+    the first half of this kernel's grid.
+    """
+    kv_cache_dtype = fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope.dtype
+    # Same weights and group size the fp8 branch of rocm_absorb_q_bmm passes to
+    # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant;
+    # that call takes q_nope as (B, QH, P) and transposes internally, while this
+    # kernel wants (QH, B, P) up front.
+    return fused_fp8_bmm_rope_cat_and_cache_mla(
+        q_nope.transpose(0, 1),
+        attn.w_kc.transpose(-1, -2),
+        attn.w_scale,
         q_pe,
         k_nope,
         k_pe,
@@ -360,9 +483,10 @@ def _fused_rope_cat_and_cache(
         positions,
         attn.rotary_emb.cos_cache,
         attn.rotary_emb.sin_cache,
-        attn.attn_mqa.k_scale,
-        attn.rotary_emb.is_neox_style,
-        q_out_dtype=q_out_dtype,
+        group_size=128,
+        k_scale=attn.attn_mqa.k_scale,
+        is_neox=attn.rotary_emb.is_neox_style,
+        q_out_dtype=kv_cache_dtype,
     )
 
 
@@ -416,6 +540,10 @@ class DeepseekMLARocmForwardMixin:
                     self.kv_a_layernorm.variance_epsilon,
                 )
             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+                    q.shape[0],
+                    on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+                )
                 if self.use_dsa:
                     q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                         q,
@@ -428,9 +556,13 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=False,
+                        transpose_scale=emit_transposed_scale,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if emit_transposed_scale:
+                        q_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                            q_quanted
+                        )
+                    elif _use_aiter_bpreshuffle_gfx95:
                         q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = q_quanted
                 else:
@@ -445,9 +577,11 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=False,
-                        transpose_scale=False,
+                        transpose_scale=emit_transposed_scale,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if emit_transposed_scale:
+                        q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
+                    elif _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
@@ -538,6 +672,14 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        # The fused kernel wins at decode-sized batches (decode, target verify,
+        # draft extend); prefill shapes run faster as the two separate launches.
+        fuse_bmm_rope_cache = (
+            not q_replicate_active
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and _can_fuse_bmm_rope_cat_and_cache(self)
+        )
+
         if q_replicate_active:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
@@ -575,20 +717,25 @@ class DeepseekMLARocmForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
+            elif fuse_bmm_rope_cache:
+                # The absorb is the first half of the kernel core will run, and
+                # that kernel wants q_nope un-absorbed. Nothing to do here.
+                q_nope_out = None
             else:
                 q_nope_out = rocm_absorb_q_bmm(
                     self, q_nope, is_capture_mode=get_is_capture_mode()
                 )
 
-            q_nope_out = q_nope_out.transpose(0, 1)
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                    kv_b_lora_q_apply,
-                )
+            if q_nope_out is not None:
+                q_nope_out = q_nope_out.transpose(0, 1)
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                    from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                        kv_b_lora_q_apply,
+                    )
 
-                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-            elif is_kv_b_lora_active(self):
-                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                    q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+                elif is_kv_b_lora_active(self):
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
 
@@ -664,6 +811,7 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            q_nope if fuse_bmm_rope_cache else None,
         )
 
     def forward_absorb_rocm_core(
@@ -677,20 +825,35 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        q_nope_unabsorbed=None,
     ):
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
-                q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
-                    self,
-                    q_nope_out,
-                    q_pe,
-                    k_nope,
-                    k_pe,
-                    positions,
-                    forward_batch.out_cache_loc,
-                )
+                if q_nope_unabsorbed is not None:
+                    # prepare left the absorb to us: one kernel for the BMM,
+                    # the RoPE and the KV write instead of two launches that
+                    # each leave most of the machine idle.
+                    q_cat, _, k_pe_fused, _ = _fused_bmm_rope_cat_and_cache(
+                        self,
+                        q_nope_unabsorbed,
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        positions,
+                        forward_batch.out_cache_loc,
+                    )
+                else:
+                    q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
+                        self,
+                        q_nope_out,
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        positions,
+                        forward_batch.out_cache_loc,
+                    )
                 save_kv_cache = False
                 # Pass q_cat straight to attn_mqa with q_rope=None so the backend
                 # reuses it as a zero-copy view instead of rebuilding a tensor
@@ -792,7 +955,7 @@ class DeepseekMLARocmForwardMixin:
                 q[..., : self.kv_lora_rank] *= llama_4_scaling
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mqa,
-                forward_batch.out_cache_loc,
+                KVWriteLoc.for_batch(forward_batch),
                 k_nope,
                 k_pe,
             )

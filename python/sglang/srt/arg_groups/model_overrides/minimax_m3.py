@@ -1,7 +1,4 @@
-"""Config-time override declarations for minimax_m3.
-
-Architectures: MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration.
-"""
+"""Config-time override declarations for minimax_m3."""
 
 import logging
 from typing import Any, Dict
