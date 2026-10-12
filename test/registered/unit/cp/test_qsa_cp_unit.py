@@ -9,10 +9,12 @@ import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
 from sglang.srt.layers.attention.qsa import qsa_indexer
+from sglang.srt.layers.attention.qsa.cp_kv_gather import build_cp_kv_gather_index
 from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -50,7 +52,7 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
 
 
 def test_cuda_indexer_forwards_global_rope_to_cp_path():
-    hidden, local_rope, metadata, global_rope = (object() for _ in range(4))
+    hidden, local_rope, metadata, global_rope, hook = (object() for _ in range(5))
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
     expected = object()
     indexer = SimpleNamespace(forward_cuda_cp=Mock(return_value=expected))
@@ -63,11 +65,12 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
         batch,
         metadata,
         cp_global_rope_positions=global_rope,
+        cp_on_key_gather_issued=hook,
     )
 
     assert actual is expected
     indexer.forward_cuda_cp.assert_called_once_with(
-        hidden, local_rope, batch, metadata, global_rope
+        hidden, local_rope, batch, metadata, global_rope, on_key_gather_issued=hook
     )
 
 
@@ -104,9 +107,11 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     for name in ("cp_shard_position_ids", "cp_shard_hidden_states"):
         monkeypatch.setattr(qsa_indexer, name, lambda value, batch: value[local_rows])
+    events = []
 
     def gather_raw_keys(local, batch):
         torch.testing.assert_close(local, hidden[local_rows])
+        events.append("key_gather")
         return hidden
 
     monkeypatch.setattr(
@@ -130,15 +135,26 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         _use_fused_prep=Mock(
             side_effect=AssertionError("local keys must not be stored")
         ),
-        update_key_state_and_compress=Mock(),
+        update_key_state_and_compress=Mock(
+            side_effect=lambda *args, **kwargs: events.append("compress")
+        ),
         select_prefill_tokens=score_queries,
     )
     indexer.project_qk = lambda *args, **kwargs: QSAIndexer.project_qk(
         indexer, *args, **kwargs
     )
     actual = QSAIndexer.forward_cuda_cp(
-        indexer, hidden[local_rows], positions[local_rows], batch, metadata, positions
+        indexer,
+        hidden[local_rows],
+        positions[local_rows],
+        batch,
+        metadata,
+        positions,
+        on_key_gather_issued=lambda: events.append("hook"),
     )
+    # The hook issues the next CP-group collective (the attention's K/V gather):
+    # it must follow the key gather on every rank, and precede the work it overlaps.
+    assert events == ["key_gather", "hook", "compress"]
     expected = torch_qsa_mqa_prefill(
         hidden[local_rows].unsqueeze(1).to(compressed_dtype),
         compressed_keys,
@@ -183,8 +199,9 @@ def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     "query_dtype,cache_dtype",
     [(torch.float32, torch.float32), (torch.bfloat16, torch.float8_e4m3fn)],
 )
+@pytest.mark.parametrize("prefetched", [False, True])
 def test_qsa_cp_cached_prefix_matches_full_context_attention(
-    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype
+    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype, prefetched
 ):
     # Unequal request lengths exercise both zigzag halves and uneven rank sizes.
     extend_lens = [8, 5]
@@ -251,10 +268,13 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         pool.get_value_buffer.side_effect = AssertionError(
             "zero prefix needs no cache read"
         )
+    # A prefetched gather (prefetch_cp_kv) hands over the global K|V halves.
+    prefetched_kv = SimpleNamespace(wait=lambda: (new_k.flatten(1), new_v.flatten(1)))
     backend = SimpleNamespace(
         token_to_kv_pool=pool,
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
+        _cp_kv_prefetched={0: prefetched_kv} if prefetched else {},
     )
     batch = SimpleNamespace(
         attn_cp_metadata=meta,
@@ -279,6 +299,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     local_positions = logical_positions.index_select(0, local_rows)
 
     def gather_new_kv(local_kv, forward_batch):
+        assert not prefetched, "a prefetched layer must not gather again"
         assert forward_batch is batch
         torch.testing.assert_close(
             local_kv, torch.cat([local_k.flatten(1), local_v.flatten(1)], dim=-1)
@@ -319,6 +340,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     actual = QwenSparseAttnBackend._forward_extend_cp(
         backend, local_q, local_k, local_v, layer, batch, topk, save_kv_cache
     )
+    assert not backend._cp_kv_prefetched
 
     expected = []
     row = 0
@@ -341,6 +363,49 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         pool.set_kv_buffer.assert_not_called()
     torch.testing.assert_close(k_cache.float(), initial_k.float(), equal_nan=True)
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize(
+    "extend_lens,prefix_lens",
+    [
+        ([8193], [0]),  # uneven logical rows, padded physical rows
+        ([1000, 7193], [0, 0]),
+        ([3001, 5190], [64, 0]),
+        ([8, 5], [4, 8]),
+    ],
+)
+def test_cp_kv_gather_index_restores_global_token_order(
+    monkeypatch, cp_size, extend_lens, prefix_lens
+):
+    """The prefetched K/V gather sends every rank's padded zigzag rows; its index
+    must pick each global token from the right rank and skip the padding."""
+    seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    num_tokens = sum(extend_lens)
+    monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cpu"))
+    monkeypatch.setattr(
+        cp_padding, "get_parallel", lambda: SimpleNamespace(attn_cp_size=cp_size)
+    )
+    monkeypatch.setattr(cp_base, "is_zigzag", lambda: True)
+    strategy = zigzag.ZigzagCPStrategy(cp_size=cp_size)
+    rank_rows, indices = [], []
+    for rank in range(cp_size):
+        monkeypatch.setattr(
+            cp_base,
+            "get_parallel",
+            lambda rank=rank: SimpleNamespace(attn_cp_rank=rank),
+        )
+        meta = strategy.build_metadata(num_tokens, seq_lens, extend_lens)
+        cp_padding.pad_logical_token_to_physical(meta)
+        batch = SimpleNamespace(attn_cp_metadata=meta)
+        rank_rows.append(strategy.shard_hidden_states(torch.arange(num_tokens), batch))
+        indices.append(build_cp_kv_gather_index(meta, torch.device("cpu")))
+    gathered = torch.cat(rank_rows)
+    for index in indices:
+        torch.testing.assert_close(index, indices[0])
+    torch.testing.assert_close(
+        gathered.index_select(0, indices[0]), torch.arange(num_tokens)
+    )
 
 
 if __name__ == "__main__":

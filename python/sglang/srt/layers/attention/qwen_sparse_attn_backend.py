@@ -21,6 +21,11 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.cp_kv_gather import (
+    CPKVGather,
+    CPKVGatherHandle,
+    build_cp_kv_gather_index,
+)
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -125,6 +130,20 @@ def _resolve_flash_attn_varlen_func():
             "QSA decode requires flash_attn (FA2), flash-attn-4 (FA4 cute), "
             "or aiter (ROCm) for its packed varlen fallback."
         ) from exc
+
+
+def _require_zigzag_cp() -> None:
+    strategy = get_cp_strategy()
+    if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+        strategy_name = strategy.name if strategy is not None else "none"
+        raise NotImplementedError(
+            f"QSA prefill CP only supports the zigzag strategy; got {strategy_name}."
+        )
+
+
+def _cp_kv_send_rows(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """This rank's K|V rows, [rows, k_heads * k_dim + v_heads * v_dim]."""
+    return torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
 
 
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
@@ -256,6 +275,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
+        # Prefill-CP K/V gathers started by prefetch_cp_kv, keyed by layer id;
+        # the gather index is built once per forward on first use.
+        self._cp_kv_gather: Optional[CPKVGather] = None
+        self._cp_kv_gather_index: Optional[torch.Tensor] = None
+        self._cp_kv_prefetched: Dict[int, CPKVGatherHandle] = {}
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -769,10 +793,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
+        self._reset_cp_kv_prefetch()
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+
+    def _reset_cp_kv_prefetch(self) -> None:
+        # An unconsumed gather must still finish before this stream issues
+        # later collectives on the CP group, or the two could interleave.
+        for handle in self._cp_kv_prefetched.values():
+            handle.wait()
+        self._cp_kv_prefetched.clear()
+        self._cp_kv_gather_index = None
 
     def init_forward_metadata_out_graph(
         self,
@@ -1540,6 +1573,32 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return self._pad_extend_output(output, num_output_rows)
 
+    def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
+        """Start ``layer``'s prefill-CP K/V all-gather on a side stream; the
+        layer's forward_extend then waits for it instead of gathering inline.
+
+        Call it only once the indexer's key gather has been issued (the
+        indexer's ``cp_on_key_gather_issued`` hook), so every rank issues the
+        CP group's collectives in the same order."""
+        _require_zigzag_cp()
+        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+        meta = forward_batch.attn_cp_metadata
+        if k.shape[0] != meta.per_rank_actual_token[0]:
+            raise ValueError(
+                "QSA CP K/V prefetch needs this rank's padded rows: "
+                f"rows={k.shape[0]}, physical={meta.per_rank_actual_token[0]}"
+            )
+        if self._cp_kv_gather is None:
+            self._cp_kv_gather = CPKVGather()
+        if self._cp_kv_gather_index is None:
+            self._cp_kv_gather_index = build_cp_kv_gather_index(meta, k.device)
+        self._cp_kv_prefetched[layer.layer_id] = self._cp_kv_gather.issue(
+            _cp_kv_send_rows(k, v),
+            key_width=k.shape[1] * k.shape[2],
+            gather_index=self._cp_kv_gather_index,
+        )
+
     def _forward_extend_cp(
         self,
         q: torch.Tensor,
@@ -1559,23 +1618,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         absolute end position (bottom-right causal), ``cu_k`` is the request's
         base row in the packed full K/V, and ``topk_indices`` are per-request
         logical positions exactly as in the non-CP path."""
-        strategy = get_cp_strategy()
-        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
-            strategy_name = strategy.name if strategy is not None else "none"
-            raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
-                f"got {strategy_name}."
-            )
+        _require_zigzag_cp()
         meta = forward_batch.attn_cp_metadata
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
-        k_width = k.shape[1] * k.shape[2]
-        v_width = v.shape[1] * v.shape[2]
-        kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
-        kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
-        k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
+        prefetched = self._cp_kv_prefetched.pop(layer.layer_id, None)
+        if prefetched is not None:
+            k_full, v_full = prefetched.wait()
+        else:
+            kv_full = cp_materialize_global_token_order(
+                _cp_kv_send_rows(k, v), forward_batch
+            )
+            k_full, v_full = kv_full.split(
+                [k.shape[1] * k.shape[2], v.shape[1] * v.shape[2]], dim=-1
+            )
         k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
         v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
         if save_kv_cache:
