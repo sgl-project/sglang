@@ -80,6 +80,9 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_mori_epv2(self):
+        return self.is_mori() and envs.SGLANG_MORI_EP_V2.get()
+
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
