@@ -66,6 +66,28 @@ class TestWorkerNumaBinding(unittest.TestCase):
         self.assertEqual(node, 1)
         bind.assert_called_once_with(1)
 
+    def test_cpu_affinity_still_binds_without_mempolicy(self):
+        with (
+            patch.dict("os.environ", {"SGLANG_AUTO_NUMA_BIND": "1"}),
+            patch("sglang.srt.utils.numa_utils._is_cuda", True),
+            patch("os.path.isdir", return_value=True),
+            patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False),
+            patch(
+                "sglang.srt.utils.numa_utils.shutil.which",
+                return_value="/usr/bin/numactl",
+            ),
+            patch(
+                "sglang.srt.utils.numa_utils._query_numa_node_for_gpu",
+                return_value=[1],
+            ),
+            patch("sglang.srt.utils.numa_utils.numa_bind_to_node") as bind,
+        ):
+            node = _bind_worker_to_gpu_numa_node(
+                SimpleNamespace(numa_node=None), local_rank=1
+            )
+        self.assertEqual(node, 1)
+        bind.assert_called_once_with(1)
+
     def test_disabled_auto_bind_leaves_worker_unbound(self):
         with (
             patch.dict("os.environ", {"SGLANG_AUTO_NUMA_BIND": "0"}),
