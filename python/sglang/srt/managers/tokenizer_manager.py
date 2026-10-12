@@ -124,6 +124,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -1120,6 +1121,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Multimodal inputs are not supported when --language-model-only "
                 "is set; the encoder is not loaded. Restart without the flag."
             )
+
+        # Reject audio input early for models without an audio tower. Without
+        # this guard the request reaches the scheduler, where
+        # get_audio_feature() raises inside model.forward and kills the
+        # scheduler process.
+        if (
+            has_valid_data(obj.audio_data)
+            and not self.model_config.is_audio_understandable_model
+        ):
+            raise ValueError(
+                f"Audio inputs are not supported by {self.served_model_name}"
+            )
+
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
