@@ -1090,8 +1090,8 @@ def report_c4pos(rows):
 
 C4DEC_RUNBOOK = (
     "[C4DEC-RUNBOOK] windowed probe (compressor produced idxK vs stored pool):\n"
-    "  DSV4_DUMP_C4DEC=2 DSV4_DUMP_IDXK=2 DSV4_DUMP_LAYERS=2 "
-    "DSV4_DUMP_MIN_POS=17280 DSV4_DUMP_MAX_POS=17540 "
+    "  DSV4_DUMP_C4DEC=2 DSV4_DUMP_IDXK=2 DSV4_DUMP_IDXIN=2 "
+    "DSV4_DUMP_LAYERS=2 DSV4_DUMP_MIN_POS=17280 DSV4_DUMP_MAX_POS=17540 "
     "SGLANG_DSV4_AIC_NUM=<real> <serve> ; <curl miss> ; <curl hit> ; "
     "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_c4dec.log\n"
     "  verdicts: OUTPUT-SLOT (produced same, stored differs) | "
@@ -1182,6 +1182,37 @@ def _c4dec_split(rows):
     return _c4pos_requests(rows)
 
 
+def _c4dec_roles(c4_reqs, idxin_rows):
+    """``(miss_idx, hit_idx, source)`` for the [C4DEC] requests.
+
+    MISS/HIT is decided by the REQUEST BOUNDARY rule the [IDXIN]/[C4POS] sections
+    use -- the ``/v1/chat/completions`` split plus the ``sps`` rule (``sps==0`` ->
+    MISS, ``sps>0`` -> HIT) -- NOT by [C4DEC]'s own ``start==[]``.  The [IDXIN]
+    rows are split by the SAME ``/v1/chat/completions`` boundaries as the [C4DEC]
+    rows, so their request indices align; the [IDXIN] sps classification is
+    mapped straight onto the [C4DEC] request indices.  This is REQUIRED because
+    the widened [C4DEC] gate makes the MISS request's emitted call a
+    window-overlapping CHUNK whose ``start`` list is 0-FREE, so the old
+    ``start==0`` test mislabelled the MISS as HIT (``miss_req=[]``).  The
+    [C4DEC] ``start`` list is used ONLY as a secondary fallback, never as the
+    sole MISS test.
+    """
+    if idxin_rows and _idxin_split_source(idxin_rows) == "chat/completions":
+        ireqs = _idxin_requests(idxin_rows)
+        if len(ireqs) == len(c4_reqs):
+            _miss_i, miss_set, hit_idx, source, _note = _idxin_roles(ireqs)
+            if miss_set or hit_idx:
+                return list(miss_set), list(hit_idx), f"idxin:{source}"
+    # Secondary hint only (no usable [IDXIN]): the [C4DEC] start==0 test.
+    miss, hit = [], []
+    for i, g in enumerate(c4_reqs):
+        starts = [s for s in (_c4dec_start_min(r) for r in g) if s is not None]
+        if not starts:
+            continue
+        (miss if min(starts) == 0 else hit).append(i)
+    return miss, hit, "c4dec-start"
+
+
 def _c4dec_produced_maps(group):
     """``{layer: (idxK_by_block, kbase, rdcarry_by_pos)}`` for one request."""
     out = {}
@@ -1209,13 +1240,15 @@ def _c4dec_stored_maps(group):
     return out
 
 
-def report_c4dec(rows, idxk_rows=()):
+def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
     """``[C4DEC-VERDICT]`` produced idxK vs stored [IDXK] blkx, per absolute block.
 
     produced = the compressor's PRODUCED compressed KV ([C4DEC] ``idxK``);
     stored   = the POOL content per absolute block ([IDXK] ``blkx[j]``).
-    Requests are split the existing way (``start`` / sps: 0 => MISS, >0 => HIT).
-    Per shared (layer, absolute block j):
+    Requests are split by the ``/v1/chat/completions`` boundary and MISS/HIT is
+    classified by the REQUEST-BOUNDARY rule the [IDXIN] section uses (``sps==0``
+    -> MISS, ``sps>0`` -> HIT, via ``_c4dec_roles``); the [C4DEC] ``start==0``
+    test is only a secondary fallback.  Per shared (layer, absolute block j):
 
       * produced MISS==HIT but stored MISS!=HIT  -> OUTPUT-SLOT
         (scatter / c4_loc misplacement: the right value lands in the wrong slot)
@@ -1233,15 +1266,11 @@ def report_c4dec(rows, idxk_rows=()):
         print(C4DEC_RUNBOOK)
         return
     c4_reqs = _c4dec_split(rows)
-    miss_idx, hit_idx = [], []
-    for i, g in enumerate(c4_reqs):
-        starts = [s for s in (_c4dec_start_min(r) for r in g) if s is not None]
-        if not starts:
-            continue
-        (miss_idx if min(starts) == 0 else hit_idx).append(i)
+    miss_idx, hit_idx, role_src = _c4dec_roles(c4_reqs, idxin_rows)
     if not miss_idx or not hit_idx:
         print(f"  [C4DEC-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
-              f"-> need >=1 MISS (start==0) and >=1 HIT (start>0); none")
+              f"(source={role_src}) "
+              f"-> need >=1 MISS and >=1 HIT; none")
         print(C4DEC_RUNBOOK)
         return
 
@@ -1299,6 +1328,7 @@ def report_c4dec(rows, idxk_rows=()):
         verdict = "SAME"
 
     print(f"  [C4DEC-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
+          f"(source={role_src}) "
           f"n_shared={n_shared} produced_same={produced_same} "
           f"stored_diff={stored_diff} kbase_diff={kbase_diff} "
           f"rdcarry_diff={rdcarry_diff} => {verdict}")
@@ -1992,7 +2022,7 @@ def main(path):
             continue
         if tag == "C4DEC":
             # Same always-emit rule: needs the [IDXK] rows for the stored side.
-            report_c4dec(rows, recs.get("IDXK", []))
+            report_c4dec(rows, recs.get("IDXK", []), recs.get("IDXIN", []))
             continue
         if not rows:
             continue
@@ -2437,6 +2467,24 @@ def _selftest():
         c4slot_out = _run_main(c4dec_slot)
         c4ksplit_out = _run_main(c4dec_ksplit)
         c4rmis_out = _run_main(c4dec_rmis)
+        # H4: the EXACT reported repro -- FIVE ``/v1/chat/completions`` requests
+        #     (boundary line AFTER each request's rows -> 0-based indices); req0..3
+        #     are cache-MISS (sps=0) and req4 the cache-HIT (sps=16384).  The
+        #     widened [C4DEC] gate emits the MISS calls from a window-OVERLAPPING
+        #     chunk, so ALL five [C4DEC] start lists are 0-FREE.  The split MUST
+        #     follow the request boundary + sps rule -> miss_req=[0, 1, 2, 3],
+        #     hit_req=[4]; the OLD start==0 test gave miss_req=[].
+        c4dec_startfree = []
+        for _r in range(5):
+            _shift = 0 if _r < 4 else 16384
+            c4dec_startfree += [
+                _idxin(2, 17523, "aaaa", kpg_a,
+                       knorm="198.935:100:64", shift=_shift),
+                _c4dec(2, 16384, _KB_A, _RC_A, "aaaa", "bbbb"),
+                _idxk_line(2, "p111", "p222"),
+                _chat,
+            ]
+        h4_out = _run_main(c4dec_startfree)
         _slot_c4 = _parse_src(c4dec_slot).get("C4DEC", [])
 
         b1_rows, b1_out = _run_nocmp(nocmp_rope)
@@ -2579,6 +2627,11 @@ def _selftest():
              and "produced_same=False" in c4rmis_out
              and "kbase_diff=False" in c4rmis_out
              and "rdcarry_diff=True" in c4rmis_out),
+            ("[C4DEC] start-free MISS classified by request boundary"
+             " -> miss 0-3 / hit 4",
+             "[C4DEC-VERDICT] miss_req=[0, 1, 2, 3] hit_req=[4]" in h4_out
+             and "miss_req=[]" not in h4_out
+             and "source=idxin:sps" in h4_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:

@@ -1184,8 +1184,31 @@ class CompressorAscendBackendMixin:
                 _su = fm.seqused.reshape(-1).to(torch.int64).cpu()
                 _sp_l = _sp.tolist()
                 _su_l = _su.tolist()
+                # S242: emit for EVERY prefill call whose (start, seqused)
+                # window OVERLAPS [lo, hi], not just the call that CONTAINS one
+                # hardcoded token.  The old ``<= 17534 <`` test keyed on a
+                # single absolute position, so the cache-MISS full prefill
+                # (start=0, seqused=17523) was never emitted and the analyzer
+                # could not see the MISS side at all.  ``[start, start+seqused)``
+                # intersects ``[lo, hi]`` <=> start <= hi and start+seqused > lo
+                # (inclusive-hi / exclusive-lo endpoint also fixes the window
+                # that ENDS exactly on the boundary).  Window env-gated; default
+                # 17280..17540 matches the C4DEC runbook.
+                _dec_lo = int(
+                    os.environ.get(
+                        "DSV4_DUMP_C4DEC_MIN_POS",
+                        os.environ.get("DSV4_DUMP_MIN_POS", "17280"),
+                    )
+                )
+                _dec_hi = int(
+                    os.environ.get(
+                        "DSV4_DUMP_C4DEC_MAX_POS",
+                        os.environ.get("DSV4_DUMP_MAX_POS", "17540"),
+                    )
+                )
                 if any(
-                    int(_sp_l[_b]) <= 17534 < int(_sp_l[_b]) + int(_su_l[_b])
+                    int(_sp_l[_b]) <= _dec_hi
+                    and int(_sp_l[_b]) + int(_su_l[_b]) > _dec_lo
                     for _b in range(len(_sp_l))
                 ):
                     _tbl_cpu = (
