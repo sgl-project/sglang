@@ -296,24 +296,37 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 layer.self_attn.attn.sliding_window_size = self._draft_window_size
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        # A reduced draft vocab wins over the tied embedding: such a checkpoint
+        # ships its own lm_head.weight with draft_vocab_size rows, so consulting
+        # tie_word_embeddings first would bind the full-size target embedding and
+        # silently drop that head.
         self.load_lm_head_from_target = False
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            if config.draft_vocab_size is None:
-                self.load_lm_head_from_target = True
-                config.draft_vocab_size = config.vocab_size
+        draft_vocab_size = getattr(config, "draft_vocab_size", None)
+        if draft_vocab_size is not None:
             self.lm_head = ParallelLMHead(
-                config.draft_vocab_size,
+                draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+            draft_logits_vocab_size = draft_vocab_size
+        elif self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+            draft_logits_vocab_size = config.vocab_size
+        else:
+            self.load_lm_head_from_target = True
+            config.draft_vocab_size = config.vocab_size
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+            draft_logits_vocab_size = config.vocab_size
 
         config_ = copy.deepcopy(config)
-        config_.vocab_size = (
-            config_.draft_vocab_size
-        )  # draft logits processor has it's own vocab size
+        # draft logits processor has its own vocab size
+        config_.vocab_size = draft_logits_vocab_size
         self.logits_processor = LogitsProcessor(config_)
 
         self.capture_aux_hidden_states = True
