@@ -1330,6 +1330,14 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _on_prefetch_dequeue(self, operation: PrefetchOperation) -> None:
+        """Prepare an op after dequeue on the prefetch storage thread.
+
+        The default controller does no extra preparation. Subclasses can use
+        this hook to initialize backreferences or observability state while
+        keeping the work out of the scheduler thread.
+        """
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1339,6 +1347,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self._on_prefetch_dequeue(operation)
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0

@@ -1393,13 +1393,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # op's caller/trace ids correlate spans to their root.
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             session_id = (
-                (extra_info.extra_info or {}).get("session_id")
-                if extra_info
-                else None
+                (extra_info.extra_info or {}).get("session_id") if extra_info else None
             )
-            return self._batch_io_v2(
-                transfers, is_set=True, session_id=session_id
-            )
+            return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (

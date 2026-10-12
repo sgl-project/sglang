@@ -253,6 +253,58 @@ class PrefetchSubmission:
     decision: Optional[bool] = None
 
 
+def _init_op_trace(operation: Any, rid: Any, role: str) -> None:
+    """Create the hybrid-controller root span for one storage operation."""
+    if getattr(operation, "trace_ctx", None) is not None:
+        return
+
+    trace_ctx = TraceReqContext(rid=str(rid), role=role, module_name="hicache")
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
+    if trace_ctx.tracing_enable:
+        trace_ctx.trace_req_start()
+        span_context = trace_ctx.thread_context.thread_span.get_span_context()
+        trace_id = format(span_context.trace_id, "032x")
+        span_id = format(span_context.span_id, "016x")
+    else:
+        trace_ctx = TraceNullContext()
+        if role == "Backup":
+            # Backups have no request id; give each op a distinct trace so
+            # Mooncake does not derive one constant id per backup thread.
+            trace_id = _synth_backup_trace_id(rid)
+            span_id = _synth_backup_span_id(rid)
+
+    operation.trace_ctx = trace_ctx
+    operation.trace_id = trace_id
+    operation.span_id = span_id
+
+
+def _finish_op_trace(operation: Any) -> None:
+    """Finish a storage op's root span; safe to call from retirement paths."""
+    trace_ctx = getattr(operation, "trace_ctx", None)
+    if trace_ctx is not None:
+        trace_ctx.trace_req_finish()
+
+
+def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dict:
+    """Build the per-RPC metadata forwarded to Mooncake."""
+    extra_info: dict = {}
+    caller = get_thread_caller_info()
+    if caller is not None:
+        extra_info["caller_id"], extra_info["caller_role"] = caller
+    if include_request_id:
+        request_id = getattr(operation, "request_id", None)
+        if request_id:
+            extra_info["request_id"] = request_id
+    trace_id = getattr(operation, "trace_id", None)
+    if trace_id:
+        extra_info["trace_id"] = trace_id
+    span_id = getattr(operation, "span_id", None)
+    if span_id:
+        extra_info["span_id"] = span_id
+    return extra_info
+
+
 class HybridCacheController(BaseHiCacheController):
     is_kv_sharded: bool = False
 
@@ -266,56 +318,16 @@ class HybridCacheController(BaseHiCacheController):
             getattr(storage_config, "pp_rank", None),
         )
 
-    def _init_op_trace(self, operation: Any, rid: Any, role: str) -> None:
-        """Create the hybrid-controller root span for one storage operation."""
-        if getattr(operation, "trace_ctx", None) is not None:
-            return
-
-        trace_ctx = TraceReqContext(rid=str(rid), role=role, module_name="hicache")
-        trace_id: Optional[str] = None
-        span_id: Optional[str] = None
-        if trace_ctx.tracing_enable:
-            trace_ctx.trace_req_start()
-            span_context = trace_ctx.thread_context.thread_span.get_span_context()
-            trace_id = format(span_context.trace_id, "032x")
-            span_id = format(span_context.span_id, "016x")
-        else:
-            trace_ctx = TraceNullContext()
-            if role == "Backup":
-                # Backups have no request id; give each op a distinct trace so
-                # Mooncake does not derive one constant id per backup thread.
-                trace_id = _synth_backup_trace_id(rid)
-                span_id = _synth_backup_span_id(rid)
-
-        operation.trace_ctx = trace_ctx
-        operation.trace_id = trace_id
-        operation.span_id = span_id
+    def _on_prefetch_dequeue(self, operation: PrefetchOperation) -> None:
+        """Prepare a prefetch op on the storage thread before its hit query."""
+        _init_op_trace(operation, rid=operation.request_id, role="Prefetch")
 
     @staticmethod
     def _finish_op_trace(operation: Any) -> None:
-        """Finish a storage op's root span; safe to call from retirement paths."""
-        trace_ctx = getattr(operation, "trace_ctx", None)
-        if trace_ctx is not None:
-            trace_ctx.trace_req_finish()
-
-    @staticmethod
-    def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dict:
-        """Build the per-RPC metadata forwarded to Mooncake."""
-        extra_info: dict = {}
-        caller = get_thread_caller_info()
-        if caller is not None:
-            extra_info["caller_id"], extra_info["caller_role"] = caller
-        if include_request_id:
-            request_id = getattr(operation, "request_id", None)
-            if request_id:
-                extra_info["request_id"] = request_id
-        trace_id = getattr(operation, "trace_id", None)
-        if trace_id:
-            extra_info["trace_id"] = trace_id
-        span_id = getattr(operation, "span_id", None)
-        if span_id:
-            extra_info["span_id"] = span_id
-        return extra_info
+        """Finish a storage op for retirement paths using controller methods."""
+        # Name lookup in a method body does not include the class namespace, so
+        # this calls the module-level helper with the same name.
+        _finish_op_trace(operation)
 
     def __init__(
         self,
@@ -1538,9 +1550,6 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        HybridCacheController._init_op_trace(
-            self, operation, rid=operation.request_id, role="Prefetch"
-        )
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -1559,10 +1568,7 @@ class HybridCacheController(BaseHiCacheController):
         # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info=HybridCacheController._storage_trace_extra(
-                operation, include_request_id=True
-            )
-            or None,
+            extra_info=_storage_trace_extra(operation, include_request_id=True) or None,
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1638,7 +1644,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_hit_count = int(reduced[0])
         if storage_hit_count == 0:
             # A miss is never sent to the transfer worker, so finish its span here.
-            HybridCacheController._finish_op_trace(operation)
+            _finish_op_trace(operation)
         operation.query_pool_hit_pages = {
             pool: pages
             for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
@@ -1738,12 +1744,12 @@ class HybridCacheController(BaseHiCacheController):
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
         # PP ticket workers can enter transfer without a local hit query, so
         # initialize here too; _init_op_trace is idempotent.
-        self._init_op_trace(operation, rid=operation.request_id, role="Prefetch")
+        _init_op_trace(operation, rid=operation.request_id, role="Prefetch")
         try:
             with self.mem_pool_host.layout_lease():
                 return self._page_transfer_with_stable_layout(operation)
         finally:
-            self._finish_op_trace(operation)
+            _finish_op_trace(operation)
 
     def _page_transfer_kv_batch(
         self,
@@ -1754,7 +1760,7 @@ class HybridCacheController(BaseHiCacheController):
         kv_derived_transfers: List[PoolTransfer],
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
-        trace_extra = self._storage_trace_extra(operation, include_request_id=True)
+        trace_extra = _storage_trace_extra(operation, include_request_id=True)
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=extra_info.prefix_keys,
             extra_info=trace_extra or None,
@@ -1808,9 +1814,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation.prefix_keys,
                     sidecar_hashes,
                     transfers_nonkv,
-                    extra_info=self._storage_trace_extra(
-                        operation, include_request_id=True
-                    )
+                    extra_info=_storage_trace_extra(operation, include_request_id=True)
                     or None,
                 ):
                     results.update(
@@ -1865,7 +1869,7 @@ class HybridCacheController(BaseHiCacheController):
             batch_host_indices = operation.host_indices[
                 start * self.page_size : (start + len(batch_hashes)) * self.page_size
             ]
-            trace_extra = self._storage_trace_extra(operation, include_request_id=False)
+            trace_extra = _storage_trace_extra(operation, include_request_id=False)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
                 extra_info=trace_extra or None,
@@ -1897,7 +1901,7 @@ class HybridCacheController(BaseHiCacheController):
         # base _page_backup.
         needs_backup = bool(backup_transfers) or not self.backup_skip
         if needs_backup:
-            self._init_op_trace(operation, rid=operation.id, role="Backup")
+            _init_op_trace(operation, rid=operation.id, role="Backup")
 
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
@@ -1909,9 +1913,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation.prefix_keys,
                 operation.hash_value,
                 backup_transfers,
-                extra_info=self._storage_trace_extra(
-                    operation, include_request_id=False
-                )
+                extra_info=_storage_trace_extra(operation, include_request_id=False)
                 or None,
             ):
                 results.update(
@@ -1944,7 +1946,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         if needs_backup:
-            self._finish_op_trace(operation)
+            _finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
