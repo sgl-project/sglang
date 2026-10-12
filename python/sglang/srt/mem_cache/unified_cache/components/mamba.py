@@ -679,6 +679,9 @@ class MambaComponent(TreeComponent):
             if not mamba_value_inserted:
                 pool.free_mamba_cache(req)
         else:
+            if insert_params.mamba_value is None and self.int8_ckpt_pool is None:
+                # No slot was donated, so the request still owns a usable checkpoint.
+                return
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
