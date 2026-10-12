@@ -260,3 +260,58 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
+
+
+_SPAWN_HOST = """
+import multiprocessing
+import os
+import sys
+from types import SimpleNamespace
+
+# ComfyUI's main.py fails like this when a spawned child re-imports it.
+if __name__ != "__main__":
+    raise SystemExit("host entry script re-ran in the worker")
+
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+
+def start_worker(**_kwargs):
+    proc = multiprocessing.get_context("spawn").Process(target=os.getpid)
+    proc.start()
+    proc.join(120)
+    return SimpleNamespace(exitcode=proc.exitcode)
+
+
+generator.DiffGenerator.from_pretrained = start_worker
+if sys.argv[1] == "init_generator":
+    worker = generator.SGLDiffusionGenerator().init_generator("m", "FluxPipeline")
+else:
+    worker = start_worker()
+print("EXITCODE", worker.exitcode)
+"""
+
+
+def test_worker_spawn_does_not_rerun_host_entry_script(tmp_path) -> None:
+    """Spawned SGLD workers re-ran the host's __main__ file; under ComfyUI that
+    is main.py, which dies on import in the child, so every model failed to load."""
+    import os
+    import subprocess
+    import sys
+
+    host = tmp_path / "host.py"
+    host.write_text(_SPAWN_HOST)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+
+    def worker_exitcode(mode):
+        out = subprocess.run(
+            [sys.executable, str(host), mode],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        return int(out.stdout.split("EXITCODE")[-1])
+
+    assert worker_exitcode("plain_spawn") != 0
+    assert worker_exitcode("init_generator") == 0

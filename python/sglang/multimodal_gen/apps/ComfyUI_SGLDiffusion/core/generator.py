@@ -3,8 +3,10 @@ Generator for SGLang Diffusion ComfyUI integration.
 """
 
 import atexit
+import contextlib
 import logging
 import os
+import sys
 
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
@@ -12,6 +14,22 @@ from ..executors.zimage import ZImageExecutor
 from .preflight import check_sgld_options
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _spawn_without_host_main():
+    # Spawned workers re-import __main__ from its file; under ComfyUI that is
+    # main.py, which fails in the child because comfy/ is first on sys.path.
+    main = sys.modules["__main__"]
+    saved_file = main.__dict__.pop("__file__", None)
+    saved_spec = main.__spec__
+    main.__spec__ = None
+    try:
+        yield
+    finally:
+        main.__spec__ = saved_spec
+        if saved_file is not None:
+            main.__file__ = saved_file
 
 
 class _HeaderTensor:
@@ -212,11 +230,12 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("cfg_parallel_degree", 1)
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            self.generator = DiffGenerator.from_pretrained(
-                model_path=model_path,
-                pipeline_class_name=pipeline_class_name,
-                **kwargs,
-            )
+            with _spawn_without_host_main():
+                self.generator = DiffGenerator.from_pretrained(
+                    model_path=model_path,
+                    pipeline_class_name=pipeline_class_name,
+                    **kwargs,
+                )
         except EOFError as error:
             # A worker that raises while loading closes its pipe without a message.
             raise RuntimeError(
