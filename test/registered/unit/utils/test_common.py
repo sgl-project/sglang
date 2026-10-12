@@ -1,5 +1,9 @@
+import contextlib
+import importlib
 import io
+import os
 import sys
+import tempfile
 import unittest
 from array import array
 from unittest import mock
@@ -7,9 +11,12 @@ from unittest import mock
 import torch
 from PIL import Image
 
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils.common import (
+    _flashinfer_has_fused_dcp_reduce,
     _get_device_sm_via_nvml,
     _load_image,
+    fi_a2a_platform_blocker,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
@@ -249,6 +256,77 @@ class TestGetDeviceSmViaNvml(CustomTestCase):
         ):
             self.assertIsNone(_get_device_sm_via_nvml())
         self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestFiA2aPlatformBlocker(CustomTestCase):
+    @contextlib.contextmanager
+    def _flashinfer_package(self, *, with_fused_op: bool):
+        """Install a flashinfer package that fails when imported."""
+        with tempfile.TemporaryDirectory() as root:
+            package = os.path.join(root, "flashinfer")
+            os.makedirs(os.path.join(package, "comm"))
+            with open(os.path.join(package, "__init__.py"), "w") as f:
+                f.write("raise ImportError('flashinfer was imported')\n")
+            if with_fused_op:
+                open(os.path.join(package, "comm", "dcp_lse_reduce.py"), "w").close()
+            with (
+                mock.patch.dict(sys.modules),
+                mock.patch.object(sys, "path", [root, *sys.path]),
+            ):
+                for name in [n for n in sys.modules if n.split(".")[0] == "flashinfer"]:
+                    del sys.modules[name]
+                importlib.invalidate_caches()
+                _flashinfer_has_fused_dcp_reduce.cache_clear()
+                try:
+                    yield
+                finally:
+                    _flashinfer_has_fused_dcp_reduce.cache_clear()
+
+    @override_platform(is_sm100=True)
+    def test_finds_the_fused_op_without_importing_flashinfer(self):
+        """The blocker runs while the launcher resolves arguments, so it must
+        find FlashInfer's fused op on disk without importing flashinfer."""
+        for with_fused_op in (True, False):
+            with (
+                self.subTest(with_fused_op=with_fused_op),
+                self._flashinfer_package(with_fused_op=with_fused_op),
+            ):
+                reason = fi_a2a_platform_blocker(
+                    dcp_size=8, tp_size=8, pp_size=1, nnodes=1
+                )
+                self.assertNotIn("flashinfer", sys.modules)
+                if with_fused_op:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIn("decode_cp_a2a_lse_reduce", reason)
+
+    @override_platform(is_sm100=True)
+    def test_dcp_group_must_share_one_nvlink_domain(self):
+        # (MNNVL fabric, dcp_size, tp_size, pp_size, nnodes, blocked)
+        cases = (
+            (False, 8, 16, 1, 2, False),
+            (False, 16, 16, 1, 2, True),
+            (False, 8, 8, 2, 2, False),
+            (True, 16, 16, 1, 2, False),
+        )
+        for fabric, dcp_size, tp_size, pp_size, nnodes, blocked in cases:
+            with (
+                self.subTest(
+                    fabric=fabric, dcp_size=dcp_size, pp_size=pp_size, nnodes=nnodes
+                ),
+                mock.patch(
+                    "sglang.srt.utils.common.is_mnnvl_fabric_device",
+                    return_value=fabric,
+                ),
+                mock.patch(
+                    "sglang.srt.utils.common._flashinfer_has_fused_dcp_reduce",
+                    return_value=True,
+                ),
+            ):
+                reason = fi_a2a_platform_blocker(
+                    dcp_size=dcp_size, tp_size=tp_size, pp_size=pp_size, nnodes=nnodes
+                )
+                self.assertEqual(reason is not None, blocked, reason)
 
 
 if __name__ == "__main__":

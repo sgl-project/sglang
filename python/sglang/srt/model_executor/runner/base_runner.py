@@ -67,6 +67,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# fi_a2a workspace capacity in tokens when no decode CUDA graph batch sizes are
+# configured; arbitrary, since wider eager batches are reduced in chunks of this size.
+_FI_A2A_EAGER_ONLY_MAX_TOKENS = 256
+
 
 def _allocate_decode_buffers(
     *,
@@ -322,19 +326,28 @@ class BaseRunner(ABC):
         )
 
     def _pre_initialize_fi_a2a_workspace(self):
-        """Allocate the FlashInfer MNNVL all-to-all workspace for the fi_a2a DCP
-        comm backend; must run before CG capture (it syncs the stream + barriers
-        cross-rank, uncapturable) and raises early on non-MNNVL platforms.
+        """Create the fused fi_a2a DCP reduce workspaces; must run before CG
+        capture, since creation is collective and synchronizes the stream.
         """
-        if (
-            not get_parallel().dcp_enabled
-            or get_parallel().dcp_comm_backend != "fi_a2a"
-        ):
+        parallel = get_parallel()
+        if not parallel.dcp_enabled or parallel.dcp_comm_backend != "fi_a2a":
             return
 
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_or_create_global_graph_capture_stream,
+        )
 
-        init_fi_a2a_workspace(get_parallel().dcp_group)
+        mr = self.model_runner
+        init_fi_a2a_workspace(
+            cp_group=parallel.dcp_group,
+            # Batches wider than the captured graphs run as several fused calls.
+            max_tokens=self._widest_decode_rows() or _FI_A2A_EAGER_ONLY_MAX_TOKENS,
+            local_heads=mr.model_config.num_attention_heads // parallel.attn_tp_size,
+            head_dim=mr.model_config.kv_lora_rank,
+            dtype=mr.dtype,
+            capture_stream=get_or_create_global_graph_capture_stream(),
+        )
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.
