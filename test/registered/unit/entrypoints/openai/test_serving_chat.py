@@ -554,6 +554,47 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertIn(media_type, error["message"])
         self.tm.generate_request.assert_not_called()
 
+    def test_input_ids_keep_the_images_of_a_multimodal_request(self):
+        """A pre-tokenized client (miles TITO session server) sends the prompt
+        as input_ids with one placeholder per image and the images in the
+        messages; the images must reach the multimodal processor."""
+        url = "data:image/png;base64,iVBORw0KGgo="
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe"},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }
+            ],
+            input_ids=[101, 102, 151655, 103],
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=True)
+        self.assertEqual(processed.prompt_ids, [101, 102, 151655, 103])
+        self.assertEqual(processed.prompt, "")
+        self.assertEqual([image.url for image in processed.image_data], [url])
+        self.assertIsNone(processed.video_data)
+        self.assertIsNone(processed.audio_data)
+
+        self.tm.model_config.is_multimodal = True
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            adapted, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        self.assertEqual(adapted.input_ids, [101, 102, 151655, 103])
+        self.assertEqual([image.url for image in adapted.image_data], [url])
+        conv_mock.assert_not_called()
+
+        # A text-only model keeps the old shape: no media is collected.
+        text_only = self.chat._process_messages(req, is_multimodal=False)
+        self.assertIsNone(text_only.image_data)
+
     def test_media_validation_does_not_reject_supported_content(self):
         text_request = ChatCompletionRequest(
             model="x",
