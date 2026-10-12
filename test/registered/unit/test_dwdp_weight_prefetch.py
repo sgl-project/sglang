@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_experts
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.utils import get_device, get_device_module, is_cuda, is_xpu
+from sglang.srt.utils.vmm_backend import get_vmm_backend
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kernels.utils import (
     gloo_group,
@@ -80,6 +81,16 @@ def _reference_weight(layer_idx: int, name: str, device: torch.device) -> torch.
     return full.to(dtype=_DTYPE).to(device)
 
 
+def _local_params(
+    references: Dict[WeightKey, torch.Tensor], layout: DwdpExpertLayout
+) -> Dict[WeightKey, torch.Tensor]:
+    # the transport frees these, so hand it copies of the reference rows
+    return {
+        key: reference[layout.local_expert_start : layout.local_expert_end].clone()
+        for key, reference in references.items()
+    }
+
+
 class _DwdpFixture:
     """The transport/buffer/manager stack one rank would build during setup()."""
 
@@ -103,11 +114,7 @@ class _DwdpFixture:
             for layer_idx in range(_NUM_LAYERS)
             for name in _WEIGHT_NAMES
         }
-        # the transport frees these, so hand it copies of the reference rows
-        local_params = {
-            key: reference[local_start:local_end].clone()
-            for key, reference in self.references.items()
-        }
+        local_params = _local_params(self.references, self.layout)
         specs = build_layer_weight_specs(local_params, _NUM_EXPERTS)
 
         transport = DWDPTransport.create(
@@ -201,6 +208,80 @@ def test_prefetch_reconstructs_every_expert(dwdp: _DwdpFixture) -> None:
             f"rank {dwdp.rank} layer {layer_idx} {name}: experts "
             f"{mismatched.nonzero().flatten().tolist()} differ"
         )
+
+
+def _fd_is_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    else:
+        return True
+
+
+def test_failed_peer_import_closes_every_fd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A peer import that fails partway must not leak the fds the exchange handed
+    over: every received fd, and the exported ones the backend leaves to the
+    caller, are closed when DWDPTransport.create raises."""
+    if dist.get_world_size() < 2:
+        pytest.skip("needs at least 2 ranks")
+    group = gloo_group()
+    device_id = local_device_id()
+    device = torch.device(get_device(), device_id)
+    layout = DwdpExpertLayout(
+        num_routed_experts=_NUM_EXPERTS,
+        dwdp_size=dist.get_world_size(),
+        dwdp_rank=dist.get_rank(),
+    )
+    references = {
+        (layer_idx, name): _reference_weight(layer_idx, name, device)
+        for layer_idx in range(_NUM_LAYERS)
+        for name in _WEIGHT_NAMES
+    }
+    local_params = _local_params(references, layout)
+
+    backend = get_vmm_backend(device_id)
+    export_handles = backend.export_handles
+    exported_fds: List[int] = []
+    received_fds: List[Optional[int]] = []
+
+    def recording_export(
+        handles: List[int], cpu_group: dist.ProcessGroup, rank: int
+    ) -> Tuple[List[bytes], List[int], bool]:
+        fabric_handles, posix_fds, use_fabric = export_handles(handles, cpu_group, rank)
+        exported_fds.extend(posix_fds)
+        return fabric_handles, posix_fds, use_fabric
+
+    def failing_import(
+        fabric_handle: Optional[bytes],
+        fd: Optional[int],
+        *,
+        use_fabric: bool,
+        peer_rank: int,
+        size: int,
+    ) -> int:
+        received_fds.append(fd)
+        raise RuntimeError("injected peer import failure")
+
+    monkeypatch.setattr(backend, "export_handles", recording_export)
+    monkeypatch.setattr(backend, "import_handle", failing_import)
+    with pytest.raises(RuntimeError, match="injected peer import failure"):
+        DWDPTransport.create(
+            layer_weight_specs=build_layer_weight_specs(local_params, _NUM_EXPERTS),
+            local_params=local_params,
+            group=SimpleNamespace(cpu_group=group, device_group=group),
+            layout=layout,
+            device_id=device_id,
+        )
+    if any(fd is None for fd in received_fds):
+        pytest.skip("FABRIC handles carry no fds")
+    else:
+        pass
+    caller_owned = exported_fds if backend.owns_exported_fds() else []
+    still_open = [fd for fd in received_fds + caller_owned if _fd_is_open(fd)]
+    dist.barrier(group=group)
+    assert received_fds, "the injected failure never reached a peer import"
+    assert not still_open, f"rank {dist.get_rank()} leaked fds {still_open}"
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ raises at import on a host with no CUDA (issue #31995).
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from functools import cache
 from typing import List, Optional, Tuple
 
@@ -19,19 +20,18 @@ from sglang.srt.utils.common import is_xpu
 from sglang.srt.utils.vmm_common import Reservation
 
 
-class VmmBackend:
+class VmmBackend(ABC):
     """VMM + handle-IPC operations bound to one device.
 
     ``granularity`` is the page every reservation, offset and mapping size aligns
-    to. Read it: CUDA reports it per device, Level Zero per allocation size.
+    to; on Level Zero it is the coarsest page the driver reports.
     """
 
     def __init__(self, device_id: int) -> None:
         self.device_id = int(device_id)
         self.granularity = self._impl_granularity()
 
-    # ===== Reservations and physical memory =====
-
+    @abstractmethod
     def make_reservation(
         self, size: int, *, exportable: bool, alignment: int = 0
     ) -> Reservation:
@@ -39,10 +39,12 @@ class VmmBackend:
         memory created through ``reservation.map`` can be shared with peers."""
         raise NotImplementedError
 
+    @abstractmethod
     def release_handle(self, handle: int) -> None:
         """Release one physical-memory handle. All its mappings must be gone."""
         raise NotImplementedError
 
+    @abstractmethod
     def tensor_from_pointer(
         self,
         pointer: int,
@@ -68,8 +70,7 @@ class VmmBackend:
         )
         destination.copy_(source)
 
-    # ===== Handle exchange =====
-
+    @abstractmethod
     def export_handles(
         self, handles: List[int], group: ProcessGroup, rank: int
     ) -> Tuple[List[bytes], List[int], bool]:
@@ -77,6 +78,7 @@ class VmmBackend:
         one of the two lists is populated."""
         raise NotImplementedError
 
+    @abstractmethod
     def import_handle(
         self,
         fabric_handle: Optional[bytes],
@@ -93,6 +95,7 @@ class VmmBackend:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def owns_exported_fds(self) -> bool:
         """Whether the caller must close the fds from ``export_handles``.
 
@@ -101,6 +104,7 @@ class VmmBackend:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def supports_aliased_mappings(self) -> bool:
         """Whether one physical object may sit in two live VA ranges at once.
 
@@ -109,8 +113,6 @@ class VmmBackend:
         """
         raise NotImplementedError
 
-    # ===== Device control =====
-
     def synchronize(self) -> None:
         torch.get_device_module(self.torch_device).synchronize(self.device_id)
 
@@ -118,9 +120,11 @@ class VmmBackend:
         torch.get_device_module(self.torch_device).empty_cache()
 
     @property
+    @abstractmethod
     def torch_device(self) -> torch.device:
         raise NotImplementedError
 
+    @abstractmethod
     def _impl_granularity(self) -> int:
         raise NotImplementedError
 

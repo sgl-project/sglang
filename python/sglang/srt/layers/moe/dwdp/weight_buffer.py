@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.dwdp.layout import (
     lookup_owner,
 )
 from sglang.srt.layers.moe.dwdp.page_pool import (
+    DEFAULT_PAGE_SIZE_MULTIPLIER,
     PagePool,
     PoolBinding,
     compute_slot_sizes,
@@ -25,6 +26,14 @@ from sglang.srt.utils.vmm_backend import get_vmm_backend
 from sglang.srt.utils.vmm_common import Reservation
 
 logger = logging.getLogger(__name__)
+
+# Layer L's compute triggers the prefetch of layer L + PREFETCH_DEPTH.
+PREFETCH_DEPTH = 2
+# A backend that remaps pool pages needs one slot more than the prefetch depth, so
+# the slot it takes back belongs to a layer whose compute was launched a layer
+# earlier and the host-side remap overlaps compute instead of stalling the launch.
+ALIASED_NUM_SLOTS = PREFETCH_DEPTH
+REMAPPED_NUM_SLOTS = PREFETCH_DEPTH + 1
 
 
 class WeightBuffer:
@@ -45,14 +54,13 @@ class WeightBuffer:
         self._device_id = device_id
         self._backend = get_vmm_backend(device_id)
         self._granularity = self._backend.granularity
-        self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
+        self._pool_page_size = DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
         self._rebinds_pool_pages = not self._backend.supports_aliased_mappings()
-        # Prefetch runs two layers ahead. A remapping backend gets a third slot so
-        # the slot it evicts belongs to a layer the device already finished, and
-        # the host-side remap overlaps compute instead of stalling the launch path.
-        self._num_slots = 3 if self._rebinds_pool_pages else 2
+        self._num_slots = (
+            REMAPPED_NUM_SLOTS if self._rebinds_pool_pages else ALIASED_NUM_SLOTS
+        )
         self._layer_slots = {
             li: pos % self._num_slots for pos, li in enumerate(self._moe_layer_indices)
         }
@@ -64,6 +72,8 @@ class WeightBuffer:
         self._reservations: Dict[int, List[Reservation]] = {}
         self._pool_bindings: Dict[int, List[PoolBinding]] = {}
         self._bound_layers: Set[int] = set()
+        # remapping backends only: the layer whose pool pages a slot currently holds
+        self._slot_owners: Dict[int, int] = {}
         self._released = False
 
     @classmethod
@@ -96,9 +106,7 @@ class WeightBuffer:
         slot_sizes = compute_slot_sizes(
             buf._layouts, assignments, num_slots=buf._num_slots
         )
-        buf._page_pool = PagePool.create(
-            slot_sizes, device_id, page_size=buf._pool_page_size
-        )
+        buf._page_pool = PagePool(slot_sizes, device_id, buf._pool_page_size)
 
         for li in buf._moe_layer_indices:
             buf._setup_layer(li)
@@ -193,20 +201,19 @@ class WeightBuffer:
             return
         if self._rebinds_pool_pages:
             slot = self.buffer_index_for_layer(layer_idx)
-            for other in [
-                li
-                for li in self._bound_layers
-                if self.buffer_index_for_layer(li) == slot
-            ]:
-                self._unbind_pool_pages(other)
+            owner = self._slot_owners.get(slot)
+            if owner is not None:
+                for binding in self._pool_bindings[owner]:
+                    self._page_pool.unmap_binding(binding)
+                self._bound_layers.discard(owner)
+            self._slot_owners[slot] = layer_idx
         for binding in self._pool_bindings[layer_idx]:
             self._page_pool.map_binding(binding)
         self._bound_layers.add(layer_idx)
 
-    def _unbind_pool_pages(self, layer_idx: int) -> None:
-        for binding in self._pool_bindings[layer_idx]:
-            self._page_pool.unmap_binding(binding)
-        self._bound_layers.discard(layer_idx)
+    def is_bound(self, layer_idx: int) -> bool:
+        """Whether this layer's pool pages are mapped into its composite VA."""
+        return layer_idx in self._bound_layers
 
     @property
     def num_slots(self) -> int:
@@ -272,6 +279,7 @@ class WeightBuffer:
         self._reservations.clear()
         self._pool_bindings.clear()
         self._bound_layers.clear()
+        self._slot_owners.clear()
         self._tensors.clear()
         self._remote_slices.clear()
         if self._page_pool is not None:
@@ -326,4 +334,5 @@ def fill_edge_experts(
             # wait for the copies above
             weight_buffer.synchronize()
 
-    weight_buffer.synchronize()
+    if not weight_buffer.rebinds_pool_pages:
+        weight_buffer.synchronize()

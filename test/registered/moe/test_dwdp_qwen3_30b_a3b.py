@@ -34,12 +34,16 @@ DWDP_SIZE = 4
 # weights come off disk uncached in CI, and DWDP copies each local shard into
 # driver-owned physical memory afterwards
 LAUNCH_TIMEOUT = 1800
+# bf16 experts make one buffer slot about 1 GB per card at 4 ranks, and a backend
+# that remaps pool pages keeps three slots, which the shared 0.85 leaves no KV room for
+MEM_FRACTION_STATIC = "0.88"
+GENERATE_TIMEOUT_S = 600
 
 SERVER_ARGS = [
     "--dwdp-size",
     str(DWDP_SIZE),
     "--mem-fraction-static",
-    "0.85",
+    MEM_FRACTION_STATIC,
     "--max-total-tokens",
     "8192",
     "--context-length",
@@ -80,7 +84,7 @@ class TestDwdpQwen3_30BA3B(CustomTestCase):
                     "max_new_tokens": max_new_tokens,
                 },
             },
-            timeout=600,
+            timeout=GENERATE_TIMEOUT_S,
         )
         response.raise_for_status()
         return response.json()["text"]
@@ -96,8 +100,11 @@ class TestDwdpQwen3_30BA3B(CustomTestCase):
         layers, so each buffer slot is handed back and forth between two layers
         many times. Rebinding a slot too early tore down the pages under a live
         read and killed the rank."""
-        text = self._generate(_LONG_PROMPT, 16)
-        self.assertGreater(len(text.strip()), 0, "empty reply after chunked prefill")
+        text = self._generate(_LONG_PROMPT, 16).lower()
+        self.assertTrue(
+            "fox" in text or "dog" in text,
+            f"reply does not summarize the prompt: {text!r}",
+        )
 
 
 if __name__ == "__main__":

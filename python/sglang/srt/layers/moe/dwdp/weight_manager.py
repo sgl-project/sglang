@@ -1,5 +1,5 @@
 # Adapted from NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM)
-"""Double-buffered async prefetch of peer expert weights into the composite VA."""
+"""Slot-rotated async prefetch of peer expert weights into the composite VA."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PeerRanges, lookup_owner
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
-from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
+from sglang.srt.layers.moe.dwdp.weight_buffer import PREFETCH_DEPTH, WeightBuffer
 from sglang.srt.utils.common import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,9 @@ class DWDPWeightManager:
         self._peer_ranges = peer_ranges
         self._moe_layer_indices = sorted(moe_layer_indices)
         self._moe_layer_set = set(self._moe_layer_indices)
+        self._layer_positions = {
+            li: pos for pos, li in enumerate(self._moe_layer_indices)
+        }
         self._weight_names = list(weight_names)
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
@@ -46,6 +49,7 @@ class DWDPWeightManager:
 
         event_type = self._device_module.Event
         num_slots = weight_buffer.num_slots
+        assert num_slots >= PREFETCH_DEPTH, (num_slots, PREFETCH_DEPTH)
         self._prefetch_events = [event_type() for _ in range(num_slots)]
         self._consume_events = [event_type() for _ in range(num_slots)]
 
@@ -78,7 +82,9 @@ class DWDPWeightManager:
     def prefetch_layer(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
 
-        if self._weight_buffer.rebinds_pool_pages:
+        if self._weight_buffer.rebinds_pool_pages and not self._weight_buffer.is_bound(
+            layer_idx
+        ):
             # Unmapping is a host call that does not wait, so the copy DMA writing
             # these pages and the compute reading them must both have finished.
             self._prefetch_events[buf_idx].synchronize()
@@ -125,22 +131,19 @@ class DWDPWeightManager:
 
         self._consume_events[buf_idx].record(compute_stream)
 
-        # prefetch the layer 2 ahead; with 2 slots it reuses this layer's slot,
-        # with 3 the slot of the layer before, so the host wait does not block
-        next_layer = self.next_moe_layer(layer_idx)
-        if next_layer is not None:
-            next_next = self.next_moe_layer(next_layer)
-            if next_next is not None:
-                self.prefetch_layer(next_next)
+        ahead = self._layer_positions[layer_idx] + PREFETCH_DEPTH
+        if ahead < len(self._moe_layer_indices):
+            self.prefetch_layer(self._moe_layer_indices[ahead])
 
     def prefetch_first_layers(self) -> None:
-        if len(self._moe_layer_indices) >= 1:
-            self.prefetch_layer(self._moe_layer_indices[0])
-        if len(self._moe_layer_indices) >= 2:
-            self.prefetch_layer(self._moe_layer_indices[1])
+        for layer_idx in self._moe_layer_indices[:PREFETCH_DEPTH]:
+            self.prefetch_layer(layer_idx)
 
     def release(self) -> None:
         if self._weight_buffer is not None:
+            # copies may still be writing the pages that are about to be unmapped
+            self._copy_stream.synchronize()
+            self._weight_buffer.synchronize()
             self._weight_buffer.release()
             self._weight_buffer = None
         if self._transport is not None:

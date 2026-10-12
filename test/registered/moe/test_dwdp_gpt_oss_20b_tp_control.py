@@ -12,13 +12,16 @@ from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.dwdp_test_utils import (
     GPT_OSS_20B_GSM8K_FLOOR,
+    GSM8K_NUM_EXAMPLES,
+    GSM8K_NUM_THREADS,
+    MEM_FRACTION_STATIC,
     assert_gsm8k_accuracy,
     launch_dwdp_server,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 register_xpu_ci(est_time=600, suite="nightly-xpu-2-gpu", nightly=True)
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-h100")
 
 MODEL = "openai/gpt-oss-20b"
 TP_SIZE = 2
@@ -33,7 +36,7 @@ class TestDwdpGptOss20BTpControl(CustomTestCase):
         cls.process = launch_dwdp_server(
             MODEL,
             cls.base_url,
-            extra_args=["--mem-fraction-static", "0.85"],
+            extra_args=["--mem-fraction-static", MEM_FRACTION_STATIC],
             timeout=LAUNCH_TIMEOUT,
             tp_size=TP_SIZE,
         )
@@ -43,16 +46,13 @@ class TestDwdpGptOss20BTpControl(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        # 8 threads: the XPU default is single-stream because intel_xpu attention
-        # wedged the driver on concurrent prefill, and 8 measured clean here
-        # across four full gpt-oss-20b runs at TP=2.
         assert_gsm8k_accuracy(
             self,
             model=MODEL,
             base_url=self.base_url,
             accuracy=GPT_OSS_20B_GSM8K_FLOOR,
-            num_examples=100,
-            num_threads=8,
+            num_examples=GSM8K_NUM_EXAMPLES,
+            num_threads=GSM8K_NUM_THREADS,
         )
 
 

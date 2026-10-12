@@ -16,8 +16,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-# must stay in step with the "<QQQ" header send_fd packs
-_FD_HEADER_BYTES = 24
+# (src_rank, base_idx, fd_count) sent in front of every SCM_RIGHTS fd
+_FD_HEADER = struct.Struct("<QQQ")
 FD_SEND_TIMEOUT_S = 120.0
 
 
@@ -57,8 +57,9 @@ def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
 
 
 def send_fd(sock: socket.socket, fd: int, src_rank: int, base_idx: int) -> None:
+    """Send one fd as an SCM_RIGHTS message behind a (src_rank, base_idx) header."""
     fds = array.array("i", [int(fd)])
-    header = struct.pack("<QQQ", int(src_rank), int(base_idx), 1)
+    header = _FD_HEADER.pack(int(src_rank), int(base_idx), 1)
     sent = sock.sendmsg(
         [header],
         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds.tobytes())],
@@ -68,17 +69,16 @@ def send_fd(sock: socket.socket, fd: int, src_rank: int, base_idx: int) -> None:
 
 
 def recv_fd(sock: socket.socket) -> Optional[Tuple[int, int, int]]:
+    """Receive one send_fd message as (src_rank, base_idx, fd); None at end of stream."""
     fd_item_size = array.array("i").itemsize
-    data, ancdata, _, _ = sock.recvmsg(
-        _FD_HEADER_BYTES, socket.CMSG_SPACE(fd_item_size)
-    )
+    data, ancdata, _, _ = sock.recvmsg(_FD_HEADER.size, socket.CMSG_SPACE(fd_item_size))
     if not data:
         return None
-    if len(data) != _FD_HEADER_BYTES:
+    if len(data) != _FD_HEADER.size:
         raise RuntimeError(
-            f"received truncated fd header: {len(data)} < {_FD_HEADER_BYTES}"
+            f"received truncated fd header: {len(data)} < {_FD_HEADER.size}"
         )
-    src_rank, base_idx, fd_count = struct.unpack("<QQQ", data)
+    src_rank, base_idx, fd_count = _FD_HEADER.unpack(data)
     fds = array.array("i")
     for level, cmsg_type, cmsg_data in ancdata:
         if level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
@@ -110,7 +110,11 @@ def exchange_posix_fds(
     sock_kind = socket.SOCK_SEQPACKET
     sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
     sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
+    try:
+        server = socket.socket(socket.AF_UNIX, sock_kind)
+    except BaseException:
+        os.rmdir(sock_dir)
+        raise
     server.settimeout(FD_SEND_TIMEOUT_S)
     received_fds: Dict[Tuple[int, int], int] = {}
     errors: List[BaseException] = []
@@ -137,7 +141,7 @@ def exchange_posix_fds(
     try:
         server.bind(sock_path)
         server.listen(world_size)
-        paths = [None] * world_size
+        paths: List[Optional[str]] = [None] * world_size
         dist.all_gather_object(paths, sock_path, group=group)
 
         thread = threading.Thread(target=recv_loop, daemon=True)
@@ -168,13 +172,16 @@ def exchange_posix_fds(
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
         if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
             raise RuntimeError(
                 "POSIX fd exchange mismatch: "
                 f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
             )
         return received_fds
+    except BaseException:
+        # on any failure the caller never sees these fds, so they are closed here
+        for fd in received_fds.values():
+            os.close(fd)
+        raise
     finally:
         server.close()
         try:

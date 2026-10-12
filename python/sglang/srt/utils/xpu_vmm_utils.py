@@ -37,9 +37,12 @@ logger = logging.getLogger(__name__)
 
 # Constants and struct layouts below are transcribed from the oneAPI Level Zero
 # headers, github.com/oneapi-src/level-zero include/{ze,zes}_api.h, at ZE_API_VERSION
-# 1.14; each is named for the enum or #define it was copied from.
+# 1.15; each is named for the enum or #define it was copied from.
 
 _LOADER_SONAME = "libze_loader.so.1"
+# The same fixed tool and search path CPython's ctypes.util._findSoname_ldconfig uses.
+_LDCONFIG = "/sbin/ldconfig"
+_LDCONFIG_SEARCH_PATH = "/sbin:/usr/sbin:/bin:/usr/bin"
 
 # zePhysicalMemGetProperties is the version gate: absent from loader 1.26.2, present
 # in 1.28.2, and the only route to an exportable fd for a physical object.
@@ -70,7 +73,7 @@ _ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC = 0x18
 _ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD = 0x19
 _ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_FD = 0x1A
 _ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC = 0x20
-_ZE_STRUCTURE_TYPE_PHYSICAL_MEM_PROPERTIES = 0x00020040  # added in 1.15
+_ZE_STRUCTURE_TYPE_PHYSICAL_MEM_PROPERTIES = 0x00020040
 
 _ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD = 1  # ZE_BIT(0); L0's only physical-mem type
 _ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE = 1
@@ -83,7 +86,7 @@ _ZES_STRUCTURE_TYPE_PROCESS_STATE = 0x16
 
 _ZES_STRING_PROPERTY_SIZE = 64  # #define; sizes _ZesDeviceProperties arrays
 
-# ===== Chosen here, not read from the spec =====
+# Chosen here, not read from the spec:
 
 # zesDeviceProcessesGetState counts then fills, and a rank starting up in between
 # turns the second call into INVALID_SIZE; ask for room the count did not ask for.
@@ -209,10 +212,10 @@ def _ldconfig_paths(soname: str) -> Tuple[str, ...]:
     # where the paths are. Invoked as CPython's ctypes.util._findSoname_ldconfig does.
     try:
         listing = subprocess.run(
-            ["/sbin/ldconfig", "-p"],
+            [_LDCONFIG, "-p"],
             capture_output=True,
             text=True,
-            env={"LC_ALL": "C", "LANG": "C", "PATH": "/sbin:/usr/sbin:/bin:/usr/bin"},
+            env={"LC_ALL": "C", "LANG": "C", "PATH": _LDCONFIG_SEARCH_PATH},
             timeout=_LDCONFIG_TIMEOUT_S,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -299,25 +302,31 @@ def _driver_and_devices() -> Dict[bytes, Tuple[int, int]]:
     return by_uuid
 
 
+def _torch_uuid(device_id: int) -> bytes:
+    return bytes(torch.xpu.get_device_properties(int(device_id)).uuid.bytes)
+
+
 @cache
-def _device_handle(device_id: int) -> int:
-    """L0 device handle for a torch XPU ordinal, matched by UUID: ZE_AFFINITY_MASK
-    and multi-driver systems permute index order, the UUID is what both agree on."""
-    device_id = int(device_id)
-    torch_uuid = bytes(torch.xpu.get_device_properties(device_id).uuid.bytes)
+def _driver_and_device(device_id: int) -> Tuple[int, int]:
+    """(driver, device) L0 handles for a torch XPU ordinal, matched by UUID:
+    ZE_AFFINITY_MASK and multi-driver systems permute index order, the UUID is what
+    both agree on."""
+    torch_uuid = _torch_uuid(device_id)
     entry = _driver_and_devices().get(torch_uuid)
     if entry is None:
         raise RuntimeError(
             f"torch XPU device {device_id} (uuid={torch_uuid.hex()}) has no "
             f"matching Level Zero device"
         )
-    return entry[1]
+    return entry
 
 
-@cache
+def _device_handle(device_id: int) -> int:
+    return _driver_and_device(int(device_id))[1]
+
+
 def _driver_handle(device_id: int) -> int:
-    torch_uuid = bytes(torch.xpu.get_device_properties(int(device_id)).uuid.bytes)
-    return _driver_and_devices()[torch_uuid][0]
+    return _driver_and_device(int(device_id))[0]
 
 
 @cache
@@ -465,7 +474,6 @@ class VmmReservation:
         device_id: int,
         *,
         alignment: int = 0,
-        requested_address: int = 0,
     ) -> None:
         lib = _load_level_zero()
         self.size = int(size)
@@ -483,7 +491,7 @@ class VmmReservation:
         check_ze(
             lib.zeVirtualMemReserve(
                 ctypes.c_void_p(self._context),
-                ctypes.c_void_p(int(requested_address)) if requested_address else None,
+                None,
                 ctypes.c_size_t(self.size),
                 ctypes.byref(base),
             ),
@@ -496,15 +504,7 @@ class VmmReservation:
 
     def map(self, offset: int, size: int, *, retain_handle: bool) -> int:
         """Create and map local memory at ``base + offset``."""
-        if self._closed:
-            raise RuntimeError("VmmReservation.map after close")
-        offset, size = int(offset), int(size)
-        if offset < 0 or size <= 0 or offset + size > self.size:
-            raise ValueError(
-                f"mapping [{offset}, {offset + size}) is outside reservation "
-                f"[0, {self.size})"
-            )
-
+        offset, size = self._check_range(offset, size, "map")
         address = self.base + offset
         handle = create_physical_mem(size, self._prop)
         try:
@@ -523,9 +523,7 @@ class VmmReservation:
 
     def map_existing(self, offset: int, size: int, handle: int) -> None:
         """Map a caller-owned physical allocation into this reservation."""
-        if self._closed:
-            raise RuntimeError("VmmReservation.map_existing after close")
-        offset, size = int(offset), int(size)
+        offset, size = self._check_range(offset, size, "map_existing")
         address = self.base + offset
         # zeVirtualMemMap maps the whole range or nothing, so a failure leaves
         # no mapping to roll back.
@@ -535,17 +533,26 @@ class VmmReservation:
     def unmap_existing(self, offset: int, size: int) -> None:
         """Undo one ``map_existing`` so its handle can be mapped somewhere else; a
         physical object may sit in only one live mapping on this backend."""
-        if self._closed:
-            raise RuntimeError("VmmReservation.unmap_existing after close")
-        offset, size = int(offset), int(size)
+        offset, size = self._check_range(offset, size, "unmap_existing")
         record = (self.base + offset, size, None, False)
         if record not in self._mappings:
             raise ValueError(
                 f"[{offset}, {offset + size}) is not an aliased mapping of this "
                 f"reservation"
             )
-        self._mappings.remove(record)
         self._unmap(record[0], size)
+        self._mappings.remove(record)
+
+    def _check_range(self, offset: int, size: int, operation: str) -> Tuple[int, int]:
+        if self._closed:
+            raise RuntimeError(f"VmmReservation.{operation} after close")
+        offset, size = int(offset), int(size)
+        if offset < 0 or size <= 0 or offset + size > self.size:
+            raise ValueError(
+                f"{operation} [{offset}, {offset + size}) is outside reservation "
+                f"[0, {self.size})"
+            )
+        return offset, size
 
     def _map_physical(self, address: int, size: int, handle: int) -> None:
         lib = _load_level_zero()
@@ -579,6 +586,7 @@ class VmmReservation:
             return
         self._closed = True
         lib = _load_level_zero()
+        # teardown frees as much as it can: one failed step must not leak the rest
         while self._mappings:
             address, size, handle, privately_owned = self._mappings.pop()
             try:
@@ -671,6 +679,8 @@ def import_peer_handle(
     """
     if use_fabric:
         raise ValueError("XPU has no FABRIC handle type")
+    if fd is None:
+        raise ValueError(f"no fd received from rank {peer_rank}")
     lib = _load_level_zero()
     device_id = int(device_id)
     dup_fd = os.dup(fd)
@@ -694,10 +704,7 @@ def import_peer_handle(
             f"zePhysicalMemCreate(IMPORT_FD, rank={peer_rank})",
         )
     finally:
-        try:
-            os.close(dup_fd)
-        except OSError:
-            pass
+        os.close(dup_fd)
     return int(handle.value)
 
 
@@ -751,7 +758,7 @@ def _sysman_device_handle(device_id: int) -> int:
     independently of the core API, so index order is no contract here either."""
     lib = _load_level_zero_exporting(_SYSMAN_SYMBOLS)
     check_ze(lib.zesInit(0), "zesInit")
-    torch_uuid = bytes(torch.xpu.get_device_properties(int(device_id)).uuid.bytes)
+    torch_uuid = _torch_uuid(device_id)
 
     driver_count = ctypes.c_uint32(0)
     check_ze(lib.zesDriverGet(ctypes.byref(driver_count), None), "zesDriverGet(count)")

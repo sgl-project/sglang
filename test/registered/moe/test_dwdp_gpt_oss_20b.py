@@ -19,6 +19,9 @@ from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.dwdp_test_utils import (
     GPT_OSS_20B_GSM8K_FLOOR,
+    GSM8K_NUM_EXAMPLES,
+    GSM8K_NUM_THREADS,
+    MEM_FRACTION_STATIC,
     assert_gsm8k_accuracy,
     launch_dwdp_server,
 )
@@ -45,11 +48,8 @@ class TestDwdpGptOss20B(CustomTestCase):
                 # moe_a2a_backend=none and disable_cuda_graph on its own.
                 "--dwdp-size",
                 str(DWDP_SIZE),
-                # DWDP's staging slots (2 on CUDA, 3 on XPU) cost 2-3x the
-                # per-layer expert bytes on top of the owned shard; the TP
-                # control fits under 0.75, this arm does not.
                 "--mem-fraction-static",
-                "0.85",
+                MEM_FRACTION_STATIC,
             ],
             timeout=LAUNCH_TIMEOUT,
             tp_size=DWDP_SIZE,
@@ -67,8 +67,8 @@ class TestDwdpGptOss20B(CustomTestCase):
             model=MODEL,
             base_url=self.base_url,
             accuracy=GPT_OSS_20B_GSM8K_FLOOR,
-            num_examples=100,
-            num_threads=8,
+            num_examples=GSM8K_NUM_EXAMPLES,
+            num_threads=GSM8K_NUM_THREADS,
         )
 
 

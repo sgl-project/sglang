@@ -1,13 +1,14 @@
 # Adapted from NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM)
-"""Double-buffered pool of local VMM pages backing the remote regions of the composite VA."""
+"""Per-slot pool of local VMM pages backing the remote regions of the composite VA."""
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import msgspec
 
+from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
 from sglang.srt.utils.vmm_backend import get_vmm_backend
 from sglang.srt.utils.vmm_common import Reservation, align_up
 
@@ -28,23 +29,11 @@ class PoolBinding(msgspec.Struct, frozen=True):
 
 
 class PagePool:
-    DEFAULT_PAGE_SIZE_MULTIPLIER = DEFAULT_PAGE_SIZE_MULTIPLIER
-
-    def __init__(
-        self,
-        slot_sizes: List[int],
-        device_id: int,
-        granularity: Optional[int] = None,
-        page_size: Optional[int] = None,
-    ):
+    def __init__(self, slot_sizes: List[int], device_id: int, page_size: int):
         self._device_id = device_id
         self._backend = get_vmm_backend(device_id)
-        self._granularity = granularity or self._backend.granularity
-
-        if page_size is None:
-            self._page_size = self.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
-        else:
-            self._page_size = page_size
+        self._granularity = self._backend.granularity
+        self._page_size = page_size
 
         self._slot_sizes = list(slot_sizes)
         self._slot_pages = [
@@ -71,15 +60,6 @@ class PagePool:
             logger.debug(
                 f"PagePool slot {slot_idx}: {num_pages} pages × {self._page_size} B"
             )
-
-    @classmethod
-    def create(
-        cls,
-        slot_sizes: List[int],
-        device_id: int,
-        page_size: Optional[int] = None,
-    ) -> PagePool:
-        return cls(slot_sizes, device_id, page_size=page_size)
 
     @property
     def page_size(self) -> int:
@@ -114,11 +94,11 @@ class PagePool:
         for handles in self._page_handles:
             for h in handles:
                 self._backend.release_handle(h)
-        self._page_handles = [[], []]
+        self._page_handles = []
 
 
 def compute_slot_sizes(
-    layouts: Dict[int, Dict[str, PageAlignedLayout]],  # noqa: F821
+    layouts: Dict[int, Dict[str, PageAlignedLayout]],
     buffer_slot_assignments: Dict[int, int],
     *,
     num_slots: int,

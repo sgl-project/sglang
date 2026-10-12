@@ -25,7 +25,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 # 2 MiB is what both drivers report for objects this size; 64 KiB is the finest either
 # reports at all, so the pair brackets the arithmetic rather than pinning one device.
 _GRANULARITIES = (2 * 1024 * 1024, 64 * 1024)
-# PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER, which WeightBuffer passes as both the
+# page_pool.DEFAULT_PAGE_SIZE_MULTIPLIER, which WeightBuffer passes as both the
 # pool's page size and the layout's pool_granularity
 _POOL_MULTIPLIER = 8
 

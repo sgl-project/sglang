@@ -23,11 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 def _close_fds(fds: Iterable[int]) -> None:
-    for fd in fds:
+    """Close every fd, then raise the first close error if there was one."""
+    first_error: Optional[OSError] = None
+    for fd in list(fds):
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except OSError as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
 
 
 def _copy_local_weights_to_handles(
@@ -127,79 +131,79 @@ class DWDPTransport:
             handle_list, cpu_group, layout.dwdp_rank
         )
         peer_fds: Dict[Tuple[int, int], int] = {}
+        try:
+            key_counts = [None] * layout.dwdp_size
+            dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
+            if any(count != len(sorted_keys) for count in key_counts):
+                raise RuntimeError(
+                    f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+                )
 
-        key_counts = [None] * layout.dwdp_size
-        dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
-        if any(count != len(sorted_keys) for count in key_counts):
-            raise RuntimeError(
-                f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+            if use_fabric:
+                all_fabric = [None] * layout.dwdp_size
+                dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
+            else:
+                all_fabric = None
+                peer_fds = exchange_posix_fds(
+                    cpu_group,
+                    layout.dwdp_rank,
+                    layout.dwdp_size,
+                    local_posix_fds,
+                    key_counts,
+                )
+            logger.info(
+                f"DWDP handle exchange via {'FABRIC' if use_fabric else 'POSIX fd'} "
+                f"({len(sorted_keys)} handles)"
             )
+            for key_idx, (layer_idx, name) in enumerate(sorted_keys):
+                spec = layer_weight_specs[layer_idx][name]
 
-        if use_fabric:
-            all_fabric = [None] * layout.dwdp_size
-            dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
-        else:
-            all_fabric = None
-            peer_fds = exchange_posix_fds(
-                cpu_group,
-                layout.dwdp_rank,
-                layout.dwdp_size,
-                local_posix_fds,
-                key_counts,
-            )
-        logger.info(
-            "DWDP handle exchange via %s (%d handles)",
-            "FABRIC" if use_fabric else "POSIX fd",
-            len(sorted_keys),
-        )
+                for peer_rank in range(layout.dwdp_size):
+                    if peer_rank == layout.dwdp_rank:
+                        continue
 
-        for key_idx, (layer_idx, name) in enumerate(sorted_keys):
-            spec = layer_weight_specs[layer_idx][name]
+                    peer_start, peer_end = layout.peer_ranges[peer_rank]
+                    peer_start_bytes = peer_start * spec.expert_bytes
+                    peer_end_bytes = peer_end * spec.expert_bytes
+                    peer_page_start = align_down(peer_start_bytes, granularity)
+                    peer_page_end = align_up(peer_end_bytes, granularity)
+                    peer_phys_size = peer_page_end - peer_page_start
+                    peer_data_offset = peer_start_bytes - peer_page_start
 
-            for peer_rank in range(layout.dwdp_size):
-                if peer_rank == layout.dwdp_rank:
-                    continue
+                    fabric_handle = (
+                        all_fabric[peer_rank][key_idx] if use_fabric else None
+                    )
+                    fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
+                    # not all backends' handles carry the object's size
+                    peer_handle = self._backend.import_handle(
+                        fabric_handle,
+                        fd,
+                        use_fabric=use_fabric,
+                        peer_rank=peer_rank,
+                        size=peer_phys_size,
+                    )
+                    self._imported_handles.append(int(peer_handle))
 
-                peer_start, peer_end = layout.peer_ranges[peer_rank]
-                peer_start_bytes = peer_start * spec.expert_bytes
-                peer_end_bytes = peer_end * spec.expert_bytes
-                peer_page_start = align_down(peer_start_bytes, granularity)
-                peer_page_end = align_up(peer_end_bytes, granularity)
-                peer_phys_size = peer_page_end - peer_page_start
-                peer_data_offset = peer_start_bytes - peer_page_start
+                    peer_reservation = self._backend.make_reservation(
+                        peer_phys_size,
+                        exportable=True,
+                        alignment=granularity,
+                    )
+                    peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
+                    self._peer_reservations.append(peer_reservation)
 
-                fabric_handle = all_fabric[peer_rank][key_idx] if use_fabric else None
-                fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
-                # not all backends' handles carry the object's size
-                peer_handle = self._backend.import_handle(
-                    fabric_handle,
-                    fd,
-                    use_fabric=use_fabric,
-                    peer_rank=peer_rank,
-                    size=peer_phys_size,
-                )
-                self._imported_handles.append(int(peer_handle))
-
-                peer_reservation = self._backend.make_reservation(
-                    peer_phys_size,
-                    exportable=True,
-                    alignment=granularity,
-                )
-                peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
-                self._peer_reservations.append(peer_reservation)
-
-                num_peer_experts = peer_end - peer_start
-                peer_tensor = self._backend.tensor_from_pointer(
-                    peer_reservation.base + peer_data_offset,
-                    peer_end_bytes - peer_start_bytes,
-                    shape=(num_peer_experts,) + spec.full_shape[1:],
-                    dtype=spec.dtype,
-                )
-                self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
-
-        if self._backend.owns_exported_fds():
-            _close_fds(local_posix_fds)
-        _close_fds(peer_fds.values())
+                    num_peer_experts = peer_end - peer_start
+                    peer_tensor = self._backend.tensor_from_pointer(
+                        peer_reservation.base + peer_data_offset,
+                        peer_end_bytes - peer_start_bytes,
+                        shape=(num_peer_experts,) + spec.full_shape[1:],
+                        dtype=spec.dtype,
+                    )
+                    self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
+        finally:
+            if self._backend.owns_exported_fds():
+                _close_fds(local_posix_fds)
+            _close_fds(peer_fds.values())
 
     @property
     def handle_set(self) -> MnnvlHandleSet:
@@ -218,5 +222,11 @@ class DWDPTransport:
         for h in self._imported_handles:
             self._backend.release_handle(h)
         self._imported_handles.clear()
+
+        # local shards are mapped by the weight buffer, which is released first
+        if self._handle_set is not None:
+            for handle in self._handle_set.handles.values():
+                self._backend.release_handle(handle)
+            self._handle_set = None
 
         self._peer_views.clear()

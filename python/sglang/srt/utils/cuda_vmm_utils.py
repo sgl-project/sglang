@@ -631,11 +631,7 @@ class VmmReservation:
         self._mappings.append((address, size, None))
 
     def unmap_existing(self, offset: int, size: int) -> None:
-        """Undo one ``map_existing``, leaving its handle alive and unmapped.
-
-        Only a backend without aliased mappings needs to rebind, but the shared
-        ``PagePool.unmap_binding`` calls this on whichever reservation it holds.
-        """
+        """Undo one ``map_existing``, leaving its handle alive and unmapped."""
         if self._closed:
             raise RuntimeError("VmmReservation.unmap_existing after close")
         offset, size = int(offset), int(size)
@@ -645,10 +641,10 @@ class VmmReservation:
                 f"[{offset}, {offset + size}) is not an aliased mapping of this "
                 f"reservation"
             )
-        self._mappings.remove(record)
         check_drv(
             _get_cuda_driver().cuMemUnmap(record[0], size), "cuMemUnmap(existing)"
         )
+        self._mappings.remove(record)
 
     def close(self, *, release_handles: bool = True) -> None:
         """Unmap allocations, optionally release retained handles, and free VA."""
