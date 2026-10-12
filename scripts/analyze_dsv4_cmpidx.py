@@ -287,6 +287,36 @@ def _is_prefill(rec):
     return rec.get("mode") != "2"
 
 
+def _blkx_groups(rows, field="blkx", keep=None):
+    """``{(layer, block): {hashes}}`` over the (optionally filtered) rows.
+
+    The shared per-block grouping used by every ``blkx``-based verdict: a block's
+    hash must be unique across requests (deterministic), so a ``(layer, block)``
+    group with >1 distinct hash is a REAL divergence there.
+    """
+    groups = defaultdict(set)
+    for r in rows:
+        if keep is not None and not keep(r):
+            continue
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r, field).items():
+            groups[(ly, b)].add(h)
+    return groups
+
+
+def _blkx_divergent(rows, field="blkx", keep=None):
+    """``{(layer, block): sorted(distinct hashes)}`` for every divergent group.
+
+    A group with >1 distinct hash is the SAME divergence ``report_blkx`` prints as
+    ``divergent=`` (identical criterion).  Callers that must agree with that
+    section REUSE this instead of re-keying the pool a second way; a page found
+    divergent here (e.g. page 136) can then never be missed downstream.
+    """
+    return {(ly, b): sorted(s)
+            for (ly, b), s in _blkx_groups(rows, field, keep).items()
+            if len(s) > 1}
+
+
 def report_blkx(rows, label, field="blkx", keep=None):
     """Per-c128-block (``position // 128``) hit==miss verdict.
 
@@ -297,13 +327,7 @@ def report_blkx(rows, label, field="blkx", keep=None):
     block and the layers diverging there (=> the first divergent layer).
     ``keep`` optionally filters rows (e.g. prefill-only to drop decode noise).
     """
-    groups = defaultdict(set)
-    for r in rows:
-        if keep is not None and not keep(r):
-            continue
-        ly = _int(r, "layer")
-        for b, h in _parse_blkx(r, field).items():
-            groups[(ly, b)].add(h)
+    groups = _blkx_groups(rows, field, keep)
     if not groups:
         print(f"  [{label}] no blkx= field (probe without per-block hashing)")
         return
@@ -1300,7 +1324,12 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
       * produced MISS!=HIT                       -> CONTENT, sub-split below
       * else (all identical)                     -> SAME
 
-    ``n_shared`` is counted over the TRANSLATED (page) keys.  CONTENT sub-split
+    ``n_shared`` is counted over the TRANSLATED (page) keys.  The stored side is
+    taken from the SAME ``[IDXK]`` pool the ``[IDXK]`` section groups: any shared
+    page that section found divergent (``divergent=`` / ``first_block=``) is
+    REUSED (``_blkx_divergent``) as a stored divergence, so ``stored_diff`` cannot
+    miss a page such as 136 even when the per-request stored maps do not line up
+    with the ``[C4DEC]`` request indices.  CONTENT sub-split
     via [C4DEC] ``kbase`` / ``rdcarry``:
       kbase differs                          -> CONTENT:K-SPLIT
       kbase same + rdcarry differs           -> CONTENT:READ-MISALIGN (ReadState)
@@ -1321,6 +1350,14 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
         return
 
     idxk_groups = _c4dec_split(idxk_rows) if idxk_rows else []
+    # REUSE the [IDXK] per-page divergence instead of a SECOND, independent
+    # keying of the stored pool.  ``_blkx_divergent`` applies the exact criterion
+    # ``report_blkx`` prints as ``divergent=`` (a ``(layer, page)`` group with >1
+    # distinct hash); the stored side is that SAME pool, so a page the [IDXK]
+    # section already found divergent (e.g. page 136) MUST make stored_diff True
+    # even when the per-request stored maps do not line up with the [C4DEC]
+    # request indices.
+    idxk_div = _blkx_divergent(idxk_rows, "blkx", keep=_is_prefill)
 
     def _stored(i):
         return (_c4dec_stored_maps(idxk_groups[i])
@@ -1371,10 +1408,22 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
                     produced_same = False
                 s_m = sm_map.get(page)
                 s_h = sh_map.get(page)
-                if s_m is not None and s_h is not None and s_m != s_h:
+                # A shared page the [IDXK] section found divergent is a STORED
+                # divergence by construction -- take it from idxk_div, not from
+                # the (possibly index-misaligned) per-request stored maps, and
+                # make both hashes visible in the row below.
+                div_hashes = idxk_div.get((ly, page))
+                if div_hashes is not None:
+                    stored_diff = True
+                    if s_m is None:
+                        s_m = div_hashes
+                    if s_h is None:
+                        s_h = div_hashes
+                elif s_m is not None and s_h is not None and s_m != s_h:
                     stored_diff = True
                 rows_out.append((ly, page, sorted(pm_pages[page]),
-                                 sorted(ph_pages[page]), s_m, s_h, p_same))
+                                 sorted(ph_pages[page]), s_m, s_h, p_same,
+                                 div_hashes))
 
     if not produced_same:
         if kbase_diff:
@@ -1395,10 +1444,12 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
           f"rdcarry_diff={rdcarry_diff} => {verdict}")
 
     shown = 0
-    for (ly, page, pm, ph, s_m, s_h, p_same) in rows_out:
+    for (ly, page, pm, ph, s_m, s_h, p_same, div_hashes) in rows_out:
         if verdict == "OUTPUT-SLOT":
-            keep = (p_same and s_m is not None and s_h is not None
-                    and s_m != s_h)
+            # Show the reused [IDXK] divergent page too -- it is the evidence
+            # that the stored side differs, even absent an aligned per-side map.
+            keep = div_hashes is not None or (
+                p_same and s_m is not None and s_h is not None and s_m != s_h)
         elif verdict.startswith("CONTENT"):
             keep = not p_same
         else:
@@ -2556,6 +2607,35 @@ def _selftest():
         c4rmis_out = _run_main(c4dec_rmis)
         c4page136_out = _run_main(c4dec_page136)
         c4proddiff_out = _run_main(c4dec_prod_diff)
+        # H7 ([IDXK] reuse): produced page 136 is IDENTICAL MISS vs HIT, but the
+        #     [IDXK] POOL itself carries TWO hashes for page 136 -- exactly what
+        #     ``report_blkx`` prints as ``divergent=1 first_block=136``.  The
+        #     per-request stored maps do NOT line up with the [C4DEC] indices
+        #     (both [IDXK] rows sit in req 1, so the hit req's stored map is
+        #     empty), so the OLD keying missed it -> wrongly SAME.  The stored
+        #     side must REUSE the [IDXK] divergence -> OUTPUT-SLOT, with page
+        #     136's two hashes in the verdict row.
+        c4dec_idxk_div = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "same4382", "same4383"),
+            _idxk_line(2, "79bc7de27691ef57", "p222"),
+            _idxk_line(2, "be64ada86e32b778", "p222"),
+            _chat,
+            _c4dec(2, 16384, _KB_A, _RC_A, "same4382", "same4383"),
+        ]
+        # H8 (no divergence): same produced page 136 and the [IDXK] pool agrees on
+        #     ONE hash for page 136 -> stored_diff stays False -> SAME (SAME only
+        #     when NO shared page diverges).
+        c4dec_no_div = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "same4382", "same4383"),
+            _idxk_line(2, "p111", "p222"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 16384, _KB_A, _RC_A, "same4382", "same4383"),
+        ]
+        c4idxkdiv_out = _run_main(c4dec_idxk_div)
+        c4nodiv_out = _run_main(c4dec_no_div)
         # H4: the EXACT reported repro -- FIVE ``/v1/chat/completions`` requests
         #     (boundary line AFTER each request's rows -> 0-based indices); req0..3
         #     are cache-MISS (sps=0) and req4 the cache-HIT (sps=16384).  The
@@ -2732,6 +2812,21 @@ def _selftest():
              "[C4DEC-VERDICT] miss_req=[0, 1, 2, 3] hit_req=[4]" in h4_out
              and "miss_req=[]" not in h4_out
              and "source=idxin:sps" in h4_out),
+            ("[C4DEC] [IDXK] divergent page 136 REUSED -> OUTPUT-SLOT"
+             " (produced_same, stored_diff)",
+             "== [C4DEC]" in c4idxkdiv_out
+             and "=> OUTPUT-SLOT" in c4idxkdiv_out
+             and "produced_same=True" in c4idxkdiv_out
+             and "stored_diff=True" in c4idxkdiv_out
+             and "page=136" in c4idxkdiv_out
+             and "79bc7de27691ef57" in c4idxkdiv_out
+             and "be64ada86e32b778" in c4idxkdiv_out
+             and "=> SAME" not in c4idxkdiv_out),
+            ("[C4DEC] no [IDXK] divergence -> SAME",
+             "== [C4DEC]" in c4nodiv_out
+             and "=> SAME" in c4nodiv_out
+             and "stored_diff=False" in c4nodiv_out
+             and "=> OUTPUT-SLOT" not in c4nodiv_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
