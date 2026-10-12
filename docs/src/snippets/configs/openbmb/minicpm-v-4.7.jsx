@@ -4,8 +4,7 @@
 // Every cell carries `--mamba-radix-cache-strategy extra_buffer` for the GDN
 // hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. INT4 stays at TP=1:
 // the bf16 vision tower's W4A16 group-128 divisibility fails at TP=2.
-// DSpark is an overlay; its draft path follows the variant. It was measured on
-// the BF16 bases only, so the quantized cells report it as unverified.
+// DSpark is an overlay; its draft path follows the variant.
 
 export const config = {
   modelName: "MiniCPM-V 4.7",
@@ -131,7 +130,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "35b-a3b", quant: "fp8", nodes: "single" },
-      verificationStatus: (s) => (s.spec === "dspark" ? "unverified" : "verified"),
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -144,7 +143,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "35b-a3b", quant: "int4", nodes: "single" },
-      verificationStatus: (s) => (s.spec === "dspark" ? "unverified" : "verified"),
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

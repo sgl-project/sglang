@@ -122,12 +122,12 @@ MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen
 - The 1B model runs on one GPU. The 35B-A3B BF16 and FP8 checkpoints use `--tp 2`.
 - Serve INT4 at `--tp 1`. The vision tower stays unquantized BF16, and the W4A16 group-128 layout does not divide evenly across the vision layers at TP=2.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
-- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Measured accept length is about 1.1–1.3. DSPARK was validated on the BF16 bases; on FP8 and INT4 the panel marks it unverified.
+- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Measured accept length is about 1.3 on 1B, 1.1–1.3 on 35B-A3B BF16, 1.1–1.2 on FP8, and 1.2–1.7 on INT4.
 - Thinking is on by default. Without a reasoning parser, the thinking trace stays in `message.content`. To return it in `message.reasoning_content`, add `--reasoning-parser qwen3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground](#playground)).
 - Image and video requests need no extra server flags.
 
 <Warning>
-  The FP8 and INT4 checkpoints' remote code fails to import on transformers 5.17. `video_processing_minicpmv4_7.py` imports `BASE_VIDEO_PROCESSOR_DOCSTRING` from `transformers.video_processing_utils`, and transformers 5.17 removed that constant. In your local copy of the checkpoint, drop the name from that import and define it in the file instead:
+  The FP8 and INT4 checkpoints' remote code fails to import on transformers 5.16 and later. `video_processing_minicpmv4_7.py` imports `BASE_VIDEO_PROCESSOR_DOCSTRING` from `transformers.video_processing_utils`. That code targets transformers 5.12 and earlier; the constant is gone from 5.16 onward, so upgrading transformers does not fix the import. In your local copy of the checkpoint, drop the name from that import and define it in the file instead:
 
   ```python Example
   from transformers.video_processing_utils import BaseVideoProcessor
