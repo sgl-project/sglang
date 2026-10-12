@@ -135,6 +135,7 @@ class TestPPLoopRowsAtCommit(unittest.TestCase):
 
         s = Scheduler.__new__(Scheduler)
         s.enable_overlap = False
+        s.recv_skipper = None
         s.spec_algorithm = SpeculativeAlgorithm.NONE
         s.device = "cpu"
         s.enable_hisparse = False
