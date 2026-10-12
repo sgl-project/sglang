@@ -489,8 +489,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                     return encode(**kwargs)
 
                 async def other_request():
-                    # Conversion may yield before the lazy question iterator is
-                    # consumed. Measure fairness once question encoding starts.
+                    # Conversion may now yield before question encoding starts.
                     await encoding_started.wait()
                     for _ in range(3):
                         events.append("other")
