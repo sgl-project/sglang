@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import re
@@ -10,12 +9,14 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -58,7 +59,7 @@ def _find_safetensors_file(path: str) -> str:
         return path
 
     if os.path.isdir(path):
-        files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+        files = _list_safetensors_files(path)
         if len(files) == 1:
             return files[0]
         elif len(files) > 1:
@@ -74,7 +75,7 @@ def _find_safetensors_file(path: str) -> str:
     try:
         maybe_downloaded = maybe_download_model(path)
         if os.path.isdir(maybe_downloaded):
-            files = sorted(glob.glob(os.path.join(maybe_downloaded, "*.safetensors")))
+            files = _list_safetensors_files(maybe_downloaded)
             if len(files) == 1:
                 return files[0]
             elif len(files) > 1:
@@ -197,7 +198,6 @@ def _load_explicit_config(
 class UpsamplerLoader(PlainStateDictComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
-    supports_component_weight_override = True
 
     def load_customized(
         self,
@@ -226,12 +226,15 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
             component_name
         )
         target_device = self.target_device(component_starts_on_cpu)
+        dtype = resolve_component_precision(server_args, component_name)
+        if dtype is None:
+            dtype = torch.bfloat16
 
         with torch.device("meta"):
             model = LatentUpsampler(**config)
 
         model.load_state_dict(state_dict, assign=True)
-        model = model.to(device=target_device, dtype=torch.bfloat16).eval()
+        model = model.to(device=target_device, dtype=dtype).eval()
 
         logger.info("Loaded LatentUpsampler to %s", target_device)
         return model

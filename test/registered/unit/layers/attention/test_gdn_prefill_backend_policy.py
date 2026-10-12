@@ -4,15 +4,14 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    MambaAttnBackendBase,
-)
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
     _validate_gdn_linear_attn_backends,
     flashinfer_gdn_prefill_default,
+    validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
@@ -26,7 +25,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _publish(testcase, **fields):
@@ -59,6 +58,7 @@ def make_runner(
         mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
+        enable_mis=False,
     )
     fields.update(arg_overrides)
     args = _publish(testcase, **fields)
@@ -79,6 +79,32 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    @staticmethod
+    def make_target_verify_routing_backend():
+        backend = object.__new__(GDNAttnBackend)
+        nominal_capability = MagicMock(return_value=False)
+        backend.kernel_dispatcher = SimpleNamespace(
+            verify_kernel_is_flashinfer=True,
+            target_verify_supports_strided_qkv=nominal_capability,
+        )
+        return backend, nominal_capability
+
+    def test_mis_requires_triton_prefill_backend(self):
+        runner = make_runner(self, enable_mis=True)
+        with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
+            validate_gdn_mis_backend(LinearAttnKernelBackend.FLASHINFER)
+
+    def test_mis_rejects_page_major_layout(self):
+        make_runner(self, enable_mis=True, enable_page_major_kv_layout=True)
+        with self.assertRaisesRegex(ValueError, "page-major"):
+            validate_gdn_mis_backend(LinearAttnKernelBackend.TRITON)
+
+    def test_non_gdn_linear_backend_rejects_mis(self):
+        with self.assertRaisesRegex(ValueError, "does not support multi-item scoring"):
+            MambaAttnBackendBase.validate_mis_support(SimpleNamespace(enable_mis=True))
+
+        GDNAttnBackend.validate_mis_support(SimpleNamespace(enable_mis=True))
+
     def apply_policy(
         self,
         runner,
@@ -232,6 +258,8 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
         )
@@ -245,7 +273,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
 
     def test_tree_verify_uses_triton_kernel(self):
-        flashinfer_kernel = MagicMock(supports_target_verify=True)
+        flashinfer_kernel = MagicMock(
+            supports_target_verify=True,
+            supports_strided_target_verify_qkv=False,
+        )
         with (
             patch.object(gdn_backend, "is_cuda", return_value=True),
             patch(
@@ -260,6 +291,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             )
 
         self.assertIsInstance(dispatcher.tree_verify_kernel, TritonGDNKernel)
+        self.assertFalse(dispatcher.target_verify_supports_strided_qkv(None))
+        self.assertTrue(
+            dispatcher.target_verify_supports_strided_qkv(sentinel.parent_token)
+        )
 
         tensor = sentinel.tensor
         with patch.object(
@@ -275,6 +310,41 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
+
+    def test_target_verify_strided_input_capability_is_opt_in(self):
+        dispatcher = GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+        )
+
+        self.assertTrue(dispatcher.target_verify_supports_strided_qkv(None))
+        dispatcher.verify_kernel = SimpleNamespace()
+        self.assertFalse(dispatcher.target_verify_supports_strided_qkv(None))
+
+    def test_target_verify_strided_qkv_routing(self):
+        backend, nominal_capability = self.make_target_verify_routing_backend()
+        cases = (
+            ("fp32_fold", True, False, torch.float32, 4, True, False),
+            ("short_bf16_fold", True, False, torch.bfloat16, 2, True, False),
+            ("cutedsl_fold", True, False, torch.bfloat16, 4, False, False),
+            ("circular", False, True, torch.bfloat16, 4, True, False),
+            ("nominal", False, False, torch.bfloat16, 4, False, True),
+        )
+        for name, fold, circular, dtype, draft_tokens, expected, delegates in cases:
+            with self.subTest(name=name):
+                nominal_capability.reset_mock()
+                actual = backend._target_verify_supports_strided_qkv(
+                    retrieve_parent_token=None,
+                    use_replayssm_fold=fold,
+                    use_replayssm_spec=circular,
+                    ssm_dtype=dtype,
+                    draft_token_num=draft_tokens,
+                )
+                self.assertEqual(actual, expected)
+                if delegates:
+                    nominal_capability.assert_called_once_with(None)
+                else:
+                    nominal_capability.assert_not_called()
 
     def test_helion_backend_reports_kda_only(self):
         cases = (

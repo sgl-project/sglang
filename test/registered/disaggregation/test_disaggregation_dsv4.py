@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=184, stage="base-c", runner_config="8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -66,9 +66,8 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             cls.prefill_nccl_port,
             "--tp",
             4,
-            "--dp",
+            "--attn-dp-size",
             4,
-            "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
             "--deepep-config",
@@ -81,7 +80,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             "--watchdog-timeout",
             "900",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -102,9 +101,8 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             cls.decode_nccl_port,
             "--tp",
             4,
-            "--dp",
+            "--attn-dp-size",
             4,
-            "--enable-dp-attention",
             "--base-gpu-id",
             4,
             "--moe-a2a-backend",
@@ -119,7 +117,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             "--watchdog-timeout",
             "900",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

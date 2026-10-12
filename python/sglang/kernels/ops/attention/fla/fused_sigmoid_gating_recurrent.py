@@ -5,6 +5,132 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import (
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_sm90_supported,
+)
+
+_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
+_is_sm90 = is_sm90_supported()
+_is_sm103 = is_cuda() and get_device_sm() == 103
+
+
+def _select_recurrent_launch_config(
+    n: int,
+    h: int,
+    hv: int,
+    k: int,
+    v: int,
+    is_kda: bool,
+    target_verify: bool = False,
+    *,
+    cache_steps: int = 0,
+) -> tuple[int, int]:
+    """Select the value tile and warp count for recurrent GDN/KDA."""
+    if (
+        _is_hip
+        and _is_gfx95
+        and not is_kda
+        and 0 < n <= 32
+        and h == 4
+        and hv == 16
+        and k == 128
+        and v == 128
+    ):
+        return (8, 4) if n == 1 else (16, 2)
+    if (
+        target_verify
+        and not _is_hip
+        and not is_kda
+        and 0 < n <= 64
+        and k == 128
+        and v == 128
+        and _is_sm90
+    ):
+        # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
+        # with narrow tiles but not bit-identical to BV=32. Only the dense
+        # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
+        return 4, 1
+    if (
+        _is_sm103
+        and is_kda
+        and target_verify
+        and (n, h, hv, k, v, cache_steps) == (1, 8, 8, 128, 128, 8)
+    ):
+        # GLM TP8 DFlash verification: 256 CTAs instead of 32.
+        return 4, 1
+    return min(triton.next_power_of_2(v), 32), 1
+
+
+_EX2_APPROX_FTZ_F32 = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
+_LG2_APPROX_FTZ_F32 = tl.constexpr("lg2.approx.ftz.f32 $0, $1;")
+_UNARY_F32_REGISTERS = tl.constexpr("=f,f")
+
+
+@triton.jit
+def _ex2_approx_ftz_f32(x):
+    return tl.inline_asm_elementwise(
+        asm=_EX2_APPROX_FTZ_F32,
+        constraints=_UNARY_F32_REGISTERS,
+        args=(x,),
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _lg2_approx_ftz_f32(x):
+    return tl.inline_asm_elementwise(
+        asm=_LG2_APPROX_FTZ_F32,
+        constraints=_UNARY_F32_REGISTERS,
+        args=(x,),
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _cutedsl_exp(x):
+    return _ex2_approx_ftz_f32(x * 1.4426950408889634)
+
+
+@triton.jit
+def _cutedsl_qk_sum_squares(x, BK: tl.constexpr):
+    """Lane-striped Q/K sum of squares, as FlashInfer's ``recurrent_kda`` CuTe
+    DSL decode kernel reduces it: lane ``l`` owns the elements ``l + i * 32``
+    and a 32-lane butterfly combines the lanes. Keeping both reduction
+    dimensions explicit stops Triton from flattening K into a different
+    reduction tree.
+    """
+    NS: tl.constexpr = BK // 32
+    tl.static_assert(
+        NS >= 1 and NS <= 4,
+        "match_cutedsl_decode needs 32 <= BK <= 128 (head_k_dim <= 128)",
+    )
+    # The decode kernel accumulates its per-lane squares with packed f32x2 FMA,
+    # so the even and odd i streams stay separate until both are complete. A
+    # plain tl.sum(x * x) is mathematically equivalent, but can move a BF16
+    # recurrent state across a rounding boundary after several verify steps.
+    lane_values = tl.reshape(x, (NS, 32), can_reorder=False)
+    row = tl.arange(0, NS)[:, None]
+    even0 = tl.sum(tl.where(row == 0, lane_values, 0.0), axis=0)
+    odd0 = tl.sum(tl.where(row == 1, lane_values, 0.0), axis=0)
+    zeros = tl.zeros((32,), tl.float32)
+    even_sum = tl.fma(even0, even0, zeros)
+    odd_sum = tl.fma(odd0, odd0, zeros)
+    if NS == 4:
+        even1 = tl.sum(tl.where(row == 2, lane_values, 0.0), axis=0)
+        odd1 = tl.sum(tl.where(row == 3, lane_values, 0.0), axis=0)
+        even_sum = tl.fma(even1, even1, even_sum)
+        odd_sum = tl.fma(odd1, odd1, odd_sum)
+    lane_sum = even_sum + odd_sum
+    return tl.sum(lane_sum, axis=0)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -69,11 +195,22 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    MATCH_CUTEDSL_DECODE: tl.constexpr = False,
+    ROUND_STATE_TO_BF16: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    if SPLIT_N_HV_GRID:
+        i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        # The GPU wrapper asserts NK == 1. Keep N and HV on independent grid
+        # axes so large GLM5 decode batches do not exceed CUDA's grid limit.
+        i_k = 0
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_n, i_hv = i_nh // HV, i_nh % HV
     # PDL: overlap this kernel's prologue with the producer (the KDA/GDN
     # conv1d_update). All global loads below happen after the wait, so
     # numerics are unchanged. The immediate trigger releases the LAUNCH of
@@ -83,8 +220,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
@@ -198,18 +333,32 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (a + dt_bias))
             b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
         else:
-            # Compute g = -exp(A_log) * softplus(a + dt_bias)
-            beta_x = softplus_beta * x
-            # Apply softplus with numerical stability
-            softplus_x = tl.where(
-                beta_x <= softplus_threshold,
-                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-                x,
-            )
-            b_g = -tl.exp(b_A_log) * softplus_x
+            if MATCH_CUTEDSL_DECODE and IS_KDA:
+                # The CuTe decode kernel forms the multiplicative gate directly
+                # in base 2. Algebraically this is exp(-A * softplus(x)), but
+                # the instruction sequence decides on which side of a BF16
+                # state-rounding boundary the result lands.
+                b_gate_multiplier = _ex2_approx_ftz_f32(
+                    (-_cutedsl_exp(b_A_log))
+                    * _lg2_approx_ftz_f32(1.0 + _cutedsl_exp(x))
+                )
+                b_g = tl.log(b_gate_multiplier)
+            else:
+                # Compute g = -exp(A_log) * softplus(a + dt_bias)
+                beta_x = softplus_beta * x
+                # Apply softplus with numerical stability
+                softplus_x = tl.where(
+                    beta_x <= softplus_threshold,
+                    (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                    x,
+                )
+                b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if MATCH_CUTEDSL_DECODE:
+            b_beta = b_b
+        else:
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -276,14 +425,34 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            if MATCH_CUTEDSL_DECODE:
+                q_sum_sq = _cutedsl_qk_sum_squares(b_q, BK)
+                k_sum_sq = _cutedsl_qk_sum_squares(b_k, BK)
+                q_rsqrt = tl.rsqrt(q_sum_sq + 1e-6)
+                k_rsqrt = tl.rsqrt(k_sum_sq + 1e-6)
+            else:
+                q_sum_sq = tl.sum(b_q * b_q)
+                k_sum_sq = tl.sum(b_k * b_k)
+                q_rsqrt = 1.0 / tl.sqrt(q_sum_sq + 1e-6)
+                k_rsqrt = 1.0 / tl.sqrt(k_sum_sq + 1e-6)
+            b_q *= q_rsqrt
+            b_k *= k_rsqrt
 
         b_q = b_q * scale
 
         # Apply gating to hidden state: h *= exp(g)
         if IS_KDA:
-            b_h *= tl.exp(b_g[:, None])
+            if MATCH_CUTEDSL_DECODE:
+                # The CuTe decode kernel forms the decayed state with packed
+                # FMA and a zero addend. Keep that rounding instead of letting
+                # the compiler pick a plain multiply.
+                b_h = tl.fma(
+                    b_h,
+                    b_gate_multiplier[:, None],
+                    tl.zeros((BK, BV), tl.float32),
+                )
+            else:
+                b_h *= tl.exp(b_g[:, None])
         else:
             b_h *= tl.exp(b_g)
 
@@ -294,7 +463,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v *= b_beta
 
         # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+        if MATCH_CUTEDSL_DECODE:
+            b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
+        elif IS_KDA and V == 128 and BV == 4:
+            # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
+            b_h = tl.inline_asm_elementwise(
+                "add.rn.f32 $0, $1, $2;",
+                constraints="=f,f,f",
+                args=[b_h, b_k[:, None] * b_v[None, :]],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            b_h += b_k[:, None] * b_v[None, :]
 
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -313,6 +495,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + o_k[:, None]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+
+        # A BF16 recurrent-state decode persists its state after every token.
+        # Multi-token verification must make that precision boundary visible to
+        # the next recurrence step instead of retaining the FP32 accumulator for
+        # the whole candidate chain. FP32 state pools must retain the accumulator.
+        if ROUND_STATE_TO_BF16:
+            b_h = b_h.to(tl.bfloat16).to(tl.float32)
 
         step_idx += 1
 
@@ -360,9 +549,7 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
-    cache_steps: Optional[
-        int
-    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
+    cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
     # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
     # stores pre-norm k / raw v / gate / beta into these per-slot rings,
@@ -372,6 +559,12 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    # Reproduce FlashInfer's `recurrent_kda` CuTe DSL decode kernel step for
+    # step: `b` is then the already-sigmoided FP32 beta, the gate is formed in
+    # base 2 with ex2/lg2.approx, Q/K norms reduce lane-striped, the state
+    # decays and updates through FMA, and a BF16 state pool is rounded after
+    # every token.
+    match_cutedsl_decode: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -383,6 +576,11 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if match_cutedsl_decode and (not is_kda or lower_bound is not None):
+        raise ValueError(
+            "match_cutedsl_decode is defined for the KDA softplus gate only "
+            "(is_kda=True, lower_bound=None)."
+        )
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
@@ -396,11 +594,26 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    use_pdl = is_arch_support_pdl()
+    target_verify = (
+        disable_state_update and not match_cutedsl_decode
+        if is_kda
+        else intermediate_states_buffer is not None
+    )
+    BV, num_warps = _select_recurrent_launch_config(
+        N,
+        H,
+        HV,
+        K,
+        V,
+        is_kda,
+        target_verify=target_verify,
+        cache_steps=cache_steps,
+    )
+    BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -419,15 +632,17 @@ def fused_sigmoid_gating_delta_rule_update(
 
     NP2_T = triton.next_power_of_2(T)
 
-    grid = (NK, NV, N * HV)
+    split_n_hv_grid = q.device.type == "cuda"
+    grid = (NV, N, HV) if split_n_hv_grid else (NK, NV, N * HV)
 
-    # Per-req stride must match the buffer's allocated dim, not runtime steps
-    # (they can differ under --speculative-adaptive).
-    cache_stride_steps = (
-        intermediate_states_buffer.shape[1]
-        if intermediate_states_buffer is not None
-        else 0
-    )
+    # Adaptive spec changes the runtime draft count without changing the
+    # allocated per-request pitch, which is preserved in stride(0).
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif cache_steps is not None and cache_steps > 0:
+        cache_stride_steps = cache_steps
+    else:
+        cache_stride_steps = 0
 
     # ring strides (per-slot rings are contiguous [num_slots, heads, L, dim];
     # the kernel offsets within a slot with MAX_CACHE_LEN and the dim extents).
@@ -455,7 +670,15 @@ def fused_sigmoid_gating_delta_rule_update(
     # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
     # already launches dependents. Bit-exact (scheduling only) — benefits both
     # KDA and GDN recurrent paths.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
+
+    # CuTeDSL specializes on the persisted state dtype. Its BF16 decode path
+    # writes BF16 after every token and reloads FP32 for the next recurrence;
+    # its FP32 path has no such rounding boundary. Keep CuTe math parity and
+    # state-persistence precision as separate compile-time choices.
+    round_state_to_bf16 = match_cutedsl_decode and (
+        initial_state_source is None or initial_state_source.dtype == torch.bfloat16
+    )
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -516,6 +739,9 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        SPLIT_N_HV_GRID=split_n_hv_grid,
+        MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
+        ROUND_STATE_TO_BF16=round_state_to_bf16,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

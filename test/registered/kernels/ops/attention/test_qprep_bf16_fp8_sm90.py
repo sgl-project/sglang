@@ -109,9 +109,9 @@ def test_qprep_fp64_reference_parity(h_k):
     ).transpose(0, 1)
     err_tri = (ref8[..., :N_LORA].to(torch.float64) - ref64).abs().mean().item()
     err_cuda = (out8[..., :N_LORA].to(torch.float64) - ref64).abs().mean().item()
-    assert (
-        err_cuda <= 1.05 * err_tri
-    ), f"CUDA fp64-ref mean |err| {err_cuda:.4e} exceeds Triton's {err_tri:.4e}"
+    assert err_cuda <= 1.05 * err_tri, (
+        f"CUDA fp64-ref mean |err| {err_cuda:.4e} exceeds Triton's {err_tri:.4e}"
+    )
 
 
 if __name__ == "__main__":

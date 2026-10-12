@@ -98,6 +98,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             seq_len=seq_v,
             batch_size=batch_size,
             key="sp_video_valid_token_count",
+            has_padding=batch.sp_video_has_padding,
             device=model_inputs.latent_model_input.device,
         )
         video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
@@ -129,6 +130,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 seq_len=seq_a,
                 batch_size=batch_size,
                 key="sp_audio_valid_token_count",
+                has_padding=batch.sp_audio_has_padding,
                 device=model_inputs.audio_latent_model_input.device,
             )
             audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
@@ -515,7 +517,9 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             ]
 
         with self._ltx2_model_forward_context(ctx, step):
-            model_video, model_audio = step.current_model(**model_kwargs)
+            model_video, model_audio = self._ltx2_call_current_model(
+                ctx, step, model_kwargs
+            )
 
         if memory_meta:
             memory_video_len = memory_meta["memory_video_len"]

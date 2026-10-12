@@ -13,6 +13,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
@@ -53,17 +54,6 @@ def _require_int(value: Any, path: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{path} must be an integer")
     return value
-
-
-def _optional_positive_finite_float(value: Any, path: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{path} must be a number")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized <= 0.0:
-        raise ValueError(f"{path} must be a positive finite number")
-    return normalized
 
 
 def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
@@ -196,7 +186,7 @@ def _validate_conditions(
             MINIMAX_H3_CONDITION_ROLE_REFERENCE,
         ):
             raise ValueError(
-                f"{cpath}.role must be keyframe or reference, " f"got {role!r}"
+                f"{cpath}.role must be keyframe or reference, got {role!r}"
             )
         cond_type = _require_str(cond.get("type"), f"{cpath}.type")
         try:
@@ -358,8 +348,8 @@ def minimax_h3_validate_canonical_request(
         "conditions": normalized_conditions,
         "target": normalized_target,
     }
-    normalized_flow_shift = _optional_positive_finite_float(flow_shift, "flow_shift")
-    normalized_audio_flow_shift = _optional_positive_finite_float(
+    normalized_flow_shift = optional_positive_finite_float(flow_shift, "flow_shift")
+    normalized_audio_flow_shift = optional_positive_finite_float(
         audio_flow_shift, "audio_flow_shift"
     )
     if normalized_flow_shift is not None:

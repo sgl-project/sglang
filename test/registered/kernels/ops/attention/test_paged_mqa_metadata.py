@@ -58,12 +58,12 @@ def paged_mqa_metadata_ref(
     seq_lens: torch.Tensor, num_sm: int, page_size: int
 ) -> torch.Tensor:
     assert page_size == 64, f"page_size must be 64, got {page_size}"
-    assert (
-        seq_lens.dtype == torch.int32
-    ), f"seq_lens dtype must be int32, got {seq_lens.dtype}"
-    assert (
-        seq_lens.dim() == 1
-    ), f"seq_lens must be 1-D, got shape {tuple(seq_lens.shape)}"
+    assert seq_lens.dtype == torch.int32, (
+        f"seq_lens dtype must be int32, got {seq_lens.dtype}"
+    )
+    assert seq_lens.dim() == 1, (
+        f"seq_lens must be 1-D, got shape {tuple(seq_lens.shape)}"
+    )
 
     device = seq_lens.device
     batch_size = int(seq_lens.shape[0])

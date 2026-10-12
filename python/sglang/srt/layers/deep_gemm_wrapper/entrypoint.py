@@ -72,7 +72,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-
             fp4_kwargs = {}
             if recipe_a is not None:
                 fp4_kwargs["recipe_a"] = recipe_a
@@ -171,15 +170,66 @@ def grouped_gemm_nt_bf16_contig(
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
 
 
+def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
+    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    if isinstance(alignment, tuple):
+        alignment = alignment[0]
+
+    theoretical_alignment = getattr(
+        deep_gemm, "get_theoretical_mk_alignment_for_contiguous_layout", None
+    )
+    if theoretical_alignment is None:
+        return alignment
+
+    per_group_m = (expected_m + num_groups - 1) // num_groups
+    try:
+        try:
+            candidate = theoretical_alignment(per_group_m)
+        except TypeError:
+            candidate = theoretical_alignment(
+                expected_m=expected_m, num_groups=num_groups
+            )
+    except Exception:
+        return alignment
+    return candidate if 0 < candidate <= alignment else alignment
+
+
+@contextmanager
+def contiguous_layout_alignment_scope(alignment: Optional[int]):
+    if alignment is None:
+        yield
+        return
+
+    getter = getattr(deep_gemm, "get_mk_alignment_for_contiguous_layout", None)
+    setter = getattr(deep_gemm, "set_mk_alignment_for_contiguous_layout", None)
+    if getter is None or setter is None:
+        yield
+        return
+
+    previous = getter()
+    if isinstance(previous, tuple):
+        previous = previous[0]
+    setter(alignment)
+    try:
+        yield
+    finally:
+        setter(previous)
+
+
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
-    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+        if recipe == (1, 32, 32)
+        else compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+    )
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -189,6 +239,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            **({"recipe": recipe} if recipe is not None else {}),
         )
 
 

@@ -498,19 +498,25 @@ struct CodecQ8 : public CodecBase {
   }
 };
 
-// Keep the scale on the f32 side of the narrowing conversion. With the HIP
-// intrinsic, LLVM can reassociate (bf16_as_f32 * scale) -> fp16 into
+// Keep the scale on the f32 side of the narrowing conversion. With nothing in
+// between, LLVM reassociates (bf16_as_f32 * scale) -> fp16 into
 // fp16(bf16_as_f32) * scale, which clips values above 65504 before the range
-// guard is applied. The opaque ISA conversion makes the scaled f32 values
-// explicit inputs and prevents that transform.
+// guard is applied.
+//
+// The barrier is what blocks that: it forces the scaled values into registers
+// the optimizer cannot see through, so the multiply has to happen before the
+// narrowing. Naming a conversion instruction would do the same, but only where
+// that instruction exists -- v_cvt_pk_f16_f32 is not part of the CDNA ISA, so
+// spelling it out fails to assemble for gfx942. The narrowing itself is left to
+// __float22half2_rn, which every target implements and which matches the
+// round-to-nearest conversion the quantized path above uses.
 __quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value, float scale) {
   float2 scaled = __bfloat1622float2(value);
   scaled.x *= scale;
   scaled.y *= scale;
 
-  int packed;
-  asm volatile("v_cvt_pk_f16_f32 %0, %1, %2" : "=v"(packed) : "v"(scaled.x), "v"(scaled.y));
-  return *reinterpret_cast<half2*>(&packed);
+  asm volatile("" : "+v"(scaled.x), "+v"(scaled.y));
+  return __float22half2_rn(scaled);
 }
 
 // Twoshot All Reduce

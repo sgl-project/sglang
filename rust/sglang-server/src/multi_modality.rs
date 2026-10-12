@@ -1,6 +1,5 @@
 //! Multimodal worker pool.
 
+pub mod encoded;
 pub mod payload;
-mod shm;
-pub mod sidecar;
 pub mod worker;
