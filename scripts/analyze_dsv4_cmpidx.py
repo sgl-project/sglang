@@ -23,8 +23,12 @@ from collections import defaultdict
 
 TAG = re.compile(
     r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA"
-    r"|C4ST|C4STP|KSTATELOC|C4POS)\]"
+    r"|C4ST|C4STP|KSTATELOC|C4POS|C4DEC)\]"
 )
+# [C4DEC] kbase= contains SPACES (``mBaseNum=.. kBaseNum=.. raw_tok=..``), so
+# the generic ``KV`` regex would truncate it at the first space.  Capture the
+# full value up to the following ``rdcarry=`` field.
+C4DEC_KBASE = re.compile(r"kbase=(.*?)\s+rdcarry=")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 # [IDXIN] kpg= is emitted by ``_read_page_table_pages`` as
 # ``n=<count>,first=[..],last=[..]`` (Python list repr, spaces after commas).
@@ -112,6 +116,11 @@ def parse(path):
             if tag == "KSTATELOC":
                 # Positional line: keep the raw text for the dedicated parser.
                 d["_raw"] = ln
+            if tag == "C4DEC":
+                # kbase= spans spaces: overwrite the KV-truncated value.
+                m = C4DEC_KBASE.search(ln)
+                if m:
+                    d["kbase"] = m.group(1).strip()
             if tag == "CMPIDX" and "lastpos" in d:
                 cur_lp = d["lastpos"]
             elif "lastpos" not in d and cur_lp is not None:
@@ -1079,6 +1088,240 @@ def report_c4pos(rows):
     print(C4POS_RUNBOOK)
 
 
+C4DEC_RUNBOOK = (
+    "[C4DEC-RUNBOOK] windowed probe (compressor produced idxK vs stored pool):\n"
+    "  DSV4_DUMP_C4DEC=2 DSV4_DUMP_IDXK=2 DSV4_DUMP_LAYERS=2 "
+    "DSV4_DUMP_MIN_POS=17280 DSV4_DUMP_MAX_POS=17540 "
+    "SGLANG_DSV4_AIC_NUM=<real> <serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_c4dec.log\n"
+    "  verdicts: OUTPUT-SLOT (produced same, stored differs) | "
+    "CONTENT:K-SPLIT (kbase differs) | "
+    "CONTENT:READ-MISALIGN (kbase same, rdcarry differs) | SAME"
+)
+
+
+def _c4dec_start_min(rec):
+    """Min of the ``start=[..]`` list (the call's start position / ``sps``).
+
+    ``0`` marks a full prefill (cache-MISS); ``>0`` a suffix prefill (cache-HIT).
+    """
+    v = rec.get("start")
+    if not v:
+        return None
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    vals = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            vals.append(int(tok))
+        except ValueError:
+            continue
+    return min(vals) if vals else None
+
+
+def _c4dec_idxk(rec):
+    """Parse ``idxK=[n_raw=..,n_keep=..,<block>:<hash>:v0=..:sum=..:am=.., ..]``.
+
+    Returns ``(by_block, meta)`` where ``by_block`` = ``{abs_block: md5}`` (the
+    compressor's PRODUCED index-K) and ``meta`` = ``{n_raw, n_keep}``.
+    """
+    v = rec.get("idxK")
+    if not v:
+        return {}, {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    by_block, meta = {}, {}
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        parts = tok.split(":")
+        if "=" in parts[0]:
+            k, _, val = tok.partition("=")
+            meta[k] = val
+            continue
+        if len(parts) >= 2:
+            try:
+                by_block[int(parts[0])] = parts[1]
+            except ValueError:
+                continue
+    return by_block, meta
+
+
+def _c4dec_rdcarry(rec):
+    """Parse ``rdcarry=[<pos>=<sl>:<h>, ..]`` into ``{pos: "<sl>:<h>"}``."""
+    v = rec.get("rdcarry")
+    if not v:
+        return {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for tok in s.split(","):
+        tok = tok.strip()
+        if "=" not in tok:
+            continue
+        k, _, val = tok.partition("=")
+        out[k.strip()] = val.strip()
+    return out
+
+
+def _c4dec_split(rows):
+    """Split [C4DEC]/[IDXK] rows into requests (chat boundary, else layer reset)."""
+    return _c4pos_requests(rows)
+
+
+def _c4dec_produced_maps(group):
+    """``{layer: (idxK_by_block, kbase, rdcarry_by_pos)}`` for one request."""
+    out = {}
+    for r in group:
+        if not _is_prefill(r):
+            continue
+        idxk, _meta = _c4dec_idxk(r)
+        if not idxk:
+            continue
+        out[_int(r, "layer")] = (
+            idxk, r.get("kbase", ""), _c4dec_rdcarry(r))
+    return out
+
+
+def _c4dec_stored_maps(group):
+    """``{layer: {abs_block: md5}}`` of the stored [IDXK] pool content."""
+    out = {}
+    for r in group:
+        if not _is_prefill(r):
+            continue
+        blk = _parse_blkx(r, "blkx")
+        if not blk:
+            continue
+        out[_int(r, "layer")] = blk
+    return out
+
+
+def report_c4dec(rows, idxk_rows=()):
+    """``[C4DEC-VERDICT]`` produced idxK vs stored [IDXK] blkx, per absolute block.
+
+    produced = the compressor's PRODUCED compressed KV ([C4DEC] ``idxK``);
+    stored   = the POOL content per absolute block ([IDXK] ``blkx[j]``).
+    Requests are split the existing way (``start`` / sps: 0 => MISS, >0 => HIT).
+    Per shared (layer, absolute block j):
+
+      * produced MISS==HIT but stored MISS!=HIT  -> OUTPUT-SLOT
+        (scatter / c4_loc misplacement: the right value lands in the wrong slot)
+      * produced MISS!=HIT                       -> CONTENT, sub-split below
+      * else (all identical)                     -> SAME
+
+    CONTENT sub-split via [C4DEC] ``kbase`` / ``rdcarry``:
+      kbase differs                          -> CONTENT:K-SPLIT
+      kbase same + rdcarry differs           -> CONTENT:READ-MISALIGN (ReadState)
+      both same                              -> producer-internal (CONTENT)
+    """
+    print("\n== [C4DEC] produced idxK vs stored [IDXK] blkx (absolute block) ==")
+    if not rows:
+        print("  [C4DEC-VERDICT] no [C4DEC] rows (dump gate off?)")
+        print(C4DEC_RUNBOOK)
+        return
+    c4_reqs = _c4dec_split(rows)
+    miss_idx, hit_idx = [], []
+    for i, g in enumerate(c4_reqs):
+        starts = [s for s in (_c4dec_start_min(r) for r in g) if s is not None]
+        if not starts:
+            continue
+        (miss_idx if min(starts) == 0 else hit_idx).append(i)
+    if not miss_idx or not hit_idx:
+        print(f"  [C4DEC-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
+              f"-> need >=1 MISS (start==0) and >=1 HIT (start>0); none")
+        print(C4DEC_RUNBOOK)
+        return
+
+    idxk_groups = _c4dec_split(idxk_rows) if idxk_rows else []
+
+    def _stored(i):
+        return (_c4dec_stored_maps(idxk_groups[i])
+                if 0 <= i < len(idxk_groups) else {})
+
+    miss_prod = _c4dec_produced_maps(c4_reqs[miss_idx[0]])
+    stored_miss = _stored(miss_idx[0])
+    hit_prod = [_c4dec_produced_maps(c4_reqs[i]) for i in hit_idx]
+    hit_stored = [_stored(i) for i in hit_idx]
+
+    n_shared = 0
+    produced_same = True
+    stored_diff = False
+    kbase_diff = False
+    rdcarry_diff = False
+    rows_out = []
+    for ly in sorted(miss_prod):
+        pm_idxk, pm_kbase, pm_rd = miss_prod[ly]
+        sm_map = stored_miss.get(ly, {})
+        for hj, hm in enumerate(hit_prod):
+            if ly not in hm:
+                continue
+            ph_idxk, ph_kbase, ph_rd = hm[ly]
+            if pm_kbase != ph_kbase:
+                kbase_diff = True
+            if pm_rd != ph_rd:
+                rdcarry_diff = True
+            sh_map = hit_stored[hj].get(ly, {})
+            for j in sorted(set(pm_idxk) & set(ph_idxk)):
+                n_shared += 1
+                p_same = pm_idxk[j] == ph_idxk[j]
+                if not p_same:
+                    produced_same = False
+                s_m = sm_map.get(j)
+                s_h = sh_map.get(j)
+                if s_m is not None and s_h is not None and s_m != s_h:
+                    stored_diff = True
+                rows_out.append((ly, j, pm_idxk[j], ph_idxk[j],
+                                 s_m, s_h, p_same))
+
+    if not produced_same:
+        if kbase_diff:
+            verdict = "CONTENT:K-SPLIT"
+        elif rdcarry_diff:
+            verdict = "CONTENT:READ-MISALIGN"
+        else:
+            verdict = "CONTENT"
+    elif stored_diff:
+        verdict = "OUTPUT-SLOT"
+    else:
+        verdict = "SAME"
+
+    print(f"  [C4DEC-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
+          f"n_shared={n_shared} produced_same={produced_same} "
+          f"stored_diff={stored_diff} kbase_diff={kbase_diff} "
+          f"rdcarry_diff={rdcarry_diff} => {verdict}")
+
+    shown = 0
+    for (ly, j, pm, ph, s_m, s_h, p_same) in rows_out:
+        if verdict == "OUTPUT-SLOT":
+            keep = (p_same and s_m is not None and s_h is not None
+                    and s_m != s_h)
+        elif verdict.startswith("CONTENT"):
+            keep = not p_same
+        else:
+            keep = False
+        if not keep:
+            continue
+        print(f"  [C4DEC-VERDICT] layer={ly} block={j} prod_miss={pm} "
+              f"prod_hit={ph} stored_miss={s_m} stored_hit={s_h}")
+        shown += 1
+        if shown >= MAX_OFFENDER_SHOWN:
+            break
+    print(C4DEC_RUNBOOK)
+
+
 def _parse_kstateloc(recs):
     """Split raw [KSTATELOC] rows into (write op=W, read op=R) numeric dicts."""
     writes, reads = [], []
@@ -1720,7 +1963,7 @@ def verdict_c4stp(recs):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC", "C4POS"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC", "C4POS", "C4DEC"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -1739,13 +1982,17 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS", "C4DEC"):
         rows = recs.get(tag, [])
         if tag == "C4POS":
             # Emit this section ALWAYS (real verdict, or the no-data fallback
             # when the dump gate produced no rows), so the [C4POS] block is
             # visible on the executed main() path even with zero rows.
             report_c4pos(rows)
+            continue
+        if tag == "C4DEC":
+            # Same always-emit rule: needs the [IDXK] rows for the stored side.
+            report_c4dec(rows, recs.get("IDXK", []))
             continue
         if not rows:
             continue
@@ -2125,6 +2372,73 @@ def _selftest():
         #     no-data line) reaches stdout.
         g5_out = _run_main(g1_pos)
 
+        # --- [C4DEC] produced idxK vs stored [IDXK] blkx (3 verdict branches) ---
+        _KB_A = ("mBaseNum=137/kBaseNum=1 raw_tok=17523 headDim=128"
+                 "(attr=None,state=64) dBasicBlockNum=2 state_row_dim=64 "
+                 "thresh=274 usedCoreNum=unset")
+        _KB_B = ("mBaseNum=137/kBaseNum=2 raw_tok=17523 headDim=128"
+                 "(attr=None,state=64) dBasicBlockNum=2 state_row_dim=64 "
+                 "thresh=274 usedCoreNum=unset")
+        _RC_A = "[17528=40:aaaa,17529=41:bbbb]"
+        _RC_B = "[17528=41:cccc,17529=42:dddd]"
+
+        def _c4dec(ly, start, kbase, rd, blk_a, blk_b):
+            idxk = (f"[n_raw=2,n_keep=2,"
+                    f"10:{blk_a}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00,"
+                    f"11:{blk_b}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00]")
+            return (f"[C4DEC] layer={ly} idx=1 start=[{start}] "
+                    f"kbase={kbase} rdcarry={rd} idxK={idxk}")
+
+        def _idxk_line(ly, h10, h11):
+            blkx = f"['10:{h10}', '11:{h11}']"
+            return (f"[IDXK] layer={ly} mode=EXTEND logical=ll "
+                    f"blkx={blkx} ptab=['10:7', '11:8']")
+
+        def _parse_src(src_lines):
+            fd5, p5 = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
+            try:
+                with os.fdopen(fd5, "w", encoding="utf-8") as fh5:
+                    fh5.write("\n".join(src_lines) + "\n")
+                return parse(p5)
+            finally:
+                try:
+                    os.remove(p5)
+                except OSError:
+                    pass
+
+        _chat = "/v1/chat/completions"
+        # H1 OUTPUT-SLOT: produced MISS==HIT, stored MISS!=HIT at block 10.
+        c4dec_slot = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "aaaa", "bbbb"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 17536, _KB_A, _RC_A, "aaaa", "bbbb"),
+            _idxk_line(2, "p333", "p222"),
+        ]
+        # H2 CONTENT:K-SPLIT: produced differs + kbase differs.
+        c4dec_ksplit = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "aaaa", "bbbb"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 17536, _KB_B, _RC_A, "cccc", "bbbb"),
+            _idxk_line(2, "p111", "p222"),
+        ]
+        # H3 CONTENT:READ-MISALIGN: produced differs, kbase same, rdcarry differs.
+        c4dec_rmis = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "aaaa", "bbbb"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 17536, _KB_A, _RC_B, "cccc", "bbbb"),
+            _idxk_line(2, "p111", "p222"),
+        ]
+        c4slot_out = _run_main(c4dec_slot)
+        c4ksplit_out = _run_main(c4dec_ksplit)
+        c4rmis_out = _run_main(c4dec_rmis)
+        _slot_c4 = _parse_src(c4dec_slot).get("C4DEC", [])
+
         b1_rows, b1_out = _run_nocmp(nocmp_rope)
         b2_rows, b2_out = _run_nocmp(nocmp_content)
         c1_rows, c1_out = _run_nocmp(same_slq)
@@ -2244,6 +2558,27 @@ def _selftest():
             ("[C4POS] real main() prints no-data fallback when no rows",
              "== [C4POS]" in no_c4pos_out
              and "no [C4POS] rows (dump gate off?)" in no_c4pos_out),
+            ("[C4DEC] parse: full kbase + 2 idxK blocks + start==0",
+             bool(_slot_c4)
+             and _slot_c4[0].get("kbase") == _KB_A
+             and len(_c4dec_idxk(_slot_c4[0])[0]) == 2
+             and _c4dec_start_min(_slot_c4[0]) == 0),
+            ("[C4DEC] produced==produced but stored differs -> OUTPUT-SLOT",
+             "== [C4DEC]" in c4slot_out
+             and "=> OUTPUT-SLOT" in c4slot_out
+             and "produced_same=True" in c4slot_out
+             and "stored_diff=True" in c4slot_out
+             and "block=10" in c4slot_out),
+            ("[C4DEC] produced differs + kbase differs -> CONTENT:K-SPLIT",
+             "=> CONTENT:K-SPLIT" in c4ksplit_out
+             and "produced_same=False" in c4ksplit_out
+             and "kbase_diff=True" in c4ksplit_out),
+            ("[C4DEC] produced differs, kbase same, rdcarry differs"
+             " -> CONTENT:READ-MISALIGN",
+             "=> CONTENT:READ-MISALIGN" in c4rmis_out
+             and "produced_same=False" in c4rmis_out
+             and "kbase_diff=False" in c4rmis_out
+             and "rdcarry_diff=True" in c4rmis_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
