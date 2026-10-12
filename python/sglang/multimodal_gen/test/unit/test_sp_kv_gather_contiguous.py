@@ -10,12 +10,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestSequenceParallelKvGatherContiguous(unittest.TestCase):
+class TestSequenceParallelKvGatherContiguous(CustomTestCase):
     def test_noncontiguous_kv_chunk_is_materialized_before_all_gather(self):
         packed = torch.randn(2, 8, 12)
         key = packed.chunk(3, dim=-1)[1]
