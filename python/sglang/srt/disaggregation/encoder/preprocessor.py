@@ -338,6 +338,12 @@ class EncoderPreprocessor:
                     and img.mode != "RGB"
                 ):
                     img = img.convert("RGB")
+                elif (
+                    envs.SGLANG_ENCODER_EAGER_IMAGE_DECODE.get()
+                    and not isinstance(img, torch.Tensor)
+                ):
+                    # PIL decodes lazily; force it in the encoder I/O worker.
+                    img.load()
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
