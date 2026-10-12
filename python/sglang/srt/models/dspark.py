@@ -9,10 +9,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    gather_and_crop_vocab,
+    lm_head_logits_dtype,
+    project_through_lm_head,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -36,30 +39,6 @@ logger = logging.getLogger(__name__)
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
-
-
-def gather_and_crop_vocab(
-    local_logits: torch.Tensor, lm_head: nn.Module
-) -> torch.Tensor:
-    full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
-    return full_logits[..., : int(lm_head.org_vocab_size)]
-
-
-def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
-    """Project draft hidden states through the target head; a quantized head
-    stores `weight` packed, so it needs its own kernel instead of a matmul."""
-    quant_method = lm_head.quant_method
-    if should_apply_lm_head_quant_method(lm_head, quant_method):
-        return quant_method.apply(lm_head, hidden, None)
-    weight = lm_head.weight
-    return torch.matmul(hidden.to(weight.dtype), weight.T)
-
-
-def lm_head_logits_dtype(lm_head: nn.Module, hidden_dtype: torch.dtype) -> torch.dtype:
-    """The dtype ``project_through_lm_head`` returns for hidden of ``hidden_dtype``."""
-    if should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
-        return hidden_dtype
-    return lm_head.weight.dtype
 
 
 class VocabShard(msgspec.Struct, frozen=True):
