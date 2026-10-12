@@ -1,7 +1,7 @@
-"""XPU Prefill Full Graph smoke test.
+"""XPU Full Graph integration test.
 
 Usage:
-    python3 -m unittest test_xpu_graph.TestXPUGraph.test_prefill_full_graph_runs
+    python3 -m unittest test_xpu_graph.TestXPUGraph.test_full_graph_runs
 """
 
 import unittest
@@ -21,9 +21,9 @@ _FULL_IO_ARGS = ["--input", "128", "--output", "16"]
 
 
 class TestXPUGraph(CustomTestCase):
-    """Decode Full Graph plus XPU Prefill Full Graph."""
+    """Decode Full Graph plus Prefill Full Graph."""
 
-    def test_prefill_full_graph_runs(self):
+    def test_full_graph_runs(self):
         args = [
             "--device",
             "xpu",
@@ -35,7 +35,7 @@ class TestXPUGraph(CustomTestCase):
             "--batch-size",
             "1",
             "--cuda-graph-config",
-            '{"decode":{"backend":"full"},"prefill":{"backend":"full"}}',
+            '{"decode":{"backend":"full"},"prefill":{"backend":"full","full_prefill_max_req":4}}',
             "--cuda-graph-bs-prefill",
             "64",
             "128",
@@ -50,6 +50,7 @@ class TestXPUGraph(CustomTestCase):
         )
         self.assertGreater(
             prefill_latency,
+            0,
             "prefill latency must be > 0 with full prefill XPU graph",
         )
         self.assertGreater(

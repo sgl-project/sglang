@@ -161,10 +161,9 @@ def handle_xpu_backends(server_args: Any):
             Backend.DISABLED,
             Backend.FULL,
             Backend.BREAKABLE,
-            Backend.TC_PIECEWISE,
         ):
             logger.warning(
-                "XPU platform only supports prefill backends 'full', 'breakable', and 'tc_piecewise'; "
+                "XPU platform only supports prefill backends 'full' and 'breakable'; "
                 "disabling unsupported prefill backend '%s'.",
                 cfg.cuda_graph_config.prefill.backend,
             )

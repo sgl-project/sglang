@@ -117,6 +117,7 @@ def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
+    model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
