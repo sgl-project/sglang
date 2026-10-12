@@ -74,6 +74,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
+        scheduler.recv_skipper = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
         scheduler.running_batch = MagicMock()

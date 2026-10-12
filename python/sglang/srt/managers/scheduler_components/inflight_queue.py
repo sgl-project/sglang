@@ -36,9 +36,6 @@ class InflightQueue:
         self.blocking = blocking
         # Completed loop steps; only end_step advances it.
         self.step = 0
-        # The live batch the last completed step launched, or None. Read only
-        # by the scheduler's debug check against last_batch.
-        self.last_launched: Optional[ScheduleBatch] = None
         self._records: Deque[StepRecord] = deque()
 
     def can_launch(self) -> bool:
@@ -64,7 +61,6 @@ class InflightQueue:
         """Remove every record, oldest first, regardless of age."""
         records = list(self._records)
         self._records.clear()
-        self.last_launched = None
         return records
 
     def head(self) -> StepRecord:
@@ -73,9 +69,8 @@ class InflightQueue:
     def newest(self) -> Optional[StepRecord]:
         return self._records[-1] if self._records else None
 
-    def end_step(self, launched: Optional[ScheduleBatch]) -> None:
+    def end_step(self) -> None:
         self.step += 1
-        self.last_launched = launched
 
     def __len__(self) -> int:
         return len(self._records)

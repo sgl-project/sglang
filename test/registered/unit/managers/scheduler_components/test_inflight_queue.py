@@ -17,27 +17,25 @@ class TestInflightQueue(CustomTestCase):
         self.assertTrue(q.has_due())
         record = q.pop_due()
         self.assertEqual((record.batch, record.result), ("b0", "r0"))
-        q.end_step("b0")
+        q.end_step()
         self.assertEqual(len(q), 0)
-        self.assertEqual(q.last_launched, "b0")
 
     def test_depth_one_commits_one_completed_step_later(self):
         q = InflightQueue(depth=1)
         q.push("b0", "r0")
         self.assertFalse(q.has_due())
-        q.end_step("b0")
+        q.end_step()
         # The next step launches b1 before committing b0; b1 is not due yet.
         self.assertTrue(q.can_launch())
         q.push("b1", "r1")
         self.assertTrue(q.has_due())
         self.assertEqual(q.pop_due().batch, "b0")
         self.assertFalse(q.has_due())
-        q.end_step("b1")
+        q.end_step()
         # A step that launches nothing still commits the previous record.
         self.assertEqual(q.pop_due().batch, "b1")
-        q.end_step(None)
+        q.end_step()
         self.assertFalse(q.has_due())
-        self.assertIsNone(q.last_launched)
 
     def test_launch_cap_is_depth_plus_one(self):
         q = InflightQueue(depth=1, blocking=False)
@@ -51,12 +49,11 @@ class TestInflightQueue(CustomTestCase):
     def test_drain_takes_every_record_oldest_first(self):
         q = InflightQueue(depth=1)
         q.push("b0", "r0")
-        q.end_step("b0")
+        q.end_step()
         q.push("b1", "r1")
         self.assertEqual([record.batch for record in q.drain()], ["b0", "b1"])
         self.assertEqual(len(q), 0)
         self.assertIsNone(q.newest())
-        self.assertIsNone(q.last_launched)
 
     def test_step_rule_matches_last_batch_gate(self):
         # Differential against the gate the loops used before the queue: commit
@@ -108,7 +105,7 @@ class TestInflightQueue(CustomTestCase):
                         continue
                     self.assertEqual(q.pop_due().batch, pending.popleft())
                 last_batch = batch
-                q.end_step(batch)
+                q.end_step()
                 waiting = False
                 self.assertLessEqual(len(q), q.depth)
 

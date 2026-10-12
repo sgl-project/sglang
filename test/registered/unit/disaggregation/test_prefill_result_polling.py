@@ -121,7 +121,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _commit_due_step = Scheduler._commit_due_step
     _debug_check_commit_gate = Scheduler._debug_check_commit_gate
-    _debug_check_last_launched = Scheduler._debug_check_last_launched
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 
@@ -164,6 +163,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.last_batch = None
+        self.recv_skipper = None
         self.inflight_steps = InflightQueue(depth=0)
         self.chunked_req = None
         self.decode_offload_manager = None

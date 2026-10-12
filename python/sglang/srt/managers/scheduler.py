@@ -1972,8 +1972,9 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -2044,8 +2045,9 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -2058,10 +2060,6 @@ class Scheduler(
         # A record is due exactly when the last_batch gate would commit.
         if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
             assert self.inflight_steps.has_due() == last_batch_gate
-
-    def _debug_check_last_launched(self) -> None:
-        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
-            assert self.inflight_steps.last_launched is self.last_batch
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -2390,7 +2388,6 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
-            get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -5345,8 +5342,8 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            # Empty when idle; this resets last_launched with last_batch.
-            self.inflight_steps.drain()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(None)
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5612,7 +5609,7 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and len(self.inflight_steps) > 0:
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
                 and (req := self.chunked_req) is not None
@@ -5660,6 +5657,8 @@ class Scheduler(
                 retract_reqs += staged
 
         self.last_batch = None
+        if self.recv_skipper is not None:
+            self.recv_skipper.on_launch(None)
         self.cur_batch_for_debug = None
 
         if self.decode_offload_manager is not None:

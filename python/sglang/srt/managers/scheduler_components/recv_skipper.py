@@ -44,6 +44,12 @@ class SchedulerRecvSkipper:
             ForwardMode.TARGET_VERIFY: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY.get(),
             None: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE.get(),
         }
+        self._last_mode: Optional[ForwardMode] = None
+
+    def on_launch(self, batch: Optional[ScheduleBatch]) -> None:
+        """Record the batch launched last (None if none); its mode weighs the
+        following recv calls."""
+        self._last_mode = self._pick_mode(batch)
 
     def _pick_mode(self, last_batch: Optional[ScheduleBatch]) -> Optional[ForwardMode]:
         # The recv decision must be identical on every rank in the request
@@ -55,11 +61,11 @@ class SchedulerRecvSkipper:
             return last_batch.recv_skipper_forward_mode
         return last_batch.forward_mode
 
-    def handle(self, last_batch: Optional[ScheduleBatch]) -> bool:
+    def handle(self) -> bool:
         should_recv = False
 
         last_weight = self._weight_of_forward_mode.get(
-            self._pick_mode(last_batch), self._default_weight
+            self._last_mode, self._default_weight
         )
         self._counter += last_weight
 

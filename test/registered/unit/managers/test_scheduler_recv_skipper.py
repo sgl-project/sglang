@@ -49,35 +49,39 @@ class TestSchedulerRecvSkipper(CustomTestCase):
     def test_no_last_batch_accumulates_slowly(self):
         _publish(self, 50)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(None))
+        skipper.on_launch(None)
+        self.assertFalse(skipper.handle())
 
     def test_decode_accumulates_until_threshold(self):
         # DECODE weight = 1: recv only every `interval` decode steps.
         _publish(self, 3)
         skipper = SchedulerRecvSkipper.maybe_create()
-        decode = _batch(ForwardMode.DECODE)
-        self.assertFalse(skipper.handle(decode))  # counter 1
-        self.assertFalse(skipper.handle(decode))  # counter 2
-        self.assertTrue(skipper.handle(decode))  # counter 3 -> recv, reset
-        self.assertFalse(skipper.handle(decode))  # counter 1 again
+        skipper.on_launch(_batch(ForwardMode.DECODE))
+        self.assertFalse(skipper.handle())  # counter 1
+        self.assertFalse(skipper.handle())  # counter 2
+        self.assertTrue(skipper.handle())  # counter 3 -> recv, reset
+        self.assertFalse(skipper.handle())  # counter 1 again
 
     def test_prefill_triggers_recv_immediately(self):
         # Non-decode passes use the large default weight: recv right away.
         _publish(self, 50)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertTrue(skipper.handle(_batch(ForwardMode.EXTEND)))
+        skipper.on_launch(_batch(ForwardMode.EXTEND))
+        self.assertTrue(skipper.handle())
 
     def test_dp_uses_synced_mode_not_local(self):
         # Local EXTEND (weight 1000) must be ignored in favor of the synced
         # DECODE (weight 1); a recv here would mean the local mode leaked in.
         _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(_batch(ForwardMode.EXTEND, ForwardMode.DECODE)))
+        skipper.on_launch(_batch(ForwardMode.EXTEND, ForwardMode.DECODE))
+        self.assertFalse(skipper.handle())
 
     def test_dp_synced_extend_triggers_recv(self):
         _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertTrue(skipper.handle(_batch(ForwardMode.IDLE, ForwardMode.EXTEND)))
+        skipper.on_launch(_batch(ForwardMode.IDLE, ForwardMode.EXTEND))
+        self.assertTrue(skipper.handle())
 
     def test_derive_forward_mode(self):
         derive = SchedulerRecvSkipper.derive_forward_mode

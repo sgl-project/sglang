@@ -3025,13 +3025,16 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.inflight_steps = InflightQueue(depth=1)
         self.last_batch: Optional[ScheduleBatch] = None
+        if self.recv_skipper is not None:
+            self.recv_skipper.on_launch(None)
 
         while True:
             if self.gracefully_exit:
@@ -3090,8 +3093,9 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(

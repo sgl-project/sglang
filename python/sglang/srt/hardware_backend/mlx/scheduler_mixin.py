@@ -260,6 +260,8 @@ class SchedulerMlxOverlapMixin:
             ):
                 self.cur_batch_for_debug = pending_next.schedule_batch
                 self.last_batch = pending_next.schedule_batch
+                if self.recv_skipper is not None:
+                    self.recv_skipper.on_launch(pending_next.schedule_batch)
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
                 continue
@@ -282,5 +284,7 @@ class SchedulerMlxOverlapMixin:
                 self.on_idle()
 
             self.last_batch = next_batch
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(next_batch)
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()

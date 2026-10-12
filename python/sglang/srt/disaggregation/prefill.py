@@ -701,8 +701,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
     def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
         """Check support once on entry to the prefill overlap loop."""
@@ -833,8 +834,9 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch and scheduler status
             self._sched_idled = batch is None
             self.last_batch = batch
-            self.inflight_steps.end_step(batch)
-            self._debug_check_last_launched()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
             waiting_for_batch_result = False
 
     def is_disagg_prefill_batch_result_ready(

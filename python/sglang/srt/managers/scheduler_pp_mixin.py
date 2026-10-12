@@ -128,6 +128,8 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                if self.recv_skipper is not None:
+                    self.recv_skipper.on_launch(self.last_batch)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -257,6 +259,8 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                if self.recv_skipper is not None:
+                    self.recv_skipper.on_launch(self.last_batch)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -384,6 +388,8 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                if self.recv_skipper is not None:
+                    self.recv_skipper.on_launch(self.last_batch)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size

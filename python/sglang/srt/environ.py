@@ -496,7 +496,7 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     # Each event loop step: the in-flight step queue commits exactly when the
-    # last_batch gate would, and its last launched batch is last_batch.
+    # last_batch gate would.
     SGLANG_DEBUG_INFLIGHT_STEPS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
