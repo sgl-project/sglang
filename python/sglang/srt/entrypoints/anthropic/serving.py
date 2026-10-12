@@ -10,9 +10,10 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -155,6 +156,15 @@ def _extract_system_text(
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+async def _prepend_line(
+    first: Optional[str], rest: AsyncIterator[str]
+) -> AsyncGenerator[str, None]:
+    if first is not None:
+        yield first
+    async for line in rest:
+        yield line
 
 
 def _scrub_error_message(message: str, status_code: int) -> str:
@@ -811,12 +821,57 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
+        # Pull the first OpenAI chunk before committing HTTP 200, as
+        # OpenAIServingChat._handle_streaming_request does, so a rejection
+        # raised before it (raise_pre_stream_abort, e.g. queue full) is
+        # returned with its real status code.
+        openai_stream = self.openai_serving_chat._generate_chat_stream(
+            adapted_request, processed_request, raw_request
+        )
+        try:
+            first_line = await openai_stream.__anext__()
+        except StopAsyncIteration:
+            first_line = None
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as e:
+            # An engine-side rejection (raise_pre_stream_abort). Its overload
+            # message is safe to forward; other 5xx details are scrubbed.
+            logger.warning(
+                "Streaming request rejected before first chunk: %s %s",
+                e.status_code,
+                e.detail,
+            )
+            message = str(e.detail)
+            if e.status_code != HTTPStatus.SERVICE_UNAVAILABLE:
+                message = _scrub_error_message(message, e.status_code)
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=message,
+            )
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=_scrub_error_message(str(e), 400),
+            )
+        except Exception as e:
+            logger.exception("Error starting streaming request: %s", e)
+            return self._error_response(
+                status_code=500,
+                error_type="api_error",
+                message="Internal server error",
+                exception_name=type(e).__name__,
+            )
+
         return StreamingResponse(
             self._generate_anthropic_stream(
                 adapted_request,
                 processed_request,
                 anthropic_request,
                 raw_request,
+                openai_stream=_prepend_line(first_line, openai_stream),
             ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
@@ -830,11 +885,13 @@ class AnthropicServing:
         processed_request: ChatCompletionRequest,
         anthropic_request: AnthropicMessagesRequest,
         raw_request: Request,
+        openai_stream: AsyncIterator[str],
     ) -> AsyncGenerator[str, None]:
-        """Convert OpenAI chat stream to Anthropic event stream."""
-        openai_stream = self.openai_serving_chat._generate_chat_stream(
-            adapted_request, processed_request, raw_request
-        )
+        """Convert OpenAI chat stream to Anthropic event stream.
+
+        ``openai_stream`` is the OpenAI chat stream; ``_handle_streaming`` has
+        already answered any error raised before its first chunk.
+        """
 
         content_block_index = 0
         content_block_open = False
@@ -986,11 +1043,10 @@ class AnthropicServing:
             )
             return error_type, str(upstream_message)
 
-        # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization
-        # failure that raises ValueError before any chunk is yielded) would
-        # otherwise abort the StreamingResponse with no envelope at all and
-        # the client would see a half-open SSE / TCP close. Catch them here
-        # and emit a clean Anthropic error sequence instead.
+        # An exception from the OpenAI stream would otherwise abort the
+        # StreamingResponse with no envelope at all and the client would see a
+        # half-open SSE / TCP close. Catch it and emit a clean Anthropic error
+        # sequence instead.
         try:
             stream_iter = openai_stream.__aiter__()
         except Exception as e:
@@ -1006,17 +1062,6 @@ class AnthropicServing:
                 break
             except asyncio.CancelledError:
                 raise
-            except ValueError as e:
-                # _generate_chat_stream re-raises ValueError when its own
-                # ``stream_started`` flag is still False — surface as a
-                # proper Anthropic error event rather than aborting the
-                # StreamingResponse generator.
-                logger.warning("OpenAI stream raised before first chunk: %s", e)
-                for frame in _flush_on_error(
-                    "invalid_request_error", str(e) or "Request failed"
-                ):
-                    yield frame
-                return
             except Exception as e:
                 logger.exception("OpenAI stream raised mid-flight: %s", e)
                 for frame in _flush_on_error("api_error", "Internal server error"):
