@@ -87,7 +87,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 self.calls.reset_mock()
                 for _ in range(2):
                     plan = s.get_next_disagg_prefill_batch_to_run(
-                        decoding_batch=self.decoding_batch, last_batch=None
+                        decoding_batch=self.decoding_batch
                     )
                     self.assertIsNone(plan.batch_to_run)
                 self.assertEqual(

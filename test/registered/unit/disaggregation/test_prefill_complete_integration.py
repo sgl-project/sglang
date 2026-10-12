@@ -566,7 +566,7 @@ class TestAllocationIntegration(CustomTestCase):
                             "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
                         ):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
-                                scheduler, None
+                                scheduler
                             )
                         if policy == "prefill_complete":
                             self.assertIs(scheduler.chunked_req, req)

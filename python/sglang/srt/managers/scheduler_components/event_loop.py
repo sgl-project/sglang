@@ -195,9 +195,7 @@ def _plan(self: Scheduler) -> Optional[ScheduleBatch]:
 
 
 def _plan_pd_prefill(self: Scheduler) -> Optional[ScheduleBatch]:
-    plan = self.get_next_disagg_prefill_batch_to_run(
-        decoding_batch=self.decoding_batch, last_batch=self.last_batch
-    )
+    plan = self.get_next_disagg_prefill_batch_to_run(decoding_batch=self.decoding_batch)
     batch = plan.batch_to_run
     return self.ngram_embedding_manager.prepare_for_forward(
         batch, chunked_req=self.chunked_req

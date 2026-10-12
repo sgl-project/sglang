@@ -631,7 +631,6 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
         decoding_batch: DecodingBatch,
-        last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
@@ -645,7 +644,7 @@ class SchedulerDisaggregationPrefillMixin:
         # replan in the same step sees the same step in flight.
         inflight = self.inflight_steps.newest()
         if inflight is None or not inflight.prefill_chunk_done:
-            self.process_prefill_chunk(last_batch=last_batch)
+            self.process_prefill_chunk()
             if inflight is not None:
                 inflight.prefill_chunk_done = True
 
@@ -744,7 +743,6 @@ class SchedulerDisaggregationPrefillMixin:
                 # Get the next batch to run
                 plan = self.get_next_disagg_prefill_batch_to_run(
                     decoding_batch=self.decoding_batch,
-                    last_batch=self.last_batch,
                     # Storage retry deadlines count scheduling steps, not copy polls.
                     should_retry_storage_prefetch=not waiting_for_batch_result,
                 )
@@ -1332,12 +1330,8 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
-    def process_prefill_chunk(
-        self: Scheduler, last_batch: Optional[ScheduleBatch]
-    ) -> None:
-        reqs_to_exclude = set()
+    def process_prefill_chunk(self: Scheduler) -> None:
         if (req := self.chunked_req) is not None:
-            reqs_to_exclude.add(req)
             self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
@@ -1363,14 +1357,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             else:
                 self.send_kv_chunk(req)
-
-        if last_batch and last_batch.forward_mode.is_extend():
-            if last_batch.chunked_req:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                reqs_to_exclude.add(last_batch.chunked_req)
-
-            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():

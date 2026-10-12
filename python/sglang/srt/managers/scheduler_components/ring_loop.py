@@ -238,7 +238,7 @@ def _plan(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
 
 
 def _plan_pd_prefill(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
-    self.process_prefill_chunk(last_batch=self._pp_slot_last_batch(slot.mb_id))
+    self.process_prefill_chunk()
     self._process_hicache_events()
     prefill_plan = self.get_new_batch_prefill(self.decoding_batch)
     batch = prefill_plan.batch_to_run
