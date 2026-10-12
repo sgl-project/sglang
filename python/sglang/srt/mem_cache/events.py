@@ -114,7 +114,11 @@ class KvEventLoraNames(LoRANameTable):
         if lora_id is not None:
             self._adapter_names[lora_id] = lora_name
             return
-        if req.lora_id is None or not lora_name:
+        if req.lora_id is None:
+            return
+        # Older IPC senders omit the optional name; admission still resolves an ID.
+        lora_name = lora_name or self._adapter_names.get(req.lora_id)
+        if not lora_name:
             return
         self._names[req.extra_key] = lora_name
         self._requests.setdefault(req.extra_key, weakref.WeakSet()).add(req)

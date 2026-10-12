@@ -1627,6 +1627,24 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         )
         self.assertEqual(lora[0].lora_name, "adapter-a")
 
+    def test_lora_request_without_optional_ipc_name_uses_loaded_adapter(self):
+        names = KvEventLoraNames()
+        names.register(lora_id="loaded-id", lora_name="adapter-a")
+        req = _LoraReq("user|loaded-id", lora_id="loaded-id")
+        names.register(req)
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key=req.extra_key)
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(stored[0].lora_name, "adapter-a")
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(
+            self._event_hashes(self._removed_events(cache, StorageMedium.GPU)),
+            self._event_hashes(stored),
+        )
+
     def test_lora_name_is_kept_until_published_blocks_are_removed(self):
         """Removals hash like their stores after the request is gone; then the
         name is forgotten, so the table does not grow without bound."""
