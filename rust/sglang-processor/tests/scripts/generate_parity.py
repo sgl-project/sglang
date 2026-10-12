@@ -57,7 +57,7 @@ class RecordingTokenizer:
 
 def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
-    a reasoning parser."""
+    a reasoning parser. Served text-only: the processor leaves media to the engine."""
     server = object.__new__(OpenAIServingChat)
     server.tokenizer_manager = SimpleNamespace(
         tokenizer=tokenizer,
