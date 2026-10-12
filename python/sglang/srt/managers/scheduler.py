@@ -3952,8 +3952,9 @@ class Scheduler(
     ) -> Optional[AdmissionSkipReason]:
         """Why this step's admission cannot admit anything, or None to run it.
 
-        Reads only current state, and is checked before admission touches any
-        state, so a skipped step leaves the same state as an empty admission.
+        Reads only current state. It is checked after ready grammar requests
+        join the waiting queue and before the admission pass sorts that queue
+        or touches the cache.
         """
         # A chunked request always continues: under PP it can start in one
         # micro-batch and end in another, so its slot is not counted here.

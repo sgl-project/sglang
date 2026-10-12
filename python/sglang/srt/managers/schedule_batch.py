@@ -3968,5 +3968,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class NextBatchPlan(msgspec.Struct):
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
-    # Set when this step skipped admission before touching any state.
+    # Set when this step skipped the admission pass before it sorted the
+    # waiting queue or touched the cache.
     admission_skip_reason: Optional[AdmissionSkipReason] = None
