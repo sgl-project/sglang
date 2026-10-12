@@ -522,7 +522,9 @@ pub struct Proxy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutKind {
     /// The KERNEL gave up on the socket: an `io::ErrorKind::TimedOut` that the
-    /// OS itself raised (`ETIMEDOUT`). Not caused by any budget we set.
+    /// OS itself raised (`ETIMEDOUT`) once the peer stayed silent past the
+    /// socket's `TCP_USER_TIMEOUT` (`EngineTcpKeepalive::user_timeout`). Not
+    /// one of our request budgets.
     Socket,
     /// One of OUR budgets elapsed — `.timeout(request_timeout)` or
     /// `connect_timeout`. Actionable by changing that budget.
@@ -571,14 +573,124 @@ fn timeout_kind(source: &anyhow::Error) -> TimeoutKind {
     TimeoutKind::None
 }
 
-/// Build a forwarding client for `protocol`, sharing pool/connect tuning
-/// across protocols. The h2c variant pins HTTP/2 prior knowledge so it
+/// TCP keepalive on forwarding connections. A non-streaming request sits silent
+/// for minutes while the engine generates, and keepalive probes are the only
+/// traffic on the socket meanwhile.
+///
+/// With keepalive on, Linux resets the socket once `TCP_USER_TIMEOUT` has
+/// passed since the peer last acknowledged anything while a probe is
+/// outstanding, whatever the retry count says. reqwest's defaults set the user
+/// timeout to exactly idle + interval, so they kill an in-flight request on ONE
+/// lost probe or ACK: the kernel raises `ETIMEDOUT` at the next tick and the
+/// router answers `upstream_socket_timeout`. All four are set explicitly so no
+/// reqwest default decides it. The user timeout is the binding limit (see
+/// [`Self::probes_before_reset`]); the retry count covers platforms where
+/// reqwest does not set a user timeout.
+///
+/// The user timeout is not keepalive-only. It also caps how long sent data may
+/// go unacknowledged (and, on current kernels, how long a zero receive window
+/// may last: an engine that stops reading a large request body). So it is also
+/// how long a silently dead engine holds a request before it fails with
+/// `upstream_socket_timeout`. Lowering it buys faster dead-peer detection at
+/// the cost of probe-loss tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineTcpKeepalive {
+    /// Silence before the first probe (`TCP_KEEPIDLE`).
+    pub idle: Duration,
+    /// Gap between probes (`TCP_KEEPINTVL`).
+    pub interval: Duration,
+    /// Unanswered probes before a reset where no user timeout applies
+    /// (`TCP_KEEPCNT`).
+    pub retries: u32,
+    /// `TCP_USER_TIMEOUT`. Applied only where reqwest sets it (Linux, Android,
+    /// Fuchsia).
+    pub user_timeout: Duration,
+}
+
+impl EngineTcpKeepalive {
+    pub const DEFAULT: Self = Self {
+        idle: Duration::from_secs(15),
+        interval: Duration::from_secs(15),
+        retries: 8,
+        user_timeout: Duration::from_secs(120),
+    };
+
+    /// Probes Linux sends to a silent peer before the user timeout resets the
+    /// socket. The kernel checks the user timeout at each probe tick (`idle +
+    /// k * interval`) and resets on the first tick at or past it, except that
+    /// the first tick always probes (it resets only with a probe outstanding),
+    /// so the count is at least 1. The socket survives as long as one of these
+    /// probes is answered.
+    pub fn probes_before_reset(&self) -> u128 {
+        let idle = self.idle.as_millis();
+        let interval = self.interval.as_millis().max(1);
+        self.user_timeout
+            .as_millis()
+            .saturating_sub(idle)
+            .div_ceil(interval)
+            .max(1)
+    }
+
+    /// Reject values the kernel would refuse. hyper-util only logs a failed
+    /// `setsockopt` and connects anyway, so without this a typo would ship
+    /// sockets on the kernel defaults with nothing failing. Bounds are Linux's
+    /// (`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL`, `MAX_TCP_KEEPCNT`, and the
+    /// `int` milliseconds `TCP_USER_TIMEOUT` takes).
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        const MAX_KEEPALIVE_SECS: u64 = 32767;
+        const MAX_KEEPCNT: u32 = 127;
+        for (name, d) in [("idle", self.idle), ("interval", self.interval)] {
+            if !(1..=MAX_KEEPALIVE_SECS).contains(&d.as_secs()) {
+                anyhow::bail!("keepalive {name} must be 1..={MAX_KEEPALIVE_SECS} s (got {d:?})");
+            }
+        }
+        if !(1..=MAX_KEEPCNT).contains(&self.retries) {
+            anyhow::bail!(
+                "keepalive retries must be 1..={MAX_KEEPCNT} (got {})",
+                self.retries
+            );
+        }
+        if self.user_timeout.is_zero() || self.user_timeout.as_millis() > i32::MAX as u128 {
+            anyhow::bail!(
+                "TCP user timeout must be > 0 and at most {} ms (got {:?})",
+                i32::MAX,
+                self.user_timeout
+            );
+        }
+        if self.probes_before_reset() < 2 {
+            anyhow::bail!(
+                "TCP user timeout ({:?}) must exceed keepalive idle + interval ({:?}): \
+                 otherwise one lost probe or ACK resets an in-flight request",
+                self.user_timeout,
+                self.idle + self.interval
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for EngineTcpKeepalive {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Build a forwarding client for `protocol`, sharing pool/connect/keepalive
+/// tuning across protocols. The h2c variant pins HTTP/2 prior knowledge so it
 /// speaks cleartext h2c to Granian engines (no ALPN on plaintext); the
 /// HTTP/1.1 variant is the reqwest default and is safe against any engine.
-fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
+fn build_client(
+    protocol: WireProtocol,
+    keepalive: &EngineTcpKeepalive,
+) -> Result<Client, anyhow::Error> {
     let builder = Client::builder()
         .pool_max_idle_per_host(64)
-        .connect_timeout(Duration::from_secs(5));
+        .connect_timeout(Duration::from_secs(5))
+        .tcp_keepalive(keepalive.idle)
+        .tcp_keepalive_interval(keepalive.interval)
+        .tcp_keepalive_retries(keepalive.retries);
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(keepalive.user_timeout);
     match protocol {
         WireProtocol::Http1 => builder,
         WireProtocol::H2c => builder.http2_prior_knowledge(),
@@ -597,9 +709,21 @@ impl Proxy {
     /// [`WireProtocol`] — there is no per-request build and no fleet-wide
     /// lock-in.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
+        Self::with_engine_tcp(request_timeout, &EngineTcpKeepalive::DEFAULT)
+    }
+
+    /// [`Self::new`] with the engine sockets' keepalive tuning taken from
+    /// configuration instead of [`EngineTcpKeepalive::DEFAULT`]. Runs
+    /// [`EngineTcpKeepalive::validate`] itself, so a caller that skips config
+    /// load cannot build sockets the kernel refuses.
+    pub fn with_engine_tcp(
+        request_timeout: Duration,
+        keepalive: &EngineTcpKeepalive,
+    ) -> Result<Self, anyhow::Error> {
+        keepalive.validate().context("engine TCP keepalive")?;
         Ok(Self {
-            http1_client: build_client(WireProtocol::Http1)?,
-            h2c_client: build_client(WireProtocol::H2c)?,
+            http1_client: build_client(WireProtocol::Http1, keepalive)?,
+            h2c_client: build_client(WireProtocol::H2c, keepalive)?,
             request_timeout,
             // Defaults; prod overrides from config via `with_stream_timeouts`.
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
@@ -610,7 +734,7 @@ impl Proxy {
     }
 
     /// Override the streaming stall budgets (upstream idle / client backpressure)
-    /// from configuration. Chained after [`Self::new`] at startup; tests that
+    /// from configuration. Chained after [`Self::with_engine_tcp`] at startup; tests that
     /// build a bare `Proxy` keep the `STREAM_IDLE_TIMEOUT` / `STREAM_SEND_STALL`
     /// defaults.
     pub fn with_stream_timeouts(
@@ -726,7 +850,8 @@ impl Proxy {
     ///   `connect_timeout`) expired. Actionable by changing the budget.
     /// * `UpstreamSocketTimeout` — the SOCKET gave up under us (kernel
     ///   `ETIMEDOUT` surfacing as `io::ErrorKind::TimedOut`). A broken network
-    ///   path; no budget change helps.
+    ///   path or a dead peer; no request-budget change helps. How long the
+    ///   kernel tolerates the silence is `EngineTcpKeepalive::user_timeout`.
     ///
     /// The split itself lives in [`timeout_kind`] — see there for the two
     /// non-obvious traps (chain-walk order, and why `io::ErrorKind::TimedOut`
@@ -2201,6 +2326,197 @@ mod tests {
             timeout_kind(&source),
             TimeoutKind::Budget,
             "an errno-less TimedOut is one of OUR timers, not the kernel's"
+        );
+    }
+
+    /// Both forwarding clients open engine sockets carrying the configured
+    /// keepalive tuning: the default from `Proxy::new`, and a non-default one
+    /// from `Proxy::with_engine_tcp` (so a constructor that ignores its
+    /// argument fails too). Read back from the live socket, not the builder:
+    /// what the kernel enforces is what matters, and reqwest's 30 s user
+    /// timeout is exactly what this test fails on if `build_client` stops
+    /// overriding it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forwarding_sockets_carry_engine_keepalive_tuning() {
+        use std::os::fd::BorrowedFd;
+
+        let custom = EngineTcpKeepalive {
+            idle: Duration::from_secs(11),
+            interval: Duration::from_secs(7),
+            retries: 5,
+            user_timeout: Duration::from_secs(50),
+        };
+        let cases = [
+            (
+                EngineTcpKeepalive::DEFAULT,
+                Proxy::new(Duration::from_secs(5)).unwrap(),
+            ),
+            (
+                custom,
+                Proxy::with_engine_tcp(Duration::from_secs(5), &custom).unwrap(),
+            ),
+        ];
+        for ((want, proxy), protocol) in cases
+            .iter()
+            .flat_map(|case| [WireProtocol::Http1, WireProtocol::H2c].map(|p| (case, p)))
+        {
+            let label = format!("{protocol:?} {want:?}");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = proxy.client_for(protocol).clone();
+            let pending = tokio::spawn(async move {
+                client
+                    .post(format!("http://{addr}/v1/chat/completions"))
+                    .send()
+                    .await
+            });
+            // The server never answers: only the client socket's options matter,
+            // and hyper-util sets them before `connect`, so they are in place by
+            // the time `accept` returns. Bounded, so a client that fails before
+            // connecting fails the test instead of hanging it.
+            let (_server_side, client_addr) =
+                tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                    .await
+                    .unwrap_or_else(|_| panic!("{label}: client never connected"))
+                    .unwrap();
+
+            // Client and server share this process, so the client's socket is
+            // the fd here connected from `client_addr` to `addr`. Match the whole
+            // 4-tuple: Linux lets `connect` reuse a local port toward a different
+            // destination, so a parallel test's socket can share `client_addr`.
+            let sock = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .find_map(|fd| {
+                    // SAFETY: the matching fd is the client's live connection,
+                    // which `pending` keeps open until `abort()` below. A
+                    // non-matching fd may be closed or reused mid-scan by a
+                    // parallel test; that only makes getsockname/getpeername
+                    // fail or report another address, and no memory is accessed
+                    // through the fd.
+                    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let probe = socket2::SockRef::from(&fd);
+                    let local = probe.local_addr().ok()?.as_socket()?;
+                    let peer = probe.peer_addr().ok()?.as_socket()?;
+                    (local == client_addr && peer == addr).then_some(fd)
+                })
+                .unwrap_or_else(|| panic!("{label}: no fd connected {client_addr} -> {addr}"));
+            let sock = socket2::SockRef::from(&sock);
+
+            assert!(sock.keepalive().unwrap(), "{label}: SO_KEEPALIVE");
+            assert_eq!(
+                sock.tcp_keepalive_time().unwrap(),
+                want.idle,
+                "{label}: TCP_KEEPIDLE"
+            );
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                want.interval,
+                "{label}: TCP_KEEPINTVL"
+            );
+            assert_eq!(
+                sock.tcp_keepalive_retries().unwrap(),
+                want.retries,
+                "{label}: TCP_KEEPCNT"
+            );
+            assert_eq!(
+                sock.tcp_user_timeout().unwrap(),
+                Some(want.user_timeout),
+                "{label}: TCP_USER_TIMEOUT decides when a silent request dies"
+            );
+            pending.abort();
+        }
+    }
+
+    /// Probe counts follow the kernel's tick arithmetic: reqwest's defaults
+    /// send one probe before the reset, ours send seven, a user timeout
+    /// between ticks rounds up to the next tick, and one at or below `idle`
+    /// still gets the first tick's probe.
+    #[test]
+    fn probes_before_reset_counts_kernel_ticks() {
+        let ka = |idle, interval, user_timeout| EngineTcpKeepalive {
+            idle: Duration::from_secs(idle),
+            interval: Duration::from_secs(interval),
+            retries: 8,
+            user_timeout: Duration::from_secs(user_timeout),
+        };
+        assert_eq!(EngineTcpKeepalive::DEFAULT.probes_before_reset(), 7);
+        assert_eq!(
+            ka(15, 15, 30).probes_before_reset(),
+            1,
+            "reqwest's defaults"
+        );
+        assert_eq!(ka(15, 15, 31).probes_before_reset(), 2);
+        assert_eq!(ka(15, 5, 60).probes_before_reset(), 9);
+        assert_eq!(ka(30, 15, 10).probes_before_reset(), 1);
+        assert_eq!(ka(30, 15, 30).probes_before_reset(), 1);
+    }
+
+    /// Each rejection names the offending value; the default passes.
+    #[test]
+    fn engine_tcp_keepalive_validate_rejects_what_the_kernel_would() {
+        EngineTcpKeepalive::DEFAULT.validate().unwrap();
+        let d = EngineTcpKeepalive::DEFAULT;
+        let rejected = [
+            (
+                "idle",
+                EngineTcpKeepalive {
+                    idle: Duration::ZERO,
+                    ..d
+                },
+            ),
+            (
+                "idle",
+                EngineTcpKeepalive {
+                    idle: Duration::from_secs(32768),
+                    ..d
+                },
+            ),
+            (
+                "interval",
+                EngineTcpKeepalive {
+                    interval: Duration::ZERO,
+                    ..d
+                },
+            ),
+            ("retries", EngineTcpKeepalive { retries: 0, ..d }),
+            ("retries", EngineTcpKeepalive { retries: 128, ..d }),
+            (
+                "user timeout",
+                EngineTcpKeepalive {
+                    user_timeout: Duration::ZERO,
+                    ..d
+                },
+            ),
+            (
+                "user timeout",
+                EngineTcpKeepalive {
+                    user_timeout: Duration::from_secs(2_147_484),
+                    ..d
+                },
+            ),
+            (
+                "one lost probe",
+                EngineTcpKeepalive {
+                    user_timeout: Duration::from_secs(30),
+                    ..d
+                },
+            ),
+        ];
+        for (needle, ka) in rejected {
+            let err = ka
+                .validate()
+                .expect_err(&format!("{ka:?} must be rejected"));
+            assert!(err.to_string().contains(needle), "{ka:?}: got {err}");
+        }
+        let one_probe = EngineTcpKeepalive {
+            user_timeout: Duration::from_secs(30),
+            ..d
+        };
+        assert!(
+            Proxy::with_engine_tcp(Duration::from_secs(5), &one_probe).is_err(),
+            "the constructor validates too"
         );
     }
 

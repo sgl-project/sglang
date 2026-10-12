@@ -3,7 +3,7 @@ pub mod types;
 pub use cli::Cli;
 pub use types::*;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 /// The k8s default `terminationGracePeriodSeconds`. A `shutdown_drain_secs`
 /// above this will be SIGKILLed mid-drain unless the operator has raised the
@@ -78,6 +78,10 @@ impl Config {
                 ));
             }
         }
+        self.proxy
+            .engine_tcp_keepalive
+            .validate()
+            .context("--engine-tcp-keepalive-* / --engine-tcp-user-timeout-secs")?;
         if self.load_monitor.enabled {
             let lm = &self.load_monitor;
             if lm.report_interval_ms == 0 {

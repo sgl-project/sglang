@@ -90,6 +90,10 @@ pub struct ProxyConfig {
     /// under a disconnect flood. Set well above the longest legitimate
     /// generation. Wired into `STREAM_TOTAL_TIMEOUT`'s slot.
     pub stream_total_timeout_secs: u64,
+    /// TCP keepalive and user timeout on router→engine sockets: how much
+    /// silence an in-flight request survives. See
+    /// [`EngineTcpKeepalive`](crate::proxy::EngineTcpKeepalive).
+    pub engine_tcp_keepalive: crate::proxy::EngineTcpKeepalive,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -114,6 +118,26 @@ pub fn default_stream_total_timeout_secs() -> u64 {
     3600
 }
 
+// Engine socket keepalive defaults, read off the proxy's own default so the flag
+// defaults and a `Proxy` built without config cannot drift apart.
+pub fn default_engine_tcp_keepalive_idle_secs() -> u64 {
+    crate::proxy::EngineTcpKeepalive::DEFAULT.idle.as_secs()
+}
+
+pub fn default_engine_tcp_keepalive_interval_secs() -> u64 {
+    crate::proxy::EngineTcpKeepalive::DEFAULT.interval.as_secs()
+}
+
+pub fn default_engine_tcp_keepalive_retries() -> u32 {
+    crate::proxy::EngineTcpKeepalive::DEFAULT.retries
+}
+
+pub fn default_engine_tcp_user_timeout_secs() -> u64 {
+    crate::proxy::EngineTcpKeepalive::DEFAULT
+        .user_timeout
+        .as_secs()
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -121,6 +145,7 @@ impl Default for ProxyConfig {
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             stream_send_stall_secs: default_stream_send_stall_secs(),
             stream_total_timeout_secs: default_stream_total_timeout_secs(),
+            engine_tcp_keepalive: crate::proxy::EngineTcpKeepalive::DEFAULT,
         }
     }
 }

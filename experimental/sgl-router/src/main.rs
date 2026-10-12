@@ -103,6 +103,16 @@ async fn main() -> Result<()> {
         cfg.server.host,
         cfg.server.port
     );
+    // Env-settable, so log the resolved values the engine sockets are built with.
+    let ka = &cfg.proxy.engine_tcp_keepalive;
+    tracing::info!(
+        idle = ?ka.idle,
+        interval = ?ka.interval,
+        retries = ka.retries,
+        user_timeout = ?ka.user_timeout,
+        probes_before_reset = ka.probes_before_reset(),
+        "engine TCP keepalive"
+    );
     // Surface the input_ids offload state: a serving-semantics kill switch
     // must be greppable in logs, so an engaged switch is never mistaken for
     // a broken offload.
@@ -187,9 +197,10 @@ async fn main() -> Result<()> {
     let itl = sgl_router::policies::itl::ItlTable::new();
 
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
-            cfg.proxy.request_timeout_secs,
-        ))
+        sgl_router::proxy::Proxy::with_engine_tcp(
+            std::time::Duration::from_secs(cfg.proxy.request_timeout_secs),
+            &cfg.proxy.engine_tcp_keepalive,
+        )
         .context("construct proxy")?
         .with_stream_timeouts(
             std::time::Duration::from_secs(cfg.proxy.stream_idle_timeout_secs),

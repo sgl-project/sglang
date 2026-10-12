@@ -141,12 +141,15 @@ pub enum ApiError {
     /// Shares 504 with [`UpstreamTimeout`](Self::UpstreamTimeout) — same
     /// class, deliberately distinct `error_code` — because the two demand
     /// opposite responses: `upstream_timeout` means "raise the budget or
-    /// shorten the ask", this one means "the network path broke" and no
-    /// budget change will help. They were indistinguishable until 2026-08-07,
-    /// when a fleet-wide population of 504s quantized at N × ~15.35 s (N ≥ 2)
-    /// turned out to be arriving through this branch while the engine was
-    /// healthy and mid-generation — invisible because both branches reported
-    /// `upstream_timeout`.
+    /// shorten the ask", this one means "the peer went silent past the
+    /// socket's `TCP_USER_TIMEOUT`" (the network path or the engine broke) and
+    /// no request-budget change will help; the socket tolerance is
+    /// `--engine-tcp-user-timeout-secs`. They were indistinguishable until
+    /// 2026-08-07, when a fleet-wide population of 504s quantized at
+    /// N × ~15.35 s (N ≥ 2) turned out to be arriving through this branch while
+    /// the engine was healthy and mid-generation — invisible because both
+    /// branches reported `upstream_timeout`. The quantum is the keepalive
+    /// tick; see `proxy::EngineTcpKeepalive`.
     ///
     /// Carries `source` — like `UpstreamUnreachable`, and unlike
     /// `UpstreamTimeout` — because the concrete OS error is the whole

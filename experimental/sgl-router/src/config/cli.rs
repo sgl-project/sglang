@@ -9,9 +9,12 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use crate::config::{
     default_cache_sim_max_concurrent_captures, default_cb_cool_down,
+    default_engine_tcp_keepalive_idle_secs, default_engine_tcp_keepalive_interval_secs,
+    default_engine_tcp_keepalive_retries, default_engine_tcp_user_timeout_secs,
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
@@ -392,6 +395,47 @@ pub struct Cli {
         default_value_t = default_stream_total_timeout_secs()
     )]
     pub stream_total_timeout_secs: u64,
+    /// Silence (seconds) on a router→engine socket before the first TCP
+    /// keepalive probe. Also settable via the
+    /// `SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_IDLE_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_IDLE_SECS",
+        default_value_t = default_engine_tcp_keepalive_idle_secs()
+    )]
+    pub engine_tcp_keepalive_idle_secs: u64,
+    /// Seconds between TCP keepalive probes on a router→engine socket. Also
+    /// settable via the `SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_INTERVAL_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_INTERVAL_SECS",
+        default_value_t = default_engine_tcp_keepalive_interval_secs()
+    )]
+    pub engine_tcp_keepalive_interval_secs: u64,
+    /// Unanswered keepalive probes before a router→engine socket is reset, on
+    /// platforms without a TCP user timeout (on Linux the user timeout
+    /// decides). Also settable via the
+    /// `SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_RETRIES` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_RETRIES",
+        default_value_t = default_engine_tcp_keepalive_retries()
+    )]
+    pub engine_tcp_keepalive_retries: u32,
+    /// `TCP_USER_TIMEOUT` (seconds, Linux) on router→engine sockets: how long
+    /// the engine may leave probes or data unacknowledged before the kernel
+    /// resets the socket and the request fails with `upstream_socket_timeout`
+    /// (re-dispatched to another worker only under `--enable-retry`). Must
+    /// exceed idle + interval, or one lost probe kills an in-flight request.
+    /// Lower means a dead engine fails requests sooner, higher means more
+    /// tolerance for packet loss. Also settable via the
+    /// `SGLANG_ROUTER_ENGINE_TCP_USER_TIMEOUT_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_ENGINE_TCP_USER_TIMEOUT_SECS",
+        default_value_t = default_engine_tcp_user_timeout_secs()
+    )]
+    pub engine_tcp_user_timeout_secs: u64,
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
@@ -756,6 +800,12 @@ impl Cli {
                 stream_idle_timeout_secs: self.stream_idle_timeout_secs,
                 stream_send_stall_secs: self.stream_send_stall_secs,
                 stream_total_timeout_secs: self.stream_total_timeout_secs,
+                engine_tcp_keepalive: crate::proxy::EngineTcpKeepalive {
+                    idle: Duration::from_secs(self.engine_tcp_keepalive_idle_secs),
+                    interval: Duration::from_secs(self.engine_tcp_keepalive_interval_secs),
+                    retries: self.engine_tcp_keepalive_retries,
+                    user_timeout: Duration::from_secs(self.engine_tcp_user_timeout_secs),
+                },
             },
             load_monitor: {
                 let d = LoadMonitorConfig::default();
@@ -1535,20 +1585,36 @@ mod tests {
     /// cascade-fail its siblings with a misleading PoisonError.
     static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-    /// Restores SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD on drop, even
-    /// through a panic mid-test.
+    /// Every env var a test sets, plus the ones its assertions need unset (the
+    /// keepalive siblings feed the user-timeout validation). Each must be
+    /// listed here so `lock_env` starts from, and `EnvReset` restores, a clean
+    /// slate.
+    const MUTATED_ENV_VARS: [&str; 5] = [
+        "SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD",
+        "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_IDLE_SECS",
+        "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_INTERVAL_SECS",
+        "SGLANG_ROUTER_ENGINE_TCP_KEEPALIVE_RETRIES",
+        "SGLANG_ROUTER_ENGINE_TCP_USER_TIMEOUT_SECS",
+    ];
+
+    /// Removes every `MUTATED_ENV_VARS` entry on drop, even through a panic
+    /// mid-test.
     struct EnvReset;
     impl Drop for EnvReset {
         fn drop(&mut self) {
-            std::env::remove_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD");
+            for var in MUTATED_ENV_VARS {
+                std::env::remove_var(var);
+            }
         }
     }
 
-    /// Take the env lock (recovering from poison) and clean slate the var,
-    /// returning a guard pair whose drop removes it again.
+    /// Take the env lock (recovering from poison) and clean slate the vars,
+    /// returning a guard pair whose drop removes them again.
     fn lock_env() -> (std::sync::RwLockWriteGuard<'static, ()>, EnvReset) {
         let guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD");
+        for var in MUTATED_ENV_VARS {
+            std::env::remove_var(var);
+        }
         (guard, EnvReset)
     }
 
@@ -2476,6 +2542,81 @@ mod tests {
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
         assert_eq!(c.proxy.stream_idle_timeout_secs, 90);
         assert_eq!(c.proxy.stream_send_stall_secs, 45);
+    }
+
+    /// The four engine keepalive flags land in their own fields (adjacent
+    /// integers again), and omitting them yields the proxy's own default.
+    #[test]
+    fn engine_tcp_keepalive_flags_land_in_distinct_fields() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--engine-tcp-keepalive-idle-secs",
+            "11",
+            "--engine-tcp-keepalive-interval-secs",
+            "7",
+            "--engine-tcp-keepalive-retries",
+            "5",
+            "--engine-tcp-user-timeout-secs",
+            "50",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.proxy.engine_tcp_keepalive,
+            crate::proxy::EngineTcpKeepalive {
+                idle: Duration::from_secs(11),
+                interval: Duration::from_secs(7),
+                retries: 5,
+                user_timeout: Duration::from_secs(50),
+            }
+        );
+
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(
+            c.proxy.engine_tcp_keepalive,
+            crate::proxy::EngineTcpKeepalive::DEFAULT
+        );
+    }
+
+    /// The user timeout is the knob an operator turns per deployment, so it
+    /// must take effect from the env var alone, and a flag must still win.
+    #[test]
+    fn engine_tcp_user_timeout_from_env_var_and_flag_wins() {
+        let (_guard, _reset) = lock_env();
+        std::env::set_var("SGLANG_ROUTER_ENGINE_TCP_USER_TIMEOUT_SECS", "90");
+        let c = parse_env_locked(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(
+            c.proxy.engine_tcp_keepalive.user_timeout,
+            Duration::from_secs(90)
+        );
+        let c = parse_env_locked(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--engine-tcp-user-timeout-secs",
+            "60",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.proxy.engine_tcp_keepalive.user_timeout,
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A user timeout that one lost probe can reach is the bug this tuning
+    /// exists to fix, so it fails startup instead of shipping.
+    #[test]
+    fn engine_tcp_user_timeout_within_one_probe_is_rejected() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--engine-tcp-user-timeout-secs",
+            "30",
+        ]))
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("one lost probe"),
+            "got: {err:#}"
+        );
     }
 
     /// The multimodal-affinity knobs must reach CacheAwareConfig, and tuning
