@@ -29,6 +29,7 @@
  */
 
  #include "musa.h"
+ #include <cstdint>
  #include <iostream>
  #include <vector>
  #include <cmath>
@@ -407,35 +408,55 @@
     const SrcDtype* __restrict p_src = input + m_idx * N;
     SrcDtype* __restrict p_res = residual + m_idx * N;  // residual ptr
 
+    // Full vector accesses are only safe when every row and vector is aligned
+    // and N has no partial vector at its end. Fall back to scalar accesses for
+    // tails and offset/misaligned views.
+    const bool use_scalar =
+        (N % vlen != 0) ||
+        (reinterpret_cast<std::uintptr_t>(p_src) % alignof(SrcVec) != 0) ||
+        (reinterpret_cast<std::uintptr_t>(p_res) % alignof(SrcVec) != 0) ||
+        (weight != nullptr && reinterpret_cast<std::uintptr_t>(weight) %
+                                  alignof(SrcVec) != 0) ||
+        (reinterpret_cast<std::uintptr_t>(smem) % alignof(ComputeVec) != 0);
+
     // TODO(wuke): use robust_load, robust_store
     bool m_valid = m_idx < M;
     if (m_valid) {
-      for (size_t j = n_idx; j < N; j += n_step) {
-        ComputeVec x_vec;
-        SrcVec curr, res_vec, fused_vec;
-        #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
-            curr = *(SrcVec *)(p_src+j);
-            res_vec = *(SrcVec *)(p_res+j);
-        #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
-            curr = SrcVec::load_byp_slc(p_src, j);
-            res_vec = SrcVec::load_byp_slc(p_res, j);
-        #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
-            //  TODO: use LS specific load inst
-            curr = *(SrcVec *)(p_src+j);
-            res_vec = *(SrcVec *)(p_res+j);
-        #else
-            curr = *(SrcVec *)(p_src + j);
-            res_vec = *(SrcVec *)(p_res + j);
-        #endif
-        #pragma unroll
-        for (int k = 0; k < vlen; k++) {
-          ComputeType x = (ComputeType)curr.val_.elem[k] + (ComputeType)res_vec.val_.elem[k];
+      if (use_scalar) {
+        for (size_t j = tx; j < N; j += blockDim.x) {
+          ComputeType x = (ComputeType)p_src[j] + (ComputeType)p_res[j];
           var += x * x;
-          fused_vec.val_.elem[k] = (SrcDtype)x;
-          x_vec.val_.elem[k] = x;
+          p_res[j] = (SrcDtype)x;
+          smem[j] = x;
         }
-        *(SrcVec*)(p_res + j) = fused_vec;
-        *(ComputeVec*)(smem + j) = x_vec;
+      } else {
+        for (size_t j = n_idx; j < N; j += n_step) {
+          ComputeVec x_vec;
+          SrcVec curr, res_vec, fused_vec;
+          #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
+              curr = *(SrcVec *)(p_src+j);
+              res_vec = *(SrcVec *)(p_res+j);
+          #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
+              curr = SrcVec::load_byp_slc(p_src, j);
+              res_vec = SrcVec::load_byp_slc(p_res, j);
+          #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
+              //  TODO: use LS specific load inst
+              curr = *(SrcVec *)(p_src+j);
+              res_vec = *(SrcVec *)(p_res+j);
+          #else
+              curr = *(SrcVec *)(p_src + j);
+              res_vec = *(SrcVec *)(p_res + j);
+          #endif
+          #pragma unroll
+          for (int k = 0; k < vlen; k++) {
+            ComputeType x = (ComputeType)curr.val_.elem[k] + (ComputeType)res_vec.val_.elem[k];
+            var += x * x;
+            fused_vec.val_.elem[k] = (SrcDtype)x;
+            x_vec.val_.elem[k] = x;
+          }
+          *(SrcVec*)(p_res + j) = fused_vec;
+          *(ComputeVec*)(smem + j) = x_vec;
+        }
       }
     }
     AllReduceOp<ComputeType, BLOCK_X, BLOCK_Y, 1> all_reduce_op;
@@ -445,23 +466,29 @@
       SrcDtype* __restrict p_dst = input + m_idx * N;
       bool with_weight = (weight != NULL);
       if (with_weight) {
-        for (size_t j = n_idx; j < N; j += n_step) {
-          SrcVec weight_val, dst;
-          ComputeVec x_vec;
-          x_vec = *(ComputeVec *)(smem + j);
-          #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
-            weight_val = *(SrcVec *)(weight + j);
-          #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
-            weight_val = SrcVec::load_byp_slc(weight, j);
-          #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
-            weight_val = *(SrcVec *)(weight + j);
-          #endif
-  #pragma unroll
-          for (int k = 0; k < vlen; k++) {
-             dst.val_.elem[k] = (SrcDtype)(x_vec.val_.elem[k] * inv_var *
-                             (ComputeType)weight_val.val_.elem[k]);
+        if (use_scalar) {
+          for (size_t j = tx; j < N; j += blockDim.x) {
+            p_dst[j] = (SrcDtype)(smem[j] * inv_var * (ComputeType)weight[j]);
           }
-          *(SrcVec*)(p_dst + j) = dst;
+        } else {
+          for (size_t j = n_idx; j < N; j += n_step) {
+            SrcVec weight_val, dst;
+            ComputeVec x_vec;
+            x_vec = *(ComputeVec *)(smem + j);
+            #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
+              weight_val = *(SrcVec *)(weight + j);
+            #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
+              weight_val = SrcVec::load_byp_slc(weight, j);
+            #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
+              weight_val = *(SrcVec *)(weight + j);
+            #endif
+    #pragma unroll
+            for (int k = 0; k < vlen; k++) {
+               dst.val_.elem[k] = (SrcDtype)(x_vec.val_.elem[k] * inv_var *
+                               (ComputeType)weight_val.val_.elem[k]);
+            }
+            *(SrcVec*)(p_dst + j) = dst;
+          }
         }
       }
     }
