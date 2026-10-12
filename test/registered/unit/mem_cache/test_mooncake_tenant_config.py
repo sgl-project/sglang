@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
@@ -65,7 +67,7 @@ class OldMooncakeDistributedStore(FakeMooncakeDistributedStore):
         return super().setup(*args, **kwargs)
 
 
-def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
+def _make_storage_config(tenant_id=DEFAULT_TENANT_ID, kv_cache_dtype=None):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
         "check_server": False,
@@ -88,6 +90,7 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
         tp_lcm_size=None,
         should_split_heads=False,
         extra_config=extra_config,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -182,8 +185,14 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                 MooncakeStore,
             )
 
-            with self.assertRaisesRegex(RuntimeError, "tenant_id"):
-                MooncakeStore(_make_storage_config("tenant-a"))
+            for tenant, dtype in (("tenant-a", None), ("default", "bfloat16")):
+                with (
+                    self.subTest(tenant=tenant, dtype=dtype),
+                    self.assertRaisesRegex(
+                        RuntimeError, r"mooncake-transfer-engine>=0\.3\.12"
+                    ),
+                ):
+                    MooncakeStore(_make_storage_config(tenant, dtype))
 
     def test_embedding_store_forwards_tenant_id(self):
         FakeMooncakeDistributedStore.instances = []
@@ -206,6 +215,98 @@ class TestMooncakeTenantConfig(unittest.TestCase):
 
         fake_store = FakeMooncakeDistributedStore.instances[-1]
         self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-embedding")
+
+    def test_dtype_namespaces_preserve_key_prefixes(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        cases = (
+            ("default", "bfloat16", "dtype_bfloat16"),
+            ("default", "float16", "dtype_float16"),
+            ("default", "float8_e4m3fn", "dtype_float8_e4m3fn"),
+            ("default", "float8_e5m2", "dtype_float8_e5m2"),
+            ("tenant-a", "bfloat16", "tenant-a_dtype_bfloat16"),
+        )
+        for tenant, dtype, expected in cases:
+            with (
+                self.subTest(tenant=tenant, dtype=dtype),
+                patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ),
+            ):
+                cfg = _make_storage_config(tenant, dtype)
+                cfg.extra_config["extra_backend_tag"] = "prod"
+                store = MooncakeStore(cfg)
+                self.assertEqual(store.store.setup_calls[0][1]["tenant_id"], expected)
+                with patch.object(
+                    store.store, "batch_is_exist", return_value=[1, 1], create=True
+                ) as exists:
+                    self.assertEqual(store.batch_exists(["page0"]), 1)
+                    exists.assert_called_once_with(
+                        ["prod_test_page0_0_k", "prod_test_page0_0_v"]
+                    )
+
+    def test_ssd_fallback_preserves_dtype_tenant(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        cfg = _make_storage_config(kv_cache_dtype="bfloat16")
+        cfg.extra_config["enable_ssd_offload"] = True
+        with (
+            patch.dict(
+                "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+            ),
+            patch.object(
+                FakeMooncakeDistributedStore,
+                "setup",
+                side_effect=[
+                    TypeError("unexpected keyword argument 'enable_ssd_offload'"),
+                    0,
+                ],
+            ) as setup,
+        ):
+            MooncakeStore(cfg)
+        self.assertEqual(setup.call_count, 2)
+        self.assertEqual(setup.call_args.kwargs, {"tenant_id": "dtype_bfloat16"})
+
+    def test_controller_uses_logical_dtype_for_byte_backed_pools(self):
+        from sglang.srt.managers import cache_controller
+
+        controller = SimpleNamespace(
+            enable_storage_metrics=False,
+            storage_host_pool=SimpleNamespace(storage_format_tag=None),
+            get_attn_cp_rank_and_size=lambda: (0, 1),
+        )
+        # Covers both a byte-backed host pool and a hybrid facade with no dtype.
+        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        with (
+            patch.object(cache_controller, "get_parallel", return_value=parallel),
+            patch.object(
+                cache_controller, "is_dp_attention_enabled", return_value=False
+            ),
+        ):
+            for host_pool in (
+                SimpleNamespace(layout="page_first", dtype=torch.uint8),
+                SimpleNamespace(layout="page_first"),
+            ):
+                controller.mem_pool_host = host_pool
+                for dtype, expected in (
+                    (torch.bfloat16, "bfloat16"),
+                    (torch.float8_e4m3fn, "float8_e4m3fn"),
+                    (torch.float8_e5m2, "float8_e5m2"),
+                ):
+                    with self.subTest(host_pool=host_pool, dtype=dtype):
+                        controller.mem_pool_device = SimpleNamespace(
+                            dtype=dtype, store_dtype=torch.uint8
+                        )
+                        config = (
+                            cache_controller.HiCacheController._generate_storage_config(
+                                controller
+                            )
+                        )
+                        self.assertEqual(config.kv_cache_dtype, expected)
 
 
 if __name__ == "__main__":
