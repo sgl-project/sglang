@@ -1,6 +1,6 @@
 ---
 title: MiniCPM-V 4.7
-description: "Deploy OpenBMB MiniCPM-V 4.7 with SGLang — 1B dense and 35B-A3B Mixture-of-Experts vision-language models on a hybrid Gated DeltaNet backbone, in BF16, FP8, or INT4, with DSpark speculative decoding on GB300."
+description: "Deploy OpenBMB MiniCPM-V 4.7 with SGLang — 1B dense and 35B-A3B Mixture-of-Experts vision-language models on a hybrid Gated DeltaNet backbone, in BF16, FP8, or INT4, with DSpark speculative decoding on a single GB300 or H200."
 tag: NEW
 ---
 
@@ -47,7 +47,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick the variant and quantization to generate the launch command. Each checkpoint has one validated recipe on GB300, plus an optional **DSPARK** speculative-decoding row that loads the matching DSpark draft checkpoint.
+Pick the hardware, variant, and quantization to generate the launch command. Every recipe runs on a single GPU and is verified on GB300 and H200; the H100 recipes (1B, FP8, INT4) are unverified. The optional **DSPARK** row loads the matching DSpark draft checkpoint.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/openbmb/minicpm-v-4.7.jsx";
@@ -86,22 +86,22 @@ MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B dense base, TP=1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B dense base.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B MoE base, TP=2.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B MoE base.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-FP8</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (compressed-tensors)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35B-A3B FP8, TP=2.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35B-A3B FP8.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-INT4</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT4 W4A16 (llm-compressor)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B INT4, TP=1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B INT4.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B-DSpark</code></td>
@@ -121,11 +121,13 @@ MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen
 ## 2. Configuration Tips
 
 - Every variant needs `--trust-remote-code` and `--mamba-radix-cache-strategy extra_buffer`; both are in every generated command.
-- The 1B model runs on one GPU. The 35B-A3B BF16 and FP8 checkpoints use `--tp 2`.
-- Serve INT4 at `--tp 1`. The vision tower stays unquantized BF16, and the W4A16 group-128 layout does not divide evenly across the vision layers at TP=2.
+- Every recipe runs on one GPU. On H100 the 35B-A3B BF16 checkpoint (about 66 GB of weights) does not fit the default static memory fraction of an 80 GB card; use FP8 or INT4 there.
+- Pick the quantization by platform. On H200, quantization is a speed win: at concurrency 16, INT4 and FP8 reach 15,808 and 15,280 tokens/s per GPU against 12,103 for BF16, and INT4 has the fastest 35B-A3B decode (TPOT 3.47 ms at concurrency 1). On GB300, BF16 decodes fastest (TPOT 4.36 ms), FP8 is on par (4.44 ms), and INT4 is slower (8.56 ms), so FP8 and INT4 there save memory, not time.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
-- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Measured accept length is about 2.6 on 1B, 4.1 on 35B-A3B BF16, 4.0 on FP8, and 3.8 on INT4.
+- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Use it for low-concurrency serving of the 35B-A3B variants. On real text (sharegpt) at concurrency 1, it cuts TPOT from 4.36 to 2.80 ms for BF16 and from 4.44 to 2.76 ms for FP8 on GB300, and from 3.69 to 3.02 ms (BF16), 3.55 to 2.61 ms (FP8), and 3.47 to 2.38 ms (INT4) on H200. On 1B the draft overhead roughly cancels the gain, and at concurrency 16 DSPARK raises TPOT on every configuration.
+- Benchmark speculative decoding on real text. Random-token prompts collapse draft acceptance, so they say nothing about DSPARK. For a real-workload reference, GSM8K accept length is about 2.6 on 1B, 4.1 on 35B-A3B BF16, 4.0 on FP8, and 3.8 on INT4.
 - Every command carries `--reasoning-parser auto --tool-call-parser auto`. SGLang resolves both from the chat template, to `qwen3` for reasoning and `qwen3_coder` for tool calls, so the thinking trace lands in `message.reasoning_content` and tool calls in `message.tool_calls` (see §3.1 and §3.2). To turn either off, toggle it in the **Parsers** card of the [Playground](#playground).
+- Thinking is on by default. To get a direct answer for one request, pass `"chat_template_kwargs": {"enable_thinking": false}` (in the OpenAI Python client, `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); `reasoning_content` then comes back empty.
 - Image and video requests need no extra server flags.
 
 <Warning>
@@ -148,27 +150,56 @@ MiniCPM-V 4.7 thinks by default. The reasoning parser in every generated command
 <Accordion title="Reasoning (Python)">
 
 ```python Example
-from openai import OpenAI
+import requests
 
-client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-
-resp = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4.7-35B-A3B",
-    messages=[{"role": "user", "content": "What is 23 × 17?"}],
-)
-msg = resp.choices[0].message
-print("Reasoning:", msg.reasoning_content)
-print("Answer:", msg.content)
+resp = requests.post(
+    "http://localhost:30000/v1/chat/completions",
+    json={
+        "model": "openbmb/MiniCPM-V-4.7-35B-A3B",
+        "messages": [{"role": "user", "content": "What is 23*17?"}],
+    },
+).json()
+choice = resp["choices"][0]
+print("finish_reason:", choice["finish_reason"])
+print("--- reasoning_content ---")
+print(choice["message"]["reasoning_content"])
+print("--- content ---")
+print(choice["message"]["content"])
 ```
 
 </Accordion>
 
 <Accordion title="Example Output">
 
-{/* TODO: replace with verbatim server output. */}
-
 ```text Output
-Pending update...
+finish_reason: stop
+--- reasoning_content ---
+The user is asking for the product of 23 and 17. I need to compute 23 * 17.
+
+Let me calculate:
+23 * 17
+I can break it down:
+23 * 10 = 230
+23 * 7 = 161
+Now add: 230 + 161 = 391
+
+Wait, let me double-check:
+23 * 17
+23 * (10 + 7) = 23*10 + 23*7
+23*10 = 230
+23*7: 20*7=140, 3*7=21, so 140+21=161
+Now 230 + 161 = 391
+
+So the product is 391.
+
+--- content ---
+
+
+To find 23 × 17, I'll calculate the multiplication:
+
+23 × 17 = 391
+
+Answer: 391
 ```
 
 </Accordion>
@@ -180,9 +211,9 @@ The tool-call parser in every generated command returns calls in `message.tool_c
 <Accordion title="Tool calling (Python)">
 
 ```python Example
-from openai import OpenAI
+import json
 
-client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+import requests
 
 tools = [{
     "type": "function",
@@ -197,27 +228,48 @@ tools = [{
     },
 }]
 
-resp = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4.7-35B-A3B",
-    messages=[{"role": "user", "content": "What is the weather in Beijing today?"}],
-    tools=tools,
-)
-choice = resp.choices[0]
-print("Finish reason:", choice.finish_reason)
-print("Reasoning:", choice.message.reasoning_content)
-print("Content:", choice.message.content)
-for call in choice.message.tool_calls or []:
-    print("Tool:", call.function.name, call.function.arguments)
+resp = requests.post(
+    "http://localhost:30000/v1/chat/completions",
+    json={
+        "model": "openbmb/MiniCPM-V-4.7-35B-A3B",
+        "messages": [{"role": "user", "content": "What is the weather in Beijing today?"}],
+        "tools": tools,
+    },
+).json()
+choice = resp["choices"][0]
+msg = choice["message"]
+print("finish_reason:", choice["finish_reason"])
+print("--- reasoning_content ---")
+print(msg["reasoning_content"])
+print("--- content ---")
+print(repr(msg["content"]))
+print("--- tool_calls ---")
+print(json.dumps(msg["tool_calls"], indent=1))
 ```
 
 </Accordion>
 
 <Accordion title="Example Output">
 
-{/* TODO: replace with verbatim server output. */}
-
 ```text Output
-Pending update...
+finish_reason: tool_calls
+--- reasoning_content ---
+The user is asking about the weather in Beijing. I need to call the get_weather function with the city parameter set to Beijing.
+
+--- content ---
+'\n\n'
+--- tool_calls ---
+[
+ {
+  "id": "call_592d3b19eca4432eaf1a89f1",
+  "index": 0,
+  "type": "function",
+  "function": {
+   "name": "get_weather",
+   "arguments": "{\"city\": \"Beijing\"}"
+  }
+ }
+]
 ```
 
 </Accordion>

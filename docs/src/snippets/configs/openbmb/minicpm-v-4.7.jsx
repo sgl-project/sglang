@@ -2,14 +2,15 @@
 // Cells are denormalized: no `--nnodes`/`--node-rank`/`--dist-init-addr`/`--host`/`--port` literals — engine injects them.
 //
 // Every cell carries `--mamba-radix-cache-strategy extra_buffer` for the GDN
-// hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. INT4 stays at TP=1:
-// the bf16 vision tower's W4A16 group-128 divisibility fails at TP=2.
+// hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. Every recipe is
+// single-GPU. H100 has no 35B-A3B BF16 cell: its ~66 GB of weights exceed the
+// default static memory fraction of an 80 GB card, so the server cannot start.
 // DSpark is an overlay; its draft path follows the variant.
 
 export const config = {
   modelName: "MiniCPM-V 4.7",
 
-  supportedHardware: ["gb300"],
+  supportedHardware: ["gb300", "h200", "h100"],
 
   matchDims: [
     { id: "variant", title: "Model Variant", options: [
@@ -81,6 +82,8 @@ sgl-eval run gsm8k \\
   // Patch image built from the #41993 head; nightly `dev` lacks 4.7 support until it merges.
   dockerImages: {
     gb300: "lmsysorg/sglang:dev-minicpm-v-4.7",
+    h200:  "lmsysorg/sglang:dev-minicpm-v-4.7",
+    h100:  "lmsysorg/sglang:dev-minicpm-v-4.7",
   },
 
   github: {
@@ -126,7 +129,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 2",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -141,7 +143,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 2",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -156,7 +157,101 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "1b", quant: "bf16", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "35b-a3b", quant: "bf16", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "35b-a3b", quant: "fp8", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "35b-a3b", quant: "int4", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "1b", quant: "bf16", nodes: "single" },
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "35b-a3b", quant: "fp8", nodes: "single" },
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "35b-a3b", quant: "int4", nodes: "single" },
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
