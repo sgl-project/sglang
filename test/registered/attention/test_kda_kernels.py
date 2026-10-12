@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.common import get_device, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -790,6 +790,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         )
         return decode_output, decode_state, verify_output, verify_state[slots]
 
+    @unittest.skipIf(is_hip(), "match_cutedsl_decode requires CUDA")
     def test_bf16_state_verify_matches_single_token_launches(self):
         for K in (128, 64):
             with self.subTest(head_dim=K):
@@ -818,6 +819,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
             verify_output.float(), decode_output.float(), atol=2e-2, rtol=1e-2
         )
 
+    @unittest.skipIf(is_hip(), "match_cutedsl_decode requires CUDA")
     def test_fp32_state_pool_is_not_rounded(self):
         _, decode_state, _, verify_state = self._run_decode_loop_and_verify(
             B=2, T=16, H=4, K=128, state_dtype=torch.float32, match_decode=True
