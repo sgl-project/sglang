@@ -42,6 +42,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.attn import (
     InklingAttention,
@@ -465,7 +468,8 @@ class InklingDecoderLayer(nn.Module):
 
         # The eager group reads the live prepared batch from the runner scope.
         if (
-            is_in_breakable_cuda_graph()
+            is_in_prefill_graph_scope()
+            and is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             # BCG prefill path: the AR fusion is decode-only, so partials never
@@ -906,7 +910,8 @@ class InklingCausalLLM(nn.Module):
             # Match the per-layer prefill eager region.
             scattered = self.layers[-1].scattered_sconv
             if (
-                is_in_breakable_cuda_graph()
+                is_in_prefill_graph_scope()
+                and is_in_breakable_cuda_graph()
                 and forward_batch.forward_mode.is_extend_without_speculative()
             ):
                 # Under scattered sconv the input is the last MoE's [T, H/P]

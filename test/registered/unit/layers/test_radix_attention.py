@@ -270,5 +270,32 @@ def test_prefill_graph_policy_restores_after_exception():
     assert get_prefill_raw_num_tokens() is None
 
 
+@pytest.mark.parametrize("mode_name", ["DECODE", "TARGET_VERIFY", "DLLM_EXTEND"])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_decode_bcg_without_prefill_scope_uses_backend(mode_name, sparse):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+
+    layer = RadixAttention(1, 2, 1.0, 1, 0)
+    batch = make_batch(tokens=4)
+    batch.forward_mode = ForwardMode[mode_name]
+    q = torch.zeros(4, 1, 2)
+    result = object()
+    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    with (
+        forward_context(ForwardContext(backend)),
+        patch(
+            "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
+            return_value=True,
+        ),
+        patch.object(layer, "_eager_attention") as eager,
+    ):
+        with pytest.raises(RuntimeError, match="No forward batch"):
+            get_forward_batch()
+        kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
+        assert layer(q, q, q, batch, **kwargs) is result
+        eager.assert_not_called()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

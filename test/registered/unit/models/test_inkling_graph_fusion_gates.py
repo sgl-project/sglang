@@ -1,6 +1,7 @@
 """BCG prefill must not change decode or verification fusion eligibility."""
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("scope", ["eager", "breakable", "full"])
+@pytest.mark.parametrize("scope", ["eager", "breakable", "full", "decode_breakable"])
 @pytest.mark.parametrize("mode", ["extend", "decode", "verify"])
 @pytest.mark.parametrize("scattered", [False, True])
 def test_fusion_gate_preserves_non_prefill_behavior(scope, mode, scattered):
@@ -37,10 +38,16 @@ def test_fusion_gate_preserves_non_prefill_behavior(scope, mode, scattered):
         else comm.fullwidth_ar_sconv_fusable
     )
     with (
-        prefill_graph_scope(full_graph=scope == "full"),
+        (
+            prefill_graph_scope(full_graph=scope == "full")
+            if scope in ("breakable", "full")
+            else nullcontext()
+        ),
         patch.object(comm, "is_cuda", return_value=True),
         patch.object(
-            comm, "is_in_breakable_cuda_graph", return_value=scope == "breakable"
+            comm,
+            "is_in_breakable_cuda_graph",
+            return_value=scope in ("breakable", "decode_breakable"),
         ),
         patch.object(
             comm,

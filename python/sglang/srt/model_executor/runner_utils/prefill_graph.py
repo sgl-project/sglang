@@ -16,6 +16,11 @@ _current: ContextVar[_PrefillGraphState | None] = ContextVar(
 )
 
 
+def is_in_prefill_graph_scope() -> bool:
+    """Whether the prefill runner owns this execution, regardless of graph backend."""
+    return _current.get() is not None
+
+
 def is_in_full_prefill_graph() -> bool:
     state = _current.get()
     return state is not None and state.full_graph

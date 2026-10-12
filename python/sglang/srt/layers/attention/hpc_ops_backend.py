@@ -53,6 +53,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -411,11 +412,15 @@ class HPCOpsAttnBackend(AttentionBackend):
             device=qkv.device,
         )
 
-        if is_extend and (
-            is_in_full_prefill_graph()
-            or (
-                is_in_breakable_cuda_graph()
-                and forward_batch.forward_mode.is_extend_without_speculative()
+        if (
+            is_in_prefill_graph_scope()
+            and is_extend
+            and (
+                is_in_full_prefill_graph()
+                or (
+                    is_in_breakable_cuda_graph()
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
             )
         ):
             self._eager_rope_store_kv(

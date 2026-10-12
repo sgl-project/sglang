@@ -10,6 +10,9 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 
@@ -724,7 +727,11 @@ def scattered_ar_sconv_fusable(
     # [:raw]), and sentinel request slots have qlen == 0 so the in-kernel
     # cache update/track skip them.
 
-    if is_in_breakable_cuda_graph() and fm.is_extend_without_speculative():
+    if (
+        is_in_prefill_graph_scope()
+        and is_in_breakable_cuda_graph()
+        and fm.is_extend_without_speculative()
+    ):
         return False
     comm = group.torch_symm_mem_comm
     if (
@@ -1052,7 +1059,7 @@ def fullwidth_ar_sconv_fusable(
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
 
-    if is_in_breakable_cuda_graph():
+    if is_in_prefill_graph_scope() and is_in_breakable_cuda_graph():
         return False
     comm = group.torch_symm_mem_comm
     if (

@@ -39,6 +39,7 @@ from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_bat
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     get_prefill_raw_num_tokens,
     is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
 )
 
 if TYPE_CHECKING:
@@ -131,6 +132,7 @@ class RadixAttention(nn.Module):
         full_cg = is_in_full_prefill_graph()
         use_eager_attention = (
             self.use_prefill_attention_wrapper
+            and is_in_prefill_graph_scope()
             and forward_batch.forward_mode.is_extend()
             and (breakable_cg or full_cg)
         )

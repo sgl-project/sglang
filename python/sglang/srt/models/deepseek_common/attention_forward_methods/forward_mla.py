@@ -65,6 +65,7 @@ _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get
 
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
 )
 
 if TYPE_CHECKING:
@@ -159,7 +160,9 @@ class DeepseekMLAForwardMixin:
             return False
         # Like the DSA indexer eager region, this fusion is enabled for
         # non-speculative CUDA BCG prefill.
-        if not is_graph_dsa_split_op_surface(forward_batch):
+        if not is_in_prefill_graph_scope() or not is_graph_dsa_split_op_surface(
+            forward_batch
+        ):
             return False
         if not self.use_dsa:
             return False
