@@ -6,7 +6,7 @@ import logging
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
@@ -3140,6 +3140,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prev_comb: Optional[torch.Tensor] = None,
         *,
         _afd_microbatch_launch: bool = False,
+        _afd_defer_shared_experts: bool = False,
     ) -> Union[
         Tuple[
             torch.Tensor,
@@ -3293,6 +3294,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             afd_microbatch_launch=_afd_microbatch_launch,
+            defer_shared_experts=_afd_defer_shared_experts,
         )
         if _afd_microbatch_launch:
             moe, context = moe_output
@@ -3422,6 +3424,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
         afd_microbatch_launch: bool = False,
+        defer_shared_experts: bool = False,
     ) -> Union[
         torch.Tensor,
         deepseek_v2.MoEOutput,
@@ -3552,6 +3555,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     use_reduce_scatter=mlp_reduce_scatter,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=_do_shared_local,
+                    defer_shared_experts=defer_shared_experts,
                 ),
                 context,
             )
@@ -3900,6 +3904,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         child: ForwardBatch,
         state: _DeepseekV4AFDChildState,
         input_ids_global: torch.Tensor,
+        *,
+        defer_shared_experts: bool = False,
     ) -> _DeepseekV4AFDLayerPending:
         return cast(
             _DeepseekV4AFDLayerPending,
@@ -3913,6 +3919,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 state.prev_post,
                 state.prev_comb,
                 _afd_microbatch_launch=True,
+                _afd_defer_shared_experts=defer_shared_experts,
             ),
         )
 
@@ -4394,6 +4401,7 @@ class DeepseekV4Model(nn.Module):
         )
 
         children = forward_batch.afd_microbatch_children
+        batch_shared_experts = is_afd_attn_moe_scattered() and len(children) > 1
         capture_layer_ids = set(self.dspark_layers_to_capture or ())
         captured_children = {
             layer_id: [None] * len(children) for layer_id in capture_layer_ids
@@ -4433,7 +4441,17 @@ class DeepseekV4Model(nn.Module):
                 child,
                 state,
                 child_input_ids_global[child_index],
+                defer_shared_experts=batch_shared_experts,
             )
+
+        def after_launch_layer(layer, pending):
+            moe_pending = layer.mlp.run_afd_shared_experts_batch(
+                [item.moe for item in pending]
+            )
+            return [
+                replace(item, moe=moe)
+                for item, moe in zip(pending, moe_pending, strict=True)
+            ]
 
         def finish_child_layer(layer, child, pending, child_index):
             state = layer.forward_afd_microbatch_finish(child, pending)
@@ -4459,6 +4477,7 @@ class DeepseekV4Model(nn.Module):
             child_states=child_states,
             launch_child_layer=launch_child_layer,
             finish_child_layer=finish_child_layer,
+            after_launch_layer=after_launch_layer if batch_shared_experts else None,
         )
 
         if self.use_fused_mhc_post_pre:

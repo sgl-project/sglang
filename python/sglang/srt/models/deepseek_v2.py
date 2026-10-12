@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import (
     Any,
@@ -600,6 +600,7 @@ class DeepseekAFDMoEPending:
     handle: AFDDispatchHandle
     shared_output: Optional[torch.Tensor]
     use_reduce_scatter: bool
+    shared_input: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -986,7 +987,11 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor],
         skip_shared_experts: bool,
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        defer_shared_experts: bool = False,
     ) -> DeepseekAFDMoEPending:
+        if defer_shared_experts:
+            assert is_afd_attn_moe_scattered()
+            assert gemm_output_zero_allocator is None
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         topk_kwargs = (
             {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
@@ -1000,23 +1005,56 @@ class DeepseekV2MoE(nn.Module):
         handle = self.experts.dispatch_afd(hidden_states, topk_output)
 
         shared_output = None
-        # Run shared experts after remote dispatch so their GEMMs overlap F-side
-        # work. This also consumes the DP buffer before the next child reuses it.
+        shared_input = None
         if (
             hasattr(self, "shared_experts")
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
         ):
-            with afd_shared_expert_sm_budget(handle):
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
+            if defer_shared_experts:
+                # Only scattered DSV4 callers defer: their MHC/norm output is
+                # owned by this child, rather than a reused DP gather buffer.
+                shared_input = hidden_states
+            else:
+                # Consume any DP gather buffer before another child reuses it.
+                # Shared GEMMs overlap the remote routed work after dispatch.
+                with afd_shared_expert_sm_budget(handle):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator
+                    )
 
         return DeepseekAFDMoEPending(
             handle=handle,
             shared_output=shared_output,
             use_reduce_scatter=use_reduce_scatter,
+            shared_input=shared_input,
         )
+
+    def run_afd_shared_experts_batch(
+        self, pending: list[DeepseekAFDMoEPending]
+    ) -> list[DeepseekAFDMoEPending]:
+        active = [i for i, item in enumerate(pending) if item.shared_input is not None]
+        if not active:
+            return pending
+
+        sizes = [pending[i].shared_input.shape[0] for i in active]
+        outputs = [None] * len(active)
+        if sum(sizes) > 0:
+            inputs = torch.cat([pending[i].shared_input for i in active], dim=0)
+            # The existing budget reserves every child lane, including empty
+            # children and lanes whose AG may already have completed.
+            with afd_shared_expert_sm_budget(pending[active[0]].handle):
+                output = self._forward_shared_experts(inputs)
+            outputs = output.split(sizes, dim=0)
+
+        result = list(pending)
+        for i, size, output in zip(active, sizes, outputs, strict=True):
+            result[i] = replace(
+                pending[i],
+                shared_output=output if size else None,
+                shared_input=None,
+            )
+        return result
 
     def finish_afd_experts(
         self,

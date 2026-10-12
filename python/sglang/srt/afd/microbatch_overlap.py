@@ -654,6 +654,7 @@ def run_afd_microbatch_wavefront(
     child_states: list,
     launch_child_layer: Callable,
     finish_child_layer: Callable,
+    after_launch_layer: Optional[Callable] = None,
 ):
     children = forward_batch.afd_microbatch_children
     parent_context = get_forward_context()
@@ -696,6 +697,9 @@ def run_afd_microbatch_wavefront(
                     child_index,
                 )
 
+        if after_launch_layer is not None:
+            pending = after_launch_layer(layers[start_layer], pending)
+
         for layer_id in range(start_layer, end_layer):
             next_layer_id = layer_id + 1
             for child_index, (child, child_context) in enumerate(
@@ -718,6 +722,9 @@ def run_afd_microbatch_wavefront(
                                 child_states[child_index],
                                 child_index,
                             )
+
+            if next_layer_id < end_layer and after_launch_layer is not None:
+                pending = after_launch_layer(layers[next_layer_id], pending)
 
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
