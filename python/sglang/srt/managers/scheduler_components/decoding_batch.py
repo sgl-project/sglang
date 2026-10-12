@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -28,6 +30,9 @@ class DecodingBatch:
         self.rows = rows
         # The decode step copied from the rows and not yet absorbed.
         self._step: Optional[ScheduleBatch] = None
+        # Under SGLANG_DEBUG_INFLIGHT_STEPS: the rows object and its requests
+        # when the decode step was copied.
+        self._rows_at_step: Optional[Tuple[ScheduleBatch, List[Req]]] = None
 
     def join(self, batch: ScheduleBatch) -> None:
         """Append batch's rows. Empty rows become batch, and its penalizers
@@ -60,6 +65,8 @@ class DecodingBatch:
     def decode_step(self) -> ScheduleBatch:
         """The step that decodes every row: a copy of the advanced rows."""
         self._step = self.rows.shallow_copy()
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
+            self._rows_at_step = (self.rows, self.rows.reqs[:])
         return self._step
 
     def absorb(self) -> None:
@@ -69,6 +76,8 @@ class DecodingBatch:
         step, self._step = self._step, None
         if step is None:
             return
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
+            self._check_absorb(step)
         fields = vars(step)
         if step.forward_mode.is_extend():
             fields = {
@@ -78,6 +87,25 @@ class DecodingBatch:
             }
         vars(self.rows).update(fields)
         self.rows.reqs = step.reqs[:]
+
+    def _check_absorb(self, step: ScheduleBatch) -> None:
+        # The update below overwrites every rows field, so a rows write made
+        # since decode_step would be lost silently.
+        rows, reqs = self._rows_at_step
+        self._rows_at_step = None
+        assert self.rows is rows, "the rows were replaced while a decode step ran"
+        assert len(self.rows.reqs) == len(reqs) and all(
+            a is b for a, b in zip(self.rows.reqs, reqs)
+        ), "the rows changed while a decode step ran"
+        assert len(step.reqs) == len(reqs) and all(
+            a is b for a, b in zip(step.reqs, reqs)
+        ), "the decode step's requests changed"
+        # The step is still a decode step, or the DP extend view of one;
+        # an extend mode a worker leaked would turn the rows into a prefill.
+        assert step.forward_mode == ForwardMode.DECODE or (
+            step.forward_mode == ForwardMode.EXTEND
+            and step.num_decode_rows == len(step.reqs)
+        ), f"decode step came back as {step.forward_mode}"
 
     def park_for_mix(self) -> None:
         """Hand the rows to a mixed step: they run inside that step's batch,
@@ -89,3 +117,4 @@ class DecodingBatch:
         pause retracted them."""
         self.rows.reqs = []
         self._step = None
+        self._rows_at_step = None

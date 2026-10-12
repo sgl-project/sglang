@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler_components.decoding_batch import (  # noqa: E402
     DecodingBatch,
@@ -174,6 +175,29 @@ class TestDecodingBatchRowCopy(CustomTestCase):
         self.assertIsNone(rows.extend_lens)
         self.assertEqual(rows.num_decode_rows, 0)
         self.assertIs(rows.seq_lens, step.seq_lens)
+
+    def test_debug_check_rejects_a_rows_write_during_the_step(self):
+        rows = _schedule_batch(["a", "b"])
+        decoding_batch = DecodingBatch(rows)
+        with envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True):
+            decoding_batch.decode_step()
+            rows.reqs = rows.reqs[:1]
+            with self.assertRaisesRegex(AssertionError, "rows changed"):
+                decoding_batch.absorb()
+
+    def test_debug_check_rejects_a_leaked_extend_mode(self):
+        decoding_batch = DecodingBatch(_schedule_batch(["a", "b"]))
+        with envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True):
+            step = decoding_batch.decode_step()
+            step.forward_mode = ForwardMode.TARGET_VERIFY
+            with self.assertRaisesRegex(AssertionError, "came back as"):
+                decoding_batch.absorb()
+
+            # The DP extend view converts every row and passes.
+            step = decoding_batch.decode_step()
+            step.forward_mode = ForwardMode.EXTEND
+            step.num_decode_rows = 2
+            decoding_batch.absorb()
 
     def test_pause_drops_the_decode_step(self):
         rows = _schedule_batch(["a"])
