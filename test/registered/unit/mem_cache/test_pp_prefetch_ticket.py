@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
 )
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -69,6 +70,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4)
+        c.mem_pool_host.available_size.return_value = 1 << 20
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
@@ -342,6 +344,118 @@ class TestPPPrefetchTicket(unittest.TestCase):
                     self.assertEqual(operation.query_pool_hit_pages, {PoolName.KV: 1})
 
         self.assertEqual(local_votes, [8, 4])
+
+    def test_file_stage_hit_fits_capacity_before_consensus(self):
+        """A large local hit must not discard a prefix that fits on every stage."""
+        c = self.c
+        c.page_size = c.prefetch_threshold = 256
+        key = RadixKey(array("q", range(8193)), is_bigram=True)
+        hashes = get_storage_hash_str(key, page_size=256)
+        c.storage_backend_type = "file"
+        c._storage_hit_query = Mock(
+            wraps=HybridCacheController._storage_hit_query.__get__(c)
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR, "get", return_value=None
+            ),
+        ):
+            backends = []
+            for rank, pages in ((0, 32), (1, 8)):
+                config = replace(
+                    c.storage_config,
+                    pp_rank=rank,
+                    pp_size=2,
+                    extra_config={
+                        "file_storage_path": str(Path(directory) / str(rank)),
+                        "enable_metadata_cache": False,
+                        "max_size": 0,
+                        "min_free_space": 0,
+                    },
+                )
+                backend = HiCacheFile(config)
+                for hash_value in hashes[:pages]:
+                    self.assertTrue(backend.set(hash_value, torch.ones(1)))
+                backends.append(backend)
+
+            for capacity in (4096, 4097):
+                c.storage_config.pp_rank = 0
+                c.pp_prefetch_states.clear()
+                c.pp_prefetch_command_queue = Queue()
+                result = c.submit_prefetch(
+                    CacheRequestHandle("capacity", 0), key, None, None, [], None
+                )
+                ticket = pickle.loads(
+                    pickle.dumps(c.pp_prefetch_states["capacity"].ticket)
+                )
+                for rank, local_vote in ((0, 4096), (1, 2048)):
+                    with self.subTest(capacity=capacity, rank=rank):
+                        c.storage_config.pp_rank = rank
+                        c.storage_backend = backends[rank]
+                        if rank:
+                            c.pp_prefetch_states.clear()
+                        host_pool = LogicalHostPool(4096, page_size=256)
+                        c.mem_pool_host.available_size.return_value = capacity
+                        c.mem_pool_host.available_size.reset_mock()
+                        c.mem_pool_host.alloc.reset_mock()
+                        c.mem_pool_host.free.reset_mock()
+                        c.mem_pool_host.alloc.side_effect = lambda size, **_: (
+                            host_pool.alloc(size)
+                        )
+                        c.mem_pool_host.free.side_effect = lambda indices, **_: (
+                            host_pool.free(indices)
+                        )
+                        c.prefetch_tokens_occupied = 0
+                        c._storage_hit_query.reset_mock()
+                        c._all_reduce.reset_mock()
+                        local_votes = []
+
+                        def reduce_hits(tensor, op, groups):
+                            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+                            self.assertEqual(groups, c.prefetch_hits_sync_groups)
+                            self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                            local_votes.append(tensor[0].item())
+                            kv_index = 1 + list(PoolName).index(PoolName.KV)
+                            self.assertEqual(
+                                tensor[kv_index].item(), 32 if rank == 0 else 8
+                            )
+                            peer_vote = 2048 if rank == 0 else 4096
+                            tensor[0] = min(tensor[0].item(), peer_vote)
+                            tensor[kv_index] = min(tensor[kv_index].item(), 8)
+
+                        c._all_reduce.side_effect = reduce_hits
+                        self.run_commands(ticket)
+                        operation = c.prefetch_buffer.get_nowait()
+                        if rank == 0:
+                            self.assertIs(operation, result.operation)
+                        self.assertEqual(operation.storage_hit_count, 2048)
+                        self.assertEqual(local_votes, [local_vote])
+                        c.mem_pool_host.alloc.assert_called_once_with(
+                            local_vote, pool=PoolName.KV
+                        )
+                        self.assertEqual(operation.hash_value, hashes[:8])
+                        self.assertEqual(operation.host_indices.numel(), 2048)
+                        self.assertFalse(operation.is_terminated())
+                        self.assertEqual(
+                            operation.query_pool_hit_pages, {PoolName.KV: 8}
+                        )
+                        self.assertEqual(c.prefetch_tokens_occupied, 2048)
+                        self.assertEqual(host_pool.available_size(), 2048)
+                        c._storage_hit_query.assert_called_once_with(operation)
+                        c.mem_pool_host.available_size.assert_called_once_with(
+                            pool=PoolName.KV
+                        )
+                        c._all_reduce.assert_called_once()
+                        if rank == 0:
+                            self.assertEqual(c.mem_pool_host.free.call_count, 1)
+                            freed = c.mem_pool_host.free.call_args
+                            self.assertEqual(freed.kwargs, {"pool": PoolName.KV})
+                            self.assertTrue(
+                                torch.equal(freed.args[0], torch.arange(2048, 4096))
+                            )
+                        else:
+                            c.mem_pool_host.free.assert_not_called()
 
     def test_local_miss_or_query_error_completes_before_next_ticket(self):
         """A stage miss/error must complete admission without breaking ACK order."""

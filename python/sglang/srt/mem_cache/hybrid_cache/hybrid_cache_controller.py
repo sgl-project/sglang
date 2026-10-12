@@ -1276,6 +1276,10 @@ class HybridCacheController(BaseHiCacheController):
 
                 try:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    storage_hit_count = min(
+                        storage_hit_count,
+                        self.mem_pool_host.available_size(pool=PoolName.KV),
+                    )
                     storage_hit_count -= storage_hit_count % self.page_size
                     operation.storage_hit_count = storage_hit_count
                     if (
