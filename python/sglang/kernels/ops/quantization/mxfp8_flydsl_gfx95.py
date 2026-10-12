@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
-"""MXFP8 dense GEMM for gfx950 (MI355X), written in FlyDSL.
+"""
+MXFP8 dense GEMM for gfx950 (MI355X), written in FlyDSL.
 
     C[M, N] (bf16) = A[M, K] @ B[N, K]^T
 
 A is row-major fp8 e4m3. B is fp8 e4m3, row-major or preshuffled by aiter's
 ``shuffle_weight(b, (16, 16))``. Each has one ue8m0 scale per 32 consecutive K elements,
-passed in the layout of ``mxfp8_scale_layout`` (the activation's quantization should write
-it directly); the scaled MFMA ``v_mfma_scale_f32_16x16x128_f8f6f4`` applies them. The
-pipeline follows aiter's 8-wave a8w8 FP8 kernel.
+passed in the layout of ``mxfp8_scale_layout``. The pipeline follows aiter's 8-wave a8w8
+FP8 kernel.
 
 Work split. A workgroup of 8 waves (2 rows x 4 columns) computes a block_m x 256 tile of
 C. A is split in halves A0/A1 along M, B in halves B0/B1 along N, giving four quadrants
@@ -17,31 +17,17 @@ C. A is split in halves A0/A1 along M, B in halves B0/B1 along N, giving four qu
 quadrant: (block_m/64) x 2 MFMA tiles of 16 x 16.
 
 K loop. K advances 128 per step. Each half has two LDS buffers, K-tile t in buffer t % 2,
-filled by a DMA (global -> LDS, no registers) that all 8 waves share. A step has four
-phases, one per quadrant: read from LDS the halves the quadrant newly needs, start one
-DMA for a later K-tile, barrier, MFMAs, barrier. A1 is fetched one K-tile ahead, the
-others two ahead into the buffer just read; only the last phase waits for memory.
+filled by a DMA (global -> LDS, no registers) that all 8 waves share.
 
 LDS layout. A DMA instruction fills 1 KB of a buffer. A row-major operand is stored
 [row][16-byte K-chunk], chunk c of row x at c ^ (x // 2) % 8 so the 16 rows of an MFMA
-operand hit different banks; an instruction copies 8 rows. A shuffled B is
-[16-row group][K/16 chunks][16 rows][16 bytes] in memory, so a group's K-tile is 2 KB
-contiguous; it is copied as is, half a group per instruction, and a group is one MFMA tile.
+operand hit different banks.
 
 Wave rows. Wave row 1 runs one barrier behind row 0, so one row's MFMAs overlap the
-other row's loads. A barrier therefore only proves the other row reached its previous
-barrier, hence: (1) a buffer is read only after each wave waited for its own share of
-the DMA and one more barrier passed; (2) phase 0's barrier also waits for the wave's LDS
-reads, because the leading row refills B0 right after the next barrier.
-
-Scales. The MFMA takes one 32-bit scale per lane and selects a byte with op_sel, an
-instruction constant. Lane (r, g) = (lane % 16, lane // 16) supplies row r's scale for
-MX block g of the step (K 32g .. 32g+32), so a word holds that scale for 4 consecutive
-steps: word (row, q, g) holds in byte j the scale of MX block 16q + 4j + g, and step k
-uses byte k % 4 of word q = k // 4.
+other row's loads. A barrier then only proves the other row reached its previous barrier.
 
 Epilogue. B is the MFMA's first operand, so a lane accumulates 4 consecutive columns of
-one row of C; the tile is staged through the idle LDS and stored 1 KB per instruction.
+one row of C; the tile is staged through the idle LDS.
 """
 
 import functools
@@ -64,34 +50,43 @@ def _ceil_div(a, b):
 
 
 def _swizzle(row, col):
-    """LDS byte offset of the 16-byte chunk at byte offset ``col`` of a row-major ``row``:
-    chunks are XOR-permuted by (row // 2) % 8 so the 16 rows of an MFMA operand hit
-    different banks. Depends on row % 16 only."""
+    """
+    LDS byte offset of the 16-byte chunk at byte ``col`` of ``row``. Avoid an MFMA operand
+    hit different banks.
+    """
     return col ^ ((row // 2 % 8) * 16)
 
 
 def _buffer(tensor):
-    """Element-indexed buffer view of a flat tensor: loads past its end return 0 and stores
-    past it are dropped."""
+    """
+    Element-indexed buffer view of a flat tensor: loads past its end return 0 and stores past
+    it are dropped.
+    """
     return fx.logical_divide(fx.rocdl.make_buffer_tensor(tensor, max_size=False), fx.make_layout(1, 1))
 
 
 def _lds(addr, dtype, n):
-    """View of ``n`` elements of ``dtype`` at LDS byte address ``addr``."""
+    """
+    View of ``n`` elements of ``dtype`` at LDS byte address ``addr``.
+    """
     ptr = fx.inttoptr(fx.PointerType.get(dtype.ir_type, 2, n * dtype.width // 8), addr)
     return fx.make_view(ptr, fx.make_layout(n, 1))
 
 
 def _opaque(x):
-    """``x``, hidden from constant folding: constants added later then fit ds_read's 16-bit
-    offset instead of each (buffer, tile) costing a VGPR once a base exceeds 64 KB."""
+    """
+    ``x``, hidden from constant folding: constants added later then fit ds_read's 16-bit
+    offset instead of each (buffer, tile) costing a VGPR once a base exceeds 64 KB.
+    """
     v = fx.Int32(x).ir_value()
     return fx.Int32(llvm.inline_asm(v.type, [v], "", "=v,0", has_side_effects=False))
 
 
 def _barrier(vmcnt=None, lds=False):
-    """s_barrier once this wave has at most ``vmcnt`` VMEM loads in flight and, with
-    ``lds``, no LDS access in flight. Also a compiler fence for the async DMA."""
+    """
+    s_barrier once this wave has at most ``vmcnt`` VMEM loads in flight and, with
+    ``lds``, no LDS access in flight. Also a compiler fence for the async DMA.
+    """
     waits = []
     if vmcnt is not None:
         waits.append(f"vmcnt({vmcnt})")
@@ -102,8 +97,10 @@ def _barrier(vmcnt=None, lds=False):
 
 
 def _workgroup_tile(n_tiles_m, n_tiles_n, band):
-    """(tile_m, tile_n) of this workgroup. The hardware deals workgroups round-robin to
-    the 8 XCDs; remap them so each XCD walks ``band`` tile rows and the band shares L2."""
+    """
+    (tile_m, tile_n) of this workgroup. The hardware deals workgroups round-robin to
+    the 8 XCDs; remap them so each XCD walks ``band`` tile rows and the band shares L2.
+    """
     wgid = fx.block_idx.x
     if const_expr(band == 0):
         return wgid // n_tiles_n, wgid % n_tiles_n
@@ -121,18 +118,20 @@ def _num_cus(device):
 
 
 def _default_block_m(m, n, device):
-    """The tile height needing fewer rounds of workgroups over the CUs; a 128-row tile
-    costs ~0.6 of a 256-row one (fits every shape and M measured on MI355X)."""
+    """
+    The tile height needing fewer rounds of workgroups over the CUs; a 128-row tile
+    costs ~0.6 of a 256-row one (fits every shape and M measured on MI355X).
+    """
     rounds = {bm: _ceil_div(_ceil_div(m, bm) * _ceil_div(n, BLOCK_N), _num_cus(device)) for bm in (128, 256)}
     return 128 if 0.6 * rounds[128] < rounds[256] else 256
 
 
 def _build(K, block_m, xcd_swizzle, b_shuffled):
     k_tiles = K // BLOCK_K
-    n_groups = _ceil_div(k_tiles, GROUP_STEPS)  # 512-K scale groups, i.e. scale words per row
+    n_groups = _ceil_div(k_tiles, GROUP_STEPS)  # 512-K scale groups; one scale word per group per lane
     rows = {"A": block_m // 2, "B": BLOCK_N // 2}  # rows of a half
     tiles = {"A": block_m // 64, "B": 2}  # MFMA tiles per wave per half
-    n_dma = {op: rows[op] // 64 for op in "AB"}  # DMA instructions per wave per half; each moves 64 rows
+    n_dma = {op: rows[op] // 64 for op in "AB"}  # DMA instructions per wave per half; 8 rows each
     # VMEM loads that may still be in flight at a step's wait: the DMAs of B0, A0 and B1
     # for two K-tiles ahead. Loads complete in order, so everything older has landed.
     in_flight = 2 * n_dma["B"] + n_dma["A"]
@@ -228,7 +227,8 @@ def _build(K, block_m, xcd_swizzle, b_shuffled):
             return {op: [[word(op, h * rows[op] // 16 + i) for i in range(tiles[op])] for h in range(2)]
                     for op in "AB"}
 
-        # MFMAs. op_sel is an instruction constant: one atom per byte of the scale word.
+        # MFMAs. Lane (r, g) supplies the scale of row r, MX block g of the step; op_sel, an
+        # instruction constant, picks the step's byte of the word: one atom per byte.
         atoms = [fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN, opsel_a=j, opsel_b=j))
                  for j in range(GROUP_STEPS)]
 
@@ -242,8 +242,10 @@ def _build(K, block_m, xcd_swizzle, b_shuffled):
             return out
 
         def mma(acc, a_ops, b_ops, a_scales, b_scales, opsel):
-            """acc[i][j] += A tile i x B tile j. B goes first, so tile (i, j) accumulates C^T
-            and lane (r, g) gets row r, columns 4g .. 4g+3."""
+            """
+            acc[i][j] += A tile i x B tile j. B goes first, so tile (i, j) accumulates C^T
+            and lane (r, g) gets row r, columns 4g .. 4g+3.
+            """
             a, b = regs(a_ops, 8, fx.Int32), regs(b_ops, 8, fx.Int32)
             c = [regs(row, 4, fx.Float32) for row in acc]
             rocdl.s_setprio(1)
@@ -276,7 +278,7 @@ def _build(K, block_m, xcd_swizzle, b_shuffled):
 
             a0, b0 = read("A", 0, k), read("B", 0, k)
             dma("A", 1, k + 1)
-            _barrier(lds=True)  # rule (2): B0's buffer is refilled after the next barrier
+            _barrier(lds=True)  # the leading wave row refills B0 right after the next barrier
             quadrant(0, 0, a0, b0)
 
             b1 = read("B", 1, k)
@@ -348,9 +350,10 @@ def _scale_layout_kernel(src, dst, rows, blocks, stride_r, stride_b, n_groups):
 
 
 def mxfp8_scale_layout(scale: torch.Tensor) -> torch.Tensor:
-    """ue8m0 scales [rows, K/32] (uint8) -> int32 words [ceil(rows/16), ceil(K/512), 4, 16];
-    word (row, q, g) holds in byte j the scale of MX block 16q + 4j + g. Padding is 127 (x1).
-    The reference for producers: the activation's quantization should write this layout."""
+    """
+    ue8m0 scales [rows, K/32] (uint8) -> int32 words [ceil(rows/16), ceil(K/512), 4, 16]; word
+    (row, q, g) holds in byte j the scale of MX block 16q + 4j + g. Padding is 127 (x1).
+    """
     scale = scale.view(torch.uint8)
     rows, blocks = scale.shape
     tiles, n_groups = _ceil_div(rows, 16), _ceil_div(blocks, 16)
@@ -366,11 +369,13 @@ _KERNELS = {}
 
 
 def mxfp8_gemm(a, a_scale, b, b_scale, *, b_shuffled=False, out=None, block_m=None, xcd_swizzle=4):
-    """``a @ b.T`` in bf16, with K % 128 == 0 and N % 8 == 0.
+    """
+    ``a @ b.T`` in bf16, with K % 128 == 0 and N % 8 == 0.
 
     a: [M, K] fp8 e4m3, row-major. b: [N, K] fp8 e4m3, row-major or, with ``b_shuffled``,
     aiter's shuffle_weight(b, (16, 16)). a_scale, b_scale: ``mxfp8_scale_layout`` of their
-    [rows, K/32] ue8m0 scales. block_m (128 or 256) defaults to ``_default_block_m``."""
+    [rows, K/32] ue8m0 scales. block_m (128 or 256) defaults to ``_default_block_m``.
+    """
     (m, k), n = a.shape, b.shape[0]
     if b.shape[1] != k or k % BLOCK_K or n % 8:
         raise ValueError(f"need K % {BLOCK_K} == 0 and N % 8 == 0: a {tuple(a.shape)}, b {tuple(b.shape)}")
