@@ -1306,7 +1306,9 @@ class Scheduler(
         self.enable_skip_finishing_decode = False
         # Set by the event loops that join a launched step's finished-prefill
         # rows into the running rows at launch and drop finished rows at
-        # commit; the other loops do both at the top of the next plan.
+        # commit; the other loops do both at the top of the next plan. Those
+        # are the pipeline and MLX loops; the flag goes once they join at
+        # launch too.
         self.rows_join_at_launch = False
         # Set by the PD decode loops that launch a copy of the running rows as
         # their decode step; the pipeline PD decode loop launches the rows.
@@ -3833,7 +3835,10 @@ class Scheduler(
 
         # The step launched last stays last_batch until the loop launches the
         # next one, and the idle checks and request queries read its requests,
-        # so it drops here the requests that leave the rows.
+        # so it drops here the requests that leave the rows. After a drop it is
+        # only a listing of requests: its tensors, num_decode_rows and beam
+        # tails still describe the launched rows, so nothing may filter, merge
+        # or plan it again.
         if last_batch is not None and not last_batch.has_prefill_rows():
             # A decode step, or its DP extend view: a copy of the running rows,
             # which have dropped their finished rows by the leave below. Filter
