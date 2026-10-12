@@ -272,9 +272,8 @@ class SchedulerMlxOverlapMixin:
                 self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
             plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
             )
-            self.running_batch = plan.running_batch
             next_batch = plan.batch_to_run
             self.cur_batch_for_debug = next_batch
             if next_batch:

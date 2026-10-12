@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -68,9 +69,9 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
 
-        def get_new_batch_prefill(running_batch):
-            seen.append(running_batch)
-            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+        def get_new_batch_prefill(decoding_batch):
+            seen.append(decoding_batch.rows)
+            return NextBatchPlan(batch_to_run=None, running_batch=decoding_batch.rows)
 
         s.get_new_batch_prefill = get_new_batch_prefill
         return s
@@ -79,16 +80,17 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         seen = []
         s = self._scheduler(seen)
         running = _RunningBatch(num_reqs=3)
+        decoding_batch = DecodingBatch(running)
 
         # Step N: decode is converted to extend because a peer rank extends.
-        plan = s.get_next_batch_to_run(running_batch=running, last_batch=None)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=None)
         self.assertIs(plan.batch_to_run, running)
         self.assertIs(plan.running_batch, running)
 
         # Step N+1: one row finished; the batch comes back as last_batch.
         running.reqs[0].finished = True
         plan = s.get_next_batch_to_run(
-            running_batch=plan.running_batch, last_batch=plan.batch_to_run
+            decoding_batch=decoding_batch, last_batch=plan.batch_to_run
         )
 
         self.assertEqual(len(seen), 2)

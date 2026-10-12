@@ -15,6 +15,7 @@ from sglang.srt.managers.min_free_slots_delayer import MinFreeSlotsDelayer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, AdmissionSkipReason
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -45,7 +46,8 @@ class TestAdmissionSkipReason(CustomTestCase):
         )
         try:
             ret = s._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=None, running_batch=running_batch
+                prefill_delayer_single_pass=None,
+                decoding_batch=DecodingBatch(running_batch),
             ).batch_to_run
         except _AdmissionAttempted:
             return True
@@ -175,7 +177,9 @@ class TestAdmissionEveryStep(CustomTestCase):
             ),
         ):
             plan = Scheduler._get_new_batch_prefill_raw(
-                s, prefill_delayer_single_pass=None, running_batch=running_batch
+                s,
+                prefill_delayer_single_pass=None,
+                decoding_batch=DecodingBatch(running_batch),
             )
         return plan.batch_to_run
 

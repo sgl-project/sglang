@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -36,8 +37,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.process_prefill_chunk = Mock()
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
-        self.running_batch = SimpleNamespace(
-            is_prefill_only=False, is_empty=lambda: True
+        self.decoding_batch = DecodingBatch(
+            SimpleNamespace(is_prefill_only=False, is_empty=lambda: True)
         )
 
     def test_feature_gates(self):
@@ -76,7 +77,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.resolve_waiting_queue_bootstrap = Mock()
         s.get_new_batch_prefill = self.calls.admit
         s.get_new_batch_prefill.return_value = NextBatchPlan(
-            batch_to_run=None, running_batch=self.running_batch
+            batch_to_run=None, running_batch=self.decoding_batch.rows
         )
         for waiting_queue in ([], [SimpleNamespace(rid="pending_l3")]):
             with self.subTest(waiting=bool(waiting_queue)):
@@ -84,12 +85,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 self.calls.reset_mock()
                 for _ in range(2):
                     plan = s.get_next_disagg_prefill_batch_to_run(
-                        running_batch=self.running_batch, last_batch=None
+                        decoding_batch=self.decoding_batch, last_batch=None
                     )
                     self.assertIsNone(plan.batch_to_run)
                 self.assertEqual(
                     self.calls.mock_calls,
-                    [call.drain(), call.retry(), call.admit(self.running_batch)] * 2,
+                    [call.drain(), call.retry(), call.admit(self.decoding_batch)] * 2,
                 )
 
     def test_unified_drains_when_prefill_is_deferred(self):
@@ -109,7 +110,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.return_value = None
 
-        plan = s.get_next_batch_to_run(self.running_batch, None)
+        plan = s.get_next_batch_to_run(self.decoding_batch, None)
 
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()
@@ -123,7 +124,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.pp_loop_size = 1
         enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
-        s.running_mbs = [self.running_batch]
+        s.decoding_batches = [self.decoding_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
         s.waiting_queue = []
@@ -139,7 +140,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
         self.assertEqual(
             self.calls.mock_calls,
-            [call.drain(), call.retry(), call.admit(self.running_batch)],
+            [call.drain(), call.retry(), call.admit(self.decoding_batch)],
         )
 
 

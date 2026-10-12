@@ -214,9 +214,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler.stream_groups = [(Mock(), Mock())]
                 scheduler.sm_counts = [(80, 52)]
                 scheduler.split_prefill_batch = None
-                scheduler.update_split_prefill_batch = lambda sm_count, running_batch: (
-                    False,
-                    running_batch,
+                scheduler.update_split_prefill_batch = lambda sm_count, decoding_batch: (
+                    False
                 )
                 scheduler.update_running_batch = Mock(
                     side_effect=[batch or ScheduleBatch(reqs=[]) for batch in schedule]

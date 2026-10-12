@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -122,6 +123,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     _commit_due_step = Scheduler._commit_due_step
     _debug_check_commit_gate = Scheduler._debug_check_commit_gate
     pause_generation = Scheduler.pause_generation
+    running_batch = Scheduler.running_batch
     continue_generation = Scheduler.continue_generation
 
     def __init__(
@@ -167,7 +169,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.inflight_steps = InflightQueue(depth=0)
         self.chunked_req = None
         self.decode_offload_manager = None
-        self.running_batch = ScheduleBatch(reqs=[])
+        self.decoding_batch = DecodingBatch(ScheduleBatch(reqs=[]))
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
@@ -286,7 +288,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             self, last_batch=last_batch
         )
 
-    def get_new_batch_prefill(self, running_batch):
+    def get_new_batch_prefill(self, decoding_batch):
         self.admission_attempts.append(self.iteration)
         batch = self.ready_batches.popleft() if self.ready_batches else None
         if batch is not None:
@@ -294,7 +296,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in batch.reqs
             ]
-        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
+        return NextBatchPlan(batch_to_run=batch, running_batch=decoding_batch.rows)
 
     def run_batch(self, batch):
         assert len(self.inflight_steps) < 2, (
@@ -503,11 +505,13 @@ class TestPrefillResultPolling(CustomTestCase):
 
     def test_deferred_pause_stops_preparation_with_a_free_forward_slot(self):
         class ReadyAfterPauseScheduler(_Scheduler):
-            def get_new_batch_prefill(self, running_batch):
+            def get_new_batch_prefill(self, decoding_batch):
                 if self.iteration == 1:
                     self.admission_attempts.append(self.iteration)
-                    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
-                return super().get_new_batch_prefill(running_batch)
+                    return NextBatchPlan(
+                        batch_to_run=None, running_batch=decoding_batch.rows
+                    )
+                return super().get_new_batch_prefill(decoding_batch)
 
         scheduler = ReadyAfterPauseScheduler(
             [_batch(1), _batch(2), None, _batch(3)] + [None] * 8,
@@ -542,12 +546,14 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.reissues.append(self.iteration)
                 self.tree_cache.storage_prefetch_retries.poll_miss(req.rid)
 
-            def get_new_batch_prefill(self, running_batch):
+            def get_new_batch_prefill(self, decoding_batch):
                 if self.iteration > 0 and not self.result_processes[1]:
                     self.admission_attempts.append(self.iteration)
-                    self.policy.calc_priority(self.waiting_queue, running_batch)
-                    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
-                return super().get_new_batch_prefill(running_batch)
+                    self.policy.calc_priority(self.waiting_queue, decoding_batch.rows)
+                    return NextBatchPlan(
+                        batch_to_run=None, running_batch=decoding_batch.rows
+                    )
+                return super().get_new_batch_prefill(decoding_batch)
 
         for arrivals_during_wait in (False, True):
             with self.subTest(arrivals_during_wait=arrivals_during_wait):
@@ -640,7 +646,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.grammar_future.set_result(self.compiled_grammar)
                 return super()._inputs_for_step()
 
-            def get_new_batch_prefill(self, running_batch):
+            def get_new_batch_prefill(self, decoding_batch):
                 if self.readiness_source == "grammar":
                     if self.grammar_manager.has_waiting_grammars():
                         ready = self.grammar_manager.get_ready_grammar_requests()
@@ -653,8 +659,10 @@ class TestPrefillResultPolling(CustomTestCase):
                     and not self.prefetch_ready
                 ):
                     self.admission_attempts.append(self.iteration)
-                    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
-                return super().get_new_batch_prefill(running_batch)
+                    return NextBatchPlan(
+                        batch_to_run=None, running_batch=decoding_batch.rows
+                    )
+                return super().get_new_batch_prefill(decoding_batch)
 
         for readiness_source in ("cache", "grammar"):
             for pending_forward, enabled in (
@@ -782,16 +790,16 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.waiting_queue.extend(second.reqs)
                 return result
 
-            def get_new_batch_prefill(self, running_batch):
+            def get_new_batch_prefill(self, decoding_batch):
                 if self.iteration > 0 and second in self.ready_batches:
                     index = self.req_to_metadata_buffer_idx_allocator.alloc()
                     if index is None:
                         self.admission_attempts.append(self.iteration)
                         return NextBatchPlan(
-                            batch_to_run=None, running_batch=running_batch
+                            batch_to_run=None, running_batch=decoding_batch.rows
                         )
                     second.reqs[0].metadata_buffer_index = index
-                return super().get_new_batch_prefill(running_batch)
+                return super().get_new_batch_prefill(decoding_batch)
 
         first = _batch(1)
         scheduler = MetadataBlockedScheduler(

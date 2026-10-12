@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -36,7 +37,7 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         s = self._scheduler()
         batch = self._batch(fits=False)
 
-        self.assertFalse(s.select_decode_rows(batch, retract=False))
+        self.assertFalse(s.select_decode_rows(DecodingBatch(batch), retract=False))
         batch.check_decode_mem.assert_called_once_with()
         batch.retract_decode.assert_not_called()
         batch.prepare_for_decode.assert_not_called()
@@ -46,7 +47,7 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         s = self._scheduler()
         batch = self._batch(fits=True)
 
-        self.assertTrue(s.select_decode_rows(batch, retract=False))
+        self.assertTrue(s.select_decode_rows(DecodingBatch(batch), retract=False))
         batch.prepare_for_decode.assert_called_once_with()
         s.new_token_ratio_tracker.decay_step.assert_not_called()
 
@@ -109,7 +110,9 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
             ),
         ):
             plan = Scheduler._get_new_batch_prefill_raw(
-                s, prefill_delayer_single_pass=None, running_batch=running_batch
+                s,
+                prefill_delayer_single_pass=None,
+                decoding_batch=DecodingBatch(running_batch),
             )
 
         self.assertIs(plan.batch_to_run, new_batch)
