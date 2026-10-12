@@ -286,7 +286,11 @@ namespace stdv = stdr::views;
 #endif
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
+#if SGL_USE_CONCEPTS
+template <std::integral T>
+#else
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+#endif
 inline auto irange(T end) {
 #if SGL_USE_RANGES
   return stdv::iota(static_cast<T>(0), end);
@@ -296,7 +300,11 @@ inline auto irange(T end) {
 }
 
 /// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
+#if SGL_USE_CONCEPTS
+template <std::integral T>
+#else
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+#endif
 inline auto irange(T start, T end) {
 #if SGL_USE_RANGES
   return stdv::iota(start, end);

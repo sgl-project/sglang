@@ -211,6 +211,47 @@ def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):
     assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
 
 
+@pytest.mark.parametrize("backend", ["cuda", "hip", "musa"])
+@pytest.mark.parametrize("version_available", [True, False])
+def test_compiler_fingerprint_backend_policy(monkeypatch, backend, version_available):
+    def compiler_version(command, **kwargs):
+        if not version_available:
+            raise OSError("compiler probe failed")
+        return f"{command[0]} version 1\n"
+
+    monkeypatch.setattr(cache, "is_hip_runtime", lambda: backend == "hip")
+    monkeypatch.setattr(cache, "is_musa_runtime", lambda: backend == "musa")
+    monkeypatch.setattr(
+        cache, "get_jit_cuda_arch", lambda: arch.make_jit_cuda_arch(9, 0)
+    )
+    monkeypatch.setattr(cache.toolchain, "gpu_arch_name", lambda: "test_arch")
+    monkeypatch.setattr(
+        cache.toolchain, "device_compiler_path", lambda: "/missing/device"
+    )
+    monkeypatch.setattr(cache.toolchain, "host_compiler_path", lambda: "/missing/host")
+    monkeypatch.setattr(
+        cache,
+        "subprocess",
+        SimpleNamespace(
+            check_output=compiler_version,
+            SubprocessError=cache.subprocess.SubprocessError,
+        ),
+    )
+    monkeypatch.setattr(cache, "_VERSIONED_PACKAGES", ())
+
+    compilers = []
+    for path in ("/missing/device", "/missing/host"):
+        version = f"{path} version 1\n" if version_available else "unknown"
+        if backend == "musa":
+            compilers.append((path, version if version_available else "missing"))
+        else:
+            compilers.append(version)
+    target = "cuda:9.0a" if backend == "cuda" else f"{backend}:test_arch"
+    assert cache._environment_fingerprint.__wrapped__() == cache._hash_parts(
+        [target, compilers, []]
+    )
+
+
 def test_compiler_fingerprint_resolves_host_compiler_from_path(monkeypatch, tmp_path):
     first_compiler = _write(tmp_path / "bin" / "c++-first", "first")
     second_compiler = _write(tmp_path / "bin" / "c++-second", "second")

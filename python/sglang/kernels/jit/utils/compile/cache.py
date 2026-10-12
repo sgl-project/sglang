@@ -247,13 +247,16 @@ def _environment_fingerprint() -> str:
     for path in (toolchain.device_compiler_path(), toolchain.host_compiler_path()):
         try:
             version = subprocess.check_output([path, "--version"], text=True)
-            compilers.append((path, version))
+            compilers.append((path, version) if is_musa_runtime() else version)
         except (OSError, subprocess.SubprocessError) as error:
             logger.warning("Cannot fingerprint compiler %s: %s", path, error)
-            resolved_path = pathlib.Path(path)
-            if not resolved_path.is_absolute():
-                resolved_path = pathlib.Path(shutil.which(path) or path)
-            compilers.append((path, _file_digest(resolved_path) or "missing"))
+            if is_musa_runtime():
+                resolved_path = pathlib.Path(path)
+                if not resolved_path.is_absolute():
+                    resolved_path = pathlib.Path(shutil.which(path) or path)
+                compilers.append((path, _file_digest(resolved_path) or "missing"))
+            else:
+                compilers.append("unknown")
 
     versions: List[Tuple[str, str]] = []
     for name in _VERSIONED_PACKAGES:
