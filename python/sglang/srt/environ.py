@@ -1816,6 +1816,9 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Fused KDA decode for 6 local heads (TP16 of the 96-head layers) as well as
+    # 12 (TP8), keeping the unfused chain's bf16 rounding points at 6 heads.
+    SGLANG_OPT_K3_FUSED_KDA_DECODE_TP16 = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

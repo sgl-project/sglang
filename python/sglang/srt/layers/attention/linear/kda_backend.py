@@ -682,7 +682,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 if self._fused_override_notice is not None:
                     rank0_log(self._fused_override_notice)
                     self._fused_override_notice = None
-                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
+                (
+                    w_q_t,
+                    w_k_t,
+                    w_v_t,
+                    conv_bias,
+                    a_log,
+                    onorm_w,
+                    onorm_eps,
+                    round_like_unfused,
+                ) = fused_static
                 core_attn_out = kda_fused_decode.kda_fused_decode(
                     mixed_qkv,
                     a,
@@ -701,6 +710,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     scale=layer.head_k_dim**-0.5,
                     onorm_eps=onorm_eps,
                     lower_bound=layer.lower_bound,
+                    round_like_unfused=round_like_unfused,
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
