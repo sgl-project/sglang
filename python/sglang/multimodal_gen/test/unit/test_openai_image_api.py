@@ -2,6 +2,7 @@ import inspect
 import os
 from dataclasses import fields
 
+import pytest
 from fastapi import HTTPException
 from PIL import Image
 
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
@@ -34,6 +36,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
+
+
+def test_image_requests_accept_request_level_profiling():
+    request = ImageGenerationsRequest(
+        prompt="p", profile=True, num_profiled_timesteps=4, profile_all_stages=True
+    )
+    assert (request.profile, request.num_profiled_timesteps) == (True, 4)
+    assert request.profile_all_stages is True
+    edit_params = inspect.signature(edits).parameters
+    sampling_fields = {f.name for f in fields(SamplingParams)}
+    for name in ("profile", "num_profiled_timesteps", "profile_all_stages"):
+        assert name in edit_params
+        assert name in sampling_fields
 
 
 def test_url_response_returns_one_item_per_output_path():
@@ -277,3 +292,16 @@ def test_select_image_variant_path_falls_back_to_single_file_path():
 
     assert _select_image_variant_path(item, None) == "only.png"
     assert _select_image_variant_path(item, "0") == "only.png"
+
+
+def test_request_validation_errors_are_client_errors(monkeypatch):
+    """A request that fails sampling-parameter validation returns 400, not 500."""
+
+    def reject(request_id, **kwargs):
+        raise ValueError("unsupported size")
+
+    monkeypatch.setattr(image_api, "build_sampling_params", reject)
+    with pytest.raises(HTTPException) as error:
+        image_api._build_request_sampling_params("request", size="7x7")
+    assert error.value.status_code == 400
+    assert "unsupported size" in error.value.detail
