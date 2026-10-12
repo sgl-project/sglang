@@ -55,12 +55,7 @@ def transform_index_page_table_dcp(
     dcp_rank: int,
     repeat_rows: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep the widened KV slots this DCP rank owns and map them to local rows.
-
-    Owned slots are compacted to the front of each row in their original order
-    and padded with -1. Returns the local page table and the int32 number of
-    owned slots per row; every row is emitted ``repeat_rows`` times.
-    """
+    """Owned widened slots -> local rows, compacted to the front in score order, -1 padded."""
     num_rows, topk = page_table.shape
     result = torch.empty(
         (num_rows * repeat_rows, topk),

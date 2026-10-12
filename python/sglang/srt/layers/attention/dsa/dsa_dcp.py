@@ -1,9 +1,4 @@
-"""RoPE DSA sparse attention under decode context parallelism (DCP).
-
-Index keys are replicated, so every rank selects the global top-k; each rank
-then attends over the selected slots it owns and returns a partial output with
-its LSE for the MLA DCP merge.
-"""
+"""RoPE DSA sparse attention under decode context parallelism (DCP)."""
 
 from __future__ import annotations
 
@@ -18,16 +13,14 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 
-# FlashInfer 0.7.0.post1 returns a wrong LSE for short-KV FP8 rows above this;
-# drop the folding once the pinned FlashInfer passes
-# test_folded_head_groups_match_single_group_attention with one group.
+# FlashInfer 0.7.0.post1 returns a wrong LSE above this; drop the head folding
+# once test_folded_head_groups_match_single_group_attention passes with one group.
 _TRTLLM_LSE_MAX_HEADS = 32
 # TRT-LLM puts the batch in a 16-bit grid dimension.
 TRTLLM_MAX_BATCH_ROWS = 65535
 
 
 def dsa_dcp_head_groups(num_q_heads: int) -> int:
-    """Smallest even split of the gathered query heads that fits the LSE kernel."""
     groups = math.ceil(num_q_heads / _TRTLLM_LSE_MAX_HEADS)
     while num_q_heads % groups:
         groups += 1
@@ -59,11 +52,6 @@ def localize_dcp_page_table(
     dcp_rank: int,
     head_groups: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map widened KV slots to the rows this rank owns, once per fresh top-k.
-
-    A layer that shares the previous layer's top-k hands over the same tensor
-    object, so the identity check is what keys the reuse.
-    """
     reuse = (
         topk_indices is not None
         and cache.metadata is metadata
@@ -89,12 +77,6 @@ def dcp_trtllm_sparse_attention(
     cu_seqlens_q: torch.Tensor,
     **attention_kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """TRT-LLM sparse MLA attention that also returns the per-head LSE.
-
-    Heads are folded into extra batch rows to stay within the LSE head limit,
-    and the batch is split to stay within the 16-bit row limit. Rows that own
-    no KV come back as zero output and -inf LSE.
-    """
     import flashinfer.decode
 
     rows, _, heads, dim = query.shape

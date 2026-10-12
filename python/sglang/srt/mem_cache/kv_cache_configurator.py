@@ -2037,8 +2037,7 @@ class KVCacheConfigurator:
         else:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:
-            # The replicated draft pool spans the widened slots while the DSA
-            # kernels keep reading 64-token pages.
+            # The replicated draft spans the widened slots on 64-token kernel pages.
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [

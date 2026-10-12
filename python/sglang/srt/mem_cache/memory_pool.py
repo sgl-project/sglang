@@ -4788,9 +4788,8 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
-    # True: this pool holds one row per WIDENED allocator slot (a draft replicated
-    # across the DCP ranks), so writes are identity and its reserve page is the
-    # allocator's widened page rather than the kernel page.
+    # True: one row per WIDENED slot (a draft replicated across the DCP ranks),
+    # so writes are identity and the reserve page is the allocator's widened page.
     dcp_replicated = False
 
     @property
@@ -5215,8 +5214,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
         self.index_page_size = self.page_size // index_kpool
-        # Index keys are replicated under DCP: every rank scores the whole
-        # sequence, so the cache is addressed by the widened allocator slot.
+        # Index keys are replicated under DCP and addressed by the widened slot.
         dcp_size = get_parallel().attn_dcp_size
         self.index_alloc_page_size = self.page_size * dcp_size
         if index_buf_size is None:

@@ -467,7 +467,6 @@ class DeepseekSparseAttnBackend(
             1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
         )
         self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
-        # Under DCP the sparse kernel sees the DCP group's gathered query heads.
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
         self.dcp_head_groups = (
             dsa_dcp_head_groups(self.num_dcp_q_heads) if self.dcp_size > 1 else 1

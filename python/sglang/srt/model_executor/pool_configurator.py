@@ -386,8 +386,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                # Index keys are replicated across the DCP group; a draft's token
-                # count already spans the widened slots.
+                # Replicated index keys; a draft's token count is already widened.
                 if not kvc.is_draft_worker:
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
