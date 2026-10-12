@@ -476,9 +476,11 @@ def _recv_decode_transfer(
 # Commit: the next slot's step, launched L - 1 ring steps ago.
 
 
-def _commit_due_slot_labeled(
+def _commit_due_slot_spec_relay(
     self: Scheduler, ring: _RingChannels, slot: _RingSlot
 ) -> None:
+    # The commit of the non-PD ring: it may process against the step's
+    # forward-time snapshot, and labels the processing for the profiler.
     slot.next_batch = self._pp_pop_due_batch()
     if slot.next_batch is not None:
         slot.d2h_event.synchronize()
@@ -564,7 +566,7 @@ PP_RING = RingSpec(
         _commit_proxy_send,
         _launch,
         _exchange_outputs_late,
-        _commit_due_slot_labeled,
+        _commit_due_slot_spec_relay,
         _update_rows_at_commit,
         _send_proxy,
         _end_slot,
