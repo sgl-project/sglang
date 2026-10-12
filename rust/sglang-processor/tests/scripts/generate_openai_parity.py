@@ -221,7 +221,16 @@ def lower(case, settings, model):
         request_logger=SimpleNamespace(log_requests=False),
         create_abort_task=lambda obj: None,
     )
-    handler = handler_type(tokenizer_manager, template_manager(model, settings))
+    # A checkpoint without a Jinja template, as DeepSeek-V4's.
+    template_manager = model.template_manager or SimpleNamespace(
+        completion_template_name=settings.get("completion_template"),
+        chat_template_name=None,
+        jinja_template_content_format="string",
+        jinja_template_may_reorder_tool_results=False,
+        reasoning_config=None,
+        force_reasoning=False,
+    )
+    handler = handler_type(tokenizer_manager, template_manager)
     raw_request = Request(
         {
             "type": "http",
@@ -255,22 +264,8 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
-def template_manager(model, settings):
-    """The server's `TemplateManager` for the checkpoint's Jinja template."""
-    if model.template_manager is not None:
-        return model.template_manager
-    # A checkpoint without a Jinja template, as DeepSeek-V4's.
-    return SimpleNamespace(
-        completion_template_name=settings.get("completion_template"),
-        chat_template_name=None,
-        jinja_template_content_format="string",
-        jinja_template_may_reorder_tool_results=False,
-        reasoning_config=None,
-        force_reasoning=False,
-    )
-
-
 def load_template_manager(path, tokenizer):
+    """The server's `TemplateManager` for a checkpoint with a Jinja template."""
     if not tokenizer.chat_template:
         return None
     manager = TemplateManager()
@@ -302,13 +297,13 @@ def load_model(path):
 def generate(path, model, engine_url):
     fixture = json.loads(path.read_text())
     # The model facts the host reads, so the test runs without the checkpoint.
-    reasoning_config = template_manager(model, {}).reasoning_config
     fixture["chat_model"] = {
         "context_length": get_context_length(model.text_config),
         "generation_config": model.sampling_defaults,
-        "always_thinks": reasoning_config is not None
-        and reasoning_config.special_case == "always",
     }
+    config = model.template_manager and model.template_manager.reasoning_config
+    if config is not None and config.special_case == "always":
+        fixture["chat_model"]["always_thinks"] = True
     defaults = generate_defaults()
     fixture["generate_defaults"] = {
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS

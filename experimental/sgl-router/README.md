@@ -514,9 +514,8 @@ equal to the workers', a reasoning parser the processor reproduces
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
 parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine.
-With `--tool-call-parser glm47`, a chat with tools also goes to the engine: SGLang
-constrains it with a full-assistant grammar flagged `ebnf_full_assistant`, which
-`/generate` does not accept.
+With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
+grammar needs `ebnf_full_assistant`, which `/generate` does not accept.
 The router reads the model's `config.json` and `generation_config.json` beside
 `--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
 path should point into the model's directory. Engine env vars that change the
@@ -568,15 +567,11 @@ the encoder renders them differently.
 ## GLM-5.3
 
 GLM-5.3 and GLM-5.3-Flash render with the checkpoint's `chat_template.jinja` through
-`rust/sglang-processor`, which picks them by their template as SGLang does and builds
-the template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
-Media, a `chat_template` key in `chat_template_kwargs` or the default kwargs, `-0`
-in tools or tool arguments, and U+001C..U+001F in assistant history render on the
-worker. With the cookbook's parsers
-(`glm45` and `glm47`, which `auto` resolves to) chats without tools are served
-through `/generate`, with the router splitting reasoning as SGLang does. Chats with
-tools take the engine's own route, still with the router's `input_ids`, since
-`/generate` cannot carry the grammar `glm47` constrains them with.
+`rust/sglang-processor`, which builds the template context SGLang's Jinja path builds,
+so every text chat forwards `input_ids`. Media, a `chat_template` kwarg, `-0` in tools
+or tool arguments, and U+001C..U+001F in assistant history render on the worker. With
+the cookbook's parsers, chats without tools are served through `/generate`; chats with
+tools keep the engine's route (see above).
 
 ## Kimi-K3
 

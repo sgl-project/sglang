@@ -17,18 +17,14 @@ Multimodal preprocessing is not covered here.
 
 ## Done means
 
-- **All text should work.** Every text chat the engine accepts renders and
-  tokenizes in the processor (sgl-router's `ForwardingScope::AllText`). A request
-  goes to the engine only when SGLang rejects it or the processor cannot reproduce
-  it (media, a `chat_template` kwarg); list each such case in the PR.
-- **Chat and completions go through the engine's `/generate`.** The router lowers
-  OpenAI chat and completions requests to `/generate` (`lower_chat`,
-  `lower_completion`) and does the rendering, tokenization and output parsing
-  itself. The engine's own OpenAI route is the fallback for `Unsupported`, not the
-  plan. With the cookbook's flags that needs the model's `--reasoning-parser` and
-  `--tool-call-parser` ported, plus any grammar the tool parser constrains
-  generation with, where `/generate` can carry it. Rendering parity alone is not
-  done; verify the route end to end against a live engine.
+- **All text should work**: every text chat the engine accepts renders and
+  tokenizes in the processor (sgl-router's `AllText`). Only what SGLang rejects or
+  the processor cannot reproduce goes to the engine; list it in the PR.
+- **Chat and completions go through the engine's `/generate`**, with the router
+  rendering, tokenizing and parsing (`lower_chat`, `lower_completion`); the
+  engine's OpenAI route is only the `Unsupported` fallback. That needs the
+  cookbook's `--reasoning-parser` and `--tool-call-parser` ported. Verify the route
+  against a live engine.
 
 The worked example is DeepSeek-V4-Flash-0731: `src/render/models/deepseek_v4.rs`
 plus `tests/fixtures/parity/deepseek-v4-flash-0731.json`. Paths below are relative
@@ -109,18 +105,16 @@ renders the model:
 ## Checklist (DeepSeek-V4 case that covers each)
 
 - **Message dump**: roles lowercased; unknown and null fields dropped; `user`
-  reduced to role and content; null content becomes `""`. Nested models dump too:
-  a history tool call keeps only `ToolCall`'s fields, which a template may read.
-  (`ignored_fields`, `tool_results`; GLM-5.3's `tool_call_extra_fields`)
+  reduced to role and content; null content becomes `""`; history tool calls keep
+  only `ToolCall`'s fields. (`ignored_fields`, `tool_results`; GLM-5.3's `tool_call_extra_fields`)
 - **Content parts**: which part types survive and the join separator. (`parts`)
 - **Tools**: all request tools or only those `tool_choice` allows; field order
-  and defaults of `Function.model_dump`; message-level tools; empty lists; the
-  schema types `_validate_request` rewrites in place (`varchar` becomes `string`).
-  (`tools`, `tools_none`, `tools_named`, `message_tools`, `empty_message_tools`;
-  GLM-5.3's `tool_schema_type_aliases`)
-- **Template kwargs**: the request's merged with the server's defaults. Check
-  reserved names (`apply_chat_template`'s own arguments) on the merged kwargs.
-  (GLM-5.3's `kwargs_tokenize`, `default_tokenize`)
+  and defaults of `Function.model_dump`; message-level tools; empty lists; schema
+  types `_validate_request` rewrites (`varchar` becomes `string`). (`tools`,
+  `tools_none`, `tools_named`, `message_tools`, `empty_message_tools`; GLM-5.3's
+  `tool_schema_type_aliases`)
+- **Template kwargs**: check reserved names (`apply_chat_template`'s own arguments)
+  after the server's defaults merge in. (GLM-5.3's `kwargs_tokenize`, `default_tokenize`)
 - **Pydantic coercion**: typed request fields are coerced before rendering. For
   example, `strict: 1` and `defer_loading: "false"` become booleans, and
   `strict: null` is rejected. Probe the pydantic model in Python to get its exact
@@ -157,12 +151,10 @@ renders the model:
   includes pydantic rejections and Python crashes (a 500 is still a rejection).
   (`invalid_tool_arguments`, `continuation_only`) If Dynamo rejects a shape Python accepts, say in the
   PR that hosts fall back to the engine for it.
-- **Known gaps**: when a mismatch is out of the processor's reach (inside Dynamo,
-  or in how serde_json parses the body), fix it upstream where possible and mark
-  the case `known_gap` with the reason. The test reports the case without failing,
-  and fails once it matches so the marker gets removed. Before writing an upstream
-  fix, check whether a newer Dynamo release already has it. (GLM-5.3's
-  `negative_zero_arguments`: serde_json reads `-0` as `-0.0`)
+- **Known gaps**: when a mismatch is inside Dynamo and out of the processor's
+  reach, fix it upstream and mark the case `known_gap` with the reason. The test
+  reports the case without failing, and fails once it matches so the marker gets
+  removed. Check a newer Dynamo release first. (`tool_float_values`: Dynamo's `deepseek::common::to_json`)
 
 ## Generating fixtures
 
@@ -213,7 +205,7 @@ fixture's recorded DeepSeek-V4 profile.
 ## OpenAI layer
 
 A host serves a model's OpenAI requests through `/generate` (`src/openai/`) only
-once its render parity holds. More fixtures then cover the rest of Python's
+once its render parity holds. Two more fixtures then cover the rest of Python's
 OpenAI layer:
 - `tests/fixtures/reasoning_parity/<parser>.json`, from
   `tests/scripts/generate_reasoning_parity.py`: SGLang's `ReasoningParser` on
@@ -227,24 +219,19 @@ OpenAI layer:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
   output for it, and the response Python builds from that output. Launch the
   engine with the model's cookbook flags, including its parsers. Without the
-  weights, mark cases `synthetic` and write the engine output by hand in the
-  model's real output format (GLM-5.3's fixture does). The model facts the host
-  reads go in the fixture's `chat_model`, such as `always_thinks` for a template
-  `template_detection` resolves to always-on reasoning.
+  weights, mark cases `synthetic` and write the engine output by hand, as GLM-5.3's
+  fixture does.
 
 ## Pitfalls
 
 - Dynamo version bumps change rendering silently: rerun every fixture after bumping
   `dynamo-renderer` or `dynamo-tokenizers`.
-- `/generate` accepts only the API's sampling fields
-  (`proto/sglang/api/v1/sampling.proto`, checked by Python's `api_contract.py` and
-  by the Rust server). A field Python's OpenAI layer sets in-process, such as
-  `ebnf_full_assistant` for glm47's tool grammar, cannot be sent, so a request
-  that needs one stays on the engine's route. The parity fixtures record Python's
-  in-process `GenerateReqInput`, so only a live engine shows this.
+- `/generate` accepts only the API's sampling fields (`proto/sglang/api/v1/sampling.proto`).
+  A field Python sets in-process, such as glm47's `ebnf_full_assistant`, cannot be
+  sent, so such requests stay on the engine's route. Fixtures don't show this; a
+  live engine does.
 - Python mutates the request before rendering (`_validate_request` rewrites tool
-  schemas; Pydantic drops unknown nested fields). A fixture generator that skips a
-  step hides the divergence, so drive the same entry points the server does.
+  schemas), so fixture generators drive the server's own entry points.
 - Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`,
   `SGLANG_DSV41_REASONING_EFFORT`) are read per request, as in Python. The
   generator pins them and `tests/parity.rs` clears them, so fixtures do not

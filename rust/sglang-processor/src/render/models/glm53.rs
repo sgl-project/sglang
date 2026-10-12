@@ -67,8 +67,8 @@ pub(crate) fn render(
     {
         return Err("-0 renders on the engine".into());
     }
-    // The template strips assistant content; Python's `str.strip` also strips
-    // U+001C..U+001F, where minijinja's `strip` does not.
+    // The template strips assistant content, and Python also strips U+001C..U+001F;
+    // drop once dynamo-renderer includes ai-dynamo/frontend-crates#395.
     if messages
         .iter()
         .any(|m| m["role"] == "assistant" && has_python_only_space(&m["content"]))
