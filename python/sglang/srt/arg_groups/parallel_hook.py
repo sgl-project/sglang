@@ -7,7 +7,9 @@ import logging
 import os
 from typing import Any
 
-from sglang.srt.arg_groups.cp_tp_group_sharing_hook import resolve_cp_tp_group_sharing
+from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+    resolve_cp_tp_group_sharing,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
@@ -59,34 +61,25 @@ def handle_deprecated_dp_attention(server_args: Any):
     )
 
 
-def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    kimi_k3 = architecture in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
     if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (
-        model_type == "glm5_next_text"
-        and cfg.enable_prefill_cp
-        and cfg.attn_cp_size > 1
-    ):
-        # KDA heads/state are partitioned across CP ranks. PD still transfers
-        # state only from CP rank zero, assuming CP-replicated recurrent state.
-        if cfg.disaggregation_mode != "null":
-            raise ValueError(
-                "GLM-5.3-Flash prefill CP does not support PD disaggregation: "
-                "KDA state transfer does not yet support CP head partitions."
-            )
-    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
-        # Neither model enters the input-scattered attention scope. Preserve
-        # their existing ordinary execution and make the effective flag explicit.
+    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+        # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
-            model_type,
+            architecture,
         )
         return {"enable_attn_tp_input_scattered": False}
     return {}
@@ -109,10 +102,9 @@ def handle_context_parallelism(server_args: Any):
             server_args,
             "boundary_parallelism",
             **_boundary_parallelism_overrides(
-                cfg, model_config.hf_text_config.model_type
+                cfg, model_config.hf_text_config.model_type, model_arch
             ),
         )
-        resolve_cp_tp_group_sharing(server_args, model_config)
         if (
             cfg.enable_prefill_cp
             and get_platform().is_hip
@@ -148,6 +140,7 @@ def handle_context_parallelism(server_args: Any):
                     "MiMo V2 prefill CP only supports text inference; add "
                     "--language-only."
                 )
+        resolve_cp_tp_group_sharing(server_args, model_config)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(

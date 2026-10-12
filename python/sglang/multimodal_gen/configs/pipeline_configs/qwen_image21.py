@@ -33,6 +33,7 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     vae_config: QwenImage21VAEConfig = field(default_factory=QwenImage21VAEConfig)
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
+    sample_sigmas: list[float] | None = None
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
@@ -48,7 +49,9 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
         return True
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
-        return self._prepare_sigmas(sigmas, num_inference_steps)
+        if sigmas is None:
+            sigmas = self.sample_sigmas
+        return list(self._prepare_sigmas(sigmas, num_inference_steps))
 
     def get_classifier_free_guidance_scale(self, batch, guidance_scale):
         return (
@@ -113,6 +116,6 @@ def register():
     register_configs(
         sampling_param_cls=QwenImage21SamplingParams,
         pipeline_config_cls=QwenImage21PipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        hf_model_paths=["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
         model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
     )

@@ -159,6 +159,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
                 model_type="qwen3_5_moe",
             ),
             decision_config=None,
+            joint_head_config=None,
         )
         pad, video = (
             tokenizer.encode(token, add_special_tokens=False)[0]
