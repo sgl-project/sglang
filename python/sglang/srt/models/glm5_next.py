@@ -967,14 +967,21 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, forward_batch, capture=capture_output
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
-            prev_topk_indices=prev_topk_indices,
-        )
+        # KDA is already TP-partitioned. Only the replicated DSA attention
+        # switches to cached head shards on decode / speculative verification.
+        with (
+            nullcontext()
+            if self.is_linear_attn
+            else self.self_attn.maybe_use_decode_attn_tp(forward_batch)
+        ):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:

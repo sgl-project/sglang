@@ -34,6 +34,8 @@ CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
     # GLM-5.x (inherits DeepseekV2 attention; DSA path)
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 _global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
@@ -45,6 +47,25 @@ def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
     if _global_cp_decode_attn_tp_ctx is None:
         _global_cp_decode_attn_tp_ctx = CpDecodeAttnTpContext()
     return _global_cp_decode_attn_tp_ctx
+
+
+@contextmanager
+def cp_tp_shared_draft_context():
+    """Run an attention-owning draft on TP, without the target's CP policy.
+
+    With colocated CP/TP, the target attention-TP group is a singleton. The
+    draft instead partitions heads over the shared TP group; it must not also
+    inherit the target's prefill CP or cached decode-weight slicing.
+    """
+    from sglang.srt.distributed.parallel_state import patch_tensor_parallel_group
+
+    with patch_tensor_parallel_group(get_parallel().tp_group, owns_attention=True):
+        with get_parallel().override(
+            enable_prefill_cp=False,
+            enable_cp_decode_attn_tp=False,
+            enable_cp_tp_group_sharing=False,
+        ):
+            yield
 
 
 class CpDecodeAttnTpContext:
@@ -124,6 +145,25 @@ class CpDecodeAttnTpContext:
                 sliced = self._slice_aiter_bpreshuffled_weight(raw)
             else:
                 sliced = self._slice(raw, dim)
+            if (
+                attr_name in ("weight_scale_inv", "weight_scale")
+                and raw.dtype == torch.int32
+                and raw.ndim == 2
+            ):
+                # DeepGEMM's packed UE8M0 scales are MN-major with a 16-byte
+                # TMA-aligned MN stride. Narrowing N retains the original
+                # stride, while making a K shard contiguous loses MN-major
+                # order. Repack once, also retaining the stride for Kpack=1.
+                alignment = 16 // raw.element_size()
+                mn = sliced.shape[0]
+                aligned_mn = (mn + alignment - 1) // alignment * alignment
+                packed = torch.empty(
+                    (sliced.shape[1], aligned_mn),
+                    dtype=sliced.dtype,
+                    device=sliced.device,
+                ).t()[:mn]
+                packed.copy_(sliced)
+                sliced = packed
             # Cache shards to avoid recomputation and keep CUDA graph pointers stable.
             cache = (raw, sliced, is_param)
             self._slice_cache[cache_key] = cache

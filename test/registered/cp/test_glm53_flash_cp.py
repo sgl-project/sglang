@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash interleave CP4 + native MTP on four Blackwell GPUs."""
+"""GLM-5.3-Flash prefill CP4 / decode TP4 + MTP on four Blackwell GPUs."""
 
 import base64
 import io
@@ -52,6 +52,7 @@ class TestGLM53FlashB200ContextParallel(
         "--speculative-num-draft-tokens",
         "6",
         "--enable-prefill-cp",
+        "--enable-cp-decode-attn-tp",
         "--cp-strategy",
         "interleave",
         "--attn-cp-size",

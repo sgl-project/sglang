@@ -761,6 +761,10 @@ def draft_tp_context(owns_attention: bool):
     """
     if not owns_attention:
         return contextlib.nullcontext()
+    if get_parallel().enable_cp_tp_group_sharing:
+        from sglang.srt.layers.cp.cp_decode_attn_tp import cp_tp_shared_draft_context
+
+        return cp_tp_shared_draft_context()
     return patch_tensor_parallel_group(
         get_parallel().attn_tp_group, owns_attention=True
     )

@@ -206,6 +206,18 @@ Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/
 
 Use prefill context parallelism (CP) to distribute DSA prefill computation for long prompts, including multimodal inputs. This hybrid model uses **interleave CP for DSA layers** and **head-wise tensor parallelism for KDA layers**, sharing the same communication group. Layer boundaries all-gather the context shards before KDA and reduce-scatter its output back onto those shards. The mHC residual streams and their coefficients stay local, with each output's reduction completed before the residual update.
 
+Add `--enable-cp-decode-attn-tp` to partition the replicated DSA attention heads during decode and speculative target verification. Prefill still uses interleave CP, and KDA and MoE keep their existing TP layout. Set `--attn-cp-size` equal to `--tp-size` (for example, both `8`). This colocated mode does not require separate prefill and decode servers.
+
+The switch supports native MTP and DFlash2. To use DFlash2, replace the four EAGLE speculative flags in the example below with:
+
+```bash
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2 \
+  --speculative-draft-attention-backend fa4
+```
+
+The DFlash draft uses attention TP over the shared group; only the target's DSA prefill uses CP. Multimodal inputs remain supported.
+
 <Accordion title="Example of launching with Prefill CP on Blackwell GPU">
 
 ```bash Command
