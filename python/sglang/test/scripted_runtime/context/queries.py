@@ -15,7 +15,7 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
         yield s.chunked_req
     yield from s.waiting_queue
     if get_parallel().pp_size > 1:
-        for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
+        for mb in (*s.inflight_steps.slot_batches(), *s.last_mbs, *s.running_mbs):
             if mb is not None:
                 yield from mb.reqs
     else:

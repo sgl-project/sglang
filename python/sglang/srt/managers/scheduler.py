@@ -1297,8 +1297,8 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         # Launched batches whose results are not committed yet. The normal,
-        # overlap and PD event loops install their own on entry; the pipeline
-        # and MLX loops keep their own holders.
+        # overlap, PD and pipeline event loops install their own on entry;
+        # the MLX loop keeps its own holder.
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
@@ -5230,7 +5230,7 @@ class Scheduler(
         if get_parallel().pp_size == 1:
             return True
         return all(x.is_empty() for x in self.running_mbs) and all(
-            mb is None or mb.is_empty() for mb in self.mbs
+            mb is None or mb.is_empty() for mb in self.inflight_steps.slot_batches()
         )
 
     def attach_hicache_storage_wrapped(
@@ -5442,7 +5442,10 @@ class Scheduler(
         if get_parallel().pp_size == 1:
             inflight_batches = running_and_inflight_batches(self)
         else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
+            inflight_batches = [
+                *self.running_mbs,
+                *self.inflight_steps.slot_batches(),
+            ]
         if self.enable_continuous_input_polling and self.inflight_steps:
             # Polling can run intake before the newest queued batch becomes last_batch.
             inflight_batches.extend(record.batch for record in self.inflight_steps)

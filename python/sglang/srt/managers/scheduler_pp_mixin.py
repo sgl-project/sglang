@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -148,9 +149,9 @@ class SchedulerPPMixin:
                         running_batch=self.running_batch, last_batch=self.last_batch
                     )
                     self.running_batch = plan.running_batch
-                    self.mbs[mb_id] = plan.batch_to_run
+                    self.inflight_steps.push(plan.batch_to_run, None)
                 self.running_mbs[mb_id] = self.running_batch
-                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                cur_batch: Optional[ScheduleBatch] = plan.batch_to_run
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
@@ -187,9 +188,10 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if self.mbs[next_mb_id] is not None:
+                next_batch = self._pp_pop_due_batch()
+                if next_batch is not None:
                     d2h_event.synchronize()
-                    process_target = self.mbs[next_mb_id]
+                    process_target = next_batch
                     next_md = self.mb_metadata[next_mb_id]
                     if next_md is not None and next_md.fwd_batch is not None:
                         # PP+spec: process against the forward-time snapshot;
@@ -200,12 +202,13 @@ class SchedulerPPMixin:
                             process_target,
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.last_mbs[next_mb_id] = next_batch
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                self.inflight_steps.end_step(cur_batch)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -290,10 +293,10 @@ class SchedulerPPMixin:
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-                self.mbs[mb_id] = batch
+                self.inflight_steps.push(batch, None)
                 self.running_mbs[mb_id] = self.running_batch
 
-                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                cur_batch: Optional[ScheduleBatch] = batch
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
@@ -334,13 +337,14 @@ class SchedulerPPMixin:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
+                next_batch = self._pp_pop_due_batch()
+                if next_batch is not None:
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
+                        next_batch,
                         next_batch_result,
                     )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.last_mbs[next_mb_id] = next_batch
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -355,6 +359,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                self.inflight_steps.end_step(cur_batch)
                 release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
@@ -426,10 +431,10 @@ class SchedulerPPMixin:
                 )
                 self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
-                self.mbs[mb_id] = batch
+                self.inflight_steps.push(batch, None)
                 self.running_mbs[mb_id] = self.running_batch
 
-                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                cur_batch: Optional[ScheduleBatch] = batch
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
@@ -513,13 +518,14 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
+                next_batch = self._pp_pop_due_batch()
+                if next_batch is not None:
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
+                        next_batch,
                         next_batch_result,
                     )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.last_mbs[next_mb_id] = next_batch
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -538,6 +544,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                self.inflight_steps.end_step(cur_batch)
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
@@ -562,7 +569,9 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
-        self.mbs = [None] * self.pp_loop_size
+        # One record per ring step; slot mb_id commits L - 1 steps after its
+        # launch, just before the step that replans it.
+        self.inflight_steps = InflightQueue(depth=self.pp_loop_size - 1, ring=True)
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False)
@@ -738,12 +747,19 @@ class SchedulerPPMixin:
         ) = self._pp_send_recv_and_preprocess_output_tensors(
             next_first_rank_mb_id,
             next_mb_id,
-            self.mbs,
+            self.inflight_steps.slot_batches(),
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
         )
         return next_pp_outputs, next_batch_result, d2h_event
+
+    def _pp_pop_due_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+        """Pop the record of slot next_mb_id, launched L - 1 steps ago, and
+        return its batch; None for an empty record or in the first round."""
+        if not self.inflight_steps.has_due():
+            return None
+        return self.inflight_steps.pop_due().batch
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []

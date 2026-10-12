@@ -71,7 +71,8 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
         flushed = False
         for _ in range(DEFAULT_MAX_STEPS):
             in_flight = any(
-                mb is not None and not mb.is_empty() for mb in scheduler.mbs
+                mb is not None and not mb.is_empty()
+                for mb in scheduler.inflight_steps.slot_batches()
             )
             queues_clear = (
                 scheduler.chunked_req is None

@@ -259,8 +259,11 @@ class SchedulerInternalStateController:
         running, including PP micro-batches and PD decode queues."""
         scheduler = self.scheduler
         batches = running_and_inflight_batches(scheduler)
+        # Read the PP holders only if present: a non-PP scheduler has no
+        # micro-batches. The pipeline loops install their step ring with last_mbs.
         batches.extend(getattr(scheduler, "running_mbs", ()))
-        batches.extend(getattr(scheduler, "mbs", ()))
+        if hasattr(scheduler, "last_mbs"):
+            batches.extend(scheduler.inflight_steps.slot_batches())
         batches.extend(getattr(scheduler, "last_mbs", ()))
         queued = [
             *(req for batch in batches if batch is not None for req in batch.reqs),
