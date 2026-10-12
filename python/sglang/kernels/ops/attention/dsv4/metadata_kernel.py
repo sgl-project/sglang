@@ -282,12 +282,15 @@ def _store_compressed_positions(
     seq, valid, offsets, dst, BS: tl.constexpr, RATIO: tl.constexpr
 ):
     keep = valid & (seq % RATIO == 0)
-    ordinal = tl.cumsum(keep.to(tl.int32), 0) - 1
+    prefix = tl.cumsum(keep.to(tl.int32), 0)
     count = tl.sum(keep.to(tl.int32), 0)
-    # Selected requests own [0, count), in their original order. Tail stores
-    # own [count, BS): disjoint writes, with no zero-then-scatter race.
-    tl.store(dst + ordinal, seq.to(tl.int64) - RATIO, mask=keep)
-    tl.store(dst + offsets, 0, mask=(offsets >= count) & (offsets < BS))
+    # Give every lane a unique destination: selected rows fill [0, count)
+    # in order, and unselected rows fill [count, BS) with zeros. Padding lanes
+    # map to their own offsets >= BS, so even masked lanes cannot alias a
+    # valid write if Ascend lowers the masked store to load/select/store.
+    dst_offsets = tl.where(keep, prefix - 1, count + offsets - prefix)
+    values = tl.where(keep, seq.to(tl.int64) - RATIO, 0)
+    tl.store(dst + dst_offsets, values, mask=offsets < BS)
 
 
 @triton.jit(do_not_specialize=["n_c4", "n_c128"])

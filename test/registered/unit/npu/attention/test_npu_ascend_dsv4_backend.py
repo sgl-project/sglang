@@ -451,6 +451,40 @@ class TestNPUDecodeCompressionMetadata(CustomTestCase):
     @unittest.skipUnless(
         hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
     )
+    def test_npu_fused_compaction_preserves_positions_on_buffer_reuse(self):
+        # Unselected rows must not restore stale values over the compacted
+        # prefix. Guard both ends to catch writes outside the output view.
+        for ratio in (4, 128):
+            for bs in (4, 7):
+                fm = self._metadata(bs, "npu")
+                guards = {}
+                for key in ("positions_cmp_padding_c4", "positions_cmp_padding_c128"):
+                    guards[key] = torch.full(
+                        (bs + 2,), -911, dtype=torch.int64, device="npu"
+                    )
+                    setattr(fm, key, guards[key][1:-1])
+                cases = (
+                    [(i + 2) * ratio for i in range(bs)],
+                    # C128, bs=4: [256, 257, 384, 385] -> [128, 256, 0, 0].
+                    [(i // 2 + 2) * ratio + i % 2 for i in range(bs)],
+                    # A leading idle row used to produce a masked ordinal=-1.
+                    [0] + [(i + 2) * ratio if i % 2 == 0 else 0 for i in range(bs - 1)],
+                    [1] * bs,
+                    [0] * bs,
+                )
+                for values in cases:
+                    with self.subTest(ratio=ratio, bs=bs, values=values):
+                        _, expected = self._refresh(
+                            values, (4, 128), device="npu", fm=fm, fused=True
+                        )
+                        self._assert_metadata(fm, expected)
+                        for key, storage in guards.items():
+                            self.assertEqual(storage[0].item(), -911, key)
+                            self.assertEqual(storage[-1].item(), -911, key)
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
     def test_npu_graph_consumes_updated_metadata_and_cleared_tails(self):
         fm = self._metadata(5, "npu")
         backend = self._backend((4, 128))
