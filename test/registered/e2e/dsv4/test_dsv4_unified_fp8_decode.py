@@ -567,7 +567,7 @@ class TestUnifiedFp8Decode(CustomTestCase):
     @_needs_gfx950
     @unittest.skipUnless(
         runtime.flydsl_decode_supported(16),
-        "aiter has no flydsl_mla_v4_decode_fused",
+        "no FlyDSL v4 nm decode (aiter or in-tree)",
     )
     def test_fused_wo_a_operands_match_unfused_chain(self):
         """decode + inverse RoPE + wo_a quant in one launch == the unfused chain,

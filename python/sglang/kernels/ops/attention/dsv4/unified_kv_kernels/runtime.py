@@ -27,6 +27,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -48,6 +49,8 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices i
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -474,19 +477,51 @@ def decode_fp8_hca_ps(
     return out
 
 
+# TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+# (with it: the in-tree fallback below, flydsl_v4nm/ and
+# SGLANG_DSV4_FLYDSL_DECODE_SOURCE; aiter's copy is then the only one).
+_FLYDSL_V4_DECODE_SOURCES = ("auto", "aiter", "intree")
+
+
 @lru_cache(maxsize=1)
 def _flydsl_v4_decode():
-    """aiter.ops.flydsl when it ships the FlyDSL v4 nm decode, else None."""
+    """The FlyDSL v4 nm decode API (ROCm/aiter#5882) or None (asm kernel).
+
+    SGLANG_DSV4_FLYDSL_DECODE=0 forces None. SGLANG_DSV4_FLYDSL_DECODE_SOURCE:
+    auto (default) takes aiter.ops.flydsl when the installed aiter ships it, else
+    sglang's in-tree copy (flydsl_v4nm); aiter / intree take only that one.
+    """
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_DSV4_FLYDSL_DECODE.get():
         return None
-    try:
-        from aiter.ops import flydsl as fly
+    source = envs.SGLANG_DSV4_FLYDSL_DECODE_SOURCE.get()
+    if source not in _FLYDSL_V4_DECODE_SOURCES:
+        raise ValueError(
+            f"SGLANG_DSV4_FLYDSL_DECODE_SOURCE={source!r}, expected one of "
+            f"{_FLYDSL_V4_DECODE_SOURCES}"
+        )
+    fly = None
+    if source != "intree":
+        try:
+            from aiter.ops import flydsl as fly
 
-        fly.flydsl_mla_v4_decode_supported  # resolves the lazy import
-    except (ImportError, AttributeError):
-        return None
+            fly.flydsl_mla_v4_decode_supported  # resolves the lazy import
+            origin = "aiter.ops.flydsl"
+        except (ImportError, AttributeError):
+            fly = None
+    if fly is None and source != "aiter":
+        try:
+            from sglang.kernels.ops.attention.dsv4 import flydsl_v4nm as fly
+
+            origin = "sglang in-tree copy of ROCm/aiter#5882"
+        except ImportError as e:  # no flydsl, or an aiter before ROCm/aiter#6377
+            fly = None
+            logger.warning("in-tree FlyDSL v4 nm decode unavailable: %s", e)
+    if fly is None:
+        logger.info("DSv4 fp8 decode: no FlyDSL v4 nm decode (source=%s)", source)
+    else:
+        logger.info("DSv4 fp8 decode: FlyDSL v4 nm decode from %s", origin)
     return fly
 
 

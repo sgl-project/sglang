@@ -1599,6 +1599,11 @@ class Envs:
     # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
     # installed aiter ships it; 0 keeps the asm kernel.
     SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
+    # ... which copy: "auto" = aiter's when the installed aiter ships it, else
+    # sglang's in-tree copy; "aiter" = aiter's only (asm without it); "intree" =
+    # the in-tree copy only.
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    SGLANG_DSV4_FLYDSL_DECODE_SOURCE = EnvStr("auto")
     # ... also with 128 local heads (DP attention). Off: there the asm path
     # below (split plan + HCA persistent, ROCm/aiter#6126) measured the same
     # DP8 DSpark decode step on MI355X without depending on FlyDSL.
