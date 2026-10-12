@@ -26,6 +26,12 @@ fn kimi_tokens_match_sglang() {
                 .repeat(repeat as usize)
                 .into();
         }
+        // Dynamo rejects a system turn with both content and tools, which SGLang
+        // renders; the router leaves that shape to the worker.
+        if case["name"] == "developer_tools" {
+            assert!(formatter.encode(&tokenizer, &request).is_err());
+            continue;
+        }
         let ids = formatter.encode(&tokenizer, &request).unwrap();
         let mut hash = Sha256::new();
         for id in &ids {
