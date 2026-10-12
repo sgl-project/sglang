@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -822,6 +823,32 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         return x
 
 
+class WanS2VBlockRunner(nn.Module):
+    """One transformer block followed by its audio injector.
+
+    The injector must sit inside the iterated unit, not in the caller's loop: a
+    DiT cache replaces the iterated ModuleList with a single pseudo-block that
+    runs the blocks itself, so an injector driven by the loop index would fire
+    once per step instead of at each injected layer. The first argument is named
+    `hidden_states` for cache-dit's Pattern_3 contract.
+    """
+
+    def __init__(
+        self,
+        block: nn.Module,
+        block_idx: int,
+        after_block: Callable[[int, torch.Tensor], torch.Tensor],
+    ):
+        super().__init__()
+        # Kept out of the module tree: the block stays owned by `blocks`, so
+        # state_dict keys and the layerwise-offload hooks are unchanged.
+        self._runs = (block, block_idx, after_block)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        block, block_idx, after_block = self._runs
+        return after_block(block_idx, block(hidden_states, **kwargs))
+
+
 class WanModelS2V(ModelMixin, ConfigMixin):
     ignore_for_config = [
         "args",
@@ -957,6 +984,19 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             enable_adain=enable_adain,
             adain_dim=self.dim,
             need_adain_ont=adain_mode != "attn_norm",
+        )
+        # What forward iterates, instead of `blocks`: a DiT cache swaps this
+        # list for its own pseudo-block, so the injectors ride along with it
+        # (see _CUSTOM_BLOCK_ADAPTER_SPECS in runtime/cache).
+        self.block_runners = nn.ModuleList(
+            [
+                WanS2VBlockRunner(
+                    block=block,
+                    block_idx=block_idx,
+                    after_block=self.after_transformer_block,
+                )
+                for block_idx, block in enumerate(self.blocks)
+            ]
         )
         self.adain_mode = adain_mode
         self.trainable_cond_mask = nn.Embedding(3, self.dim)
@@ -1295,9 +1335,8 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             context_lens=None,
             num_replicated_suffix=condition_suffix_len if sequence_shard_enabled else 0,
         )
-        for idx, block in enumerate(self.blocks):
-            x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+        for block_runner in self.block_runners:
+            x = block_runner(x, **kwargs)
         if sequence_shard_enabled:
             x_video = sequence_model_parallel_all_gather(
                 x[:, : self.local_original_seq_len].contiguous(), dim=1
