@@ -2038,7 +2038,6 @@ class KVCacheConfigurator:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
-            pool_kwargs["index_kernel_page_size"] = get_schedule().page_size
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)

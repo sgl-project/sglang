@@ -5174,7 +5174,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
-        index_kernel_page_size: Optional[int] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5201,13 +5200,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
-        self.index_kernel_page_size = (
-            page_size if index_kernel_page_size is None else index_kernel_page_size
+        assert self.page_size % index_kpool == 0, (
+            f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
-        assert self.index_kernel_page_size % index_kpool == 0, (
-            f"page_size {self.index_kernel_page_size} must be a multiple of index_kpool {index_kpool}"
-        )
-        self.index_page_size = self.index_kernel_page_size // index_kpool
+        self.index_page_size = self.page_size // index_kpool
+        if dcp_replicated:
+            self.index_page_size //= get_parallel().attn_dcp_size
         if index_buf_size is None:
             index_buf_size = (
                 size if dcp_replicated else size * get_parallel().attn_dcp_size
