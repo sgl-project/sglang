@@ -49,6 +49,7 @@ pub use vet::{VetError, VettedSnapshot};
 pub const SNAPSHOT_FORMAT: u32 = 1;
 /// LoRA aliases are required to interpret removals; older replicas must refuse these snapshots.
 pub const LORA_SNAPSHOT_FORMAT: u32 = 2;
+pub const LORA_MAPPINGS_PARAM: &str = "include_lora";
 
 /// Path the producer serves snapshots on.
 pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";

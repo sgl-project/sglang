@@ -97,9 +97,10 @@ IDs can own the same lookup key; removing one leaves the other owners and
 storage tiers intact. The remote indexer bridge performs the same translation.
 Base-model events retain their existing published-key path.
 
-Peer snapshots containing LoRA mappings use version 2 so an older replica
-cannot import lookup keys without the IDs needed to remove them. Base-only
-snapshots retain version 1. LoRA stores buffered during bootstrap retain their
+New replicas request `?include_lora=true` snapshots containing LoRA mappings
+(version 2). Legacy consumers receive a base-only version-1 view, so mixed
+snapshots do not prevent base-cache bootstrap during rolling upgrades. Base-only
+snapshots retain version 1 for every consumer. LoRA stores buffered during bootstrap retain their
 tokens; the original base-model buffering and replay behavior is unchanged.
 
 Reloading different adapter weights under the same public name can still
