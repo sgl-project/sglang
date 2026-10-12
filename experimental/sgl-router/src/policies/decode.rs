@@ -5,7 +5,7 @@
 
 use crate::config::DecodePolicyKind;
 use crate::policies::admission::{
-    compare_decode_pressure, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
+    compare_decode_engines, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
     RoutingStage,
 };
 use crate::policies::registry::select_decode_with_affinity;
@@ -126,7 +126,7 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
                 let left = &domain.workers[i];
                 let right = &domain.workers[j];
                 let (primary, backup) =
-                    if compare_decode_pressure(left, right, ctx.load_snapshot()).is_gt() {
+                    if compare_decode_engines(left, right, ctx.load_snapshot()).is_gt() {
                         (Arc::clone(right), Arc::clone(left))
                     } else {
                         (Arc::clone(left), Arc::clone(right))

@@ -164,6 +164,8 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     max_num_tokens_padded_sgl = topk_ids.numel() + num_experts * (block_size - 1)
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded_sgl = topk_ids.numel() * block_size
+    # The kernel pads sorted_ids with int4 stores.
+    max_num_tokens_padded_sgl = (max_num_tokens_padded_sgl + 3) // 4 * 4
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded_sgl,), dtype=torch.int32, device=topk_ids.device
     )

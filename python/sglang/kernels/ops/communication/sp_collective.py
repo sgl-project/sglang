@@ -68,8 +68,11 @@ def get_dispatch(
     hidden_size: int,
     num_tokens: int,
     device: torch.device,
+    *,
+    element_size: int = 2,
+    max_push_size: Optional[int] = None,
 ) -> Optional[Dispatch]:
-    """Return the tuned strategy, or None when the table selects NCCL."""
+    """Return a tuned strategy that fits, or None when NCCL should run."""
     table = _table(world_size, hidden_size, device)
     if table is None:
         return None
@@ -77,13 +80,35 @@ def get_dispatch(
     if raw_configs is None:
         return None
     configs = {int(k): v for k, v in raw_configs.items()}
-    bucket = min(configs)
-    for candidate in sorted(configs):
+    buckets = sorted(configs)
+    bucket_index = 0
+    for index, candidate in enumerate(buckets):
         if candidate <= num_tokens:
-            bucket = candidate
+            bucket_index = index
         else:
             break
-    config = configs[bucket]
+    config = configs[buckets[bucket_index]]
+    if (
+        max_push_size is not None
+        and config["strategy"] == "push"
+        and num_tokens * hidden_size * element_size // world_size > max_push_size
+    ):
+        # The selected push bucket does not fit. Advance to the next measured
+        # operation-specific fallback rather than immediately using NCCL.
+        fallback_strategy = {
+            "reduce_scatter": "pull",
+            "all_gather": "direct",
+        }.get(kind)
+        if fallback_strategy is None:
+            return None
+        for candidate in buckets[bucket_index + 1 :]:
+            config = configs[candidate]
+            if config["strategy"] == "nccl":
+                return None
+            if config["strategy"] == fallback_strategy:
+                break
+        else:
+            return None
     if config["strategy"] == "nccl":
         return None
     return Dispatch(

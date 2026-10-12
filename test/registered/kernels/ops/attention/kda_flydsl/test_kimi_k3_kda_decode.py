@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
 
 import pytest
@@ -12,8 +13,7 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
+pytest.importorskip("aiter")
 
 from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
@@ -27,12 +27,9 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
+    if importlib.util.find_spec("flydsl") is None:
         return False
-    try:
-        return get_gfx() == "gfx950"
-    except (AssertionError, KeyError, RuntimeError):
-        return False
+    return is_flydsl_kimi_k3_kda_decode_supported()
 
 
 pytestmark = pytest.mark.skipif(
@@ -519,9 +516,9 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
 def test_fused_kda_backend_is_opt_in(monkeypatch):
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.delenv("SGLANG_K3_KDA_FUSED_BACKEND", raising=False)
+    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
     assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_K3_KDA_FUSED_BACKEND", "aiter")
+    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
     assert kda_fused_decode_aiter_hip.enabled()
 
 

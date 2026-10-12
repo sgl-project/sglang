@@ -5,14 +5,17 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
+from huggingface_hub.errors import LocalEntryNotFoundError
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     checkpoint_bytes,
+    dit_parameter_count,
     load_safetensors_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -22,6 +25,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
+from sglang.test.test_utils import CustomTestCase
 
 _DIST_STREAMER_MOD = "runai_model_streamer.distributed_streamer.distributed_streamer"
 
@@ -108,6 +112,171 @@ class TestPrecisionVariantSelection(unittest.TestCase):
             checkpoint.flush()
 
             self.assertEqual(checkpoint_bytes(checkpoint.name), 10)
+
+
+_LOADER_UTILS = "sglang.multimodal_gen.runtime.loader.utils"
+_SNAPSHOT_DOWNLOAD = f"{_LOADER_UTILS}.snapshot_download"
+_TWO_SHARD_INDEX = (
+    '{"weight_map":{"a":"shard-1.safetensors","b":"shard-2.safetensors"}}'
+)
+
+
+def _write_sharded_transformer(root: Path) -> None:
+    transformer = root / "transformer"
+    transformer.mkdir(parents=True)
+    safetensors_save_file({"a": torch.zeros(3, 4)}, transformer / "shard-1.safetensors")
+    safetensors_save_file(
+        {"b": torch.zeros(5, dtype=torch.bfloat16)},
+        transformer / "shard-2.safetensors",
+    )
+    (transformer / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        _TWO_SHARD_INDEX
+    )
+
+
+class TestDitParameterCount(CustomTestCase):
+    def test_counts_every_indexed_shard_across_float_dtypes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_sharded_transformer(Path(tmpdir) / "sub")
+
+            self.assertEqual(
+                dit_parameter_count(tmpdir, subfolder="sub", revision=None), 17
+            )
+
+    def test_counts_the_canonical_file_over_a_precision_variant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transformer = Path(tmpdir) / "transformer"
+            transformer.mkdir()
+            safetensors_save_file(
+                {"w": torch.zeros(2, 3)},
+                transformer / "diffusion_pytorch_model.safetensors",
+            )
+            safetensors_save_file(
+                {"w": torch.zeros(2, 3, dtype=torch.float16)},
+                transformer / "diffusion_pytorch_model.fp16.safetensors",
+            )
+
+            self.assertEqual(
+                dit_parameter_count(tmpdir, subfolder=None, revision=None), 6
+            )
+
+    def test_expands_a_home_relative_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_sharded_transformer(Path(tmpdir) / "model")
+            with patch.dict(os.environ, {"HOME": tmpdir}):
+                self.assertEqual(
+                    dit_parameter_count("~/model", subfolder=None, revision=None), 17
+                )
+
+    def test_missing_shard_or_quantized_weights_leave_the_dit_unsized(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_shard = Path(tmpdir) / "missing" / "transformer"
+            missing_shard.mkdir(parents=True)
+            (
+                missing_shard / "diffusion_pytorch_model.safetensors.index.json"
+            ).write_text(_TWO_SHARD_INDEX)
+            quantized = Path(tmpdir) / "quantized" / "transformer"
+            quantized.mkdir(parents=True)
+            safetensors_save_file(
+                {
+                    "w": torch.zeros(2, 3, dtype=torch.float8_e4m3fn),
+                    "scale": torch.ones(1),
+                },
+                quantized / "diffusion_pytorch_model.safetensors",
+            )
+
+            for model_dir in ("missing", "quantized"):
+                with self.subTest(model_dir=model_dir):
+                    self.assertIsNone(
+                        dit_parameter_count(
+                            os.path.join(tmpdir, model_dir),
+                            subfolder=None,
+                            revision=None,
+                        )
+                    )
+
+    def test_single_file_checkpoint_is_not_sized(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            snapshot_download = Mock()
+            with patch(_SNAPSHOT_DOWNLOAD, snapshot_download):
+                self.assertIsNone(
+                    dit_parameter_count(checkpoint.name, subfolder=None, revision=None)
+                )
+
+        snapshot_download.assert_not_called()
+
+    def test_cached_hub_snapshot_is_sized_without_the_network(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_sharded_transformer(Path(tmpdir))
+            hub_download = Mock()
+            with (
+                patch(_SNAPSHOT_DOWNLOAD, return_value=tmpdir) as snapshot_download,
+                patch(f"{_LOADER_UTILS}.hf_hub_download", hub_download),
+            ):
+                self.assertEqual(
+                    dit_parameter_count("org/model", subfolder=None, revision="abc"),
+                    17,
+                )
+
+        hub_download.assert_not_called()
+        self.assertTrue(snapshot_download.call_args.kwargs["local_files_only"])
+        self.assertEqual(snapshot_download.call_args.kwargs["revision"], "abc")
+
+    def test_hub_headers_size_an_uncached_or_partly_cached_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = Path(tmpdir) / "index.json"
+            index.write_text(_TWO_SHARD_INDEX)
+            # a cached snapshot whose second shard never finished downloading
+            partial = Path(tmpdir) / "partial"
+            _write_sharded_transformer(partial)
+            (partial / "transformer" / "shard-2.safetensors").unlink()
+            header = SimpleNamespace(parameter_count={"F32": 10, "BF16": 2})
+            for snapshot in (
+                Mock(side_effect=LocalEntryNotFoundError("not cached")),
+                Mock(return_value=str(partial)),
+            ):
+                with (
+                    self.subTest(snapshot=snapshot),
+                    patch.dict(os.environ, {"SGLANG_USE_MODELSCOPE": "0"}),
+                    patch(_SNAPSHOT_DOWNLOAD, snapshot),
+                    patch(f"{_LOADER_UTILS}.hf_hub_download", return_value=str(index)),
+                    patch(
+                        f"{_LOADER_UTILS}.parse_safetensors_file_metadata",
+                        return_value=header,
+                    ) as parse,
+                ):
+                    self.assertEqual(
+                        dit_parameter_count(
+                            "org/model", subfolder=None, revision="abc"
+                        ),
+                        24,
+                    )
+                    self.assertEqual(
+                        [call.kwargs["filename"] for call in parse.call_args_list],
+                        [
+                            "transformer/shard-1.safetensors",
+                            "transformer/shard-2.safetensors",
+                        ],
+                    )
+                    self.assertEqual(parse.call_args.kwargs["revision"], "abc")
+
+    def test_unreachable_hub_or_modelscope_leaves_the_dit_unsized(self):
+        for use_modelscope, hub_download in (
+            ("0", Mock(side_effect=LocalEntryNotFoundError("unreachable"))),
+            ("1", Mock()),
+        ):
+            with (
+                self.subTest(use_modelscope=use_modelscope),
+                patch.dict(os.environ, {"SGLANG_USE_MODELSCOPE": use_modelscope}),
+                patch(_SNAPSHOT_DOWNLOAD, side_effect=LocalEntryNotFoundError("miss")),
+                patch(f"{_LOADER_UTILS}.hf_hub_download", hub_download),
+                patch(f"{_LOADER_UTILS}.parse_safetensors_file_metadata") as parse,
+            ):
+                self.assertIsNone(
+                    dit_parameter_count("org/model", subfolder=None, revision=None)
+                )
+                parse.assert_not_called()
+                self.assertEqual(hub_download.called, use_modelscope == "0")
 
 
 class TestDisableRunaiStreamerRankDiscoveryCollective(unittest.TestCase):
