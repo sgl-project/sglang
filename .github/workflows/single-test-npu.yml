@@ -16,7 +16,7 @@ concurrency:
 jobs:
   single-node-poc:
     name: single-node-poc
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-16
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B100
     steps:
@@ -41,7 +41,8 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/npu/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in3k5_out1k5_10ms.py"
+            "test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py"
+            #"test/registered/npu/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in3k5_out1k5_10ms.py"
             #"test/registered/npu/basic_function/test_npu_lora_hf_sgl_logprob_diff.py"
             #"test/registered/npu/basic_function/speculative_inference/test_npu_speculative_draft_attention_backend.py"
             #"test/registered/npu/basic_function/lora/test_npu_lora_qwen3_6_27b_logprob_diff.py"
