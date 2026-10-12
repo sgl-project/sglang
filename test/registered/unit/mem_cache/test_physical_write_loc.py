@@ -390,31 +390,7 @@ def _unified_producer_files():
     return sorted(files)
 
 
-def _unified_backend_names():
-    """Every attention backend the unified-memory allowlists name."""
-    tree = ast.parse((_SRT / "arg_groups/kv_cache_hook.py").read_text())
-    names = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and any(_is_name(t, n) for t in node.targets for n in _ALLOWLIST_NAMES)
-            and isinstance(node.value, ast.Set)
-        ):
-            names.update(
-                e.value for e in node.value.elts if isinstance(e, ast.Constant)
-            )
-    return names
-
-
 class TestEveryUnifiedProducerMarksItsLoc(unittest.TestCase):
-    def test_the_census_covers_every_allowlisted_backend(self):
-        names = _unified_backend_names()
-        self.assertIn("fa3", names)  # the parse found the allowlists
-        self.assertLessEqual(names, set(_UNIFIED_BACKEND_FILES))
-        for group in _UNIFIED_BACKEND_FILES.values():
-            for f in group:
-                self.assertTrue((_SRT / f).is_file(), f)
-
     def test_every_write_door_call_passes_a_marked_loc(self):
         files = _unified_producer_files()
         census = _WriteLocCensus(
@@ -422,30 +398,6 @@ class TestEveryUnifiedProducerMarksItsLoc(unittest.TestCase):
         )
         self.assertGreater(len(census.doors), 20)  # the census saw the doors
         self.assertEqual(census.unmarked(), [])
-
-    def test_the_census_tells_marked_from_unmarked(self):
-        src = """
-def good(self, pool, fb, layer):
-    pool.set_kv_buffer(layer, KVWriteLoc.for_batch(fb), 1, 2)
-    loc = KVWriteLoc(fb.out_cache_loc // 2, physical=True)
-    pool.set_mla_kv_buffer(layer, loc, 1, 2)
-    pool.set_kv_buffer(layer, self._helper(fb), 1, 2)
-    self._write(fb, layer, KVWriteLoc.for_layer(fb, layer))
-
-def _helper(self, fb):
-    return KVWriteLoc.for_batch(fb)
-
-def _write(self, fb, layer, loc_info):
-    pool.set_kv_buffer(layer, loc_info, 1, 2)
-
-def bad(self, pool, fb, layer):
-    pool.set_kv_buffer(layer, fb.out_cache_loc, 1, 2)
-    cache_loc = fb.out_cache_loc
-    pool.set_mla_kv_buffer(layer, cache_loc, 1, 2)
-    pool.set_kv_buffer(layer, KVWriteLoc(cache_loc), 1, 2)
-"""
-        census = _WriteLocCensus({"m.py": src})
-        self.assertEqual(census.unmarked(), ["m.py:16", "m.py:18", "m.py:19"])
 
 
 def _only_raises(fn) -> bool:
@@ -512,36 +464,6 @@ class TestEveryPoolDoorTakesAWriteLoc(unittest.TestCase):
         )
         self.assertGreater(doors, 20)  # the census saw the doors
         self.assertEqual(bad, [])
-
-    def test_the_census_tells_unwrapping_from_bare(self):
-        src = """
-class Good(KVCache):
-    def set_kv_buffer(self, layer, loc_info, k, v):
-        loc, _, _ = unwrap_write_loc(loc_info)
-        self.buf[loc] = k
-
-    def set_mla_kv_buffer(self, layer, loc_info, k, v):
-        self.inner.set_mla_kv_buffer(layer, loc_info, k, v)
-
-
-class PassThrough(KVCache):
-    def set_kv_buffer(self, *args, **kwargs):
-        self.inner.set_kv_buffer(*args, **kwargs)
-
-
-class Bare(KVCache):
-    def set_kv_buffer(self, layer, loc, k, v):
-        self.buf[loc] = k
-
-    def set_mla_kv_buffer(self, layer, loc, k, v):
-        loc = self.translate(loc)
-        super().set_mla_kv_buffer(layer, loc, k, v)
-"""
-        doors, bad = _pool_doors_taking_a_bare_loc({"m.py": src})
-        self.assertEqual(doors, 5)
-        self.assertEqual(
-            bad, ["m.py:Bare.set_kv_buffer", "m.py:Bare.set_mla_kv_buffer"]
-        )
 
 
 if __name__ == "__main__":

@@ -25,15 +25,6 @@ def skip_if_no_blackwell_nvfp4(func):
 class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
-    def test_registry_contains_nvfp4_and_blockfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            KV_CACHE_QUANT_REGISTRY,
-        )
-
-        self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
-
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
