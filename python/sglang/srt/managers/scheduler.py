@@ -3832,6 +3832,8 @@ class Scheduler(
         # live rows. Runs after the last_batch join and outside it, so finished
         # rows leave even when no new batch arrives (e.g. traffic stops).
         self.leave_finished_rows(running_batch)
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_plan_start(running_batch)
 
         admit_plan = self._admit_prefill(running_batch)
         running_batch = admit_plan.running_batch
