@@ -4808,6 +4808,7 @@ class DeepseekV4Model(nn.Module):
                         _win = False
                     if _win:
                         _parts = []
+                        _hpos = ""
                         if hidden_states.numel():
                             _arr = (
                                 hidden_states.detach()
@@ -4817,7 +4818,8 @@ class DeepseekV4Model(nn.Module):
                                 .numpy()
                             )
                             _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
-                            _hp = _pos.reshape(-1).to(torch.int64).cpu() // 128
+                            _pflat = _pos.reshape(-1).to(torch.int64).cpu()
+                            _hp = _pflat // 128
                             _hh = hidden_states.detach().to(torch.float32).cpu()
                             for _b in torch.unique(_hp).tolist():
                                 _m = _hp == _b
@@ -4827,12 +4829,42 @@ class DeepseekV4Model(nn.Module):
                                         _hh[_m].contiguous().numpy().tobytes()
                                     ).hexdigest()[:8]
                                 )
+                            # S252: per-ABSOLUTE-POSITION single-row hash
+                            # (alignment-correct template, cf. [IDXIN] qpos=).
+                            # ``md5`` above is whole-tensor and ``blkx`` is
+                            # per-c128-block, so neither isolates ONE row: a MISS
+                            # full prefill (ntok=17523) and a HIT suffix prefill
+                            # (ntok=1139) are shape-confounded. ``hpos=[pos:md5|..]``
+                            # hashes the row for each absolute position p in
+                            # [DSV4_DUMP_MIN_POS, DSV4_DUMP_MAX_POS], so MISS-vs-HIT
+                            # is compared at the SAME absolute position for the
+                            # per-layer sweep. Emitted only in the WINDOWED mode
+                            # (both bounds set); additive/read-only.
+                            if (
+                                _lo is not None
+                                and _hi is not None
+                                and _pflat.numel() == _hh.shape[0]
+                            ):
+                                _hparts = []
+                                for _r in range(_pflat.numel()):
+                                    _pv = int(_pflat[_r])
+                                    if int(_lo) <= _pv <= int(_hi):
+                                        _hparts.append(
+                                            f"{_pv}:"
+                                            + _hl.md5(
+                                                _hh[_r]
+                                                .contiguous()
+                                                .numpy()
+                                                .tobytes()
+                                            ).hexdigest()[:8]
+                                        )
+                                _hpos = " hpos=[" + "|".join(_hparts) + "]"
                         else:
                             _h = "empty"
                         print(
                             f"[LHID] layer={i} lastpos={_lastpos} "
                             f"ntok={int(hidden_states.shape[0])} md5={_h} "
-                            f"blkx={_parts[-8:]}",
+                            f"blkx={_parts[-8:]}{_hpos}",
                             flush=True,
                         )
                 if capture_dspark and i in self.dspark_layers_to_capture:

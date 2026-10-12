@@ -256,6 +256,70 @@ def report_lhid(rows):
     report_group(rows, "md5", "LHID")
 
 
+def _lhid_hpos(rec):
+    """Parse ``hpos=[pos:md5|pos:md5|..]`` into ``{abs_pos: md5}``.
+
+    ``hpos`` (S252) is the per-ABSOLUTE-POSITION single-row hash of a layer's
+    output hidden state, emitted in the WINDOWED mode (both ``DSV4_DUMP_MIN_POS``
+    and ``DSV4_DUMP_MAX_POS`` set). The whole-tensor ``md5`` is shape-confounded
+    (MISS prefill ntok=17523 vs HIT ntok=1139) and ``blkx`` keys by c128 block, so
+    only ``hpos`` aligns a MISS and a HIT at the SAME absolute position for the
+    per-layer sweep. Mirrors the ``[IDXIN]`` ``qpos=`` template.
+    """
+    v = rec.get("hpos")
+    if not v:
+        return {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for item in s.split("|"):
+        if ":" not in item:
+            continue
+        p, h = item.split(":", 1)
+        try:
+            out[int(p)] = h
+        except ValueError:
+            continue
+    return out
+
+
+def report_lhid_pos(rows):
+    """Per-ABSOLUTE-POSITION hit==miss verdict for the per-layer hidden sweep.
+
+    Group by ``(layer, absolute position)``: each group's single-row hash must be
+    unique across requests (deterministic), so a group with >1 distinct hash is a
+    REAL divergence at that layer/position. Locates the FIRST divergent layer at
+    the FIRST divergent position -> the origin layer of the divergence (bracket
+    with ``[XIN]`` to tell whether it is inside that layer's read).
+    """
+    groups = defaultdict(set)
+    for r in rows:
+        ly = _int(r, "layer")
+        for pos, h in _lhid_hpos(r).items():
+            groups[(ly, pos)].add(h)
+    if not groups:
+        print("  [LHID-POS] no hpos= field (old probe, or a non-windowed run: set "
+              "DSV4_DUMP_MIN_POS and DSV4_DUMP_MAX_POS)")
+        return
+    div = [(ly, pos, sorted(s)) for (ly, pos), s in groups.items() if len(s) > 1]
+    if not div:
+        print(f"  [LHID-POS] no per-position divergence: every (layer,pos) group "
+              f"has one hash ({len(groups)} groups)")
+        return
+    div.sort(key=lambda t: (t[1], t[0]))
+    p0 = div[0][1]
+    layers0 = sorted(ly for ly, p, _ in div if p == p0)
+    print(f"  [LHID-POS] groups={len(groups)} divergent={len(div)} first_pos={p0}")
+    print(f"  FIRST divergent position={p0}; layers there = {layers0}")
+    for ly, p, s in div[:MAX_DIFF_SHOWN]:
+        print(f"     pos={p} layer={ly}  hashes={s}")
+    if len(div) > MAX_DIFF_SHOWN:
+        print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
 def _parse_blkx(rec, field="blkx"):
     """Parse a ``<field>=[<block>:<hash>, ...]`` field into {block: hash}."""
     v = rec.get(field)
@@ -2963,6 +3027,8 @@ def main(path):
         if tag == "LHID":
             print("\n== [LHID] per-layer hidden (order-independent) ==")
             report_lhid(rows)
+            print("  ---- [LHID] per-absolute-position single row ----")
+            report_lhid_pos(rows)
             print("  ---- [LHID] per-c128-block ----")
             report_blkx(rows, "LHID")
             continue
@@ -3529,6 +3595,28 @@ def _selftest():
         qk_same_out = _run_main(qk_same)
         qk_diff_out = _run_main(qk_diff)
 
+        # --- [LHID] per-absolute-position single-row (S252) ---
+        # Two requests emit the SAME layer's hidden at absolute position 17597:
+        # layers 1/2 identical, layer 3 differs -> the first divergent layer.
+        def _lhid_line(ly, hpos):
+            return (f"[LHID] layer={ly} lastpos=17597 ntok=1 md5=full "
+                    f"blkx=[] hpos={hpos}")
+
+        lhid_diff = [
+            _lhid_line(1, "[17597:aa]"),
+            _lhid_line(2, "[17597:bb]"),
+            _lhid_line(3, "[17597:cc]"),
+            _lhid_line(3, "[17597:dd]"),
+        ]
+        lhid_same = [
+            _lhid_line(1, "[17597:aa]"),
+            _lhid_line(2, "[17597:bb]"),
+            _lhid_line(3, "[17597:cc]"),
+            _lhid_line(3, "[17597:cc]"),
+        ]
+        lhid_out = _run_main(lhid_diff)
+        lhid_same_out = _run_main(lhid_same)
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -3732,6 +3820,16 @@ def _selftest():
              and "QUERY-PATH" in qk_diff_out),
             ("[QK-ALIGNED] index-K alignment field emitted",
              "blkx_aligned_diff=" in qk_same_out),
+            ("[LHID-POS] hpos parsed per absolute position",
+             _lhid_hpos({"hpos": "[17597:aa|17598:bb]"})
+             == {17597: "aa", 17598: "bb"}),
+            ("[LHID-POS] first divergent layer at first pos reported",
+             "[LHID-POS]" in lhid_out
+             and "FIRST divergent position=17597" in lhid_out
+             and "layers there = [3]" in lhid_out
+             and "layer=3" in lhid_out),
+            ("[LHID-POS] identical layers -> no divergence",
+             "no per-position divergence" in lhid_same_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
