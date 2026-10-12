@@ -124,6 +124,9 @@ using fp32x4_t = float4;
 #ifdef USE_ROCM
 inline constexpr auto kDLGPU = kDLROCM;
 inline constexpr auto kDLGPUHost = kDLROCMHost;
+#elif defined(USE_MUSA)
+inline constexpr auto kDLGPU = kDLExtDev;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
