@@ -27,7 +27,6 @@ use tonic::{Request, Response, Status};
 const CHAT_COMPLETE_ROUTE: &str = "/sglang.runtime.v1.SglangService/ChatComplete";
 
 type RpcResult<T> = Result<Response<T>, Status>;
-type Unserved<T> = futures::stream::Empty<Result<T, Status>>;
 
 fn unserved<T>(rpc: &str) -> RpcResult<T> {
     Err(Status::unimplemented(format!(
@@ -160,8 +159,7 @@ macro_rules! sglang_service {
                 }
             )*
             $(
-                type $stream = Unserved<proto::$sresp>;
-                async fn $srpc(&self, _: Request<proto::$sreq>) -> RpcResult<Self::$stream> {
+                async fn $srpc(&self, _: Request<proto::$sreq>) -> RpcResult<tonic::codegen::BoxStream<proto::$sresp>> {
                     unserved(stringify!($srpc))
                 }
             )*
@@ -171,7 +169,6 @@ macro_rules! sglang_service {
 
 sglang_service! {
     served {
-        type ChatCompleteStream = ChunkStream;
         async fn chat_complete(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<ChunkStream> {
             RouterGrpc::chat_complete(self, request).await
         }
