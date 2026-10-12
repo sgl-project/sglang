@@ -536,8 +536,3 @@ class Platform:
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         """Check if a tensor is on the current platform's device."""
         return t.is_cuda
-
-
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""

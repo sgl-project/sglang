@@ -44,6 +44,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -450,7 +451,7 @@ class BaseMultimodalProcessor(ABC):
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
-                self.server_args.tp_size,
+                get_mm_feature_consumer_count(),
             )
 
     @property
