@@ -466,7 +466,11 @@ class EncoderPreprocessor:
         try:
             frames = await asyncio.get_running_loop().run_in_executor(
                 self.io_executor,
-                glm_decode_frames_at,
+                functools.partial(
+                    glm_decode_frames_at,
+                    # Full-clip count. local_indices is this rank's shard.
+                    budget_frame_count=len(global_indices),
+                ),
                 vr,
                 local_indices,
                 video_config,

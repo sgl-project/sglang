@@ -174,40 +174,52 @@ def _clamp_glm_video_request_config(defaults, request):
     path so the HF sampler is not bypassed by an injected max_frames.
     """
     merged = {**defaults, **request}
+    if defaults.get("max_tokens_per_frame") is not None:
+        merged["_server_max_tokens_per_frame"] = True
+    else:
+        merged.pop("_server_max_tokens_per_frame", None)
     for key in GLM_MEDIA_CONFIG_KEYS:
         if key not in request:
             continue
-        value = request[key]
-        if key == "fps":
-            value = float(value)
-        else:
-            value = int(value)
+        number = float if key == "fps" else int
+        try:
+            value = number(request[key])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"GLM video {key} must be a positive number") from None
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"GLM video {key} must be positive")
         if value <= 0:
-            raise ValueError(f"GLM video {key} must be positive, got {request[key]!r}")
+            raise ValueError(f"GLM video {key} must be positive")
+        merged[key] = value
 
         ceiling = _glm_video_budget_ceiling(defaults, key)
         if ceiling is None:
             continue
-
-        if key == "fps":
-            ceiling = float(ceiling)
-        else:
-            ceiling = int(ceiling)
-
-        if value <= ceiling:
-            merged[key] = value
-            continue
-
-        if key == "max_tokens_per_frame":
-            # A still-large per-frame cap skips _presize_budget. Drop back to
-            # the deployment default (or omit) so the multi-frame path runs.
-            if key in defaults and defaults[key] is not None:
-                merged[key] = defaults[key]
-            else:
-                merged.pop(key, None)
-        else:
-            merged[key] = ceiling
+        merged[key] = min(value, number(ceiling))
     return merged
+
+
+def _glm_video_config_for_decode(video_config, frame_count):
+    """Drop a request per-frame cap that exceeds the shared token budget.
+
+    ``frame_count`` is the full clip. ``glm_decode_frames_at`` uses
+    ``len(indices)`` unless the DP encoder passes the global index count,
+    because a shard is shorter than the clip. A server cap recorded as
+    ``_server_max_tokens_per_frame`` stays.
+    """
+    config = dict(video_config or {})
+    cap = config.get("max_tokens_per_frame")
+    budget = config.get("_presize_budget")
+    if (
+        cap is None
+        or not budget
+        or config.get("_server_max_tokens_per_frame") is not None
+    ):
+        return config
+    shared_tokens = budget["max_pixels"] // budget["pixels_per_token"]
+    if int(cap) * int(frame_count) > shared_tokens:
+        config.pop("max_tokens_per_frame", None)
+    return config
 
 
 def _merge_glm_video_configs(default_config, item_configs):
@@ -446,11 +458,14 @@ def _pre_resize_frames_for_processor(
     return nchw.permute(0, 2, 3, 1).contiguous()
 
 
-def glm_decode_frames_at(vr, indices, video_config=None):
+def glm_decode_frames_at(vr, indices, video_config=None, budget_frame_count=None):
+    """Decode ``indices`` and resize under the shared token budget."""
     indices = list(indices)
     if not indices:
         return None
-    video_config = video_config or {}
+    if budget_frame_count is None:
+        budget_frame_count = len(indices)
+    video_config = _glm_video_config_for_decode(video_config, budget_frame_count)
     if hasattr(vr, "get_frames_as_tensor"):
         frames = vr.get_frames_as_tensor(indices)
     else:
