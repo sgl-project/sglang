@@ -651,9 +651,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
         # The binding reads is_write_back from the core's current config.
-        assert (
-            is_write_back == self.is_write_back
-        ), "is_write_back must match the core's current config"
+        assert is_write_back == self.is_write_back, (
+            "is_write_back must match the core's current config"
+        )
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
