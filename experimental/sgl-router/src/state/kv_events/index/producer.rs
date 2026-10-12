@@ -172,8 +172,8 @@ impl KvEventIndex {
             .map(|(w, seq)| (w.clone(), *seq))
             .collect();
         let tree = Arc::clone(&self.tree);
-        let walked = tokio::task::spawn_blocking(move || tree.export_snapshot()).await;
-        let (worker_table, nodes) = match walked {
+        let walked = tokio::task::spawn_blocking(move || tree.export_with_lora()).await;
+        let (worker_table, nodes, lora_blocks) = match walked {
             Ok(v) => v,
             Err(e) => {
                 // The walk panicked or the runtime is shutting down. Answer
@@ -220,6 +220,10 @@ impl KvEventIndex {
         let workers = worker_table.iter().map(WireWorker::from).collect();
         let mut snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
         snap.empty_ranks = empty_ranks;
+        if !lora_blocks.is_empty() {
+            snap.format = super::super::bootstrap::LORA_SNAPSHOT_FORMAT;
+        }
+        snap.lora_blocks = lora_blocks;
         // Encode on the blocking pool for the same reason the walk goes there:
         // serialising and compressing a fleet-sized tree is CPU-bound with no
         // await point, and this runs on the runtime that is also proxying
@@ -282,6 +286,7 @@ impl KvEventIndex {
             workers,
             cursors,
             nodes,
+            lora_blocks: Vec::new(),
             empty_ranks: Vec::new(),
         }
     }

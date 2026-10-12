@@ -7,7 +7,7 @@ use serde_json::json;
 use sgl_router::discovery::{ModelId, WorkerMode};
 use sgl_router::policies::request_tokens_for;
 use sgl_router::state::kv_events::{
-    compute_block_hashes, CacheNamespace, HashTree, KvEventIndex, KvWorkerId,
+    compute_block_hashes, BlockStored, HashTree, KvEventIndex, KvWorkerId,
 };
 use sgl_router::tokenizer::TokenizerRegistry;
 use std::time::Duration;
@@ -61,10 +61,6 @@ async fn lora_requests_match_only_their_adapter_blocks() {
     let ids = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes")
         .ids;
-    let adapter_a = CacheNamespace {
-        lora_name: Some("adapter-a".into()),
-        ..Default::default()
-    };
 
     // Same tokens: `base` holds the base-model blocks, `lora` the adapter's.
     let tree = HashTree::new();
@@ -73,8 +69,20 @@ async fn lora_requests_match_only_their_adapter_blocks() {
         None,
         &compute_block_hashes(&ids, 1),
     );
-    let lora_hashes = adapter_a.block_hashes(&ids, 1, false);
-    tree.insert(&KvWorkerId::new(lora.url.clone(), 0), None, &lora_hashes);
+    tree.store_event(
+        &KvWorkerId::new(lora.url.clone(), 0),
+        &BlockStored {
+            block_hashes: (0..ids.len()).map(|i| 1000 + i as i64).collect(),
+            parent_block_hash: None,
+            token_ids: ids.clone(),
+            block_size: 1,
+            lora_id: None,
+            lora_name: Some("adapter-a".into()),
+            cache_salt: None,
+            is_bigram: false,
+            medium: Some("GPU".into()),
+        },
+    );
     let router = radix_router(
         &[(&base, WorkerMode::Plain), (&lora, WorkerMode::Plain)],
         tree,

@@ -6,19 +6,17 @@ Two modes:
   python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py
       Regenerate the committed JSON fixture from the locally-replicated
       algorithm. Run this when changing block-hash logic or adding new
-      shape coverage. CI's drift-check step runs this in --check mode.
+      shape coverage. CI regenerates the file and checks its diff.
 
   python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py --validate-against-sglang
-      Import the real `sglang.srt.mem_cache.radix_cache.RadixKey.hash_page`
-      and assert it agrees with the locally-replicated algorithm on every
-      fixture case. This is the only place the replica and the real
-      SGLang implementation are checked against each other. Run it
-      nightly (or whenever sglang is available on the Python path).
+      Render through SGLang's real KV-event recorder, check its opaque LoRA
+      IDs, and compare canonical lookup keys with every fixture case.
+      Run this whenever SGLang is available on the Python path.
 
 # Authority
 
 Source-of-truth implementation:
-  - `python/sglang/srt/mem_cache/radix_cache.py::RadixKey.hash_page`
+  - `python/sglang/srt/mem_cache/utils.py::get_hash_str`
   - `python/sglang/srt/mem_cache/utils.py::hash_str_to_int64`
 
 `hash_page_chain` below replicates that algorithm verbatim (no `import
@@ -30,7 +28,7 @@ can be audited at a glance. The algorithm is intentionally tiny:
 
 If SGLang ever changes the algorithm, update both the SGLang side AND
 this script in the same commit; the Rust port in
-`src/policies/kv_events/hash.rs` will then need the corresponding
+`src/state/kv_events/hash.rs` will then need the corresponding
 update. The nightly `--validate-against-sglang` job is the safety net
 that catches an SGLang-side change the human forgot to mirror here.
 
@@ -59,9 +57,10 @@ import sys
 def namespaced_hashes(
     tokens: list[int], block_size: int, cache_salt=None, lora_name=None
 ) -> list[int]:
-    """Hashes as the engine publishes them for a salted and/or LoRA request:
-    the chain starts from the salt seed, then each hash is mixed with the
-    LoRA name (`kv_event_lora_seed` / `namespace_event_block_hash`)."""
+    """Canonical lookup keys: salt-seeded token chain plus public adapter name.
+
+    LoRA worker block IDs are opaque and are translated during event ingestion.
+    """
     prior = None
     if cache_salt is not None:
         prior = hashlib.sha256(b"sglang-cache-salt-v1\0" + cache_salt.encode()).digest()
@@ -189,42 +188,62 @@ def _materialize_cases() -> list[dict]:
     ]
 
 
-def _published_by_sglang(case: dict) -> list[int]:
-    """Block hashes SGLang's KV event recorder publishes for a namespaced case."""
+def _lookup_keys_from_sglang(case: dict) -> list[int]:
+    """Check opaque LoRA IDs, then derive lookup keys from the base event chain."""
     from array import array
 
-    from sglang.srt.disaggregation.kv_events import BlockStored
+    from sglang.srt.disaggregation.kv_events import (
+        BlockStored,
+        kv_event_namespace_seed,
+        namespaced_block_hash,
+    )
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
-    cache = RadixCache.create_simulated(
-        page_size=case["block_size"], enable_kv_cache_events=True
-    )
-
     class LoraReq:
-        """The request fields the name table reads; kept alive until the take."""
+        pass
 
-    req = LoraReq()
-    req.extra_key = req.lora_id = "lora-id" if case.get("lora_name") else None
-    cache.kv_events.lora_names.register(req, case.get("lora_name"))
-    key = RadixKey(
-        array("q", case["tokens"]),
-        extra_key=req.extra_key,
-        cache_salt=case.get("cache_salt"),
-    )
-    cache.insert(InsertParams(key=key))
+    def publish(name=None):
+        cache = RadixCache.create_simulated(
+            page_size=case["block_size"], enable_kv_cache_events=True
+        )
+        req = LoraReq()
+        req.extra_key = req.lora_id = "lora-id" if name else None
+        cache.kv_events.lora_names.register(req, name)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(
+                    array("q", case["tokens"]),
+                    extra_key=req.extra_key,
+                    cache_salt=case.get("cache_salt"),
+                )
+            )
+        )
+        return [e for e in cache.take_events() if isinstance(e, BlockStored)]
+
+    base = [h for e in publish() for h in e.block_hashes]
+    name = case.get("lora_name")
+    if name is None:
+        return base
+    events = publish(name)
+    seed = kv_event_namespace_seed(extra_key="lora-id", cache_salt=None)
+    assert [h for e in events for h in e.block_hashes] == [
+        namespaced_block_hash(h, namespace_seed=seed) for h in base
+    ]
+    assert all(e.lora_name == name for e in events)
+    seed = hashlib.sha256(b"sglang-kv-event-lora-v1\0" + name.encode()).digest()
     return [
-        h
-        for e in cache.take_events()
-        if isinstance(e, BlockStored)
-        for h in e.block_hashes
+        int.from_bytes(
+            hashlib.sha256(seed + h.to_bytes(8, "big", signed=True)).digest()[:8],
+            "big",
+            signed=True,
+        )
+        for h in base
     ]
 
 
 def _validate_against_sglang() -> int:
-    """Compare the replica with the block hashes SGLang's KV event recorder
-    publishes. Exits non-zero on any mismatch; the parity net for nightly CI.
-    """
+    """Check the engine's published IDs and the canonical prompt lookup keys."""
     try:
         import sglang  # noqa: F401
     except ImportError as e:
@@ -243,7 +262,7 @@ def _validate_against_sglang() -> int:
             c["tokens"], c["block_size"], *(c.get(k) for k in NAMESPACE_KEYS)
         )
         # The engine publishes full pages only, so it must match a prefix.
-        published = _published_by_sglang(c)
+        published = _lookup_keys_from_sglang(c)
         if not published or published != local[: len(published)]:
             failures.append(f"case {c['name']}: local={local} sglang={published}")
 

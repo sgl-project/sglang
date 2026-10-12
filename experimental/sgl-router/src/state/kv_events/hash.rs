@@ -42,7 +42,7 @@
 
 use sha2::{Digest, Sha256};
 
-/// Request fields the engine namespaces published block hashes by.
+/// Public request fields that define canonical prompt lookup keys.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheNamespace {
     pub cache_salt: Option<String>,
@@ -59,9 +59,8 @@ impl CacheNamespace {
         ambiguous: false,
     };
 
-    /// The prompt's block hashes as the engine publishes them: a salt-seeded
-    /// chain, then mixed with the LoRA name (`kv_event_lora_seed` and
-    /// `namespace_event_block_hash` in `mem_cache/utils.py`).
+    /// Canonical prompt lookup keys. Base keys match the legacy publisher;
+    /// LoRA keys use the public adapter name, independently of worker block IDs.
     pub fn block_hashes(&self, token_ids: &[u32], block_size: usize, bigram: bool) -> Vec<i64> {
         if self.ambiguous {
             return Vec::new();
