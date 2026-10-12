@@ -22,7 +22,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -41,6 +41,16 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     }
 )
 
+
+if tree_speculative_sampling_target_only is None and is_hip():
+    # The general tree verifier has no ROCm kernel (the CUDA one is built on
+    # FlashInfer), so temperature > 0 DFlash requests would silently fall back
+    # to greedy argmax verification. DFlash proposals are a linear chain, so the
+    # chain-specialised Triton verifier is used instead; it keeps the operator's
+    # keyword signature. It is DFlash-only: it does not walk sibling branches.
+    from sglang.kernels.ops.speculative.dflash_chain_sampling import (
+        chain_speculative_sampling_target_only as tree_speculative_sampling_target_only,
+    )
 
 # DFlash does not run sampling verify on NPU, even where the op exists.
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
