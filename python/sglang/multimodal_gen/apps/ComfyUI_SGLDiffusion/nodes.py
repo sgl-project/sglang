@@ -973,23 +973,7 @@ class SGLDiffusionServerUnsetLora:
 class SGLDWorkerStatus:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {"model": ("MODEL",)},
-            "optional": {
-                "native_seconds_per_step": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 10000.0,
-                        "step": 0.001,
-                        "tooltip": "Seconds per SAMPLER step of the same workflow "
-                        "with the stock UNETLoader (1 / it/s in ComfyUI's progress "
-                        "bar). 0 hides the speedup line.",
-                    },
-                ),
-            },
-        }
+        return {"required": {"model": ("MODEL",)}}
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("status",)
@@ -997,21 +981,9 @@ class SGLDWorkerStatus:
     OUTPUT_NODE = True
     CATEGORY = "SGLDiffusion"
 
-    def show(self, model, native_seconds_per_step=0.0):
-        from .executors.base import SGLDiffusionExecutor
-        from .worker_status import collect_status, format_status
-
-        owner = SGLDiffusionGenerator.shared()
+    def show(self, model):
         try:
-            executor = model.model.diffusion_model
-            tracker = (
-                executor.step_latency
-                if isinstance(executor, SGLDiffusionExecutor)
-                else None
-            )
-            text = format_status(
-                collect_status(owner, tracker), native_seconds_per_step
-            )
+            text = SGLDiffusionGenerator.shared().status_text()
         except Exception as e:
             text = f"SGLD Worker Status: failed to collect ({e!r})"
         print(text)

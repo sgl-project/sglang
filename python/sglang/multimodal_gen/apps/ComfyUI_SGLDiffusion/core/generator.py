@@ -134,6 +134,20 @@ _EXECUTOR_CLASSES = _load_executor_classes()
 
 _SHARED = None
 _ATEXIT_REGISTERED = False
+# ServerArgs fields shown by SGLDWorkerStatus.
+_STATUS_FIELDS = (
+    "num_gpus",
+    "tp_size",
+    "sp_degree",
+    "ulysses_degree",
+    "ring_degree",
+    "dp_size",
+    "enable_cfg_parallel",
+    "attention_backend",
+    "dit_cpu_offload",
+    "dit_layerwise_offload",
+    "component_quantizations",
+)
 
 
 class SGLDiffusionGenerator:
@@ -247,6 +261,36 @@ class SGLDiffusionGenerator:
         if gen is None:
             return []
         return list(getattr(gen, "local_scheduler_process", None) or [])
+
+    def status_text(self) -> str:
+        """Worker summary from ServerArgs and the worker's RequestMetrics."""
+        if self.generator is None:
+            return "SGLD worker: not started (run the workflow once to load a model)"
+        import torch
+
+        import sglang
+
+        args = self.generator.server_args
+        pids = [proc.pid for proc in self._worker_processes()]
+        lines = [
+            f"model: {args.model_path} pipeline={args.pipeline_class_name}",
+            f"worker: {'live' if self._is_live() else 'NOT live'} pids={pids}",
+            " ".join(f"{name}={getattr(args, name)}" for name in _STATUS_FIELDS),
+        ]
+        metrics = self.executor.last_metrics if self.executor is not None else None
+        if metrics is None:
+            lines.append("last DiT call: none yet")
+        else:
+            lines.append(f"last DiT call: {metrics.total_duration_ms:.1f} ms")
+            snapshot = metrics.memory_snapshots.get("after_forward")
+            if snapshot is not None:
+                lines.append(
+                    f"vram during that call: peak allocated "
+                    f"{snapshot.peak_allocated_mb:.0f} MiB, peak reserved "
+                    f"{snapshot.peak_reserved_mb:.0f} MiB"
+                )
+        lines.append(f"sglang={sglang.__version__} torch={torch.__version__}")
+        return "\n".join(lines)
 
     def _is_live(self) -> bool:
         """True when this owner still has a usable worker + scheduler client."""
