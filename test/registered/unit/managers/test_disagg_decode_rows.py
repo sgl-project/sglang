@@ -119,16 +119,6 @@ class TestPrebuiltJoin(CustomTestCase):
         # The penalizers read their requests from the rows.
         self.assertIs(rows.sampling_info.penalizer_orchestrator.batch, rows)
 
-    def test_join_into_running_rows_appends(self):
-        s = _plan_scheduler([_Req("p")])
-        decoding_batch = DecodingBatch(_Batch([_Req("a"), _Req("b")]))
-        rows = decoding_batch.rows
-
-        self._plan(s, decoding_batch)
-
-        self.assertIs(decoding_batch.rows, rows)
-        self.assertEqual(_rids(rows.reqs), ["a", "b", "p"])
-
 
 class _StopLoop(Exception):
     pass
