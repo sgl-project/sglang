@@ -58,6 +58,8 @@ _COMPLETES_OWN_SUM = {
 # Only a class that names one of these bases directly is exempt.
 _VOCAB_PARALLEL_BASES = ("VocabParallelEmbedding", "ParallelLMHead")
 
+_BOUNDARY_COMPLETIONS = {"deepseek_v4_boundary.py": frozenset({"MoeFinalize.complete"})}
+
 
 def _is_vocab_parallel(node) -> bool:
     return isinstance(node, ast.ClassDef) and any(
@@ -102,21 +104,28 @@ def _unguarded_sums(source: str, completes_own_sum=frozenset()):
     found = []
     guards = _reduce_results_names(ast.parse(source))
 
-    def visit(node, guarded):
+    def visit(node, guarded, owners=()):
         if _is_vocab_parallel(node):
             return
-        if isinstance(node, ast.FunctionDef) and node.name in completes_own_sum:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                visit(child, guarded, (*owners, node.name))
+            return
+        if isinstance(node, ast.FunctionDef) and (
+            node.name in completes_own_sum
+            or ".".join((*owners, node.name)) in completes_own_sum
+        ):
             return
         if isinstance(node, ast.If) and _requires(node.test, guards):
             for child in node.body:
-                visit(child, True)
+                visit(child, True, owners)
             for child in node.orelse:
-                visit(child, guarded)
+                visit(child, guarded, owners)
             return
         if isinstance(node, ast.Call) and not guarded and _is_sum(_call_name(node)):
             found.append(f"{node.lineno}: {ast.unparse(node)}")
         for child in ast.iter_child_nodes(node):
-            visit(child, guarded)
+            visit(child, guarded, owners)
 
     visit(ast.parse(source), False)
     return found
@@ -132,14 +141,21 @@ class TestStageProducersLeaveSums(CustomTestCase):
                 continue
             checked += 1
             exempt = _COMPLETES_OWN_SUM.get(path.name, frozenset())
+            boundary_completions = _BOUNDARY_COMPLETIONS.get(path.name, frozenset())
             if exempt and "output_complete=" not in source:
                 offenders[str(path.relative_to(models))] = [
                     "exempt sums, but no stage declares output_complete"
                 ]
-            elif sums := _unguarded_sums(source, exempt):
+            elif sums := _unguarded_sums(source, exempt | boundary_completions):
                 offenders[str(path.relative_to(models))] = sums
         self.assertGreater(checked, 30)
         self.assertEqual(offenders, {})
+
+    def test_a_base_class_name_does_not_exempt_compute_sums(self):
+        for base in ("ComputeTransport", "DeferredFinalize"):
+            with self.subTest(base=base):
+                source = f"class Arbitrary({base}):\n    def finish(self, value):\n        return post_experts_all_reduce(value)\n"
+                self.assertEqual(len(_unguarded_sums(source)), 1)
 
     def test_fused_sums_count_and_only_a_required_flag_guards(self):
         source = (

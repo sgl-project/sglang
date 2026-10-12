@@ -68,7 +68,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         value = torch.ones(2, 4)
         hidden, stream = stage._prepare(value, ResidualStream(), None, steps)
@@ -115,7 +115,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         for increment in (2, 7):
             with self.subTest(increment=increment):
@@ -419,7 +419,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         partial = torch.ones(4, 4)
         partial_ref = weakref.ref(partial)

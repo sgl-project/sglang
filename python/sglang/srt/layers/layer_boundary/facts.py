@@ -114,6 +114,9 @@ def facts_of(declaration):
         sum_impl=declaration.sum_impl.facts()
         if declaration.sum_impl is not None
         else None,
+        row_transport=declaration.row_transport.facts()
+        if declaration.row_transport is not None
+        else None,
         previous=None,
         prepared_from=None,
     )

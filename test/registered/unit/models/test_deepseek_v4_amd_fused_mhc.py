@@ -229,7 +229,7 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            DeepseekV4DecoderLayer._forward_compat(
                 layer,
                 positions=object(),
                 hidden_states=hs_in,
@@ -304,7 +304,7 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            DeepseekV4DecoderLayer._forward_compat(
                 layer,
                 positions=object(),
                 hidden_states=object(),

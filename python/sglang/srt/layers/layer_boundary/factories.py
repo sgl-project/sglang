@@ -55,6 +55,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_ADD,
 )
+from sglang.srt.layers.layer_boundary.row_transport import RowTransport
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -303,6 +304,9 @@ class StageDeclaration:
         sum_impl: Optional implementation of the declared output sum using
             the model's custom collective. Its batch predicate, when supplied,
             preserves eligibility for carrying that sum to the consumer.
+        row_transport: Explicit source, compute and return rows for a stage
+            whose operand moves independently of its residual. The bound
+            invocation owns output completion and inverse transport.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's
@@ -337,6 +341,7 @@ class StageDeclaration:
     output_complete: bool = False
     attn_tp_gather: Optional[Callable] = None
     sum_impl: Optional[SumImplementation] = None
+    row_transport: Optional[RowTransport] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -432,6 +437,7 @@ def declare_attn(
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
     sum_impl=None,
+    row_transport=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -469,6 +475,7 @@ def declare_attn(
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         sum_impl=sum_impl,
+        row_transport=row_transport,
     )
 
 
@@ -483,6 +490,7 @@ def declare_ffn(
     exit_rows=None,
     output_complete=False,
     sum_impl=None,
+    row_transport=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -516,6 +524,7 @@ def declare_ffn(
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
         sum_impl=sum_impl,
+        row_transport=row_transport,
     )
 
 
@@ -605,6 +614,38 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     and the stage after it (None when it ends the stack or a branch)."""
     axes, attention, local, full = _row_layouts(variant)
     _reject_unsupported(stage)
+    if stage.row_transport is not None:
+        if (
+            stage.sum_impl is not None
+            or stage.output_transform is not None
+            or stage.output_complete
+        ):
+            raise NotImplementedError(
+                "operand transport cannot bypass another output contract"
+            )
+        if stage.exit_rows not in (None, ExitRows.ATTENTION):
+            raise NotImplementedError(
+                "operand transport declares its return rows explicitly"
+            )
+        try:
+            rows = stage.row_transport.rows[variant]
+        except KeyError:
+            raise NotImplementedError(
+                "operand transport does not support this batch variant"
+            ) from None
+        if rows.group is not None and not isinstance(rows.group, SumGroup):
+            raise TypeError("operand transport requires a declared SumGroup")
+        if rows.decode_group is not None and not isinstance(
+            rows.decode_group, SumGroup
+        ):
+            raise TypeError("operand transport requires a declared decode SumGroup")
+        if rows.source != arrival.produced.layout or rows.returned != rows.source:
+            raise NotImplementedError("compute transport must return its source rows")
+        declaration = StageContract(
+            InputContract(rows.source, read=stage.read),
+            OutputContract(rows.returned, group=rows.group, update=stage.update),
+        )
+        return _Flow(declaration, arrival, arrival.residual, rows.returned)
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
             variant,
@@ -1033,8 +1074,9 @@ def _handed_off(declaration):
     return replace(
         declaration,
         exit_rows=ExitRows.ATTENTION,
-        writes_at_handoff=_ffn_on_rank_rows(
-            declaration.sparse, declaration.dense_tp_size
+        writes_at_handoff=(
+            declaration.row_transport is not None
+            or _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
         ),
     )
 
