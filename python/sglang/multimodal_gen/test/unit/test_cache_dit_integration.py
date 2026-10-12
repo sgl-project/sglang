@@ -80,6 +80,7 @@ def _install_cache_dit_stub():
             return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
+    block_adapters.FakeDiffusionPipeline = type("FakeDiffusionPipeline", (), {})
     cache_dit.BlockAdapterRegister = _FakeBlockAdapterRegister
 
     class _FakeDMDCalibratorConfig:
@@ -96,6 +97,7 @@ def _install_cache_dit_stub():
 
     return {
         "cache_dit": cache_dit,
+        "cache_dit.caching": types.ModuleType("cache_dit.caching"),
         "cache_dit.caching.block_adapters": block_adapters,
         "cache_dit.parallelism": parallelism,
     }

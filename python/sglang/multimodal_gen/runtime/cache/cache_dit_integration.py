@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 import cache_dit
+from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 
 try:
     from cache_dit import (
@@ -66,6 +67,11 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     cache_dit.disable_cache(target)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
+    # cache-dit 1.5.1 marks the FakeDiffusionPipeline class as cached when it
+    # wraps a bare transformer, and disable_cache(transformer) never clears it,
+    # so the next enable skips building a context and asserts.
+    if "_is_cached" in FakeDiffusionPipeline.__dict__:
+        del FakeDiffusionPipeline._is_cached
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
             delattr(transformer, name)
