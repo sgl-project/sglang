@@ -224,17 +224,20 @@ class _EagerOnGraphCallable:
 
     def __init__(self, graph_call: Callable, eager_call: Callable):
         self._graph_call = graph_call
-        self.run_eager = eager_call
+        self._eager_call = eager_call
 
     def __call__(self, *args, **kwargs):
         return self._graph_call(*args, **kwargs)
+
+    def run_eager(self, *args, **kwargs):
+        return self._eager_call(*args, **kwargs)
 
     def __get__(self, instance, owner=None):
         if instance is None:
             return self
         bound = _EagerOnGraphCallable(
             functools.partial(self._graph_call, instance),
-            functools.partial(self.run_eager, instance),
+            functools.partial(self._eager_call, instance),
         )
         return bound
 
