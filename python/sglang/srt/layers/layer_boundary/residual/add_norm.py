@@ -273,6 +273,8 @@ def _norm_quant_kernel(quant_format: str):
 class PlainAdd:
     """A plain residual: the output is added into it."""
 
+    bind = None
+
     is_plain_add = True
     applied_at_exit = False
     outlives_layer = True
@@ -295,6 +297,8 @@ class ReplaceAtExit:
     scaling, in whatever kernels it uses) and writes it at its exit; the
     previous residual is dropped. The stream is complete: the producer has its
     boundary complete each part's sum first (StageBoundary.sum_part)."""
+
+    bind = None
 
     is_plain_add = False
     applied_at_exit = True
@@ -329,6 +333,8 @@ class NormQuantReadout:
     ``post_residual_addition`` is added after a plain add and before the norm.
     It is not applied by the aiter mxfp4 and fp8-group kernels, after an
     update other than a plain add, or by ``read``, which has no add."""
+
+    bind = None
 
     is_plain_norm = True
     completing_fusions = ()
@@ -369,6 +375,8 @@ class NormReadout:
     runs in the same kernel. An empty batch skips the norm. It rejects a
     ``quant_format`` and a ``post_residual_addition``, except that the latter
     is not applied after an update other than a plain add."""
+
+    bind = None
 
     is_plain_norm = True
     completing_fusions = ()
@@ -416,6 +424,8 @@ class UnfusedNormReadout(NormReadout):
     """The input is the norm of the residual after the producer's update, in
     two steps: the update rounds to the activation dtype before the norm, as
     in models that add their residual themselves. No fused kernel takes it."""
+
+    bind = None
 
     is_plain_norm = False
     completing_fusions = ()

@@ -72,6 +72,12 @@ class DeferredFinalize(msgspec.Struct, frozen=True):
     there may do that work together with its own; anything else passes it
     through complete_owed(), which calls ``complete()``."""
 
+    @property
+    def completion_group(self):
+        from sglang.srt.layers.layer_boundary.layout import SumGroup
+
+        return SumGroup.MOE_OUTPUT
+
     def complete(self) -> torch.Tensor:
         """Do the owed work, unfused, and return the complete output."""
         raise NotImplementedError

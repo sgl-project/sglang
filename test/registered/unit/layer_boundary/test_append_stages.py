@@ -1032,6 +1032,8 @@ class TestRowsTheConsumerReads(CustomTestCase):
         class Scaled:
             """Neither a plain add nor applied at the producer's exit."""
 
+            bind = None
+
             is_plain_add = False
             applied_at_exit = False
             outlives_layer = True
@@ -1119,6 +1121,9 @@ class TestReadKernels(CustomTestCase):
                 return "boundary", residual
 
         class Update:
+            bind = None
+            is_plain_add = True
+
             def slice_residual_attn_tp(self, residual):
                 return residual[:2]
 

@@ -32,6 +32,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
 )
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.ops import sum_output
+from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
@@ -168,7 +169,7 @@ class StageBoundary:
         )
         return hidden_states
 
-    def finish(self, hidden_states, forward_batch):
+    def finish(self, hidden_states, forward_batch, *, update_context=None):
         """Hand this stage's output to the following stage: an attention's
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
@@ -177,16 +178,18 @@ class StageBoundary:
             produced = self.plan.path_for(forward_batch).output
             return stream_of(forward_batch).record(
                 hidden_states,
-                produced.update,
+                bind_update(produced.update, forward_batch, update_context),
                 declared_sum=produced.group if produced.always_partial else None,
             )
         if self.kind is StageKind.FFN and self.plan.fusions is not None:
             raise RuntimeError(
                 "an FFN whose boundary has fusions finishes through exit()"
             )
-        return self.exit(forward_batch).finish(hidden_states)
+        return self.exit(forward_batch, update_context=update_context).finish(
+            hidden_states
+        )
 
-    def exit(self, forward_batch):
+    def exit(self, forward_batch, *, update_context=None):
         """Select and scope one FFN or single-stage mixer's output decision,
         for an FFN whose MoE may hand off its finalize (see finish()).
 
@@ -201,7 +204,11 @@ class StageBoundary:
             using the same decision rather than selecting a second path.
         """
         result = (
-            self.plan.output.ffn_exit(forward_batch, stream=stream_of(forward_batch))
+            self.plan.output.ffn_exit(
+                forward_batch,
+                stream=stream_of(forward_batch),
+                update_context=update_context,
+            )
             if self.kind is StageKind.FFN
             else self.plan.output.mixer_exit(
                 forward_batch, stream=stream_of(forward_batch)
@@ -347,6 +354,7 @@ class StageBoundary:
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
         capture: Optional[Callable] = None,
+        read_context=None,
     ):
         # Aux consumers need a materialized output before the input norm.
         # Complete communication here, preserving the existing add+norm kernel
@@ -373,6 +381,7 @@ class StageBoundary:
             steps,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
+            read_context=read_context,
         )
         entry = steps.entry
         if capture is not None and not capture_before_read:

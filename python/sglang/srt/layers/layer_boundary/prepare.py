@@ -77,19 +77,35 @@ from sglang.srt.layers.layer_boundary.ops import (
 
 
 def _run_read_fusions(
-    read_fusions, hidden_states, residual, forward_batch, norm, *, read, **call
+    read_fusions,
+    hidden_states,
+    residual,
+    forward_batch,
+    norm,
+    *,
+    read,
+    update=PLAIN_ADD,
+    **call,
 ):
     """The first of the read's own kernels (ReadoutFusion) that takes the
     batch: one that completes the sum with the residual add hands the written
     stream to ``read``; one that also reads returns the read. None when every
     kernel declines."""
     for fused in read_fusions:
+        args = {}
+        if fused.accepts_update is None:
+            if not update.is_plain_add:
+                continue
+        else:
+            if not fused.accepts_update(update):
+                continue
+            args["update"] = update
         if fused.reads:
-            result = fused.run(hidden_states, residual, forward_batch, norm)
+            result = fused.run(hidden_states, residual, forward_batch, norm, **args)
             if result is not None:
                 return result
             continue
-        stream = fused.run(hidden_states, residual, forward_batch)
+        stream = fused.run(hidden_states, residual, forward_batch, **args)
         if stream is not None:
             return read.read(stream, norm, **call)
     return None
@@ -125,6 +141,7 @@ def _reduce_update_read(
         forward_batch,
         norm,
         read=read,
+        update=update,
         quant_format=quant_format,
         post_residual_addition=post_residual_addition,
     )
@@ -271,12 +288,15 @@ def _run_entry(
     step: Callable,
     is_plain_add: bool,
     carried_fusions: Tuple[Callable, ...],
+    carried_read_fusions: Tuple[ReadoutFusion, ...] = (),
+    read: ResidualReadout = NORM_READOUT,
     expected_sum: Optional[SumGroup] = None,
     completed_step: Optional[Callable] = None,
     pending=None,
     written_step: Optional[Callable] = None,
     written: bool = False,
     update: ResidualUpdate = PLAIN_ADD,
+    read_context=None,
     **call,
 ):
     """A boundary's half into a stage: complete what the value carries, a sum
@@ -287,6 +307,23 @@ def _run_entry(
     whose declared sum is already completed uses ``completed_step`` instead;
     a pending declared sum must match ``expected_sum``. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
+    bind = read.bind
+    if bind is not None:
+        bound = bind(forward_batch, read_context)
+        for fact in (
+            "is_plain_norm",
+            "reads_before_dp_gather",
+            "reads_after_attn_tp_gather",
+        ):
+            if getattr(bound, fact) != getattr(read, fact):
+                raise ValueError("invocation read changed its declared capability")
+        read = bound
+        selected = {(f.completes, f.scatters, f.carried) for f in carried_read_fusions}
+        carried_read_fusions = tuple(
+            f
+            for f in read.completing_fusions
+            if (f.completes, f.scatters, f.carried) in selected
+        )
     if residual is not None and update.is_plain_add != is_plain_add:
         raise RuntimeError("producer update does not match the boundary's capability")
     if pending is not None:
@@ -299,7 +336,7 @@ def _run_entry(
             step = completed_step
     if written and written_step is not None:
         step = written_step
-    if not isinstance(hidden_states, torch.Tensor):
+    if isinstance(hidden_states, (UnreducedOutput, DeferredFinalize)):
         owed = hidden_states
         if residual is None:
             raise RuntimeError(f"{type(owed).__name__} requires residual input")
@@ -311,6 +348,30 @@ def _run_entry(
         if isinstance(owed, UnreducedOutput) and owed.reduce_to_dp_local is not None:
             hidden_states = complete_owed(owed)
         else:
+            read_candidates = tuple(
+                fused
+                for fused in carried_read_fusions
+                if (
+                    isinstance(owed, DeferredFinalize)
+                    and fused.completes is owed.completion_group
+                )
+                or (
+                    isinstance(owed, UnreducedOutput)
+                    and _sum_group(fused.completes) is owed.group
+                )
+            )
+            result = _run_read_fusions(
+                read_candidates,
+                owed,
+                residual,
+                forward_batch,
+                norm,
+                read=read,
+                update=update,
+                **call,
+            )
+            if result is not None:
+                return result
             for fused in carried_fusions:
                 result = fused(
                     owed, residual, forward_batch, call.get("post_residual_addition")
@@ -321,6 +382,8 @@ def _run_entry(
                 hidden_states = complete_owed(owed)
             else:
                 hidden_states = owed.partial
+    if bind is not None:
+        call["read"] = read
     return step(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
@@ -385,7 +448,13 @@ def _attn_tp_reduce_scatter_update_read(
     of the read's ``read_fusions`` that takes the batch does all of this
     instead."""
     result = _run_read_fusions(
-        read_fusions, hidden_states, residual, forward_batch, norm, read=read
+        read_fusions,
+        hidden_states,
+        residual,
+        forward_batch,
+        norm,
+        read=read,
+        update=update,
     )
     if result is not None:
         return result

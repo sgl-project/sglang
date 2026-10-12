@@ -133,6 +133,8 @@ class _ResidualMergeRead:
     sum as the new residual, and the input norm of that sum in the model
     dtype. The producer's update must be a plain add."""
 
+    bind = None
+
     is_plain_norm = False
     completing_fusions = ()
     gathering_reads = ()

@@ -50,6 +50,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
+from sglang.srt.layers.layer_boundary.residual import takes_pending_update
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.runtime_context import (
     get_forward,
@@ -125,6 +126,7 @@ class StagePlan:
         is_branch=False,
         terminal=False,
         writes_at_handoff=False,
+        pipeline_handoff=False,
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
@@ -189,6 +191,8 @@ class StagePlan:
                     edges.outgoing,
                     cp_moves=edges.cp_moves,
                     attn_tp_gather=exit_gather,
+                    local_stage=not pipeline_handoff,
+                    writes_at_handoff=writes_at_handoff,
                 )
             )
             path = StagePath(
@@ -269,6 +273,7 @@ def _bind_stage(
     *,
     final_read=None,
     capture_preserves_residual=None,
+    pipeline_handoff=False,
     **options,
 ):
     if incoming.consumer != declaration or outgoing.producer != declaration:
@@ -276,7 +281,17 @@ def _bind_stage(
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
     update = declaration.update
-    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+    if pipeline_handoff and not (
+        update.is_plain_add or update.applied_at_exit or declaration.writes_at_handoff
+    ):
+        raise NotImplementedError(
+            "pipeline boundaries require a producer-written residual"
+        )
+    if declaration.terminal and not (
+        update.is_plain_add
+        or update.applied_at_exit
+        or takes_pending_update(final_read, update)
+    ):
         # The final read adds the last output into the residual itself, as a
         # plain add, before its norm.
         raise NotImplementedError(
@@ -316,6 +331,7 @@ def _bind_stage(
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
         writes_at_handoff=declaration.writes_at_handoff,
+        pipeline_handoff=pipeline_handoff,
         attn_tp_gather=declaration.attn_tp_gather,
         # The exit runs its consumer's gather: the next stage's, or the
         # final read's.

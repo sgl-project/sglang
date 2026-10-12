@@ -162,6 +162,8 @@ class _TransformedRead:
     transform runs on the complete sum, then the update and ``inner``. Not a
     plain norm, so no fused add + norm and no residual-first order takes it."""
 
+    bind = None
+
     inner: ResidualReadout
     transform: OutputTransform
 
@@ -339,6 +341,14 @@ def _bind_entry_path(
             step=entry.step,
             is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
+            carried_read_fusions=tuple(
+                f
+                for f in edge.need.read.completing_fusions
+                if f.carried
+                and not f.scatters
+                and (is_plain_add or f.accepts_update is not None)
+            ),
+            read=edge.need.read,
             expected_sum=declared_sum,
             completed_step=completed_step,
             written_step=written_step,
@@ -360,6 +370,8 @@ def bind_exit(
     *,
     cp_moves: Optional[CpMoves] = None,
     attn_tp_gather: Optional[Callable] = None,
+    local_stage: bool = False,
+    writes_at_handoff: bool = False,
 ) -> ExitMove:
     """Bind the producer half of a layer or branch exit.
 
@@ -381,10 +393,14 @@ def bind_exit(
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
-        if not update.is_plain_add and get_parallel().pp_size > 1:
-            raise NotImplementedError(
-                "pipeline boundaries require a plain add or a producer-written residual"
-            )
+    if (
+        not update.is_plain_add
+        and not (local_stage or writes_at_handoff or update.applied_at_exit)
+        and get_parallel().pp_size > 1
+    ):
+        raise NotImplementedError(
+            "pipeline boundaries require a producer-written residual"
+        )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")
     return _select_exit_move(
@@ -397,15 +413,14 @@ def bind_exit(
 
 
 def _read_fusions(read, owes, is_plain_add, *, scatters):
-    """The kernels a read supplies that complete ``owes`` on the rows this
-    entry completes it on. They take the residual add themselves, so only a
-    plain one."""
-    if not is_plain_add:
-        return ()
+    """The read's completions for this group and row placement. A non-plain
+    update requires explicit acceptance of the actual producer update."""
     return tuple(
         f
         for f in read.completing_fusions
-        if f.completes is owes and f.scatters == scatters
+        if (is_plain_add or f.accepts_update is not None)
+        and f.completes is owes
+        and f.scatters == scatters
     )
 
 

@@ -184,6 +184,8 @@ class _WrittenIn:
     """An update that is not a plain add: the output is written into the
     residual only once its sum is complete."""
 
+    bind = None
+
     is_plain_add = False
     applied_at_exit = False
 
