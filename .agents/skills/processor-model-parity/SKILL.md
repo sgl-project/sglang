@@ -201,9 +201,10 @@ OpenAI layer:
 
 - Dynamo version bumps change rendering silently: rerun every fixture after bumping
   `dynamo-renderer` or `dynamo-tokenizers`.
-- Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`) are read per
-  request, as in Python. The generator pins them and `tests/parity.rs` clears them,
-  so fixtures do not depend on the machine.
+- Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`,
+  `SGLANG_DSV41_REASONING_EFFORT`) are read per request, as in Python. The
+  generator pins them and `tests/parity.rs` clears them, so fixtures do not
+  depend on the machine.
 - Typed hosts (the renderer's `OAIChatLikeRequest` path) cannot carry every field,
   such as `task` and message-level `tools`. Parity is defined on `render_request`;
   report host-adapter gaps separately rather than bending the model code.
