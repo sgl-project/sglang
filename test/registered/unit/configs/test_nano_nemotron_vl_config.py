@@ -54,6 +54,7 @@ class TestNemotronHOmniConfig(CustomTestCase):
         )
 
         self.assertIs(config.get_text_config(), config.llm_config)
+        self.assertIs(config.get_text_config(encoder=True), config.llm_config)
 
 
 if __name__ == "__main__":

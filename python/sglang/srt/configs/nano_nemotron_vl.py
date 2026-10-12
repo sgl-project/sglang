@@ -146,7 +146,7 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             "video_maintain_aspect_ratio", True
         )
 
-    def get_text_config(self, decoder=False):
+    def get_text_config(self, decoder=None, encoder=None):
         return self.llm_config
 
     def create_radio_config(self):
