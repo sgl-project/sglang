@@ -16,8 +16,9 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -137,10 +138,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-        )
-
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
             (
@@ -152,7 +149,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 cfg.enable_decoder_swa_bounded_replay,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
-            ("the fp8 unified_kv pool", is_unified_kv_fp8()),
         )
         for feature, enabled in unsupported:
             if enabled:
@@ -217,9 +213,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+        )
     if cfg.enable_encoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -264,8 +265,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
-        ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
+        (
+            "TRT-LLM with SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm"
+            and (
+                cfg.enable_encoder_swa_bounded_replay
+                or cfg.enable_decoder_swa_bounded_replay
+            ),
+        ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )
@@ -282,26 +289,41 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or num_dp_ranks_of(cfg) != 1
-            or attn_dp_enabled_of(cfg)
-            or cfg.attn_cp_size != 1
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "--enable-prefill-cp with the interleave strategy. "
+                "DP attention is supported when "
+                "both servers use the same block size and target/draft KV layout."
             )
 
-    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
+    ):
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
@@ -315,16 +337,23 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
+            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            (
+                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                attn_dp_enabled_of(cfg)
+                and not (
+                    is_hip()
+                    and cfg.moe_a2a_backend == "none"
+                    and cfg.attn_dp_size == cfg.tp_size
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

@@ -85,6 +85,18 @@ impl EngineGroup {
             .collect()
     }
 
+    /// Live members minus the engines this request already failed on.
+    fn candidates(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        stage: Stage,
+    ) -> Vec<Arc<Worker>> {
+        let mut engines = self.members(workers, request.model, stage);
+        engines.retain(|engine| !request.excluded.contains(&engine.id));
+        engines
+    }
+
     async fn pick_from(
         &self,
         mut engines: Vec<Arc<Worker>>,
@@ -128,6 +140,8 @@ pub struct BucketRequest<'a> {
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
+    /// Engines this request already failed on; no group offers them again.
+    pub excluded: &'a [WorkerId],
 }
 
 /// A complete selection from one bucket. For plain serving, `prefill` is the
@@ -221,13 +235,13 @@ impl Bucket {
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => {
-                let engines = group.members(workers, request.model, Stage::Plain);
+                let engines = group.candidates(workers, request, Stage::Plain);
                 let plain = self.pick_from_group(group, Stage::Plain, engines, request);
                 (plain.await?, None)
             }
             BucketGroups::Pd { prefill, decode } => {
-                let prefills = prefill.members(workers, request.model, Stage::Prefill);
-                let decoders = decode.members(workers, request.model, Stage::Decode);
+                let prefills = prefill.candidates(workers, request, Stage::Prefill);
+                let decoders = decode.candidates(workers, request, Stage::Decode);
                 let stage = if prefills.is_empty() {
                     Stage::Prefill
                 } else {

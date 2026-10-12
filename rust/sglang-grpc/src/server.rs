@@ -17,13 +17,32 @@ use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
 };
-use sglang_grpc_types::sglang::runtime::v1 as proto;
+use sglang_api_types::runtime::v1 as proto;
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
     engine_state: EngineStatePublisher,
     stream_shutdown: watch::Receiver<bool>,
+}
+
+/// A follower has no tokenizer manager or inference bridge. It exposes the same
+/// discovery RPC as the leader, with a node-local startup snapshot. Generated
+/// default handlers return UNIMPLEMENTED for every other RPC.
+pub struct MetadataService {
+    pub server_info_json: String,
+}
+
+#[tonic::async_trait]
+impl proto::sglang_service_server::SglangService for MetadataService {
+    async fn get_server_info(
+        &self,
+        _request: Request<proto::GetServerInfoRequest>,
+    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
+        Ok(Response::new(proto::GetServerInfoResponse {
+            json_info: self.server_info_json.clone(),
+        }))
+    }
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -300,12 +319,10 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
 impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     // --- SGLang-native RPCs: TextGenerate / Generate ---
 
-    type TextGenerateStream = StreamResult<proto::TextGenerateResponse>;
-
     async fn text_generate(
         &self,
         request: Request<proto::TextGenerateRequest>,
-    ) -> Result<Response<Self::TextGenerateStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::TextGenerateResponse>>, Status> {
         let req = request.into_inner();
         let rid = req
             .rid
@@ -369,12 +386,10 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type GenerateStream = StreamResult<proto::GenerateResponse>;
-
     async fn generate(
         &self,
         request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::GenerateResponse>>, Status> {
         let req = request.into_inner();
         let rid = req
             .rid
@@ -645,12 +660,10 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
     }
 
-    type WatchEngineStateStream = StreamResult<proto::EngineStateSnapshot>;
-
     async fn watch_engine_state(
         &self,
         _request: Request<proto::WatchEngineStateRequest>,
-    ) -> Result<Response<Self::WatchEngineStateStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::EngineStateSnapshot>>, Status> {
         let mut receiver = self.engine_state.subscribe();
         let mut shutdown = self.stream_shutdown.clone();
         let stream = async_stream::stream! {
@@ -831,22 +844,18 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
     // --- OpenAI-compatible RPCs (JSON pass-through) ---
 
-    type ChatCompleteStream = StreamResult<proto::OpenAiStreamChunk>;
-
     async fn chat_complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::ChatCompleteStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::OpenAiStreamChunk>>, Status> {
         self.openai_streaming_rpc(request, "submit_openai_chat")
             .await
     }
 
-    type CompleteStream = StreamResult<proto::OpenAiStreamChunk>;
-
     async fn complete(
         &self,
         request: Request<proto::OpenAiRequest>,
-    ) -> Result<Response<Self::CompleteStream>, Status> {
+    ) -> Result<Response<StreamResult<proto::OpenAiStreamChunk>>, Status> {
         self.openai_streaming_rpc(request, "submit_openai_complete")
             .await
     }
@@ -1079,6 +1088,14 @@ async fn recv_json_response(
     }
 }
 
+pub enum ServerMode {
+    Inference {
+        bridge: Arc<PyBridge>,
+        response_timeout: Duration,
+    },
+    Metadata(MetadataService),
+}
+
 /// Start the Tonic gRPC server on the given address.
 //
 // TODO(grpc-auth): this listener is currently unauthenticated. Before exposing
@@ -1086,12 +1103,18 @@ async fn recv_json_response(
 // checks the HTTP server applies (see issue tracking gRPC auth parity).
 pub async fn run_grpc_server(
     listener: std::net::TcpListener,
-    bridge: Arc<PyBridge>,
+    mode: ServerMode,
     shutdown: Arc<Notify>,
-    response_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = listener.local_addr()?;
-    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let (bridge, response_timeout) = match mode {
+        ServerMode::Metadata(service) => {
+            return serve_grpc(listener, service, shutdown, None).await;
+        }
+        ServerMode::Inference {
+            bridge,
+            response_timeout,
+        } => (bridge, response_timeout),
+    };
     let (state_changed_tx, mut state_changed_rx) = tokio::sync::mpsc::channel(1);
     bridge.set_engine_state_changed_callback(state_changed_tx)?;
     let engine_state = EngineStatePublisher::new(bridge.clone()).await?;
@@ -1112,6 +1135,19 @@ pub async fn run_grpc_server(
         }
     });
 
+    let result = serve_grpc(listener, service, shutdown, Some(stream_shutdown_tx)).await;
+    monitor.abort();
+    result
+}
+
+async fn serve_grpc(
+    listener: std::net::TcpListener,
+    service: impl proto::sglang_service_server::SglangService,
+    shutdown: Arc<Notify>,
+    stream_shutdown: Option<watch::Sender<bool>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     let max_message_size = resolve_max_message_size();
     let svc = proto::sglang_service_server::SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
@@ -1123,11 +1159,12 @@ pub async fn run_grpc_server(
         .add_service(svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
-            stream_shutdown_tx.send_replace(true);
+            if let Some(stream_shutdown) = stream_shutdown {
+                stream_shutdown.send_replace(true);
+            }
             tracing::info!("gRPC server shutting down");
         })
         .await;
-    monitor.abort();
     result?;
 
     Ok(())

@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
+    remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -791,10 +792,13 @@ def _resolve_gguf_quant_load_spec(
 
     _validate_gguf_runtime_support(server_args, component_name)
 
-    quant_config = GGUFConfig(
-        gguf_file=gguf_file,
-        tensor_meta=read_gguf_tensor_meta(gguf_file),
-    )
+    tensor_meta = read_gguf_tensor_meta(gguf_file)
+    dequantize_prefixes = vars(model_cls).get("gguf_dequantize_prefixes", ())
+    if dequantize_prefixes:
+        tensor_meta = remap_gguf_tensor_meta(
+            tensor_meta, lambda name: name, dequantize_prefixes=dequantize_prefixes
+        )
+    quant_config = GGUFConfig(gguf_file=gguf_file, tensor_meta=tensor_meta)
     packed = getattr(model_cls, "packed_modules_mapping", None)
     if packed:
         quant_config.packed_modules_mapping = packed

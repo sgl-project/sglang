@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.choices import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.utils.common import human_readable_int
@@ -217,11 +218,13 @@ class ExecKernel(msgspec.Struct):
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",
+                "triton_sparse_mla",
                 "fa3",
                 "tilelang",
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -237,6 +240,16 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
     ] = "auto"
+    dsa_triton_union: A[
+        int,
+        Arg(
+            help="Union group size for --dsa-prefill-backend triton_sparse_mla: "
+            "0 disables, 2 or 4 make G adjacent query tokens share one gathered "
+            "index set (mathematically exact; an ownership mask restores each "
+            "token's own softmax support).",
+            choices=[0, 2, 4],
+        ),
+    ] = 0
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -252,6 +265,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -492,22 +506,24 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_config: A[
         Optional[CudaGraphConfig],
         Arg(
-            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
+            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}\'. Allowed backends per phase: full, breakable, disabled. JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
             type_parser=parse_cuda_graph_config_arg,
         ),
     ] = None
     cuda_graph_backend_decode: A[
-        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
+        Optional[Literal["full", "breakable", "disabled"]],
         Arg(
             help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_backend_prefill: A[
-        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
+        Optional[Literal["full", "breakable", "disabled"]],
         Arg(
             help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_max_bs_decode: A[
@@ -542,10 +558,6 @@ class ExecGraph(msgspec.Struct):
             type_parser=human_readable_int,
             aliases=["--context-bucket"],
         ),
-    ] = None
-    cuda_graph_tc_compiler: A[
-        Optional[Literal["eager", "inductor"]],
-        "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
     ] = None
     disable_prefill_cuda_graph: A[
         bool,
