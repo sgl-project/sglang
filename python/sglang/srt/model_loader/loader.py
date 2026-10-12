@@ -853,6 +853,33 @@ class DefaultModelLoader(BaseModelLoader):
                 )
         return model
 
+    def initialize_model_without_storage(
+        self,
+        *,
+        model_config: ModelConfig,
+        device: torch.device,
+    ) -> Tuple[nn.Module, Dict[str, torch.Size]]:
+        """Build the model of `initialize_model_for_startup` without allocating parameter storage.
+
+        Returns the model, with every parameter 0-size on `device`, and the shape each parameter was built with,
+        by name. Parameters keep their subclass, attributes and ties; other tensors stay on meta, so the model
+        cannot run forward. For a trainer that binds its own buffers before loading weights in this rank's layout
+        (p2p weight updates).
+        """
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        built_shapes_by_name = {
+            name: param.shape for name, param in model.named_parameters()
+        }
+        _replace_parameters_with_empty(model, device)
+        return model, built_shapes_by_name
+
     def prepare_model_for_capture(
         self,
         *,
@@ -1118,6 +1145,24 @@ class DefaultModelLoader(BaseModelLoader):
             if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
+
+
+def _replace_parameters_with_empty(model: nn.Module, device: torch.device) -> None:
+    # by the original's id, so a parameter shared by several modules stays shared
+    replacements: Dict[int, nn.Parameter] = {}
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            if id(param) not in replacements:
+                replacement = torch.Tensor._make_subclass(
+                    type(param),
+                    torch.empty(0, dtype=param.dtype, device=device),
+                    param.requires_grad,
+                )
+                replacement.__dict__.update(param.__dict__)
+                replacements[id(param)] = replacement
+            module._parameters[name] = replacements[id(param)]
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -3253,6 +3298,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 load_config.remote_instance_weight_loader_transfer_engine,
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
                 load_config.tp_rank,
+                role="draft" if model_config.is_draft_model else "target",
             )
             if not success:
                 raise RuntimeError(
@@ -3331,11 +3377,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self, model, transfer_engine, seed_url, tp_rank, role
     ) -> bool:
         # get remote weights metadata from source instance
         seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank, role)
         )
         if (
             seed_transfer_engine_session_id is None
