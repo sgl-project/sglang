@@ -1518,6 +1518,219 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         print(f"[IDXIN-ROPE] differing shared blocks (>{knorm_tol}): {off_txt}")
 
 
+QK_ALIGNED_RUNBOOK = (
+    "[QK-ALIGNED-RUNBOOK] query vs index-K at P* (per absolute position/block):\n"
+    "  DSV4_DUMP_IDXIN=<layer> DSV4_DUMP_IDXK=<layer> DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=17590 DSV4_DUMP_MAX_POS=17605 "
+    "<serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_qk.log\n"
+    "  qpos=[pos:md5|..] = query= operand (q_quant) per ABSOLUTE position; "
+    "[IDXK] blkx=[blk:md5] = index-K pool page per ABSOLUTE 128-token block"
+)
+
+
+def _idxin_qpos(rec):
+    """Parse ``qpos=[pos:md5|pos:md5|..]`` into ``{abs_pos: md5}``.
+
+    ``qpos`` is the per-ABSOLUTE-POSITION hash of the indexer op's ``query=``
+    operand (``q_quant``), emitted at the op-input point.  It is the ONLY query
+    signal that aligns a MISS and a HIT at the SAME DECODE step: ``qblk`` keys by
+    128-token block, and at decode block 137 spans 128 positions, so a MISS and a
+    HIT at the divergence position P*=17598 would land in the SAME group as every
+    other decode step.  Empty for probes without the field.
+    """
+    v = rec.get("qpos")
+    if not v:
+        return {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for entry in s.split("|"):
+        entry = entry.strip()
+        if ":" not in entry:
+            continue
+        p, _, h = entry.partition(":")
+        try:
+            out[int(p.strip())] = h.strip()
+        except ValueError:
+            continue
+    return out
+
+
+def _qpos_maps(group):
+    """``{layer: {abs_pos: q_md5}}`` of one request's [IDXIN] rows."""
+    out = defaultdict(dict)
+    for r in group:
+        ly = _int(r, "layer")
+        for pos, h in _idxin_qpos(r).items():
+            out[ly].setdefault(pos, h)
+    return out
+
+
+def _idxk_aligned_div(idxk_rows):
+    """``[(layer, block, lastpos, hashes)]`` where 2+ requests disagree at the
+    SAME decode step.
+
+    Keyed by ``(layer, block, lastpos)`` so the compare is at the SAME absolute
+    decode position, NOT across the evolving page: within one request a
+    ``lastpos`` has exactly one hash for a block, so >1 distinct hash among
+    requests is a REAL MISS-vs-HIT index-K pool divergence (a per-block-only
+    grouping would false-positive on the partially-written tail page).
+    """
+    groups = defaultdict(lambda: defaultdict(set))  # (ly,blk,lastpos) -> {req: hashes}
+    for r in idxk_rows:
+        ly = _int(r, "layer")
+        lp = _int(r, "lastpos", -1)
+        req = _int(r, "_req", -1)
+        for b, h in _parse_blkx(r, "blkx").items():
+            groups[(ly, b, lp)][req].add(h)
+    out = []
+    for (ly, b, lp), byreq in groups.items():
+        if len(byreq) < 2:
+            continue
+        allh = set().union(*byreq.values())
+        if len(allh) > 1:
+            out.append((ly, b, lp, sorted(allh)))
+    out.sort()
+    return out
+
+
+def report_qk_aligned(idxin_rows, idxk_rows=(), c4pos_rows=()):
+    """``[QK-ALIGNED]`` query vs index-K at P* -- the decisive q-vs-K split.
+
+    The indexer op ``npu_quant_lightning_indexer`` is fed TWO operands
+    (``ascend_dsv4_backend.py:1898-1915``):
+      * (a) QUERY -- ``query=q_quant``: this report reads the ``qpos=[pos:md5]``
+        field (per ABSOLUTE position) emitted at the op-input point, so MISS and
+        HIT are compared at the SAME decode position P*;
+      * (b) KEYS  -- ``key=<index-K pool>``: the [IDXIN] ``klog`` whole-logical-read
+        content (``_idxin_comp_differs``, keyed by ``(layer,lastpos)``) plus the
+        [IDXK] ``blkx=[blk:md5]`` per-absolute-block pool divergence, aligned by
+        ``(layer,block,lastpos)`` so the evolving tail page cannot false-positive.
+
+    MISS/HIT roles reuse the [IDXIN] ``sps`` rule (``_idxin_roles``).  The query
+    side also runs a two-MISS control (self-control): two MISS requests must
+    agree at every shared position.
+
+    Decision tree (printed as ``[QK-ALIGNED] DECISION``):
+      * ``Q_DIFF``  -> divergence is the QUERY path (q proj/quant/RoPE);
+      * ``K_DIFF``  -> upstream compressor / state at P* (trace the compressor
+        state read at P*, ``_build_explicit_state_block_table`` /
+        ``translate_from_swa_loc_to_state_loc``);
+      * both SAME   -> the top-k score/reduction inside the indexer is
+        shape-dependent (probe the score / top-k ORDER, cf.
+        ``[CMPIDX-ORDERED-ALIGNED]``).
+    """
+    print("\n== [QK-ALIGNED] query (qpos) vs index-K (klog/blkx) at P* ==")
+    if not idxin_rows:
+        print("  [QK-ALIGNED] no [IDXIN] rows -> run with DSV4_DUMP_IDXIN=<layer>")
+        print(QK_ALIGNED_RUNBOOK)
+        return
+    if not any("qpos" in r for r in idxin_rows):
+        print("  [QK-ALIGNED] [IDXIN] has no `qpos=` field (probe without the "
+              "windowed query hash) -> cannot judge the QUERY side; re-run with "
+              "DSV4_DUMP_MIN_POS/MAX_POS set (the field is window-gated)")
+        print(QK_ALIGNED_RUNBOOK)
+        return
+    reqs = _idxin_requests(idxin_rows)
+    n_req = sum(1 for g in reqs if g)
+    if n_req < 2:
+        print("  [QK-ALIGNED] <2 requests -> no MISS/HIT split")
+        print(QK_ALIGNED_RUNBOOK)
+        return
+    miss_i, miss_set, hit_idx, role_src, note = _idxin_roles(reqs)
+    report_idxin_split(idxin_rows)
+    print(f"  [QK-ALIGNED] miss_req={miss_set} hit_req={hit_idx} "
+          f"source={role_src}  ({note})")
+
+    # (a) QUERY: per absolute position.
+    miss_q = _qpos_maps(reqs[miss_i])
+    hit_qs = [_qpos_maps(reqs[j]) for j in hit_idx]
+    q_cmp = q_same = q_diff = 0
+    q_offenders = []
+    for ly in sorted(miss_q):
+        for pos in sorted(miss_q[ly]):
+            for hqm in hit_qs:
+                if ly in hqm and pos in hqm[ly]:
+                    q_cmp += 1
+                    if miss_q[ly][pos] == hqm[ly][pos]:
+                        q_same += 1
+                    else:
+                        q_diff += 1
+                        q_offenders.append(
+                            (ly, pos, miss_q[ly][pos], hqm[ly][pos]))
+    q_verdict = ("Q_DIFF" if q_diff else
+                 ("Q_SAME" if q_cmp else "Q_NO_SHARED"))
+    print(f"  [QK-ALIGNED] QUERY(qpos): compared={q_cmp} same={q_same} "
+          f"diff={q_diff} => {q_verdict}")
+    for ly, pos, a, b in q_offenders[:MAX_OFFENDER_SHOWN]:
+        print(f"     [Q] layer={ly} pos={pos} miss={a} hit={b}")
+    if q_offenders:
+        _firstq = min(q_offenders, key=lambda t: t[1])
+        print(f"  [QK-ALIGNED] FIRST query diff at layer={_firstq[0]} "
+              f"pos={_firstq[1]}")
+
+    # two-MISS control (self-control): two MISS requests must agree on qpos.
+    if len(miss_set) >= 2:
+        base = _qpos_maps(reqs[miss_set[0]])
+        ctl = ctl_same = ctl_diff = 0
+        for m in miss_set[1:]:
+            o = _qpos_maps(reqs[m])
+            for ly in base:
+                for pos in base[ly]:
+                    if ly in o and pos in o[ly]:
+                        ctl += 1
+                        if base[ly][pos] == o[ly][pos]:
+                            ctl_same += 1
+                        else:
+                            ctl_diff += 1
+        if ctl == 0:
+            print("  [QK-ALIGNED] two-MISS control: no shared qpos position")
+        elif ctl_diff == 0:
+            print(f"  [QK-ALIGNED] two-MISS control: IDENTICAL at all {ctl} "
+                  f"shared qpos position(s) (sanity OK)")
+        else:
+            print(f"  [QK-ALIGNED] WARN two-MISS control: {ctl_diff}/{ctl} "
+                  f"shared qpos position(s) DIFFER between two MISS requests")
+
+    # (b) KEYS: whole-read content (klog) + per-block pool divergence ([IDXK]).
+    klog_diff = _idxin_comp_differs(idxin_rows)
+    kblk_diff = _idxk_aligned_div(idxk_rows) if idxk_rows else []
+    if kblk_diff or klog_diff:
+        k_verdict = "K_DIFF"
+    elif klog_diff is False:
+        k_verdict = "K_SAME"
+    else:
+        k_verdict = "K_UNKNOWN"
+    _kblk_show = [f"L{ly}/blk{b}/lp{lp}" for ly, b, lp, _h in kblk_diff]
+    print(f"  [QK-ALIGNED] KEYS: klog_diff={klog_diff} "
+          f"blkx_aligned_diff={len(kblk_diff)} "
+          f"{_kblk_show[:MAX_OFFENDER_SHOWN]} => {k_verdict}")
+
+    # DECISION.
+    print("  [QK-ALIGNED] DECISION:")
+    if q_verdict == "Q_DIFF":
+        print("     QUERY-PATH: q differs at P* -> divergence is the QUERY "
+              "(q proj/quant/RoPE); index-K is at most secondary")
+    elif k_verdict == "K_DIFF":
+        print("     COMPRESSOR/STATE: index-K differs at P* -> upstream "
+              "compressor/state; trace the state read at P* "
+              "(_build_explicit_state_block_table / "
+              "translate_from_swa_loc_to_state_loc)")
+    elif q_verdict == "Q_SAME" and k_verdict == "K_SAME":
+        print("     BOTH-SAME: neither op input differs -> the indexer's "
+              "score/top-k reduction is shape-dependent; probe the score/ORDER "
+              "next (see [CMPIDX-ORDERED-ALIGNED])")
+    else:
+        print(f"     INCONCLUSIVE: q={q_verdict} k={k_verdict} -> enable BOTH "
+              f"DSV4_DUMP_IDXIN and DSV4_DUMP_IDXK and set the window "
+              f"(DSV4_DUMP_MIN_POS/MAX_POS)")
+    print(QK_ALIGNED_RUNBOOK)
+
+
 C4POS_RUNBOOK = (
     "[C4POS-RUNBOOK] DSV4_DUMP_C4POS=1 bash start_test.sh > /tmp/dsv4_c4pos.log 2>&1 & "
     "bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; "
@@ -2736,6 +2949,8 @@ def main(path):
             report_idxin_verdict(rows)
             print("\n== [IDXIN-ROPE] RoPE-phase vs content/window (knorm invariant) ==")
             report_idxin_rope(rows)
+            print("\n== [QK-ALIGNED] query vs index-K at P* (decisive q-vs-K split) ==")
+            report_qk_aligned(rows, recs.get("IDXK", []), recs.get("C4POS", []))
             continue
         if tag == "LIMETA":
             print("\n== [LIMETA] metadata core-partition ==")
@@ -2837,15 +3052,16 @@ def _selftest():
     kpg_b = "n=8,first=[1, 2, 3, 4],last=[5, 6, 7, 8]"
 
     def _idxin(ly, slq, klog, kpg, knorm="1.0:100:64", shift=0, npb=100,
-               slk=17523, with_sps=True):
+               slk=17523, with_sps=True, qpos=None):
         sps = f"sps=[{shift * 4}]," if with_sps else ""
+        q = f" qpos={qpos}" if qpos is not None else ""
         return (
             f"[IDXIN] layer={ly} mode=1 qblk=[0:aa] wblk=[0:bb] "
             f"slq=({slq},{slq},1) slk=({slk},{slk},1) klog={klog} kpg={kpg} "
             f"knorm={knorm} ropephase=r=4,{sps}shift=[{shift}],"
             f"npb=[{npb}],loc=[0..{npb - 1}],abs=[{shift}..{shift + npb - 1}] "
             f"kraw=kk meta=mm bt=tt qshape=(1,2,3) wshape=(1,2,3) "
-            f"kshape=(4,5,6)"
+            f"kshape=(4,5,6){q}"
         )
 
     lines = [
@@ -3292,6 +3508,27 @@ def _selftest():
         ci_ord_same_out = _run_main(cmpidx_ord_same)
         ci_ord_diff_out = _run_main(cmpidx_ord_diff)
 
+        # --- [QK-ALIGNED] query vs index-K at P* (Q1/Q2) ---
+        # Q1: two MISS (sps=0) + one HIT (sps=16384) share qpos=[17598:qq] AND
+        #     klog -> Q_SAME + K_SAME -> DECISION BOTH-SAME (indexer-internal).
+        # Q2: the HIT's qpos differs (qq->rr) -> Q_DIFF -> DECISION QUERY-PATH.
+        def _qk_line(ly, slq, klog, shift, qhash):
+            return _idxin(ly, slq, klog, kpg_a, shift=shift,
+                          qpos=f"[17598:{qhash}]")
+
+        qk_same = [
+            CHAT, _c4pos_first(0), _qk_line(2, 17523, "aaaa", 0, "qq"),
+            CHAT, _c4pos_first(0), _qk_line(2, 17523, "aaaa", 0, "qq"),
+            CHAT, _c4pos_first(16384), _qk_line(2, 1139, "aaaa", 4096, "qq"),
+        ]
+        qk_diff = [
+            CHAT, _c4pos_first(0), _qk_line(2, 17523, "aaaa", 0, "qq"),
+            CHAT, _c4pos_first(0), _qk_line(2, 17523, "aaaa", 0, "qq"),
+            CHAT, _c4pos_first(16384), _qk_line(2, 1139, "aaaa", 4096, "rr"),
+        ]
+        qk_same_out = _run_main(qk_same)
+        qk_diff_out = _run_main(qk_diff)
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -3472,12 +3709,29 @@ def _selftest():
              and "two-MISS control: SEQUENCE-IDENTICAL" in ci_ord_same_out
              and "escalate to the metadata/attention probes" in ci_ord_same_out
              and "=> ORDER_DIFF" not in ci_ord_same_out),
-            ("[CMPIDX-ORDERED-ALIGNED] ORDER_DIFF + SET same (R1)",
-             "=> ORDER_DIFF" in ci_ord_diff_out
-             and "SET_same" in ci_ord_diff_out
-             and "first_diff offset=0 miss=7 hit=8" in ci_ord_diff_out
-             and "swapped_miss=[7, 8, 9] -> hit=[8, 7, 9]" in ci_ord_diff_out
-             and "ordered-consumption" in ci_ord_diff_out),
+             ("[CMPIDX-ORDERED-ALIGNED] ORDER_DIFF + SET same (R1)",
+              "=> ORDER_DIFF" in ci_ord_diff_out
+              and "SET_same" in ci_ord_diff_out
+              and "first_diff offset=0 miss=7 hit=8" in ci_ord_diff_out
+              and "swapped_miss=[7, 8, 9] -> hit=[8, 7, 9]" in ci_ord_diff_out
+              and "ordered-consumption" in ci_ord_diff_out),
+            ("[QK-ALIGNED] qpos parsed per absolute position",
+             _idxin_qpos({"qpos": "[17598:qq|17599:rr]"})
+             == {17598: "qq", 17599: "rr"}),
+            ("[QK-ALIGNED] Q_SAME + K_SAME -> DECISION BOTH-SAME",
+             "[QK-ALIGNED] QUERY(qpos): " in qk_same_out
+             and "=> Q_SAME" in qk_same_out
+             and "=> K_SAME" in qk_same_out
+             and "BOTH-SAME" in qk_same_out
+             and "QUERY-PATH" not in qk_same_out),
+            ("[QK-ALIGNED] two-MISS qpos control OK",
+             "two-MISS control: IDENTICAL" in qk_same_out),
+            ("[QK-ALIGNED] qpos diff -> Q_DIFF -> DECISION QUERY-PATH",
+             "=> Q_DIFF" in qk_diff_out
+             and "=> Q_SAME" not in qk_diff_out
+             and "QUERY-PATH" in qk_diff_out),
+            ("[QK-ALIGNED] index-K alignment field emitted",
+             "blkx_aligned_diff=" in qk_same_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:

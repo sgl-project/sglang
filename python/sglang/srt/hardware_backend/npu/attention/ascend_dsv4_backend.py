@@ -1999,6 +1999,38 @@ class C4IndexerAscendBackendMixin:
                 )
                 _meta = kwargs.get("metadata")
                 _bt = kwargs.get("block_table")
+                # S251: [IDXIN] per-ABSOLUTE-POSITION query hash ('qpos='). The
+                # decisive divergence sits at a DECODE position (P*=17598), where
+                # `qblk` keys by 128-token block: block 137 mixes every decode
+                # step 17536..17663 into ONE group, so it CANNOT align a MISS and
+                # a HIT at the SAME decode step. `qpos=[pos:md5|..]` hashes the op
+                # INPUT `query=` (q_quant) row for each absolute position p in
+                # [DSV4_DUMP_MIN_POS, DSV4_DUMP_MAX_POS], so MISS-vs-HIT is
+                # compared at the SAME absolute decode position.  Emitted only in
+                # the WINDOWED mode (both bounds set) to keep an unbounded dump
+                # cheap; purely additive/read-only, same DSV4_DUMP_IDXIN gate.
+                _qpos = ""
+                try:
+                    _q_lo_e = os.environ.get("DSV4_DUMP_MIN_POS")
+                    _q_hi_e = os.environ.get("DSV4_DUMP_MAX_POS")
+                    if _q_lo_e is not None and _q_hi_e is not None:
+                        _qlo = int(_q_lo_e)
+                        _qhi = int(_q_hi_e)
+                        _qp = (
+                            forward_batch.positions.reshape(-1)
+                            .to(torch.int64)
+                            .cpu()
+                        )
+                        _qq = q_quant.detach().to("cpu")
+                        if _qp.numel() == _qq.shape[0]:
+                            _qparts = [
+                                f"{int(_qp[_r])}:{_md5_in(_qq[_r])}"
+                                for _r in range(_qp.numel())
+                                if _qlo <= int(_qp[_r]) <= _qhi
+                            ]
+                            _qpos = " qpos=[" + "|".join(_qparts) + "]"
+                except Exception:
+                    _qpos = " qpos=[err]"
                 print(
                     f"[IDXIN] layer={getattr(c4_indexer, 'layer_id', -1)} "
                     f"mode={forward_batch.forward_mode} "
@@ -2008,7 +2040,8 @@ class C4IndexerAscendBackendMixin:
                     f"klog={_klog} "
                     f"kpg={_kpg} "
                     f"knorm={_knorm} "
-                    f"ropephase={_ropephase} "
+                    f"ropephase={_ropephase}"
+                    f"{_qpos} "
                     f"kraw={_md5_in(_k) if _k is not None else 'None'} "
                     f"meta={_md5_in(_meta) if _meta is not None else 'None'} "
                     f"bt={_md5_in(_bt) if _bt is not None else 'None'} "
