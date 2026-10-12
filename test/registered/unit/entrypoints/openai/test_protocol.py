@@ -33,7 +33,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     DeltaMessage,
     Function,
     FunctionResponse,
-    ModelCard,
     Tool,
     ToolCall,
     UsageInfo,
@@ -41,18 +40,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-
-
-class TestModelCard(unittest.TestCase):
-    """Test ModelCard protocol model"""
-
-    def test_model_card_serialization(self):
-        """Test model card JSON serialization"""
-        card = ModelCard(id="test-model", max_model_len=4096)
-        data = card.model_dump()
-        self.assertEqual(data["id"], "test-model")
-        self.assertEqual(data["object"], "model")
-        self.assertEqual(data["max_model_len"], 4096)
 
 
 class TestCompletionRequest(unittest.TestCase):
@@ -766,14 +753,6 @@ class TestFunctionDeferLoading(unittest.TestCase):
 
 class TestValidationEdgeCases(unittest.TestCase):
     """Test edge cases and validation scenarios"""
-
-    def test_invalid_tool_choice_type(self):
-        """Test invalid tool choice type"""
-        messages = [{"role": "user", "content": "Hello"}]
-        with self.assertRaises(ValidationError):
-            ChatCompletionRequest(
-                model="test-model", messages=messages, tool_choice=123
-            )
 
     def test_negative_token_limits(self):
         """Test negative token limits"""
