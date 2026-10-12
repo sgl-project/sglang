@@ -1,6 +1,7 @@
 """PD decode joins the prebuilt rows into the running rows at the plan,
 through a copy, and the normal and overlap loops decode a copy of the rows:
-neither the prebuilt batch nor a launched step ever becomes the rows."""
+neither the prebuilt batch nor a launched step ever becomes the rows. Rows
+leave at the commit that finishes them."""
 
 import copy
 import unittest
@@ -154,6 +155,7 @@ class _Loop:
         s = _Scheduler()
         self.s = s
         self.launched, self.intake, self.prealloc, self.idle = [], [], [], []
+        self.intake_inflight = []
         s.gracefully_exit = False
         s._engine_paused = False
         s.enable_hisparse = False
@@ -184,6 +186,9 @@ class _Loop:
         def ingest_requests():
             rows = s.decoding_batch.rows
             self.intake.append((_rids(rows.reqs), getattr(rows, "launch", None)))
+            self.intake_inflight.append(
+                sorted(r.rid for r in request_queries.inflight_reqs(s))
+            )
             if len(self.intake) > self.num_steps:
                 raise _StopLoop
 
@@ -287,6 +292,37 @@ class TestDecodeStepCopy(CustomTestCase):
             num_steps=2,
         )
         self.assertEqual(loop.idle, [(False, [])])
+
+
+class TestLeaveAtCommit(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+        enter_scope(self, envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True))
+
+    def test_finished_rows_leave_at_their_commit(self):
+        for event_loop, rows_seen in (
+            (_LOOPS[0], [["a", "b"], ["b"], ["b"]]),
+            # Overlap commits the first step after launching the second.
+            (_LOOPS[1], [["a", "b"], ["a", "b"], ["b"]]),
+        ):
+            with self.subTest(event_loop=event_loop.__name__):
+                loop = _Loop(self, [{"finish": {"a"}}, {}], rows=[_Req("a"), _Req("b")])
+                loop.run(event_loop, num_steps=2)
+                # Intake, then preallocation and its budget, see only the
+                # rows still decoding.
+                self.assertEqual([rids for rids, _ in loop.intake], rows_seen)
+                self.assertEqual(loop.prealloc, rows_seen[:2])
+
+    def test_prebuilt_row_finishing_with_a_step_in_flight(self):
+        # p joins from the prebuilt batch and decodes; its finish is observed
+        # while the overlap loop has its next step in flight. p leaves the
+        # rows at that commit, and stays listed in flight until the plan that
+        # follows.
+        loop = _Loop(self, [{"prebuilt": [_Req("p")], "finish": {"p"}}, {}, {}])
+        loop.run(_LOOPS[1], num_steps=3)
+        self.assertEqual([rids for rids, _ in loop.intake], [[], ["p"], [], []])
+        self.assertEqual(loop.intake_inflight, [[], ["p"], ["p"], []])
 
 
 if __name__ == "__main__":

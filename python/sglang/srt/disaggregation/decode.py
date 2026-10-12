@@ -3010,9 +3010,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            # Finished rows leave before preallocation and the prebuilt join
-            # size their budgets from the running batch.
-            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3032,6 +3029,10 @@ class SchedulerDisaggregationDecodeMixin:
                 self.decoding_batch.absorb()
                 self.inflight_steps.push(batch, result)
                 self._commit_due_step()
+                # Rows whose finish the commit observed leave here, so the
+                # readers between steps, preallocation and the prebuilt join
+                # see only the rows still decoding.
+                self.leave_finished_rows(self.decoding_batch)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -3064,9 +3065,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            # Finished rows leave before preallocation and the prebuilt join
-            # size their budgets from the running batch.
-            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3105,6 +3103,12 @@ class SchedulerDisaggregationDecodeMixin:
                 self._commit_due_step()
             elif batch is None:
                 self.on_idle()
+            # Rows whose finish a commit observed leave here, after the
+            # launch: the decode step copied from the rows hands back its run
+            # writes first. This also covers the commit made before the
+            # launch. The readers between steps, preallocation and the
+            # prebuilt join then see only the rows still decoding.
+            self.leave_finished_rows(self.decoding_batch)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

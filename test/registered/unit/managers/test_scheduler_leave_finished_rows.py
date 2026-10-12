@@ -1,7 +1,8 @@
 """Finished running rows leave at the top of the next plan: before admission,
-and in PD decode before preallocation. Under a loop that joins at the next
-plan, the step launched last, which readers between steps see as last_batch,
-drops them at that plan too."""
+and in the pipeline PD decode loop before its prebuilt join. Under a loop that
+joins at the next plan, the step launched last, which readers between steps
+see as last_batch, drops them at that plan too. The PD decode normal and
+overlap loops drop them at the commit instead (test_disagg_decode_rows.py)."""
 
 import copy
 import unittest
@@ -13,7 +14,6 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel, published_topology
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
@@ -217,39 +217,7 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
         self.assertEqual(self._run(rows=[], first_step=step), [True])
 
 
-class TestLeaveBeforeDecodePrealloc(unittest.TestCase):
-    def _run_one_step(self, event_loop):
-        """Run one PD-decode loop step; return the rows preallocation saw."""
-        s = MagicMock()
-        s.gracefully_exit = False
-        s._engine_paused = False
-        s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
-        s.decoding_batch = DecodingBatch(
-            _Batch([_Req("a"), _Req("b", True), _Req("c")])
-        )
-        s.is_disable_overlap_for_batch.return_value = False
-        s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
-        seen = []
-
-        def process_decode_queue():
-            seen.append(_rids(s.decoding_batch.rows))
-            s.gracefully_exit = True
-
-        s.process_decode_queue.side_effect = process_decode_queue
-        s.get_next_disagg_decode_batch_to_run.side_effect = lambda decoding_batch: (
-            NextBatchPlan(batch_to_run=None, running_batch=decoding_batch.rows)
-        )
-        event_loop(s)
-        return seen
-
-    def test_prealloc_sees_only_live_rows(self):
-        for event_loop in (
-            SchedulerDisaggregationDecodeMixin.event_loop_normal_disagg_decode,
-            SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode,
-        ):
-            with self.subTest(event_loop=event_loop.__name__):
-                self.assertEqual(self._run_one_step(event_loop), [["a", "c"]])
-
+class TestLeaveBeforePPDecodePrebuiltJoin(unittest.TestCase):
     def test_pp_prebuilt_join_sees_only_live_rows(self):
         # The PP loop runs up to the plan of its first slot; the mocked
         # init_pp_loop_state leaves the slot state set here.
