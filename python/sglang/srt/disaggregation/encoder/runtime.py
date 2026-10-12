@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
     MMEncoder,
     MMError,
+    PreparedBatch,
     await_task_completion_on_cancel,
     launch_encoder,
 )
@@ -182,6 +183,9 @@ class EncoderScheduler:
         # sustained overload. Enough in flight to keep every worker busy.
         self._loader_slots: Optional[asyncio.Semaphore] = None
         self.use_image_loader = self._resolve_image_loader_enabled()
+        self.overlap_preprocess = (
+            self.use_image_loader and envs.SGLANG_ENCODER_OVERLAP_PREPROCESS.get()
+        )
 
     def _resolve_image_loader_enabled(self) -> bool:
         """Whether IMAGE batches may take the out-of-process loader path.
@@ -215,7 +219,8 @@ class EncoderScheduler:
                 "EncoderScheduler started with "
                 f"max_batch_size={self.max_batch_size}, "
                 f"coalesce_same_turn={self.coalesce_same_turn}, "
-                f"image_loader={self.use_image_loader}"
+                f"image_loader={self.use_image_loader}, "
+                f"overlap_preprocess={self.overlap_preprocess}"
             )
 
     def _start_image_loader(self) -> None:
@@ -238,7 +243,14 @@ class EncoderScheduler:
         # Deliberately a task on this loop, not a second event loop in a thread:
         # the encode path shares asyncio primitives with this loop
         # (encode_dispatch_lock, ReqState.embedding_ready, lifecycle_condition),
-        # and those are loop-bound.
+        # and those are loop-bound. Driving them from a second loop hangs the
+        # waiter whenever its loop is otherwise idle, because the releasing loop
+        # completes the waiter's future without waking that loop's selector.
+        # Overlap comes from threads under the loop instead: image decode in the
+        # loader processes, preprocessing in preproc_executor, and the ViT
+        # forward on the encoder's forward thread.
+        if self.overlap_preprocess:
+            self.encoder.enable_forward_thread()
         self._loader_consumer_task = asyncio.create_task(
             self.process_batch_separate(self._loader_out_queue)
         )
@@ -393,37 +405,97 @@ class EncoderScheduler:
         Image decoding already overlaps the GPU here by construction: it happens
         in the loader processes, and this task only blocks a thread-pool thread
         waiting on their output queue.
+
+        With SGLANG_ENCODER_OVERLAP_PREPROCESS the CPU preprocessing and the GPU
+        forward additionally form a two-stage pipeline: this task (stage 1) preps
+        batches as they arrive and hands them to _forward_worker (stage 2) over a
+        depth-1 queue. The forward runs on the encoder's forward thread, so it
+        never blocks this loop. A forward starts as soon as its batch is prepped
+        — it is never deferred waiting for future traffic — and the overlap
+        emerges whenever the next batch has already arrived.
         """
         loop = asyncio.get_running_loop()
-        while True:
-            try:
-                payload = await loop.run_in_executor(None, output_queue.get)
-                loaded_images, batch_id = payload
-                info = self.batch_info_map.pop(batch_id, None)
-                if info is None:
-                    logger.error(f"Unknown batch_id from loader: {batch_id}")
-                    continue
-                # The batch is off the loader; let the next one in. Released
-                # here rather than after the encode so decoding keeps running
-                # ahead of the GPU, which is the point of the loader.
-                self._loader_slots.release()
-                group, modality, _start = info
-                # A loader worker reports a decode failure by sending the
-                # exception in place of the images; fail that batch's futures
-                # instead of dispatching it to the GPU.
-                if isinstance(loaded_images, Exception):
-                    for p in group:
-                        p.reject(loaded_images)
-                    continue
+        forward_task: Optional[asyncio.Task] = None
+        prepped_q: Optional[asyncio.Queue] = None
+        if self.overlap_preprocess:
+            # Depth 1: prepped batches carry whole-batch pixel tensors, so they
+            # must not pile up ahead of the GPU under sustained load.
+            prepped_q = asyncio.Queue(maxsize=1)
+            forward_task = asyncio.create_task(self._forward_worker(prepped_q))
+        # A prepped batch owns encode refs until its forward runs, so one that is
+        # prepped but not yet handed to stage 2 must stay reachable for the
+        # drain below.
+        in_flight: Optional[Tuple] = None
+        try:
+            while True:
+                try:
+                    payload = await loop.run_in_executor(None, output_queue.get)
+                    loaded_images, batch_id = payload
+                    info = self.batch_info_map.pop(batch_id, None)
+                    if info is None:
+                        logger.error(f"Unknown batch_id from loader: {batch_id}")
+                        continue
+                    # The batch is off the loader; let the next one in. Released
+                    # here rather than after the encode so decoding keeps running
+                    # ahead of the GPU, which is the point of the loader.
+                    self._loader_slots.release()
+                    group, modality, _start = info
+                    # A loader worker reports a decode failure by sending the
+                    # exception in place of the images; fail that batch's futures
+                    # instead of dispatching it to the GPU.
+                    if isinstance(loaded_images, Exception):
+                        for p in group:
+                            p.reject(loaded_images)
+                        continue
 
-                await self._dispatch_group(
-                    group, modality, preloaded_images=loaded_images
-                )
-            except asyncio.CancelledError:
-                raise
+                    if not self.overlap_preprocess:
+                        await self._dispatch_group(
+                            group, modality, preloaded_images=loaded_images
+                        )
+                        continue
+
+                    # Stage 1: CPU preprocessing (the heavy work runs in
+                    # preproc_executor). While stage 2 forwards batch N on the
+                    # encoder's forward thread, this loop is free to prep N+1.
+                    in_flight = await self._dispatch_group_prep(
+                        group, modality, preloaded_images=loaded_images
+                    )
+                    if in_flight is not None:
+                        await prepped_q.put(in_flight)
+                        in_flight = None
+                except Exception as e:
+                    logger.error(
+                        f"Error in EncoderScheduler loader consumer: {e}", exc_info=True
+                    )
+                    if in_flight is not None:
+                        with contextlib.suppress(Exception):
+                            await self._dispatch_group_forward(*in_flight)
+                        in_flight = None
+        finally:
+            if forward_task is not None:
+                forward_task.cancel()
+            # Forward (never drop) whatever is still prepped: that call is what
+            # releases the encode refs these batches hold.
+            pending_forwards = [] if in_flight is None else [in_flight]
+            while prepped_q is not None:
+                try:
+                    pending_forwards.append(prepped_q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            for item in pending_forwards:
+                with contextlib.suppress(Exception):
+                    await self._dispatch_group_forward(*item)
+
+    async def _forward_worker(self, prepped_q: asyncio.Queue) -> None:
+        """Stage 2 of the pipelined dispatch: run each prepped batch's GPU
+        forward in FIFO order, as soon as it is available."""
+        while True:
+            item = await prepped_q.get()
+            try:
+                await self._dispatch_group_forward(*item)
             except Exception as e:
                 logger.error(
-                    f"Error in EncoderScheduler loader consumer: {e}", exc_info=True
+                    f"Error in EncoderScheduler forward worker: {e}", exc_info=True
                 )
 
     async def _dispatch_group(
@@ -537,6 +609,84 @@ class EncoderScheduler:
                 await self._dispatch_group(
                     [pending], modality, observe_queue_wait=False
                 )
+            return
+
+        for p, result in zip(group, results):
+            p.resolve(result)
+
+    async def _dispatch_group_prep(
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
+    ) -> Optional[Tuple[List[PendingRequest], float, PreparedBatch]]:
+        """Stage 1 (CPU) of a pipelined dispatch.
+
+        Runs the batch's preprocessing and returns ``(group, start, prepared)``
+        for a later _dispatch_group_forward, or None when there is nothing left
+        to forward. The returned PreparedBatch owns encode refs, so a non-None
+        result must always reach _dispatch_group_forward.
+
+        Only reached on the single-rank path (see _resolve_image_loader_enabled),
+        so there is no TP broadcast to keep ordered against the forward here.
+        """
+        if modality not in _BATCHABLE_MODALITIES:
+            await self._dispatch_per_request(group, modality)
+            return None
+
+        requests = [p.request for p in group]
+        start = time.time()
+        modality_str = modality.name.lower()
+        if server_module.encoder_metrics_collector is not None:
+            for p in group:
+                server_module.encoder_metrics_collector.observe_queue_wait(
+                    max(0.0, start - p.submit_time), modality=modality_str
+                )
+        logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
+        # No encode_dispatch_lock: with no TP followers to broadcast to, taking it
+        # would serialize this prep behind the in-flight forward that holds it,
+        # defeating the pipeline. The forward stage still takes it.
+        prepared = await self.encoder.batch_preprocess(
+            requests, modality, preloaded_images=preloaded_images
+        )
+        return (group, start, prepared)
+
+    async def _dispatch_group_forward(
+        self,
+        group: List[PendingRequest],
+        start: float,
+        prepared: PreparedBatch,
+    ) -> None:
+        """Stage 2 (GPU) of a pipelined dispatch: forward an already-prepped
+        batch and resolve its futures.
+
+        Always runs the forward, even for a batch whose preprocessing failed,
+        because that call is what releases the encode refs it holds.
+        """
+        try:
+            async with self.encoder.encode_dispatch_lock:
+                # The blocking ViT forward inside here runs on the encoder's
+                # forward thread, so awaiting this leaves the loop free for
+                # stage 1 to prep the next batch.
+                results = await self.encoder.batch_encode_forward(prepared)
+                if len(group) > 1:
+                    logger.info(
+                        f"Batch of {len(group)} {prepared.modality.name} requests "
+                        f"completed in {(time.time() - start) * 1000:.1f}ms"
+                    )
+        except Exception as e:
+            logger.error(f"batch_encode forward raised: {e}", exc_info=True)
+            for p in group:
+                p.reject(e)
+            return
+
+        if len(results) != len(group):
+            err = RuntimeError(
+                f"batch_encode returned {len(results)} results for {len(group)} requests"
+            )
+            logger.error(str(err))
+            for p in group:
+                p.reject(err)
             return
 
         for p, result in zip(group, results):
