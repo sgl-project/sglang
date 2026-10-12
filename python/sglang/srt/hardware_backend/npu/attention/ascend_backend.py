@@ -1300,6 +1300,9 @@ class AscendAttnBackend(AttentionBackend):
         ).clamp(min=1)
 
         forward_batch.dsa_cp_local_positions = local_positions
+        # Keep forward_batch.positions aligned with the rank-local shard so any
+        # downstream reader sees the local rows (parity with the model hook).
+        forward_batch.positions = local_positions
         forward_batch.dsa_cp_metadata_prepared = True
 
     def do_cp_balance_attn(
@@ -3404,7 +3407,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
             else:
                 assert (
-                    self.graph_mode == False
+                    not self.graph_mode
                 )  # _npu_paged_attention_mla not support graph mode
                 if q_rope is not None:
                     q = torch.cat([q, q_rope], dim=-1)
