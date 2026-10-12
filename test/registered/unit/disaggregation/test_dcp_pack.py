@@ -250,7 +250,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     rid="cached-prefix",
                     kv=SimpleNamespace(req_pool_idx=0),
                     origin_input_ids=[0] * total,
-                    extend_range=SimpleNamespace(end=total),
+                    extend_end=total,
                     start_send_idx=prefix,
                     disagg_decode_prefix_len=prefix,
                     disagg_kv_sender=sender,

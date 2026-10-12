@@ -210,7 +210,6 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
-    device_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> PoolEntry:
     return PoolEntry(
@@ -223,7 +222,6 @@ def build_pool_entry(
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
-        device_indices_from_anchor_fn=device_indices_from_anchor_fn,
         packed_draft_device_pools=packed_draft_device_pools,
     )
 
@@ -271,20 +269,15 @@ def build_kv_only_group(
     )
 
 
-def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
+def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
     from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 
     if isinstance(allocator, MultiEndedAllocator):
+        # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,
             device_free_fn=allocator.cancel_physical_reservation,
-        )
-    if bind is not None:
-        assert free_bound is not None
-        return dict(
-            device_indices_from_anchor_fn=bind,
-            device_free_fn=free_bound,
         )
     if allocator is None:
         return {}
@@ -327,8 +320,6 @@ def build_hybrid_swa_group(
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     swa_attn_allocator: Any = None,
-    swa_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
-    swa_free_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     mtp_swa_device_pools: tuple[Any, ...] = (),
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
@@ -394,11 +385,7 @@ def build_hybrid_swa_group(
                 transfer_layer_id_max=transfer_layer_id_max + len(mtp_swa_device_pools),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
-                **_swa_allocation_callbacks(
-                    swa_attn_allocator,
-                    swa_indices_from_anchor_fn,
-                    swa_free_from_anchor_fn,
-                ),
+                **_swa_allocation_callbacks(swa_attn_allocator),
                 packed_draft_device_pools=mtp_swa_device_pools,
             ),
         ]
@@ -499,17 +486,6 @@ def build_hybrid_swa_stack(
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
         swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
-        # Unified SWA binds pages to the full pool's virtual IDs instead.
-        swa_indices_from_anchor_fn=(
-            params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
-            if get_memory().enable_unified_memory
-            else None
-        ),
-        swa_free_from_anchor_fn=(
-            params.token_to_kv_pool_allocator.free_swa
-            if get_memory().enable_unified_memory
-            else None
-        ),
         mtp_swa_device_pools=mtp_swa_device_pools,
     )
     cache_controller = HybridCacheController(
@@ -1128,6 +1104,22 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def build_mamba_host_pool(mamba_pool, *, host_size: float, layout: str):
+    (pool_info,) = mamba_pool.get_device_pool_infos()
+    pool_info.buffer_info.validate(layer_ids=pool_info.layer_ids)
+    capacity = mamba_pool.host_capacity_tokens
+    if capacity is None:
+        capacity = mamba_pool.size
+    return MambaPoolHost(
+        pool_info.buffer_info,
+        get_memory().hicache_ratio,
+        host_size,
+        device_capacity=capacity,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1191,11 +1183,9 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=mamba_layout,
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
@@ -1305,11 +1295,9 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=get_memory().hicache_mem_layout,
     )
     entries = [
@@ -1329,15 +1317,7 @@ def build_hybrid_mamba_swa_stack(
             transfer_layer_id_max=transfer_layer_id_max,
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
-            **_swa_allocation_callbacks(
-                swa_attn_allocator,
-                params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
-                if get_memory().enable_unified_memory
-                else None,
-                params.token_to_kv_pool_allocator.free_swa
-                if get_memory().enable_unified_memory
-                else None,
-            ),
+            **_swa_allocation_callbacks(swa_attn_allocator),
         ),
         build_pool_entry(
             name=PoolName.MAMBA,

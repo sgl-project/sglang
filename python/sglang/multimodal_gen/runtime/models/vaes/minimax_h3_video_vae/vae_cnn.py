@@ -182,8 +182,6 @@ class EncoderFCN3D(nn.Module):
         else:
             self.num_res_blocks = num_res_blocks
 
-        self.space_down_factors = space_down
-        self.time_down_factors = time_down
         self.in_channels = in_channels
 
         self.use_fused_norm = (

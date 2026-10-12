@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -176,7 +177,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
-                    loc = self._resolve_fused_write_loc(forward_batch)
+                    loc = forward_batch.out_cache_loc
                     if loc is not None:
                         query = self._set_kv_and_concat_q_fp8_fused(
                             layer=layer,
@@ -208,7 +209,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                self._kv_write_loc(forward_batch),
+                KVWriteLoc.for_batch(forward_batch),
                 k,
                 k_rope,
             )
