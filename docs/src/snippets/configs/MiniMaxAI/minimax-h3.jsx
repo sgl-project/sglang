@@ -527,18 +527,18 @@ return {
       description: "Cumulative reference, fusion-only, or audited Cache-DiT execution.",
       quality: "Sampling policy",
       learnMore: "#choose-the-quality-level",
-      default: "lossless",
+      default: "exact",
       options: [
         {
-          id: "lossless",
-          label: "Lossless",
+          id: "exact",
+          label: "Exact",
           recommended: true,
           description: "Reference-exact denoising without Cache-DiT approximation.",
         },
         {
-          id: "extra-high",
-          label: "Extra high",
-          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
+          id: "lossless",
+          label: "Lossless",
+          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its exact denoise path at this tier.",
         },
         {
           id: "high",
@@ -716,8 +716,8 @@ return {
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified && checkpointVerified;
       const requestCovered = s.hw !== "gb300" || (serveVerified && s.weights === "fl2va"
-        && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
-      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
+        && s.mode === "t2va" && s.quality === "exact" && Number(s.outputs) === 1);
+      const requestVerified = topologyVerified && requestCovered && (["exact", "lossless"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];
@@ -1001,16 +1001,11 @@ return {
 
   dockerMounts: ["{{MEDIA_DIR}}:/data/minimax-h3:ro"],
 
-  dockerRunCommand: (s) =>
-    ["mi300x", "mi355x"].includes(s.hw)
-      ? `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion_hip]" && exec sglang serve "$@"' --`
-      : `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --`,
-
   // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
     ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
       ? ["python"]
-      : ["python", "docker"],
+      : ["docker", "python"],
 
   dockerImages: {
     b200: "lmsysorg/sglang:dev",
