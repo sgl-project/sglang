@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
+    get_kv_scale_attention_layers,
     resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -2070,40 +2071,18 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             **pool_kwargs,
         )
-        if getattr(token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False):
+        if token_to_kv_pool.dsa_kv_cache_store_nvfp4:
             self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
 
     def _load_dsa_nvfp4_global_scales(self, pool: DSATokenToKVPool) -> None:
         """Copy calibrated per-layer K scales into the graph-stable NVFP4 pool."""
-        from sglang.srt.model_loader.utils import resolve_language_model
-
-        language_model = resolve_language_model(self.model)
-        layers = getattr(language_model, "layers", None)
-        if layers is None:
-            decoder = getattr(language_model, "decoder", None)
-            layers = [] if decoder is None else [decoder]
-
         initialized = 0
-        for model_layer in layers:
-            attention = None
-            if hasattr(model_layer, "self_attn"):
-                self_attn = model_layer.self_attn
-                attention = getattr(
-                    self_attn, "attn", getattr(self_attn, "attn_mqa", None)
-                )
-            elif hasattr(model_layer, "attn"):
-                attention = model_layer.attn
-            elif hasattr(model_layer, "attention"):
-                attention = getattr(model_layer.attention, "attn", None)
-            if attention is None or not hasattr(attention, "layer_id"):
-                continue
+        for attention in get_kv_scale_attention_layers(self.model):
             layer_id = attention.layer_id
             if not pool.start_layer <= layer_id < pool.start_layer + pool.layer_num:
                 continue
-            scale = getattr(attention, "k_scale_float", None)
-            if scale is None:
-                scale = getattr(attention, "k_scale", None)
+            scale = attention.k_scale_float
             pool.set_mla_kv_global_scale(layer_id, 1.0 if scale is None else scale)
             initialized += 1
         logger.info(

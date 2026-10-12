@@ -1283,7 +1283,6 @@ class TestDSAIndexer(CustomTestCase):
         backend = object.__new__(DeepseekSparseAttnBackend)
         backend.dsa_kv_cache_store_fp8 = False
         backend.dsa_kv_cache_store_nvfp4 = True
-        backend.dsa_kv_cache_store_packed_fp4 = True
         backend.dsa_prefill_impl = "flashmla_sparse"
         self.assertEqual(
             backend.get_topk_transform_method(ForwardMode.EXTEND),
@@ -1294,7 +1293,6 @@ class TestDSAIndexer(CustomTestCase):
         # contiguous cache and therefore still requires RAGGED offsets.
         backend.dsa_kv_cache_store_fp8 = True
         backend.dsa_kv_cache_store_nvfp4 = False
-        backend.dsa_kv_cache_store_packed_fp4 = False
         self.assertEqual(
             backend.get_topk_transform_method(ForwardMode.EXTEND),
             TopkTransformMethod.RAGGED,
@@ -1303,7 +1301,7 @@ class TestDSAIndexer(CustomTestCase):
     def test_nvfp4_flashmla_dispatch_keeps_packed_cache(self):
         backend = object.__new__(DeepseekSparseAttnBackend)
         backend.dsa_kv_cache_store_nvfp4 = True
-        backend.real_page_size = 64
+        backend.physical_page_size = 64
         backend.kv_cache_dim = 416
         global_scale = torch.tensor([1.375], device=self.device)
         backend.token_to_kv_pool = MagicMock()
@@ -1355,14 +1353,11 @@ class TestDSAIndexer(CustomTestCase):
         self.assertIs(kwargs["kv_global_scale"], global_scale)
 
     def test_nvfp4_dsa_pool_moves_main_and_index_cache_together(self):
-        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if fp4_dtype is None:
-            self.skipTest("torch build does not expose float4_e2m1fn_x2")
         pool = DSATokenToKVPool(
             size=128,
             page_size=64,
             kv_lora_rank=512,
-            dtype=fp4_dtype,
+            dtype=torch.float4_e2m1fn_x2,
             qk_rope_head_dim=64,
             layer_num=2,
             device=self.device,
@@ -1370,19 +1365,28 @@ class TestDSAIndexer(CustomTestCase):
             enable_memory_saver=False,
             kv_cache_dim=416,
         )
-        source = torch.tensor([3, 7], dtype=torch.int64, device=self.device)
-        target = torch.tensor([9, 11], dtype=torch.int64, device=self.device)
+        source = torch.tensor([69], dtype=torch.int64, device=self.device)
+        target = torch.tensor([128], dtype=torch.int64, device=self.device)
+        page_size = pool.index_page_size
+        key_bytes = pool.index_head_dim
+        scale_bytes = key_bytes // pool.quant_block_size * 4
         for layer in range(pool.layer_num):
             pool.kv_buffer[layer][source] = layer + 17
             index_buffer = pool.index_k_with_scale_buffer[layer]
-            row_bytes = index_buffer.shape[1] // pool.page_size
-            index_rows = index_buffer.view(-1, row_bytes)
-            index_rows[source] = layer + 29
+            key_rows = index_buffer[:, : page_size * key_bytes].view(-1, key_bytes)
+            scale_rows = index_buffer[:, page_size * key_bytes :].view(-1, scale_bytes)
+            key_rows[source] = layer + 29
+            scale_rows[source] = layer + 47
         expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
-        expected_index = [
-            buffer.view(-1, buffer.shape[1] // pool.page_size)[source].clone()
-            for buffer in pool.index_k_with_scale_buffer
-        ]
+        expected_keys = []
+        expected_scales = []
+        for buffer in pool.index_k_with_scale_buffer:
+            expected_keys.append(
+                buffer[:, : page_size * key_bytes].view(-1, key_bytes)[source].clone()
+            )
+            expected_scales.append(
+                buffer[:, page_size * key_bytes :].view(-1, scale_bytes)[source].clone()
+            )
 
         pool.move_kv_cache(target, source)
 
@@ -1390,16 +1394,11 @@ class TestDSAIndexer(CustomTestCase):
             self.assertTrue(
                 torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
             )
-            self.assertTrue(
-                torch.equal(
-                    pool.index_k_with_scale_buffer[layer].view(
-                        -1,
-                        pool.index_k_with_scale_buffer[layer].shape[1]
-                        // pool.page_size,
-                    )[target],
-                    expected_index[layer],
-                )
-            )
+            index_buffer = pool.index_k_with_scale_buffer[layer]
+            key_rows = index_buffer[:, : page_size * key_bytes].view(-1, key_bytes)
+            scale_rows = index_buffer[:, page_size * key_bytes :].view(-1, scale_bytes)
+            self.assertTrue(torch.equal(key_rows[target], expected_keys[layer]))
+            self.assertTrue(torch.equal(scale_rows[target], expected_scales[layer]))
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

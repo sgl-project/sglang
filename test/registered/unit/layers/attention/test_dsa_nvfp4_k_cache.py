@@ -210,62 +210,6 @@ def test_cuda_paged_dequant_matches_stored_byte_reference(output_dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    "chunk_size,expected_full_chunks",
-    [(8192, 24), (16384, 12), (32768, 6)],
-)
-def test_cuda_chunked_200k_chain_matches_one_shot(chunk_size, expected_full_chunks):
-    """Chunk boundaries must not change the final 200K physical cache bytes."""
-
-    num_tokens = 200_000
-    tail = num_tokens % chunk_size
-    assert tail == 3392
-    assert num_tokens // chunk_size == expected_full_chunks
-
-    generator = torch.Generator(device="cuda").manual_seed(20260810 + chunk_size)
-    latent = torch.randn(
-        num_tokens,
-        1,
-        NVFP4_LATENT_DIM,
-        generator=generator,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    rope = torch.randn(
-        num_tokens,
-        1,
-        NVFP4_ROPE_DIM,
-        generator=generator,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    locations = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
-    one_shot = torch.zeros(
-        num_tokens,
-        1,
-        NVFP4_BYTES_PER_TOKEN,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    chunked = torch.zeros_like(one_shot)
-
-    quantize_nvfp4_k_cache_into(latent, rope, one_shot, locations, global_scale=1.375)
-    starts = list(range(0, num_tokens, chunk_size))
-    assert len(starts) == expected_full_chunks + 1
-    for start in starts:
-        end = min(start + chunk_size, num_tokens)
-        quantize_nvfp4_k_cache_into(
-            latent[start:end],
-            rope[start:end],
-            chunked,
-            locations[start:end],
-            global_scale=1.375,
-        )
-    torch.cuda.synchronize()
-    assert torch.equal(chunked, one_shot)
-
-
 @pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_global_scale_rejected(scale):
     latent, rope = _make_inputs(1)

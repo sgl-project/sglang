@@ -55,13 +55,25 @@ class IndexKeyCache:
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
-            # The indexer cache is page-packed as [pages, page_size * row_bytes],
-            # while move_kv_cache receives physical token locations.  Flatten
-            # pages back to token rows before indexing; treating token locations
-            # as page indices fails as soon as a location exceeds num_pages.
-            row_bytes = index_k.shape[1] // self.pool.page_size
-            token_rows = index_k.view(-1, row_bytes)
-            token_rows[tgt_loc_flat] = token_rows[src_loc_flat]
+            page_size = self.pool.index_page_size
+            key_bytes = self.pool.index_head_dim
+            scale_bytes = key_bytes // self.pool.quant_block_size * 4
+            key_pages = index_k[:, : page_size * key_bytes].view(
+                -1, page_size, key_bytes
+            )
+            scale_pages = index_k[:, page_size * key_bytes :].view(
+                -1, page_size, scale_bytes
+            )
+            tgt_page, tgt_offset = (
+                tgt_loc_flat // page_size,
+                tgt_loc_flat % page_size,
+            )
+            src_page, src_offset = (
+                src_loc_flat // page_size,
+                src_loc_flat % page_size,
+            )
+            key_pages[tgt_page, tgt_offset] = key_pages[src_page, src_offset]
+            scale_pages[tgt_page, tgt_offset] = scale_pages[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

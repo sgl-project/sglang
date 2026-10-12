@@ -1,19 +1,7 @@
-"""GLM-5.2 DSA mixed NVFP4/BF16 key-cache codec.
+"""GLM-5.2 mixed NVFP4/BF16 DSA cache codec.
 
-The SM100 cache row is intentionally byte-addressed and has one canonical
-layout per physical token::
-
-    [ E2M1 latent (256 B) | E4M3 block-16 scales (32 B) | BF16 RoPE (128 B) ]
-
-Only the 512-dimensional latent vector uses NVFP4 block scaling.  The
-64-dimensional RoPE vector is stored directly as BF16.  The fused attention
-producer dequantizes the latent vector to BF16 and feeds the unchanged
-FlashMLA FP8-cache BF16 QK/PV consumer.  A persistent FP32 global scale is
-stored once per layer by the KV pool, outside this row.
-
-The PyTorch functions are executable, bit-exact references.  The Triton path
-scatters directly into the cache and is used for production cache writes; it
-does not materialize a full-cache dequantization workspace.
+Each 416-byte row stores 256 bytes of E2M1 latent data, 32 bytes of E4M3
+block scales, and 128 bytes of BF16 RoPE data.
 """
 
 from __future__ import annotations
@@ -446,15 +434,7 @@ def dequantize_nvfp4_k_cache_paged(
     global_scale: torch.Tensor | Real,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Gather NVFP4 rows and decode them with one allocation and one kernel.
-
-    Production decode consumes the packed cache directly.  The current
-    FlashMLA sparse-prefill compatibility path calls this helper only for the
-    selected prefix rows; cache inspection, copy/offload validation, and
-    backend-attribution benchmarks also use it.  Keeping gather and decode
-    fused avoids the large chain of temporary tensors created by the bit-exact
-    PyTorch reference.
-    """
+    """Gather selected NVFP4 rows and decode them in one kernel."""
 
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(f"unsupported production dequant dtype: {dtype}")

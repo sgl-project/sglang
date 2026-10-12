@@ -18,6 +18,12 @@ _IMPORT_ERROR = ImportError(
 _V32_NO_ROPE_BYTES_PER_TOKEN = 528
 
 
+def is_flash_mla_nvfp4_available() -> bool:
+    return _flashmla_import_error is None and hasattr(
+        torch.ops.sgl_kernel, "sparse_decode_fwd_nvfp4"
+    )
+
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """Tile scheduler metadata for the newer FlashMLA Python API."""
@@ -244,15 +250,7 @@ def flash_mla_with_kvcache_nvfp4(
     topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """SM100 GLM-5.2 sparse decode over the 416-byte mixed NVFP4 row.
-
-    Unlike :func:`flash_mla_with_kvcache`, this is a distinct ABI: the cache is
-    byte-addressed, RoPE is BF16, the global FP32 scale is explicit, and Q is
-    BF16.  The producer dequantizes E2M1 latent values into the same BF16
-    shared-memory layout consumed by the open FlashMLA FP8-cache kernel.
-    Keeping the op separate prevents a packed cache from being accidentally
-    interpreted as FlashMLA's 656-byte FP8 layout.
-    """
+    """Run SM100 GLM-5.2 sparse decode over its 416-byte NVFP4 cache ABI."""
 
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error

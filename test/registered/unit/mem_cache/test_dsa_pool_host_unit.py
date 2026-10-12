@@ -63,15 +63,12 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         if packed_fp4_format is not None:
             if is_hip():
                 self.skipTest("DSA packed FP4 host transfer is only supported on CUDA.")
-            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-            if fp4_dtype is None:
-                self.skipTest("PyTorch does not expose torch.float4_e2m1fn_x2.")
             kv_lora_rank = 512
             qk_rope_head_dim = 64
             if packed_fp4_format != "nvfp4":
                 raise ValueError(f"unsupported packed FP4 format: {packed_fp4_format}")
             kv_cache_dim = NVFP4_BYTES_PER_TOKEN
-            dtype = fp4_dtype
+            dtype = torch.float4_e2m1fn_x2
         else:
             kv_lora_rank = 128
             qk_rope_head_dim = 32

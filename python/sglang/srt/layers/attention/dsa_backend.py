@@ -444,10 +444,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
-        self.dsa_kv_cache_store_nvfp4 = getattr(
-            model_runner.token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False
+        self.dsa_kv_cache_store_nvfp4 = (
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_nvfp4
         )
-        self.dsa_kv_cache_store_packed_fp4 = self.dsa_kv_cache_store_nvfp4
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
@@ -580,14 +579,14 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        if self.dsa_kv_cache_store_packed_fp4:
+        if self.dsa_kv_cache_store_nvfp4:
             expected = {
                 "device_sm_major": (self.device_sm_major, 10),
                 "local_q_heads": (self.num_q_heads, 64),
                 "kv_lora_rank": (self.kv_lora_rank, 512),
                 "qk_rope_head_dim": (self.qk_rope_head_dim, 64),
                 "index_topk": (self.dsa_index_topk, 2048),
-                "page_size": (self.real_page_size, 64),
+                "page_size": (self.physical_page_size, 64),
             }
             mismatches = [
                 f"{name}={actual} (expected {wanted})"
@@ -608,16 +607,11 @@ class DeepseekSparseAttnBackend(
                     "GLM-5.2 SM100 NVFP4 DSA requires "
                     "--dsa-prefill-backend=flashmla_sparse"
                 )
-            # Importing the wrapper also loads flashmla_ops.  Fail at backend
-            # construction, rather than during graph capture, when a wheel was
-            # built without the native SM100 specialization.
-            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+            from sgl_kernel.flash_mla import is_flash_mla_nvfp4_available
 
-            del flash_mla_with_kvcache_nvfp4
-            required_op = "sparse_decode_fwd_nvfp4"
-            if not hasattr(torch.ops.sgl_kernel, required_op):
+            if not is_flash_mla_nvfp4_available():
                 raise RuntimeError(
-                    f"sglang-kernel is missing {required_op}; rebuild "
+                    "sglang-kernel is missing sparse_decode_fwd_nvfp4; rebuild "
                     "the SM100 flashmla_ops extension from this source tree"
                 )
             logger.info("Enabled GLM-5.2 SM100 NVFP4-to-BF16 fused FlashMLA decode")
@@ -2724,7 +2718,7 @@ class DeepseekSparseAttnBackend(
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = (
             64
-            if self.dsa_kv_cache_store_packed_fp4
+            if self.dsa_kv_cache_store_nvfp4
             else (128 if self.device_sm_major >= 10 else 64)
         )
 
@@ -3185,14 +3179,10 @@ class DeepseekSparseAttnBackend(
                 raise ValueError(
                     f"native GLM-5.2 NVFP4 decode requires Hq=64, got {num_q_heads}"
                 )
-            packed_kv = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+            packed_kv = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
             indices = page_table_1.unsqueeze(1).contiguous()
-            # `_compute_flashmla_metadata` builds the persistent graph schedule
-            # for the full 2048 slots, matching the existing FP8 path.  Passing
-            # a shorter topk_length with that schedule can leave a partition's
-            # scheduled start block beyond its runtime end block.  The kernel
-            # masks padded `-1` indices before any cache load, so retaining the
-            # fixed-width schedule is both safe and graph-stable.
+            # Keep the graph schedule at its captured 2048-slot width; padded
+            # -1 indices are masked before cache loads.
             topk_length = None
             global_scale = self.token_to_kv_pool.get_mla_kv_global_scale(layer.layer_id)
             o, _, _, _ = flash_mla_with_kvcache_nvfp4(
@@ -3929,7 +3919,7 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            (self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_packed_fp4)
+            (self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_nvfp4)
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
