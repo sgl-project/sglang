@@ -258,6 +258,23 @@ class TestFlatLoopOrder(_LoopOrderCase):
         s.is_disable_overlap_for_batch.side_effect = _values([False, True], False)
         self.check("overlap_exit", self.run_loop(Scheduler.event_loop_overlap, s))
 
+    def test_pd_overlap_loops_sample_for_non_generation(self):
+        for name, loop in (
+            (
+                "pd_prefill_overlap_non_generation",
+                Scheduler.event_loop_overlap_disagg_prefill,
+            ),
+            (
+                "pd_decode_overlap_non_generation",
+                Scheduler.event_loop_overlap_disagg_decode,
+            ),
+        ):
+            with self.subTest(name):
+                s = self.flat_scheduler([A, B], paused=(), n=3)
+                s.is_generation = False
+                s._is_continuous_input_polling_enabled.return_value = False
+                self.check(name, self.run_loop(loop, s))
+
     def test_pd_prefill_overlap_blocking(self):
         s = self.flat_scheduler([A, B, None, None, C, None])
         s._is_continuous_input_polling_enabled.return_value = False
@@ -495,6 +512,13 @@ disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests
 disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests(); process_decode_queue(); get_next_disagg_decode_batch_to_run(decoding_batch=decoding_batch); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; is_disable_overlap_for_batch(None,last_batch=None); _sched_idled=True; _debug_check_commit_gate(False); on_idle(); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(None,None); last_batch=None; iq.end_step(None); _debug_check_last_launched()
 disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests()
 """,
+    "pd_decode_overlap_non_generation": """
+inflight_steps=IQ(1,True,False); last_batch=None
+disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests(); process_decode_queue(); get_next_disagg_decode_batch_to_run(decoding_batch=decoding_batch); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; is_disable_overlap_for_batch(A,last_batch=None); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); decoding_batch.absorb(); _debug_check_commit_gate(False); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(rA,A); last_batch=A; iq.end_step(A); _debug_check_last_launched()
+disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests(); process_decode_queue(); get_next_disagg_decode_batch_to_run(decoding_batch=decoding_batch); ngram_embedding_manager.prepare_for_forward(B,chunked_req=None); cur_batch_for_debug=B; is_disable_overlap_for_batch(B,last_batch=A); run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); decoding_batch.absorb(); _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(rB,B); last_batch=B; iq.end_step(B); _debug_check_last_launched()
+disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests(); process_decode_queue(); get_next_disagg_decode_batch_to_run(decoding_batch=decoding_batch); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; is_disable_overlap_for_batch(None,last_batch=B); _sched_idled=True; _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Bc,rB); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(None,None); last_batch=None; iq.end_step(None); _debug_check_last_launched()
+disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries(); ingest_requests()
+""",
     "pd_prefill_normal": """
 inflight_steps=IQ(0,True,False)
 ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; maybe_prefetch_staging_for_batch(A); run_batch(A); iq.push(A,rA); _commit_due_step(); iq.pop_due(); process_batch_result(A,rA); process_disagg_prefill_inflight_queue(); last_batch=A; iq.end_step(A); _debug_check_last_launched()
@@ -517,6 +541,13 @@ ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstr
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(C,chunked_req=None); cur_batch_for_debug=C; maybe_prefetch_staging_for_batch(C); run_batch(C); _apply_war_barrier(); iq.push(Cc,rC); _debug_check_commit_gate(False); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rC,C); _sched_idled=False; last_batch=C; iq.end_step(C); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=C,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Cc,rC); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(None,None); _sched_idled=True; last_batch=None; iq.end_step(None); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _debug_check_commit_gate(False); on_idle(); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(None,None); _sched_idled=True; last_batch=None; iq.end_step(None); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False)
+""",
+    "pd_prefill_overlap_non_generation": """
+_is_continuous_input_polling_enabled(); enable_continuous_input_polling=False; inflight_steps=IQ(1,True,False)
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; maybe_prefetch_staging_for_batch(A); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _debug_check_commit_gate(False); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rA,A); _sched_idled=False; last_batch=A; iq.end_step(A); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=A,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(B,chunked_req=None); cur_batch_for_debug=B; maybe_prefetch_staging_for_batch(B); run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rB,B); _sched_idled=False; last_batch=B; iq.end_step(B); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=B,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Bc,rB); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(None,None); _sched_idled=True; last_batch=None; iq.end_step(None); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False)
 """,
     "pd_prefill_polling": """
