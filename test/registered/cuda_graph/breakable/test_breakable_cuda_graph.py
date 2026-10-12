@@ -12,6 +12,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.runner_utils.forward_batch import (
+    set_forward_batch,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    prefill_graph_scope,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -241,13 +248,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         )
 
     def test_attention_narrows_padded_positions(self):
-        from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.model_executor.runner_utils.forward_batch import (
-            set_forward_batch,
-        )
-        from sglang.srt.model_executor.runner_utils.prefill_graph import (
-            prefill_graph_scope,
-        )
 
         num_tokens = 3
         padded_num_tokens = 5

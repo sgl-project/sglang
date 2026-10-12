@@ -9,9 +9,20 @@ import pytest
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
-from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import (
+    get_forward_batch,
+    set_forward_batch,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    get_prefill_raw_num_tokens,
+    is_in_full_prefill_graph,
+    prefill_graph_scope,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -191,9 +202,6 @@ def test_output_dtype_follows_values():
     "return_lse,sparse", [(False, False), (True, False), (False, True)]
 )
 def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, sparse):
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-        breakable_cuda_graph as bcg,
-    )
 
     layer = RadixAttention(2, 3, 1.0, 2, 0)
     q = torch.zeros(4, 2, 3)
@@ -253,10 +261,6 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
 
 
 def test_prefill_graph_policy_restores_after_exception():
-    from sglang.srt.model_executor.runner_utils.prefill_graph import (
-        get_prefill_raw_num_tokens,
-        is_in_full_prefill_graph,
-    )
 
     with prefill_graph_scope(full_graph=True, raw_num_tokens=3):
         with pytest.raises(RuntimeError):
@@ -273,8 +277,6 @@ def test_prefill_graph_policy_restores_after_exception():
 @pytest.mark.parametrize("mode_name", ["DECODE", "TARGET_VERIFY", "DLLM_EXTEND"])
 @pytest.mark.parametrize("sparse", [False, True])
 def test_decode_bcg_without_prefill_scope_uses_backend(mode_name, sparse):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 
     layer = RadixAttention(1, 2, 1.0, 1, 0)
     batch = make_batch(tokens=4)

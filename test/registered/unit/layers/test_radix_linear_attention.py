@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.radix_linear_attention as radix_linear_attention
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -125,7 +126,6 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                     )
 
     def test_decode_bcg_without_prefill_scope_uses_backend(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
         for mode in (
