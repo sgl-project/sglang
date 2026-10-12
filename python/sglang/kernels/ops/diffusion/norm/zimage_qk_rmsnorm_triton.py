@@ -8,6 +8,12 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.common.fast_launch import (
+    SignatureLaunch,
+    launch_signature,
+)
+
+_QK_RMSNORM_LAUNCH = SignatureLaunch()
 
 
 @triton.jit
@@ -143,6 +149,13 @@ def zimage_qk_rmsnorm_native(
     absorbing the `.contiguous()` materialization the eager path needs.
     Returns None when the input is not supported (caller falls back).
     """
+    signature = launch_signature(x, weight, eps)
+    launch = _QK_RMSNORM_LAUNCH.get(signature)
+    if launch is not None:
+        y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        launch(y, x, weight)
+        return y
+
     head_dim = x.shape[-1]
     if not can_use_qk_rmsnorm_native(x, weight, head_dim):
         return None
@@ -160,19 +173,10 @@ def zimage_qk_rmsnorm_native(
     num_warps = 4 if is_sm103 else 8
     y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     grid = (triton.cdiv(n_rows, rows_per_prog),)
+    args = (y, x, weight, token_stride, nheads, n_rows, head_dim, eps, rows_per_prog)
     with torch.get_device_module().device(x.device):
-        _qk_rmsnorm_native_kernel[grid](
-            y,
-            x,
-            weight,
-            token_stride,
-            nheads,
-            n_rows,
-            head_dim,
-            eps,
-            rows_per_prog=rows_per_prog,
-            num_warps=num_warps,
-        )
+        compiled = _qk_rmsnorm_native_kernel[grid](*args, num_warps=num_warps)
+        _QK_RMSNORM_LAUNCH.record(signature, compiled, grid, args)
     return y
 
 
