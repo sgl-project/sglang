@@ -1412,31 +1412,24 @@ class TestDSAIndexer(CustomTestCase):
                     128 // pool.page_size * page_size
                     + 128 % pool.page_size // index_kpool
                 )
+                source_slot = divmod(index_source, page_size)
+                target_slot = divmod(index_target, page_size)
+                expected_keys = []
+                expected_scales = []
                 for layer in range(pool.layer_num):
                     pool.kv_buffer[layer][source] = layer + 17
                     index_buffer = pool.index_k_with_scale_buffer[layer]
-                    key_rows = index_buffer[:, : page_size * key_bytes].view(
-                        -1, key_bytes
+                    key_pages = index_buffer[:, : page_size * key_bytes].view(
+                        -1, page_size, key_bytes
                     )
-                    scale_rows = index_buffer[:, page_size * key_bytes :].view(
-                        -1, scale_bytes
+                    scale_pages = index_buffer[:, page_size * key_bytes :].view(
+                        -1, page_size, scale_bytes
                     )
-                    key_rows[index_source] = layer + 29
-                    scale_rows[index_source] = layer + 47
+                    key_pages[source_slot] = layer + 29
+                    scale_pages[source_slot] = layer + 47
+                    expected_keys.append(key_pages[source_slot].clone())
+                    expected_scales.append(scale_pages[source_slot].clone())
                 expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
-                expected_keys = []
-                expected_scales = []
-                for buffer in pool.index_k_with_scale_buffer:
-                    expected_keys.append(
-                        buffer[:, : page_size * key_bytes]
-                        .view(-1, key_bytes)[index_source]
-                        .clone()
-                    )
-                    expected_scales.append(
-                        buffer[:, page_size * key_bytes :]
-                        .view(-1, scale_bytes)[index_source]
-                        .clone()
-                    )
 
                 pool.move_kv_cache(target, source)
 
@@ -1445,17 +1438,17 @@ class TestDSAIndexer(CustomTestCase):
                         torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
                     )
                     index_buffer = pool.index_k_with_scale_buffer[layer]
-                    key_rows = index_buffer[:, : page_size * key_bytes].view(
-                        -1, key_bytes
+                    key_pages = index_buffer[:, : page_size * key_bytes].view(
+                        -1, page_size, key_bytes
                     )
-                    scale_rows = index_buffer[:, page_size * key_bytes :].view(
-                        -1, scale_bytes
-                    )
-                    self.assertTrue(
-                        torch.equal(key_rows[index_target], expected_keys[layer])
+                    scale_pages = index_buffer[:, page_size * key_bytes :].view(
+                        -1, page_size, scale_bytes
                     )
                     self.assertTrue(
-                        torch.equal(scale_rows[index_target], expected_scales[layer])
+                        torch.equal(key_pages[target_slot], expected_keys[layer])
+                    )
+                    self.assertTrue(
+                        torch.equal(scale_pages[target_slot], expected_scales[layer])
                     )
 
     # TODO: enable this test after indexer accuracy aligned
