@@ -957,8 +957,7 @@ class DeepseekMLAForwardMixin:
         topk_indices: Optional[torch.Tensor] = None,
     ) -> None:
         torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
-        self.attn_mqa._eager_attention.__wrapped__(
-            self.attn_mqa,
+        self.attn_mqa._eager_attention.run_eager(
             q_nope_out_view,
             k_nope,
             k_nope,
