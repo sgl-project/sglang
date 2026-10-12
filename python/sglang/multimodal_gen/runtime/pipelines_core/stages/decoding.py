@@ -229,13 +229,46 @@ class DecodingStage(PipelineStage):
                   VAE precision ("fp32", "fp16", "bf16")
                 - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
-            on_frames: For a VAE with ``supports_decode_on_frames``, receives the
-                returned frames once, in order, in the pieces the VAE finishes them.
+            on_frames: Receives finished video frames in order. VAEs without a
+                frame callback hand over the complete decoded clip once.
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
-            normalized to [0, 1] range and moved to CPU as float32
+            normalized to [0, 1] on the decode device.
         """
+        normalized_on_frames = (
+            (lambda frames: on_frames(_to_unit_range(frames)))
+            if on_frames is not None
+            and isinstance(self.vae, ParallelTiledVAE)
+            and self.vae.supports_decode_on_frames
+            else None
+        )
+        image = self.decode_raw(
+            latents,
+            server_args,
+            vae_dtype=vae_dtype,
+            on_frames=normalized_on_frames,
+        )
+        image = _to_unit_range(image)
+        if (
+            on_frames is not None
+            and normalized_on_frames is None
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+        return image
+
+    @torch.no_grad()
+    def decode_raw(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+        on_frames=None,
+    ) -> torch.Tensor:
+        """Decode without pixel normalization, including for inter-clip conditioning."""
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.
@@ -269,10 +302,12 @@ class DecodingStage(PipelineStage):
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
             decode_kwargs = {}
-            if on_frames is not None:
-                decode_kwargs["on_frames"] = lambda frames: on_frames(
-                    _to_unit_range(frames)
-                )
+            streams_frames = (
+                isinstance(self.vae, ParallelTiledVAE)
+                and self.vae.supports_decode_on_frames
+            )
+            if on_frames is not None and streams_frames:
+                decode_kwargs["on_frames"] = on_frames
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
@@ -304,8 +339,14 @@ class DecodingStage(PipelineStage):
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
 
-        # De-normalize image to [0, 1] range
-        image = _to_unit_range(image)
+        if (
+            on_frames is not None
+            and not streams_frames
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+
         return image
 
     def load_model(self):
