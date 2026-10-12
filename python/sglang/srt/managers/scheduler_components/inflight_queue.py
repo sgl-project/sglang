@@ -3,8 +3,8 @@
 An event loop pushes one record per launched batch and commits records oldest
 first. A loop of depth ``d`` commits a record once ``d`` loop steps have
 completed after the step that launched it: depth 0 commits in the launching
-step, depth 1 (overlap) in the next one. So at most ``d + 1`` batches are in
-flight when a step starts planning.
+step, depth 1 (overlap) in the next one. So at most ``d`` records are in flight
+when a step starts planning, and ``d + 1`` right after its launch.
 """
 
 from __future__ import annotations
