@@ -445,6 +445,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         match = self._match(tokens)
         req = mock.MagicMock(spec=Req)
         req.rid = "load-back"
+        req.extra_key = None
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = 0
         req.prefix_len = match.device_prefix_len
