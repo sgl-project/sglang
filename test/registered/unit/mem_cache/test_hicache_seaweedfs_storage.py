@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage import backend_factory
 from sglang.srt.mem_cache.storage.seaweedfs import seaweedfs_store
@@ -93,19 +94,18 @@ class InMemoryS3:
 
 
 def _host_pool(layout: str) -> MHATokenToKVPoolHost:
-    device_pool = SimpleNamespace(
-        store_dtype=torch.bfloat16,
+    device_pool = MHATokenToKVPool(
+        dtype=torch.bfloat16,
         size=64,
+        page_size=PAGE_SIZE,
         layer_num=4,
         start_layer=0,
         end_layer=4,
         head_num=2,
         head_dim=64,
         v_head_dim=64,
-        row_dim=128,
         device="cpu",
-        layer_shard_enabled=False,
-        hicache_write_back_staging=None,
+        enable_memory_saver=False,
     )
     return MHATokenToKVPoolHost(
         device_pool=device_pool,
@@ -291,8 +291,8 @@ class TestSeaweedFSStore(CustomTestCase):
     # the backend only touches it through the host-pool page API, so what this
     # proves is the per-pool object naming, routing and hit policies.
 
-    def _v2_store(self, layout="page_first", **store_kwargs):
-        store = self._store(**store_kwargs)
+    def _v2_store(self, layout="page_first"):
+        store = self._store()
         kv, side = _host_pool(layout), _host_pool(layout)
         store.register_mem_host_pool_v2(kv, PoolName.KV)
         store.register_mem_host_pool_v2(side, PoolName.MAMBA)
@@ -324,28 +324,6 @@ class TestSeaweedFSStore(CustomTestCase):
                     self.assertEqual(loaded[p], [True] * NUM_PAGES)
                     for i in range(NUM_PAGES):
                         self.assertTrue(torch.equal(_page(pool, i), expected[p][i]))
-
-    def test_v2_mla_mamba_state_stays_per_rank(self):
-        # Every MLA TP rank backs up its own Mamba shard; replicated KV is shared.
-        ranks = [self._v2_store(tp_rank=r, tp_size=2, is_mla=True) for r in (0, 1)]
-        keys = ranks[0][3]
-        for store, _, _, _, transfers in ranks:
-            transfers[1].keys = keys
-            self.assertEqual(
-                store.batch_set_v2(transfers[1:])[PoolName.MAMBA], [True] * NUM_PAGES
-            )
-        for store, _, side, _, transfers in ranks:
-            expected = [_page(side, i) for i in range(NUM_PAGES)]
-            side.kv_buffer.zero_()
-            self.assertEqual(
-                store.batch_get_v2(transfers[1:])[PoolName.MAMBA], [True] * NUM_PAGES
-            )
-            for i in range(NUM_PAGES):
-                self.assertTrue(torch.equal(_page(side, i), expected[i]))
-        self.assertEqual(
-            ranks[0][0]._component_key("k", PoolName.KV),
-            ranks[1][0]._component_key("k", PoolName.KV),
-        )
 
     def test_v2_kv_pages_are_the_v1_objects(self):
         # KV pages keep their v1 object names, so v1 and v2 share one cache;

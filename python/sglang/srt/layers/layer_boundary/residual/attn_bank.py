@@ -21,6 +21,7 @@ import torch
 from sglang.srt.layers.attn_residual import AttnResidual
 from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
+from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
@@ -187,6 +188,22 @@ class AttnBankState:
             ffn_update=PLAIN_ADD,
         )
 
+    @classmethod
+    def facts(cls, *, reads_slices: bool = False) -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of) for a layer whose bank
+        stays on each rank's attention-TP slice when ``reads_slices``. It does
+        not depend on the bank or the layer's modules, so the stages of a
+        layer that is not built declare it too."""
+        state = cls(
+            bank=None,
+            attn_score_proj=None,
+            attn_score_norm=None,
+            ffn_score_proj=None,
+            ffn_score_norm=None,
+            reads_slices=reads_slices,
+        )
+        return residual_facts(state.residual_ops())
+
 
 class _BankReadout:
     """A read that mixes the banked snapshots into the residual's norm, so it
@@ -195,6 +212,8 @@ class _BankReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = True
+    completing_fusions = ()
+    gathering_reads = ()
 
     def __init__(self, state: AttnBankState):
         self.state = state
@@ -217,7 +236,8 @@ class _BankReadout:
 
 class _AttnReadout(_BankReadout):
     """The attention input: the bank aggregation and this layer's input norm.
-    A write layer snapshots the residual this read forms."""
+    A write layer snapshots the residual this read forms. ``read`` rejects a
+    ``post_residual_addition``; ``update_and_read`` does not apply one."""
 
     @property
     def reads_after_attn_tp_gather(self):
@@ -246,6 +266,8 @@ class _AttnReadout(_BankReadout):
 class _FfnReadout(_BankReadout):
     """The FFN input: the attention output's add folded into the bank
     aggregation, and this layer's post-attention norm."""
+
+    reads_after_attn_tp_gather = False
 
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
