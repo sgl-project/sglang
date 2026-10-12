@@ -2,7 +2,6 @@
 """Flux ControlNet residuals: DiT hook, worker kwargs, ComfyUI numerical parity."""
 
 import os
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -234,7 +233,10 @@ def test_dit_matches_comfyui_with_control(
 ):
     """Needs a ComfyUI checkout: COMFYUI_PATH=/path/to/ComfyUI."""
     torch.manual_seed(0)
-    sys.path.insert(0, os.environ.get("COMFYUI_PATH", ""))
+    comfyui_path = os.environ.get("COMFYUI_PATH")
+    if not comfyui_path:
+        pytest.skip("set COMFYUI_PATH to a ComfyUI checkout")
+    monkeypatch.syspath_prepend(comfyui_path)
     pytest.importorskip("comfy.ldm.flux.model")
     comfy_model = _build_comfyui_flux()
     dit = _load_dit_from_comfyui_state(monkeypatch, tmp_path, comfy_model.state_dict())
