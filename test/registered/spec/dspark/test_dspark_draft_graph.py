@@ -214,7 +214,6 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         if not with_confidence:
             self.assertIsNone(folded.confidence)
             self.assertIsNone(eager.confidence)
-        # Folded steps carry what the eager proposal computes.
         for name, value in eager._asdict().items():
             if value is not None:
                 self.assertTrue(torch.equal(getattr(folded, name), value), name)

@@ -57,8 +57,8 @@ class DraftProposalGraphTail:
                 dtype=confidence_head.proj.weight.dtype,
                 device=device,
             )
-        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
-        # the first call; a greedy draft keeps none.
+        # The [max_bs, gamma, vocab] step logits are sized on the first call; a
+        # greedy draft keeps none.
         self.buffers = DraftProposalTensors(
             out.view(self.max_bs, self.gamma), None, confidence, confidence_raw
         )
