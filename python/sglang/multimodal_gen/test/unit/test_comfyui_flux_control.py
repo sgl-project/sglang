@@ -318,3 +318,29 @@ def test_pipeline_config_shards_control_residuals_like_latents(monkeypatch):
     assert local.shape == (1, 3, 4)
     assert local[0, :2, 0].tolist() == [3.0, 4.0]
     assert local[0, 2].abs().sum() == 0
+
+
+def test_shared_control_residuals_cross_the_request_once():
+    """ComfyUI reuses one residual object for several blocks; sending a copy per
+    block made the per-step request scale with block count (about 1 s per step
+    for Flux + InstantX on an H100)."""
+    import pickle
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
+        _pack_control,
+    )
+
+    shared = [torch.randn(1, 64, 32) for _ in range(2)]
+    control = {"input": [shared[0]] * 19, "output": [shared[1]] * 38}
+    packed = _pack_control(control, batch_size=1, seq_len=64)
+    one_each = len(pickle.dumps(_pack_control({"input": shared}, 1, 64)))
+    sent = pickle.loads(pickle.dumps(packed))
+    assert len(pickle.dumps(packed)) < 1.5 * one_each
+    kwargs = FluxPipelineConfig().prepare_control_residual_kwargs(
+        _control_batch({"comfyui_control": sent}),
+        torch.device("cpu"),
+        torch.bfloat16,
+    )
+    double = kwargs["controlnet_block_samples"]
+    assert len(double) == 19 and all(r is double[0] for r in double)
+    torch.testing.assert_close(double[0], shared[0].to(torch.bfloat16))

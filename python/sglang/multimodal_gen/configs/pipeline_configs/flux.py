@@ -265,13 +265,23 @@ class FluxPipelineConfig(ImagePipelineConfig):
         if not control:
             return {}
 
+        # Blocks that share one residual object share one prepared tensor.
+        prepared: dict[int, torch.Tensor] = {}
+
+        def prepare_one(residual):
+            residual = residual.to(device=device, dtype=dtype)
+            if batch.did_sp_shard_latents:
+                residual, _ = self.shard_latents_for_sp(batch, residual)
+            return residual
+
         def prepare(residuals):
             out = []
             for residual in residuals:
                 if residual is not None:
-                    residual = residual.to(device=device, dtype=dtype)
-                    if batch.did_sp_shard_latents:
-                        residual, _ = self.shard_latents_for_sp(batch, residual)
+                    key = id(residual)
+                    if key not in prepared:
+                        prepared[key] = prepare_one(residual)
+                    residual = prepared[key]
                 out.append(residual)
             return out
 

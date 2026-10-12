@@ -33,6 +33,9 @@ def _pack_control(control, batch_size: int, seq_len: int) -> dict[str, list] | N
     if not control:
         return None
     packed = {}
+    # ComfyUI repeats one residual object across several blocks; keep it one
+    # object so the request pickles it once instead of once per block.
+    detached: dict[int, torch.Tensor] = {}
     for key in ("input", "output"):
         residuals = []
         for index, residual in enumerate(control.get(key) or []):
@@ -42,7 +45,7 @@ def _pack_control(control, batch_size: int, seq_len: int) -> dict[str, list] | N
                         f"Flux control {key}[{index}] has shape {tuple(residual.shape)}, "
                         f"expected ({batch_size}, {seq_len}, hidden)"
                     )
-                residual = residual.detach()
+                residual = detached.setdefault(id(residual), residual.detach())
             residuals.append(residual)
         if any(r is not None for r in residuals):
             packed[key] = residuals
