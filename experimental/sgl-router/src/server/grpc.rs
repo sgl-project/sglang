@@ -15,9 +15,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 use futures::StreamExt;
 use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_server::{
-    SglangService, SglangServiceServer,
-};
+use sglang_api_types::runtime::v1::sglang_service_server::{SglangService, SglangServiceServer};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;

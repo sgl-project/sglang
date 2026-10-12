@@ -233,6 +233,7 @@ fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) ->
             ..Default::default()
         };
         let profile = EngineProfile {
+            openai: None,
             protocol: WireProtocol::default(),
             dp_ranks: 1,
             grpc_port,

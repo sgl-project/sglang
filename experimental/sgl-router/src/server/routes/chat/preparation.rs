@@ -126,7 +126,16 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        Self::openai_inner(ctx, path, model, fields, headers, body, policy_needs_request_tokens, true)
+        Self::openai_inner(
+            ctx,
+            path,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+            true,
+        )
     }
 
     pub(super) fn openai_grpc(
@@ -138,10 +147,20 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        Self::openai_inner(ctx, path, model, fields, headers, body, policy_needs_request_tokens, false)
+        Self::openai_inner(
+            ctx,
+            path,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+            false,
+        )
     }
 
-    pub(super) fn openai_inner(
+    #[allow(clippy::too_many_arguments)]
+    fn openai_inner(
         ctx: &AppContext,
         path: &'static str,
         model: ModelId,
@@ -159,7 +178,11 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
-        let lowered = if lower { lower_openai(ctx, path, &model, headers, &with_defaults) } else { Err("native_grpc") };
+        let lowered = if lower {
+            lower_openai(ctx, path, &model, headers, &with_defaults)
+        } else {
+            Err("native_grpc")
+        };
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
         if let Ok((mut generate, responder)) = lowered {
