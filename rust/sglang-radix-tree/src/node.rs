@@ -112,6 +112,12 @@ impl KeyNamespace {
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
     }
+
+    pub fn extra_key_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.extra_key.clone())
+    }
 }
 
 impl PartialEq for KeyNamespace {
@@ -172,6 +178,8 @@ pub struct Node<K: ChildKeyType> {
     pub swa_uuid: Option<i64>,
     /// SWA lock-window uuid for host locks; stamped where a host lock walk fills the window.
     pub swa_host_uuid: Option<i64>,
+    /// Full host-lock segment boundary uuid. A split migrates it to the new prefix.
+    pub full_host_uuid: Option<i64>,
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
@@ -404,6 +412,7 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
             rotation_base: None,
@@ -430,6 +439,7 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
             rotation_base: None,

@@ -39,11 +39,15 @@ fn config_for(_worker_url: &str) -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -70,7 +74,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
@@ -88,7 +92,7 @@ fn build_ctx_with_janitor(url: &str) -> (Arc<AppContext>, JanitorHandle) {
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -245,7 +249,7 @@ async fn streaming_chunks_pass_through() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.headers().get("content-type").unwrap().to_str().unwrap(),
-        "text/event-stream"
+        "text/event-stream; charset=utf-8"
     );
 
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
@@ -1006,7 +1010,7 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("ghost-7b".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -1178,6 +1182,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
             None,
             None,
@@ -1405,7 +1410,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1539,7 +1544,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
