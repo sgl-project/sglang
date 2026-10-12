@@ -36,6 +36,7 @@ LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.
 RESULT_TIMESTAMPS = tuple(ts + 0.1 for ts in LAUNCH_TIMESTAMPS)
 PP_MODULE = "sglang.srt.managers.scheduler_pp_mixin"
+RING_MODULE = "sglang.srt.managers.scheduler_components.ring_loop"
 PDMUX_MODULE = "sglang.srt.multiplex.multiplexing_mixin"
 
 
@@ -190,7 +191,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                                 pp_async_batch_depth=depth,
                             ),
                             patch(
-                                f"{PP_MODULE}.get_disagg",
+                                f"{RING_MODULE}.get_disagg",
                                 return_value=SimpleNamespace(
                                     disaggregation_decode_enable_offload_kvcache=False
                                 ),
