@@ -170,6 +170,124 @@ def _read_page_table_pages(buf, tbl, pages, max_pages: int = 256):
     return f"n={len(ids_list)},first={ids_list[:8]},last={ids_list[-8:]}"
 
 
+def _read_page_table_knorm(buf, tbl, pages, rope_dim, max_pages: int = 256) -> str:
+    """RoPE-INVARIANT magnitude signature of the LOGICAL index-K slab.
+
+    RoPE rotates each adjacent pair ``(x_{2i}, x_{2i+1})`` of the latter
+    ``rope_dim`` head dims by an angle -- an ORTHONORMAL map -- so the pair's
+    L2 norm ``sqrt(x0^2 + x1^2)`` is INVARIANT under any phase.  We walk the
+    SAME logical pages ``_read_page_table_md5`` hashes (whole logical pages,
+    tail ``max_pages``), slice the last ``rope_dim`` dims, form the per-pair
+    norms and return their length-normalised mean as ``mean:npairs:ropeDim``.
+    Two calls that differ ONLY by the RoPE PHASE print the same ``knorm`` (up to
+    fp8 rounding); a genuine CONTENT/WINDOW difference moves the mean.  CPU only.
+    """
+    if tbl is None or not torch.is_tensor(tbl) or not tbl.numel():
+        return "none"
+    t = tbl.reshape(1, -1) if tbl.dim() == 1 else tbl
+    t = t.to(torch.int64)
+    ids_list, seen = [], set()
+    for row in t.tolist():
+        for v in row:
+            if v < 0 or v >= pages or v in seen:
+                continue
+            seen.add(v)
+            ids_list.append(v)
+    if not ids_list:
+        return "empty"
+    if len(ids_list) > max_pages:
+        ids_list = ids_list[-max_pages:]
+    ids = torch.tensor(ids_list, dtype=torch.int64)
+    slab = buf.detach().to("cpu")[ids].to(torch.float32)
+    d = int(slab.shape[-1])
+    rd = int(rope_dim) if rope_dim and 0 < rope_dim <= d and rope_dim % 2 == 0 else d
+    seg = slab.reshape(-1, d)[:, d - rd:].reshape(-1, rd // 2, 2)
+    n = int(seg.shape[0])
+    if n == 0:
+        return "empty"
+    pair = torch.sqrt((seg * seg).sum(dim=-1))
+    mean = float(pair.mean().item())
+    return f"{mean:.6g}:{n}:{rd}"
+
+
+def _idx_rope_dim(c4_indexer, k: Optional[torch.Tensor]) -> int:
+    """RoPE head dim of the index-K buffer (the rotated tail of the last dim).
+
+    The c4 indexer's compressor carries ``rope_head_dim`` (= ``qk_rope_head_dim``,
+    64); RoPE is applied only to the LATTER ``rope_head_dim`` dims (see
+    ``compressor_block_vec.h::CalRope``: ``headDim - ropeHeadDim`` is the nope
+    offset).  Falls back to the WHOLE last dim when no attribute is reachable,
+    so ``knorm`` still parses (the trailing ``:r<dim>`` records which was used).
+    """
+    for holder in (c4_indexer, getattr(c4_indexer, "compressor", None)):
+        rd = getattr(holder, "rope_head_dim", None)
+        if isinstance(rd, int) and rd > 0 and rd % 2 == 0:
+            return rd
+    if k is not None and k.dim() > 0:
+        return int(k.shape[-1])
+    return 0
+
+
+def _cpu_int_1d(v) -> list[int]:
+    """Best-effort 1-D int list from a tensor/list (``[]`` when unusable)."""
+    if torch.is_tensor(v):
+        try:
+            return [int(x) for x in v.detach().to("cpu").reshape(-1).tolist()]
+        except Exception:
+            return []
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                return out
+        return out
+    return []
+
+
+def _ropephase_in(fm, cmp_ratio: int = 4, limit: int = 8) -> str:
+    """Absolute-vs-call-local RoPE phase index for this call's index-K output.
+
+    The A5 compressor (arch35 ``compressor_block_vec.h::CalRope``) indexes the
+    RoPE table with ``SinCosOffset = padScIdx * ropeHeadDim``; for the TH layout
+    ``padScIdx = dealedScCnt`` is the CALL-LOCAL compressed counter (0 at the
+    start of each fused-compressor invocation), while the ABSOLUTE compressed
+    index of the same block is ``Trunc(GetStartPos(b), cmpRatio)/cmpRatio + local``.
+    The kernel's internal per-``nSize`` counter is not visible from Python, so we
+    print the per-request call ORIGIN: the call-local range (``loc``, base 0) and
+    the ABSOLUTE candidate range (``abs``, base ``start_pos // cmp_ratio``), plus
+    the ``shift`` = the phase error the kernel applies.  MISS (start_pos 0) ->
+    shift 0; a suffix HIT (start_pos 16384, cmp_ratio 4) -> shift 4096.
+    """
+    r = int(cmp_ratio) if cmp_ratio else 4
+    sp_list = _cpu_int_1d(getattr(fm, "start_pos", None))
+    su_list = _cpu_int_1d(getattr(fm, "seqused", None))
+    if not sp_list:
+        return f"r={r},sps=?,shift=?"
+    shifts, npb = [], []
+    for i, s in enumerate(sp_list):
+        used = su_list[i] if i < len(su_list) else 0
+        q0 = int(s) // r
+        q1 = (int(s) + max(0, int(used))) // r
+        shifts.append(q0)
+        npb.append(max(0, q1 - q0))
+    sps, sh, ns = sp_list[:limit], shifts[:limit], npb[:limit]
+    loc = [("" if n <= 0 else ("0" if n == 1 else f"0..{n - 1}")) for n in ns]
+    abs_ = [
+        (
+            ""
+            if n <= 0
+            else (str(shifts[i]) if n == 1 else f"{shifts[i]}..{shifts[i] + n - 1}")
+        )
+        for i, n in enumerate(ns)
+    ]
+    return (
+        f"r={r},sps={sps},shift={sh},npb={ns},"
+        f"loc=[{';'.join(loc)}],abs=[{';'.join(abs_)}]"
+    )
+
+
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
@@ -1657,6 +1775,22 @@ class C4IndexerAscendBackendMixin:
                     if _k is not None
                     else "None"
                 )
+                # S233: RoPE-PHASE confirmation. RoPE is orthonormal, so the
+                # per-pair L2 magnitude of the index-K head is INVARIANT under the
+                # phase; ``knorm`` matches hit-vs-miss while ``klog`` differs =>
+                # the divergence is the RoPE PHASE (the kernel anchors its table
+                # offset on the CALL-LOCAL compressed counter, not the absolute
+                # index). Purely additive/read-only; same DSV4_DUMP_IDXIN gate.
+                _knorm = (
+                    _read_page_table_knorm(
+                        _k, _ptab, int(_k.shape[0]), _idx_rope_dim(c4_indexer, _k)
+                    )
+                    if _k is not None
+                    else "None"
+                )
+                _ropephase = _ropephase_in(
+                    fm, int(kwargs.get("cmp_ratio", 4) or 4)
+                )
                 _meta = kwargs.get("metadata")
                 _bt = kwargs.get("block_table")
                 print(
@@ -1667,6 +1801,8 @@ class C4IndexerAscendBackendMixin:
                     f"slk={_seq(fm.actual_seq_lengths_kv)} "
                     f"klog={_klog} "
                     f"kpg={_kpg} "
+                    f"knorm={_knorm} "
+                    f"ropephase={_ropephase} "
                     f"kraw={_md5_in(_k) if _k is not None else 'None'} "
                     f"meta={_md5_in(_meta) if _meta is not None else 'None'} "
                     f"bt={_md5_in(_bt) if _bt is not None else 'None'} "

@@ -32,6 +32,12 @@ KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 # known structured form first and fall back to the loose ``kpg=([^ ]+)`` form.
 KPG_STRUCT = re.compile(r"kpg=(n=\d+,first=\[[^\]]*\],last=\[[^\]]*\])")
 KPG_LOOSE = re.compile(r"kpg=([^\s]+)")
+# [IDXIN] S233 additive fields. ``knorm=<mean>:<npairs>:<ropeDim>`` is a
+# RoPE-INVARIANT magnitude (per-pair L2 mean) of the logical index-K slab;
+# ``ropephase=r=<ratio>,sps=[..],shift=[..],npb=[..],loc=[..],abs=[..]`` is the
+# call-origin RoPE phase index.  Neither contains spaces, so the generic KV
+# regex captures the whole value; ``ROPE_SHIFT`` pulls the ``shift`` sub-field.
+ROPE_SHIFT = re.compile(r"shift=\[([^\]]*)\]")
 # [KSTATELOC] is emitted positionally (no key=value for the numbers):
 #   op=W <batch> <seq> <col> <sl> <blk> <row> out=<curSeqIdx>
 #   op=R <batch> <seq> <col> <sl> <blk> <row>
@@ -415,24 +421,16 @@ def _km_classify(miss_set, hit_set):
     return "READ-PAGE misaligned"
 
 
-def report_idxin_verdict(rows):
-    """One ``[IDXIN-VERDICT]`` line per layer: MISS-vs-HIT ``(klog,kpg)``.
+def _idxin_layer_verdict(rows):
+    """(per_layer, miss_i, nreqs) for the [IDXIN] MISS-vs-HIT klog comparison.
 
-    Compares, at every ``(layer,lastpos)`` probe that BOTH the MISS request and
-    at least one HIT request reached, the distinct ``(klog,kpg)`` sets:
-
-      * equal                          -> ``SAME at these probes``
-      * ``klog`` differs               -> ``COMPRESSOR-OUTPUT differs`` (the
-                                          written index-K content differs)
-      * ``klog`` same, ``kpg`` differs -> ``READ-PAGE misaligned`` (same content
-                                          md5 read from a different page)
+    ``per_layer[ly]`` = ``{same, comp, page, first_comp, first_page}``; ``comp``
+    counts ``(layer,lastpos)`` probes where the MISS logical index-K md5
+    (``klog``) differs from a HIT -> compressor-output divergence.  Shared by
+    ``report_idxin_verdict`` (which prints it) and ``report_idxin_rope`` (which
+    feeds the ROPE-PHASE verdict).
     """
-    if not rows:
-        return
     reqs = _idxin_requests(rows)
-    if len(reqs) < 2:
-        print("[IDXIN-VERDICT] need >=2 requests (MISS + HIT); none")
-        return
     miss_i = _idxin_miss_index(reqs)
     probes = defaultdict(lambda: defaultdict(set))
     for i, g in enumerate(reqs):
@@ -460,6 +458,38 @@ def report_idxin_verdict(rows):
             agg["page"] += 1
             if agg["first_page"] is None:
                 agg["first_page"] = lp
+    return per_layer, miss_i, len(reqs)
+
+
+def _idxin_comp_differs(rows):
+    """True/False when the index-K content (``klog``) diverges MISS-vs-HIT.
+
+    ``None`` when there is no MISS/HIT split to judge.
+    """
+    per_layer, _miss_i, nreqs = _idxin_layer_verdict(rows)
+    if nreqs < 2:
+        return None
+    return any(a["comp"] for a in per_layer.values())
+
+
+def report_idxin_verdict(rows):
+    """One ``[IDXIN-VERDICT]`` line per layer: MISS-vs-HIT ``(klog,kpg)``.
+
+    Compares, at every ``(layer,lastpos)`` probe that BOTH the MISS request and
+    at least one HIT request reached, the distinct ``(klog,kpg)`` sets:
+
+      * equal                          -> ``SAME at these probes``
+      * ``klog`` differs               -> ``COMPRESSOR-OUTPUT differs`` (the
+                                          written index-K content differs)
+      * ``klog`` same, ``kpg`` differs -> ``READ-PAGE misaligned`` (same content
+                                          md5 read from a different page)
+    """
+    if not rows:
+        return
+    per_layer, _miss_i, nreqs = _idxin_layer_verdict(rows)
+    if nreqs < 2:
+        print("[IDXIN-VERDICT] need >=2 requests (MISS + HIT); none")
+        return
     if not per_layer:
         print("[IDXIN-VERDICT] no overlapping (layer,lastpos) probes "
               "between MISS and HIT")
@@ -481,6 +511,108 @@ def report_idxin_verdict(rows):
         print(f"[IDXIN-VERDICT] layer={_ly} same={a['same']} "
               f"compressor_output_diff={a['comp']} readpage_diff={a['page']} "
               f"=> {verdict}{extra}")
+
+
+def _knorm_mean(v):
+    """Leading float of ``knorm=<mean>:<n>:<rd>`` (or None when unparseable)."""
+    if not v:
+        return None
+    try:
+        return float(str(v).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _rope_shift(v):
+    """First ``shift=[..]`` entry of a ``ropephase=`` value (or None)."""
+    if not v:
+        return None
+    m = ROPE_SHIFT.search(str(v))
+    if not m:
+        return None
+    first = m.group(1).split(",")[0].strip()
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
+def _knorm_verdict(miss_vals, hit_vals, tol):
+    """(verdict, max_rel) comparing the MISS vs HIT ``knorm`` means.
+
+    RoPE is orthonormal, so the per-pair magnitude is invariant: the means must
+    match within ``tol`` (fp8 rounding) when the ONLY difference is the phase.
+    A larger relative gap means the CONTENT/WINDOW differs.
+    """
+    if not miss_vals or not hit_vals:
+        return "UNKNOWN", None
+    rel = 0.0
+    for a in miss_vals:
+        for b in hit_vals:
+            denom = max(abs(a), abs(b), 1e-12)
+            rel = max(rel, abs(a - b) / denom)
+    return ("CONTENT/WINDOW" if rel > tol else "SAME", rel)
+
+
+def report_idxin_rope(rows, knorm_tol=0.05):
+    """``[IDXIN-ROPE]`` MISS-vs-HIT RoPE-phase verdict (one line + per request).
+
+    The A5 compressor anchors its RoPE table offset on the CALL-LOCAL compressed
+    counter (``padScIdx = dealedScCnt``), so the same absolute index-K block is
+    rotated by a call-origin phase.  RoPE is orthonormal, so the per-pair L2
+    magnitude (``knorm``) is phase-INVARIANT:
+
+      * ``knorm`` differs (rel > ``knorm_tol``) -> ``CONTENT/WINDOW`` (the
+        index-K content/window itself differs, not just its rotation)
+      * ``knorm`` equal & ``klog`` differs       -> ``ROPE-PHASE`` (the sole
+        remaining difference is the RoPE phase the kernel applies)
+
+    Also prints the ``shift`` = ``abs - loc`` (the phase error: 0 for the MISS,
+    ``start_pos // cmp_ratio`` for a suffix HIT).  Additive / read-only.
+    """
+    if not rows:
+        return
+    reqs = _idxin_requests(rows)
+    if len(reqs) < 2:
+        print("  [IDXIN-ROPE] <2 requests -> MISS/HIT RoPE split skipped")
+        return
+    miss_i = _idxin_miss_index(reqs)
+    knorms, shifts = [], []
+    for g in reqs:
+        knorms.append(sorted({r.get("knorm") for r in g if r.get("knorm")}))
+        shifts.append(sorted({_rope_shift(r.get("ropephase")) for r in g
+                              if _rope_shift(r.get("ropephase")) is not None}))
+    print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq); "
+          f"{len(reqs) - 1} HIT request(s)  knorm_tol={knorm_tol}")
+    for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
+        role = "MISS" if i == miss_i else "HIT "
+        kmeans = [_knorm_mean(v) for v in knorms[i]]
+        kmean_txt = ",".join(
+            "?" if m is None else f"{m:.4g}" for m in kmeans[:MAX_DIFF_SHOWN])
+        print(f"     req{i} {role} knorm[{len(knorms[i])}]={kmean_txt or '-'} "
+              f"shift={shifts[i] or '-'}")
+
+    miss_kn = [m for m in (_knorm_mean(v) for v in knorms[miss_i])
+               if m is not None]
+    hit_kn = []
+    for j, kn in enumerate(knorms):
+        if j == miss_i:
+            continue
+        hit_kn += [m for m in (_knorm_mean(v) for v in kn) if m is not None]
+    knorm_cmp, rel = _knorm_verdict(miss_kn, hit_kn, knorm_tol)
+    klog_diff = _idxin_comp_differs(rows)
+    if knorm_cmp == "CONTENT/WINDOW":
+        verdict = "CONTENT/WINDOW"
+    elif klog_diff:
+        verdict = "ROPE-PHASE"
+    elif klog_diff is None:
+        verdict = "UNKNOWN"
+    else:
+        verdict = "SAME"
+    rel_txt = "na" if rel is None else f"{rel:.3e}"
+    print(f"[IDXIN-ROPE] miss_knorm={miss_kn[:4]} hit_knorm={hit_kn[:4]} "
+          f"maxrel={rel_txt} knorm_same={knorm_cmp != 'CONTENT/WINDOW'} "
+          f"klog_diff={klog_diff} => {verdict}")
 
 
 def _parse_kstateloc(recs):
@@ -1177,6 +1309,8 @@ def main(path):
                         ("klog", "kpg", "kraw", "meta", "bt"))
             report_idxin_requests(rows)
             report_idxin_verdict(rows)
+            print("\n== [IDXIN-ROPE] RoPE-phase vs content/window (knorm invariant) ==")
+            report_idxin_rope(rows)
             continue
         if tag == "LIMETA":
             print("\n== [LIMETA] metadata core-partition ==")
@@ -1258,32 +1392,38 @@ def _selftest():
     kpg_a = "n=8,first=[3, 5, 7, 9],last=[11, 13, 15, 17]"
     kpg_b = "n=8,first=[1, 2, 3, 4],last=[5, 6, 7, 8]"
 
-    def _idxin(ly, slq, klog, kpg):
+    def _idxin(ly, slq, klog, kpg, knorm="1.0:100:64", shift=0, npb=100):
         return (
             f"[IDXIN] layer={ly} mode=1 qblk=[0:aa] wblk=[0:bb] "
             f"slq=({slq},{slq},1) slk=(17523,17523,1) klog={klog} kpg={kpg} "
+            f"knorm={knorm} ropephase=r=4,sps=[{shift * 4}],shift=[{shift}],"
+            f"npb=[{npb}],loc=[0..{npb - 1}],abs=[{shift}..{shift + npb - 1}] "
             f"kraw=kk meta=mm bt=tt qshape=(1,2,3) wshape=(1,2,3) "
             f"kshape=(4,5,6)"
         )
 
     lines = [
-        # MISS request (prefill slq=17523) spans layer 5 and layer 7, lastpos
-        # 100 then 101.
+        # MISS request (prefill slq=17523) spans layers 5/7/9, lastpos 100 then 101.
         "[CMPIDX] layer=5 lastpos=100 ntok=17523 md5=ffff",
         _idxin(5, 17523, "aaaa", kpg_a),
         "[CMPIDX] layer=7 lastpos=100 ntok=17523 md5=ffff",
         _idxin(7, 17523, "zzzz", kpg_a),
+        "[CMPIDX] layer=9 lastpos=100 ntok=17523 md5=ffff",
+        _idxin(9, 17523, "mmmm", kpg_a),
         "[CMPIDX] layer=5 lastpos=101 ntok=17523 md5=ffff",
         _idxin(5, 17523, "aaaa", kpg_a),
         "[CMPIDX] layer=7 lastpos=101 ntok=17523 md5=ffff",
         _idxin(7, 17523, "zzzz", kpg_a),
         # HIT request (suffix prefill slq=1139): lastpos drops to 100 -> new req.
-        #   layer 5: same (klog,kpg) as MISS        -> SAME
-        #   layer 7: same klog, DIFFERENT kpg        -> READ-PAGE misaligned
+        #   layer 5: same (klog,kpg) as MISS               -> SAME
+        #   layer 7: same klog, DIFFERENT kpg              -> READ-PAGE misaligned
+        #   layer 9: DIFFERENT klog, same knorm (invariant) -> ROPE-PHASE
         "[CMPIDX] layer=5 lastpos=100 ntok=1139 md5=ffff",
-        _idxin(5, 1139, "aaaa", kpg_a),
+        _idxin(5, 1139, "aaaa", kpg_a, shift=4096),
         "[CMPIDX] layer=7 lastpos=100 ntok=1139 md5=ffff",
-        _idxin(7, 1139, "zzzz", kpg_b),
+        _idxin(7, 1139, "zzzz", kpg_b, shift=4096),
+        "[CMPIDX] layer=9 lastpos=100 ntok=1139 md5=ffff",
+        _idxin(9, 1139, "hhhh", kpg_a, shift=4096),
         # [KSTATELOC] write/read loc
         "[KSTATELOC] op=W 0 17520 -12 40 0 40 out=17520",
         "[KSTATELOC] op=W 0 17521 -11 41 0 41 out=17520",
@@ -1303,6 +1443,7 @@ def _selftest():
         with contextlib.redirect_stdout(buf):
             report_idxin_requests(idxin)
             report_idxin_verdict(idxin)
+            report_idxin_rope(idxin)
             report_kstateloc(ks)
         out = buf.getvalue()
 
@@ -1310,6 +1451,11 @@ def _selftest():
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
             ("klog parsed", bool(idxin) and idxin[0].get("klog") == "aaaa"),
+            ("knorm parsed",
+             bool(idxin) and idxin[0].get("knorm") == "1.0:100:64"),
+            ("ropephase shift parsed (miss=0, hit=4096)",
+             bool(idxin) and _rope_shift(idxin[0].get("ropephase")) == 0
+             and any(_rope_shift(r.get("ropephase")) == 4096 for r in idxin)),
             ("kraw/meta/bt kept",
              bool(idxin) and idxin[0].get("kraw") == "kk"
              and idxin[0].get("meta") == "mm" and idxin[0].get("bt") == "tt"),
@@ -1327,6 +1473,8 @@ def _selftest():
             ("[IDXIN-VERDICT] READ-PAGE branch",
              "[IDXIN-VERDICT] layer=7" in out
              and "READ-PAGE misaligned" in out),
+            ("[IDXIN-ROPE] ROPE-PHASE verdict",
+             "[IDXIN-ROPE] " in out and "=> ROPE-PHASE" in out),
             ("[KSTATELOC-W] out sequence printed",
              "out=17520" in out and "out=17524" in out),
         ]
