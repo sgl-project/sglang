@@ -692,6 +692,12 @@ def handle_elastic_ep(server_args: Any):
         assert cfg.elastic_ep_backend is not None, (
             "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
         )
+        if cfg.ep_join_mode == "recover":
+            assert cfg.elastic_ep_backend == "mooncake", (
+                "Elastic EP fixed-slot recovery requires "
+                "--elastic-ep-backend mooncake for process-group membership "
+                f"recovery (got {cfg.elastic_ep_backend})."
+            )
         if cfg.ep_join_mode == "scale":
             assert cfg.node_rank == 1, (
                 "Elastic EP scale-up requires one joining TP group at "
