@@ -2576,8 +2576,10 @@ class MQALayer(MqaAttentionBase):
                     # Blackwell (including SM120): UE8M0 scales via the dedicated
                     # JIT kernel.
                     if fuse_rope_quant:
-                        o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
-                            o, self.freqs_cis, positions
+                        o_fp8, o_s = (
+                            sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                                o, self.freqs_cis, positions
+                            )
                         )
                     else:
                         o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)

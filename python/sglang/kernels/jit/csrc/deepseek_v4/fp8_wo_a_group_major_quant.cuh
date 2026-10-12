@@ -202,20 +202,28 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
 };
 
 // Fused inverse RoPE with vectorized frequency loads and early dependency loads.
-template <typename T, bool kUsePDL, uint32_t kGPT, uint32_t kSubwarps, bool kStreamLoad, bool kPrefetchRope, uint32_t kMinBlocks>
-__global__ void __launch_bounds__(kSubwarps * THREADS_PER_GROUP, kMinBlocks) fp8_wo_a_group_major_quant_ue8m0_rope_kernel(
-    const T* __restrict__ input,
-    fp8_e4m3_t* __restrict__ output_q,
-    int32_t* __restrict__ output_s,
-    uint32_t total_scale_groups,
-    uint32_t num_tokens,
-    uint32_t hidden_dim_groups,
-    int packed_hidden_dim_groups,
-    uint32_t num_outer_groups,
-    int64_t aligned_num_tokens,
-    int64_t input_stride_t,
-    const float* __restrict__ freqs_cis,
-    const int64_t* __restrict__ positions) {
+template <
+    typename T,
+    bool kUsePDL,
+    uint32_t kGPT,
+    uint32_t kSubwarps,
+    bool kStreamLoad,
+    bool kPrefetchRope,
+    uint32_t kMinBlocks>
+__global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
+    fp8_wo_a_group_major_quant_ue8m0_rope_kernel(
+        const T* __restrict__ input,
+        fp8_e4m3_t* __restrict__ output_q,
+        int32_t* __restrict__ output_s,
+        uint32_t total_scale_groups,
+        uint32_t num_tokens,
+        uint32_t hidden_dim_groups,
+        int packed_hidden_dim_groups,
+        uint32_t num_outer_groups,
+        int64_t aligned_num_tokens,
+        int64_t input_stride_t,
+        const float* __restrict__ freqs_cis,
+        const int64_t* __restrict__ positions) {
   constexpr int kRopeDim = 64;
   constexpr int kHeadDim = 512;
   constexpr uint32_t INPUT_VEC_SIZE = INPUT_VEC_NUM_BYTES / sizeof(T);
@@ -251,13 +259,15 @@ __global__ void __launch_bounds__(kSubwarps * THREADS_PER_GROUP, kMinBlocks) fp8
   // issued ahead of the input loads so its latency overlaps them.
   auto load_rope = [&]() {
 #pragma unroll
-    for (uint32_t k = 0; k < kGPT; ++k) position[k] = do_rope[k] ? __ldg(positions + token_idx[k]) : 0;
+    for (uint32_t k = 0; k < kGPT; ++k)
+      position[k] = do_rope[k] ? __ldg(positions + token_idx[k]) : 0;
 #pragma unroll
     for (uint32_t k = 0; k < kGPT; ++k) {
       if (do_rope[k]) {
         const float4* f = reinterpret_cast<const float4*>(freqs_cis + position[k] * kRopeDim + 2 * pair0[k]);
 #pragma unroll
-        for (uint32_t q = 0; q < INPUT_VEC_SIZE / 4; ++q) freq[k][q] = __ldg(f + q);
+        for (uint32_t q = 0; q < INPUT_VEC_SIZE / 4; ++q)
+          freq[k][q] = __ldg(f + q);
       }
     }
   };
@@ -348,9 +358,12 @@ __global__ void __launch_bounds__(kSubwarps * THREADS_PER_GROUP, kMinBlocks) fp8
 
 template <typename T, bool kUsePDL>
 struct FP8WoAGroupMajorQuantUE8M0RopeKernel {
-  static void run(tvm::ffi::TensorView input,
+  static void
+  run(tvm::ffi::TensorView input,
       tvm::ffi::TensorView freqs_cis,
-      tvm::ffi::TensorView positions, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -399,8 +412,8 @@ struct FP8WoAGroupMajorQuantUE8M0RopeKernel {
         "input token stride must preserve 16-byte vector-load alignment");
 
     RuntimeCheck(hidden_dim % 512 == 0, "inverse RoPE requires 512-dimensional heads");
-    RuntimeCheck(reinterpret_cast<uintptr_t>(freqs_cis.data_ptr()) % sizeof(float4) == 0,
-                 "freqs_cis must be 16-byte aligned");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(freqs_cis.data_ptr()) % sizeof(float4) == 0, "freqs_cis must be 16-byte aligned");
     const int64_t total_scale_groups = num_tokens * num_outer_groups * hidden_dim_groups;
     if (total_scale_groups == 0) return;
     RuntimeCheck(total_scale_groups < (int64_t{1} << 31), "fused kernel uses 32-bit group indices");
