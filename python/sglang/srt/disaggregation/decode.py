@@ -3156,7 +3156,8 @@ class SchedulerDisaggregationDecodeMixin:
             # requests. It is a copy of the rows, or an idle step without
             # requests: it drops the requests that have left the rows since,
             # by a finish or a retract. Filter only its request list; the rows
-            # share its sampling and spec objects.
+            # share its sampling and spec objects. It is then only a listing
+            # of requests, which nothing may filter, merge or plan again.
             row_ids = set(map(id, decoding_batch.rows.reqs))
             self.last_batch.reqs = [r for r in self.last_batch.reqs if id(r) in row_ids]
 
