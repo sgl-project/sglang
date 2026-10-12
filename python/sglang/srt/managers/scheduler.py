@@ -2093,6 +2093,9 @@ class Scheduler(
             and batch.forward_mode.is_decode()
             and len(self.inflight_steps) > 0
         )
+        # Every DP attention rank must take the same decision, but this term is
+        # rank-local. The algorithms that need it do not support DP attention.
+        assert not (self.attn_dp_enabled and need_grammar_sync)
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
