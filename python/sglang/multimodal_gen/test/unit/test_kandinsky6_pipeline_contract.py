@@ -279,6 +279,8 @@ def test_distilled_denoising_calls_the_dit_once_per_step_without_guidance(
         scheduler=scheduler,
         guidance_scale=1.0,
         do_classifier_free_guidance=False,
+        enable_teacache=False,
+        enable_spectrum=False,
         extra={},
         prompt_embeds=[torch.randn(1, text_len, 8)],
         negative_prompt_embeds=[torch.randn(1, text_len + 2, 8)],

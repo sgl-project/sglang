@@ -514,11 +514,9 @@ def _insert(cache, tokens):
 
 
 def _match_len(cache, tokens) -> int:
-    return len(
-        cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).device_indices
-    )
+    return cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", tokens)))
+    ).device_prefix_len
 
 
 class TestHeapOnRealCache(CustomTestCase):

@@ -42,7 +42,7 @@ class _Req:
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
-        self.extend_range = None
+        self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
@@ -128,7 +128,7 @@ def test_aborted_final_result_releases_hybrid_cache(
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=50)
+    req.extend_end = 50
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
@@ -143,7 +143,7 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+    req.extend_end = len(req.origin_input_ids)
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
