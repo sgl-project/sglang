@@ -4,7 +4,7 @@ title: "Prefill Context Parallelism"
 
 Prefill context parallelism (CP) distributes the tokens of a prompt across an attention CP group. Each rank computes attention and, for models with an indexer, indexer operations for its local queries, while all-gather on the KV cache makes the required keys and values available. This lets multiple GPUs share the work of processing a long prompt.
 
-To compare prefill CP with other common paralellism strategy: Tensor parallelism (TP) splits attention heads and weights, [Decode context parallelism (DCP)](https://docs.sglang.io/docs/advanced_features/dcp) shards the KV cache and its attention workload during decode, while prefill CP (PCP) splits prompt tokens across GPUs. Note that PCP and DCP are independent optimizations for different phases of inference.
+To compare prefill CP with other common parallelism strategy: Tensor parallelism (TP) splits attention heads and weights, [Decode context parallelism (DCP)](https://docs.sglang.io/docs/advanced_features/dcp) shards the KV cache and its attention workload during decode, while prefill CP (PCP) splits prompt tokens across GPUs. Note that PCP and DCP are independent optimizations for different phases of inference.
 
 ## Why prefill context parallelism?
 
