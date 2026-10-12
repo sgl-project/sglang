@@ -1,0 +1,29 @@
+{
+  "synthetic": true,
+  "expected": {
+    "1": 2.0,
+    "2": 4.0
+  },
+  "eager": {
+    "1": 2.0,
+    "2": 4.0
+  },
+  "compiled": {
+    "1": 2.0,
+    "2": 4.0
+  },
+  "replay": [
+    {
+      "length": 1,
+      "actual": 2.0
+    },
+    {
+      "length": 2,
+      "actual": 4.0
+    },
+    {
+      "length": 1,
+      "actual": 2.0
+    }
+  ]
+}

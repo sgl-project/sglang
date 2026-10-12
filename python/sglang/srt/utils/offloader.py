@@ -1,4 +1,5 @@
 import logging
+from collections import OrderedDict
 import os
 from abc import ABC
 from typing import Callable, Generator, List, Optional
@@ -85,6 +86,14 @@ def create_offloader(dp_rank: int):
     return NoopOffloader()
 
 
+class _OffloadStateDict(OrderedDict):
+    """Fresh state destination retaining PyTorch metadata during compilation."""
+
+    def __init__(self):
+        super().__init__()
+        self._metadata = OrderedDict()
+
+
 class OffloaderV1(BaseOffloader):
     def __init__(self, cpu_offload_max_bytes: int):
         self._cpu_offload_bytes = 0
@@ -110,7 +119,7 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
-        pin_memory = is_pin_memory_available()
+        pin_memory = is_pin_memory_available() or device.type == "npu"
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
@@ -143,7 +152,7 @@ class OffloaderV1(BaseOffloader):
                     # here we blindly call `to(device)`
                     # if the parameter is already on the device, it will be a no-op
                     k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
+                    for k, v in module.state_dict(destination=_OffloadStateDict()).items()
                 }
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward

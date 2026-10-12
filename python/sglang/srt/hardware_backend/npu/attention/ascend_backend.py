@@ -1,4 +1,6 @@
 from __future__ import annotations
+from sglang.srt.hardware_backend.npu.attention.fia_decode import fia_decode_bsh
+import sglang.srt.hardware_backend.npu.attention.fia_decode_graph  # noqa: F401 - registers the graph capture handler
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -2548,41 +2550,17 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
 
             num_tokens = query.shape[0]
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                query,
-                k_cache,
-                v_cache,
+            output = fia_decode_bsh(
+                query, k_cache, v_cache,
                 block_table=block_tables,
                 block_size=self.page_size,
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 atten_mask=attn_mask,
                 sparse_mode=0,
-            )
-            output = torch.empty(
-                (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query,
-                k_cache,
-                v_cache,
-                block_table=block_tables,
-                block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSH",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                atten_mask=attn_mask,
-                sparse_mode=0,
-                workspace=workspace,
-                out=[output, softmax_lse],
+                output_hidden_size=layer.tp_q_head_num * layer.v_head_dim,
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
@@ -2724,7 +2702,7 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode and (not self.enable_torch_compile):
+        if self.graph_mode:
             return self.forward_decode_graph(
                 q,
                 k,
