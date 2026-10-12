@@ -313,6 +313,12 @@ def adjust_config_with_unaligned_cpu_tp(
         [
             model_config.hf_config,
             "vision_config",
+            "muse_glimmer_vision",
+            "num_attention_heads",
+        ],
+        [
+            model_config.hf_config,
+            "vision_config",
             "llama4_vision_model",
             "num_attention_heads",
         ],
