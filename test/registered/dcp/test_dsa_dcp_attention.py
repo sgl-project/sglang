@@ -7,10 +7,7 @@ from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
-from sglang.srt.layers.attention.dsa.dsa_dcp import (
-    dcp_trtllm_sparse_attention,
-    dsa_dcp_head_groups,
-)
+from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -20,27 +17,24 @@ TOPK = 2048
 SCALE = 1 / math.sqrt(192)
 
 
-def _reference_page_table(page_table, dcp_size, rank, repeat_rows):
+def _reference_page_table(page_table, dcp_size, rank):
     rows, counts = [], []
     for row in page_table.tolist():
         owned = [
             slot // dcp_size for slot in row if slot >= 0 and slot % dcp_size == rank
         ]
-        rows += [owned + [-1] * (len(row) - len(owned))] * repeat_rows
-        counts += [len(owned)] * repeat_rows
+        rows.append(owned + [-1] * (len(row) - len(owned)))
+        counts.append(len(owned))
     return torch.tensor(rows, dtype=page_table.dtype), torch.tensor(counts)
 
 
-def _sparse_attention(query, kv, page_table, seq_lens, head_groups=1):
-    rows, _, heads, _ = query.shape
+def _sparse_attention(query, kv, page_table, seq_lens):
+    rows = query.shape[0]
     return dcp_trtllm_sparse_attention(
         query=query,
         block_tables=page_table.unsqueeze(1),
         seq_lens=seq_lens,
-        head_groups=head_groups,
-        cu_seqlens_q=torch.arange(
-            rows * head_groups + 1, dtype=torch.int32, device="cuda"
-        ),
+        cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
         kv_cache=kv.reshape(-1, 1, 64, 576),
         workspace_buffer=torch.zeros(128 << 20, dtype=torch.uint8, device="cuda"),
         qk_nope_head_dim=128,
@@ -63,63 +57,21 @@ class TestDsaDcpAttention(CustomTestCase):
             page_table[1] = -1
             for dcp_size in (2, 4):
                 for rank in range(dcp_size):
-                    for repeat_rows in (1, 2):
-                        with self.subTest(
-                            width=width, dcp=dcp_size, rank=rank, repeat=repeat_rows
-                        ):
-                            expected, expected_counts = _reference_page_table(
-                                page_table, dcp_size, rank, repeat_rows
-                            )
-                            actual, counts = transform_index_page_table_dcp(
-                                page_table.cuda(), dcp_size, rank, repeat_rows
-                            )
-                            self.assertEqual(actual.cpu().tolist(), expected.tolist())
-                            self.assertEqual(
-                                counts.cpu().tolist(), expected_counts.tolist()
-                            )
-
-    def test_folded_head_groups_match_single_group_attention(self):
-        generator = torch.Generator().manual_seed(0)
-        heads, rows = 64, 4
-        head_groups = dsa_dcp_head_groups(heads)
-        page_table = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
-        seq_lens = torch.tensor([1, 63, 64, 0], dtype=torch.int32, device="cuda")
-        for row, count in enumerate(seq_lens.tolist()):
-            page_table[row, :count] = torch.randperm(64, generator=generator)[:count]
-        query_cpu = torch.randn(rows, 1, heads, 576, generator=generator) * 0.25
-        kv_cpu = torch.randn(64, 576, generator=generator) * 0.25
-
-        for dtype in (torch.float8_e4m3fn, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                query, kv = query_cpu.cuda().to(dtype), kv_cpu.cuda().to(dtype)
-                output, lse = _sparse_attention(
-                    query,
-                    kv,
-                    page_table.repeat_interleave(head_groups, dim=0),
-                    seq_lens.repeat_interleave(head_groups),
-                    head_groups,
-                )
-                expected = [
-                    _sparse_attention(
-                        query[:, :, begin : begin + 32].contiguous(),
-                        kv,
-                        page_table,
-                        seq_lens,
-                    )
-                    for begin in range(0, heads, 32)
-                ]
-                torch.testing.assert_close(
-                    output, torch.cat([o for o, _ in expected], dim=2)
-                )
-                torch.testing.assert_close(
-                    lse, torch.cat([l for _, l in expected], dim=1)
-                )
-                self.assertTrue((output[-1] == 0).all())
-                self.assertTrue(torch.isneginf(lse[-1]).all())
+                    with self.subTest(width=width, dcp=dcp_size, rank=rank):
+                        expected, expected_counts = _reference_page_table(
+                            page_table, dcp_size, rank
+                        )
+                        actual, counts = transform_index_page_table_dcp(
+                            page_table.cuda(), dcp_size, rank
+                        )
+                        self.assertEqual(actual.cpu().tolist(), expected.tolist())
+                        self.assertEqual(
+                            counts.cpu().tolist(), expected_counts.tolist()
+                        )
 
     def test_merged_shards_match_unsharded_attention(self):
         generator = torch.Generator().manual_seed(0)
-        capacity, heads = 8192, 32
+        capacity, heads = 8192, 64
         page_table = torch.full((3, TOPK), -1, dtype=torch.int32)
         page_table[0, 0] = capacity - 4
         page_table[1, :127] = (

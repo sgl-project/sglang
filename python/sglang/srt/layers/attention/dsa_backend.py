@@ -61,7 +61,6 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
     dcp_trtllm_sparse_attention,
-    dsa_dcp_head_groups,
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
@@ -467,9 +466,6 @@ class DeepseekSparseAttnBackend(
         )
         self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
-        self.dcp_head_groups = (
-            dsa_dcp_head_groups(self.num_dcp_q_heads) if self.dcp_size > 1 else 1
-        )
         self._dcp_page_table_cache = DcpPageTableCache()
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -3719,7 +3715,6 @@ class DeepseekSparseAttnBackend(
                 page_table=page_table_1,
                 dcp_size=self.dcp_size,
                 dcp_rank=self.dcp_rank,
-                head_groups=self.dcp_head_groups,
             )
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
@@ -3762,10 +3757,7 @@ class DeepseekSparseAttnBackend(
                 query=q,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
-                head_groups=self.dcp_head_groups,
-                cu_seqlens_q=self.get_device_int32_arange(
-                    batch_size * self.dcp_head_groups + 1
-                ),
+                cu_seqlens_q=self.get_device_int32_arange(batch_size + 1),
                 **attention_kwargs,
             )
             if num_decode_padding_rows:

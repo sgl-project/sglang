@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import msgspec
@@ -11,15 +10,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 
-_TRTLLM_LSE_MAX_HEADS = 32
 TRTLLM_MAX_BATCH_ROWS = 65535
-
-
-def dsa_dcp_head_groups(num_q_heads: int) -> int:
-    groups = math.ceil(num_q_heads / _TRTLLM_LSE_MAX_HEADS)
-    while num_q_heads % groups:
-        groups += 1
-    return groups
 
 
 class DcpPageTableCache(msgspec.Struct):
@@ -43,7 +34,6 @@ def localize_dcp_page_table(
     page_table: torch.Tensor,
     dcp_size: int,
     dcp_rank: int,
-    head_groups: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     reuse = (
         topk_indices is not None
@@ -55,7 +45,7 @@ def localize_dcp_page_table(
         cache.metadata = metadata
         cache.topk_indices = topk_indices
         cache.page_table, cache.counts = transform_index_page_table_dcp(
-            page_table, dcp_size, dcp_rank, repeat_rows=head_groups
+            page_table, dcp_size, dcp_rank
         )
     cache.layer_id = layer_id
     return cache.page_table, cache.counts
@@ -66,15 +56,12 @@ def dcp_trtllm_sparse_attention(
     query: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    head_groups: int,
     cu_seqlens_q: torch.Tensor,
     **attention_kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import flashinfer.decode
 
-    rows, _, heads, dim = query.shape
-    folded_rows = rows * head_groups
-    folded_heads = heads // head_groups
+    rows, _, heads, _ = query.shape
     out_dtype = torch.bfloat16
     if rows == 0:
         return (
@@ -85,31 +72,28 @@ def dcp_trtllm_sparse_attention(
             ),
             torch.empty((0, heads), dtype=torch.float32, device=query.device),
         )
-    query = query.view(folded_rows, 1, folded_heads, dim)
     lse = torch.empty((rows, heads), dtype=torch.float32, device=query.device)
-    folded_lse = lse.view(folded_rows, folded_heads)
-    rows_per_call = (TRTLLM_MAX_BATCH_ROWS // head_groups) * head_groups
-    if folded_rows > rows_per_call:
+    if rows > TRTLLM_MAX_BATCH_ROWS:
         attention_kwargs["enable_pdl"] = False
     top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)
     outputs = []
-    for start in range(0, folded_rows, rows_per_call):
-        end = min(start + rows_per_call, folded_rows)
+    for start in range(0, rows, TRTLLM_MAX_BATCH_ROWS):
+        end = min(start + TRTLLM_MAX_BATCH_ROWS, rows)
         output, _ = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query[start:end],
             block_tables=block_tables[start:end],
             seq_lens=seq_lens[start:end],
             return_lse=True,
-            lse=folded_lse[start:end],
+            lse=lse[start:end],
             sparse_mla_top_k_lens=(
                 None if top_k_lens is None else top_k_lens[start:end]
             ),
             **attention_kwargs,
         )
-        output = output.view(end - start, folded_heads, -1)
+        output = output.view(end - start, heads, -1)
         fixup_zero_kv_rows(
             output,
-            folded_lse[start:end],
+            lse[start:end],
             seq_lens[start:end],
             cu_seqlens_q[: end - start + 1],
             1,
