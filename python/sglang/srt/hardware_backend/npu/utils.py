@@ -221,6 +221,42 @@ def init_npu_backend():
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
+@_call_once
+def maybe_set_npu_deterministic_level():
+    """Opt-in CANN deterministic level for batch-consistent ops.
+
+    Setting the level to 3 makes the CANN context report
+    ``GetDeterministicLevel()==3``, which switches ops-transformer's ``hc_pre``
+    and ``compressor`` to the batch-consistency / shape-invariant path without
+    recompiling the op (see ops-transformer docs ``compressor.md`` /
+    ``mhc_pre_sinkhorn.md``).
+
+    Caller must invoke this AFTER the NPU device is set (so the level lands on
+    the right device context) and BEFORE the first model forward. It is a no-op
+    unless ``SGLANG_DSV4_DETERMINISTIC_LEVEL`` is set, so the default path and
+    its numerics are unchanged.
+    """
+    level = envs.SGLANG_DSV4_DETERMINISTIC_LEVEL.get()
+    if level is None:
+        return
+
+    try:
+        import torch_npu
+
+        torch_npu.npu.set_deterministic_level(int(level))
+        logger.info(
+            "NPU deterministic level set to %s (SGLANG_DSV4_DETERMINISTIC_LEVEL).",
+            level,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to set NPU deterministic level %s "
+            "(torch_npu.npu.set_deterministic_level requires CANN >= 9.2.0): %s",
+            level,
+            e,
+        )
+
+
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
 
