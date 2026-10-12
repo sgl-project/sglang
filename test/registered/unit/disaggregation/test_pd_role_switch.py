@@ -597,5 +597,47 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         s.tree_cache.reset.assert_called_once_with()
 
 
+class TestStartupDecodeGraphReuse(unittest.TestCase):
+    def test_switch_reuses_startup_graph_or_captures_when_missing(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        from sglang.srt.model_executor import model_runner as mr
+
+        for graph in (SimpleNamespace(capture_bs=[1, 2, 4]), None):
+            with self.subTest(captured_at_startup=graph is not None):
+                rc.reset_context()
+                try:
+                    rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+                    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+                    runner.model = MagicMock()
+                    runner.decode_cuda_graph_captured = False
+                    runner.decode_cuda_graph_capture_bs = []
+                    runner.init_decode_cuda_graph = MagicMock()
+                    capture = SimpleNamespace(
+                        eager_runner=MagicMock(),
+                        prefill=SimpleNamespace(runner=None),
+                        decode=SimpleNamespace(runner=graph),
+                        memory_usage=None,
+                        time_usage=None,
+                    )
+                    with (
+                        patch.object(mr, "capture_cuda_graphs", return_value=capture),
+                        patch.object(mr, "prebuild_deepep_v2_buffer"),
+                    ):
+                        runner.init_cuda_graphs()
+                    worker = SimpleNamespace(model_runner=runner)
+                    self.assertEqual(
+                        TpModelWorker.get_decode_cuda_graph_bs(worker),
+                        [1, 2, 4] if graph is not None else [],
+                    )
+                    runner.ensure_decode_cuda_graphs()
+                    if graph is not None:
+                        runner.init_decode_cuda_graph.assert_not_called()
+                        self.assertIs(runner.decode_cuda_graph_runner, graph)
+                    else:
+                        runner.init_decode_cuda_graph.assert_called_once_with()
+                finally:
+                    rc.reset_context()
+
+
 if __name__ == "__main__":
     unittest.main()
