@@ -127,8 +127,8 @@ class AddLayer(torch.nn.Module):
         ssmax_scale,
         moe_all_reduce_comm=None,
         attention_all_reduce_comm=None,
-        band_all_reduce=None,
-        mlp_band_all_reduce=None,
+        flashinfer_all_reduce=None,
+        mlp_flashinfer_all_reduce=None,
     ):
         hidden = self.forward(positions, residual, batch, ssmax_scale)
         return hidden * next_weight, hidden
@@ -144,7 +144,7 @@ def stub_beam_model(layers, norm, layers_to_capture):
     model.start_layer, model.end_layer = 0, len(layers)
     model.layers_to_capture = layers_to_capture
     model.has_full_attention = False
-    model._flashinfer_ar_band = None
+    model._flashinfer_ar_tokens = None
     model._flashinfer_ar = None
     return model
 

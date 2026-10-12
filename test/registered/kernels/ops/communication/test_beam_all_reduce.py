@@ -163,7 +163,7 @@ class TestBeamAllReduce(CustomTestCase):
 
         model = BeamModel.__new__(BeamModel)
         torch.nn.Module.__init__(model)
-        model.fuse_attention_all_reduce = model.fuse_moe_all_reduce = True
+        model.fuse_moe_all_reduce = True
         model._beam_all_reduce_comm = None
         hidden = torch.empty(1, 5120, device="cuda", dtype=torch.bfloat16)
         with patch.object(get_parallel().tp_group, "ca_comm", self.comm):
@@ -180,8 +180,6 @@ class TestBeamAllReduce(CustomTestCase):
             # NVFP4 fuses attention only; its TRTLLM experts return summed outputs.
             with patch.object(model, "fuse_moe_all_reduce", False):
                 self.assertEqual(model._all_reduce_limits(hidden), (limits[0], 0))
-            with patch.object(model, "fuse_attention_all_reduce", False):
-                self.assertIsNone(model._all_reduce_limits(hidden))
             with get_parallel().override(
                 attn_tp_size=1,
                 attn_tp_rank=0,
@@ -240,13 +238,13 @@ class TestBeamAllReduce(CustomTestCase):
                     self.assertEqual(model._all_reduce_limits(hidden64[:32]), (32, 32))
                     self.assertIsNone(model._all_reduce_limits(hidden64))
 
-    def test_flashinfer_band_edges_and_fallbacks(self):
+    def test_flashinfer_ar_band_edges_and_fallbacks(self):
         """Only token counts inside the measured band take the FlashInfer all-reduce."""
         from sglang.srt.models.beam import BeamModel, _mlp_owes_single_tp_sum
 
         model = BeamModel.__new__(BeamModel)
         torch.nn.Module.__init__(model)
-        model._flashinfer_ar_band = (96, 640)
+        model._flashinfer_ar_tokens = (96, 640)
         model._flashinfer_ar = object()
 
         def tokens(n, dtype=torch.bfloat16):
@@ -254,15 +252,19 @@ class TestBeamAllReduce(CustomTestCase):
 
         for n, inside in ((95, False), (96, True), (640, True), (641, False)):
             with self.subTest(tokens=n):
-                self.assertEqual(model._band_all_reduce(tokens(n)) is not None, inside)
-        self.assertIsNone(model._band_all_reduce(tokens(128, torch.float32)))
+                self.assertEqual(
+                    model._flashinfer_ar_for(tokens(n)) is not None, inside
+                )
+        self.assertIsNone(model._flashinfer_ar_for(tokens(128, torch.float32)))
         with get_forward().scoped(sp_active=True):
-            self.assertIsNone(model._band_all_reduce(tokens(128)))
-        # The MLP band needs exactly one TP-wide sum that nothing else runs.
-        model._band_mlp_single_reduction = _mlp_owes_single_tp_sum()
-        self.assertTrue(model._band_covers_mlp())
+            self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
+        # The MLP takes it only when it owes one TP-wide sum that nothing else runs.
+        model._mlp_has_single_tp_sum = _mlp_owes_single_tp_sum()
+        self.assertTrue(model._flashinfer_ar_covers_mlp())
         with get_forward().scoped(mlp_reduce_scatter=True):
-            self.assertFalse(model._band_covers_mlp(), "reduce-scatter owns the sum")
+            self.assertFalse(
+                model._flashinfer_ar_covers_mlp(), "reduce-scatter owns the sum"
+            )
         world, rank = dist.get_world_size(), dist.get_rank()
         if world >= 4:  # EP2 x MoE-TP(world/2): two partial sums, not one
             half = world // 2
@@ -273,8 +275,8 @@ class TestBeamAllReduce(CustomTestCase):
                 moe_tp_rank=rank % half,
             ):
                 self.assertFalse(_mlp_owes_single_tp_sum(), "hybrid EP needs two sums")
-        model._flashinfer_ar_band = None
-        self.assertIsNone(model._band_all_reduce(tokens(128)))
+        model._flashinfer_ar_tokens = None
+        self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
 
     def test_attention_projection_reduction_ownership(self):
         """Deferring o_proj must perform exactly one collective before its norm."""
