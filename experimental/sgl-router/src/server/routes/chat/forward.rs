@@ -166,7 +166,7 @@ async fn dispatch<T: Transport>(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
-    let body = request.into_outgoing_body(
+    let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
@@ -198,7 +198,7 @@ async fn dispatch<T: Transport>(
             let decode_load_guards = (
                 decode.load_guard(),
                 ctx.router_inflight_load
-                    .register(decode.id.clone(), decode.url.clone(), 0, 1),
+                    .register_aged(decode.id.clone(), decode.url.clone(), 0, 1, request_started_at.elapsed()),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
             let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
