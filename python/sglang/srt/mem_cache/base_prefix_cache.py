@@ -511,16 +511,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         *,
         allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
-        """Evict cache entries to cover allocator shortfalls.
+        """Evict for allocation using shortfalls or joint-reclaim quotas.
 
-        The default implementation preserves the component-count semantics of
-        :meth:`evict`. Multi-component caches backed by shared memory can
-        override this entry point to stop once collateral frees make the
-        requested allocation feasible.
+        Without ``allocation_reclaim_satisfied``, callers pass component
+        shortfalls in ``params``. The default implementation forwards these
+        counts to :meth:`evict`; multi-component caches may stop earlier when
+        collateral frees satisfy the requested allocation.
 
-        With ``allocation_reclaim_satisfied``, params are cumulative reclaim
-        quotas. The pure predicate can stop the walk when no more eviction is
-        needed; the allocator still owns preparation before actual allocation.
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas. Supporting caches may stop at the pure
+        predicate before reaching those quotas. The allocator still owns
+        preparation and the actual capacity check after the walk.
         """
         if allocation_reclaim_satisfied is not None:
             raise NotImplementedError("This cache does not support joint reclaim")

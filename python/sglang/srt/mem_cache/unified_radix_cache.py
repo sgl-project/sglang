@@ -674,16 +674,16 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
-        """Evict until the requested component allocations become feasible.
+        """Evict using component shortfalls or cumulative joint-reclaim quotas.
 
-        ``params`` contains allocator shortfalls, not absolute eviction quotas.
-        A component eviction can cascade to its peers; with a shared memory pool,
-        those collateral frees can satisfy the original allocation before the
-        triggering component's requested count is reached.
+        Without ``allocation_reclaim_satisfied``, ``params`` contains component
+        shortfalls. These become availability targets, allowing collateral frees
+        to satisfy an allocation before its requested eviction count is reached.
 
-        A joint-reclaim predicate instead pairs with cumulative eviction quotas,
-        and bypasses component-local availability targets. It is pure and may
-        include capacity that the allocator must prepare after the walk.
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas and component-local targets are bypassed.
+        The pure predicate may stop the walk before those quotas are reached;
+        the allocator must prepare and recheck actual capacity after the walk.
         """
         if self.disable:
             return EvictResult()

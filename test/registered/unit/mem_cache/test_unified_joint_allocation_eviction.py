@@ -40,9 +40,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         kv = allocator.get_kvcache()
         for i in range(occupancy):
             key = RadixKey(array("q", range(i * 1000, i * 1000 + page_size)))
-            slots = cache.match_prefix(
-                MatchPrefixParams(key=key)
-            ).device_indices.clone()
+            slots = cache.path_device_indices(
+                cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+            ).clone()
             self.assertEqual(len(slots), page_size)
             for layer, member in enumerate(
                 (allocator.full_attn_allocator, allocator.swa_attn_allocator)
@@ -58,7 +58,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         kv = allocator.get_kvcache()
         kept = []
         for i, (key, slots) in enumerate(records):
-            actual = cache.match_prefix(MatchPrefixParams(key=key)).device_indices
+            actual = cache.path_device_indices(
+                cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+            )
             if i not in expected:
                 self.assertEqual(len(actual), 0, i)
                 continue
@@ -480,9 +482,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 95)
         self.assertIsNotNone(allocator.alloc(4))
         # The next independent leaf survives the internal tombstones.
-        actual = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [1012])))
-        ).device_indices
+        actual = cache.path_device_indices(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [1012])))
+            ).last_device_node
+        )
         torch.testing.assert_close(actual, slots[12:13])
         for layer, member in enumerate(allocator._flush_targets()):
             ids = member.translate_kv_loc(actual)
