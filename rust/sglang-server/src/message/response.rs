@@ -1,4 +1,4 @@
-//! The runtime response direction: per-request channels into the frontend
+//! The runtime response direction: per-request channels into the core
 //! boundary ([`ResponseSink`] / [`ResponseItem`]), response frame encodings,
 //! and columnar batch decoding into per-request [`ChunkEvent`]s.
 
@@ -12,7 +12,7 @@ use crate::message::types::TokenIds;
 use crate::utils::error::Error;
 
 /// Per-request back-channel the detok shard writes runtime outputs to and the
-/// frontend boundary drains; bounded, and receiver-drop cancels the producer.
+/// core boundary drains; bounded, and receiver-drop cancels the producer.
 #[derive(Clone, Debug)]
 pub enum ResponseSink {
     Local(mpsc::Sender<ResponseItem>),
@@ -38,12 +38,12 @@ impl ResponseSink {
     }
 }
 
-#[allow(dead_code)] // the receiver half is owned inside the frontend boundary.
+#[allow(dead_code)] // the receiver half is owned inside the core boundary.
 pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
-/// Runtime-facing output delivered to the frontend boundary: a detok-decoded
+/// Runtime-facing output delivered to the core boundary: a detok-decoded
 /// [`ChunkEvent`], a serialized internal-operation result, or a stage error.
-/// [`crate::frontend::FrontendHandle`] translates these variants before a
+/// [`crate::api_server::core::CoreHandle`] translates these variants before a
 /// transport adapter sees them.
 #[derive(Debug)]
 pub enum ResponseItem {
@@ -54,10 +54,10 @@ pub enum ResponseItem {
     /// A control-request result encoded by the Python scheduler.
     Control(Bytes),
     /// Reply to an internal service request (`RequestKind::Detokenize`): raw
-    /// bytes for the frontend to decode (e.g. detokenized text), not a
+    /// bytes for the core to decode (e.g. detokenized text), not a
     /// client-facing wire payload and not a generation frame.
     Data(Bytes),
-    /// Terminal runtime failure; the frontend maps it to a semantic error.
+    /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
 
@@ -558,7 +558,7 @@ pub fn frame_error(rid: &str, message: &str) -> Bytes {
 #[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
     /// Runtime correlation ID. Moved out of the frame header (which owns it and
-    /// drops it), so carrying it costs no allocation. The frontend strips this
+    /// drops it), so carrying it costs no allocation. The core strips this
     /// field before exposing semantic output; the shard routes it via `Rid::shard`.
     pub rid: Rid,
     /// New token ids for this step, widened from the scheduler's int32 wire
