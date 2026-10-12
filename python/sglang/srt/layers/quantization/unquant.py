@@ -311,11 +311,7 @@ def initialize_bf16_gemm_config() -> None:
         _enable_bf16_splitk_gemm = True
 
     _enable_bf16_low_m_autotune = False
-    if (
-        backend.is_cutedsl()
-        and envs.SGLANG_OPT_BF16_LOW_M_AUTOTUNE.get()
-        and not get_exec().kernel.disable_flashinfer_autotune
-    ):
+    if backend.is_cutedsl() and not get_exec().kernel.disable_flashinfer_autotune:
         from flashinfer.autotuner import AutoTuner
         from flashinfer.gemm import mm_bf16
 
