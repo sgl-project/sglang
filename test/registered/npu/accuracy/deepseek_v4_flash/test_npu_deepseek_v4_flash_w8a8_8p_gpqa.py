@@ -1,3 +1,5 @@
+import os
+import subprocess
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -8,10 +10,18 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+from sglang.utils import wait_for_server
 
 register_npu_ci(
     est_time=3600,
     suite="nightly-acc-16-npu-a3",
+    nightly=True,
+)
+
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
 )
 
@@ -23,6 +33,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    "SGLANG_NPU_USE_MULTI_STREAM": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -38,7 +49,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -48,12 +58,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
-    # ZBAL
-    "SGLANG_ZBAL_LOCAL_MEM_SIZE": "61000",
-    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-    "ZBAL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
-    "SGLANG_ZBAL_BOOTSTRAP_URL": "tcp://127.0.0.1:14699",
-    "ZBAL_ENABLE_GRAPH": "1",
 }
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
@@ -78,9 +82,8 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     131072,
     "--max-running-requests",
     192,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -141,6 +144,31 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     stream = True
     timeout = 6000
     seed = 1
+
+    @classmethod
+    def setUpClass(cls):
+        """Launch server via `python3 -m sglang.launch_server` instead of `sglang serve`."""
+        cls._setup_per_case_output()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        env = os.environ.copy()
+        if cls.envs:
+            env.update(cls.envs)
+
+        _, host, port = cls.base_url.split(":")
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cls.model,
+            *[str(x) for x in cls.other_args],
+            "--host",
+            host[2:],
+            "--port",
+            port,
+        ]
+        cls.process = subprocess.Popen(command, env=env)
+        wait_for_server(cls.base_url, timeout=cls.server_timeout, process=cls.process)
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
