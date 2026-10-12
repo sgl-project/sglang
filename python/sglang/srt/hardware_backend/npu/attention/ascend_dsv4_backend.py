@@ -2067,8 +2067,12 @@ class C4IndexerAscendBackendMixin:
           selection is identical (the root is KV/state content); different =>
           the indexer itself diverges. The SAME line also carries the
           per-ABSOLUTE-POSITION top-k INDEX lists as
-          ``kidx=[pos:i,i,..|pos2:i,..]`` (sorted unique, pads <0 dropped), for
-          the rows in [``DSV4_DUMP_MIN_POS``, ``DSV4_DUMP_MAX_POS``] capped to the
+          ``kidx=[pos:i,i,..|pos2:i,..]`` (sorted unique, pads <0 dropped) and,
+          in parallel, ``kord=[pos:i,i,..|pos2:i,..]`` (the SAME indices in
+          STORED ORDER: no sorting, no dedup, pads <0 dropped) -- the sparse
+          kernel consumes the selection as an ORDERED list, so a permutation the
+          SET ``kidx`` cannot see shows up in ``kord``; both are emitted for the
+          rows in [``DSV4_DUMP_MIN_POS``, ``DSV4_DUMP_MAX_POS``] capped to the
           last ``DSV4_DUMP_CMPIDX_ROWS`` (default 8; 0 = all). A whole-tensor md5
           is shape-confounded (MISS ntok=17523 vs HIT ntok=1139), so the analyzer
           compares the top-k SET per absolute position from these lists.
@@ -2153,6 +2157,7 @@ class C4IndexerAscendBackendMixin:
                 # (default 8; 0 = all). Same DSV4_DUMP_CMPIDX gate; additive and
                 # read-only (a no-op unless the env is set).
                 kidx = ""
+                kord = ""
                 if t.numel():
                     _pos = forward_batch.positions.reshape(-1).to(torch.int64).cpu()
                     _blk = _pos // 128
@@ -2169,18 +2174,31 @@ class C4IndexerAscendBackendMixin:
                     if _nrows > 0:
                         _sel = _sel[-_nrows:]
                     _parts = []
+                    # S250: parallel ``kord=`` = the SAME top-k indices in STORED
+                    # ORDER (NO sorting, NO dedup; pads <0 dropped). The sparse
+                    # kernel ``kv_quant_sparse_attn_sharedkv`` consumes
+                    # ``cmp_sparse_indices`` as an ORDERED list (sequential gather
+                    # in GetRealCmpS2Idx/ProcessSparseKv) and the indexer's output
+                    # ORDER after the cross-core (LD) merge is workspace-order
+                    # (s1-dependent), so a permutation the SET ``kidx=`` cannot see
+                    # shows up here. Same DSV4_DUMP_CMPIDX gate; read-only.
+                    _ord_parts = []
                     for _r in _sel:
-                        _idxs = sorted(
-                            {int(v) for v in t[_r].tolist() if int(v) >= 0}
-                        )
+                        _raw = [int(v) for v in t[_r].tolist() if int(v) >= 0]
                         _parts.append(
-                            f"{int(_pos[_r])}:" + ",".join(str(v) for v in _idxs)
+                            f"{int(_pos[_r])}:"
+                            + ",".join(str(v) for v in sorted(set(_raw)))
+                        )
+                        _ord_parts.append(
+                            f"{int(_pos[_r])}:"
+                            + ",".join(str(v) for v in _raw)
                         )
                     kidx = " kidx=[" + "|".join(_parts) + "]"
+                    kord = " kord=[" + "|".join(_ord_parts) + "]"
                 print(
                     f"[CMPIDX] layer={layer_id} mode={forward_batch.forward_mode} "
                     f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} "
-                    f"tail={row} blkx={blkx[-8:]}{kidx}",
+                    f"tail={row} blkx={blkx[-8:]}{kidx}{kord}",
                     flush=True,
                 )
             except Exception as exc:

@@ -511,6 +511,97 @@ CMPIDX_ALIGNED_RUNBOOK = (
     "DSV4_DUMP_CMPIDX gate"
 )
 
+CMPIDX_ORDERED_RUNBOOK = (
+    "[CMPIDX-ORDERED-ALIGNED-RUNBOOK] per-absolute-position indexer top-k "
+    "SEQUENCE (window around P*):\n"
+    "  DSV4_DUMP_CMPIDX=<layer> DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=<win_lo> DSV4_DUMP_MAX_POS=<win_hi> "
+    "DSV4_DUMP_CMPIDX_ROWS=0 <serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_cmpidx.log\n"
+    "  kord=[pos:i,i,..|pos2:i,..] is emitted by the backend under the same "
+    "DSV4_DUMP_CMPIDX gate (STORED order, NO sort/dedup)"
+)
+
+
+def _cmpidx_kord(rec):
+    """Parse ``kord=[pos:i,i,..|pos2:i,..]`` into ``{pos: [i, i, ..]}``.
+
+    ``kord`` is the per-ABSOLUTE-POSITION indexer top-k key list IN STORED ORDER
+    (NO sorting, NO dedup; pads ``<0`` dropped) -- DISTINCT from ``kidx`` which
+    is sorted-unique.  The ORDER is what the sparse kernel consumes sequentially
+    (``GetRealCmpS2Idx``/``ProcessSparseKv``), so a permutation that ``kidx`` (a
+    SET) cannot see shows up here.  Empty when the field is absent (older probe).
+    """
+    v = rec.get("kord")
+    if not v:
+        return {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for entry in s.split("|"):
+        entry = entry.strip()
+        if ":" not in entry:
+            continue
+        p, _, lst = entry.partition(":")
+        try:
+            pos = int(p.strip())
+        except ValueError:
+            continue
+        seq = []
+        for tok in lst.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                seq.append(int(tok))
+            except ValueError:
+                continue
+        out[pos] = seq
+    return out
+
+
+def _cmpidx_by_layer_order(group):
+    """``{layer: {pos: (seq, mode)}}`` of one request's [CMPIDX] ``kord`` rows.
+
+    ``seq`` is the STORED-ORDER top-k list; a row's ``mode`` (``2`` ==
+    ``ForwardMode.DECODE``) labels its positions ``decode`` vs ``prefill``; the
+    FIRST row carrying a position wins.
+    """
+    out = defaultdict(dict)
+    for r in group:
+        mode = "decode" if r.get("mode") == "2" else "prefill"
+        ly = _int(r, "layer")
+        for pos, seq in _cmpidx_kord(r).items():
+            out[ly].setdefault(pos, (seq, mode))
+    return out
+
+
+def _cmpidx_seq_hash(seq):
+    """Short md5 of an ORDERED top-k index list (``empty`` for an empty list)."""
+    if not seq:
+        return "empty"
+    return hashlib.md5(
+        ",".join(str(v) for v in seq).encode("ascii")).hexdigest()[:12]
+
+
+def _seq_first_diff(a, b):
+    """``(offset, a_val, b_val)`` of the first position where two seqs differ.
+
+    Returns ``None`` when the sequences are identical (same length, every element
+    equal).  On a length mismatch the first out-of-range offset is returned with
+    the missing side's value as ``None``.
+    """
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            return (i, a[i], b[i])
+    if len(a) != len(b):
+        i = min(len(a), len(b))
+        return (i, a[i] if i < len(a) else None, b[i] if i < len(b) else None)
+    return None
+
 
 def _cmpidx_kidx(rec):
     """Parse ``kidx=[pos:i,i,..|pos2:i,..]`` into ``{pos: sorted unique idxs}``.
@@ -723,6 +814,139 @@ def report_cmpidx_aligned(cmp_rows, c4pos_rows, idxin_rows):
                   f"{ctl_pos} shared position(s) DIFFER between two MISS "
                   f"requests (first layer={first_bad[0]} pos={first_bad[1]})")
     print(CMPIDX_ALIGNED_RUNBOOK)
+
+
+def report_cmpidx_ordered(cmp_rows, c4pos_rows, idxin_rows):
+    """``[CMPIDX-ORDERED-ALIGNED]`` MISS-vs-HIT indexer top-k SEQUENCE per pos.
+
+    The sparse-attn kernel ``kv_quant_sparse_attn_sharedkv`` consumes
+    ``cmp_sparse_indices`` as an ORDERED list (a sequential gather in
+    ``GetRealCmpS2Idx``/``ProcessSparseKv``), while the indexer's output ORDER
+    after the cross-core (LD) merge is workspace-order (s1-dependent), NOT
+    canonical.  The existing ``[CMPIDX-ALIGNED]`` compares ``sorted({...})`` -- a
+    SET -- so it CANNOT see an order permutation.  This report compares the
+    SEQUENCE (the backend ``kord=[pos:i,i,..|..]`` field, STORED order) at every
+    (layer, absolute position) reached by BOTH a MISS and a HIT:
+
+      * requests are split by the [C4POS] ``first`` label (``first==0`` MISS,
+        ``first>0`` HIT), falling back to the [IDXIN] ``sps`` rule / largest
+        ``ntok`` -- the SOURCE used is printed;
+      * ``ORDER_SAME`` -> the stored order matches MISS-vs-HIT; escalate to the
+        metadata/attention probes (the mismatch is not in the top-k order);
+      * ``ORDER_DIFF`` while ``SET_miss == SET_hit`` -> confirms the
+        ordered-consumption + s1-dependent cross-core workspace-order seed (R1):
+        the SAME key SET is emitted in a different order;
+      * a two-MISS control verifies two MISS requests are SEQUENCE-identical at a
+        shared position (identical full prefills share s1) and WARNS otherwise.
+    """
+    print("\n== [CMPIDX-ORDERED-ALIGNED] indexer top-k SEQUENCE per position ==")
+    if not cmp_rows:
+        print("  [CMPIDX-ORDERED-ALIGNED] no [CMPIDX] rows")
+        return
+    if not any("kord" in r for r in cmp_rows):
+        print("  [CMPIDX-ORDERED-ALIGNED] [CMPIDX] has no per-position `kord=` "
+              "field -> cannot compare top-k SEQUENCEs. Re-run with the backend "
+              "field (DSV4_DUMP_CMPIDX=<layer>): it emits "
+              "`kord=[pos:i,i,..|..]` per absolute position (STORED order).")
+        print(CMPIDX_ORDERED_RUNBOOK)
+        return
+    cmp_reqs = _c4pos_requests(cmp_rows)
+    source, miss_idx, hit_idx, note = _cmp_aligned_roles(
+        cmp_reqs, c4pos_rows, idxin_rows)
+    print(f"  [CMPIDX-ORDERED-ALIGNED] split_source={source} "
+          f"miss_req={miss_idx} hit_req={hit_idx}")
+    print(f"  [CMPIDX-ORDERED-ALIGNED] rules: {note}")
+    if not miss_idx or not hit_idx:
+        print("  [CMPIDX-ORDERED-ALIGNED] need >=1 MISS (first==0) and >=1 HIT "
+              "(first>0) with DIFFERENT labels; none")
+        print(CMPIDX_ORDERED_RUNBOOK)
+        return
+
+    miss_maps = [_cmpidx_by_layer_order(cmp_reqs[i]) for i in miss_idx]
+    hit_maps = [_cmpidx_by_layer_order(cmp_reqs[i]) for i in hit_idx]
+
+    def _hit_pos(ly, pos):
+        for hm in hit_maps:
+            if ly in hm and pos in hm[ly]:
+                return hm[ly][pos]
+        return None
+
+    results = []  # (layer, pos, mode, mseq, hseq, diff_off, set_same, same)
+    for ly in sorted(miss_maps[0]):
+        for pos in sorted(miss_maps[0][ly]):
+            mseq, mmode = miss_maps[0][ly][pos]
+            h = _hit_pos(ly, pos)
+            if h is None:
+                continue
+            hseq = h[0]
+            same = mseq == hseq
+            set_same = set(mseq) == set(hseq)
+            results.append((ly, pos, mmode, mseq, hseq,
+                            _seq_first_diff(mseq, hseq), set_same, same))
+    diffs = [r for r in results if not r[7]]
+    set_same_all = all(r[6] for r in results) if results else None
+    print(f"  [CMPIDX-ORDERED-ALIGNED] positions_compared={len(results)} "
+          f"same={len(results) - len(diffs)} diff={len(diffs)}")
+    ordered = diffs + [r for r in results if r[7]]
+    for ly, pos, mmode, mseq, hseq, doff, set_same, same in (
+            ordered[:MAX_ALIGNED_SHOWN]):
+        verdict = "ORDER_SAME" if same else "ORDER_DIFF"
+        print(f"  [CMPIDX-ORDERED-ALIGNED] layer={ly} pos={pos} mode={mmode} "
+              f"SEQ_miss={_cmpidx_seq_hash(mseq)}({len(mseq)}) "
+              f"SEQ_hit={_cmpidx_seq_hash(hseq)}({len(hseq)}) "
+              f"SET_{'same' if set_same else 'diff'} => {verdict}")
+        if not same and doff is not None:
+            print(f"     first_diff offset={doff[0]} miss={doff[1]} "
+                  f"hit={doff[2]}  swapped_miss={mseq} -> hit={hseq}")
+    if len(ordered) > MAX_ALIGNED_SHOWN:
+        print(f"  ... {len(ordered) - MAX_ALIGNED_SHOWN} more positions")
+    print(f"  [CMPIDX-ORDERED-ALIGNED] VERDICT "
+          f"{'ORDER_SAME' if not diffs else 'ORDER_DIFF'}")
+
+    # Two-MISS control: two MISS requests must be SEQUENCE-identical at every
+    # shared position (the indexer is deterministic; identical full prefills
+    # share s1, so the workspace order must match too).
+    if len(miss_maps) >= 2:
+        base = miss_maps[0]
+        ctl_pos = ctl_same = ctl_diff = 0
+        first_bad = None
+        for ly in sorted(base):
+            for pos in sorted(base[ly]):
+                if not all(ly in m and pos in m[ly] for m in miss_maps[1:]):
+                    continue
+                ctl_pos += 1
+                seqs = {tuple(m[ly][pos][0]) for m in miss_maps}
+                if len(seqs) == 1:
+                    ctl_same += 1
+                else:
+                    ctl_diff += 1
+                    if first_bad is None:
+                        first_bad = (ly, pos)
+        if ctl_pos == 0:
+            print("  [CMPIDX-ORDERED-ALIGNED] two-MISS control: no position "
+                  "shared by both MISS requests (cannot sanity-check)")
+        elif ctl_diff == 0:
+            print(f"  [CMPIDX-ORDERED-ALIGNED] two-MISS control: SEQUENCE-"
+                  f"IDENTICAL at all {ctl_pos} shared position(s) (sanity OK)")
+        else:
+            print(f"  [CMPIDX-ORDERED-ALIGNED] WARN two-MISS control: {ctl_diff}/"
+                  f"{ctl_pos} shared position(s) DIFFER between two MISS "
+                  f"requests (first layer={first_bad[0]} pos={first_bad[1]})")
+
+    # Verdict table: ORDER_DIFF with SET_miss == SET_hit confirms the
+    # ordered-consumption + s1-dependent cross-core workspace-order seed (R1).
+    if not diffs:
+        reading = ("ORDER_SAME => the top-k ORDER matches MISS-vs-HIT; escalate "
+                   "to the metadata/attention probes")
+    elif set_same_all:
+        reading = ("ORDER_DIFF + SET_miss==SET_hit => confirms the ordered-"
+                   "consumption + s1-dependent cross-core workspace-order seed "
+                   "(R1)")
+    else:
+        reading = ("ORDER_DIFF with a SET difference too => the top-k SETS "
+                   "themselves differ; fix the selection before the order")
+    print(f"  [CMPIDX-ORDERED-ALIGNED] READING: {reading}")
+    print(CMPIDX_ORDERED_RUNBOOK)
 
 
 def report_uniq(rows, label, fields, key="mode"):
@@ -2541,6 +2765,8 @@ def main(path):
             report_cmpidx_div(rows, cmp_reqs, miss_i)
             report_cmpidx_aligned(
                 rows, recs.get("C4POS", []), recs.get("IDXIN", []))
+            report_cmpidx_ordered(
+                rows, recs.get("C4POS", []), recs.get("IDXIN", []))
             # fall through to the whole-tensor segment compare below as well
         if tag == "IDXK":
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
@@ -3018,9 +3244,10 @@ def _selftest():
         #     at the shared positions -> TOPK_SAME (+ two-MISS control OK).
         # I2: the HIT swaps key 9 -> 999 at pos 17522 -> TOPK_DIFF with the
         #     symmetric-difference offenders.
-        def _cmpidx_line(ly, mode, ntok, kidx):
+        def _cmpidx_line(ly, mode, ntok, kidx, kord=None):
+            extra = f" kord={kord}" if kord is not None else ""
             return (f"[CMPIDX] layer={ly} mode={mode} ntok={ntok} "
-                    f"lastpos=17522 md5=zz tail=[] blkx=[] kidx={kidx}")
+                    f"lastpos=17522 md5=zz tail=[] blkx=[] kidx={kidx}{extra}")
 
         def _c4pos_first(first, ly=2):
             return (f"[C4POS] layer={ly} idx=1 n=8 ratio=4 nz=8 first={first} "
@@ -3040,6 +3267,30 @@ def _selftest():
         ]
         ci_same_out = _run_main(cmpidx_same)
         ci_diff_out = _run_main(cmpidx_diff)
+
+        # J1/J2: [CMPIDX-ORDERED-ALIGNED] top-k SEQUENCE.  J1 emits identical
+        #     kord -> ORDER_SAME; J2 emits the SAME SET in a DIFFERENT ORDER
+        #     (7,8,9 -> 8,7,9) -> ORDER_DIFF with SET_miss==SET_hit (R1).
+        _kord_ok = "[17520:1,2,3|17521:4,5,6|17522:7,8,9]"
+        _kord_perm = "[17520:1,2,3|17521:4,5,6|17522:8,7,9]"
+        cmpidx_ord_same = [
+            CHAT, _c4pos_first(0),
+            _cmpidx_line(2, 1, 17523, _kidx_ok, _kord_ok),
+            CHAT, _c4pos_first(0),
+            _cmpidx_line(2, 1, 17523, _kidx_ok, _kord_ok),
+            CHAT, _c4pos_first(16384),
+            _cmpidx_line(2, 1, 1139, _kidx_ok, _kord_ok),
+        ]
+        cmpidx_ord_diff = [
+            CHAT, _c4pos_first(0),
+            _cmpidx_line(2, 1, 17523, _kidx_ok, _kord_ok),
+            CHAT, _c4pos_first(0),
+            _cmpidx_line(2, 1, 17523, _kidx_ok, _kord_ok),
+            CHAT, _c4pos_first(16384),
+            _cmpidx_line(2, 1, 1139, _kidx_ok, _kord_perm),
+        ]
+        ci_ord_same_out = _run_main(cmpidx_ord_same)
+        ci_ord_diff_out = _run_main(cmpidx_ord_diff)
 
         checks = [
             ("kpg full value parsed",
@@ -3213,6 +3464,20 @@ def _selftest():
             ("[CMPIDX-ALIGNED] miss/hit roles are disjoint (no MISS-vs-MISS pair)",
              "[CMPIDX-ALIGNED] split_source=c4pos miss_req=[1, 2] "
              "hit_req=[3]" in ci_same_out),
+            ("[CMPIDX-ORDERED-ALIGNED] kord parsed in STORED order",
+             _cmpidx_kord({"kord": _kord_perm})[17522] == [8, 7, 9]),
+            ("[CMPIDX-ORDERED-ALIGNED] ORDER_SAME + two-MISS control OK",
+             "split_source=c4pos" in ci_ord_same_out
+             and "=> ORDER_SAME" in ci_ord_same_out
+             and "two-MISS control: SEQUENCE-IDENTICAL" in ci_ord_same_out
+             and "escalate to the metadata/attention probes" in ci_ord_same_out
+             and "=> ORDER_DIFF" not in ci_ord_same_out),
+            ("[CMPIDX-ORDERED-ALIGNED] ORDER_DIFF + SET same (R1)",
+             "=> ORDER_DIFF" in ci_ord_diff_out
+             and "SET_same" in ci_ord_diff_out
+             and "first_diff offset=0 miss=7 hit=8" in ci_ord_diff_out
+             and "swapped_miss=[7, 8, 9] -> hit=[8, 7, 9]" in ci_ord_diff_out
+             and "ordered-consumption" in ci_ord_diff_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
