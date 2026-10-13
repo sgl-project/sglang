@@ -108,7 +108,9 @@ class TestQwenVLInputIds(CustomTestCase):
 
     def test_the_engine_runs_the_client_ids_with_the_placeholder_expanded(self):
         input_ids, image_tokens, pad_id, drift = _build_prompt(MODEL)
-        self.assertGreater(drift, 0, "the prompt must be non-canonical for the test to mean anything")
+        self.assertGreater(
+            drift, 0, "the prompt must be non-canonical for the test to mean anything"
+        )
         prompt_tokens, ran = _generate(DEFAULT_URL_FOR_TEST, input_ids, _data_uri())
 
         at = input_ids.index(pad_id)
@@ -124,14 +126,20 @@ class TestQwenVLInputIds(CustomTestCase):
         self.assertEqual([(i, ran[i]) for i, _ in text], text)
         image_positions = [i for i, t in enumerate(tail) if t == pad_id]
         self.assertEqual(len(image_positions), image_tokens)
-        self.assertEqual(image_positions, list(range(image_positions[0], image_positions[0] + image_tokens)))
+        self.assertEqual(
+            image_positions,
+            list(range(image_positions[0], image_positions[0] + image_tokens)),
+        )
 
     def test_a_text_only_prompt_keeps_its_length(self):
         input_ids, _, _, _ = _build_prompt(MODEL)
         text_ids = input_ids[:-3]  # drop the vision triple
         resp = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
-            json={"input_ids": text_ids, "sampling_params": {"temperature": 0.0, "max_new_tokens": 1}},
+            json={
+                "input_ids": text_ids,
+                "sampling_params": {"temperature": 0.0, "max_new_tokens": 1},
+            },
             timeout=300,
         )
         resp.raise_for_status()
