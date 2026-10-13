@@ -226,7 +226,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             stage="stage1",
             is_warmup=warmup,
             is_ltx23_variant=False,
-            use_ltx23_legacy_one_stage=mode == "legacy",
+            use_ltx23_legacy_one_stage=mode in ("legacy", "legacy_batched"),
             use_ltx23_hq_timestep_semantics=False,
             denoise_mask=None,
             clean_latent=None,
@@ -239,6 +239,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         params = LTX23SamplingParams(video_rescale_scale=0.0, audio_rescale_scale=0.0)
         embeds = torch.full((1, 2, 4), value)
         batch = SimpleNamespace(
+            quality="exact" if mode == "legacy" else "lossless",
             extra=params.build_request_extra(),
             prompt_embeds=[embeds],
             audio_prompt_embeds=[embeds],
@@ -260,10 +261,11 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         return ctx.latents, ctx.audio_latents
 
     def test_guidance_paths_capture_only_at_warmup_and_preserve_predictions(self):
-        for mode in ("batched", "ti2v", "hq", "legacy"):
+        for mode in ("batched", "ti2v", "hq", "legacy", "legacy_batched"):
             with self.subTest(mode=mode):
                 runner = Mock(side_effect=self._model)
-                calls_per_step = 1 if mode == "batched" else 4
+                batched = mode in ("batched", "legacy_batched")
+                calls_per_step = 1 if batched else 4
                 for warmup, value in ((True, 1.0), (False, 2.0)):
                     expected = self._run_step(
                         mode=mode, warmup=warmup, runner=None, value=value
@@ -275,7 +277,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
                         torch.testing.assert_close(result, reference, rtol=0, atol=0)
                 self.assertEqual(runner.capture.call_count, calls_per_step)
                 self.assertEqual(runner.call_count, calls_per_step * 2)
-                if mode == "batched":
+                if batched:
                     kwargs = runner.call_args.kwargs
                     self.assertEqual(kwargs["hidden_states"].shape[0], 4)
                     self.assertEqual(len(kwargs["perturbation_configs"]), 4)
