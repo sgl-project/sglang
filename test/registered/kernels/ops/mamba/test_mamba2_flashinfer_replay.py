@@ -1,4 +1,4 @@
-"""Isolated validation of the pinned FlashInfer 0.7.0.post1 replay contract.
+"""Isolated validation of the FlashInfer replay contract.
 
 No model or server is loaded. JSON measurements distinguish numerical error
 from exact state/buffer lifetime invariants. Run directly with Python on CUDA.
@@ -191,9 +191,6 @@ class TestFlashInferReplayContract(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         version = importlib.metadata.version("flashinfer-python")
-        assert version == "0.7.0.post1", (
-            f"Test requires our pinned release, got {version}"
-        )
         print(
             json.dumps({"flashinfer": version, "gpu": torch.cuda.get_device_name()}),
             flush=True,
@@ -335,9 +332,6 @@ if __name__ == "__main__":
         if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
             raise SystemExit(1)
         benchmark()
-        from bench_mamba2_flashinfer_pipeline import benchmark as pipeline_benchmark
-
-        pipeline_benchmark()
     elif options.benchmark:
         benchmark()
     else:

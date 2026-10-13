@@ -532,7 +532,7 @@ class ExecMamba(msgspec.Struct):
         "Enable ReplaySSM speculative verification using compact inputs instead "
         "of per-draft full-state snapshots. Supports GDN/KDA linear-chain verify "
         "(--speculative-eagle-topk in {None, 1}). NemotronH Mamba2 requires SM100, "
-        "FlashInfer 0.7.0.post1, --mamba-backend flashinfer, FP16 state, BF16 "
+        "FlashInfer 0.7.1, --mamba-backend flashinfer, FP16 state, BF16 "
         "activations, EAGLE/NEXTN, topk=1, and 4 verify positions.",
     ] = False
 

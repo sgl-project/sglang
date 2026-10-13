@@ -1,4 +1,4 @@
-"""Pinned FlashInfer checkpointing verify with eager accepted-state commit.
+"""FlashInfer checkpointing verify with eager accepted-state commit.
 
 Records are physical-slot indexed. Pending history stays zero: verification
 never changes live state, and the accepted endpoint is materialized before the
@@ -6,19 +6,12 @@ next forward. Compact records are scratch, not transferable radix checkpoints.
 """
 
 from functools import lru_cache
-from importlib.metadata import version
 
 from sglang.srt.runtime_context import get_exec
 
 
 @lru_cache(maxsize=1)
 def checkpointing_kernel():
-    installed = version("flashinfer-python")
-    if installed.split("+")[0] != "0.7.0.post1":
-        raise ValueError(
-            "--enable-linear-replayssm-spec for Mamba2 requires FlashInfer 0.7.0.post1; "
-            f"found {installed}"
-        )
     from flashinfer.mamba import checkpointing_ssu
 
     return checkpointing_ssu

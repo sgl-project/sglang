@@ -692,7 +692,7 @@ class MambaPool:
             assert cache_params.shape.temporal[1:] == (64, 128)
             from sglang.kernels.ops.mamba.mamba2_spec_replay import checkpointing_kernel
 
-            checkpointing_kernel()  # fail on an unsupported package before allocation
+            checkpointing_kernel()  # resolve the required API before allocation
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
