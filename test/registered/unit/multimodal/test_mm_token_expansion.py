@@ -2,6 +2,7 @@
 
 partly expanded IDs + boundary -> suffix matcher -> IDs
 loaded media -> process_media_async, one task per item -> BatchFeature
+request IDs + media -> TokenSpaceMultimodalProcessor entry -> serving output
 
 The matcher preserves history and never scans inserted tokens. Source configs
 must align with the media, and decoders opened by loading are closed even when
@@ -18,8 +19,13 @@ import torch
 from PIL import Image
 from transformers import ProcessorMixin
 
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.multimodal.media_processor import MultimodalProcessorMixin
 from sglang.srt.multimodal.mm_token_expansion import expand_token_placeholders
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.token_space_processor import (
+    TokenSpaceMultimodalProcessor,
+)
 from sglang.srt.multimodal.token_space.process_strategy import (
     TokenSpaceProcessStrategy,
 )
@@ -186,6 +192,40 @@ class TestProcessMedia(unittest.TestCase):
                 )
             )
         self.assertEqual(decoder.close_count, 1)
+
+
+class _OutputBuilder:
+    def build(
+        self, ret, mm_items, input_ids, *, keep_mm_features_on_device, base_input_ids
+    ):
+        return MultimodalProcessorOutput(input_ids=base_input_ids, mm_items=mm_items)
+
+
+class _TokenSpaceHost(TokenSpaceMultimodalProcessor):
+    keep_mm_features_on_device = False
+
+    def __init__(self):
+        _init_media_host(self)
+        self.mm_tokens = MultimodalSpecialTokens(image_token_id=99)
+        self.ATTR_NAME_TO_MODALITY = {"pixel_values": Modality.IMAGE}
+        self.output_builder = _OutputBuilder()
+
+    def _finalize_mm_items(self, mm_items, *, images):
+        return mm_items
+
+
+class TestTokenSpaceMultimodalProcessor(unittest.TestCase):
+    def test_entry_expands_request_ids_into_the_serving_output(self):
+        host = _TokenSpaceHost()
+        self.addCleanup(host.io_executor.shutdown)
+        output = asyncio.run(
+            host.process_mm_data_async(
+                image_data=[Image.new("RGB", (2, 1))], input_ids=[10, 99, 11]
+            )
+        )
+        self.assertEqual(output.input_ids, [10, 99, 99, 11])
+        self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2)]])
+        host._tokenizer.decode.assert_not_called()
 
 
 if __name__ == "__main__":

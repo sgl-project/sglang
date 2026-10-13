@@ -238,6 +238,7 @@ class MultimodalProcessorMixin:
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config
+        self.mm_process_config = mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
