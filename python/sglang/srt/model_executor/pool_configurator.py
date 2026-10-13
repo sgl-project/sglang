@@ -270,8 +270,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    if _is_npu and dcp_size > 1:
-                        target_indexer_size *= dcp_size
+                    target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -288,11 +287,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated and consumes the widened
-                    # allocator-global slot space on NPU DCP.
-                    if _is_npu and dcp_size > 1:
-                        draft_kv_size *= dcp_size
-                        draft_indexer_size *= dcp_size
+                    draft_kv_size *= dcp_size
+                    draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
@@ -388,7 +384,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
+                if not kvc.is_draft_worker:
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
