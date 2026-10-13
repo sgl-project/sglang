@@ -7735,15 +7735,29 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-        # it, mirroring the forward scale split: the ue8m0 path
-        # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        self._handle_fp8_wo_a_gemm_compatibility()
+
+    def _handle_fp8_wo_a_gemm_compatibility(self) -> None:
+        """Disable the FP8 W_o/A GEMM where the runtime cannot serve it.
+
+        On CUDA, enable exactly where the runtime can run it, mirroring the
+        forward scale split: the ue8m0 path (DEEPGEMM_SCALE_UE8M0, true sm100,
+        default on) or an sm90 opt-in fp32-scale path (use FP4 expert ckpt).
+        On XPU the DeepGEMM JIT never builds, so the path is always disabled;
+        without this the first forward raises ModuleNotFoundError from the
+        ``import deep_gemm`` in the wo_a GEMM, or, for a checkpoint whose
+        ``wo_a`` is not already fp8, weight loading aborts before that. Either
+        way the operator has to set SGLANG_OPT_FP8_WO_A_GEMM=0 by hand. Other
+        backends are left alone.
+        """
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            return
+
+        explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
+        if is_cuda():
             from sglang.srt.layers import deep_gemm_wrapper
 
             sm = get_device_sm()
-            explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
             supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and is_sm90_supported()
@@ -7756,8 +7770,24 @@ class ServerArgs:
                     "detected sm%d.",
                     sm,
                 )
-            if not supported:
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+        elif is_xpu():
+            # DeepGEMM JIT is compiled only for CUDA and MUSA
+            # (deep_gemm_wrapper/configurer.py returns False for every other
+            # runtime), so the FP8 W_o/A path can never be served on XPU.
+            # Decide it here rather than importing the CUDA-oriented wrapper.
+            supported = False
+            if explicit:
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: DeepGEMM JIT is not "
+                    "available on XPU."
+                )
+        else:
+            # Other runtimes keep whatever they had; this handler is scoped to
+            # the two backends whose support status is known here.
+            return
+
+        if not supported:
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
