@@ -3306,6 +3306,11 @@ class SchedulerDisaggregationDecodeMixin:
         self._verify_kv_checksums(batch)
         if batch.is_empty():
             return None
+        if batch.dsv41_cache_only_replay:
+            # A cache-only handoff has no Prefill-sampled token. The EXTEND
+            # forward must generate it; ordinary PREBUILT processing would
+            # consume an absent token and alter the replay batch.
+            return batch
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )

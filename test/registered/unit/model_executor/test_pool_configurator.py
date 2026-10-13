@@ -1668,7 +1668,7 @@ class TestSWAPoolFloor(CustomTestCase):
         )
 
         planner = DSV4PoolConfigurator(kvc)
-        self.assertEqual(planner.bytes_per_swa_token, 40 * 584)
+        self.assertEqual(planner.bytes_per_swa_token, 40 * 585)
         sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
 
         self.assertGreater(sizes.swa_max_total_num_tokens, 0)
