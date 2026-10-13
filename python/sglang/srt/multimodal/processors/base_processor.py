@@ -1274,7 +1274,7 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
-    # fti image patch (deploy/patches/sglang_mm_by_ids.py): images of a pre-tokenized prompt are located by the
+    # Images of a pre-tokenized prompt are located by the
     # placeholder id in the ids; the decoded text is never scanned.
     @staticmethod
     def _ids_for_media(prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data):
@@ -1385,7 +1385,7 @@ class BaseMultimodalProcessor(ABC):
                 audios=list(audio_data or []),
             )
 
-        # fti image patch (deploy/patches/sglang_mm_by_ids.py): a prompt that arrives as ids locates its images by the
+        # A prompt that arrives as ids locates its images by the
         # placeholder id in the ids; its decoded text is never scanned.
         ids_for_media = self._ids_for_media(
             prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
@@ -1571,7 +1571,7 @@ class BaseMultimodalProcessor(ABC):
 
         """
 
-        # fti image patch (deploy/patches/sglang_mm_by_ids.py): a prompt that arrives as ids locates its images by the
+        # A prompt that arrives as ids locates its images by the
         # placeholder id in the ids; its decoded text is never scanned.
         ids_for_media = self._ids_for_media(
             prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
@@ -2053,7 +2053,7 @@ class BaseMultimodalProcessor(ABC):
                         dtype=input_ids.dtype,
                     )
                 except Exception as e:
-                    # fti image patch (deploy/patches/sglang_mm_by_ids.py): an ids prompt's text is synthetic
+                    # An ids prompt's text is synthetic
                     # (one image token per image), not a prompt to fall back to.
                     if getattr(base_output, "synthetic_text", False):
                         raise ValueError(
