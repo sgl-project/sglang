@@ -190,26 +190,6 @@ def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "configured, expected",
-    [(None, "c++17"), ("c++17", "c++17"), ("c++20", "c++20")],
-)
-def test_musa_cxx_standard(monkeypatch, configured, expected):
-    if configured is None:
-        monkeypatch.delenv("SGLANG_MUSA_CXX_STANDARD", raising=False)
-    else:
-        monkeypatch.setenv("SGLANG_MUSA_CXX_STANDARD", configured)
-
-    assert arch.musa_cxx_standard.__wrapped__() == expected
-
-
-def test_musa_cxx_standard_rejects_unknown_value(monkeypatch):
-    monkeypatch.setenv("SGLANG_MUSA_CXX_STANDARD", "c++23")
-
-    with pytest.raises(ValueError, match="SGLANG_MUSA_CXX_STANDARD"):
-        arch.musa_cxx_standard.__wrapped__()
-
-
-@pytest.mark.parametrize(
     "backend, capability", [("cuda", (9, 0)), ("hip", (9, 4)), ("musa", (3, 1))]
 )
 def test_arch_query_uses_cuda_api_after_musa_initialization(
@@ -243,10 +223,10 @@ def test_arch_query_uses_cuda_api_after_musa_initialization(
     assert calls == (["torchada", "query"] if backend == "musa" else ["query"])
 
 
-def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):
+def test_musa_target_flags_use_cxx20_without_changing_cuda(monkeypatch):
     monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
-    assert "-std=c++17" in arch.get_default_target_flags()
+    assert "-std=c++20" in arch.get_default_target_flags()
 
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: False)
     assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
