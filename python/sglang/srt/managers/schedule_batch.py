@@ -2364,8 +2364,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
-    # Decode requests carried alongside a chunked-prefill batch
-    decoding_reqs: List[Req] = None
+    # Decode rows run as a 1-token extend. They are always the last rows of an
+    # extend step: mix_with_running appends them, and a converted step is all
+    # decode rows. prepare_for_decode, filter_batch and merge_batch clear it;
+    # mix_with_running sets it after its merge.
+    num_decode_rows: int = 0
 
     # For split prefill
     split_index: int = 0
@@ -2588,6 +2591,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    @property
+    def first_decode_row(self) -> int:
+        return len(self.reqs) - self.num_decode_rows
 
     def is_dllm(self):
         return self.dllm_config is not None
@@ -3186,6 +3193,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
+        self.num_decode_rows = running_bs
         self.out_cache_loc = out_cache_loc
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
@@ -3227,7 +3235,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req, seq_len in zip(self.reqs, seq_lens, strict=True):
             req.refresh_fill_ids()
             # end runs one past full_untruncated_fill_ids while output_ids
-            # trails; safe only while decoding_reqs suppresses the checkpoint insert.
+            # trails; safe only while an extend step's decode rows skip the
+            # checkpoint insert.
             # As in mix_with_running, read prefix and extend length off the batch.
             req.extend_end = seq_len
 
@@ -3235,7 +3244,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = [1] * bs
         self.extend_num_tokens = bs
         self.extend_logprob_start_lens = [0] * bs
-        self.decoding_reqs = self.reqs
+        self.num_decode_rows = bs
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(
@@ -3553,6 +3562,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.num_decode_rows = 0
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -3653,6 +3663,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)
+        self.num_decode_rows = 0
         if keep_indices is None:
             if isinstance(reqs_to_exclude, Req):
                 reqs_to_exclude = [reqs_to_exclude]
@@ -3738,6 +3749,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
+        self.num_decode_rows = 0
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -3825,7 +3837,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_grammar=self.has_grammar,
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
-            decoding_reqs=self.decoding_reqs,
+            num_decode_rows=self.num_decode_rows,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,

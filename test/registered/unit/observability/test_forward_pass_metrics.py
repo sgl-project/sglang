@@ -153,7 +153,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         defaults = dict(
             forward_mode=_FakeForwardMode(),
             reqs=[],
-            decoding_reqs=[],
+            num_decode_rows=0,
+            first_decode_row=0,
             prefix_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
@@ -172,7 +173,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         batch = self._make_batch(
             forward_mode=_FakeForwardMode(is_mixed=True, is_extend=True),
             reqs=[prefill_a, prefill_b, decode_req],
-            decoding_reqs=[decode_req],
+            num_decode_rows=1,
+            first_decode_row=2,
             prefix_lens=[2, 3, decode_req.seqlen - 1],
             prefill_stats=PrefillStats(
                 log_input_tokens=12,

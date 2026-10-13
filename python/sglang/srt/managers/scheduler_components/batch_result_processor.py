@@ -303,6 +303,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            first_decode_row = batch.first_decode_row
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 should_commit_output = (
@@ -365,8 +366,7 @@ class SchedulerBatchResultProcessor:
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and i >= first_decode_row
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
@@ -374,7 +374,7 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                        if i >= first_decode_row:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
@@ -382,7 +382,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif i < first_decode_row:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -975,6 +975,10 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
+        is_spec = not batch.spec_algorithm.is_none()
+        # hidden_states is [bs * stride, hidden_dim], one row per emitted
+        # token; speculative workers record their padded row width.
+        stride = _get_speculative_output_stride(result) if is_spec else 1
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -1001,65 +1005,17 @@ class SchedulerBatchResultProcessor:
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
-            is_spec = not batch.spec_algorithm.is_none()
-
-            req.time_stats.set_last_decode_finish_time()
-            sampling_mask_finish_reason = None
-            if req.return_sampling_mask:
-                statuses = logits_output.next_token_sampling_mask_status
-                status = None if statuses is None else statuses[i]
-                sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
-                    status=status
-                )
-            if sampling_mask_finish_reason is not None:
-                req.to_finish = sampling_mask_finish_reason
-                new_accept_len = 0
-            else:
-                req.output_ids.extend(next_token_id)
-                new_accept_len = len(next_token_id)
-                self._maybe_update_reasoning_tokens(req, next_token_id)
-            req.update_finish_state(new_accept_len)
-
-            if sampling_mask_finish_reason is not None:
-                self._handle_sampling_mask_abort(req)
-                continue
-
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
-
-            if req.return_logprob:
-                self._apply_decode_logprobs(
-                    req=req,
-                    i=i,
-                    batch=batch,
-                    next_token_id=next_token_id,
-                    next_token_logprobs=next_token_logprobs,
-                    logits_output=logits_output,
-                )
-
-            if req.return_sampling_mask:
-                self.add_sampling_mask_return_values(
-                    i, req, logits_output, accept_len=new_accept_len
-                )
-
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                # hidden_states is [bs * stride, hidden_dim], one row per emitted
-                # token; speculative workers record their padded row width.
-                stride = _get_speculative_output_stride(result) if is_spec else 1
-                accept_len = len(next_token_id)
-                start = i * stride
-                self._append_decode_hidden_states(
-                    req=req,
-                    hidden_states=logits_output.hidden_states,
-                    start=start,
-                    accept_len=accept_len,
-                )
-
-            if req.grammar is not None:
-                if not is_spec:
-                    # Normal decode advances the grammar for its single token
-                    # here; spec already advanced it in _resolve_spec_v2_tokens.
-                    self._accept_grammar_tokens(req, next_token_id)
-                req.grammar.finished = req.finished()
+            self._commit_decode_row(
+                req=req,
+                i=i,
+                batch=batch,
+                result=result,
+                logits_output=logits_output,
+                next_token_id=next_token_id,
+                next_token_logprobs=next_token_logprobs,
+                hidden_start=i * stride,
+                grammar_advanced=is_spec,
+            )
 
         if auxiliary_output is not None:
             self.consume_auxiliary_output(
@@ -1079,6 +1035,76 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_generated_tokens=num_generated_tokens,
         )
+
+    def _commit_decode_row(
+        self,
+        *,
+        req: Req,
+        i: int,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        logits_output: LogitsProcessorOutput,
+        next_token_id: List[int],
+        next_token_logprobs: Optional[List[float]],
+        hidden_start: int,
+        grammar_advanced: bool,
+    ) -> None:
+        """Commit one decode row's accepted tokens. hidden_start indexes the
+        row's first hidden state in logits_output.hidden_states;
+        grammar_advanced says the grammar FSM already advanced over the tokens."""
+        req.time_stats.set_last_decode_finish_time()
+        sampling_mask_finish_reason = None
+        if req.return_sampling_mask:
+            statuses = logits_output.next_token_sampling_mask_status
+            status = None if statuses is None else statuses[i]
+            sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                status=status
+            )
+        if sampling_mask_finish_reason is not None:
+            req.to_finish = sampling_mask_finish_reason
+            new_accept_len = 0
+        else:
+            req.output_ids.extend(next_token_id)
+            new_accept_len = len(next_token_id)
+            self._maybe_update_reasoning_tokens(req, next_token_id)
+        req.update_finish_state(new_accept_len)
+
+        if sampling_mask_finish_reason is not None:
+            self._handle_sampling_mask_abort(req)
+            return
+
+        self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+
+        if req.return_logprob:
+            self._apply_decode_logprobs(
+                req=req,
+                i=i,
+                batch=batch,
+                next_token_id=next_token_id,
+                next_token_logprobs=next_token_logprobs,
+                logits_output=logits_output,
+            )
+
+        if req.return_sampling_mask:
+            self.add_sampling_mask_return_values(
+                i, req, logits_output, accept_len=new_accept_len
+            )
+
+        if req.return_hidden_states and logits_output.hidden_states is not None:
+            accept_len = len(next_token_id)
+            self._append_decode_hidden_states(
+                req=req,
+                hidden_states=logits_output.hidden_states,
+                start=hidden_start,
+                accept_len=accept_len,
+            )
+
+        if req.grammar is not None:
+            if not grammar_advanced:
+                # Normal decode advances the grammar for its single token
+                # here; spec already advanced it in _resolve_spec_v2_tokens.
+                self._accept_grammar_tokens(req, next_token_id)
+            req.grammar.finished = req.finished()
 
     def _normalize_decode_outputs(
         self,

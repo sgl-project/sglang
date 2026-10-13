@@ -423,8 +423,7 @@ class SchedulerMetricsReporter:
         prefill_lengths = WelfordAccumulator()
 
         if batch.forward_mode.is_mixed():
-            decode_req_ids = {id(req) for req in batch.decoding_reqs or []}
-            prefill_reqs = [req for req in batch.reqs if id(req) not in decode_req_ids]
+            prefill_reqs = batch.reqs[: batch.first_decode_row]
         elif batch.forward_mode.is_extend():
             prefill_reqs = batch.reqs
         else:
@@ -442,7 +441,7 @@ class SchedulerMetricsReporter:
 
         decode_kv = WelfordAccumulator()
         if batch.forward_mode.is_mixed():
-            for req in batch.decoding_reqs or []:
+            for req in batch.reqs[batch.first_decode_row :]:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
             for sl in batch.seq_lens_cpu:

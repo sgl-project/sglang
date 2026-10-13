@@ -227,7 +227,8 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 batch = SimpleNamespace(
                     reqs=[middle, last],
-                    decoding_reqs=[],
+                    num_decode_rows=0,
+                    first_decode_row=2,
                     return_logprob=False,
                     return_hidden_states=True,
                     return_hidden_states_mode=capture_mode,
@@ -282,6 +283,8 @@ class TestPrefillSkippedOutput(CustomTestCase):
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
+            num_decode_rows=0,
+            first_decode_row=1,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,
@@ -334,7 +337,8 @@ class TestMixedBatchKvRelease(CustomTestCase):
             req.kv = SimpleNamespace(kv_committed_len=0)
         batch = SimpleNamespace(
             reqs=[prefill_req, decode_req],
-            decoding_reqs=[decode_req],
+            num_decode_rows=1,
+            first_decode_row=1,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,

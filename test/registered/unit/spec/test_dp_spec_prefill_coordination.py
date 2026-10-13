@@ -262,7 +262,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                     if plan.counts[rank]
                     else ForwardMode.IDLE
                 )
-                batch.decoding_reqs = None
+                batch.num_decode_rows = 0
                 batch.req_to_token_pool = batch.token_to_kv_pool_allocator = None
                 batch.tree_cache = batch.model_config = None
                 batch.enable_overlap = True
