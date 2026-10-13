@@ -61,14 +61,15 @@ class TestResolveTorchProfilerActivities(CustomTestCase):
             resolved = profile_utils.resolve_torch_profiler_activities(
                 ["CPU", "GPU", "XPU"]
             )
+            explicit = profile_utils.resolve_torch_profiler_activities(["CPU", "XPU"])
 
-        self.assertEqual(
-            resolved,
-            [
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.XPU,
-            ],
-        )
+        expected = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
+        self.assertEqual(resolved, expected)
+        # An explicit "XPU" with no "GPU" must still resolve on XPU.
+        self.assertEqual(explicit, expected)
 
     def test_request_order_is_preserved_and_unknown_names_dropped(self):
         with patch.object(profile_utils, "current_platform", _platform(xpu=True)):
