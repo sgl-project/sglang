@@ -1965,16 +1965,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         if layer is None:
             return
+        # OffloaderV1 onloads only through layer.forward; the load hook bypasses it.
+        device = torch.device("cuda", torch.cuda.current_device())
         prewarm_mhc_pre(
             # Gives dtype and device; each bucket allocates its own tokens.
             residual=torch.zeros(
                 (1, self.config.hc_mult, self.config.hidden_size),
                 dtype=torch.bfloat16,
-                device=layer.hc_attn_fn.device,
+                device=device,
             ),
-            fn=layer.hc_attn_fn,
-            hc_scale=layer.hc_attn_scale,
-            hc_base=layer.hc_attn_base,
+            fn=layer.hc_attn_fn.detach().to(device),
+            hc_scale=layer.hc_attn_scale.detach().to(device),
+            hc_base=layer.hc_attn_base.detach().to(device),
             rms_eps=self.config.rms_norm_eps,
             hc_pre_eps=self.config.hc_eps,
             hc_sinkhorn_eps=self.config.hc_eps,
@@ -1983,7 +1985,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # The mhc_pre defaults, which hc_pre uses.
             n_splits=1,
             n_splits_pre=32,
-            norm_weight=layer.input_layernorm.weight.data,
+            norm_weight=layer.input_layernorm.weight.detach().to(device),
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
 
