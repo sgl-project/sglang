@@ -21,6 +21,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=3, suite="base-a-test-npu")
+
 # Mock NPU-only modules before importing the source module.
 for _ in (
     "torch_npu",
