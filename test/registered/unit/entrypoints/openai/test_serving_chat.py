@@ -26,7 +26,7 @@ from unittest.mock import Mock, patch
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
-from sglang.srt.entrypoints.openai import chat_encoding, inkling_chat_adapter
+from sglang.srt.entrypoints.openai import chat_encoding, serving_inkling
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -4862,7 +4862,7 @@ def _inkling_serving() -> OpenAIServingChat:
     serving.chat_encoding_spec = "inkling"
     serving.reasoning_parser = "inkling"
     serving.tool_call_parser = "inkling"
-    serving._inkling = inkling_chat_adapter.InklingChatAdapter(
+    serving._inkling = serving_inkling.InklingChatAdapter(
         reasoning_parser=serving.reasoning_parser,
         tool_call_parser=serving.tool_call_parser,
         tool_call_parsing_active=serving._tool_call_parsing_active,
@@ -4876,7 +4876,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
 
     def test_named_levels(self):
-        parse = inkling_chat_adapter.parse_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
         self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
@@ -4888,7 +4888,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         self.assertEqual(parse("max"), parse("xhigh"))
 
     def test_scalar_range_is_validated(self):
-        parse = inkling_chat_adapter.parse_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertEqual(parse(0.5), 0.5)
         self.assertEqual(parse(0.99), 0.99)
         for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
@@ -4896,7 +4896,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
                 parse(value)
 
     def test_invalid_and_none(self):
-        parse = inkling_chat_adapter.parse_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertIsNone(parse(None))
         with self.assertRaises(ValueError):
             parse("garbage")
@@ -4904,7 +4904,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_env_default(self):
         from sglang.srt.environ import envs
 
-        get = inkling_chat_adapter.get_default_reasoning_effort
+        get = serving_inkling.get_default_reasoning_effort
         env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
         try:
             env.clear()  # unset -> EnvStr default "0.9"
@@ -5117,7 +5117,7 @@ class InklingTokenOutputTest(CustomTestCase):
         """Non-incremental chunks carry the cumulative ids and an incremental
         abort chunk re-sends streamed ids; either way a token parsed twice
         would duplicate text."""
-        new_ids = inkling_chat_adapter.select_new_output_ids
+        new_ids = serving_inkling.select_new_output_ids
         self.assertEqual(
             new_ids(
                 output_ids=[1, 2, 3, 4],

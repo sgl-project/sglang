@@ -60,7 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
-from sglang.srt.entrypoints.openai import chat_encoding, inkling_responses_adapter
+from sglang.srt.entrypoints.openai import chat_encoding, serving_inkling
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -1044,7 +1044,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         if self._inkling_token_output:
-            parsed = inkling_responses_adapter.parse_output(
+            parsed = serving_inkling.parse_responses_output(
                 output_ids=output_ids or [],
                 finish_reason=finish_reason,
                 separate_reasoning=bool(self.reasoning_parser),
@@ -2066,7 +2066,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         inkling_stream = (
-            inkling_responses_adapter.InklingResponsesStream(
+            serving_inkling.InklingResponsesStream(
                 separate_reasoning=bool(self.reasoning_parser),
                 parse_tool_calls=self._tool_call_parsing_enabled(request, chat_tools),
             )

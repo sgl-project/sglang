@@ -1,4 +1,5 @@
-"""Inkling chat completions: prompt rendering and token-level output parsing."""
+"""Inkling serving glue: prompt rendering and token-level output parsing for the
+Chat Completions and Responses APIs."""
 
 from __future__ import annotations
 
@@ -16,7 +17,11 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.parser.inkling_output import InklingOutputParser, InklingToolCall
+from sglang.srt.parser.inkling_output import (
+    InklingOutputDelta,
+    InklingOutputParser,
+    InklingToolCall,
+)
 from sglang.srt.parser.inkling_renderer import (
     load_tml_renderers,
     render_inkling_assistant_prefix,
@@ -191,6 +196,67 @@ class InklingChatAdapter:
             index=call.index,
             function=FunctionResponse(name=call.name, arguments=call.arguments),
         )
+
+
+def parse_responses_output(
+    *,
+    output_ids: list[int],
+    finish_reason: dict[str, Any] | None,
+    separate_reasoning: bool,
+    parse_tool_calls: bool,
+) -> InklingOutputDelta:
+    parser = InklingOutputParser(
+        separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+    )
+    return parser.finish(
+        output_ids,
+        matched_stop=(finish_reason or {}).get("matched"),
+        keep_matched_stop=False,
+    )
+
+
+class InklingResponsesStream:
+    """One streamed response's parse, shaped like the text parsers' output:
+    each engine chunk yields (reasoning, text, tool calls)."""
+
+    def __init__(self, *, separate_reasoning: bool, parse_tool_calls: bool):
+        self._parser = InklingOutputParser(
+            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+        )
+        self._incremental = get_serving().incremental_streaming_output
+        self._finished = False
+
+    def step(
+        self, chunk: dict[str, Any], finish_reason: dict[str, Any] | None
+    ) -> tuple[str, str, list[ToolCallItem]]:
+        # finish_reason stays set on later chunks; the parser finishes once.
+        if self._finished:
+            return "", "", []
+        new_output_ids = select_new_output_ids(
+            output_ids=chunk.get("output_ids") or [],
+            num_consumed_tokens=self._parser.num_consumed_tokens,
+            completion_tokens=(chunk.get("meta_info") or {}).get(
+                "completion_tokens", 0
+            ),
+            finish_reason_type=finish_reason["type"] if finish_reason else None,
+            incremental=self._incremental,
+        )
+        if finish_reason is None:
+            delta = self._parser.feed(new_output_ids)
+        else:
+            self._finished = True
+            delta = self._parser.finish(
+                new_output_ids,
+                matched_stop=finish_reason.get("matched"),
+                keep_matched_stop=False,
+            )
+        calls = [
+            ToolCallItem(
+                tool_index=call.index, name=call.name, parameters=call.arguments
+            )
+            for call in delta.tool_calls
+        ]
+        return delta.reasoning, delta.content, calls
 
 
 def select_new_output_ids(

@@ -45,7 +45,6 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
-from sglang.srt.entrypoints.openai.inkling_chat_adapter import InklingChatAdapter
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -73,6 +72,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_inkling import InklingChatAdapter
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
