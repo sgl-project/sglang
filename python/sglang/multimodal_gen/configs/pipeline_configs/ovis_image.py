@@ -17,8 +17,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     TextConditioningOutput,
+    pack_latents_2x2,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 OVIS_IMAGE_SYSTEM_PROMPT = (
@@ -173,7 +173,7 @@ class OvisImagePipelineConfig(ImagePipelineConfig):
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         _, channels, height, width = latents.shape
-        return _pack_latents(latents, batch_size, channels, height, width)
+        return pack_latents_2x2(latents, batch_size, channels, height, width)
 
     def shard_latents_for_sp(self, batch, latents):
         # Shard inside the DiT, preserving replicated scheduler state.

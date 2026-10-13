@@ -411,8 +411,8 @@ class TestOvisImageConfig(CustomTestCase):
             defaults = ServerArgs(**kwargs, enable_breakable_cuda_graph=False)
             self.assertFalse(defaults.enable_breakable_cuda_graph)
             self.assertIsNone(defaults.nunchaku_config)
-            # Keep the pre-existing warning/disable behavior for another model
-            # whose config has not opted in to rejecting unsupported graphs.
+            # Another unvalidated model whose config has not opted in to
+            # rejecting graphs keeps the request, with a warning.
             other = ServerArgs(
                 model_path="black-forest-labs/FLUX.1-schnell",
                 pipeline_config=FluxPipelineConfig(),
@@ -421,7 +421,7 @@ class TestOvisImageConfig(CustomTestCase):
                 attention_backend="torch_sdpa",
                 enable_breakable_cuda_graph=True,
             )
-            self.assertFalse(other.enable_breakable_cuda_graph)
+            self.assertTrue(other.enable_breakable_cuda_graph)
 
 
 @unittest.skipUnless(
