@@ -12,6 +12,11 @@ from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 
 class BeamDetector(ResponseTemplateToolDetector):
+    # Parsing also reads compact parameters; grammars keep the newline layout.
+    parse_tag_pattern = (
+        r'<rfl:parameter name="(?P<key>[^"]+)">(?P<newline>\n)?(?P<value>.*?)'
+        r'(?(newline)\n(?:</rfl:parameter>|(?=<rfl:parameter name="))|</rfl:parameter>)'
+    )
     response_template = BEAM_RESPONSE_TEMPLATE
     constrains_every_turn = True
     forwards_unknown_tools = True

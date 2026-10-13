@@ -18,12 +18,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.serving_chat import (
-    OpenAIServingChat,
-    _incomplete_tool_call_indices,
-)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -268,15 +266,19 @@ class OpenAIServingParse(OpenAIServingBase):
                 tools, chat.tool_call_parser, tokenizer=tokenizer
             )
             if parser.has_tool_call(text):
-                parsed = parser.parse_non_stream_result(text, preserve_incomplete=True)
-                if not parsed.calls or _incomplete_tool_call_indices(parser):
+                detector = parser.detector
+                complete = not isinstance(
+                    detector, ResponseTemplateToolDetector
+                ) or detector.calls_complete(text)
+                text, calls = parser.parse_non_stream(text)
+                if not complete or not calls:
                     raise ValueError(
                         "The output has a malformed or incomplete tool call."
                     )
                 schemas = {
                     tool.function.name: tool.function.parameters for tool in tools
                 }
-                for call in parsed.calls:
+                for call in calls:
                     if schemas.get(call.name) is None:
                         continue
                     try:
@@ -288,7 +290,6 @@ class OpenAIServingParse(OpenAIServingBase):
                             f"Tool call {call.name!r} does not match its schema: "
                             f"{e.message}"
                         ) from e
-                text = parsed.normal_text
                 tool_calls = [
                     ToolCall(
                         index=index,
@@ -296,7 +297,7 @@ class OpenAIServingParse(OpenAIServingBase):
                             name=call.name, arguments=call.parameters
                         ),
                     )
-                    for index, call in enumerate(parsed.calls)
+                    for index, call in enumerate(calls)
                 ]
 
         return ChatMessage(

@@ -21,6 +21,8 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import regex
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -157,9 +159,13 @@ def _reasoning_only_template(
     )
 
 
-def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
+def _tool_extraction_template(
+    template: dict[str, Any], tag_pattern: str | None = None
+) -> ResponseTemplate:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
     tool_field["optional"] = True
+    if tag_pattern is not None:
+        tool_field["content_args"]["tag_pattern"] = tag_pattern
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
@@ -565,6 +571,8 @@ class ResponseTemplateReasoningDetector:
 class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
 
+    # Reads arguments in layouts the template's grammar does not write.
+    parse_tag_pattern: str | None = None
     response_template: dict | None = None
     constrains_every_turn = False
     forwards_unknown_tools = False
@@ -584,7 +592,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self.response_template = template
         if _TOOL_FIELD not in loaded.fields:
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
-        self._template = _tool_extraction_template(template)
+        self._template = _tool_extraction_template(template, self.parse_tag_pattern)
         self._prefix = prefix
         self._tools = tools
         self._constrained = constrained
@@ -793,6 +801,28 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
                 )
                 return self.tool_close_literals[0] if open_at_end else None
         return None
+
+    def calls_complete(self, text: str) -> bool:
+        """Whether every tool call in the finished output `text` reaches its
+        closer, parses, and has no text outside its argument tags."""
+        field = self._template.fields[_TOOL_FIELD]
+        tag = None
+        if field.content == "xml-inline":
+            tag = regex.compile(field.content_args["tag_pattern"], regex.DOTALL)
+        adapter = self._new_adapter()
+        body_start = 0
+        for event in adapter.parse(text, self._tools):
+            if event.get("field") != _TOOL_FIELD or event["type"] == "region_chunk":
+                continue
+            if event["type"] == "region_open":
+                body_start = event["end"]
+                continue
+            body = adapter._parser.input_text[body_start : event["start"]]
+            if adapter._is_unusable_tool_end(event) or (
+                tag is not None and tag.sub("", body).strip()
+            ):
+                return False
+        return True
 
     def get_structural_tag(
         self,
