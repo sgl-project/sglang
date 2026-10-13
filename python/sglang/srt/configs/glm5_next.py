@@ -104,7 +104,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         n_routed_experts: Optional[int] = 288,
-        num_experts_per_tok: int = 7,
+        num_experts_per_tok: int = 8,
         n_shared_experts: int = 1,
         n_group: int = 1,
         topk_group: int = 1,
