@@ -40,7 +40,7 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
-    # Logical device-pool dtype. Host buffers may store FP8 as uint8 bytes.
+    # Value dtype persisted by the host pool; raw FP8 buffers may use uint8.
     kv_cache_dtype: Optional[str] = None
 
 

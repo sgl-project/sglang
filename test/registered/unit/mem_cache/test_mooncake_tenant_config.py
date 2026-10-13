@@ -271,15 +271,65 @@ class TestMooncakeTenantConfig(unittest.TestCase):
         self.assertEqual(setup.call_count, 2)
         self.assertEqual(setup.call_args.kwargs, {"tenant_id": "dtype_bfloat16"})
 
-    def test_controller_uses_logical_dtype_for_byte_backed_pools(self):
+    def test_controller_uses_host_storage_dtype(self):
         from sglang.srt.managers import cache_controller
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         controller = SimpleNamespace(
             enable_storage_metrics=False,
-            storage_host_pool=SimpleNamespace(storage_format_tag=None),
+            # The allocation facade does not need a dtype; its storage anchor
+            # owns the persisted representation.
+            mem_pool_host=SimpleNamespace(layout="page_first"),
+            mem_pool_device=SimpleNamespace(dtype=torch.float16),
             get_attn_cp_rank_and_size=lambda: (0, 1),
         )
-        # Covers both a byte-backed host pool and a hybrid facade with no dtype.
+        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        cases = (
+            # A typed host representation wins over the device value dtype.
+            (torch.bfloat16, torch.float8_e4m3fn, "bfloat16"),
+            (torch.float8_e4m3fn, torch.bfloat16, "float8_e4m3fn"),
+            (torch.uint8, torch.bfloat16, "uint8"),
+            # Raw FP8 bytes still require different interpretation.
+            (torch.uint8, torch.float8_e4m3fn, "float8_e4m3fn"),
+            (torch.uint8, torch.float8_e5m2, "float8_e5m2"),
+            (torch.uint8, torch.float8_e4m3fnuz, "float8_e4m3fnuz"),
+        )
+        with (
+            patch.object(cache_controller, "get_parallel", return_value=parallel),
+            patch.object(
+                cache_controller, "is_dp_attention_enabled", return_value=False
+            ),
+        ):
+            for pool_type in (MHATokenToKVPoolHost, MLATokenToKVPoolHost):
+                for buffer_dtype, value_dtype, expected in cases:
+                    with self.subTest(pool_type=pool_type, expected=expected):
+                        # Exercise the real host dtype contract without allocating
+                        # GPU memory or host transfer buffers.
+                        host_pool = pool_type.__new__(pool_type)
+                        host_pool.dtype = buffer_dtype
+                        host_pool.device_pool = SimpleNamespace(
+                            dtype=value_dtype, store_dtype=buffer_dtype
+                        )
+                        controller.storage_host_pool = host_pool
+                        config = (
+                            cache_controller.HiCacheController._generate_storage_config(
+                                controller
+                            )
+                        )
+                        self.assertEqual(config.kv_cache_dtype, expected)
+
+    def test_controller_accepts_logical_storage_anchor(self):
+        from sglang.srt.managers import cache_controller
+        from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+
+        controller = SimpleNamespace(
+            enable_storage_metrics=False,
+            mem_pool_host=SimpleNamespace(layout="page_first"),
+            mem_pool_device=SimpleNamespace(dtype=torch.float8_e4m3fn),
+            storage_host_pool=LogicalHostPool(size=16, page_size=1),
+            get_attn_cp_rank_and_size=lambda: (0, 1),
+        )
         parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
         with (
             patch.object(cache_controller, "get_parallel", return_value=parallel),
@@ -287,26 +337,29 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                 cache_controller, "is_dp_attention_enabled", return_value=False
             ),
         ):
-            for host_pool in (
-                SimpleNamespace(layout="page_first", dtype=torch.uint8),
-                SimpleNamespace(layout="page_first"),
-            ):
-                controller.mem_pool_host = host_pool
-                for dtype, expected in (
-                    (torch.bfloat16, "bfloat16"),
-                    (torch.float8_e4m3fn, "float8_e4m3fn"),
-                    (torch.float8_e5m2, "float8_e5m2"),
-                ):
-                    with self.subTest(host_pool=host_pool, dtype=dtype):
-                        controller.mem_pool_device = SimpleNamespace(
-                            dtype=dtype, store_dtype=torch.uint8
-                        )
-                        config = (
-                            cache_controller.HiCacheController._generate_storage_config(
-                                controller
-                            )
-                        )
-                        self.assertEqual(config.kv_cache_dtype, expected)
+            config = cache_controller.HiCacheController._generate_storage_config(
+                controller
+            )
+        self.assertIsNone(config.kv_cache_dtype)
+
+    def test_page_envelope_reports_persisted_value_dtype(self):
+        from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+
+        for store_dtype, value_dtype, expected in (
+            (torch.bfloat16, torch.float16, torch.bfloat16),
+            (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn),
+            (torch.uint8, torch.float8_e4m3fn, torch.float8_e4m3fn),
+            (torch.uint8, torch.float8_e5m2, torch.float8_e5m2),
+        ):
+            with self.subTest(store_dtype=store_dtype, value_dtype=value_dtype):
+                host_pool = UnifiedPageEnvelopeHostPool.__new__(
+                    UnifiedPageEnvelopeHostPool
+                )
+                host_pool.dtype = torch.uint8
+                host_pool.device_pool = SimpleNamespace(
+                    dtype=value_dtype, store_dtype=store_dtype
+                )
+                self.assertEqual(host_pool.get_storage_dtype(), expected)
 
 
 if __name__ == "__main__":

@@ -266,12 +266,12 @@ You can configure it through `tenant_id` in `--hicache-storage-backend-extra-con
 
 **KV-cache dtype namespace:**
 
-HiCache appends the resolved logical KV-cache dtype to the tenant:
+HiCache appends the host pool's persisted KV value dtype to the tenant:
 
 - Default tenant: `dtype_bfloat16`, `dtype_float8_e4m3fn`, etc.
 - Explicit tenant: `tenant-a_dtype_bfloat16`, etc.
 
-The suffix uses the device-pool dtype, so FP8 formats remain distinct even when buffers store `uint8` bytes. Object keys, model prefixes, and `extra_backend_tag` are unchanged. This requires **mooncake-transfer-engine >= 0.3.12** and the multi-tenant configuration described above: register the composed tenant in the master's quota policy, and use the same `--tenant_id` for an external standalone client. Without master-side multi-tenancy, dtype isolation is not enforced.
+The host pool declares this dtype through `get_storage_dtype()`. Typed host buffers use their own dtype; raw-copy FP8 buffers retain the FP8 value encoding even when their backing tensors use `uint8`. This keeps E4M3 and E5M2 separate without assuming that the device dtype always describes the stored values. Logical anchors without a KV payload declare no value dtype and keep the configured tenant unchanged. Object keys, model prefixes, and `extra_backend_tag` are unchanged. This requires **mooncake-transfer-engine >= 0.3.12** and the multi-tenant configuration described above: register the composed tenant in the master's quota policy, and use the same `--tenant_id` for an external standalone client. Without master-side multi-tenancy, dtype isolation is not enforced.
 
 **SSD Offload (`enable_ssd_offload`):**
 
