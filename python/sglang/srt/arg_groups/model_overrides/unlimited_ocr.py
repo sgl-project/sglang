@@ -26,7 +26,8 @@ def _unlimited_ocr_overrides(server_args: Any, hf_config: Any) -> dict:
     # all-SWA architecture on Ascend.
     logger.warning(
         "Unlimited-OCR on Ascend uses full KV storage and eager reference "
-        "sliding-window attention; hybrid SWA eviction and graph capture are disabled."
+        "sliding-window attention; hybrid SWA eviction, graph capture and "
+        "chunked prefill are disabled."
     )
     return {
         "disable_hybrid_swa_memory": True,

@@ -760,6 +760,13 @@ def handle_model_capability_adjustments(server_args: Any):
     if get_platform().is_npu and "UnlimitedOCRForCausalLM" in getattr(
         hf_config, "architectures", []
     ):
+        # Multi-page OCR can repeat the first image when the prompt is split
+        # across chunks. Serve the reference prompt in one causal prefill.
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            chunked_prefill_size=-1,
+        )
         # Reference SWA compacts a different generated-token suffix per request.
         # Its eager native path is not graph safe. Graph config is a computed
         # capability declaration, rather than a publishable model override.
