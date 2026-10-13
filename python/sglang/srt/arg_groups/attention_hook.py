@@ -449,7 +449,7 @@ def handle_linear_attn_backend(server_args: Any):
     # Mamba2 uses FlashInfer checkpointing_ssu and has its own capability/dtype
     # checks in handle_mamba_backend, not the GDN/KDA replay defaults below.
     if cfg.enable_linear_replayssm_spec and not mamba2_spec_replay_enabled(
-        cfg, getattr(model_config_of(server_args).hf_text_config, "model_type", None)
+        cfg, model_config_of(server_args).hf_text_config.model_type
     ):
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(

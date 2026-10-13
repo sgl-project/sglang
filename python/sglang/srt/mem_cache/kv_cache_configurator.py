@@ -346,7 +346,7 @@ class KVCacheConfigurator:
 
             validate_mamba2_spec_replay(
                 resolving_view(self.server_args),
-                getattr(self.model_config.hf_text_config, "model_type", None),
+                self.model_config.hf_text_config.model_type,
                 is_cuda=self.device == "cuda",
                 resolved=True,
             )
@@ -366,7 +366,7 @@ class KVCacheConfigurator:
             and get_exec().mamba.enable_linear_replayssm_spec
             and mamba2_spec_replay_enabled(
                 get_exec().mamba,
-                getattr(self.model_config.hf_text_config, "model_type", None),
+                self.model_config.hf_text_config.model_type,
             )
         )
 

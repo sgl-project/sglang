@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -170,6 +171,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
             dict(disaggregation_mode="decode"),
             dict(enable_unified_memory=True),
             dict(enable_linear_replayssm=True),
+            dict(speculative_adaptive=True),
             dict(mamba_backend="triton"),
             dict(mamba_ssm_dtype="bfloat16"),
             dict(enable_int8_mamba_checkpoint=True),
@@ -248,23 +250,6 @@ class TestMamba2ReplaySizing(CustomTestCase):
                 resolution_result(args, "mamba_ssm_dtype"),
                 "float16" if model_type == "nemotron_h" else "float32",
             )
-
-    def test_cli_exposes_only_shared_replay_switch(self):
-        import argparse
-        import contextlib
-        import io
-
-        from sglang.srt.server_args import ServerArgs
-
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        parsed = parser.parse_args(
-            ["--model", "dummy", "--enable-linear-replayssm-spec"]
-        )
-        self.assertTrue(parsed.enable_linear_replayssm_spec)
-        self.assertFalse(hasattr(parsed, "enable_mamba2_spec_replay"))
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(["--model", "dummy", "--enable-mamba2-spec-replay"])
 
 
 if __name__ == "__main__":

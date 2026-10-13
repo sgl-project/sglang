@@ -1589,7 +1589,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        mamba2_replay = getattr(mamba_pool, "enable_mamba2_spec_replay", False)
+        mamba2_replay = mamba_caches.mamba2_replay_x is not None
         if mamba2_replay:
             from sglang.kernels.ops.mamba.mamba2_spec_replay import commit_mamba2_replay
 
