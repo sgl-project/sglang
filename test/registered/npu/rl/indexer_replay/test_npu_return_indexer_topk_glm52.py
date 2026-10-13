@@ -62,7 +62,7 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
                 "--disable-cuda-graph",
                 "--enable-return-indexer-topk",
                 "--json-model-override-args",
-                '{"num_hidden_layers": 6}',
+                '{"num_hidden_layers": 6, "quantization_config": null}',
             ],
         )
         try:
