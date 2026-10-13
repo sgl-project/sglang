@@ -16,8 +16,11 @@ from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
@@ -74,6 +77,10 @@ class DeepseekMHARocmForwardMixin:
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
                 if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+                        q.shape[0],
+                        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+                    )
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -85,9 +92,13 @@ class DeepseekMHARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=False,
+                        transpose_scale=emit_transposed_scale,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if emit_transposed_scale:
+                        q_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                            q_quanted
+                        )
+                    elif _use_aiter_bpreshuffle_gfx95:
                         q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
@@ -118,6 +129,10 @@ class DeepseekMHARocmForwardMixin:
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+                    q.shape[0],
+                    on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+                )
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -129,9 +144,11 @@ class DeepseekMHARocmForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=emit_transposed_scale,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
+                if emit_transposed_scale:
+                    q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
+                elif _use_aiter_bpreshuffle_gfx95:
                     q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
@@ -149,6 +166,10 @@ class DeepseekMHARocmForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
+            emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+                kv_a.shape[0],
+                on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+            )
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -160,9 +181,13 @@ class DeepseekMHARocmForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=False,
+                transpose_scale=emit_transposed_scale,
             )
-            if _use_aiter_bpreshuffle_gfx95:
+            if emit_transposed_scale:
+                kv_a_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                    kv_a_quanted
+                )
+            elif _use_aiter_bpreshuffle_gfx95:
                 kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
         else:
             kv_a = self.kv_a_layernorm(kv_a)
@@ -305,13 +330,16 @@ class DeepseekMHARocmForwardMixin:
     ):
         if _use_aiter_gfx95:
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
     def _get_mla_kv_buffer_rocm(

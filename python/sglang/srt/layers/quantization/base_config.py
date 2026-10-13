@@ -267,6 +267,20 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        """Whether a linear layer at ``prefix`` keeps its checkpoint precision.
+
+        A query for deciding module layouts before layers are built, so an
+        override must not register ``prefix`` as a quantized layer.
+        """
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return isinstance(
+            self.get_quant_method(LinearBase(1, 1), prefix=prefix),
+            UnquantizedLinearMethod,
+        )
+
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
         """Returns the activation function names that should be post-scaled.

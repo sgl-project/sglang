@@ -41,7 +41,9 @@
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
 //                      autoTopology(sel), validateTopology(sel)},
-//                      resolveDeployment(sel)}. The resolver returns a cell plus
+//                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
+//                      to qualify the recommendation badge by checkpoint or mode.
+//                      The resolver returns a cell plus
 //                      `builder` metadata (topologySummary, errors, warnings,
 //                      verification, resolvedSettings). UI-only scope/expand and
 //                      local head-address/rank state never enter the URL hash.
@@ -61,6 +63,12 @@
 //                      may also be a function of the selection, for a cell whose
 //                      verification depends on an overlay pick (e.g. one
 //                      speculative option still being validated).
+//   resolveRecipe      optional — (cell, selection) => resolved cell. Used for
+//                      PD role/concurrency recipes; shared with the playground.
+//                      For cell.pd, cell.nnodes is the per-worker node count
+//                      (a 1P1D deployment has two nodes, one per worker).
+//                      cell.pd, pdMode, router, commands, hints, dockerImage,
+//                      dockerMounts carry role-specific rendering metadata.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
@@ -92,6 +100,9 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+// Component props besides `config` / `benchmarks`:
+//   agenticLink        optional — heading id of the page's agentic long-context
+//                      section; adds a footer link to it under the Playground link
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -102,7 +113,7 @@
 //     HTML tags only; factor into helper functions, not sub-components.
 //   - Import plain-data config from the MDX file, pass through as a prop.
 
-export const Deployment = ({ config, benchmarks }) => {
+export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
@@ -630,8 +641,11 @@ export const Deployment = ({ config, benchmarks }) => {
   // where `disabled` is reserved for combinations that cannot work at all.
   const optionSoft = (opt, sel) =>
     typeof opt.soft === "function" ? opt.soft(sel) : !!opt.soft;
-  const findCell = (cells, sel) =>
-    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+  const findCell = (cells, sel) => {
+    const cell = cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+    return cell && typeof config.resolveRecipe === "function"
+      ? config.resolveRecipe(cell, sel) : cell;
+  };
 
   // Entries may also key on overlay dims (e.g. kvDsaPair): an entry applies
   // only when every declared key equals the selection, and the most specific
@@ -785,7 +799,8 @@ export const Deployment = ({ config, benchmarks }) => {
     return m ? parseInt(m[1], 10) : 1;
   };
   const cellNnodes = (cell, sel) =>
-    sel.nodes !== undefined ? parseNnodes(sel.nodes) : (cell.nnodes || 1);
+    cell.pd ? (cell.nnodes || 1)
+      : sel.nodes !== undefined ? parseNnodes(sel.nodes) : (cell.nnodes || 1);
 
   // Role-specific serving ports for PD deployments — keep in sync with PD_PORTS
   // in _playground.jsx, which the generated router command targets. Each role
@@ -802,6 +817,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderCommand = (cell, sel, envValues, mode = "python") => {
     if (!cell) return "# No command available for the current selection.";
     const modelName = resolveModelName(sel);
+    if (cell.pd && cell.commands) return interpolate(cell.commands[mode] || cell.commands.python, envValues, modelName);
     const nnodes = cellNnodes(cell, sel);
     const multinode = nnodes > 1;
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
@@ -825,7 +841,10 @@ export const Deployment = ({ config, benchmarks }) => {
         `--dist-init-addr {{NODE0_IP}}:20000`);
     }
 
-    const pdServePort = PD_SERVE_PORTS[sel.pdMode];
+    // A resolved recipe owns its role; hidden picks from that overlay must
+    // not alter a legacy cell after switching hardware or model.
+    const pdServePort = PD_SERVE_PORTS[cell.pd ? cell.pdMode
+      : config.resolveRecipe ? null : sel.pdMode];
     if (pdServePort !== undefined) {
       for (let j = 0; j < flags.length; j++) {
         if (flags[j].split(/[\s=]/)[0] === "--port") {
@@ -842,7 +861,7 @@ export const Deployment = ({ config, benchmarks }) => {
       // new-variant preview image); the strategy key covers a tier that needs
       // one (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+      const image = (cell.pd && cell.dockerImage) || di[`${sel.hw}|${sel.variant}|${sel.quant}`]
         || di[`${sel.variant}|${sel.quant}`]
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
@@ -851,7 +870,7 @@ export const Deployment = ({ config, benchmarks }) => {
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
-      const hostNetwork = multinode || (typeof config.dockerHostNetworkWhen === "function"
+      const hostNetwork = multinode || cell.pd || (typeof config.dockerHostNetworkWhen === "function"
         && config.dockerHostNetworkWhen(sel, { flags, env: cellEnv }));
       const vendorOf = (hwId) => {
         for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
@@ -920,11 +939,11 @@ export const Deployment = ({ config, benchmarks }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
+        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -942,6 +961,7 @@ export const Deployment = ({ config, benchmarks }) => {
     }
 
     const hintLines = [
+      ...(cell.pd ? cell.hints || [] : []),
       ...overlayHints(sel),
       ...(multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]
         ? config.multiNodeHints[sel.hw]
@@ -1578,7 +1598,8 @@ export const Deployment = ({ config, benchmarks }) => {
   const modelName = resolveModelName(sel);
   const curlTemplate =
     typeof config.curl === "function" ? config.curl(sel, cell) : config.curl;
-  const curlText = interpolate(curlTemplate || "", env, modelName);
+  const curlText = interpolate(curlTemplate || "",
+    cell && cell.pd && cell.router ? { ...env, CURL_PORT: String(cell.router.port) } : env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
@@ -1862,6 +1883,8 @@ export const Deployment = ({ config, benchmarks }) => {
       || sel[dim.id]
       || "—";
     const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
+      && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -1985,7 +2008,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -1997,10 +2020,10 @@ export const Deployment = ({ config, benchmarks }) => {
               </strong>
             </div>
             <div>
-              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
+              {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
             </div>
           </section>
         )}
@@ -2348,6 +2371,13 @@ export const Deployment = ({ config, benchmarks }) => {
           </div>
         </div>
 
+        {builderScope === "serve" && (
+          <p className="sgd-builder-docs-tip">
+            <strong>Tip:</strong> For more server options, see the{" "}
+            <a href="/docs/sglang-diffusion/api/cli">CLI reference</a>.
+          </p>
+        )}
+
         {modal === "env" && (
           <div style={s.modalBackdrop} onClick={() => setModal(null)}>
             <div style={s.modalBox} onClick={(event) => event.stopPropagation()}>
@@ -2517,6 +2547,44 @@ export const Deployment = ({ config, benchmarks }) => {
             }}
           >
             Open the Playground →
+          </button>
+        </div>
+      )}
+
+      {/* Agentic long-context link (opt-in per page) — same scroll-only pattern. */}
+      {agenticLink && (
+        <div
+          style={{
+            padding: "0 12px 6px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: "2px 6px",
+          }}
+        >
+          <span>Need to serve Agentic Long-Context workloads?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById(agenticLink);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Refer to the Agentic Long-Context section →
           </button>
         </div>
       )}

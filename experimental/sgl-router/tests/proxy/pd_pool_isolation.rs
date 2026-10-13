@@ -49,7 +49,10 @@ fn config() -> Config {
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -546,6 +549,7 @@ fn pd_spec(
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: port,
         version_group: group.map(str::to_owned),
+        services: Default::default(),
     }
 }
 

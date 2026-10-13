@@ -5,6 +5,7 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod affinity;
 pub mod cache_aware;
 pub mod factory;
 pub mod power_of_two;
@@ -26,7 +27,10 @@ pub struct PickRequest<'a> {
     pub model: &'a ModelId,
     pub stage: Stage,
     pub bucket: &'a str,
+    /// The longest prompt, for bucket fit and prefix matching.
     pub input_tokens: u64,
+    /// Every prompt in a batch, for load comparisons.
+    pub total_input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
@@ -41,6 +45,7 @@ impl<'a> PickRequest<'a> {
             stage,
             bucket: "",
             input_tokens,
+            total_input_tokens: input_tokens,
             expected_peak_tokens: None,
             prefix: None,
             token_ids: None,
@@ -102,7 +107,7 @@ pub trait Policy: Send + Sync + Debug {
         false
     }
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
     }

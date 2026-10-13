@@ -3,14 +3,14 @@
 
 pub mod adapter;
 pub mod chat_formatter;
-mod deepseek;
 mod kimi;
 pub mod stats;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
-use dynamo_tokenizers::Tokenizer;
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use sglang_processor::openai::{ChatModel, OpenAiTokenizer, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -64,6 +64,53 @@ pub struct TokenizerRegistry {
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
     /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
     stats: Arc<stats::TokenizerStats>,
+    /// Special tokens the engine adds around a raw prompt; `None` if unknown.
+    prompt_affixes: Option<adapter::PromptAffixes>,
+    /// What SGLang's OpenAI layer asks of the tokenizer; needs `tokenizer.json`.
+    openai: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The model config SGLang's OpenAI chat layer reads.
+    chat_model: ChatModel,
+}
+
+/// `get_context_length` over the model's text config.
+fn context_length(config: &serde_json::Value) -> u64 {
+    let config = config.get("text_config").unwrap_or(config);
+    let scaling = &config["rope_scaling"];
+    let factor = match scaling.as_object() {
+        Some(s)
+            if !s.contains_key("original_max_position_embeddings")
+                && s.get("rope_type").and_then(|t| t.as_str()) != Some("llama3") =>
+        {
+            s.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0)
+        }
+        _ => 1.0,
+    };
+    [
+        "max_sequence_length",
+        "seq_length",
+        "max_seq_len",
+        "model_max_length",
+        "max_position_embeddings",
+    ]
+    .iter()
+    .find_map(|key| config[*key].as_f64())
+    .map_or(2048, |len| (factor * len) as u64)
+}
+
+/// The served model's tokenizer as SGLang's OpenAI layer uses it.
+struct OpenAiTokens {
+    tokenizer: Arc<Tokenizer>,
+    pieces: TokenPieces,
+}
+
+impl OpenAiTokenizer for OpenAiTokens {
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        adapter::decode_complete(&self.tokenizer, ids, true).ok()
+    }
+
+    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        self.pieces.byte_level_bytes(id)
+    }
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -86,9 +133,36 @@ impl TokenizerRegistry {
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
             l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
             "tokenizer loaded");
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        if let Ok(Some(json)) = files.json("tokenizer.json") {
+            me.openai = Some(Arc::new(OpenAiTokens {
+                tokenizer: Arc::clone(&t),
+                pieces: TokenPieces::from_tokenizer_json(&json),
+            }));
+        }
+        me.chat_model = ChatModel {
+            context_length: files
+                .json("config.json")
+                .ok()
+                .flatten()
+                .map(|config| context_length(&config)),
+            generation_config: files
+                .json("generation_config.json")
+                .ok()
+                .flatten()
+                .and_then(|config| config.as_object().cloned())
+                .unwrap_or_default(),
+        };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
-        match ChatFormatter::load(&m.id, tokenizer_path) {
+        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
+            .map_err(|e| {
+                tracing::warn!(model = %m.id, error = %format!("{e:#}"),
+                    "cannot reproduce the engine's tokens; /generate, /v1/embeddings and \
+                     /v1/classify forward text")
+            })
+            .ok();
+        match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
@@ -109,23 +183,26 @@ impl TokenizerRegistry {
                 ForwardingScope::AllText => tracing::info!(model = %m.id,
                     "router-generated input_ids forwarding enabled for all text chats; requires the \
                      workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
-                     and SGLANG_DSV4_REASONING_EFFORT"),
+                     and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, so this model forwards only guarded request shapes (plain text \
+                     for DeepSeek-V4 and V4.1, so this model forwards only guarded request shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
-                ForwardingScope::Never if me.has_chat_formatter(&m.id) => {
-                    tracing::warn!(model = %m.id,
-                    "input_ids forwarding disabled: the DeepSeek-V4.1 renderer is not verified against \
-                     current SGLang; workers tokenize messages")
-                }
                 ForwardingScope::Never => {}
             }
         }
         Ok(me)
+    }
+
+    pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
+        self.openai.clone()
+    }
+
+    pub fn chat_model(&self) -> &ChatModel {
+        &self.chat_model
     }
 
     pub fn stats(&self) -> &stats::TokenizerStats {
@@ -134,6 +211,20 @@ impl TokenizerRegistry {
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
+    }
+
+    /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
+    pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        let affixes = self.prompt_affixes.as_ref()?;
+        let tokenizer = self.get(model_id)?;
+        // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
+        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+            kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
+        } else {
+            adapter::encode(&tokenizer, text)
+        }
+        .ok()?;
+        (!ids.is_empty()).then(|| affixes.apply(&ids))
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware
@@ -219,7 +310,10 @@ mod tests {
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,

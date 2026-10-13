@@ -339,6 +339,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
 
+        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+            make_indexer_cp,
+        )
+
+        self.indexer_cp = make_indexer_cp(self, runner, sparse_cfg)
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
@@ -1836,6 +1842,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
                 hisparse_swap_in_fn=hisparse_swap_in_fn,
+                indexer_cp=self.indexer_cp,
+                # the verify funnel lays out each request's draft rows consecutively
+                packed_queries=(
+                    self.speculative_num_draft_tokens
+                    if forward_batch.forward_mode.is_target_verify()
+                    else 1
+                ),
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

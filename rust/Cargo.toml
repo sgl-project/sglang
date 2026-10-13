@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "../proto",
+    "sglang-api-codegen",
+    "sglang-api-types",
     "sglang-grpc",
     "sglang-mm",
     "sglang-processor",
@@ -12,7 +13,7 @@ exclude = ["sglang-radix-tree"]
 
 [workspace.metadata.sglang]
 # Extension crates that intentionally cannot share this workspace's dependency
-# graph (sglang-radix-tree currently uses the tch-compatible PyO3 0.22 API).
+# graph (sglang-radix-tree builds against libtorch through tch).
 extension-manifests = ["sglang-radix-tree/Cargo.toml"]
 
 [workspace.package]
@@ -30,9 +31,9 @@ futures = "0.3"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 # These versions define the generated public gRPC API. Update them together
 # and deliberately rather than changing bindings during an unrelated build.
-prost = "=0.13.5"
-prost-types = "=0.13.5"
-prost-build = "=0.13.5"
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
 protoc-bin-vendored = "=3.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,11 +41,13 @@ socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tonic = { version = "=0.12.3", features = ["gzip", "transport"] }
-tonic-build = "=0.12.3"
 uuid = { version = "1", features = ["v4"] }
 
 # Profiles only take effect at the workspace root; per-member profile sections

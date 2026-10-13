@@ -208,10 +208,13 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 /// out-of-band admin call would skew the state the request router uses to
 /// pick workers.
 ///
+/// The caller's `Authorization` header is forwarded, so engines started with
+/// `--api-key` flush only for a caller holding that key.
+///
 /// Status: `200 OK` when every worker flushed successfully (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
 /// always carries the full breakdown so a partial failure is actionable.
-pub async fn flush_cache(State(ctx): State<Arc<AppContext>>) -> Response {
+pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
 
@@ -231,6 +234,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>) -> Response {
         &workers,
         ctx.proxy.admin_client(),
         ctx.proxy.request_timeout,
+        headers.get(header::AUTHORIZATION),
     )
     .await;
 
@@ -273,6 +277,7 @@ async fn fan_out_flush(
     workers: &[Arc<Worker>],
     client: &Client,
     timeout: Duration,
+    auth: Option<&HeaderValue>,
 ) -> (Vec<String>, Vec<FailedWorker>) {
     // Snapshot the URLs into owned Strings up front so the per-worker stream
     // does not borrow the `workers` slice across the await points.
@@ -280,12 +285,13 @@ async fn fan_out_flush(
 
     let outcomes = stream::iter(urls)
         .map(|url| {
-            let client = client.clone();
-            async move {
-                let flush_url = format!("{}/flush_cache", url.trim_end_matches('/'));
-                let result = client.post(&flush_url).timeout(timeout).send().await;
-                (url, result)
+            let mut request = client
+                .post(format!("{}/flush_cache", url.trim_end_matches('/')))
+                .timeout(timeout);
+            if let Some(auth) = auth {
+                request = request.header(header::AUTHORIZATION, auth);
             }
+            async move { (url, request.send().await) }
         })
         .buffer_unordered(MAX_CONCURRENT_FLUSH)
         .collect::<Vec<_>>()
@@ -445,6 +451,35 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0]["worker"], nf_url);
         assert!(failed[0]["error"].as_str().unwrap().contains("404"));
+    }
+
+    /// The caller's `Authorization` reaches workers started with `--api-key`.
+    #[tokio::test]
+    async fn forwards_caller_authorization() {
+        let app = Router::new().route(
+            "/flush_cache",
+            post(|headers: HeaderMap| async move {
+                match headers.get(header::AUTHORIZATION) {
+                    Some(v) if v == "Bearer k" => StatusCode::OK,
+                    _ => StatusCode::UNAUTHORIZED,
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let keyed = Request::post("/flush_cache")
+            .header(header::AUTHORIZATION, "Bearer k")
+            .body(Body::empty())
+            .unwrap();
+        let res = crate::server::app::build_router(ctx_with_workers(&[&url]))
+            .oneshot(keyed)
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (status, _) = post_flush(ctx_with_workers(&[&url])).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     /// A worker URL with a trailing slash must still resolve to
