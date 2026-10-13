@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.disaggregation.utils import restore_cache_only_rebootstrap_tokens
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -726,8 +727,8 @@ class TpModelWorker(BaseTpWorker):
             ):
 
                 def sample_batch_func():
-                    batch_result.next_token_ids = self.model_runner.sample(
-                        logits_output, forward_batch
+                    batch_result.next_token_ids = restore_cache_only_rebootstrap_tokens(
+                        batch, self.model_runner.sample(logits_output, forward_batch)
                     )
                     self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
@@ -737,8 +738,8 @@ class TpModelWorker(BaseTpWorker):
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
+                batch_result.next_token_ids = restore_cache_only_rebootstrap_tokens(
+                    batch, self.model_runner.sample(logits_output, forward_batch)
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU

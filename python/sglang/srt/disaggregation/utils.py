@@ -39,7 +39,7 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -341,6 +341,32 @@ def poll_and_all_reduce_with_staging(
 
 CACHE_ONLY_METADATA_SLOT = 7
 CACHE_ONLY_COVERAGE_SLOT = 8
+
+
+def restore_cache_only_rebootstrap_tokens(
+    batch: Optional[ScheduleBatch], next_token_ids: torch.Tensor
+) -> torch.Tensor:
+    """Restore emitted boundaries before relay or draft state consumes tokens.
+
+    Keep request markers until result processing, which owns the output commit
+    and skips accounting already performed before retraction.
+    """
+    if batch is None or not batch.dsv41_cache_only_replay:
+        return next_token_ids
+    forced = [
+        (i, req.pd_rebootstrap_forced_output_id)
+        for i, req in enumerate(batch.reqs)
+        if req.pd_rebootstrap_in_progress
+        and req.pd_rebootstrap_forced_output_id is not None
+    ]
+    if not forced:
+        return next_token_ids
+    rows, tokens = zip(*forced)
+    restored = next_token_ids.clone()
+    restored[torch.tensor(rows, device=restored.device)] = torch.tensor(
+        tokens, dtype=restored.dtype, device=restored.device
+    )
+    return restored
 
 
 class ReqToMetadataIdxAllocator:
