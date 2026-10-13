@@ -1199,6 +1199,25 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if _mirrors_hybrid_dsa_indexer(kv_pool, mtp_draft_device_pools):
+        # Sparse attention picks its top-k from these keys; without a host copy a
+        # restored prefix reads whatever the previous owner of its pages wrote.
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=DSAIndexerPoolHost(
+                    kv_pool,
+                    kv_host_pool,
+                    get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                ),
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1220,6 +1239,27 @@ def build_hybrid_mamba_stack(
         host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
+
+
+def _mirrors_hybrid_dsa_indexer(kv_pool: Any, draft_pools: tuple[Any, ...]) -> bool:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if not isinstance(kv_pool, DSATokenToKVPool):
+        return False
+    # DSAIndexerPoolHost packs one index buffer per target layer and per draft
+    # pool, so every layer of every pool must own index keys.
+    pools = (kv_pool, *draft_pools)
+    if all(
+        isinstance(pool, DSATokenToKVPool) and not any(pool.skip_topk_layers)
+        for pool in pools
+    ):
+        return True
+    logger.warning(
+        "HiCache does not back up DSA index keys for this hybrid model when some "
+        "layers or MTP draft pools share top-k; host-tier hits may return wrong "
+        "output. Disable --enable-hierarchical-cache to avoid it."
+    )
+    return False
 
 
 def build_hybrid_mamba_swa_stack(
@@ -1827,6 +1867,7 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        has_indexer = PoolName.INDEXER in host_pool_group.entry_map
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1834,8 +1875,11 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=(
+                [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)] if has_indexer else []
+            ),
             register_req_to_token_counter=True,
-            pools_desc="KV + MAMBA",
+            pools_desc="KV + MAMBA + INDEXER" if has_indexer else "KV + MAMBA",
         )
 
 

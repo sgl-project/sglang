@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
@@ -19,7 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
     build_hybrid_swa_group,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -238,6 +239,100 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
 
 _ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+
+
+def _dsa_kv_pool(skip_topk_layers: list[bool]) -> DSATokenToKVPool:
+    pool = object.__new__(DSATokenToKVPool)
+    pool.skip_topk_layers = skip_topk_layers
+    pool.layer_num = len(skip_topk_layers)
+    return pool
+
+
+class TestHybridMambaDsaIndexerMirror(CustomTestCase):
+    def _build_mamba_strategy(self, kv_pool, draft_pools=()):
+        memory = SimpleNamespace(
+            hicache_size=0,
+            hicache_ratio=2.0,
+            hicache_mem_layout="page_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="default",
+        )
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            full_attention_layer_id_mapping={3: 0, 7: 1},
+            full_kv_pool=kv_pool,
+            use_mla=True,
+        )
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_map={0: 0, 1: 1, 2: 2},
+                mamba_pool=MagicMock(),
+                mamba_allocator=MagicMock(),
+            ),
+            mtp_draft_device_pools=draft_pools,
+            page_size=64,
+            token_to_kv_pool_allocator=None,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        with (
+            patch(_ASSEMBLER + "get_memory", return_value=memory),
+            patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+            patch(_ASSEMBLER + "build_kv_host_pool"),
+            patch(_ASSEMBLER + "MambaPoolHost"),
+            patch(_ASSEMBLER + "DSAIndexerPoolHost") as indexer_host_cls,
+            patch(_ASSEMBLER + "HybridCacheController"),
+            patch(
+                _ASSEMBLER + "build_pool_entry",
+                side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+            ),
+            patch(
+                _ASSEMBLER + "HostPoolGroup",
+                side_effect=lambda entries: SimpleNamespace(
+                    entry_map={e.name: e for e in entries},
+                    get_pool=lambda name: None,
+                ),
+            ),
+        ):
+            result = _MambaStrategy().build(
+                cache=MagicMock(),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        return result, indexer_host_cls
+
+    def test_dsa_index_keys_ride_kv_transfers(self):
+        """A hybrid Mamba + DSA host tier that skips the index keys makes every
+        restored prefix select top-k from the previous page owner's keys."""
+        kv_pool = _dsa_kv_pool([False, False])
+        result, indexer_host_cls = self._build_mamba_strategy(kv_pool)
+
+        entries = result.host_pool_group.entry_map
+        self.assertIn(PoolName.INDEXER, entries)
+        indexer, kv = entries[PoolName.INDEXER], entries[PoolName.KV]
+        self.assertIs(indexer.device_pool, kv_pool)
+        self.assertIs(indexer.host_pool, indexer_host_cls.return_value)
+        self.assertEqual(indexer.layer_mapping, kv.layer_mapping)
+        self.assertEqual(indexer.transfer_layer_id_max, kv.transfer_layer_id_max)
+        self.assertEqual(
+            result.sidecars, [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)]
+        )
+
+    def test_shared_topk_draft_skips_index_mirror(self):
+        # The packed indexer host needs one index buffer per draft pool.
+        draft = _dsa_kv_pool([True])
+        result, indexer_host_cls = self._build_mamba_strategy(
+            _dsa_kv_pool([False, False]), draft_pools=(draft,)
+        )
+
+        self.assertNotIn(PoolName.INDEXER, result.host_pool_group.entry_map)
+        self.assertEqual(result.sidecars, [])
+        indexer_host_cls.assert_not_called()
 
 
 class TestTransferLayerSpan(CustomTestCase):
