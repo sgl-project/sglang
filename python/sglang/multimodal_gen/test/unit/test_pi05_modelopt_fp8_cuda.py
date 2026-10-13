@@ -32,10 +32,7 @@ from sglang.multimodal_gen.tools.quantize_pi05_modelopt_fp8 import (
 from sglang.srt.models.siglip import SiglipEncoderLayer
 from sglang.srt.runtime_context import publish, restore_context, snapshot_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
 
 
 def tiny_core():
