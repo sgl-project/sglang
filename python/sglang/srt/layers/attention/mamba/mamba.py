@@ -719,7 +719,7 @@ class MambaMixer2(torch.nn.Module):
             if is_target_verify:
                 verify_fn = selective_state_update
                 verify_kwargs = {}
-                if getattr(layer_cache, "mamba2_replay_x", None) is not None:
+                if layer_cache.mamba2_replay_x is not None:
                     from sglang.kernels.ops.mamba.mamba2_spec_replay import (
                         verify_mamba2_replay,
                     )

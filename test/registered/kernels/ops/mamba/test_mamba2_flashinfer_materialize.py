@@ -1,10 +1,9 @@
 """Validate eager materialization from pinned FlashInfer compact records."""
 
-import argparse
 import unittest
 
-import test_mamba2_flashinfer_replay as replay_tests
 import torch
+
 from sglang.kernels.ops.mamba.flashinfer_replay_materialize import (
     make_replay_pointer_table,
     materialize_flashinfer_mamba2,
@@ -29,7 +28,7 @@ class TestFlashInferMaterialization(CustomTestCase):
         torch.testing.assert_close(c.state, c.initial, rtol=0, atol=0)
 
     def commit(self, c, last, tracks=None, steps=None, seeds=None):
-        if not hasattr(c, "pointer_table"):
+        if c.pointer_table is None:
             c.pointer_table = make_replay_pointer_table(
                 c.state.unsqueeze(0),
                 c.old_x.unsqueeze(0),
@@ -172,13 +171,4 @@ class TestFlashInferMaterialization(CustomTestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--diagnostic", action="store_true")
-    options, remaining = parser.parse_known_args()
-    if options.diagnostic:
-        replay_tests.DIAGNOSTIC = True
-        print(
-            "DIAGNOSTIC ONLY: numerical gates reported, not enforced; not a validation pass.",
-            flush=True,
-        )
-    unittest.main(argv=[__file__, *remaining])
+    unittest.main()

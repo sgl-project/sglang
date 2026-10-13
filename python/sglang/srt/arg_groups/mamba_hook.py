@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def handle_mamba_backend(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.enable_linear_replayssm_spec and mamba2_spec_replay_enabled(
-        cfg, getattr(model_config_of(server_args).hf_text_config, "model_type", None)
+        cfg, model_config_of(server_args).hf_text_config.model_type
     ):
         from sglang.srt.configs.mamba2_spec_replay import validate_mamba2_spec_replay
         from sglang.srt.speculative.ragged_verify import (
@@ -36,7 +36,7 @@ def handle_mamba_backend(server_args: Any):
             )
         validate_mamba2_spec_replay(
             cfg,
-            getattr(model.hf_text_config, "model_type", None),
+            model.hf_text_config.model_type,
             is_cuda=get_platform().is_cuda,
         )
         if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:

@@ -1,6 +1,6 @@
 """CPU-only sizing and capability checks for compact Mamba2 verify records."""
 
-from dataclasses import dataclass
+import msgspec
 
 
 def mamba2_spec_replay_enabled(cfg, model_type):
@@ -35,18 +35,17 @@ def validate_mamba2_spec_replay(cfg, model_type, *, is_cuda, resolved=False):
         raise ValueError(prefix + "does not yet support PD disaggregation.")
     if cfg.enable_unified_memory:
         raise ValueError(prefix + "does not yet support unified memory pools.")
-    if getattr(cfg, "enable_page_major_kv_layout", False):
+    if cfg.enable_page_major_kv_layout:
         raise ValueError(prefix + "requires contiguous layer-major Mamba pools.")
     if cfg.enable_linear_replayssm:
         raise ValueError(prefix + "cannot be combined with --enable-linear-replayssm.")
-    if getattr(cfg, "speculative_adaptive", False):
+    if cfg.speculative_adaptive:
         raise ValueError(prefix + "does not yet support adaptive verify widths.")
-    if getattr(cfg, "enable_int8_mamba_checkpoint", False):
+    if cfg.enable_int8_mamba_checkpoint:
         raise ValueError(prefix + "does not yet support int8 checkpoint pools.")
 
 
-@dataclass(frozen=True)
-class Mamba2ReplaySizing:
+class Mamba2ReplaySizing(msgspec.Struct, frozen=True):
     """Exact local-layer allocation costs, including physical conv scratch."""
 
     persistent_per_slot: int

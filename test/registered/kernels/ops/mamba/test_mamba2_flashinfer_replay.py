@@ -4,22 +4,17 @@ No model or server is loaded. JSON measurements distinguish numerical error
 from exact state/buffer lifetime invariants. Run directly with Python on CUDA.
 """
 
-import argparse
 import importlib.metadata
-import importlib.util
 import json
 import unittest
-from pathlib import Path
 
 import torch
-import triton
 from flashinfer.mamba import checkpointing_ssu, selective_state_update
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-
-DIAGNOSTIC = False
 
 
 def error_summary(actual, expected):
@@ -50,8 +45,6 @@ def check_numerics(label, actual, expected, **metadata):
     # This is a kernel screening ceiling, not a model-accuracy qualification.
     eps = torch.finfo(torch.bfloat16).eps
     assert stats["finite"], label
-    if DIAGNOSTIC:
-        return
     assert stats["rms_relative"] <= eps, (label, stats)
     assert stats["max_bf16_scaled_error"] <= 4, (label, stats)
 
@@ -59,6 +52,7 @@ def check_numerics(label, actual, expected, **metadata):
 class FlashInferCase:
     def __init__(self, batch=5, width=4, window=None, rounding=False):
         self.batch, self.width = batch, width
+        self.pointer_table = None
         self.window = window or width
         self.h, self.p, self.g, self.n = 128, 64, 8, 128
         h, p, g, n = self.h, self.p, self.g, self.n
@@ -161,29 +155,14 @@ class FlashInferCase:
         dt = torch.nn.functional.softplus(
             self.raw_dt[valid].float() + self.bias_base.float()
         )
-        for name, actual, expected in (
-            (
-                "processed_dt",
-                self.old_dt[slots, :, : self.width],
-                dt.transpose(1, 2),
-            ),
-        ):
-            if DIAGNOSTIC:
-                print(
-                    json.dumps({"comparison": name, **error_summary(actual, expected)}),
-                    flush=True,
-                )
-            else:
-                # CUDA's fast log/exp softplus is not PyTorch's log1p path.
-                # Charge four FP32 eps per term and accumulation length;
-                # keep copied x/B byte-exact and report numerical errors.
-                terms = 1 if name == "processed_dt" else self.width
-                torch.testing.assert_close(
-                    actual,
-                    expected,
-                    rtol=2e-6,
-                    atol=4 * torch.finfo(torch.float32).eps * terms,
-                )
+        # CUDA's fast log/exp softplus is not PyTorch's log1p path.
+        # Charge four FP32 eps; keep copied x/B byte-exact.
+        torch.testing.assert_close(
+            self.old_dt[slots, :, : self.width],
+            dt.transpose(1, 2),
+            rtol=2e-6,
+            atol=4 * torch.finfo(torch.float32).eps,
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -265,74 +244,5 @@ class TestFlashInferReplayContract(CustomTestCase):
                 )
 
 
-@torch.inference_mode()
-def benchmark():
-    for batch in (16, 32, 64):
-        c = FlashInferCase(batch=batch, rounding=True)
-        c.verify(False)
-        c.verify(True)
-        baseline = triton.testing.do_bench_cudagraph(lambda: c.verify(False), rep=200)
-        replay = triton.testing.do_bench_cudagraph(lambda: c.verify(True), rep=200)
-        print(
-            json.dumps(
-                {
-                    "benchmark": "verify_only_per_layer",
-                    "batch": batch,
-                    "baseline_ms": baseline,
-                    "checkpointing_ms": replay,
-                    "note": "excludes materialization; not end-to-end speedup",
-                }
-            ),
-            flush=True,
-        )
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--diagnostic", action="store_true")
-    parser.add_argument("--all-stages", action="store_true")
-    options, remaining = parser.parse_known_args()
-    DIAGNOSTIC = options.diagnostic
-    if DIAGNOSTIC:
-        print(
-            "DIAGNOSTIC ONLY: numerical gates reported but not enforced; not a validation pass.",
-            flush=True,
-        )
-    if options.all_stages:
-        # Sequential gates in one container invocation: do not pay Pyxis startup
-        # again for each stage, and never run a later stage after a failed gate.
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            TestFlashInferReplayContract
-        )
-        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
-            raise SystemExit(1)
-        from test_mamba2_flashinfer_materialize import TestFlashInferMaterialization
-
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            TestFlashInferMaterialization
-        )
-        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
-            raise SystemExit(1)
-        from test_mamba2_spec_replay import TestMamba2SpecReplay
-
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestMamba2SpecReplay)
-        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
-            raise SystemExit(1)
-        sizing_path = (
-            Path(__file__).resolve().parents[3]
-            / "unit/mem_cache/test_mamba2_replay_sizing.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "replay_sizing_tests", sizing_path
-        )
-        sizing_tests = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sizing_tests)
-        suite = unittest.defaultTestLoader.loadTestsFromModule(sizing_tests)
-        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
-            raise SystemExit(1)
-        benchmark()
-    elif options.benchmark:
-        benchmark()
-    else:
-        unittest.main(argv=[__file__, *remaining])
+    unittest.main()
