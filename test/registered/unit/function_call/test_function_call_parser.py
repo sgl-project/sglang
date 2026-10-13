@@ -3896,6 +3896,22 @@ class TestLing3Detector(unittest.TestCase):
                 ),
             ),
         ]
+        self.tools.append(
+            Tool(
+                type="function",
+                function=Function(
+                    name="api_fetch",
+                    description="Fetch an API resource",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "body": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "params": {"type": ["null", "string"]},
+                        },
+                    },
+                ),
+            )
+        )
         self.detector = Ling3Detector()
 
     def _collect_streaming_tool_calls(self, chunks):
@@ -3981,6 +3997,85 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(len(tool_calls), 1)
                 self.assertEqual(tool_calls[0]["name"], "get_weather")
                 self.assertEqual(tool_calls[0]["parameters"], expected)
+
+    def test_nullable_string_null_preserved_non_streaming(self):
+        text = (
+            "<tool_call>api_fetch"
+            "<arg_key>body</arg_key><arg_value>null</arg_value>"
+            "<arg_key>params</arg_key><arg_value>null</arg_value>"
+            "</tool_call>"
+        )
+
+        result = Ling3Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "api_fetch")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"body": None, "params": None},
+        )
+
+    def test_nullable_string_non_null_values_remain_strings(self):
+        cases = (
+            ('"null"', "null"),
+            ("None", "None"),
+            ("nullish", "nullish"),
+        )
+        for raw_value, expected in cases:
+            with self.subTest(raw_value=raw_value):
+                text = (
+                    "<tool_call>api_fetch"
+                    f"<arg_key>body</arg_key><arg_value>{raw_value}</arg_value>"
+                    "</tool_call>"
+                )
+
+                result = Ling3Detector().detect_and_parse(text, self.tools)
+
+                params = json.loads(result.calls[0].parameters)
+                self.assertEqual(params, {"body": expected})
+                self.assertIsInstance(params["body"], str)
+
+    def test_nullable_string_null_preserved_streaming(self):
+        text = (
+            "<tool_call>api_fetch"
+            "<arg_key>body</arg_key><arg_value>null</arg_value>"
+            "<arg_key>params</arg_key><arg_value>null</arg_value>"
+            "</tool_call>"
+        )
+
+        tool_calls = self._collect_streaming_tool_calls(list(text))
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "api_fetch")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]),
+            {"body": None, "params": None},
+        )
+        self.assertEqual(
+            self.detector.streamed_args_for_tool[0], tool_calls[0]["parameters"]
+        )
+
+    def test_nullable_string_null_prefix_remains_string_streaming(self):
+        cases = (
+            "n",
+            "nu",
+            "nul",
+            "nullish",
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                self.detector = Ling3Detector()
+                text = (
+                    "<tool_call>api_fetch"
+                    f"<arg_key>body</arg_key><arg_value>{value}</arg_value>"
+                    "</tool_call>"
+                )
+
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+
+                params = json.loads(tool_calls[0]["parameters"])
+                self.assertEqual(params, {"body": value})
+                self.assertIsInstance(params["body"], str)
 
 
 class TestJsonArrayParser(unittest.TestCase):
