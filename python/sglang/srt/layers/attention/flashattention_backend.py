@@ -48,7 +48,10 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    per_step_draft_out_cache_loc,
+)
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -67,6 +70,52 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+
+def _is_qlen_only_tree_mask(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        getattr(spec_info, "tree_mask_mode", TreeMaskMode.FULL_MASK)
+        == TreeMaskMode.QLEN_ONLY
+    )
+
+
+def _extract_target_verify_tree_mask(
+    spec_info: SpecInput,
+    *,
+    bs: int,
+    verify_width: int,
+    seq_lens: torch.Tensor,
+    device: torch.device,
+    valid_num_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    """Return the [bs * verify_width, verify_width] tree visibility matrix.
+
+    FULL_MASK stores prefix columns before each tree suffix and therefore needs
+    a gather. QLEN_ONLY is already the exact suffix matrix and can be viewed
+    directly, eliminating the per-step index construction and gather kernel.
+    """
+    if _is_qlen_only_tree_mask(spec_info):
+        required = int(bs) * int(verify_width) * int(verify_width)
+        if spec_info.custom_mask.numel() < required:
+            raise ValueError(
+                "QLEN_ONLY target verify mask is smaller than the captured batch"
+            )
+        return spec_info.custom_mask[:required].view(-1, verify_width)
+
+    offsets = torch.arange(verify_width, device=device).unsqueeze(0)
+    cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
+    cum_len = torch.nn.functional.pad(
+        torch.cumsum(
+            (seq_lens + verify_width).repeat_interleave(verify_width), dim=0
+        ),
+        (1, 0),
+    )[:-1]
+    mask_extraction_indices = (
+        cols.repeat_interleave(verify_width, dim=0) + cum_len[:, None]
+    ).view(1, -1)
+    if valid_num_tokens is not None:
+        mask_extraction_indices[:, valid_num_tokens * verify_width :].fill_(0)
+    return spec_info.custom_mask[mask_extraction_indices].view(-1, verify_width)
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -332,6 +381,12 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             attention_tp_size
         )
+        hf_text_config = model_runner.model_config.hf_text_config
+        self.mla_qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", None)
+        self.mla_kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", None)
+        if self.use_mla:
+            assert self.mla_qk_rope_head_dim is not None
+            assert self.mla_kv_lora_rank is not None
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
@@ -408,33 +463,63 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         )
 
-    def _compute_scheduler_metadata(
-        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
+    def _compute_scheduler_metadata_for(
+        self,
+        *,
+        batch_size,
+        max_seq_len_q,
+        max_seq_len_k,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k_new=None,
+        page_size=None,
+        causal,
     ):
-        """Compute FA3 scheduler metadata for decode.
-
-        Returns the scheduler_metadata tensor, or None if not applicable.
-        """
-        if self._get_scheduler_metadata is None or self.use_mla:
+        """Compute reusable FA3 tile scheduling metadata for one attention leg."""
+        if self._get_scheduler_metadata is None:
             return None
         if self._disable_scheduler_metadata_precompute:
             return None
-        # Always use window_size=(-1, -1) because scheduler_metadata is only
-        # consumed by non-SWA layers (SWA layers skip it in forward_decode).
+        if self.use_mla:
+            # Absorbed MLA presents FA3 with the RoPE-only Q/K head and a
+            # single latent KV head. The value path is the KV-LoRA latent.
+            num_heads_k = 1
+            headdim = self.mla_qk_rope_head_dim
+            headdim_v = self.mla_kv_lora_rank
+        else:
+            num_heads_k = self.num_kv_heads
+            headdim = self.head_dim
+            headdim_v = None
         return self._get_scheduler_metadata(
             batch_size=batch_size,
-            max_seqlen_q=1,
+            max_seqlen_q=max_seq_len_q,
             max_seqlen_k=max_seq_len_k,
             num_heads=self.num_attention_heads,
-            num_heads_k=self.num_kv_heads,
-            headdim=self.head_dim,
+            num_heads_k=num_heads_k,
+            headdim=headdim,
+            headdim_v=headdim_v,
             cache_seqlens=cache_seqlens,
             qkv_dtype=self.kv_cache_dtype,
             cu_seqlens_q=cu_seqlens_q,
-            page_size=self.page_size,
-            causal=True,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            page_size=self.page_size if page_size is None else page_size,
+            causal=causal,
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
+        )
+
+    def _compute_scheduler_metadata(
+        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
+    ):
+        """Compute FA3 scheduler metadata for normal decode."""
+        # Always use window_size=(-1, -1): SWA layers do not consume this buffer.
+        return self._compute_scheduler_metadata_for(
+            batch_size=batch_size,
+            max_seq_len_q=1,
+            max_seq_len_k=max_seq_len_k,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            causal=True,
         )
 
     def validate_elastic_cuda_graph_recapture(self) -> None:
@@ -482,6 +567,11 @@ class FlashAttentionBackend(AttentionBackend):
                 # bucket always processes its full captured request width;
                 # padded rows are not consumed by the model output.
                 positions=forward_batch.positions,
+                tree_mask_mode=getattr(
+                    forward_batch.spec_info,
+                    "tree_mask_mode",
+                    TreeMaskMode.FULL_MASK,
+                ),
             )
             self._apply_cuda_graph_metadata(
                 bs=forward_batch.batch_size,
@@ -1127,24 +1217,13 @@ class FlashAttentionBackend(AttentionBackend):
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
+                mask = _extract_target_verify_tree_mask(
+                    forward_batch.spec_info,
+                    bs=batch_size,
+                    verify_width=self.speculative_num_draft_tokens,
+                    seq_lens=forward_batch.seq_lens,
+                    device=device,
+                )
 
                 # shift table indices to avoid padding
                 # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
@@ -1775,6 +1854,7 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
+                    scheduler_metadata=metadata.scheduler_metadata,
                     **kwargs,
                 )
 
@@ -1832,6 +1912,9 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    scheduler_metadata=(
+                        self.forward_metadata_spec_decode_expand.scheduler_metadata
+                    ),
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1999,6 +2082,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        scheduler_metadata=metadata.scheduler_metadata,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
@@ -2022,6 +2106,9 @@ class FlashAttentionBackend(AttentionBackend):
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
+                                scheduler_metadata=(
+                                    self.forward_metadata_spec_decode_expand.scheduler_metadata
+                                ),
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -3220,27 +3307,14 @@ class FlashAttentionBackend(AttentionBackend):
                 ).unsqueeze(0)  # shape: (1, verify_width)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            seq_lens + verify_width
-                        ).repeat_interleave(verify_width),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(verify_width, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
-                    :,
-                    spec_info.positions.numel() * verify_width :,
-                ].fill_(0)
-                mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, verify_width
-                )  # (bsz * draft_num, draft_num)
+                mask = _extract_target_verify_tree_mask(
+                    spec_info,
+                    bs=bs,
+                    verify_width=verify_width,
+                    seq_lens=seq_lens,
+                    device=device,
+                    valid_num_tokens=spec_info.positions.numel(),
+                )
 
                 col_indices = offsets.expand(
                     mask.shape[0], verify_width
@@ -3269,6 +3343,38 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                     )
                 )
+
+                # The two cascade-attention legs have identical geometry for
+                # every full-attention layer. Build FA3 scheduling metadata once
+                # at the graph head and reuse it across layers instead of running
+                # prepare_varlen_num_blocks twice per layer.
+                if (
+                    envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
+                    and not self.has_swa
+                ):
+                    metadata.scheduler_metadata = (
+                        self._compute_scheduler_metadata_for(
+                            batch_size=bs,
+                            max_seq_len_q=verify_width,
+                            max_seq_len_k=self.max_context_len,
+                            cache_seqlens=metadata.cache_seqlens_int32,
+                            cu_seqlens_q=metadata.cu_seqlens_q,
+                            cu_seqlens_k_new=metadata.cu_seqlens_k,
+                            causal=False,
+                        )
+                    )
+                    metadata_expand.scheduler_metadata = (
+                        self._compute_scheduler_metadata_for(
+                            batch_size=bs * verify_width,
+                            max_seq_len_q=1,
+                            max_seq_len_k=verify_width,
+                            cache_seqlens=metadata_expand.cache_seqlens_int32,
+                            cu_seqlens_q=metadata_expand.cu_seqlens_q,
+                            cu_seqlens_k_new=metadata_expand.cu_seqlens_k,
+                            page_size=1,
+                            causal=False,
+                        )
+                    )
                 if self.has_swa:
                     metadata_swa = self.target_verify_metadata_topk_swa[verify_key]
                     self._init_sliding_window_attn_spec_metadata(

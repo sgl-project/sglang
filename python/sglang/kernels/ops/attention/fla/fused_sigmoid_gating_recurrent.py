@@ -1042,11 +1042,12 @@ def fused_sigmoid_gating_delta_rule_update(
     # every token.
     match_cutedsl_decode: bool = False,
     factor_cache_indices: Optional[torch.Tensor] = None,
-    factor_num_warps: int = 2,
+    factor_num_warps: Optional[int] = None,
     factor_num_stages: int = 2,
-    factor_verify_bv: int = 32,
-    factor_verify_num_warps: int = 8,
-    factor_verify_num_stages: int = 3,
+    factor_verify_bv: Optional[int] = None,
+    factor_verify_bm: Optional[int] = None,
+    factor_verify_num_warps: Optional[int] = None,
+    factor_verify_num_stages: Optional[int] = None,
     tree_processed_k: Optional[torch.Tensor] = None,
     tree_processed_decay: Optional[torch.Tensor] = None,
     tree_processed_beta: Optional[torch.Tensor] = None,
@@ -1210,7 +1211,15 @@ def fused_sigmoid_gating_delta_rule_update(
             assert tree_processed_k.shape == (N, HV, tree_width, K)
             assert tree_processed_decay.shape == (N, HV, tree_width, K)
             assert tree_processed_beta.shape == (N, HV, tree_width)
-        assert factor_verify_bv in (16, 32)
+        if factor_num_warps is None:
+            factor_num_warps = 2
+        if factor_verify_bv is None:
+            # M=32 on Ling3-Flash TP4 is occupancy-limited at BV=16.  Splitting
+            # V into BV=8 tiles lowers the verify kernel register footprint and
+            # wins despite doubling the V-grid.  Other widths keep their
+            # previously validated tile.
+            factor_verify_bv = 8 if tree_width == 32 else 32
+        assert factor_verify_bv in (8, 16, 32)
         cache_tree_factors = cache_ring
         if cache_tree_factors:
             assert V == K, "factorized tree raw cache currently requires V == K"
@@ -1278,10 +1287,13 @@ def fused_sigmoid_gating_delta_rule_update(
         # 32-row CTA; width 65 is split to avoid a costly 128x128 tile. This
         # also permits controlled fixed-width sweeps without changing the
         # production adaptive/batch-aware buckets.
-        factor_verify_bm = 32 if tree_width <= 32 or tree_width == 65 else 64
-        if tree_width <= 32:
-            factor_verify_num_warps = 4
-            factor_verify_num_stages = 2
+        if factor_verify_bm is None:
+            factor_verify_bm = 32 if tree_width <= 32 or tree_width == 65 else 64
+        assert factor_verify_bm in (16, 32, 64)
+        if factor_verify_num_warps is None:
+            factor_verify_num_warps = 2 if tree_width == 32 else (4 if tree_width < 32 else 8)
+        if factor_verify_num_stages is None:
+            factor_verify_num_stages = 1 if tree_width == 32 else (2 if tree_width < 32 else 3)
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
         factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
         fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](
