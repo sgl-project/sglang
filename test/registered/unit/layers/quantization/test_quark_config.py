@@ -723,7 +723,7 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
             "re:.*shared_expert.*",
             "model.language_model.layers.2.mlp.shared_expert.down_proj",
         ):
-            with self.subTest(exclude):
+            with self.subTest(exclude=exclude):
                 config = self._config(exclude_layers=[exclude])
                 self.assertTrue(config.shared_expert_excluded_from_quant())
 
@@ -743,7 +743,7 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
             "mtp.0.mlp.shared_expert.gate_proj",
             f"model.layers.{appended}.mlp.shared_expert.down_proj",
         ):
-            with self.subTest(exclude):
+            with self.subTest(exclude=exclude):
                 config = self._config(exclude_layers=[exclude])
                 self.assertFalse(config.shared_expert_excluded_from_quant())
 
@@ -780,10 +780,10 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
             "not_rocm": {"rocm": False},
         }
         for name, kwargs in cases.items():
-            with self.subTest(name), self._online_quant_available(**kwargs):
+            with self.subTest(case=name), self._online_quant_available(**kwargs):
                 self.assertFalse(config.shared_expert_online_mxfp4_supported())
 
-        with self.subTest("not_prequantized"), self._online_quant_available():
+        with self.subTest(case="not_prequantized"), self._online_quant_available():
             not_prequantized = self._config(
                 exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
                 is_prequantized=False,
@@ -812,12 +812,12 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         # never measured on.
         excluded = ["model.layers.0.mlp.shared_expert.gate_proj"]
         for model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
-            with self.subTest(model_type), self._online_quant_available():
+            with self.subTest(model_type=model_type), self._online_quant_available():
                 config = self._config(exclude_layers=excluded, model_type=model_type)
                 self.assertTrue(config.shared_expert_online_mxfp4_supported())
 
         for model_type in ("deepseek_v3", "deepseek_v32", "qwen3_moe", None):
-            with self.subTest(model_type), self._online_quant_available():
+            with self.subTest(model_type=model_type), self._online_quant_available():
                 config = self._config(exclude_layers=excluded, model_type=model_type)
                 self.assertFalse(config.shared_expert_online_mxfp4_supported())
                 # And the pre-existing refusal is what such a checkpoint gets.
@@ -1001,6 +1001,52 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         ):
             with self.assertRaisesRegex(NotImplementedError, "W4A4 MXFP4 MoE scheme"):
                 config.get_quant_method(self._moe_layer(), "model.layers.3.mlp.experts")
+
+
+class TestSharedExpertOnlineMxfp4Quantize(CustomTestCase):
+    """The scheme side of the conversion the loader hook calls into.
+
+    TestSharedExpertOnlineMxfp4Loader stubs this method out to pin where the
+    packed result lands, so what it hands back is only checked here.
+    """
+
+    @staticmethod
+    def _scheme() -> QuarkW4A4MXFp4MoE:
+        # __init__ reads the quant specs and logs; none of that is involved.
+        return object.__new__(QuarkW4A4MXFp4MoE)
+
+    def test_the_whole_tensor_is_forwarded_and_the_result_passed_back(self):
+        # Quantizing whole and sharding afterwards is what makes a rank's bytes
+        # match an offline-quantized checkpoint of the same shard, so the
+        # tensor must reach aiter unsliced and come back untouched.
+        weight = torch.arange(4 * 64, dtype=torch.bfloat16).reshape(4, 64)
+        packed = torch.zeros(4, 32, dtype=torch.uint8)
+        scale = torch.zeros(4, 2, dtype=torch.uint8)
+        seen = []
+
+        def fake_quant(tensor):
+            seen.append(tensor)
+            return packed, scale
+
+        with patch.object(quark_moe, "dynamic_mxfp4_quant", fake_quant):
+            out_weight, out_scale = self._scheme().quantize_shared_expert(
+                weight, torch.device("cpu")
+            )
+
+        self.assertEqual(len(seen), 1)
+        torch.testing.assert_close(seen[0], weight)
+        self.assertIs(out_weight, packed)
+        self.assertIs(out_scale, scale)
+
+    def test_a_build_without_aiter_refuses_instead_of_returning_none(self):
+        # dynamic_mxfp4_quant is None on a CUDA build. Calling it would raise
+        # TypeError part way through weight loading; the fused slot cannot be
+        # filled at all, so say so.
+        with patch.object(quark_moe, "dynamic_mxfp4_quant", None):
+            with self.assertRaisesRegex(NotImplementedError, "dynamic_mxfp4_quant"):
+                self._scheme().quantize_shared_expert(
+                    torch.zeros(4, 64, dtype=torch.bfloat16), torch.device("cpu")
+                )
 
 
 if __name__ == "__main__":
