@@ -1,15 +1,18 @@
+import os
 import unittest
+from unittest.mock import patch
 
 import requests
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
-register_cuda_ci(est_time=216, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
 # AMD: flashinfer is not built in the ROCm sgl_kernel, so only the
 # triton-backend class runs on ROCm.
 register_amd_ci(est_time=130, suite="extra-a-test-1-gpu-large-amd")
@@ -31,6 +34,67 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
 
     attention_backend = "flashinfer"
     extra_args = ["--disable-overlap-schedule"]
+
+
+@unittest.skipUnless(is_cuda(), "requires CUDA stochastic verification")
+class TestNgramForceGreedyVerify(NgramServerBase):
+    attention_backend = "flashinfer"
+    extra_args = ["--disable-radix-cache"]
+
+    @classmethod
+    def setUpClass(cls):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_NGRAM_FORCE_GREEDY_VERIFY": "true",
+                "SGLANG_SIMULATE_ACC_LEN": "-1",
+            },
+        ):
+            super().setUpClass()
+
+    def test_sampled_request_matches_greedy_after_prefill(self):
+        prompt_ids = get_tokenizer(self.model, trust_remote_code=True).encode(
+            'def fibonacci(n):\n    """Return the first n Fibonacci numbers."""\n'
+        )
+        max_new_tokens = 64
+
+        def generate(input_ids, temperature, num_tokens):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": input_ids,
+                    "sampling_params": {
+                        "temperature": temperature,
+                        "sampling_seed": 42,
+                        "max_new_tokens": num_tokens,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=120,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(len(result["output_ids"]), num_tokens)
+            return result
+
+        # Same prompt/seed warms the corpus without making prefill greedy.
+        generate(prompt_ids, 1.5, max_new_tokens)
+        sampled = generate(prompt_ids, 1.5, max_new_tokens)
+        meta = sampled["meta_info"]
+        self.assertEqual(meta["completion_tokens"], max_new_tokens)
+        verify_count = meta.get("spec_verify_ct", 0)
+        self.assertGreater(verify_count, 0)
+        # Remove the sampled prefill token; each verify can emit one bonus
+        # without accepting a draft. Only this request's counts are used.
+        self.assertGreater(
+            meta["completion_tokens"] - 1,
+            verify_count,
+            "tested request must accept real drafts beyond the bonus tokens",
+        )
+
+        # Neutral penalties: the reference starts with the exact sampled root.
+        greedy = generate(prompt_ids + sampled["output_ids"][:1], 0, max_new_tokens - 1)
+        self.assertEqual(sampled["output_ids"][1:], greedy["output_ids"])
 
 
 @unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
