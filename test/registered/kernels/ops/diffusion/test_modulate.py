@@ -345,7 +345,6 @@ def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
     _assert_gate_add(residual_gate_add(residual, update, gate), expected)
 
 
-@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA implementation only")
 def test_residual_gate_add_batched_rows_cuda_graph():
     residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)

@@ -208,6 +208,7 @@ def _rga_rocm_flat(
     gate,
     numel,
     hid,
+    batch_numel,
     MODE: tl.constexpr,
     IS_BF16: tl.constexpr,
     IS_16: tl.constexpr,
@@ -222,6 +223,9 @@ def _rga_rocm_flat(
         gv = tl.load(gate + (offs % hid), mask=mask)
     elif MODE == 2:
         gv = tl.load(gate + (offs // hid), mask=mask)
+    elif MODE == 3:
+        # One [D] gate row per batch: index by batch, then hidden position.
+        gv = tl.load(gate + (offs // batch_numel) * hid + (offs % hid), mask=mask)
     else:
         gv = tl.load(gate + offs, mask=mask)
     if IS_16:
@@ -303,12 +307,11 @@ def _residual_gate_add_rocm_triton(residual, update, gate):
 
     numel = residual.numel()
     hidden = residual.shape[-1]
-    if gate.shape == residual.shape:
-        mode = 0
-    elif _is_row_broadcast_gate(residual, gate):
-        mode = 1
-    else:
-        mode = 2
+    mode = _gate_mode(residual, gate)
+    if mode == 3:
+        # AdaLN unbind views have gaps between batch rows. Only copy the small
+        # [B, 1, D] gate, never expand it across the token dimension.
+        gate = gate.contiguous()
     block = 256 if numel <= 8192 else 1024
     _rga_rocm_flat[(triton.cdiv(numel, block),)](
         out,
@@ -317,6 +320,7 @@ def _residual_gate_add_rocm_triton(residual, update, gate):
         gate,
         numel,
         hidden,
+        numel // residual.shape[0],
         mode,
         is_bf16,
         is_16,
