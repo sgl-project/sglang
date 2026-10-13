@@ -116,7 +116,8 @@ def run_ring_loop(self: Scheduler, spec: RingSpec) -> None:
 
 def _bind_slot(self: Scheduler, mb_id: int) -> _RingSlot:
     self.decoding_batch = self.decoding_batches[mb_id]
-    self.last_batch = self._pp_slot_last_batch(mb_id)
+    if self.recv_skipper is not None:
+        self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
     next_first_rank_mb_id = (mb_id + get_parallel().pp_size) % self.pp_loop_size
     next_mb_id = (mb_id + 1) % self.pp_loop_size
     return _RingSlot(mb_id, next_mb_id, next_first_rank_mb_id)
@@ -229,9 +230,7 @@ def _take_decode_transferred_ids(
 
 def _plan(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
     with torch.profiler.record_function("get_next_batch_to_run"):
-        plan = self.get_next_batch_to_run(
-            decoding_batch=self.decoding_batch, last_batch=self.last_batch
-        )
+        plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
         self._pp_debug_check_slot(slot.mb_id)
         self.inflight_steps.push(plan.batch_to_run, None)
     slot.cur_batch = plan.batch_to_run
@@ -239,7 +238,7 @@ def _plan(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
 
 
 def _plan_pd_prefill(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
-    self.process_prefill_chunk(last_batch=self.last_batch)
+    self.process_prefill_chunk(last_batch=self._pp_slot_last_batch(slot.mb_id))
     self._process_hicache_events()
     prefill_plan = self.get_new_batch_prefill(self.decoding_batch)
     batch = prefill_plan.batch_to_run
@@ -491,7 +490,7 @@ def _send_transferred_ids(
 
 def _end_slot(self: Scheduler, ring: _RingChannels, slot: _RingSlot) -> None:
     self.pp_outputs = slot.next_pp_outputs
-    self.inflight_steps.end_step(slot.cur_batch)
+    self.inflight_steps.end_step()
     ring.release_rids = slot.next_release_rids
     ring.consensus_retract_rids = slot.next_consensus_retract_rids
     ring.consensus_prealloc_rids = slot.next_consensus_prealloc_rids
