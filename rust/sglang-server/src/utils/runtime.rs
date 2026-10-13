@@ -464,6 +464,9 @@ mod tests {
     fn test_server_args() -> ServerArgs {
         ServerArgs {
             skip_tokenizer_init: true,
+            // No scheduler answers here, so a startup warmup would only
+            // occupy the scheduler ring that the tests inspect.
+            skip_server_warmup: true,
             ..Default::default()
         }
     }

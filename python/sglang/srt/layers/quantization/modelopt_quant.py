@@ -2882,10 +2882,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp4_moe_weights_for_flashinfer_trtllm,
+                trtllm_nvfp4_hidden_alignment,
             )
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            align_fp4_moe_weights_for_flashinfer_trtllm(
+                layer,
+                hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                    use_per_token_activation=self.quant_config.use_per_token_activation,
+                    is_gated=layer.moe_runner_config.is_gated,
+                ),
+            )
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -3169,6 +3176,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
+                padded_hidden_size=layer.trtllm_padded_hidden_size,
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
