@@ -367,6 +367,9 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
+    def get_required_tool_parser(self, tool_choice):
+        return None
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """
