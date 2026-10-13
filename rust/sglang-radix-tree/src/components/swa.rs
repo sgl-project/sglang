@@ -393,7 +393,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
-        let swa_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let swa_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Branch at the last page-aligned Full-KV position past the SWA boundary.
         let page_aligned_full_hit_len =
@@ -802,6 +802,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     break 'step None;
                 }
             }
+            // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,

@@ -75,11 +75,83 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     # Tail row -> packed all-gather slot; local tail metadata rows include padding.
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
+
+
+def is_interleave_extend(forward_batch):
+    return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
+        forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+    )
+
+
+def cp_interleave_to_sequence_order(hidden_states, forward_batch):
+    """Restore sequence order after CP attention and before linear attention.
+
+    With CP2 and seven tokens, the boundary all-gathers the interleaved shards
+    as ``[t0, t2, t4, t6, t1, t3, t5, pad]``. This returns
+    ``[t0, t1, t2, t3, t4, t5, t6]`` for sequence-dependent compute.
+
+    The residual and mHC coefficients do not move: only the already-read mixer
+    input is reordered. Remove physical CP padding before the recurrent kernel.
+    """
+    if not is_interleave_extend(forward_batch):
+        return hidden_states
+    metadata = forward_batch.attn_cp_metadata
+    if metadata.gather_index is not None:
+        return hidden_states.index_select(0, metadata.gather_index)
+    size = get_parallel().attn_cp_size
+    rows = hidden_states.shape[0] // size
+    return (
+        hidden_states.reshape(size, rows, *hidden_states.shape[1:])
+        .transpose(0, 1)
+        .flatten(0, 1)[: metadata.total_seq_lens]
+        .contiguous()
+    )
+
+
+def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
+    """Restore interleave order after linear attention and before CP attention.
+
+    With CP2 and seven tokens, ``[t0, t1, t2, t3, t4, t5, t6]`` becomes
+    ``[t0, t2, t4, t6, t1, t3, t5, 0]``. These padded rank-major rows match
+    the boundary's reduce-scatter and the local residual/mHC rows. The reorder
+    itself performs no communication or reduction.
+    """
+    if not is_interleave_extend(forward_batch):
+        return hidden_states
+    metadata = forward_batch.attn_cp_metadata
+    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
+    if metadata.gather_index is not None:
+        return padded.index_copy_(0, metadata.gather_index, hidden_states)
+    padded[: hidden_states.shape[0]] = hidden_states
+    size = get_parallel().attn_cp_size
+    return (
+        padded.reshape(-1, size, *hidden_states.shape[1:])
+        .transpose(0, 1)
+        .flatten(0, 1)
+        .contiguous()
+    )
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Mask physical CP padding before the dispatch/combine all-to-alls.
+
+        Attention-TP localization does not split the count over CP ranks.
+        Interleave's valid rows form a prefix of each padded local shard.
+        """
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():

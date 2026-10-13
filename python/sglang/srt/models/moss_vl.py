@@ -21,9 +21,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -897,7 +898,6 @@ class MossVLSelfAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -927,8 +927,7 @@ class MossVLSelfAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -936,8 +935,7 @@ class MossVLSelfAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -1017,14 +1015,12 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1070,25 +1066,26 @@ class MossVLTextModel(nn.Module):
         self.cross_attention_layers = config.cross_attention_layers
 
         layers = []
-        for layer_id in range(config.num_hidden_layers):
-            if layer_id in self.cross_attention_layers:
-                layers.append(
-                    MossVLCrossAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+        with layer_stack():
+            for layer_id in range(config.num_hidden_layers):
+                if layer_id in self.cross_attention_layers:
+                    layers.append(
+                        MossVLCrossAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
-            else:
-                layers.append(
-                    MossVLSelfAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                else:
+                    layers.append(
+                        MossVLSelfAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

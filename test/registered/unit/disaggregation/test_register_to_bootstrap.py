@@ -33,7 +33,11 @@ class TestRegisterToBootstrap(CustomTestCase):
         for force_query in (False, True):
             for dp_rank in (0, 1):
                 with self.subTest(force_query=force_query, dp_rank=dp_rank):
-                    mgr = MagicMock(is_dummy_cp_rank=False, attn_dp_rank=dp_rank)
+                    mgr = MagicMock(
+                        is_dummy_cp_rank=False,
+                        attn_dp_rank=dp_rank,
+                        deferred_bootstrap=None,
+                    )
                     sender = MagicMock(spec=CommonKVSender)
                     sender._register_prefill_dp_rank = (
                         CommonKVSender._register_prefill_dp_rank.__get__(sender)
@@ -55,8 +59,6 @@ class TestRegisterToBootstrap(CustomTestCase):
                             mgr=mgr,
                             bootstrap_addr="127.0.0.1:8765",
                             bootstrap_room=4,
-                            dest_tp_ranks=[0],
-                            pp_rank=0,
                         )
 
                     self.assertEqual(

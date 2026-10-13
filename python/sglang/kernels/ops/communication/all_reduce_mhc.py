@@ -34,18 +34,21 @@ def _jit_mhc_module(world_size, top_k, cluster_size, weight_dtype):
         True,
     )
     return load_jit(
-        "moe_finalize_all_reduce_mhc",
+        "moe_finalize_all_reduce_mhc_post",
         *args,
         cuda_files=["distributed/all_reduce_fusion.cuh"],
         cuda_wrappers=[
-            ("run", f"MoeFinalizeAllReduceKernel<{args}>::run_mhc"),
-            ("run_norm", f"MoeFinalizeAllReduceKernel<{args}>::run_mhc_norm"),
+            ("run", f"MoeFinalizeAllReduceKernel<{args}>::run_mhc_post"),
+            (
+                "run_norm",
+                f"MoeFinalizeAllReduceKernel<{args}>::run_mhc_post_combine_norm",
+            ),
         ],
     )
 
 
 @register_custom_op(mutates_args=["out", "mhc_out"])
-def _moe_finalize_all_reduce_mhc_op(
+def _moe_finalize_all_reduce_mhc_post_op(
     world_size: int,
     top_k: int,
     cluster_size: int,
@@ -75,7 +78,7 @@ def _moe_finalize_all_reduce_mhc_op(
     )
 
 
-def moe_finalize_all_reduce_mhc(
+def moe_finalize_all_reduce_mhc_post(
     gemm2: torch.Tensor,
     idx: torch.Tensor,
     weights: torch.Tensor,
@@ -99,7 +102,7 @@ def moe_finalize_all_reduce_mhc(
     )
     mhc_out = torch.empty_like(residual)
     if weights.shape[0]:
-        _moe_finalize_all_reduce_mhc_op(
+        _moe_finalize_all_reduce_mhc_post_op(
             world_size,
             top_k,
             cluster_size or default_cluster_size(_MHC_HIDDEN_DIM),
@@ -117,7 +120,7 @@ def moe_finalize_all_reduce_mhc(
 
 
 @register_custom_op(mutates_args=["out", "mhc_out", "normalized"])
-def _moe_finalize_all_reduce_mhc_norm_op(
+def _moe_finalize_all_reduce_mhc_post_combine_norm_op(
     world_size: int,
     top_k: int,
     cluster_size: int,
@@ -155,7 +158,7 @@ def _moe_finalize_all_reduce_mhc_norm_op(
     )
 
 
-def moe_finalize_all_reduce_mhc_norm(
+def moe_finalize_all_reduce_mhc_post_combine_norm(
     gemm2: torch.Tensor,
     idx: torch.Tensor,
     weights: torch.Tensor,
@@ -171,7 +174,7 @@ def moe_finalize_all_reduce_mhc_norm(
     world_size: int,
     cluster_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`moe_finalize_all_reduce_mhc` plus the HC=4 pre-collapse
+    """:func:`moe_finalize_all_reduce_mhc_post` plus the HC=4 pre-collapse
     (``pre`` ``[T, 4]`` fp32) and RMSNorm of the collapsed row. Returns
     ``(reduced, mhc_out, normalized [T, hidden])``.
     """
@@ -181,7 +184,7 @@ def moe_finalize_all_reduce_mhc_norm(
     mhc_out = torch.empty_like(residual)
     normalized = torch.empty_like(out)
     if weights.shape[0]:
-        _moe_finalize_all_reduce_mhc_norm_op(
+        _moe_finalize_all_reduce_mhc_post_combine_norm_op(
             world_size,
             top_k,
             cluster_size or default_cluster_size(_MHC_HIDDEN_DIM),
@@ -210,7 +213,7 @@ def _identity_routing(rows, device):
     )
 
 
-def all_reduce_mhc_norm(
+def all_reduce_mhc_post_combine_norm(
     x: torch.Tensor,
     residual: torch.Tensor,
     post: torch.Tensor,
@@ -224,7 +227,7 @@ def all_reduce_mhc_norm(
     """Plain all-reduce of ``x`` with the mHC + norm epilogue: the finalize
     kernel driven with identity routing (top_k = 1, unit weights)."""
     idx, weights = _identity_routing(x.shape[0], x.device)
-    return moe_finalize_all_reduce_mhc_norm(
+    return moe_finalize_all_reduce_mhc_post_combine_norm(
         x,
         idx,
         weights,
@@ -254,17 +257,22 @@ def _jit_mhc_quant_module(world_size, top_k, cluster_size, weight_dtype):
         True,
     )
     return load_jit(
-        "moe_finalize_all_reduce_mhc_quant",
+        "moe_finalize_all_reduce_mhc_post_combine_norm_quant",
         *args,
         cuda_files=["distributed/all_reduce_fusion.cuh"],
-        cuda_wrappers=[("run", f"MoeFinalizeAllReduceKernel<{args}>::run_mhc_quant")],
+        cuda_wrappers=[
+            (
+                "run",
+                f"MoeFinalizeAllReduceKernel<{args}>::run_mhc_post_combine_norm_quant",
+            )
+        ],
     )
 
 
 @register_custom_op(
     mutates_args=["out", "mhc_out", "normalized", "quantized", "scales"]
 )
-def _moe_finalize_all_reduce_mhc_quant_op(
+def _moe_finalize_all_reduce_mhc_post_combine_norm_quant_op(
     world_size: int,
     top_k: int,
     cluster_size: int,
@@ -306,7 +314,7 @@ def _moe_finalize_all_reduce_mhc_quant_op(
     )
 
 
-def moe_finalize_all_reduce_mhc_quant(
+def moe_finalize_all_reduce_mhc_post_combine_norm_quant(
     gemm2: torch.Tensor,
     idx: torch.Tensor,
     weights: torch.Tensor,
@@ -322,12 +330,14 @@ def moe_finalize_all_reduce_mhc_quant(
     world_size: int,
     cluster_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`moe_finalize_all_reduce_mhc_norm` plus fp8 e4m3 quantization of
-    the normalized row with ue8m0 group scales (rows <= 8). Returns
+    """:func:`moe_finalize_all_reduce_mhc_post_combine_norm` plus fp8 e4m3 quantization of
+    the normalized row with ue8m0 group scales (rows <= 128: the scale swizzle
+    addresses a single 128-row tile). Returns
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]
-    assert 0 < rows <= 8
+    # One 128-row scale tile; larger needs a (token/128) block offset in the kernel.
+    assert 0 < rows <= 128
     out = torch.empty(
         (rows, _MHC_HIDDEN_DIM), dtype=torch.bfloat16, device=gemm2.device
     )
@@ -338,7 +348,7 @@ def moe_finalize_all_reduce_mhc_quant(
     scales = torch.empty(
         (_MHC_HIDDEN_DIM // 32) * 128, device=gemm2.device, dtype=torch.uint8
     )
-    _moe_finalize_all_reduce_mhc_quant_op(
+    _moe_finalize_all_reduce_mhc_post_combine_norm_quant_op(
         world_size,
         top_k,
         cluster_size or default_cluster_size(_MHC_HIDDEN_DIM),

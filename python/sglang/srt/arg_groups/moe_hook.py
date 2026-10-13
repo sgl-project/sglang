@@ -30,7 +30,12 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_gfx1250_supported,
+    is_sm100_supported,
+    parse_connector_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +365,11 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
+        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
+            raise ValueError(
+                "--deepep-v2-mode direct is NVLink-only and cannot run across "
+                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
+            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,
@@ -455,6 +465,7 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "mori":
+        is_epv2 = _resolve_mori_ep_v2(server_args)
         if cfg.deepep_mode == "auto":
             declare_resolution(
                 server_args,
@@ -462,6 +473,16 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="normal",
             )
             logger.warning("auto set deepep_mode=`normal` for MORI EP")
+        elif is_epv2 and cfg.deepep_mode == "low_latency":
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                deepep_mode="normal",
+            )
+            logger.warning(
+                "MORI EPv2 has no separate low-latency kernel; "
+                "using deepep_mode=`normal` for deepep_mode=`low_latency`"
+            )
 
         # Check chunked prefill for mori
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -542,13 +563,17 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
 
 
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
-    """Largest prefill dispatch on one rank, after model-specific sharding."""
+    """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
-    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
-        default_tokens=tokens,
+        ceiling=ceiling,
+        default_tokens=-(-ceiling // scatter_ranks),
     )
 
 
@@ -671,6 +696,63 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
             "or unset it to size from --chunked-prefill-size, or lower "
             "--chunked-prefill-size / the CUDA graph max batch sizes."
         )
+
+
+def _resolve_mori_ep_v2(server_args: Any) -> bool:
+    """Whether to use MORI EPv2.
+
+    Unset prefers EPv2 and falls back to EPv1 where it is unsupported; an explicit
+    true keeps EPv2 regardless, and false selects EPv1.
+    """
+    if not envs.SGLANG_MORI_EP_V2.get():
+        return False
+
+    reason = _mori_epv2_unsupported_reason(server_args)
+    if reason is None:
+        return True
+    if envs.SGLANG_MORI_EP_V2.is_set():
+        logger.warning(
+            "SGLANG_MORI_EP_V2=true is set explicitly, so MORI EPv2 is used even "
+            "though it does not support %s.",
+            reason,
+        )
+        return True
+
+    logger.warning(
+        "MORI EPv2 does not support %s; falling back to MORI EPv1. "
+        "Set SGLANG_MORI_EP_V2=true to force EPv2, or false to select EPv1.",
+        reason,
+    )
+    # Worker processes inherit the env, so every reader agrees on EPv1.
+    envs.SGLANG_MORI_EP_V2.set(False)
+    return False
+
+
+def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
+    # The dispatcher falls back from unsupported dispatch/combine dtypes once it
+    # knows the weight dtype.
+    import torch
+
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    cfg = resolved_view(server_args)
+    # gfx1250 forms its LSA team from the UALink vPOD, which can span hosts and is
+    # only known once cco is up, so init_mori_epv2_op checks that EP fits in it.
+    if cfg.tp_size > 8 and not is_gfx1250_supported():
+        return f"ep_size={cfg.tp_size} across hosts (EPv2 is validated within one host)"
+    if not envs.SGLANG_USE_AITER.get():
+        return "SGLANG_USE_AITER=0 (EPv2 experts run on the aiter MoE runner)"
+    if get_bool_env_var("MORI_ENABLE_SDMA", "false"):
+        return "MORI_ENABLE_SDMA=1 (SDMA is EPv1-only)"
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return "a model loaded through an instance connector (cannot validate it)"
+    model_config = model_config_of(server_args)
+    if model_config.dtype != torch.bfloat16:
+        return f"dtype={model_config.dtype} (EPv2 requires bfloat16)"
+    if not is_deepseek_v4(model_config.hf_config):
+        architecture = (model_config.hf_config.architectures or [None])[0]
+        return f"{architecture} (EPv2 is validated on DeepSeek-V4 only)"
+    return None
 
 
 def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
