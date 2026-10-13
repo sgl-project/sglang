@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -47,7 +48,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = is_gfx95_supported()
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
-_aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = _use_aiter and envs.SGLANG_ROCM_K3_AITER_OPT.get()
 if _use_aiter:
     from aiter.ops.shuffle import (
         moe_shuffle_scale,
@@ -651,9 +652,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:
                 raise ValueError("Expected w13 or w2.")
 
-            assert current_loaded <= target_loaded_numel, (
-                f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
-            )
+            assert (
+                current_loaded <= target_loaded_numel
+            ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
 
             # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
             if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
