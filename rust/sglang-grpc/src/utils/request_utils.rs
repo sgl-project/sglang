@@ -326,9 +326,35 @@ pub(crate) fn build_generate_dict(
     rid: &str,
     req: &proto::GenerateRequest,
 ) -> Result<HashMap<String, serde_json::Value>, String> {
+    // TokenizerManager pairs mm_hashes with all media items in order, while GenerateReqInput
+    // counts them against images when n > 1; only image-only requests satisfy both.
+    if !req.mm_hashes.is_empty()
+        && (req.mm_hashes.len() != req.image_data.len()
+            || !req.video_data.is_empty()
+            || !req.audio_data.is_empty()
+            || req
+                .mm_hashes
+                .iter()
+                .any(|hash| hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit())))
+    {
+        return Err(
+            "mm_hashes needs one hex entry per image_data entry and no video_data or audio_data"
+                .into(),
+        );
+    }
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
+    for (name, values) in [
+        ("image_data", &req.image_data),
+        ("video_data", &req.video_data),
+        ("audio_data", &req.audio_data),
+        ("mm_hashes", &req.mm_hashes),
+    ] {
+        if !values.is_empty() {
+            d.insert(name.into(), serde_json::json!(values));
+        }
+    }
     d.insert(
         "sampling_params".into(),
         sampling_params_to_map(&req.sampling_params)?,
@@ -644,6 +670,116 @@ mod tests {
             assert!(!mapped.contains_key("priority"));
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
+    }
+
+    #[test]
+    fn tokenized_multimodal_request_preserves_generation_params() {
+        let request = proto::GenerateRequest {
+            input_ids: vec![2, 10, 20],
+            image_data: vec![
+                "https://example.com/image.png".to_string(),
+                "data:image/png;base64,aW1hZ2U=".to_string(),
+            ],
+            video_data: vec!["https://example.com/clip.mp4".to_string()],
+            audio_data: vec!["data:audio/wav;base64,UklGRg==".to_string()],
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.5),
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            disaggregated_params: Some(proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: i64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request", &request).unwrap();
+
+        assert_eq!(mapped["input_ids"], serde_json::json!([2, 10, 20]));
+        assert_eq!(
+            mapped["image_data"],
+            serde_json::json!([
+                "https://example.com/image.png",
+                "data:image/png;base64,aW1hZ2U="
+            ])
+        );
+        assert_eq!(
+            mapped["video_data"],
+            serde_json::json!(["https://example.com/clip.mp4"])
+        );
+        assert_eq!(
+            mapped["audio_data"],
+            serde_json::json!(["data:audio/wav;base64,UklGRg=="])
+        );
+        assert_eq!(
+            mapped["sampling_params"],
+            serde_json::json!({"temperature": 0.5, "max_new_tokens": 64})
+        );
+        assert_eq!(mapped["bootstrap_host"], serde_json::json!("10.0.0.1"));
+        assert_eq!(mapped["bootstrap_port"], serde_json::json!(8998));
+        assert_eq!(mapped["bootstrap_room"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn tokenized_request_omits_empty_media_data() {
+        let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
+
+        for key in ["image_data", "video_data", "audio_data", "mm_hashes"] {
+            assert!(!mapped.contains_key(key));
+        }
+    }
+
+    #[test]
+    fn tokenized_image_request_forwards_one_mm_hash_per_image() {
+        let request = proto::GenerateRequest {
+            input_ids: vec![2, 10, 20],
+            image_data: vec!["https://x/a.png".to_string(), "https://x/b.png".to_string()],
+            mm_hashes: vec![
+                "00112233aabbccdd".to_string(),
+                "ffeeddcc44332211".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request", &request).unwrap();
+        assert_eq!(
+            mapped["mm_hashes"],
+            serde_json::json!(["00112233aabbccdd", "ffeeddcc44332211"])
+        );
+    }
+
+    #[test]
+    fn mm_hashes_require_one_hex_entry_per_image_and_no_other_media() {
+        let hashes = |count| vec!["00112233aabbccdd".to_string(); count];
+        let requests = [
+            proto::GenerateRequest {
+                image_data: vec!["https://x/a.png".to_string()],
+                mm_hashes: vec!["zz".to_string()],
+                ..Default::default()
+            },
+            proto::GenerateRequest {
+                image_data: vec!["https://x/a.png".to_string()],
+                mm_hashes: hashes(2),
+                ..Default::default()
+            },
+            proto::GenerateRequest {
+                image_data: vec!["https://x/a.png".to_string()],
+                video_data: vec!["https://x/v.mp4".to_string()],
+                mm_hashes: hashes(1),
+                ..Default::default()
+            },
+            proto::GenerateRequest {
+                audio_data: vec!["data:audio/wav;base64,UklGRg==".to_string()],
+                mm_hashes: hashes(1),
+                ..Default::default()
+            },
+        ];
+
+        for request in requests {
+            assert!(build_generate_dict("request", &request).is_err());
         }
     }
 
