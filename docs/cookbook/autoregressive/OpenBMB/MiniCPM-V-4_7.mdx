@@ -249,6 +249,10 @@ Answer: 391
 
 </Accordion>
 
+<Note>
+  On GSM8K-style prompts that ask for the answer in `\boxed{}`, the model can write the final answer inside the thinking block and stop without emitting `</think>`, so the reasoning parser leaves `content` empty. Clients that read only `content`, such as accuracy-eval harnesses, should either serve without `--reasoning-parser` or also read `reasoning_content`.
+</Note>
+
 ### 3.2 Tool calling
 
 The tool-call parser in every generated command returns calls in `message.tool_calls`, with the arguments as a JSON string. Because thinking is on, print `reasoning_content` and `content` alongside the calls.
