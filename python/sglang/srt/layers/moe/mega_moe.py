@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -53,10 +53,11 @@ def _use_amd_flydsl_mega_moe() -> bool:
     return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
 
 
-def _mega_moe_mma_type(experts=None) -> str:
-    if experts is not None and experts._mega_moe_nvfp4:
+def _mega_moe_mma_type(experts) -> str:
+    if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
-    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
+    # Per layer: a draft may differ from the target (draft_model_build_scope).
+    return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
@@ -97,14 +98,19 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+    # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
+    # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
+    # from token TMA loads, so intermediate % 128 suffices, including V4.1
+    # Flash's 2304-wide intermediate dimension.
+    # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    hidden_align = 16 * scale_group
+    if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
-            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
+            f"of {hidden_align} and moe_intermediate_size to be a multiple of "
+            f"{align}; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -118,12 +124,11 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     num_shared_experts: int = 0,
-    mma_type: Optional[str] = None,
+    *,
+    mma_type: str,
 ) -> SymmBuffer:
     import deep_gemm
 
-    if mma_type is None:
-        mma_type = _mega_moe_mma_type()
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
             id(group),
@@ -257,19 +262,31 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if (
+            not moe.is_hash
+            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+        ):
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        else:
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -513,7 +530,7 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    mma_type = _mega_moe_mma_type()
+    mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data

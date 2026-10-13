@@ -38,11 +38,18 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
+    model_config_of,
     remote_instance_transfer_engine_of,
     resolution_result,
     resolving_view,
 )
+from sglang.srt.arg_groups.validation_hook import (
+    validate_mps_model_config,
+    validate_standard_mps_server_args,
+)
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     get_platform,
@@ -251,8 +258,38 @@ class ServerArgs:
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         self._input_frozen = True
+
         try:
+            # Validate Torch MPS before model resolution; MLX has its own gate.
+            # Platform detection covers the usual omitted --device on macOS.
+            if not use_mlx():
+                requested_device = getattr(self, "device", None)
+                explicitly_mps = (
+                    requested_device is not None
+                    and str(requested_device).split(":", 1)[0] == "mps"
+                )
+                if explicitly_mps or (
+                    requested_device is None and get_platform().is_mps
+                ):
+                    validate_mps_runtime()
+
             run_resolution_pipeline(self)
+
+            # Validate resolved arguments and checkpoint-derived constraints.
+            cfg = resolving_view(self)
+            if (
+                cfg.device == "mps"
+                and not use_mlx()
+                and str(cfg.model_path).lower() not in ("none", "dummy")
+            ):
+                validate_standard_mps_server_args(self)
+                lora_enabled = bool(cfg.enable_lora) or (
+                    cfg.enable_lora is None and bool(cfg.lora_paths)
+                )
+                validate_mps_model_config(
+                    model_config_of(self),
+                    lora_enabled=lora_enabled,
+                )
         except BaseException:
             self._resolution_failed = True
             raise
@@ -263,8 +300,17 @@ class ServerArgs:
 
     @property
     def launch_command(self) -> str | None:
-        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
+        """Original CLI arguments or Engine call, with secrets redacted."""
         return getattr(self, "_launch_command", None)
+
+    def __repr__(self) -> str:
+        hidden = {"watermark_key", "watermark_key_b", "watermark_config"}
+        values = ", ".join(
+            f"{field.name}={getattr(self, field.name)!r}"
+            for field in record_fields(type(self))
+            if field.name not in hidden
+        )
+        return f"ServerArgs({values})"
 
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
@@ -286,6 +332,7 @@ class ServerArgs:
         return resolved
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "DeepseekV4ForCausalLM",
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
@@ -650,7 +697,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
+
+    server_args._launch_command = redact_watermark_command_line(
+        argv, raw_args.watermark_config
+    )
     return server_args
 
 

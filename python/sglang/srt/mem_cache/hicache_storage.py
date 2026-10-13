@@ -93,10 +93,15 @@ class PoolHitPolicy(str, Enum):
 
     ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    BLOCK_GROUPS   : whole key groups at block boundaries from the span start
+                     (a second form of the FULL pages, e.g. compressed blocks).
+                     The pool reports the pages its leading complete groups
+                     cover as its own verdict; it never gates the KV hit.
     """
 
     ALL_PAGES = "all_pages"
     TRAILING_PAGES = "trailing_pages"
+    BLOCK_GROUPS = "block_groups"
 
 
 @dataclass
@@ -115,9 +120,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
-    # Full IDs backing a dependent device allocation: resident tensors or
-    # slices of the full rows allocated by this load, in transfer order.
-    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
+    # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
+    block_pages: int = 0
+    group_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -382,7 +387,11 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self.file_path = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
+            or (storage_config.extra_config or {}).get("file_storage_path")
+            or file_path
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -589,12 +598,11 @@ class HiCacheFile(HiCacheStorage):
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
-            existing_files = set()
-            with os.scandir(self.file_path) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name in target_files:
-                        existing_files.add(entry.name)
-            return existing_files
+            return {
+                filename
+                for filename in target_files
+                if os.path.isfile(os.path.join(self.file_path, filename))
+            }
 
         existing_files = set()
         for filename in target_files:

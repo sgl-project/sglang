@@ -1069,6 +1069,15 @@ def can_use_dp_reduce_scatter() -> bool:
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     _note_dp_gather_in_prefill_graph()
+    parallel = get_parallel()
+    if parallel.attn_cp_size > 1 and input.shape[0] % parallel.tp_size:
+        # MAX_LEN padding aligns each DP slot to attention TP, not CP x TP.
+        # Small decode batches cannot be equally split over the full TP group.
+        reduced = parallel.tp_group.all_reduce(input)
+        output.copy_(
+            reduced.narrow(0, parallel.attn_dp_rank * output.shape[0], output.shape[0])
+        )
+        return
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
         # global (sum_len) tensor back to per-rank token counts. Fall through to
@@ -1084,9 +1093,23 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_parallel().tp_rank
         ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
-        get_parallel().attn_tp_group.all_gather_into_tensor(
-            output, scattered_local_tokens
-        )
+        if parallel.attn_cp_size > 1:
+            # TP reduce-scatter splits each DP slot over CP x attention TP.
+            # Restore both axes: decode (and warmup) holds the full DP slot on
+            # every CP rank, even though prefill uses context-sharded rows.
+            cp_local_tokens = scattered_local_tokens
+            if parallel.attn_tp_size > 1:
+                cp_local_tokens = output.new_empty(
+                    (output.shape[0] // parallel.attn_cp_size, *output.shape[1:])
+                )
+                parallel.attn_tp_group.all_gather_into_tensor(
+                    cp_local_tokens, scattered_local_tokens
+                )
+            parallel.attn_cp_group.all_gather_into_tensor(output, cp_local_tokens)
+        else:
+            parallel.attn_tp_group.all_gather_into_tensor(
+                output, scattered_local_tokens
+            )
 
 
 # ---------------------------------------------------------------------------

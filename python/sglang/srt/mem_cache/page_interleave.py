@@ -68,9 +68,11 @@ class PageShardSpec(msgspec.Struct, frozen=True):
 
     @property
     def logical_page_size(self) -> int:
-        """The N*page_size span of one logical page. It bounds the assembly
-        scratch and rounds chunked_prefill_size; the allocator and the tree
-        both keep drawing and matching at the physical ``page_size``."""
+        """The N*page_size span used to align prefix-gather scratch.
+
+        Allocation, prefix matching, and chunk boundaries use the physical
+        ``page_size``.
+        """
         return self.shard_size * self.page_size
 
 

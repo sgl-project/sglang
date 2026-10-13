@@ -36,8 +36,16 @@ class IndexKeyCache:
         return (
             num_pages,
             pool.page_size
+            // pool.index_kpool
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
+
+    def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
+        pool = self.pool
+        kernel_pages_per_row = (
+            pool.page_size // pool.index_kpool // pool.index_page_size
+        )
+        return buffer.view(-1, buffer.shape[1] // kernel_pages_per_row)
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         # Layers that reuse the previous layer's top-k never write index-K, so
@@ -62,7 +70,7 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[layer_id - self.pool.start_layer]
+        return self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -92,7 +100,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
