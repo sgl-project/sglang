@@ -15,7 +15,6 @@ from sglang.kernels.spec import (
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
-    ("simulated_accept", "simulated_accept"),
     ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
@@ -42,6 +41,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.simulated_accept",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
 
 register_kernel(
     KernelSpec(
