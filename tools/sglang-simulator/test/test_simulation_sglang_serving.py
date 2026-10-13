@@ -41,6 +41,7 @@ class SGLangServingRunner:
         env.update(
             CUDA_VISIBLE_DEVICES="",
             SGLANG_USE_CPU_ENGINE="1",
+            SGLANG_SIMULATOR_BOOTSTRAP="1",
             SGLANG_SIMULATOR_CONFIG_PATH=str(config_path),
             SGLANG_SIMULATOR_OUTPUT_MODE=mode.upper(),
             SGLANG_SIMULATOR_OUTPUT_DIR=str(self.output_dir),
@@ -122,7 +123,14 @@ class SGLangServingRunner:
                 ]
             )
 
-        subprocess.run(cmd, check=True)
+        env = os.environ.copy()
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            SGLANG_USE_CPU_ENGINE="1",
+            SGLANG_SIMULATOR_BOOTSTRAP="1",
+            SGLANG_SIMULATOR_OUTPUT_DIR=str(self.output_dir),
+        )
+        subprocess.run(cmd, check=True, env=env)
         assert output_file.is_file()
         return json.loads(
             (self.output_dir / "metrics.json").read_text(encoding="utf-8")
