@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
@@ -54,24 +55,35 @@ def flat_index_logits_tiles(
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
         return
-    weights = weights.to(torch.bfloat16)
+    use_sm100 = get_platform().is_sm100
+    if use_sm100:
+        weights = weights.to(torch.bfloat16)
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
+        if use_sm100:
+            logits = fp8_fp4_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
                 width,
-            ).float(),
-        )
+            ).float()
+        else:
+            logits = fp8_fp4_mqa_logits(
+                (q[0][tile], q[1][tile]),
+                kv,
+                weights[tile],
+                tile_starts,
+                tile_starts + lengths[tile],
+                False,
+                width,
+            )
+        yield tile, logits
 
 
 def deep_gemm_fp4_paged_mqa_logits(
@@ -89,6 +101,17 @@ def deep_gemm_fp4_paged_mqa_logits(
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
+    if not get_platform().is_sm100:
+        return fp8_fp4_paged_mqa_logits(
+            q_fp4,
+            k_cache,
+            weights,
+            sl,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            False,
+        )
     # SM100 uses BF16 head weights and explicit varlen request indices.
     indices = torch.arange(sl.shape[0], dtype=torch.int32, device=sl.device)
     return fp8_fp4_paged_mqa_logits(
