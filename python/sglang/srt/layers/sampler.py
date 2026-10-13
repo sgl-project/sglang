@@ -72,6 +72,19 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
+
+def greedy_token_ids(logits: torch.Tensor) -> torch.Tensor:
+    """Each row's argmax: int32 from aiter's greedy_sample where it is enabled,
+    else int64 from torch.argmax."""
+    if _use_aiter and not _disable_aiter_greedy_sample:
+        token_ids = torch.empty(
+            logits.shape[0], device=logits.device, dtype=torch.int32
+        )
+        _aiter_greedy_sample(token_ids, logits)
+        return token_ids
+    return torch.argmax(logits, -1)
+
+
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
@@ -201,13 +214,7 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             _trace_e2e_sampler("greedy_enter")
-            if _use_aiter and not _disable_aiter_greedy_sample:
-                batch_next_token_ids = torch.empty(
-                    logits.shape[0], device=logits.device, dtype=torch.int32
-                )
-                _aiter_greedy_sample(batch_next_token_ids, logits)
-            else:
-                batch_next_token_ids = torch.argmax(logits, -1)
+            batch_next_token_ids = greedy_token_ids(logits)
             _trace_e2e_sampler(
                 "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
             )
