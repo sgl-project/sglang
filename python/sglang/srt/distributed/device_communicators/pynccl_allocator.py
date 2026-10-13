@@ -342,6 +342,11 @@ class SymmetricMemoryContext:
         # Register all unregistered segments
         # with the current comm
         self._register_segments_for_comm()
+        ca_comm = self.group_coordinator.ca_comm
+        if not self.is_graph_capture and hasattr(
+            ca_comm, "register_symmetric_segments"
+        ):
+            ca_comm.register_symmetric_segments()
 
         if self.is_graph_capture:
             if after_2_8_0:

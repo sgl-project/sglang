@@ -222,12 +222,14 @@ def custom_all_reduce(
     *,
     graph_params: torch.Tensor | None = None,
     use_multicast: bool = False,
-    peer_bases: torch.Tensor | None = None,
-    peer_offset: int = 0,
+    symm_table: torch.Tensor | None = None,
+    location: int = -1,
 ) -> torch.Tensor:
-    """``peer_bases`` (CPU int64, one per rank) + ``peer_offset`` locate the
-    input on every rank when it lives in peer-mapped symmetric memory; the
-    pull algos then read it in place instead of staging it."""
+    """With ``symm_table`` (every rank's peer-mapped symmetric-pool segment
+    bases), the pull algos run in symmetric-pool mode: ``location`` (segment
+    row << 40 | byte offset, or -1 to stage) is published to the peers, so
+    each rank's input is read where it is. Every rank must pass a table or
+    none on the same call."""
     module = get_all_reduce_module(input.dtype, comm.world_size)
     result = module.all_reduce(
         comm,
@@ -235,8 +237,8 @@ def custom_all_reduce(
         algo.algo_name,
         graph_params,
         use_multicast,
-        peer_bases,
-        peer_offset,
+        symm_table,
+        location,
     )
     return torch.from_dlpack(result)
 

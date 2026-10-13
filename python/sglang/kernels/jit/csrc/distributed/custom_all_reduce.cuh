@@ -59,7 +59,16 @@ struct AllReducePullParams {
   uint32_t rank;
   void* const* __restrict__ graph_params;
   PullWorkSpace<kWorldSize> ws;
+  // Symmetric-pool mode: every rank publishes `location` (a pool segment row
+  // and byte offset, or kStagedLocation) and reads each peer's from its
+  // semaphore; `symm_table[row * kWorldSize + i]` is rank i's segment base as
+  // mapped here.
+  const uint64_t* __restrict__ symm_table;
+  int64_t location;
 };
+
+inline constexpr int64_t kStagedLocation = -1;
+inline constexpr uint32_t kLocationShift = 40;
 
 /// `vec_offset` is a *vector index* and must stay folded into the base pointers
 /// here: a typed 32-bit bias becomes one widening multiply-add off a
@@ -85,6 +94,20 @@ struct LoadStoreImpl {
       for (uint32_t i = 0; i < kWorldSize; ++i) {
         m_data[i] = reinterpret_cast<V*>(params.ws.workspaces[i]) + vec_offset;
       }
+    }
+  }
+
+  /// Re-point every rank at the input it published; call after the barrier.
+  SGL_DEVICE void resolve_locations(const AllReducePullParams<kWorldSize>& params, uint32_t vec_offset = 0) {
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      const auto location = params.ws.semaphores[i][blockIdx.x].get_location();
+      const auto base =
+          location == kStagedLocation
+              ? params.ws.workspaces[i]
+              : reinterpret_cast<uint8_t*>(params.symm_table[(location >> kLocationShift) * kWorldSize + i]) +
+                    (location & ((int64_t{1} << kLocationShift) - 1));
+      m_data[i] = reinterpret_cast<V*>(base) + vec_offset;
     }
   }
 
@@ -119,6 +142,8 @@ struct MultiCastImpl {
   SGL_DEVICE MultiCastImpl(const AllReducePullParams<kWorldSize>& params, uint32_t vec_offset = 0)
       : m_multicast_ptr(reinterpret_cast<V*>(params.ws.mc_workspace) + vec_offset) {}
 
+  SGL_DEVICE void resolve_locations(const AllReducePullParams<kWorldSize>&, uint32_t = 0) {}
+
   SGL_DEVICE void load_reduce(V& vec, uint32_t vid) const {
     device::ptx::ld_multimem_16B(vec, m_multicast_ptr, vid);
   }
@@ -132,6 +157,27 @@ struct MultiCastImpl {
 };
 
 #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)
+
+/// First pull barrier. In symmetric-pool mode each block publishes this rank's
+/// input location before a release arrival, and resolves every peer's after
+/// the acquire, so ranks need not agree on where their inputs sit.
+template <uint32_t kWorldSize, typename Impl>
+SGL_DEVICE void arrive_and_resolve(
+    const AllReducePullParams<kWorldSize>& params,
+    const device::distributed::Barrier<kWorldSize>& barrier,
+    Impl& impl,
+    uint32_t vec_offset = 0) {
+  if (params.symm_table == nullptr) {
+    barrier.arrive_relaxed(/*n=*/0);
+    __syncthreads();
+    return;
+  }
+  if (threadIdx.x == 0) params.ws.semaphores[params.rank][blockIdx.x].set_location(params.location);
+  __syncthreads();
+  barrier.arrive_rel_acq(/*n=*/0);
+  __syncthreads();
+  impl.resolve_locations(params, vec_offset);
+}
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
 ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
@@ -214,15 +260,14 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
   const auto num_vecs = params.num_vecs;
-  const auto impl = Impl{params};
+  auto impl = Impl{params};
   PDLWaitPrimary<kUsePDL>();
   const auto barrier = distributed::Barrier<kWorldSize>{
       params.ws.semaphores.data(),
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
-  __syncthreads();
+  arrive_and_resolve(params, barrier, impl);
 
   const auto num_threads = blockDim.x * gridDim.x;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -247,15 +292,14 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   const auto rem_vecs = num_total_vecs % kWorldSize;
   const auto num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
   const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
-  const auto impl = Impl{params, vec_offset};
+  auto impl = Impl{params, vec_offset};
   PDLWaitPrimary<kUsePDL>();
   const auto barrier = distributed::Barrier<kWorldSize>{
       params.ws.semaphores.data(),
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
-  __syncthreads();
+  arrive_and_resolve(params, barrier, impl, vec_offset);
 
   const auto num_threads = blockDim.x * gridDim.x;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -312,8 +356,8 @@ struct AllReduceKernel {
       const std::string algo,
       const tvm::ffi::Optional<TensorView> graph_params_opt,
       const bool use_multicast,
-      const tvm::ffi::Optional<TensorView> peer_bases_opt,
-      const int64_t peer_offset) {
+      const tvm::ffi::Optional<TensorView> symm_table_opt,
+      const int64_t location) {
     using namespace host;
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
@@ -327,10 +371,10 @@ struct AllReduceKernel {
     const auto num_vecs = static_cast<uint32_t>(num_elems / (16 / sizeof(T)));
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto use_graph = graph_params_opt.has_value();
-    const auto use_peer_inputs = peer_bases_opt.has_value();
+    const auto use_symm = symm_table_opt.has_value();
 
     if (algo == "1shot_push") {
-      CHECK_HOST(!use_graph && !use_multicast && !use_peer_inputs);
+      CHECK_HOST(!use_graph && !use_multicast && !use_symm);
       const auto& push = comm.get_push_obj();
       Tensor out = ffi::empty_like(in);
       const auto params = PushParams{
@@ -350,14 +394,14 @@ struct AllReduceKernel {
 
     const auto& pull = comm.get_pull_obj();
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
-    CHECK_HOST(!(use_peer_inputs && (use_graph || use_multicast)));
-    // Peers read the caller's own buffers (a graph pointer row, or symmetric
-    // inputs at a common offset), so nothing is staged through the plane.
-    const auto zero_copy = use_graph || use_peer_inputs;
+    CHECK_HOST(!(use_symm && (use_graph || use_multicast)));
+    // Peers read this rank's own buffer (a graph pointer row, or a symmetric
+    // pool segment), so nothing is staged through the plane.
+    const auto zero_copy = use_graph || (use_symm && location != kStagedLocation);
     // only 2shot pull + zero copy forces inplace implementation
     const auto is_inplace = zero_copy && algo == "2shot_pull";
     Tensor out = is_inplace ? in : ffi::empty_like(in);
-    auto params = PullParams{
+    const auto params = PullParams{
         .output = out.data_ptr(),
         .num_vecs = num_vecs,
         .rank = pull.rank,
@@ -365,16 +409,13 @@ struct AllReduceKernel {
         // Graph mode reduces over the caller's own registered buffers and only
         // barriers on this plane; the eager modes stage the input through it.
         .ws = pull.get_workspace<kWorldSize>(zero_copy ? 0 : nbytes),
+        .symm_table = use_symm ? static_cast<const uint64_t*>(symm_table_opt.value().data_ptr()) : nullptr,
+        .location = use_symm ? location : kStagedLocation,
     };
-    if (use_peer_inputs) {
-      const auto peer_bases = peer_bases_opt.value();
-      CHECK_HOST(peer_bases.device().device_type == kDLCPU && is_type<int64_t>(peer_bases.dtype()));
-      CHECK_HOST(peer_bases.numel() == kWorldSize) << peer_bases.numel();
-      const auto bases = static_cast<const int64_t*>(peer_bases.data_ptr());
-      CHECK_HOST(bases[pull.rank] + peer_offset == reinterpret_cast<int64_t>(in.data_ptr()));
-      for (uint32_t i = 0; i < kWorldSize; ++i) {
-        params.ws.workspaces[i] = reinterpret_cast<uint8_t*>(bases[i] + peer_offset);
-      }
+    if (use_symm) {
+      const auto& table = symm_table_opt.value();
+      CHECK_HOST(table.device().device_type == kDLCUDA && table.ndim() == 2 && table.size(1) == kWorldSize);
+      CHECK_HOST(location == kStagedLocation || (location >> kLocationShift) < table.size(0)) << location;
     }
     const auto& ws = params.ws;
     CHECK_HOST(!use_multicast || ws.mc_workspace != nullptr) << "multicast needs a plane with an mc workspace";

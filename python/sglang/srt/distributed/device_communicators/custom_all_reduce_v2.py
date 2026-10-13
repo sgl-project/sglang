@@ -12,7 +12,7 @@ The CUDA side is split into independent pieces:
 - ``Communicator``: the two planes above (either may be absent), the handle
   every kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
-  graph_params, use_multicast, peer_bases, peer_offset)`` with three
+  graph_params, use_multicast, symm_table, location)`` with three
   algorithms (1shot_push / 1shot_pull / 2shot_pull) and four pull data
   sources (eager pull buffer / CUDA-graph pointer table / symmetric-pool
   input / multicast address).
@@ -25,9 +25,11 @@ segments) and written into a device-side pointer table (``graph_params``);
 the kernel captured in the graph dereferences its row at replay time.
 
 Eager inputs allocated from the NCCL symmetric pool (``--enable-symm-mem``)
-are zero-copy too: each pool segment is peer-mapped once, and a call passes
-the per-rank segment bases plus the input's offset, which is the same on
-every rank.
+are zero-copy too. ``register_symmetric_segments`` peer-maps new pool
+segments (collectively, like NCCL's window registration) into a device table.
+Each rank then publishes where its input sits (segment row and offset, or
+staged) at the first barrier and reads the peers' locations, so ranks need not
+agree on offsets, nor all be in the pool.
 """
 
 import bisect
@@ -82,6 +84,8 @@ MB = 1024 * 1024
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
+_MAX_SYMM_SEGMENTS = 4096
+_LOCATION_SHIFT = 40  # kLocationShift in custom_all_reduce.cuh
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # forced per-direction workspace sizes; highest priority, override both the
@@ -213,12 +217,13 @@ class CustomAllReduceV2:
         self._graph_counter = 0
         self._graph_mode_allowed = False
         self._in_capture = False
-        # peer-mapped symmetric-pool segments, sorted by base:
-        # (base, end, CPU int64 tensor of every rank's base)
+        # peer-mapped symmetric-pool segments: a device table of every rank's
+        # segment base (one row per segment), and this rank's bases sorted for
+        # lookup with their (end, row)
+        self._symm_table: Optional[torch.Tensor] = None
+        self._symm_count = 0
         self._symm_bases: List[int] = []
-        self._symm_segments: List[Tuple[int, int, torch.Tensor]] = []
-        self._symm_seen = 0
-        self._symm_pending: List[Tuple[int, int]] = []
+        self._symm_rows: List[Tuple[int, int]] = []
         self._symm_sink = _SegmentSink()
         self._symm_vmm = VmmGraphInputManager(
             obj=self._symm_sink,
@@ -368,8 +373,7 @@ class CustomAllReduceV2:
             return False
         if self.override_algo is not None:
             return inp_size <= self.max_size
-        zero_copy = self._can_use_graph() or self._lookup_symmetric(inp) is not None
-        return self._pick_config(inp_size, zero_copy) is not None
+        return self._pick_config(inp_size, self._can_use_graph()) is not None
 
     # ------------------------------------------------------------------
     # All-reduce
@@ -378,76 +382,87 @@ class CustomAllReduceV2:
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
         can_use_graph = self._can_use_graph()
-        symm = None if can_use_graph else self._lookup_symmetric(input)
         if self.override_algo is not None:
             # TODO: enhance this override pattern
             algo, use_multicast = self.override_algo, False
         else:
-            # a symmetric input is as zero-copy as a graph-registered one
-            config = self._pick_config(nbytes, can_use_graph or symm is not None)
+            config = self._pick_config(nbytes, can_use_graph)
             assert config is not None, f"No config for {nbytes = }"
             algo, use_multicast = config
         staged = algo.is_push() or use_multicast
         use_graph = can_use_graph and not staged
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
-        peer_bases, peer_offset = (None, 0) if staged or symm is None else symm
+        # every input of this call takes the same branch on every rank: it
+        # depends on collective state only, never on where this input sits
+        use_symm = (
+            self._symm_count > 0
+            and not staged
+            and not can_use_graph
+            and not self._in_capture
+            and not is_in_tc_piecewise_cuda_graph()
+        )
         return custom_all_reduce(
             self.obj,
             input,
             algo=algo,
             graph_params=graph_params,
             use_multicast=use_multicast,
-            peer_bases=peer_bases,
-            peer_offset=peer_offset,
+            symm_table=self._symm_table if use_symm else None,
+            location=self._symm_location(input) if use_symm else -1,
         )
 
     # ------------------------------------------------------------------
     # Symmetric-pool inputs
     # ------------------------------------------------------------------
 
-    def _lookup_symmetric(
-        self, input: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, int]]:
-        """Every rank's segment base and the offset of ``input``, when it lies
-        in a peer-mapped NCCL symmetric-pool segment."""
-        if not self._symm_supported or self._in_capture:
-            return None
-        if is_in_tc_piecewise_cuda_graph():
-            return None
+    def _symm_location(self, input: torch.Tensor) -> int:
+        """``row << 40 | offset`` of ``input`` in a registered symmetric-pool
+        segment, or -1 when it must be staged."""
         ptr = input.data_ptr()
-        end = ptr + input.numel() * input.element_size()
         i = bisect.bisect_right(self._symm_bases, ptr) - 1
-        if i < 0 or end > self._symm_segments[i][1]:
-            if not self._map_symmetric_segments(ptr, end):
-                return None
-            i = bisect.bisect_right(self._symm_bases, ptr) - 1
-            if i < 0 or end > self._symm_segments[i][1]:
-                return None
-        base, _, peer_bases = self._symm_segments[i]
-        return peer_bases, ptr - base
+        if i < 0:
+            return -1
+        end, row = self._symm_rows[i]
+        if ptr + input.numel() * input.element_size() > end:
+            return -1
+        return (row << _LOCATION_SHIFT) | (ptr - self._symm_bases[i])
 
-    def _map_symmetric_segments(self, ptr: int, end: int) -> bool:
-        """Peer-map the pending pool segments once an input lands in one.
+    def register_symmetric_segments(self) -> None:
+        """Peer-map the NCCL symmetric pool's new segments.
 
-        Collective over the group. Like NCCL's own window registration, it
-        relies on every rank allocating the pool identically, so all ranks
-        see the same segments and take this branch on the same call.
+        Collective over the group: every rank must call it at the same point
+        with the same number of new segments, as NCCL's own window
+        registration already requires. Offsets inside the segments may differ
+        across ranks; the kernels exchange them.
         """
-        new = get_symmetric_segments(self._symm_seen)
-        self._symm_seen += len(new)
-        self._symm_pending += [seg for seg in new if is_vmm_pointer(seg[0])]
-        if not any(b <= ptr and end <= b + n for b, n in self._symm_pending):
-            return False
-        segments, self._symm_pending = self._symm_pending, []
-        self._symm_sink.segments = segments
+        if self.disabled or not self._symm_supported:
+            return
+        new = get_symmetric_segments(self._symm_count)
+        if not new:
+            return
+        if not is_vmm_pointer(new[0][0]):
+            logger.warning("Symmetric pool is not VMM-backed; staging its inputs")
+            self._symm_supported = False
+            return
+        count = self._symm_count + len(new)
+        assert count <= _MAX_SYMM_SEGMENTS, "Symmetric segment table overflow"
+        self._symm_sink.segments = new
         self._symm_vmm.register_graph_inputs()
-        for (base, size), row in zip(segments, self._symm_sink.peer_ptrs):
+        if self._symm_table is None:
+            self._symm_table = torch.zeros(
+                (_MAX_SYMM_SEGMENTS, self.world_size),
+                dtype=torch.uint64,
+                device=self.device,
+            )
+        rows = torch.tensor(self._symm_sink.peer_ptrs, dtype=torch.uint64)
+        self._symm_table[self._symm_count : count].copy_(rows)
+        # the rows must be visible before any (PDL-chained) launch reads them
+        torch.cuda.synchronize()
+        for row, (base, size) in enumerate(new, start=self._symm_count):
             k = bisect.bisect_left(self._symm_bases, base)
             self._symm_bases.insert(k, base)
-            self._symm_segments.insert(
-                k, (base, base + size, torch.tensor(row, dtype=torch.int64))
-            )
-        return True
+            self._symm_rows.insert(k, (base + size, row))
+        self._symm_count = count
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)

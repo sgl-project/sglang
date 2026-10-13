@@ -201,6 +201,20 @@ def _init_fi_backend() -> FlashInferAllReduceBackend:
     return FlashInferAllReduceBackend()
 
 
+@cache_once
+def _init_symm_buffer() -> torch.Tensor:
+    """One registered NCCL symmetric-pool buffer that every size views."""
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        get_nccl_mem_pool,
+    )
+
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
+        buf = torch.empty(MAX_BYTES // DTYPE_ITEMSIZE, dtype=DTYPE, device=device)
+    _init_jit_backend().comm.register_symmetric_segments()
+    return buf
+
+
 BACKEND_FACTORY = {
     "nccl": _init_nccl_backend,
     "jit-eager": _init_jit_backend,
@@ -260,12 +274,7 @@ def benchmark(message_KB: int, provider: str):
     device_id = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{device_id}")
     if provider == "jit-eager-symm":
-        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-            get_nccl_mem_pool,
-        )
-
-        with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
-            x = torch.randn(numel, dtype=DTYPE, device=device)
+        x = _init_symm_buffer()[:numel].normal_()
     else:
         x = torch.randn(numel, dtype=DTYPE, device=device)
     ctx_fn = None if "eager" in provider else backend.graph_context

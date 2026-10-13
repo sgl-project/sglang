@@ -174,6 +174,19 @@ def _init_comm_once() -> CustomAllReduceV2:
     return comm
 
 
+@cache_once
+def _init_symm_buffer_once() -> torch.Tensor:
+    """One registered buffer from the NCCL symmetric pool, sized for every
+    case, so the pool never grows between cases."""
+    comm = _init_comm_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    nbytes = TEST_LAYERS * max(TEST_SIZES) * 4 + 64
+    with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    comm.register_symmetric_segments()
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -235,6 +248,7 @@ def test_custom_all_reduce(
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("layout", ["aligned", "skewed", "mixed"])
 @pytest.mark.parametrize(
     "algo", [AllReduceAlgo.ONE_SHOT_PULL, AllReduceAlgo.TWO_SHOT_PULL]
 )
@@ -245,13 +259,25 @@ def test_custom_all_reduce_symmetric(
     size: int,
     dtype: torch.dtype,
     algo: AllReduceAlgo,
+    layout: str,
 ) -> None:
-    """Eager pull over inputs from the NCCL symmetric pool: zero-copy."""
+    """Eager pull over inputs from the NCCL symmetric pool (zero-copy).
+
+    ``skewed`` puts each rank's input at a different offset in its segment;
+    ``mixed`` stages rank 0's input while the others read in place.
+    """
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{rank}")
     comm.override_algo = algo
-    with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
+    in_pool = not (layout == "mixed" and rank == 0)
+    if in_pool:
+        skew = 32 * (rank % 2) if layout == "skewed" else 0
+        nbytes = TEST_LAYERS * size * dtype.itemsize
+        buf = _init_symm_buffer_once()[skew : skew + nbytes]
+        symm_inp = buf.view(dtype).view(TEST_LAYERS, size)
+    else:
         symm_inp = torch.empty((TEST_LAYERS, size), dtype=dtype, device=device)
 
     for _ in range(TEST_LOOP):
@@ -261,11 +287,11 @@ def test_custom_all_reduce_symmetric(
         symm_inp.copy_(inp)
         outs = []
         for i in range(TEST_LAYERS):
-            assert comm._lookup_symmetric(symm_inp[i]) is not None
+            assert (comm._symm_location(symm_inp[i]) >= 0) == in_pool
             out = comm.custom_all_reduce(symm_inp[i])
             if algo == AllReduceAlgo.TWO_SHOT_PULL:
-                # in place: the sum lands in the symmetric input itself
-                assert out.data_ptr() == symm_inp[i].data_ptr()
+                # zero copy runs in place
+                assert (out.data_ptr() == symm_inp[i].data_ptr()) == in_pool
             outs.append(out)
             torch.cuda.synchronize()
         torch.testing.assert_close(out_ref, torch.stack(outs), atol=0, rtol=0)
