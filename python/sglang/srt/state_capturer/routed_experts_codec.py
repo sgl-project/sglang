@@ -21,8 +21,9 @@ _THREADS = 4
 _MAGIC = b"SGRE"
 _VERSION = 1
 _HEADER = struct.Struct("<4sB3sIHH")
-# the capturer's host dtypes, as little-endian numpy dtype strings
-_DTYPES = frozenset(("|u1", "<i2", "<i4"))
+# The capturer's host dtypes (see routed_experts._host_dtype), the only ones on the wire.
+ROUTED_EXPERTS_DTYPES = (np.dtype("|u1"), np.dtype("<i2"), np.dtype("<i4"))
+_DTYPE_STRS = frozenset(dtype.str for dtype in ROUTED_EXPERTS_DTYPES)
 
 _ROW_DTYPES = {
     1: np.dtype(np.uint8),
@@ -45,7 +46,7 @@ class RoutedExpertsEncoder:
 
     def encode(self, rows: np.ndarray) -> str:
         """Encode one request's ``[num_tokens, num_layers, topk]`` rows."""
-        if rows.dtype.str not in _DTYPES:
+        if rows.dtype.str not in _DTYPE_STRS:
             raise ValueError(f"routed experts dtype {rows.dtype} is not a host dtype")
         layer_major = _swap_leading_axes(np.ascontiguousarray(rows))
         compressor = (
@@ -78,7 +79,7 @@ def decode_routed_experts(payload: str) -> np.ndarray:
             f"not a v{_VERSION} routed experts payload (magic {magic!r}, version "
             f"{version}); is the server's sglang older than this client?"
         )
-    if dtype_str.decode("ascii", "replace") not in _DTYPES:
+    if dtype_str.decode("ascii", "replace") not in _DTYPE_STRS:
         raise ValueError(f"routed experts payload has unsupported dtype {dtype_str!r}")
     dtype = np.dtype(dtype_str.decode("ascii"))
     nbytes = num_tokens * num_layers * topk * dtype.itemsize
