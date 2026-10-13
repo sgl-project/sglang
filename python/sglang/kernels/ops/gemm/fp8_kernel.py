@@ -695,6 +695,7 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[int, int, int]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
@@ -731,7 +732,12 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    if out is not None:
+        assert out.shape == C_shape and out.dtype == output_dtype
+        assert out.is_contiguous()
+        C = out
+    else:
+        C = A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 
@@ -743,8 +749,11 @@ def w8a8_block_fp8_matmul_deepgemm(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, out=out
+    )
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM

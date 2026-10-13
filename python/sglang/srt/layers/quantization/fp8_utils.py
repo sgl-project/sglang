@@ -1303,8 +1303,12 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # out: caller-owned buffer; deepgemm writes in place, fallbacks copy in.
     if input_scale is not None:
+        # Pre-quantized inputs come row-padded; no caller combines them with out.
+        assert out is None
         assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
@@ -1319,7 +1323,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-        return triton_w8a8_block_fp8_linear(
+        result = triton_w8a8_block_fp8_linear(
             input,
             weight,
             block_size,
@@ -1329,6 +1333,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             act_scale_ue8m0=act_scale_ue8m0,
             weight_bf16=weight_bf16,
         )
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     if input_scale is not None:
         # Pre-quantized activations retain their per-token group size and
@@ -1348,6 +1356,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if out is not None:
+        assert out.is_contiguous() and out.dtype == output_dtype
+        assert out.shape == tuple(output_shape)
 
     if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
@@ -1370,7 +1382,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
 
     output = w8a8_block_fp8_matmul_deepgemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        block_size,
+        output_dtype=output_dtype,
+        out=out.view(-1, weight.shape[0]) if out is not None else None,
     )
     if bias is not None:
         output += bias

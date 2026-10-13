@@ -39,7 +39,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_forward
+from sglang.srt.runtime_context import get_forward, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.construction import StagePlan
@@ -168,17 +168,38 @@ class StageBoundary:
         )
         return hidden_states
 
-    def finish(self, hidden_states, forward_batch):
+    def can_inline_attn_tp_reduce(self, forward_batch):
+        """Whether attention may complete its plain TP sum inside o_proj."""
+        if self.kind is not StageKind.ATTENTION or not self.plan.finishes_directly:
+            return False
+        produced = self.plan.path_for(forward_batch).output
+        parallel = get_parallel()
+        return (
+            self.plan.variant_for(forward_batch) is BatchVariant.ORDINARY
+            and produced.always_partial
+            and produced.group is SumGroup.ATTN_TP
+            and parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and not get_forward().attn_input_scattered
+        )
+
+    def finish(self, hidden_states, forward_batch, *, already_reduced=False):
         """Hand this stage's output to the following stage: an attention's
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
         take a MoE finalize handoff) finishes through exit() instead."""
+        if already_reduced and not self.can_inline_attn_tp_reduce(forward_batch):
+            raise RuntimeError("attention output cannot be reduced inline on this path")
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
             produced = self.plan.path_for(forward_batch).output
             return stream_of(forward_batch).record(
                 hidden_states,
                 produced.update,
-                declared_sum=produced.group if produced.always_partial else None,
+                declared_sum=(
+                    produced.group
+                    if produced.always_partial and not already_reduced
+                    else None
+                ),
             )
         if self.kind is StageKind.FFN and self.plan.fusions is not None:
             raise RuntimeError(

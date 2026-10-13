@@ -926,7 +926,7 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = _apply_attention_output_gate(
                 self, attn_bmm_output, attention_output_gate
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        output = self._apply_o_proj(attn_bmm_output, forward_batch)
 
         if self.next_skip_topk is None:
             return output

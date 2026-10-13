@@ -1320,6 +1320,16 @@ class Envs:
     # Fold the shared-expert output into the MoE finalize epilogue when the
     # runner supports it (Humming indexed gemm); bit-identical to a separate add.
     SGLANG_OPT_MOE_FUSED_OUTPUT_ADD = EnvBool(True)
+    # Pipeline large-M prefill row-parallel GEMMs with their TP all-reduce in
+    # row chunks; see layers/chunked_gemm_ar.py.
+    SGLANG_OPT_CHUNKED_GEMM_AR = EnvBool(False)
+    SGLANG_OPT_CHUNKED_GEMM_AR_MIN_TOKENS = EnvInt(8192)
+    SGLANG_OPT_CHUNKED_GEMM_AR_NUM_CHUNKS = EnvInt(4)
+    # Size ratio of consecutive chunks; measured on H20 TP4, re-tune elsewhere.
+    SGLANG_OPT_CHUNKED_GEMM_AR_RATIO = EnvFloat(0.36)
+    # SMs kept free of deep_gemm for the NCCL kernel (H20 TP4 channel count);
+    # 0 disables the cap.
+    SGLANG_OPT_CHUNKED_GEMM_AR_RESERVE_SMS = EnvInt(24)
 
     # ===================================================================
     # DeepGEMM Mega MoE

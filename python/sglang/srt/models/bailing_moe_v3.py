@@ -25,6 +25,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.chunked_gemm_ar import chunked_gemm_ar_enabled
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -204,17 +205,24 @@ class DsV3MLA(DeepseekV2AttentionMLA):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        inline_tp_reduce: bool = False,
     ):
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            llama_4_scaling=llama_4_scaling,
-        )
-        gate = self._forward_gated(hidden_states)
-        s = (s[0], s[1], s[2], s[3] + (gate,))
-        return self.forward_core(s)
+        # Same per-forward bookkeeping as DeepseekV2AttentionMLA.forward.
+        self._inline_tp_reduce = inline_tp_reduce
+        self._inline_tp_reduced = False
+        try:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+            )
+            gate = self._forward_gated(hidden_states)
+            s = (s[0], s[1], s[2], s[3] + (gate,))
+            return self.forward_core(s)
+        finally:
+            self._inline_tp_reduce = False
 
     def _forward_gated(self, hidden_states: torch.Tensor):
         if self.g_proj:
@@ -1159,21 +1167,31 @@ class BailingMoELinearDecoderLayer(nn.Module):
             hidden_states, forward_batch, capture=capture_output
         )
 
+        attn_output_reduced = False
         if not forward_batch.forward_mode.is_idle():
+            # An o_proj that reduced inline must not leave an owed sum behind.
+            inline_tp_reduce = (
+                chunked_gemm_ar_enabled()
+                and self.attn_boundary.can_inline_attn_tp_reduce(forward_batch)
+            )
             if self.attention_type == 0:
                 hidden_states = self.attention(
                     hidden_states=hidden_states,
                     positions=positions,
                     forward_batch=forward_batch,
                     zero_allocator=zero_allocator,
+                    inline_tp_reduce=inline_tp_reduce,
                 )
+                attn_output_reduced = self.attention._inline_tp_reduced
             elif self.use_mla:
                 hidden_states = self.attention(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     zero_allocator=zero_allocator,
+                    inline_tp_reduce=inline_tp_reduce,
                 )
+                attn_output_reduced = self.attention._inline_tp_reduced
             else:
                 hidden_states = self.attention(
                     hidden_states=hidden_states,
@@ -1181,7 +1199,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(
+            hidden_states, forward_batch, already_reduced=attn_output_reduced
+        )
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if not (
