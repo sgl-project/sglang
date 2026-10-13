@@ -5,8 +5,8 @@
 // hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. Every recipe is
 // single-GPU. H100 has no 35B-A3B BF16 cell: its ~66 GB of weights exceed the
 // default static memory fraction of an 80 GB card, so the server cannot start.
-// DSpark is an overlay; its draft path follows the variant. Measured on real
-// text it lowers TPOT at concurrency 1 and raises it at 16, hence the subtitles.
+// DSpark is an overlay; its draft path follows the variant. Only the FP8 / INT4
+// cells carry --trust-remote-code: those repos declare custom processor code.
 
 export const config = {
   modelName: "MiniCPM-V 4.7",
@@ -36,9 +36,9 @@ export const config = {
       title: "Speculative Decoding",
       default: "none",
       options: [
-        { id: "none", label: "Off", subtitle: "High throughput" },
+        { id: "none", label: "Off" },
         {
-          id: "dspark", label: "DSPARK", subtitle: "Low latency",
+          id: "dspark", label: "DSPARK",
           flags: (s) => [
             "--speculative-algorithm DSPARK",
             s.variant === "1b"
@@ -130,7 +130,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
@@ -144,7 +143,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
@@ -186,7 +184,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
@@ -200,7 +197,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
@@ -241,7 +237,6 @@ sgl-eval run gsm8k \\
       match: { hw: "h100", variant: "1b", quant: "bf16", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
