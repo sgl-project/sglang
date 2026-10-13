@@ -2655,32 +2655,17 @@ export const config = {
     },
     {
       // Ascend 950PR/DT Series: 4 nodes × 8 cards, one rank per card (TP32).
-      // Unified PD, Balanced, DSPARK-only, with the product-line kernels armed
-      // per env: FIAS V2 BSND for the DSpark target-verify/draft attention
-      // paths and the fine-grained dual-stream MoE overlap. It runs without
-      // attention DP (attn-TP 32), and the shared experts / dense MLP shard across
-      // attention-TP through the server flags (--shared-experts-tp-size 4).
-      // Checkpoint: the official Moonshot MXFP4 build (moonshotai/Kimi-K3,
-      // fetched from ModelScope by SGLANG_USE_MODELSCOPE=1 above). Its routed
-      // experts declare compressed-tensors "mxfp4-pack-quantized", which the
-      // loader detects from the checkpoint itself — the NPU MXFP4 MoE scheme
-      // serves them — so the recipe passes no --quantization flag (attention,
-      // shared experts and the dense MLP are ignored by the checkpoint and stay
-      // BF16). A ModelSlim (W4A8) checkpoint would need --quantization modelslim
-      // and a modelslim-style --model-path instead; the two are not mixable.
-      // Pool sizing is internal to the Ascend path: the KDA state and MLA KV
-      // pools are sized by the runtime, so the recipe sets neither
-      // --mamba-full-memory-ratio nor --max-mamba-cache-size, and the radix
-      // cache is off (one KDA state slot per request) — the ratio calculator
-      // does not apply.
-      // --disable-custom-all-reduce is carried verbatim from the recipe script.
-      // Ascend has no custom all-reduce kernel, so the NPU backend resolves the
-      // flag to True on its own (hardware_backend/npu/utils.py); spelling it out
-      // keeps the panel command identical to the command that was measured.
-      // The `unset` lines of the source script (ASCEND_CUSTOM_OPP_PATH,
-      // SGLANG_NPU_FUSED_MOE_MODE, ENABLE_PROFILING, the K3 trace files) are
-      // launch-script hygiene against stale profiling state, not recipe env —
-      // a panel command starts clean, so they don't carry over.
+      // The script ships SGLANG_NPU_USE_FIAS_V2_BSND commented out — a real
+      // behaviour change vs the earlier revision; re-confirm with the recipe
+      // owner. MXFP4 is detected from the checkpoint, so no --quantization
+      // flag (a ModelSlim build needs --quantization modelslim). The Ascend
+      // path sizes the KDA state pool itself, so no mamba ratio/cache flags.
+      // --chunked-prefill-size pins the script's 2048; its later duplicate
+      // 8192 is dropped.
+      // TODO: DSPARK verify puts up to 32 x 8 = 256 tokens per rank per
+      // forward vs SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64 — over
+      // the CUDA sizing rule, though the A3 cells ship the same pattern;
+      // confirm on a steady-state batch-32 run before publication.
       match: { hw: "a5", pdMode: "unified", strategy: "balanced" },
       nnodes: 4,
       verified: false,
@@ -2690,20 +2675,23 @@ export const config = {
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        "SGLANG_NPU_USE_FIAS_V2_BSND=True",
         "SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM=True",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
+        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
         "STREAMS_PER_DEVICE=32",
-        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128",
-        "HCCL_BUFFSIZE=2000",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64",
+        "HCCL_BUFFSIZE=200",
+        "DEEPEP_HCCL_BUFFSIZE=2000",
         "DEEPEP_NORMAL_LONG_SEQ_ROUND=64",
         "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512",
         "HCCL_OP_EXPANSION_MODE=AIV",
+        "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "ASCEND_USE_FIA=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -2713,9 +2701,11 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
+        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.9",
-        "--chunked-prefill-size 8192",
+        "--max-total-tokens 200000",
+        "--chunked-prefill-size 2048",
         "--cuda-graph-bs-decode 32",
         "--max-running-requests 32",
         "--enable-shared-experts-attn-tp",
