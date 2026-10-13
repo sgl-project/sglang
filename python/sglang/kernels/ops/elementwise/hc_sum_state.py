@@ -1,9 +1,4 @@
-"""Explicit small-T HC sum-state operations and caller-owned buffers.
-
-GatedResidual selects the serving path and owns weight preparation. Callers
-own per-in-flight-step buffers; prepared projection scratch is reused only on
-the worker's serialized compute stream.
-"""
+"""Small-T HC sum-state operations with caller-owned buffers."""
 
 import math
 from typing import NamedTuple
@@ -45,16 +40,12 @@ def _bootstrap_module(c, h, dtype):
 
 
 class SmallTSumHCShell:
-    """Down+Inject -> Up/Mix+reset -> Apply+sum; three kernels, no inv output.
+    """Down+Inject -> Up/Mix+reset -> Apply+sum with prepared weights.
 
-    Down and Up independently consume current sums and compute inverse RMS.
-    Only Up writes next sums (reset); Apply then accumulates those next sums.
-
-    Prepare after loading weights. Allocate one buffer set per concurrently
-    live shell result; do not overwrite a still-live result. Sequential reuse
-    on the same stream is supported, including Graph replay. The next shell
-    uses its own epsilon. First input requires bootstrap (one extra kernel);
-    a chain's final consumer may simply take state.residual.
+    Down/Up reconstruct inverse RMS with this shell's epsilon; no inverse output.
+    Up clears NEXT sums before Apply accumulates. Bootstrap computes initial sums.
+    Prepare after loading; keep each live result's buffers disjoint.
+    Reuse buffers and scratch sequentially on one stream, including Graph replay.
     """
 
     def __init__(self, source, *, down_weights=None, norm_weight_permuted=None):
@@ -162,11 +153,9 @@ class SmallTSumHCShell:
         )
 
     def combine(self, state, buffers, block_output):
-        """Apply an explicit core output after ``mix`` filled these buffers.
+        """Apply the caller's attention/MoE output after ``mix``.
 
-        The caller runs attention/MoE between mix and combine. The same buffer
-        set must remain live until combine finishes; there is no identity-core
-        fallback and this method does not recompute mix or reset its sums.
+        Keep mix's buffers live until completion; another Apply needs a mix/reset.
         """
         self._validate(state, buffers)
         hc_apply_sum(

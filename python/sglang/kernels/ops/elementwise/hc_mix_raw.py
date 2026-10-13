@@ -1,7 +1,6 @@
-"""Explicitly prepared, static-weight small-T raw-state HC primitives.
+"""Small-T HC operations with weights prepared outside execution.
 
-Prepare outside execution. The shared branch-major mode reuses the large-T
-Down/Inject storage; the standalone two-dimensional weight interface remains.
+Branch-major weights share Down/Inject storage with large-T HC.
 """
 
 from functools import cache
@@ -178,8 +177,6 @@ def hc_mix_raw(
         rms_eps=rms_eps,
         branch_packed=weights.branch_packed,
     )
-    # Structural small-T policy: output-channel tile 64, token tile
-    # 8/16/32. No model-name, fixed-H or individual benchmark-T branches.
     up_tactic = SplitKTactic(
         mma_m=64,
         mma_n=8 if rows <= 8 else 16 if rows <= 16 else 32,

@@ -369,8 +369,7 @@ class SplitKDenseGemmKernel:
         self.branch_packed = branch_packed
         if branch_packed and (not raw_rms or epilogue_mode == "gate"):
             raise ValueError("branch-packed weights require raw HC Down")
-        # Retained small-T sum Down: preserve the existing gate/aux staging
-        # reservations on every other path. No shape-specific H/T dispatch.
+        # Compact staging is reserved for alpha-only Down with sum input.
         self.launch_smem_bytes = (
             _smem_bytes(tactic, tactic.ab_stages)
             if raw_sum and epilogue_mode == "silu_aux_alpha_only"
@@ -900,9 +899,7 @@ class SplitKDenseGemmKernel:
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         if cutlass.const_expr(self.raw_sum and self.epilogue_mode != "gate"):
-            # Same early scalar preparation as the retained isolated Down.
-            # Every split rank consumes current sums independently; no inv
-            # publication or dependency on another CTA's global store.
+            # Each split rank reads CURRENT sums and reconstructs inverse RMS locally.
             rEarlyInv = cute_ext.allocate(
                 cutlass.Float32,
                 cute.AddressSpace.rmem,
@@ -1020,10 +1017,8 @@ class SplitKDenseGemmKernel:
             if cutlass.const_expr(
                 self.epilogue_mode in ("silu_aux_direct", "silu_aux_alpha_only")
             ):
-                # Mirror the TMEM->RMEM destination partition with an identity
-                # tensor.  The coordinate at each ordinal therefore belongs to
-                # the same epilogue thread and the same accumulator register as
-                # rAcc[value_idx], without a SMEM transpose or CTA barrier.
+                # Identity coordinates use rAcc's TMEM->RMEM partition;
+                # each epilogue thread maps its registers to the correct output indices.
                 cAux_epi = cute.flat_divide(
                     cute.make_identity_tensor(epi_tile), epi_tile
                 )
@@ -1055,11 +1050,8 @@ class SplitKDenseGemmKernel:
                             )
 
             if cutlass.const_expr(self.epilogue_mode == "silu_aux_alpha_only"):
-                # The optimized HC contract places a trailing, CTA-aligned
-                # Inject slice after the useful Down columns.  Its tile only
-                # emits FP32 alpha: skip the otherwise dead SiLU, dtype cast,
-                # and packed-output store.  Earlier tiles keep the ordinary
-                # Down epilogue unchanged.
+                # The trailing CTA-aligned Inject tile writes FP32 alpha only.
+                # Down tiles retain their SiLU, storage cast and output store.
                 tile_start = bidx * self.cta_m
                 if tile_start < self.epilogue_aux_start:
                     scaled = rAcc.load() * self.epilogue_scale
@@ -1092,9 +1084,8 @@ class SplitKDenseGemmKernel:
                 rows = cute.size(mOut, mode=[0])
                 hs = cute.size(mOut, mode=[1])
                 if cutlass.const_expr(self.reset_sum):
-                    # Exactly one CTA per token tile clears the NEXT state.
-                    # Up's dependency wait precedes these stores; Apply uses a
-                    # normal stream launch and cannot race this reset.
+                    # One CTA per token tile clears NEXT sums after the dependency wait.
+                    # Apply's normal stream launch waits for this reset to finish.
                     if bidx == 0:
                         for reset_it in cutlass.range_constexpr(
                             cute.ceil_div(self.cta_n * group, self.epilog_threads)

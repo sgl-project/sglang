@@ -169,9 +169,8 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # HC's packed buffers are already mapped, but its Python operators are
-        # not serialized. Rebuild only client-local state; never repack into the
-        # daemon's shared weights or repeat the full quantization post-load.
+        # Rebuild only client-local HC operators over the mapped buffers;
+        # never repack daemon-shared weights or repeat quantization post-load.
         for module in model.modules():
             restore_hc = getattr(module, "restore_sum_state_from_ipc", None)
             if restore_hc is not None:

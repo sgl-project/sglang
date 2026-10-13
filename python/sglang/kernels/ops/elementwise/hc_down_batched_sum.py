@@ -1,9 +1,7 @@
-"""Large-T HC Down+Inject from raw residual and branch square sums.
+"""Large-T Down+Inject: branch-batched GEMM followed by merge/nonlinear.
 
-The framework prepares folded weights after loading and shares their storage
-with small-T HC. Each caller owns its scratch/output buffers. Projection uses
-one branch-batched GEMM and one merge/nonlinear kernel, without token chunking
-or weight packing on the inference path.
+Fold weights after loading and share their storage with small-T HC.
+Callers own the scratch and output buffers.
 """
 
 import math
@@ -143,8 +141,7 @@ def _hc_down_batched_sum_post_kernel(
     carrier_inv = gl.rsqrt(ss * (1.0 / H) + EPS)
 
     row64 = row.to(gl.int64)
-    # The validated contiguous [C,T,NP] buffer keeps this alignment for every
-    # T. Preserve vector loads without specializing on the stride's value.
+    # Contiguous [C,T,NP] rows remain vector-aligned for every runtime T.
     batch_stride = gl.multiple_of(BATCH_STRIDE.to(gl.int64), NP & -NP)
     total = gl.full((BLOCK,), 0.0, gl.float32, layout)
     for branch in gl.static_range(C):
@@ -156,8 +153,7 @@ def _hc_down_batched_sum_post_kernel(
             live,
             other=0.0,
         )
-        # Preserve the scalar post's FP32 fused multiply-add rounding. In
-        # particular, do not let pair packing lower this into FMUL2 + FADD.
+        # Keep FP32 FMA rounding; pair packing must not emit FMUL2 + FADD.
         total = gl.fma(p, inv, total)
     raw = total.to(down.dtype.element_ty).to(gl.float32)
     scaled = raw * (1.0 / C)
@@ -196,11 +192,10 @@ def allocate_batched_down_buffers(rows, weights):
 
 
 def batched_down_from_sum(residual, sum_sq, weights, buffers, rms_eps=1e-6):
-    """One batched GEMM call + one scaled-merge/nonlinear kernel.
+    """Compute Down/Inject with one batched GEMM and one merge/nonlinear kernel.
 
-    sums contain square sums, NOT inverse RMS. They may describe the accepted
-    pre-storage-rounding FP32 update. The producer owns initialization. This
-    consumer never modifies residual, sums, or prepared weights.
+    Sums are producer-initialized square sums, possibly from pre-cast FP32 updates.
+    Residual, sums and prepared weights are read-only; sums are not inverse RMS.
     """
     w = weights
     if not math.isfinite(rms_eps) or rms_eps <= 0:

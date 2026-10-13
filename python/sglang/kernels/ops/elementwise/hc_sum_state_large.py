@@ -1,8 +1,4 @@
-"""Large-T HC module: branch BMM Down -> native Up -> Mix/reset -> Apply/sum.
-
-Prepared Down, shared [H,C] RMS/source Up weights, and caller-owned buffers.
-No normalized activation, inverse tensor, runtime weight pack or token chunking.
-"""
+"""Large-T HC: branch-batched Down -> Up -> Mix/reset -> Apply/sum."""
 
 import math
 from typing import NamedTuple
@@ -61,9 +57,8 @@ def _hc_mix_from_sum_kernel(
     EPS: gl.constexpr,
     BLOCK: gl.constexpr,
 ):
-    # This is the shell's existing structural H contract, not a model shape.
-    # Each warp covers 64 consecutive hidden coordinates without crossing a
-    # token, so four lane-carried inverses can be shared by shuffle only.
+    # Each warp covers 64 hidden coordinates within one token;
+    # warp shuffle shares its four lane-carried inverses.
     gl.static_assert(H > 0 and H % 512 == 0)
     gl.static_assert(BLOCK == 256)
     layout: gl.constexpr = gl.BlockedLayout([2], [32], [4], [0])
@@ -82,9 +77,8 @@ def _hc_mix_from_sum_kernel(
     for branch in gl.static_range(4):
         gl.store(next_sums + row64 * 4 + branch, 0.0, live & (pid % (H // BLOCK) == 0))
     inv_carrier = gl.rsqrt(ss * (1.0 / H) + EPS)
-    # RMS storage is [H,4], shared with small-T. Each lane owns two hidden
-    # coordinates: load their eight BF16/FP16 values with one aligned LDG128,
-    # then repack the two values of each branch without changing precision.
+    # Shared [H,4] RMS layout: one LDG128 loads two hidden coordinates per lane.
+    # Repack their eight BF16/FP16 values into per-branch register pairs.
     w0, w1, w2, w3 = gl.inline_asm_elementwise(
         asm="""{
             .reg .b32 p0, p1, p2, p3;
@@ -131,12 +125,11 @@ def _hc_mix_from_sum_kernel(
 
 
 class LargeTSumHCShell:
-    """Five-kernel large-T HC operations around an explicit attention/MoE core.
+    """Five-kernel HC around a caller-provided attention/MoE output.
 
-    Weights are prepared after loading. All intermediates live in the supplied
-    buffer set, so simultaneously live results require disjoint buffer sets.
-    Each call resets NEXT sums in Mix, then accumulates in Apply. Epsilon is
-    a consumer property; HCSumState can cross the small/large-T boundary.
+    Prepare weights after loading; use disjoint buffers for live results.
+    Mix clears NEXT sums before Apply accumulates. Consumers own epsilon,
+    so HCSumState can cross the small/large-T boundary.
     """
 
     @torch.no_grad()
@@ -305,10 +298,9 @@ class LargeTSumHCShell:
         return buffers.mixed, buffers.alpha
 
     def combine(self, state, buffers, block_output):
-        """Apply a core output using alpha and NEXT sums prepared by ``mix``.
+        """Apply the caller's core output using mix's alpha and NEXT sums.
 
-        The caller owns the core and buffer lifetime. Do not invoke combine
-        twice without another mix/reset; it accumulates into NEXT sums.
+        Keep mix's buffers live; another combine needs mix to reset NEXT sums.
         """
         self._validate(state, buffers)
         hc_apply_sum(
