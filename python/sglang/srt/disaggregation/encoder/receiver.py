@@ -1072,7 +1072,7 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
-        apply_caller_mm_hashes(mm_inputs, self.recv_req.mm_hashes)
+        apply_caller_mm_hashes(mm_inputs=mm_inputs, mm_hashes=self.recv_req.mm_hashes)
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)

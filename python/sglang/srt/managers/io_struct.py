@@ -583,7 +583,7 @@ class GenerateReqInput:
             decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
         )
         if self.mm_hashes is not None:
-            _check_mm_hashes_are_strings(self.mm_hashes, "mm_hashes")
+            _check_mm_hashes_are_strings(hashes=self.mm_hashes, name="mm_hashes")
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -716,7 +716,7 @@ class GenerateReqInput:
                     )
                 if field_name == "mm_hashes":
                     _check_mm_hashes_are_strings(
-                        per_request, f"mm_hashes[{request_index}]"
+                        hashes=per_request, name=f"mm_hashes[{request_index}]"
                     )
                 normalized.append(per_request)
             setattr(self, field_name, normalized * self.parallel_sample_num)
@@ -1164,8 +1164,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
-    # See GenerateReqInput.mm_hashes. With encoder disaggregation the scheduler
-    # builds mm_inputs, so the scheduler applies these hashes.
+    # See GenerateReqInput.mm_hashes. With zmq_to_scheduler or mooncake the
+    # scheduler builds mm_inputs, so the scheduler applies these hashes.
     mm_hashes: Optional[List[str]] = None
 
     def wrap_pickle_fields(self):
