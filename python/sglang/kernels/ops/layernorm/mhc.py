@@ -904,8 +904,7 @@ def prewarm_mhc_pre(
     schedule = get_schedule()
     max_num_tokens = schedule.chunked_prefill_size
     if max_num_tokens is None or max_num_tokens <= 0:
-        # Chunked prefill disabled (-1): a prefill batch is bounded by the
-        # prefill token budget instead of a chunk size.
+        # Chunked prefill disabled: bound by the prefill token budget.
         max_num_tokens = schedule.max_prefill_tokens
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
