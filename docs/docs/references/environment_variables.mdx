@@ -517,8 +517,18 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_MOE_MAX_INPUT_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be &gt;= the actual number of received tokens (<code>totalRecvTokenNum</code>); setting it too small causes incorrect results. <code>0</code> disables truncation (use full buffer).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Manual MoE input row limit for MORI EPv1 and EPv2. A positive value overrides <code>SGLANG_MORI_RECV_BOUND</code> and is used unrounded, capped at the receive capacity; it only narrows the MoE input view, not the communication buffer. It must be &gt;= the actual received tokens, or results are incorrect. <code>0</code> leaves it to <code>SGLANG_MORI_RECV_BOUND</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EP_V2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used only for DeepSeek-V4 models on AITER with <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> that fits one UALink vPOD), a bfloat16 model dtype and <code>MORI_ENABLE_SDMA</code> off, and MORI EPv1 otherwise. Set to <code>true</code> to use EPv2 even when these checks fail (a warning names the failed check), or <code>false</code> to always use EPv1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_RECV_BOUND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap keep the full view.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>

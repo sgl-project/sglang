@@ -1444,6 +1444,13 @@ class ServerArgs(DisaggServerArgsMixin):
             self._requested_component_attention_backend_roles
         )
 
+    def set_automatic_component_attention_backend(
+        self, component_name: str, backend: str
+    ) -> None:
+        """Select a component's backend on the user's behalf."""
+        self.component_attention_backends[component_name] = backend
+        self._automatic_component_attention_backend_keys.add(component_name)
+
     def is_component_attention_backend_automatic(
         self, component_name: str | None
     ) -> bool:

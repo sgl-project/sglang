@@ -57,6 +57,42 @@ class TestIsNumaAvailable(unittest.TestCase):
     ):
         self.assertFalse(_is_numa_available())
 
+    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
+    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
+    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
+    @patch("os.path.isdir", return_value=True)
+    def test_cpu_only_accepted_when_mempolicy_not_permitted(
+        self, _mock_isdir, _mock_which, _mock_mempolicy
+    ):
+        self.assertTrue(_is_numa_available(require_mempolicy=False))
+
+
+class TestNumaBindWithoutMempolicy(unittest.TestCase):
+    """A container without SYS_NICE can set CPU affinity but not memory policy."""
+
+    def _bind(self, mempolicy_ok: bool) -> MagicMock:
+        libnuma = MagicMock()
+        libnuma.numa_available.return_value = 0
+        with (
+            patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=libnuma),
+            patch("sglang.srt.utils.numa_utils._node_cpus", return_value={0, 1}),
+            patch("os.sched_getaffinity", return_value={0, 1, 2, 3}),
+            patch("os.sched_setaffinity") as setaffinity,
+            patch(
+                "sglang.srt.utils.numa_utils._can_set_mempolicy",
+                return_value=mempolicy_ok,
+            ),
+        ):
+            numa_bind_to_node(0)
+        setaffinity.assert_called_once_with(0, {0, 1})
+        return libnuma
+
+    def test_cpus_bound_and_memory_policy_skipped(self):
+        self._bind(mempolicy_ok=False).numa_set_preferred.assert_not_called()
+
+    def test_memory_policy_set_when_permitted(self):
+        self._bind(mempolicy_ok=True).numa_set_preferred.assert_called_once()
+
 
 # Pin _is_xpu=False so these cases still reach the mocked pynvml on a real XPU
 # host, where _query_numa_node_for_gpu short-circuits into the XPU sysfs branch.
@@ -346,6 +382,7 @@ class TestNumaBindIntersection(unittest.TestCase):
     ):
         lib = MagicMock()
         lib.numa_available.return_value = 0
+        lib.get_mempolicy.return_value = 0
         mock_libnuma.return_value = lib
 
         numa_bind_to_node(0)

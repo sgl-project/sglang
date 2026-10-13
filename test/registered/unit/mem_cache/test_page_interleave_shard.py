@@ -33,8 +33,9 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 6. MTP draft pool construction, shared allocator/layout validation, and scratch
    sizing for separate target and draft pools.
 
-The real NCCL gather over 2 GPUs lives in
-``test_page_interleave_gather_multi_gpu.py``.
+The real NCCL MLA/MHA/MTP gathers over 2 GPUs live in
+``test_page_interleave_gather_multi_gpu.py``. DSA indexer and latent KV
+coverage over 2 and 4 GPUs lives in ``test_page_interleave_indexer_multi_gpu.py``.
 """
 
 import shutil
