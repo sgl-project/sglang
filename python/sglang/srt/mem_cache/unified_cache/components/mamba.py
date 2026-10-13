@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
@@ -503,13 +504,13 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
+    def _alloc_mamba_slot(self, required: bool = True) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            assert slot is not None or not required, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -692,9 +693,71 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        ct = self.component_type
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[ct].value
+            if value is None:
+                return None
+            # One state per node, valid only at the node's end boundary.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = self._alloc_mamba_slot(required=False)
+            if transfer.device_indices is None:
+                return None
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+    ) -> Optional[PoolTransfer]:
+        pool = self.cache.req_to_token_pool
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            pool.mamba_allocator.free(transfer.device_indices)
+            return None
+
+        assert phase == ExternalLinkerLoadPhase.PREPARE
+        if req.kv is None:
+            from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+            req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+        if req.kv.holds_mamba:
+            pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        # The layer-gated load writes the request's private state directly.
+        req.kv.mamba_pool_idx = transfer.device_indices[0]
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.req_pool_idx is not None:
+            pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = (
+                req.kv.mamba_pool_idx
+            )
+        if pool.mamba_pool.replayssm_write_pos is not None:
+            indices = pool.translate_mamba_indices(transfer.device_indices)
+            pool.mamba_pool.replayssm_write_pos[indices] = 0
+        if (
+            req.mamba_branching_seqlen is not None
+            and req.mamba_branching_seqlen <= prefix_len
+        ):
+            req.mamba_branching_seqlen = None
+        return transfer
 
     # ---- HiCache Hooks ----
 
