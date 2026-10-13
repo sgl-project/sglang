@@ -226,9 +226,8 @@ class GatedResidual(HyperConnectionBase):
     ):
         super().__init__(config, use_mix, use_combine, role)
 
-        # Only explicitly selected, structurally supported full HC instances
-        # omit the original GPU parameters. Final mixers and other paths keep
-        # their existing storage, loader and Tensor ABI.
+        # Packed full HC keeps Down/Inject/RMS checkpoint tensors on CPU.
+        # Other instances retain their original parameter storage and Tensor ABI.
         lowrank = config.hc_lowrank
         self._packed_sum_weights = (
             packed_weights
@@ -394,9 +393,8 @@ class GatedResidual(HyperConnectionBase):
         self.register_load_state_dict_post_hook(self._after_sum_state_dict_load)
 
     def _load_sum_source_weight(self, parameter, loaded_weight):
-        # These are replicated, non-sharded HC parameters. Keep checkpoint
-        # names/storage authoritative; derived layouts are refreshed at the end
-        # of the model's load_weights transaction, never on the inference path.
+        # HC parameters are replicated; refresh derived layouts at load completion,
+        # not during inference.
         if parameter.shape != loaded_weight.shape:
             raise ValueError("HC source weight shape mismatch")
         if self._packed_sum_weights:
@@ -481,8 +479,7 @@ class GatedResidual(HyperConnectionBase):
             raise ValueError("Packed HC requires CUDA Up and CPU RMS in BF16/FP16")
         c, h, lowrank = self.hc_count, self.hidden_size, self.config.hc_lowrank
         npad = ((lowrank + c + 7) // 8) * 8
-        # Fold on CPU in FP32, cast once and reorder before the single upload.
-        # No full original, FP32-folded or second prepared matrix lives on GPU.
+        # Fold in FP32 on CPU, cast once, then upload the shared packed layout.
         gamma = 1.0 + norm.detach().to(device="cpu", dtype=torch.float32)
         folded = torch.zeros((npad, c * h), device="cpu", dtype=up.dtype)
         folded[:lowrank] = (self.input_mix_weight_down.weight.float() * gamma).to(
@@ -503,8 +500,7 @@ class GatedResidual(HyperConnectionBase):
             ):
                 raise ValueError("Packed HC storage changed; recreate and reload")
             packed.copy_(host_packed)
-        # Upload RMS directly in the shared [H,C] layout. Do not create an
-        # original [C,H] CUDA copy merely to transpose it during preparation.
+        # Upload RMS in the shared [H,C] layout without an intermediate CUDA copy.
         host_norm = norm.detach().view(c, h).T.contiguous().flatten()
         packed_norm = self._hc_packed_norm
         if packed_norm is None:
@@ -584,18 +580,11 @@ class GatedResidual(HyperConnectionBase):
 
     @torch.no_grad()
     def prepare_sum_state_weights(self, *, force: bool = False):
-        """Prepare both paths once the pending Down/Inject pair is complete.
+        """Prepare packed HC after loading; return False for non-packed instances.
 
-        Packed instances retain CPU checkpoint values and one shared CUDA
-        Down/Inject storage plus one shared [H,C] RMS storage. Down and Inject
-        may arrive in separate loader calls; an incomplete pair stays dirty.
-        Validate readiness when loading ends. Unchanged Up/RMS need not be resent.
-        ``force`` handles loaders that copy through
-        state_dict instead of weight_loader. Reloading requires graph recapture.
-        Non-packed instances keep the Tensor path and return False.
-        Large-T Up shares its original parameter storage.
-        Like the existing HC dispatcher, a layer executes on the worker's
-        serialized compute stream; per-call outputs are not cached on it.
+        Incomplete Down/Inject pairs stay dirty; validate at load completion.
+        Unchanged Up/RMS need not be resent; ``force`` handles bypassed loader hooks.
+        Reloading requires graph recapture. Reuse scratch on one serialized stream.
         """
         if self._packed_sum_weights:
             if force:

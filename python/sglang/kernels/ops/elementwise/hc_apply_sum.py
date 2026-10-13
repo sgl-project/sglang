@@ -1,8 +1,4 @@
-"""HC Apply with caller-owned, pre-rounding FP32 square sums.
-
-Shared by the small- and large-T paths. The caller initializes the next sums
-before this kernel accumulates into them.
-"""
+"""HC Apply with caller-owned, pre-rounding FP32 square sums."""
 
 import torch
 
