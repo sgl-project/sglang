@@ -43,6 +43,10 @@ class Heuristic(NamedTuple):
     Setting two adjacent thresholds equal effectively disables the middle
     algo; leaving ``mc`` / ``two_shot_push_threshold`` at the default
     disables that algo.
+
+    The field order below is the positional layout of the table rows
+    (``1shot_push, 1shot_pull, 2shot_pull, mc``); ``two_shot_push_threshold``
+    is set by keyword, see ``_sm100_configs``.
     """
 
     one_shot_push_threshold: int
@@ -72,13 +76,13 @@ class Heuristic(NamedTuple):
         self, *, max_push_bytes: int, max_pull_bytes: int, world_size: int
     ) -> "Heuristic":
         return Heuristic(
-            min(self.one_shot_push_threshold, max_push_bytes),
-            min(self.one_shot_pull_threshold, max_pull_bytes),
-            min(self.two_shot_pull_threshold, max_pull_bytes),
-            self.mc.clip(max_pull_bytes),
-            min(
+            one_shot_push_threshold=min(self.one_shot_push_threshold, max_push_bytes),
+            one_shot_pull_threshold=min(self.one_shot_pull_threshold, max_pull_bytes),
+            two_shot_pull_threshold=min(self.two_shot_pull_threshold, max_pull_bytes),
+            mc=self.mc.clip(max_pull_bytes),
+            two_shot_push_threshold=min(
                 self.two_shot_push_threshold,
-                world_size * 16 * (max_push_bytes // 32),
+                two_shot_push_max_bytes(max_push_bytes, world_size),
             ),
         )
 
@@ -87,6 +91,11 @@ def two_shot_push_slot_bytes(nbytes: int, world_size: int) -> int:
     """A 2shot_push slot holds a partial half and a gathered half of one
     ``ceil(nbytes / world_size)`` chunk, in 16 B vectors."""
     return 32 * -(-nbytes // (16 * world_size))
+
+
+def two_shot_push_max_bytes(slot_bytes: int, world_size: int) -> int:
+    """Inverse of ``two_shot_push_slot_bytes``: the largest tensor a slot fits."""
+    return world_size * 16 * (slot_bytes // 32)
 
 
 class AllReduceConfig(NamedTuple):
@@ -133,10 +142,16 @@ def _pack_heuristic(*args) -> Heuristic:
 def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
 
-    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+    def config(
+        world_size: int, *, graph: tuple, eager: tuple, two_shot_push: int = 0
+    ) -> AllReduceConfig:
         return AllReduceConfig(
-            graph=_pack_heuristic(*graph),
-            eager=_pack_heuristic(*eager),
+            graph=_pack_heuristic(*graph)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
+            eager=_pack_heuristic(*eager)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
             num_push_blocks=num_sm,
             num_pull_blocks=num_sm if world_size == 2 else 96,
             num_mc_blocks=mc_blocks.get(world_size),
@@ -155,8 +170,9 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         4: config(
             4,
-            graph=(0.625 * MB, 0.625 * MB, 128.0 * MB, Range(0, 0), 8 * MB),
-            eager=(0.625 * MB, 0.625 * MB, 32.00 * MB, Range(0, 0), 8 * MB),
+            graph=(0.625 * MB, 0.625 * MB, 128.0 * MB),
+            eager=(0.625 * MB, 0.625 * MB, 32.00 * MB),
+            two_shot_push=8 * MB,
         ),
         5: config(
             5,
@@ -175,8 +191,9 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(8 * MB, 128 * MB), 8 * MB),
-            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(0, 128 * MB), 8 * MB),
+            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(8 * MB, 128 * MB)),
+            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(0, 128 * MB)),
+            two_shot_push=8 * MB,
         ),
         16: config(
             16,
