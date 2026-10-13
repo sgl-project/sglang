@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 from aiter import gemm_a8w8_blockscale
 
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_operand
 
 
 def aiter_mxfp8_blockscaled_linear(
@@ -27,11 +27,7 @@ def aiter_mxfp8_blockscaled_linear(
     if input_2d.shape[0] == 0:
         out = input_2d.new_empty((0, n), dtype=torch.bfloat16)
     else:
-        if input_scale is None:
-            xq, xs = mxfp8_e4m3_quantize(input_2d.to(torch.bfloat16))
-        else:
-            assert input_2d.dtype == torch.float8_e4m3fn, input_2d.dtype
-            xq, xs = input_2d.contiguous(), input_scale.contiguous()
+        xq, xs = mxfp8_operand(input_2d, input_scale)
         out = gemm_a8w8_blockscale(
             xq, weight, xs, weight_scale_ue8m0, dtype=torch.bfloat16
         )
