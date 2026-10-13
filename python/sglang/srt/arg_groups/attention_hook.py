@@ -616,7 +616,9 @@ def handle_deterministic_inference(server_args: Any):
             if hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.deterministic = True
                 torch.backends.cudnn.benchmark = False
-            if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+            if hasattr(
+                torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"
+            ):
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
                     False
                 )
@@ -625,9 +627,7 @@ def handle_deterministic_inference(server_args: Any):
             if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
                 torch.backends.cuda.enable_mem_efficient_sdp(False)
         except Exception as _e:  # pragma: no cover - torch may not be present yet
-            logger.debug(
-                "Could not apply PyTorch deterministic settings: %s", _e
-            )
+            logger.debug("Could not apply PyTorch deterministic settings: %s", _e)
 
         if cfg.enable_aiter_allreduce_fusion:
             logger.warning(
