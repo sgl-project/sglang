@@ -551,6 +551,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
     stride_v,
     stride_b,
     TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -633,7 +634,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
             tl.store(
                 tree_rawv
                 + factor_slot * stride_rawv_slot
-                + (i_hv * TREE_WIDTH + node_idx) * V
+                + (i_hv * CACHE_TREE_WIDTH + node_idx) * V
                 + o_k,
                 b_rawv,
                 mask=active & mask_k,
@@ -641,7 +642,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
             tl.store(
                 tree_g
                 + factor_slot * stride_g_slot
-                + (i_hv * TREE_WIDTH + node_idx) * K
+                + (i_hv * CACHE_TREE_WIDTH + node_idx) * K
                 + o_k,
                 b_g,
                 mask=active & mask_k,
@@ -650,7 +651,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
                 tl.store(
                     tree_rawk
                     + factor_slot * stride_rawk_slot
-                    + (i_h * TREE_WIDTH + node_idx) * K
+                    + (i_h * CACHE_TREE_WIDTH + node_idx) * K
                     + o_k,
                     b_rawk,
                     mask=active & mask_k,
@@ -658,7 +659,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
             tl.store(
                 tree_beta
                 + factor_slot * stride_beta_slot
-                + i_hv * TREE_WIDTH
+                + i_hv * CACHE_TREE_WIDTH
                 + node_idx,
                 b_beta,
                 mask=active,
@@ -705,6 +706,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
     stride_v,
     stride_b,
     TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
     MAX_DEPTH: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -844,7 +846,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
                     tl.store(
                         tree_rawv
                         + factor_slot * stride_rawv_slot
-                        + (i_hv * TREE_WIDTH + node_idx) * V
+                        + (i_hv * CACHE_TREE_WIDTH + node_idx) * V
                         + o_k,
                         b_rawv,
                         mask=mask_k,
@@ -852,7 +854,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
                     tl.store(
                         tree_g
                         + factor_slot * stride_g_slot
-                        + (i_hv * TREE_WIDTH + node_idx) * K
+                        + (i_hv * CACHE_TREE_WIDTH + node_idx) * K
                         + o_k,
                         b_g,
                         mask=mask_k,
@@ -861,7 +863,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
                         tl.store(
                             tree_rawk
                             + factor_slot * stride_rawk_slot
-                            + (i_h * TREE_WIDTH + node_idx) * K
+                            + (i_h * CACHE_TREE_WIDTH + node_idx) * K
                             + o_k,
                             b_rawk,
                             mask=mask_k,
@@ -869,7 +871,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
                     tl.store(
                         tree_beta
                         + factor_slot * stride_beta_slot
-                        + i_hv * TREE_WIDTH
+                        + i_hv * CACHE_TREE_WIDTH
                         + node_idx,
                         b_beta,
                     )
@@ -1189,8 +1191,8 @@ def fused_sigmoid_gating_delta_rule_update(
         # computes every node output without materializing per-node [V, K]
         # states; the post-sampling tree commit folds only the accepted path.
         tree_width = retrieve_parent_token.shape[1]
-        assert tree_width in (49, 65), (
-            "factorized tree currently supports node=49 or node=65, got "
+        assert tree_width in (31, 33, 49, 65), (
+            "factorized tree supports node=31, 33, 49, or 65, got "
             f"{tree_width}"
         )
         assert retrieve_parent_token.shape == (N, tree_width)
@@ -1262,6 +1264,7 @@ def fused_sigmoid_gating_delta_rule_update(
             stride_v=stride_v,
             stride_b=stride_b,
             TREE_WIDTH=tree_width,
+            CACHE_TREE_WIDTH=max_cache_len,
             MAX_DEPTH=tree_max_depth,
             H=H,
             HV=HV,
@@ -1279,10 +1282,14 @@ def fused_sigmoid_gating_delta_rule_update(
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
-        # Width 65 rounds the ancestor axis to BT=128. Split output rows so a
-        # program does not materialize a 128x128 factor tile; width 49 retains
-        # its original single 64-row program.
-        factor_verify_bm = 64 if tree_width <= 64 else 32
+        # Width 31 fits one 32-row output tile and benefits from a smaller CTA.
+        # Widths 33/49 retain the original 64-row tile: splitting them adds a
+        # second program and regresses end-to-end throughput despite small
+        # microbenchmark wins. Width 65 must split to avoid a 128x128 tile.
+        factor_verify_bm = 32 if tree_width in (31, 65) else 64
+        if tree_width == 31:
+            factor_verify_num_warps = 4
+            factor_verify_num_stages = 2
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
         factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
         fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](

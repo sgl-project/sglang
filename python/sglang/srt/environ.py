@@ -1480,6 +1480,9 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
+    # Capture FA3 top-k target-verify metadata construction in the target graph;
+    # replay only stages the dynamic tree mask into a stable backend buffer.
+    SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

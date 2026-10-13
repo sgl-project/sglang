@@ -966,6 +966,7 @@ def commit_mamba_states_after_verify(
             accept_index=accept_index,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
+            tree_width=draft_token_num,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,

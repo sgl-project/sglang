@@ -367,7 +367,8 @@ def kda_replayssm_tree_exact_fold_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    TREE_WIDTH: tl.constexpr,
+    LOGICAL_TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
     MAX_ACCEPT: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
@@ -407,7 +408,7 @@ def kda_replayssm_tree_exact_fold_kernel(
         track_slot = NULL_BLOCK_ID
         track_node = -1
 
-    request_node_base = i_n * TREE_WIDTH
+    request_node_base = i_n * LOGICAL_TREE_WIDTH
     for step in range(MAX_ACCEPT):
         active = step < n_commit
         global_node = tl.load(
@@ -416,13 +417,13 @@ def kda_replayssm_tree_exact_fold_kernel(
             other=request_node_base,
         ).to(tl.int64)
         node = global_node - request_node_base
-        active = active & (node >= 0) & (node < TREE_WIDTH)
+        active = active & (node >= 0) & (node < LOGICAL_TREE_WIDTH)
         safe_node = tl.maximum(node, 0)
 
         b_k = tl.load(
             rawk_cache
             + factor_slot * stride_rawk_slot
-            + (i_h * TREE_WIDTH + safe_node) * K
+            + (i_h * CACHE_TREE_WIDTH + safe_node) * K
             + o_k,
             mask=active & mask_k,
             other=0.0,
@@ -430,7 +431,7 @@ def kda_replayssm_tree_exact_fold_kernel(
         b_v = tl.load(
             rawv_cache
             + factor_slot * stride_rawv_slot
-            + (i_hv * TREE_WIDTH + safe_node) * V
+            + (i_hv * CACHE_TREE_WIDTH + safe_node) * V
             + o_v,
             mask=active & mask_v,
             other=0.0,
@@ -438,13 +439,16 @@ def kda_replayssm_tree_exact_fold_kernel(
         b_g = tl.load(
             gk_cache
             + factor_slot * stride_gk_slot
-            + (i_hv * TREE_WIDTH + safe_node) * K
+            + (i_hv * CACHE_TREE_WIDTH + safe_node) * K
             + o_k,
             mask=active & mask_k,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + factor_slot * stride_beta_slot + i_hv * TREE_WIDTH + safe_node,
+            beta_cache
+            + factor_slot * stride_beta_slot
+            + i_hv * CACHE_TREE_WIDTH
+            + safe_node,
             mask=active,
             other=0.0,
         ).to(tl.float32)
@@ -492,6 +496,11 @@ def commit_kda_replayssm_tree_all_layers(
     """Commit sampled UBTree paths for every KDA layer in one launch."""
     num_layers, _, num_value_heads, value_dim, key_dim = checkpoint_state.shape
     num_key_heads = rawk_cache.shape[2]
+    cache_tree_width = rawv_cache.shape[-2]
+    if tree_width > cache_tree_width:
+        raise ValueError(
+            f"logical tree width {tree_width} exceeds cache width {cache_tree_width}"
+        )
     block_key = triton.next_power_of_2(key_dim)
     block_value = min(triton.next_power_of_2(value_dim), 32)
     batch_size = accept_lens.shape[0]
@@ -534,7 +543,8 @@ def commit_kda_replayssm_tree_all_layers(
         V=value_dim,
         BK=block_key,
         BV=block_value,
-        TREE_WIDTH=tree_width,
+        LOGICAL_TREE_WIDTH=tree_width,
+        CACHE_TREE_WIDTH=cache_tree_width,
         MAX_ACCEPT=accept_index.shape[1],
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
@@ -551,6 +561,7 @@ def commit_kda_tree_after_verify(
     accept_index: torch.Tensor,
     accept_lens: torch.Tensor,
     last_correct_step_indices: torch.Tensor,
+    tree_width: int,
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
@@ -570,7 +581,7 @@ def commit_kda_tree_after_verify(
         factor_cache_indices=factor_cache_indices,
         accept_index=accept_index,
         accept_lens=accept_lens,
-        tree_width=spec_state.tree_rawv.shape[-2],
+        tree_width=tree_width,
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
@@ -585,7 +596,7 @@ def commit_kda_tree_after_verify(
             factor_cache_indices,
             accept_index,
             accept_lens,
-            tree_width=spec_state.tree_rawv.shape[-2],
+            tree_width=tree_width,
             track_indices=mamba_track_indices,
             track_nodes=mamba_steps_to_track,
         )
