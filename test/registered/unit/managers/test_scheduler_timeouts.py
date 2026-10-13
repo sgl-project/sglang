@@ -211,7 +211,7 @@ class TestRunningTimeout(CustomTestCase):
                 else:
                     s.inflight_steps = InflightQueue(depth=1, ring=True)
                     s.inflight_steps.push(s.last_batch, None)
-                    s.inflight_steps.end_step(s.last_batch)
+                    s.inflight_steps.end_step()
                     s.inflight_steps.push(_batch([older]), None)
 
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):

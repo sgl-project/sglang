@@ -69,7 +69,7 @@ class TestInflightQueue(CustomTestCase):
             for s in range(max(0, step - 2), step + 1):
                 expected[s % 3] = launches[s]
             self.assertEqual(q.slot_batches(), expected)
-            q.end_step(batch)
+            q.end_step()
         self.assertEqual(committed, ["b0", None])
         self.assertEqual(len(q), 2)
 

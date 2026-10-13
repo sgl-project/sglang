@@ -209,7 +209,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step(cur_batch)
+                self.inflight_steps.end_step()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -361,7 +361,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step(cur_batch)
+                self.inflight_steps.end_step()
                 release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
@@ -547,7 +547,7 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step(cur_batch)
+                self.inflight_steps.end_step()
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
