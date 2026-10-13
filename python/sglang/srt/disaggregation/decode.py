@@ -1397,10 +1397,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if is_pp_mode
                 else (self.scheduler.running_batch,)
             )
-            # Include finished requests; GPU work may still use their adapters.
+            # GPU work may still read the adapters of every slot's running rows,
+            # finished rows that have not left yet included, and of the rows of
+            # every in-flight launched batch.
             running_loras = {
                 req.lora_id for batch in running_batches for req in batch.reqs
             }
+            running_loras.update(
+                req.lora_id
+                for record in self.scheduler.inflight_steps
+                if record.batch is not None
+                for req in record.batch.reqs
+            )
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
@@ -3000,6 +3008,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            # Finished rows leave before preallocation and the prebuilt join
+            # size their budgets from the running batch.
+            self.leave_finished_rows(self.running_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3049,6 +3060,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            # Finished rows leave before preallocation and the prebuilt join
+            # size their budgets from the running batch.
+            self.leave_finished_rows(self.running_batch)
             self.process_decode_queue()
 
             # Get the next batch to run

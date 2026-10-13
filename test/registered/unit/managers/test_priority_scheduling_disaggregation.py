@@ -521,28 +521,38 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
     def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
         """In-flight requests retain their adapter slots."""
-        running, finished, transferring, waiting = [
+        occupied = [
             self._new_decode_req(rid, 0)
-            for rid in ("running", "finished", "transferring", "waiting")
+            for rid in ("running", "in-slot", "left", "transferring", "waiting")
         ]
+        running, finished_in_slot, finished_left, transferring, waiting = occupied
         reqs = [
             self._new_decode_req("new", 3),
             self._new_decode_req("blocked", 2),
             self._new_decode_req("same-adapter", 1),
         ]
-        for entry in [running, finished, transferring, waiting, *reqs]:
+        for entry in [*occupied, *reqs]:
             entry.req.lora_id = entry.req.rid
-            entry.req.finished = MagicMock(return_value=entry is finished)
+            entry.req.finished = MagicMock(
+                return_value=entry in (finished_in_slot, finished_left)
+            )
         reqs[2].req.lora_id = "running"
 
         queue = self._new_queue(reqs)
         queue.pp_size = 2
         queue.transfer_queue.queue = [transferring]
         scheduler = queue.scheduler
-        scheduler.running_batch.reqs = [finished.req]
+        scheduler.running_batch.reqs = []
         scheduler.running_mbs = [
             scheduler.running_batch,
-            SimpleNamespace(reqs=[running.req]),
+            # Another slot keeps its finished row until that slot plans again.
+            SimpleNamespace(reqs=[running.req, finished_in_slot.req]),
+        ]
+        # This finished request has left the running batch; the launched batch
+        # that still reads its adapter is in flight.
+        scheduler.inflight_steps = [
+            SimpleNamespace(batch=SimpleNamespace(reqs=[finished_left.req])),
+            SimpleNamespace(batch=None),
         ]
         scheduler.waiting_queue = [waiting.req]
         scheduler.enable_decode_hicache = False
@@ -553,7 +563,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             scheduler
         )
         manager = LoRAManager.__new__(LoRAManager)
-        manager.max_loras_per_batch = 5
+        manager.max_loras_per_batch = 6
         manager.num_pinned_loras = 0
         scheduler.tp_worker.model_runner.lora_manager = manager
 
