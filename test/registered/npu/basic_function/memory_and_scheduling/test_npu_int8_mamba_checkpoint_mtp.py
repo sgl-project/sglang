@@ -111,9 +111,7 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan, answer_prompt):
     has_draft_tokens = bool(server_info.get("speculative_num_draft_tokens"))
     assert has_draft_tokens is mtp_enabled
 
-    _check_cached_output_matches_recompute(
-        int8_enabled, mtp_enabled, answer_prompt
-    )
+    _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, answer_prompt)
 
     results = {}
     for K, (warm, probe) in plan.items():
@@ -271,7 +269,9 @@ class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
 
     def test_checkpoint_capacity_and_cache_hit_correctness(self):
         plan = _make_capacity_requests()
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL, trust_remote_code=True, use_fast=True
+        )
         answer_prompt = _make_answer_prompt(tokenizer)
         measurements = {}
         for mtp_enabled in (False, True):
