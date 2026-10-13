@@ -320,10 +320,9 @@ class TestPrefillSkippedOutput(CustomTestCase):
 
 
 class TestMixedBatchKvRelease(CustomTestCase):
-    def test_decode_req_finishing_in_mixed_batch_gets_release_hook(self):
-        """A decode req that finishes inside a mixed batch goes through the
-        worker's pre-release hook, as it would in a decode batch; a prefill
-        req finishing on its first token does not."""
+    def test_finished_reqs_in_mixed_batch_get_release_hook(self):
+        """Both finished prefills and decodes notify the worker before their
+        scheduler KV rows can be reused."""
         prefill_req = _PrefillReq(
             rid="prefill", inflight_middle_chunks=0, return_hidden_states=False
         )
@@ -360,12 +359,19 @@ class TestMixedBatchKvRelease(CustomTestCase):
             skipped_output_comm=False,
         )
         processor = _make_processor(self)
+        events = []
+        processor.model_worker.prepare_for_kv_cache_release.side_effect = lambda req: (
+            events.append(("prepare", req.rid))
+        )
 
         with (
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
-            ) as release,
+                "batch_result_processor.release_kv_cache",
+                side_effect=lambda req, *args, **kwargs: events.append(
+                    ("release", req.rid)
+                ),
+            ),
             patch.object(
                 SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
             ),
@@ -373,9 +379,16 @@ class TestMixedBatchKvRelease(CustomTestCase):
         ):
             processor.process_batch_result_prefill(batch, result)
 
-        self.assertEqual(release.call_count, 2)
-        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
-            decode_req
+        self.assertEqual(prefill_req.output_ids, [5])
+        self.assertEqual(decode_req.output_ids, [6])
+        self.assertEqual(
+            events,
+            [
+                ("prepare", "prefill"),
+                ("release", "prefill"),
+                ("prepare", "decode"),
+                ("release", "decode"),
+            ],
         )
 
 

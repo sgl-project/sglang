@@ -380,8 +380,8 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
-                            self._prepare_kv_cache_release(req)
+                        # Prefill-only requests never reach decode's release hook.
+                        self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,

@@ -112,6 +112,7 @@ class TestDecodeKvRelease(CustomTestCase):
         runner = self._decoded_runner()
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = runner
+        worker._mlx_finished_rids = set()
         req = SimpleNamespace(
             rid="r",
             kv=SimpleNamespace(mamba_last_track_seqlen=None),
