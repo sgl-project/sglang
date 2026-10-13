@@ -2627,6 +2627,9 @@ class UnifiedRadixCache(HiCacheLifecycleMixin, BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
+        # Queued requests may already own an asynchronous L2 restore. Mark it
+        # before any storage-prefetch early return; its ACK owns final cleanup.
+        self.abandon_restore_ticket(request)
         rid = request.rid
         if self.linker is not None:
             self.linker.release_request(rid)

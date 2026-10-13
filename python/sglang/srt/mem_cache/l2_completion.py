@@ -113,6 +113,11 @@ class RestoreTicket:
     ready: bool = False
     consumed: bool = False
     abandoned: bool = False
+    request_handle: object = field(init=False)
+
+    def __post_init__(self):
+        # Snapshot the attempt: Req can advance its handle while I/O is pending.
+        self.request_handle = getattr(self.req, "cache_request_handle", None)
 
 
 class AsyncL2State:

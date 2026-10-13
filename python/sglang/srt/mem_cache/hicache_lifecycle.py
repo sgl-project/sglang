@@ -320,6 +320,17 @@ class HiCacheLifecycleMixin:
         ticket.ready = True
         self._reap_cancelled_restore()
 
+    def abandon_restore_ticket(self, handle):
+        """Cancel this attempt's adoption; keep I/O owners until its ACK drains."""
+        state = self.async_l2
+        ticket = state.restore_ticket if state is not None else None
+        if ticket is None or ticket.request_handle != handle:
+            return
+        ticket.abandoned = True
+        # Do not cancel the Future or release pending targets/leases. Only the
+        # existing ACK path can establish readiness or quarantine uncertain I/O.
+        self._reap_cancelled_restore()
+
     def _reap_cancelled_restore(self):
         ticket = self.async_l2.restore_ticket
         if (
@@ -463,7 +474,8 @@ class HiCacheLifecycleMixin:
         published = False
         try:
             if (
-                ticket.req.finished_reason is not None
+                ticket.abandoned
+                or ticket.req.finished_reason is not None
                 or ticket.req.to_finish is not None
             ):
                 self._drop_restore_ticket(ticket)
