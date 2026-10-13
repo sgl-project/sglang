@@ -92,25 +92,59 @@ pub(super) async fn forward_request(
 pub(super) async fn forward_request_grpc(
     ctx: &AppContext,
     request: &mut PreparedRequest,
-    workers: SelectedWorkers,
+    routing: &super::ModelRouting<'_>,
     headers: HeaderMap,
     request_started_at: Instant,
 ) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
-    let duration = RequestDurationGuard::new(ctx, &request.model, request_started_at);
-    match dispatch(
-        Grpc,
-        ctx,
-        request,
-        workers,
-        headers,
-        request_started_at,
-        &duration,
-    )
-    .await
-    {
-        Ok(dispatched) => (dispatched.result, Some(dispatched.log_context)),
-        Err(error) => (Err(error), None),
+    let mut excluded = Vec::new();
+    let mut failed = None;
+    let mut duration = None;
+    for attempt in 0..ctx.config.proxy.max_attempts.get() {
+        if attempt > 0 {
+            let deadline = ctx.router_inflight_load.stale_request_timeout();
+            let Some(remaining) = deadline.checked_sub(request_started_at.elapsed()) else {
+                break;
+            };
+            tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+            if request_started_at.elapsed() >= deadline {
+                break;
+            }
+        }
+        let workers = match routing
+            .select_workers(ctx, request, &headers, &excluded)
+            .await
+        {
+            Ok(workers) => workers,
+            Err(error) => return failed.unwrap_or((Err(error), None)),
+        };
+        if failed.is_some() {
+            ctx.metrics.record_retry(&request.model.0);
+        }
+        let duration = duration.get_or_insert_with(|| {
+            RequestDurationGuard::new(ctx, &request.model, request_started_at)
+        });
+        let dispatched = match dispatch(
+            Grpc,
+            ctx,
+            request,
+            workers,
+            headers.clone(),
+            request_started_at,
+            duration,
+        )
+        .await
+        {
+            Ok(dispatched) => dispatched,
+            Err(error) => return (Err(error), None),
+        };
+        let result = (dispatched.result, Some(dispatched.log_context));
+        if dispatched.retry_excluding.is_empty() {
+            return result;
+        }
+        excluded.extend(dispatched.retry_excluding);
+        failed = Some(result);
     }
+    failed.expect("at least one attempt")
 }
 
 struct Dispatched<R> {

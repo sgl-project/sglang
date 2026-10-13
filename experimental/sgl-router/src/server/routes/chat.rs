@@ -103,13 +103,12 @@ pub async fn chat_completions_grpc(
             body,
             routing.needs_request_tokens(ctx),
         )?;
-        let workers = routing.select_workers(ctx, &request, &headers, &[]).await?;
-        Ok::<_, ApiError>((request, workers))
+        Ok::<_, ApiError>((request, routing))
     }
     .await;
     match prepared {
-        Ok((mut request, workers)) => {
-            forward_request_grpc(ctx, &mut request, workers, headers, start).await
+        Ok((mut request, routing)) => {
+            forward_request_grpc(ctx, &mut request, &routing, headers, start).await
         }
         Err(error) => (Err(error), None),
     }

@@ -325,6 +325,47 @@ async fn sends_the_http_body_and_relays_chunks_unchanged() {
 }
 
 #[tokio::test]
+async fn retries_failures_before_a_response_on_another_worker() {
+    for status_code in [None, Some(429), Some(503)] {
+        let failed = MockEngine::default()
+            .stream("ChatComplete", move |_: proto::OpenAiRequest| {
+                let reply = match status_code {
+                    Some(code) => Ok(chunk("{}", true, Some(code))),
+                    None => Err(Status::unavailable("engine unavailable")),
+                };
+                stream::iter([reply]).boxed()
+            })
+            .unary("Abort", |_: proto::AbortRequest| {
+                proto::AbortResponse::default()
+            })
+            .start()
+            .await;
+        let reply = vec![chunk("{\"ok\":true}", true, Some(200))];
+        let healthy = MockEngine::default()
+            .stream("ChatComplete", openai_rpc(&Seen::new(), reply.clone()))
+            .start()
+            .await;
+        for max_attempts in [1, 2] {
+            for streaming in [false, true] {
+                let mut ctx = router_ctx(&[
+                    (WorkerMode::Plain, "http://127.0.0.1:1", Some(failed)),
+                    (WorkerMode::Plain, "http://127.0.0.1:2", Some(healthy)),
+                ]);
+                Arc::get_mut(&mut ctx).unwrap().config.proxy.max_attempts =
+                    std::num::NonZeroU32::new(max_attempts).unwrap();
+                let mut client = serve_grpc(Arc::clone(&ctx)).await;
+                let mut successes = 0;
+                for _ in 0..2 {
+                    let result = collect(client.chat_complete(openai(chat(streaming))).await).await;
+                    successes += usize::from(result.is_ok_and(|chunks| chunks == reply));
+                }
+                assert_eq!(successes, max_attempts as usize);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn pd_legs_share_one_bootstrap_room() {
     let done = vec![chunk("", true, None)];
     let (prefill_chats, decode_chats) = (Seen::new(), Seen::new());
