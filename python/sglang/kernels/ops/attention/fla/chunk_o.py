@@ -137,7 +137,13 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # Varlen T counts the whole batch's tokens, so shrinking the tile with it would make a
+    # sequence's output depend on its batchmates.
+    BT = (
+        chunk_size
+        if cu_seqlens is not None
+        else min(chunk_size, max(16, triton.next_power_of_2(T)))
+    )
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
