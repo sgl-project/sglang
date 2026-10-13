@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
@@ -1071,12 +1068,14 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
+    hf_config = model_config_of(server_args).hf_config
+    # V4.1 text-only workers use the standard PD KV transfer path.
+    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = model_config_of(server_args).hf_config.architectures
+    architectures = hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):
