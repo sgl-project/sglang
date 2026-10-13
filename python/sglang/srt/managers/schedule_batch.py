@@ -1367,7 +1367,11 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None

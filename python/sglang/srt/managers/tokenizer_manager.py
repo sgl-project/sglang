@@ -110,6 +110,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -559,6 +560,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Init the CUDA IPC transport for GPU-resident embedding overrides
+        self.init_positional_embeds_transport()
+
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
@@ -856,6 +860,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.startup_time = startup_time
         if self.enable_metrics:
             self.metrics_collector.emit_startup_time(startup_time)
+
+    def init_positional_embeds_transport(self):
+        self.positional_embeds_transport = PositionalEmbedsTransport(
+            self.server_args.base_gpu_id, self.mm_processor
+        )
 
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
@@ -1758,12 +1767,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         prepared_mm_items = []
+        prepared_embeds = []
         dispatched = False
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     (tokenized_obj.mm_inputs,)
                 )
+            )
+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
+                (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1780,6 +1793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -1799,12 +1813,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
         prepared_mm_items = []
+        prepared_embeds = []
         dispatched = False
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
+            )
+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
+                tokenized_objs
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
@@ -1827,6 +1845,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 
     def _coalesce_streaming_chunks(
         self,
