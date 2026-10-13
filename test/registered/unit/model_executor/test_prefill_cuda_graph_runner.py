@@ -356,7 +356,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def test_static_batch_preserves_replay_side_channels(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
@@ -397,6 +397,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             extend_prefix_lens_cpu=[0],
             mm_inputs=None,
             mm_input_embeds=mm_input_embeds,
+            mamba_prefill_track_mask_cpu=[True],
+            mamba_track_seqlens_cpu=[2],
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
@@ -405,6 +407,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        self.assertEqual(static_batch.mamba_prefill_track_mask_cpu, [True])
+        self.assertEqual(static_batch.mamba_track_seqlens_cpu, [2])
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(

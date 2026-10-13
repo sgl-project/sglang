@@ -322,6 +322,20 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             torch.cuda.current_stream(),
         )
+        # Draft features obey the same global sequence-order contract as the
+        # final hidden states, including removal of CP/capture padding.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, static_forward_batch, torch.cuda.current_stream()
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(
+                        aux, static_forward_batch, torch.cuda.current_stream()
+                    )
+                    for aux in aux_hidden_states
+                ]
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
