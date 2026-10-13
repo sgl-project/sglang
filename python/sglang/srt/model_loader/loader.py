@@ -250,13 +250,10 @@ def _get_quantization_config(
                 )
         elif quant_config.get_name() == "humming":
             quant_config.is_fp4_experts = model_config.is_fp4_experts
-        elif quant_config.get_name() == "quark":
-            # Mixed Quark checkpoints (routed MXFP4, shared experts block FP8)
-            # set model_config.is_fp4_experts from routed_experts_quant_method.
-            # Fp8 and Humming already copy that flag; Quark must too, or the
-            # fused MoE loader copies the FP8 shared expert into the packed
-            # MXFP4 buffer.
-            quant_config.is_fp4_experts = model_config.is_fp4_experts
+        elif quant_config.get_name() == "quark" and model_config.is_fp4_experts:
+            # FP8 and Humming already do this. Skip Quark checkpoints that
+            # are not marked as MXFP4 routed experts.
+            quant_config.is_fp4_experts = True
         if not _is_npu:
             major, minor = get_device_capability()
 
