@@ -87,6 +87,11 @@ class TestDsv41EncoderOnlyRatioLayout(unittest.TestCase):
                 _official_config(compress_ratios=ratios)
             )
 
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
+    def test_feature_off_preserves_disabled_prefill_graph_validation(self, view):
+        view.return_value = _encoder_only_args(dsv41_encoder_only_prefill=False)
+        validate_deepseek_v41_features(SimpleNamespace())
+
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.get_platform")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")

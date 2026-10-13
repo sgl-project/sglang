@@ -344,8 +344,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--dsv41-encoder-only-prefill does not support " + feature
                 )
 
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
             raise ValueError(
                 "--dsv41-encoder-only-prefill requires prefill CUDA graphs "
