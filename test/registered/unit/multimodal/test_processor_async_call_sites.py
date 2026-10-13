@@ -9,10 +9,28 @@ serves at one-worker speed -- so pin the call site instead of the symptom.
 `process_and_combine_mm_data_async` delegates straight to the sync function when
 no executor exists, so using it costs nothing until a model opts into
 concurrency.
+
+  async processor entry
+    -> await process_and_combine_mm_data_async
+      -> worker pool (or direct fallback when no executor exists)
+        -> sync process_and_combine_mm_data
+  token-space processor entry -> one media task per item -> same worker pool
+                              -> expansion and serving assembly -> same worker pool
+  startup opt-in AND a token-space processor that supports the model
+    True  -> token-space processor -> shared loading -> same worker pool
+    False -> original async route -> original HF/native media processor
+  request audio/video -> loader; explicit media arguments override request fields
+  per-source configs stay with the outer call and reach the member beside loaded media
+
+
+Source-tree checks reject processor calls that bypass the async worker helper.
 """
 
 import ast
+import asyncio
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -91,6 +109,80 @@ def test_every_call_site_can_await():
         "preprocessing is reached from a non-async function, so it cannot go "
         "through the worker pool: " + ", ".join(offenders)
     )
+
+
+@pytest.mark.parametrize("media_source", ["arguments", "request"])
+def test_token_space_entry_runs_the_complete_request(
+    media_source,
+):
+    from sglang.srt.multimodal.processors.qwen_vl_token_space import (
+        QwenVLTokenSpaceProcessor,
+    )
+
+    migrated_processor = object.__new__(QwenVLTokenSpaceProcessor)
+    migrated_processor._processor = object()
+    migrated_processor.token_space_process_strategy = object()
+    loaded = SimpleNamespace(images=[object()], videos=[object()], audios=[object()])
+    migrated_processor._load_media_lists = AsyncMock(
+        return_value=(loaded.images, loaded.videos, loaded.audios)
+    )
+    migrated_processor._token_space_media_devices = Mock(
+        return_value=("image device", "video device")
+    )
+    migrated_processor.process_media_async = AsyncMock(return_value=object())
+    migrated_processor._run_mm_processor = AsyncMock(return_value=object())
+    request_kwargs = {
+        "image_data": ["image"],
+        "video_data": ["video"],
+        "audio_data": ["audio"],
+        "input_text": "",
+        "input_ids": [1, 101, 2],
+        "request_obj": SimpleNamespace(
+            video_data=["request video"], audio_data=["request audio"]
+        ),
+        "mm_token_expansion_start_len": 1,
+    }
+
+    call_kwargs = dict(request_kwargs)
+    if media_source == "request":
+        for name in ("video_data", "audio_data"):
+            del call_kwargs[name]
+        request_kwargs["video_data"] = request_kwargs["request_obj"].video_data
+        request_kwargs["audio_data"] = request_kwargs["request_obj"].audio_data
+    output = asyncio.run(migrated_processor.process_mm_data_async(**call_kwargs))
+
+    assert output is migrated_processor._run_mm_processor.return_value
+    migrated_processor._load_media_lists.assert_awaited_once_with(
+        request_kwargs["image_data"],
+        request_kwargs["video_data"],
+        request_kwargs["audio_data"],
+        audio_sample_rate=None,
+        discard_alpha_channel=True,
+    )
+    migrated_processor.process_media_async.assert_awaited_once_with(
+        images=loaded.images,
+        videos=loaded.videos,
+        audios=loaded.audios,
+        image_source_configs=[{}],
+        video_source_configs=[{}],
+        audio_source_configs=[{}],
+        video_metadata=None,
+        image_device="image device",
+        video_device="video device",
+    )
+    assert migrated_processor._run_mm_processor.await_args_list == [
+        call(
+            migrated_processor._build_token_space_output,
+            media_features=migrated_processor.process_media_async.return_value,
+            input_ids=request_kwargs["input_ids"],
+            mm_token_expansion_start_len=1,
+            options={},
+        ),
+        call(
+            migrated_processor.sglang_post_process,
+            ret=migrated_processor._run_mm_processor.return_value,
+        ),
+    ]
 
 
 def _process_mm_data_overrides():
