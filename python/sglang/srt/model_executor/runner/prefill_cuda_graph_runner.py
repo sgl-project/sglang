@@ -298,6 +298,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     _use_draft_input_embeds = False
+    _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
@@ -316,6 +317,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.dllm_attention is not None
             else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
         )
+        prefill_attn_backend = getattr(
+            model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
+        )
+        self._fa4_prefill = getattr(prefill_attn_backend, "fa_impl_ver", None) == 4
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -588,6 +593,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            logger.info(
+                "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
+                get_parallel().cp_strategy,
+                get_parallel().attn_cp_size,
+            )
+
         if self.max_context_size is not None and not (
             model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
         ):
@@ -1288,6 +1299,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
             return False
+        # Full replay bypasses forward_extend's Python image-mask guard.
+        # Keep FA4 multimodal prefill eager until its full-graph path is
+        # supported; both forward dispatch and the DP vote use this policy.
+        if self._is_full_backend and self._fa4_prefill and contains_mm_inputs:
+            return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
         if (
@@ -1360,6 +1376,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._has_inactive_dp_rank(forward_batch):
             return False
 
+        # A batch can be too small to activate CP. Its unsharded inputs must
+        # not replay a model body captured with CP-local rows.
+        if getattr(self, "enable_cp_bcg_capture", False) and not is_cp_active(
+            forward_batch
+        ):
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
             self._batch_max_context_len(forward_batch)
@@ -1394,9 +1417,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_max_context_len=batch_max_context_len,
         ):
             return False
-        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
-            forward_batch
-        ):
+        if getattr(self, "enable_cp_bcg_capture", False):
+            if not is_cp_active(forward_batch):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(

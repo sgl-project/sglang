@@ -171,9 +171,20 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
-settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
-an engine whose KV tokens have reached 95% of its capacity.
+settings, external indexers and session headers/timeouts retain their existing
+flags. Admission flags set the default per-engine caps; an engine at a cap is
+skipped, and affinity falls back to the others:
+
+| Flag | Rejects an engine at |
+|---|---|
+| `--max-in-flight N` | `N` requests this router has in flight to it (no `--filter overloaded` needed) |
+| `--max-waiting-requests N` | `N` engine-reported waiting requests |
+| `--max-pending-prefill-tokens N` | `N` engine-reported waiting uncached tokens |
+| `--max-running-usage F` | share `F` of its reported running-request capacity |
+| `--max-kv-usage F` | share `F` of its reported KV capacity |
+
+Engine-reported caps lag by one load report, so a burst can pass them; the
+router-local `--max-in-flight` counts dispatches as they happen.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
@@ -535,6 +546,27 @@ response, sent as `POST` or `PUT` to the model this router serves. The body is
 forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
+
+## Anthropic Messages
+
+`/v1/messages` converts each request to a chat completion at ingress, so it is
+routed exactly like `/v1/chat/completions`, and converts the reply (or stream)
+back to the Messages format. Consecutive turns of the same role are merged, as
+the Messages API does, and a final assistant turn is sent as a prefill
+(`continue_final_message`). Besides the Messages fields, only
+`chat_template_kwargs` and `continue_final_message` reach the chat request.
+Every error uses the Anthropic error envelope; 5xx messages are replaced with a
+generic one, and a failed stream still closes its open block and ends with
+`message_stop`.
+
+`/v1/messages/count_tokens` is answered by the router from the model's chat
+template, without calling an engine. Image tokens are not counted, and a model
+without a chat template answers 500 rather than a raw-text estimate.
+
+`thinking` sets the `thinking` / `enable_thinking` chat template kwargs. The
+engine's own `/v1/messages` also adapts it per reasoning parser (for example
+`reasoning_effort` for Hunyuan), which the router cannot see; on such models
+use `output_config.effort` or `chat_template_kwargs` directly.
 
 ## DeepSeek V4 and V4.1
 
