@@ -204,7 +204,7 @@ clamps it by the phase-level `max_bs`.
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-config '{"prefill":{"backend":"full","full_prefill_max_req":8}}'
+    --cuda-graph-backend-prefill full
 ```
 
 To override the request-slot cap for `full` prefill, pass it through
