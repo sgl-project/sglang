@@ -74,12 +74,12 @@ export DEEPEP_HYBRID_DEPLOYMENT=1
 #export SGLANG_DSV4_REASONING_EFFORT=max
 
 # 启动参数
-
+export SGLANG_DSPARK_FOLDED_PROPOSAL=1 #它控制是否把 DSpark 的“候选 token 生成阶段”放进 draft 的计算图里,默认值就是 True
 
 # 设置默认 IP，可通过环境变量 SGLANG_HOST_IP 覆盖
 IP=("${SGLANG_HOST_IP:-0.0.0.0}")
 
-
+#[2026-10-12 03:06:16] '--enable-dp-attention' is deprecated and will be removed in a future release. Use '--attn-dp-size <dp-size>' instead.
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --page-size 128 \

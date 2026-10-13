@@ -7,7 +7,12 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    from triton.language.extra.cann import libdevice
+else:
+    from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 
@@ -121,7 +126,13 @@ def _select_block(
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
         # Small words convert to FP32 exactly, so the winning small noise stays precise.
-        uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
+
+        bits_hi = (bits >> 16).to(tl.int32).to(tl.float32)
+        bits_lo = (bits & 0xFFFF).to(tl.int32).to(tl.float32)
+        bits_f32 = bits_hi * 65536.0 + bits_lo
+        uniform = (bits_f32 + 0.5) * _UNIFORM_SCALE
+
+        # uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
@@ -240,11 +251,23 @@ class MarkovSampleStep:
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
     ``has_sampled_rows=False`` argmaxes every row."""
 
+    # @classmethod
+    # def execute(cls, **kwargs) -> torch.Tensor:
+    #     if inputs_on_cuda(**kwargs):
+    #         return cls.triton(**kwargs)
+    #     return cls.torch(**kwargs)
+    
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
+        # Use the Torch implementation explicitly on NPU.
+        if kwargs["base_logits"].device.type == "npu":
+            return cls.torch(**kwargs)
+
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
+
         return cls.torch(**kwargs)
+
 
     @staticmethod
     def _check(

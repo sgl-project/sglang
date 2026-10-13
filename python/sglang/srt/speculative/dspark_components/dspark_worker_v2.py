@@ -357,7 +357,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
-            (is_cuda() or _is_npu or (is_cuda_alike() and target_is_dsv41))
+            and (is_cuda() or _is_npu or (is_cuda_alike() and target_is_dsv41))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
