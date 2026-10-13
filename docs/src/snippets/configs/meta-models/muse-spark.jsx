@@ -1,12 +1,12 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// NVIDIA recipes follow the Muse Spark 1.2 deployment specification.
+// NVIDIA recipes follow the Muse Spark deployment specification.
 // MI355X cells are the ROCm aiter + FlyDSL profile (MXFP4 TEP 4/8, BF16
 // TEP 8). Xeon is the CPU-engine profile: the INT4 checkpoint and TP 6
 // (tensor parallel only — the CPU engine has no expert-parallel degree), with
 // KV Cache Precision and Parsers as the only overlays that apply there.
 // H200 remains a placeholder with no cells.
 export const config = {
-  modelName: "Muse Spark 1.2",
+  modelName: "Muse Spark",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
   hardware: [
     { id: "xeon", label: "Xeon", vendor: "cpu", vram: "CPU" },
