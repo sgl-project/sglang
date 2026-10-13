@@ -54,7 +54,7 @@ def _check(out, x, w):
         16384,
     ],
 )
-def test_checkpoint_shape(m):
+def test_router_shape(m):
     torch.manual_seed(1)
     x = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(256, 5120, device="cuda") * 0.02

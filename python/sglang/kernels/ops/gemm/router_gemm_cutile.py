@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BF16 router activations times prepared FP32 weights on Hopper and Blackwell."""
+"""BF16x3 router GEMM with pre-split weights on Hopper and Blackwell."""
 
 import functools
 

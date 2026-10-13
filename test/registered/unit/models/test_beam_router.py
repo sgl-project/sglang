@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.kernels.ops.gemm.router_gemv import router_gemm_bf16x3
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
@@ -36,6 +35,7 @@ def _router(backend, nvfp4=False):
         if nvfp4
         else None
     )
+    runner = MoeRunnerBackend.FLASHINFER_TRTLLM if nvfp4 else MoeRunnerBackend.TRITON
     with (
         (
             envs.SGLANG_BEAM_ROUTER_BACKEND.override(backend)
@@ -43,13 +43,11 @@ def _router(backend, nvfp4=False):
             else nullcontext()
         ),
         get_context().override_server_args(
-            moe_runner_backend="flashinfer_trtllm" if nvfp4 else "triton",
+            moe_runner_backend=runner.value,
             moe_a2a_backend="none",
         ),
         get_flags().moe.override(
-            runner_backend=(
-                MoeRunnerBackend.FLASHINFER_TRTLLM if nvfp4 else MoeRunnerBackend.TRITON
-            ),
+            runner_backend=runner,
             a2a_backend=MoeA2ABackend.NONE,
         ),
         get_parallel().override(
@@ -110,23 +108,19 @@ def test_router_refresh_and_dispatch(m, nvfp4):
 @pytest.mark.parametrize("backend", [None, "cublas", "cutile"])
 @pytest.mark.parametrize("nvfp4", [False, True])
 def test_backend_dispatch(backend, nvfp4, monkeypatch):
-    """Selecting cutile must run cuTile, not fall back to the cuBLAS BF16x3 path."""
     monkeypatch.delenv("SGLANG_BEAM_ROUTER_BACKEND", raising=False)
-    router = _router(backend, nvfp4)
     expected_backend = backend or "cutile"
-    assert router.use_cutile_router == (expected_backend == "cutile")
     x = torch.randn(64, 5120, device="cuda", dtype=torch.bfloat16)
-    with patch(
-        "sglang.srt.models.beam.router_gemm_bf16x3", wraps=router_gemm_bf16x3
-    ) as cublas:
-        if expected_backend == "cutile":
-            with patch.object(
-                router, "cutile_router_gemm", wraps=router.cutile_router_gemm
-            ) as cutile:
-                router._router_logits(x)
-            assert cutile.call_count == 1
-        else:
-            router._router_logits(x)
+    with (
+        patch(
+            "sglang.kernels.ops.gemm.router_gemm_cutile.router_gemm_bf16x3_cutile",
+        ) as cutile,
+        patch("sglang.srt.models.beam.router_gemm_bf16x3") as cublas,
+    ):
+        router = _router(backend, nvfp4)
+        assert router.use_cutile_router == (expected_backend == "cutile")
+        router._router_logits(x)
+    assert cutile.call_count == int(expected_backend == "cutile")
     assert cublas.call_count == int(expected_backend == "cublas")
 
 

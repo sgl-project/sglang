@@ -357,7 +357,7 @@ class BeamMoE(nn.Module):
             self.topk.topk_config.apply_routed_scaling_factor_on_output = True
         # Offloading replaces parameters, but TopKConfig keeps an alias.
         self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
-        router_backend = envs.SGLANG_BEAM_ROUTER_BACKEND.get()
+        router_backend = envs.SGLANG_BEAM_ROUTER_BACKEND.get()  # Defaults to cutile.
         if router_backend not in ("cublas", "cutile", "torch"):
             raise ValueError(f"Unsupported Beam router backend: {router_backend}")
         # Preserve the normal linear path for offloading, adapters and strict
