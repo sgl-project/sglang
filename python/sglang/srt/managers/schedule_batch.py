@@ -646,6 +646,9 @@ class Req(ReqDllmMixin):
         # The tree lock this request holds; None while it runs on a session
         # slot's record or holds no lock.
         self.lock: Optional[TreeLock] = None
+        # Keeps a retracted request's cached prompt out of eviction once its
+        # media was released, since that prompt can no longer be re-encoded.
+        self.mm_prefix_hold: Optional[TreeLock] = None
         # Device/host prefix used to plan the latest L3 lookup. Admission uses
         # it to detect newly exposed storage demand after queue-time eviction.
         self.storage_prefetch_last_match_len: Optional[int] = None
@@ -1077,6 +1080,11 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.mrope_position_delta = (
                 positions.max() + 1 - positions.shape[1]
             ).reshape(1, 1)
+
+    def release_mm_prefix_hold(self, tree_cache: BasePrefixCache) -> None:
+        if self.mm_prefix_hold is not None:
+            tree_cache.unlock(self.mm_prefix_hold)
+            self.mm_prefix_hold = None
 
     def release_mm_inputs_on_abort(self) -> None:
         """Release this turn's media without invalidating session history."""
@@ -1803,6 +1811,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    requeue: bool = False,
 ) -> bool:
     """Returns whether the request can be resumed."""
     if hisparse_coordinator is not None and not req.finished():
@@ -1825,8 +1834,18 @@ def release_req(
         )
     else:
         resumable = req.resumable_by_rebootstrap
+    prompt_node = req.lock.node if req.lock is not None else None
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
+    if (
+        requeue
+        and resumable
+        and prompt_node is not None
+        and get_disagg().disaggregation_mode != "decode"
+        and req.multimodal_inputs is not None
+        and req.multimodal_inputs.has_released_items_beyond_prefix(0)
+    ):
+        req.mm_prefix_hold = tree_cache.lock(prompt_node)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -1855,6 +1874,7 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
+            requeue=True,
         ):
             unresumable.append(reqs[idx])
     return unresumable
@@ -2944,7 +2964,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(idx, len(sorted_indices), requeue=True):
                 retracted_reqs.append(req)
             else:
                 # No backup or rebuild exists and the device KV is already freed.
@@ -3050,6 +3070,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         idx: int,
         remaing_req_count: int,
         offload_kv: bool = True,
+        requeue: bool = False,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3059,6 +3080,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            requeue=requeue,
         )
 
     def prepare_encoder_info_decode(self):
