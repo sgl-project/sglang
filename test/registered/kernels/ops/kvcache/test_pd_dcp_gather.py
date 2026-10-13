@@ -85,6 +85,7 @@ class TestPdDcpGather(CustomTestCase):
                 [source.data_ptr()], rows, storage[: required - 1], [8],
                 pack_offset_bytes=4,
             )
+        self.assertTrue(torch.all(storage == 165))
         copy_mla_rows_into_pack(
             [source.data_ptr()], rows, storage[:required], [8], pack_offset_bytes=4
         )
@@ -92,6 +93,47 @@ class TestPdDcpGather(CustomTestCase):
 
         torch.testing.assert_close(storage[:4], torch.full_like(storage[:4], 165))
         torch.testing.assert_close(storage[required:], torch.full_like(storage[required:], 165))
+
+    def test_bounded_gather_scatter_preserves_guards(self):
+        source = torch.arange(16 * 12, dtype=torch.uint8, device="cuda").view(16, 12)
+        destination = torch.full_like(source, 165)
+        state = torch.arange(16, dtype=torch.uint8, device="cuda").view(4, 4)
+        state_dst = torch.full_like(state, 165)
+        src_rows = torch.tensor([15, 2, 7, 1, 14, 4, 11, 0, 5, 8], device="cuda")
+        dst_rows = src_rows.flip(0)
+        cap, slot, guard = 3, 44, 16
+        tx = torch.full((slot + 2 * guard,), 165, dtype=torch.uint8, device="cuda")
+        rx = torch.full_like(tx, 165)
+        tx_slot, rx_slot = tx[guard:-guard], rx[guard:-guard]
+        for start in range(0, len(src_rows), cap):
+            rows = src_rows[start : start + cap]
+            targets = dst_rows[start : start + cap]
+            last = start + cap >= len(src_rows)
+            nbytes = len(rows) * 12
+            self.assertLessEqual(nbytes + (8 if last else 0), slot)
+            copy_mla_rows_into_pack([source.data_ptr()], rows, tx_slot, [12])
+            if last:
+                copy_mla_rows_into_pack(
+                    [state.data_ptr()], torch.tensor([1, 3], device="cuda"),
+                    tx_slot, [4], pack_offset_bytes=nbytes,
+                )
+            rx_slot.copy_(tx_slot)
+            copy_pack_into_mla_rows(rx_slot, [destination.data_ptr()], targets, [12])
+            if last:
+                copy_pack_into_mla_rows(
+                    rx_slot, [state_dst.data_ptr()], torch.tensor([0, 2], device="cuda"),
+                    [4], pack_offset_bytes=nbytes,
+                )
+        torch.cuda.synchronize()
+        expected = torch.full_like(source, 165)
+        expected[dst_rows] = source[src_rows]
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+        expected_state = torch.full_like(state, 165)
+        expected_state[[0, 2]] = state[[1, 3]]
+        torch.testing.assert_close(state_dst, expected_state, rtol=0, atol=0)
+        for storage in (tx, rx):
+            self.assertTrue(torch.all(storage[:guard] == 165))
+            self.assertTrue(torch.all(storage[-guard:] == 165))
 
     def test_packed_tp2_pp2_to_dcp4_preserves_kv(self):
         """Packing must preserve both target rows and draft head shards across PP stages."""
