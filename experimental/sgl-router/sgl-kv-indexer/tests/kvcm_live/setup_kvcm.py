@@ -20,7 +20,11 @@ configuration.
     python3 tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
 
 `start` is idempotent: an already running manager is left alone and the
-provisioning is re-applied. `config` re-applies provisioning only.
+provisioning is re-applied. `config` re-applies provisioning only. `start`
+verifies the state file's pid is still the manager it started before reusing or
+signalling it, so a stale workdir (they live in `/tmp`, which survives reboots)
+cannot make `stop` take down an unrelated process; `status` reports that check
+too. If the binary moved, point at it with `--binary`.
 
 The liveness knobs below are deliberately tight (2s timeout, 2s grace, 100ms
 check interval) so the reclamation tests finish in seconds; a production
@@ -88,6 +92,67 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def free_ports(count: int) -> list:
+    """Distinct free ports: four independent bind-then-close calls can hand back
+    the same number, and a colliding set only shows up as a startup timeout."""
+    ports = set()
+    while len(ports) < count:
+        ports.add(free_port())
+    return sorted(ports)
+
+
+def process_identity(pid: int) -> Dict[str, str]:
+    """What `/proc` says the pid is right now, for the checks below."""
+    identity = {"exe": "", "cmdline": ""}
+    try:
+        identity["exe"] = os.path.realpath(f"/proc/{pid}/exe")
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            identity["cmdline"] = handle.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        pass
+    return identity
+
+
+def is_our_manager(state: Dict[str, Any], pid: int) -> bool:
+    """Whether `pid` is the manager this state file started.
+
+    State files live in workdirs under /tmp, which survive reboots, and pids are
+    reused: signalling on the strength of a stale file would take down an
+    unrelated process. The binary name is compared by basename so that a rebuild
+    into a different bazel output tree still identifies the running manager.
+    """
+    expected = os.path.basename(state.get("binary", ""))
+    if not expected:
+        return False
+    identity = process_identity(pid)
+    return (
+        os.path.basename(identity["exe"]) == expected
+        and expected in identity["cmdline"]
+    )
+
+
+def terminate(pid: int, timeout: float) -> bool:
+    """SIGTERM, then SIGKILL after `timeout` seconds. True when it is gone."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and pid_alive(pid):
+        time.sleep(0.2)
+    if pid_alive(pid):
+        print(f"[setup] pid {pid} ignored SIGTERM; sending SIGKILL")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.5)
+    return not pid_alive(pid)
+
+
 def state_path(workdir: str) -> str:
     return os.path.join(workdir, STATE_FILE)
 
@@ -106,13 +171,22 @@ def write_state(workdir: str, state: Dict[str, Any]) -> None:
 
 
 def pid_alive(pid: int) -> bool:
+    """False for a pid that is gone, and for a zombie: `kill(pid, 0)` succeeds on
+    a zombie, which would read as "still running" until its parent reaps it."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    return True
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            # "<pid> (<comm>) <state> ..."; comm may itself contain spaces and
+            # parentheses, so split on the last one.
+            state = handle.read().rsplit(b")", 1)[-1].split()
+        return not state or state[0] != b"Z"
+    except OSError:
+        return True
 
 
 def resolve_binary(args: argparse.Namespace) -> str:
@@ -176,15 +250,10 @@ def wait_ready(http_port: int, timeout: float) -> None:
     raise SetupError(f"KVCM did not become ready within {timeout:.0f}s: {last_error}")
 
 
-def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
-    os.makedirs(args.workdir, exist_ok=True)
-    existing = read_state(args.workdir)
-    if existing and pid_alive(int(existing["pid"])):
-        print(f"[setup] KVCM already running (pid={existing['pid']})")
-        return existing
-
+def start_once(args: argparse.Namespace) -> Dict[str, Any]:
+    """One attempt: spawn a manager on a fresh port set and wait for readiness."""
     binary = resolve_binary(args)
-    rpc_port, http_port, admin_rpc_port, admin_http_port = (free_port() for _ in range(4))
+    rpc_port, http_port, admin_rpc_port, admin_http_port = free_ports(4)
     registry = os.path.join(args.workdir, "registry.json")
     command = [
         binary,
@@ -221,12 +290,54 @@ def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
     write_state(args.workdir, state)
     try:
         wait_ready(http_port, args.startup_timeout)
-    except SetupError:
-        if not pid_alive(process.pid):
-            tail(os.path.join(args.workdir, "stderr.log"))
-        raise
+    except SetupError as error:
+        # A manager that never became ready is still holding its ports and
+        # writing logs; leaving it behind turns one failed start into a leak.
+        tail(os.path.join(args.workdir, "stderr.log"))
+        reaped = terminate(process.pid, args.stop_timeout)
+        if reaped:
+            try:
+                # Reap our own child, so it cannot linger as a zombie.
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                reaped = False
+        if reaped:
+            os.remove(state_path(args.workdir))
+            raise SetupError(
+                f"{error} (the manager never became ready; pid {process.pid} shut down)"
+            ) from error
+        raise SetupError(
+            f"{error} (pid {process.pid} survived shutdown and still holds "
+            f"ports {rpc_port}/{http_port}; `stop` will retry it)"
+        ) from error
     print(f"[setup] KVCM ready: grpc=127.0.0.1:{rpc_port} http=127.0.0.1:{http_port}")
     return state
+
+
+def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
+    os.makedirs(args.workdir, exist_ok=True)
+    existing = read_state(args.workdir)
+    if existing and pid_alive(int(existing["pid"])):
+        pid = int(existing["pid"])
+        if is_our_manager(existing, pid):
+            print(f"[setup] KVCM already running (pid={pid}, grpc=127.0.0.1:{existing['rpc_port']})")
+            return existing
+        # A reused pid would otherwise make `start` report "already running"
+        # and provision against ports this state file no longer owns.
+        print(
+            f"[setup] state file is stale: pid {pid} is "
+            f"{process_identity(pid)['exe'] or 'unknown'}, not the recorded manager"
+        )
+        os.remove(state_path(args.workdir))
+
+    last_error = None
+    for attempt in range(1, args.start_attempts + 1):
+        try:
+            return start_once(args)
+        except SetupError as error:
+            last_error = error
+            print(f"[setup] start attempt {attempt}/{args.start_attempts} failed: {error}")
+    raise last_error
 
 
 def stop_manager(args: argparse.Namespace) -> int:
@@ -239,14 +350,16 @@ def stop_manager(args: argparse.Namespace) -> int:
         print(f"[setup] KVCM (pid={pid}) is not running")
         os.remove(state_path(args.workdir))
         return 0
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + args.stop_timeout
-    while time.monotonic() < deadline and pid_alive(pid):
-        time.sleep(0.2)
-    if pid_alive(pid):
-        print(f"[setup] KVCM (pid={pid}) ignored SIGTERM; sending SIGKILL")
-        os.kill(pid, signal.SIGKILL)
-        time.sleep(0.5)
+    if not is_our_manager(state, pid):
+        identity = process_identity(pid)
+        raise SetupError(
+            f"pid {pid} is {identity['exe'] or 'unknown'} "
+            f"({identity['cmdline'] or 'cmdline unreadable'}), not the manager this state file "
+            f"started ({state.get('binary')}); refusing to signal it. "
+            f"The manager is gone or the pid was reused: remove {state_path(args.workdir)} and run `start`."
+        )
+    if not terminate(pid, args.stop_timeout):
+        raise SetupError(f"pid {pid} survived SIGKILL; check it manually")
     print(f"[setup] KVCM (pid={pid}) stopped")
     os.remove(state_path(args.workdir))
     return 0
@@ -397,6 +510,12 @@ def main() -> int:
     parser.add_argument("--binary", default=DEFAULT_BINARY, help="manager binary (relative to --kvcm-repo)")
     parser.add_argument("--startup-timeout", type=float, default=60.0, help="seconds to wait for readiness")
     parser.add_argument("--stop-timeout", type=float, default=15.0, help="seconds to wait for SIGTERM")
+    parser.add_argument(
+        "--start-attempts",
+        type=int,
+        default=2,
+        help="start attempts with a fresh port set; a stolen port is otherwise just a timeout",
+    )
     args = parser.parse_args()
 
     try:
@@ -418,12 +537,16 @@ def main() -> int:
         if not state:
             print(f"[setup] no KVCM state in {args.workdir}")
             return 1
-        alive = pid_alive(int(state["pid"]))
+        pid = int(state["pid"])
+        alive = pid_alive(pid)
+        ours = alive and is_our_manager(state, pid)
         print(
-            f"[setup] pid={state['pid']} alive={alive} grpc=127.0.0.1:{state['rpc_port']} "
+            f"[setup] pid={pid} alive={alive} ours={ours} grpc=127.0.0.1:{state['rpc_port']} "
             f"http=127.0.0.1:{state['http_port']} workdir={state['workdir']}"
         )
-        return 0 if alive else 1
+        if alive and not ours:
+            print(f"[setup] pid {pid} is {process_identity(pid)['exe'] or 'unknown'}, not this state file's manager")
+        return 0 if ours else 1
     except SetupError as error:
         print(f"[setup] error: {error}", file=sys.stderr)
         return 1

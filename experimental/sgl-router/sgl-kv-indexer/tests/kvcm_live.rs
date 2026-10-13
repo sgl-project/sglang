@@ -78,23 +78,81 @@ fn nonempty_env(key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Whether this run explicitly asked for ignored tests (`--ignored` or
+/// `--include-ignored`, both passed straight to the test binary by libtest).
+///
+/// A run that asks for the live suite and then skips it because one variable is
+/// missing reports the same `ok. 17 passed` as a run that verified something.
+/// The suite must not be able to lie about that: an explicit request with no
+/// harness means failure, and only an implicit run (a plain `cargo test`, where
+/// these tests never start) skips silently.
+fn live_suite_requested() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--ignored" || arg == "--include-ignored")
+}
+
 fn live_env() -> Option<LiveEnv> {
-    let endpoint = nonempty_env(ENV_ENDPOINT)?;
+    let Some(endpoint) = nonempty_env(ENV_ENDPOINT) else {
+        assert!(
+            !live_suite_requested(),
+            "--ignored was requested but {ENV_ENDPOINT} is not set, so the live KVCM suite would verify nothing. \
+             Start the manager and source its environment first:\n  \
+             python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live\n  \
+             source /tmp/kvcm-live/kvcm_live.env"
+        );
+        return None;
+    };
     let required = |key: &str| {
         nonempty_env(key).unwrap_or_else(|| {
             panic!("{ENV_ENDPOINT} is set but {key} is not; source the harness env file")
         })
     };
-    Some(LiveEnv {
+    let env = LiveEnv {
         endpoint,
         instance_id: required(ENV_INSTANCE_ID),
         instance_group: required(ENV_INSTANCE_GROUP),
         model_name: required(ENV_MODEL_NAME),
         dtype: required(ENV_MODEL_DTYPE),
-    })
+    };
+    // A manager that is gone (this host's other workflows kill by name) must
+    // read as an environment failure with a next step, not as 17 bare
+    // connection errors that look like assertion failures.
+    if let Err(reason) = probe_endpoint(&env.endpoint) {
+        panic!(
+            "{} is not reachable ({reason}); check the manager with \
+             `python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py status --workdir /tmp/kvcm-live` \
+             and restart it with `start`",
+            env.endpoint
+        );
+    }
+    Some(env)
 }
 
-/// Skips the test (rather than failing) when the harness is not running.
+/// A TCP connect is enough to tell "the manager is running" from "it is gone";
+/// no RPC, no runtime, no protocol.
+fn probe_endpoint(endpoint: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let Some(host_port) = endpoint
+        .strip_prefix("http://")
+        .map(|rest| rest.trim_end_matches('/'))
+    else {
+        // Not a form this probe understands; the first RPC reports it instead.
+        return Ok(());
+    };
+    let addr = host_port
+        .to_socket_addrs()
+        .map_err(|error| format!("{host_port} is not resolvable: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{host_port} resolves to no address"))?;
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map(|_| ())
+        .map_err(|error| format!("{addr}: {error}"))
+}
+
+/// Skips the test when the harness is not running and this run did not ask for
+/// it; fails loudly when it did (see [`live_suite_requested`]).
 macro_rules! live_env {
     () => {
         match live_env() {
@@ -147,6 +205,36 @@ fn auto_registering_backend(
         dtype: env.dtype.clone(),
     });
     KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid http endpoint")
+}
+
+/// Sets process environment variables for one test and restores them on drop.
+/// Only the env tests below use it, and no other test in this binary reads
+/// `KV_INDEXER_KVCM_*`, so the global mutation stays contained.
+struct EnvGuard(Vec<(String, Option<String>)>);
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                (key.to_string(), previous)
+            })
+            .collect();
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 /// A legacy (whole-block, mask-less) worker reporting `hashes` on HBM.
@@ -416,6 +504,52 @@ fn locals(response: &GetHostCacheStateResponse) -> HashMap<String, i64> {
 }
 
 // --- Ingestion: what KVCM accepts ------------------------------------------
+
+/// The operator-facing entry point, end to end: environment variables
+/// (`KvcmBackendConfig::from_env`) assemble an auto-registering backend that a
+/// real manager accepts. Everything else in this file builds the config
+/// programmatically, so this is the one test that would catch a renamed or
+/// unenforced variable — the failure mode being a registration KVCM rejects,
+/// which makes the bridge exit, not a quiet misconfiguration.
+#[tokio::test]
+#[ignore]
+async fn environment_configuration_registers_and_reports() {
+    let env = live_env!();
+    let instance = unique("env");
+    // The variable names are spelled out here rather than imported: a typo in
+    // the constant is exactly what this test exists to catch.
+    let _guard = EnvGuard::set(&[
+        ("KV_INDEXER_KVCM_ENDPOINT", env.endpoint.as_str()),
+        ("KV_INDEXER_KVCM_INSTANCE_ID", instance.as_str()),
+        ("KV_INDEXER_KVCM_AUTO_REGISTER", "1"),
+        (
+            "KV_INDEXER_KVCM_INSTANCE_GROUP",
+            env.instance_group.as_str(),
+        ),
+        // A positive block size and the model deployment are mandatory for
+        // KVCM's RegisterInstance.
+        ("KV_INDEXER_KVCM_BLOCK_SIZE", "128"),
+        ("KV_INDEXER_KVCM_MODEL_NAME", env.model_name.as_str()),
+        ("KV_INDEXER_KVCM_MODEL_DTYPE", env.dtype.as_str()),
+        // The harness provisions 2s liveness, so the configured cadence matters.
+        ("KV_INDEXER_KVCM_HEARTBEAT_INTERVAL_MS", "300"),
+    ]);
+    let backend = KvcmIndexerBackend::new(
+        KvcmBackendConfig::from_env().expect("the environment assembles a config"),
+    )
+    .expect("the harness endpoint is a valid http endpoint");
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30014";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[181, 182]))
+        .await
+        .expect("an environment-configured backend registers and reports");
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[181, 182], 0).await),
+        HashMap::from([(address.to_string(), 2)])
+    );
+}
 
 /// The auto-registration path end to end: `RegisterInstance` with `full`/
 /// `swa`/`mamba` `size: 0` specs, then reports landing as prefixes.
@@ -799,16 +933,16 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
     // The instance is registered directly so that no heartbeating backend ever
     // owns the reporter: silence is what this test needs.
     let _raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
-    let backend = backend(&env, &instance, None);
+    let silent = backend(&env, &instance, None);
     let worker = format!("{instance}-w0");
     let address = "http://127.0.0.1:30011";
 
-    backend
+    silent
         .apply_external_kv_batch(report_batch(&worker, address, 1, &[101, 102, 103]))
         .await
         .expect("first report registers the reporter and its blocks");
     assert_eq!(
-        prefix(&backend, &[101, 102, 103], 0)
+        prefix(&silent, &[101, 102, 103], 0)
             .await
             .best_prefix_blocks,
         3
@@ -816,7 +950,7 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let answer = prefix(&backend, &[101, 102, 103], 0).await;
+        let answer = prefix(&silent, &[101, 102, 103], 0).await;
         if answer.matches.is_empty() {
             break;
         }
@@ -834,7 +968,7 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
     // nothing the sweep below could interleave with.
     let mut seq = 2;
     let error = loop {
-        match backend
+        match silent
             .apply_external_kv_batch(revoke_batch(&worker, address, seq, &[104, 105, 106]))
             .await
         {
@@ -856,26 +990,44 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
         error.message()
     );
 
-    // KVCM dispatches the metadata sweep in the same breath as the unregister,
-    // and its generation guard only covers writes that landed before the sweep
-    // took its lease. A real bridge reconnects with a delay, so this test waits
-    // the same way instead of racing a sweep that deletes by location.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // The bridge retries the batch; the backend now prepends the registration,
-    // which clears the tombstone.
-    backend
+    // The reporter resumes: the bridge retries the batch, and the backend --
+    // which saw the `NODE_NOT_REGISTERED` failure -- prepends the registration
+    // that clears the tombstone. The request streaming again is the assertion;
+    // whether KVCM keeps *those* blocks is a separate race, handled below.
+    silent
         .apply_external_kv_batch(report_batch(&worker, address, seq, &[104, 105, 106]))
         .await
         .expect("the retry re-registers the reporter and succeeds");
-    assert_eq!(
-        prefix(&backend, &[104, 105, 106], 0)
+
+    // KVCM dispatches the metadata sweep in the same breath as the unregister,
+    // and its generation guard only covers writes that landed before the sweep
+    // took its lease, so a re-report can still be swept. Converge on the answer
+    // instead of sleeping a magic duration: keep re-reporting until the
+    // reporter is routable again. This second backend is the reporter that
+    // stays up (it heartbeats), which keeps the liveness window out of the
+    // convergence.
+    let resumed = backend(&env, &instance, Some(HEARTBEAT));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        resumed
+            .apply_external_kv_batch(report_batch(&worker, address, seq, &[104, 105, 106]))
             .await
-            .best_prefix_blocks,
-        3
-    );
-    // Reclaimed blocks stay reclaimed: the retry indexes only what it re-reports.
-    assert!(prefix(&backend, &[101, 102, 103], 0)
+            .expect("a re-report after the tombstone cleared is accepted");
+        if prefix(&resumed, &[104, 105, 106], 0)
+            .await
+            .best_prefix_blocks
+            == 3
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reporter never became routable again after the tombstone cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Reclaimed blocks stay reclaimed: only what was re-reported is indexed.
+    assert!(prefix(&resumed, &[101, 102, 103], 0)
         .await
         .matches
         .is_empty());

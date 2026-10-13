@@ -45,10 +45,13 @@
 //! * The reporter→address map is process-local: after an indexer restart,
 //!   prefix answers stay empty until each worker's next batch restates its
 //!   address. KVCM's own placements survive; only the join is lost.
-//! * `snapshot_required` reconciliation is advisory here: this backend holds no
-//!   placement state, so it cannot rebuild a snapshot. After a KVCM-side
-//!   cleanup the index under-reports (the safe direction) until the worker's
-//!   own events re-report live blocks.
+//! * `snapshot_required` is not an error and not actionable here: KVCM sets it
+//!   while a reporter has no committed snapshot version, which for a
+//!   delta-only reporter is the shape of its first delta (that request creates
+//!   the version). The backend logs the lifecycle start and never sends a
+//!   snapshot -- it holds no placement state to reconcile, so after a
+//!   KVCM-side cleanup the index under-reports (the safe direction) until the
+//!   worker's own events re-report live blocks.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1633,6 +1636,88 @@ mod tests {
         assert_eq!(config.report_tiers, [TierType::TierHbm]);
         assert_eq!(config.auto_register, None);
         assert_eq!(config.report_mediums(), ["hbm"]);
+    }
+
+    /// The environment variables are the operator's entry point, and the one
+    /// place a mistake is silent: a renamed or unenforced variable means the
+    /// backend registers without the model deployment KVCM demands, and every
+    /// report then fails `INVALID_ARGUMENT` (the bridge exits). This is the
+    /// only test in the crate that touches `KV_INDEXER_KVCM_*`, and no other
+    /// test reads them, so one sequential test keeps the global environment to
+    /// itself.
+    #[test]
+    fn from_env_assembles_and_validates_the_auto_registration() {
+        const KEYS: [&str; 7] = [
+            ENV_ENDPOINT,
+            ENV_INSTANCE_ID,
+            ENV_AUTO_REGISTER,
+            ENV_INSTANCE_GROUP,
+            ENV_BLOCK_SIZE,
+            ENV_MODEL_NAME,
+            ENV_MODEL_DTYPE,
+        ];
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var(ENV_ENDPOINT, "http://127.0.0.1:50052");
+        std::env::set_var(ENV_INSTANCE_ID, "inst-0");
+        // Auto-registration is opt-in: without the flag the deployment identity
+        // is not required, because the connector registered the instance.
+        let config = KvcmBackendConfig::from_env().expect("endpoint and instance are enough");
+        assert_eq!(config.endpoint, "http://127.0.0.1:50052");
+        assert_eq!(config.instance_id, "inst-0");
+        assert_eq!(config.auto_register, None);
+
+        std::env::set_var(ENV_AUTO_REGISTER, "1");
+        assert_eq!(
+            KvcmBackendConfig::from_env().unwrap_err(),
+            KvcmConfigError::Missing(ENV_INSTANCE_GROUP)
+        );
+        std::env::set_var(ENV_INSTANCE_GROUP, "group-a");
+        assert!(matches!(
+            KvcmBackendConfig::from_env().unwrap_err(),
+            KvcmConfigError::Invalid {
+                key: ENV_BLOCK_SIZE,
+                ..
+            }
+        ));
+        std::env::set_var(ENV_BLOCK_SIZE, "0");
+        assert!(matches!(
+            KvcmBackendConfig::from_env().unwrap_err(),
+            KvcmConfigError::Invalid {
+                key: ENV_BLOCK_SIZE,
+                ..
+            }
+        ));
+        std::env::set_var(ENV_BLOCK_SIZE, "128");
+        // KVCM rejects a registration without a model name, a dtype, or a
+        // positive block size, so each one has to be a hard requirement.
+        assert_eq!(
+            KvcmBackendConfig::from_env().unwrap_err(),
+            KvcmConfigError::Missing(ENV_MODEL_NAME)
+        );
+        std::env::set_var(ENV_MODEL_NAME, "qwen3-8b");
+        assert_eq!(
+            KvcmBackendConfig::from_env().unwrap_err(),
+            KvcmConfigError::Missing(ENV_MODEL_DTYPE)
+        );
+        std::env::set_var(ENV_MODEL_DTYPE, "FP8");
+
+        let config = KvcmBackendConfig::from_env().expect("complete environment");
+        assert_eq!(
+            config.auto_register,
+            Some(KvcmAutoRegister {
+                instance_group: "group-a".to_string(),
+                block_size: 128,
+                model_name: "qwen3-8b".to_string(),
+                dtype: "FP8".to_string(),
+            })
+        );
+
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

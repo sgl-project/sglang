@@ -12,6 +12,7 @@ mod test_kv;
 #[path = "common/net.rs"]
 mod test_net;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,11 +58,29 @@ struct MockState {
     /// Canned partial-failure `item_results` for `ReportEvent`.
     report_item_results: Vec<i32>,
     report_snapshot_required: bool,
+    /// Spec names per registered instance, as `RegisterInstance` declared
+    /// them: KVCM checks every reported name against this set.
+    registered_specs: HashMap<String, Vec<String>>,
 }
 
 impl MockState {
     fn lock(state: &Arc<Mutex<Self>>) -> std::sync::MutexGuard<'_, Self> {
         state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The spec names KVCM would accept for this instance: what its
+    /// registration declared, or the connector's deployment for an instance
+    /// the mock never saw registered (the backend reports into those).
+    fn declared_specs(&self, instance_id: &str) -> Vec<String> {
+        self.registered_specs
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                DEPLOYMENT_SPEC_NAMES
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect()
+            })
     }
 }
 
@@ -87,17 +106,23 @@ fn err_header(code: ErrorCode, message: &str) -> CommonResponseHeader {
     }
 }
 
+/// The spec names KVCM accepts for an instance the mock never saw registered:
+/// the connector's deployment (see the live suite's `full`/`swa`/`mamba`
+/// instance). A registration replaces this set for that instance.
+const DEPLOYMENT_SPEC_NAMES: [&str; 3] = ["full", "swa", "mamba"];
+
 /// The KVCM acceptance rules the backend's generated events must satisfy
-/// (mirrors cache_manager.cc: BLOCK_ADD specs carry a channel-scheme URI,
-/// BLOCK_DELETE names a registered spec, NODE_REGISTER declares mediums).
-/// Returns the first violation's reason.
-fn validate_report_events(request: &ReportEventRequest) -> Option<String> {
+/// (mirrors cache_manager.cc: BLOCK_ADD specs carry a channel-scheme URI and
+/// name a spec the instance declared, BLOCK_DELETE names a declared spec,
+/// NODE_REGISTER declares mediums). Returns the first violation's reason.
+fn validate_report_events(request: &ReportEventRequest, registered: &[String]) -> Option<String> {
     use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
     use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
     let expected_scheme = match StorageType::try_from(request.storage_type) {
         Ok(StorageType::StEventReportL2) => "vineyard://",
         _ => "event_report://",
     };
+    let declared = |name: &str| registered.iter().any(|spec| spec == name);
     for event in &request.events {
         match T::try_from(event.event_type) {
             Ok(T::EventBlockAdd) => {
@@ -114,6 +139,9 @@ fn validate_report_events(request: &ReportEventRequest) -> Option<String> {
                             spec.name, spec.uri
                         ));
                     }
+                    if !declared(&spec.name) {
+                        return Some(format!("BLOCK_ADD names undeclared spec `{}`", spec.name));
+                    }
                 }
             }
             Ok(T::EventBlockDelete) => {
@@ -123,10 +151,9 @@ fn validate_report_events(request: &ReportEventRequest) -> Option<String> {
                 if delete.spec_names.is_empty() {
                     return Some("BLOCK_DELETE without spec_names".into());
                 }
-                const REGISTERED: [&str; 3] = ["full", "swa", "mamba"];
                 for name in &delete.spec_names {
-                    if !REGISTERED.contains(&name.as_str()) {
-                        return Some(format!("BLOCK_DELETE names unregistered spec `{name}`"));
+                    if !declared(name) {
+                        return Some(format!("BLOCK_DELETE names undeclared spec `{name}`"));
                     }
                 }
             }
@@ -198,6 +225,16 @@ impl MetaService for MockKvcm {
         let violation = validate_registration(&request);
         let error = {
             let mut state = MockState::lock(&self.state);
+            // KVCM resolves reported spec names against the instance's
+            // registration, so the mock has to remember them.
+            state.registered_specs.insert(
+                request.instance_id.clone(),
+                request
+                    .location_spec_infos
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect(),
+            );
             state.registrations.push(request);
             state.register_error.clone()
         };
@@ -220,12 +257,15 @@ impl MetaService for MockKvcm {
         let request = request.into_inner();
         // KVCM's own acceptance rules, so a regression to structurally
         // invalid events fails loudly here instead of only against a real
-        // server (see cache_manager.cc ValidateEventLocationSpec).
-        let violation = validate_report_events(&request);
-        let error = {
+        // server (see cache_manager.cc ValidateEventLocationSpec). The declared
+        // spec names come from the instance's registration, exactly as KVCM
+        // resolves them.
+        let (violation, error) = {
             let mut state = MockState::lock(&self.state);
+            let declared = state.declared_specs(&request.instance_id);
+            let violation = validate_report_events(&request, &declared);
             state.reports.push(request);
-            state.report_error.clone()
+            (violation, state.report_error.clone())
         };
         let header = match error {
             Some((code, message)) => err_header(code, &message),
@@ -528,6 +568,95 @@ async fn apply_rejects_worker_id_with_hash_char() {
         .expect_err("'#' corrupts KVCM location ids");
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(MockState::lock(&state).reports.is_empty());
+}
+
+/// Sets process environment variables for one test and restores them on drop.
+/// The environment is global, so this file keeps its use to the single test
+/// below, which sets every variable it needs before building the config.
+struct EnvGuard(Vec<(String, Option<String>)>);
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                (key.to_string(), previous)
+            })
+            .collect();
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The environment is the entry point operators use, and the one place a
+/// mistake is silent: a renamed or unenforced variable produces a registration
+/// KVCM rejects, which makes the bridge exit rather than misbehave visibly.
+/// Drive the whole chain -- environment -> `KvcmBackendConfig::from_env` ->
+/// `RegisterInstance` -> wire -- so no link can drift unnoticed.
+#[tokio::test]
+async fn environment_configuration_reaches_the_wire() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    // Spelled out rather than imported: a typo in the constant is what this
+    // test exists to catch.
+    let endpoint = format!("http://{addr}");
+    let _guard = EnvGuard::set(&[
+        ("KV_INDEXER_KVCM_ENDPOINT", endpoint.as_str()),
+        ("KV_INDEXER_KVCM_INSTANCE_ID", "env-instance"),
+        ("KV_INDEXER_KVCM_AUTO_REGISTER", "1"),
+        ("KV_INDEXER_KVCM_INSTANCE_GROUP", "group-env"),
+        ("KV_INDEXER_KVCM_BLOCK_SIZE", "16"),
+        ("KV_INDEXER_KVCM_MODEL_NAME", "qwen3-8b"),
+        ("KV_INDEXER_KVCM_MODEL_DTYPE", "FP8"),
+    ]);
+    let mut config = sgl_kv_indexer::KvcmBackendConfig::from_env().expect("complete environment");
+    // The tests assert translation, not scheduling.
+    config.query_timeout = Duration::from_secs(2);
+    config.apply_timeout = Duration::from_secs(2);
+    config.heartbeat_interval = None;
+    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &[7])],
+        ))
+        .await
+        .expect("apply succeeds");
+
+    let state = MockState::lock(&state);
+    let registration = state.registrations.first().expect("auto-registered");
+    assert_eq!(registration.instance_id, "env-instance");
+    assert_eq!(registration.instance_group, "group-env");
+    assert_eq!(registration.block_size, 16);
+    let deployment = registration
+        .model_deployment
+        .as_ref()
+        .expect("KVCM rejects a registration without a model deployment");
+    assert_eq!(deployment.model_name, "qwen3-8b");
+    assert_eq!(deployment.dtype, "FP8");
+    assert_eq!(
+        registration
+            .location_spec_infos
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        ["full", "swa", "mamba"]
+    );
 }
 
 #[tokio::test]
@@ -1162,10 +1291,14 @@ async fn spec_uris_follow_the_channel_and_reporter_identity() {
     assert_eq!(uris(&reports[0]), ["vineyard://10.0.0.1:30000/hbm"]);
     assert_eq!(uris(&reports[1]), ["vineyard://worker-1/hbm"]);
     // The mock's channel rule accepted both shapes.
+    let declared: Vec<String> = DEPLOYMENT_SPEC_NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     assert!(
         reports
             .iter()
-            .all(|report| validate_report_events(report).is_none()),
+            .all(|report| validate_report_events(report, &declared).is_none()),
         "generated events must satisfy KVCM acceptance rules"
     );
 }

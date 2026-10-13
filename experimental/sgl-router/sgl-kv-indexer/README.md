@@ -415,10 +415,21 @@ cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored
 python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
 ```
 
+A run that asks for these tests has to have them: with `--ignored`, a missing
+`KVCM_LIVE_ENDPOINT` fails every test with the commands above instead of
+skipping, so `ok. N passed` always means the manager was really driven. Without
+`--ignored` (a plain `cargo test`) they are skipped, which is what keeps an
+ordinary test run independent of any external service. A manager that is set
+but no longer reachable fails fast on a connection probe, naming the endpoint
+and the harness command to diagnose it.
+
 `start` is idempotent (`config` re-applies provisioning, `status` reports the
 process, `stop` kills it), and the workdir keeps the manager's registry, logs and
 a `kvcm_live.env` with the endpoints and instance names the tests read. Pass
-`--kvcm-repo` / `--binary` if the checkout or the binary moved.
+`--kvcm-repo` / `--binary` if the checkout or the binary moved. Both `stop` and
+the reuse path of `start` check that the state file's pid is still the manager
+they started (by `/proc/<pid>/exe` and cmdline) before signalling or trusting
+it; a stale workdir cannot make them take down an unrelated process.
 
 The harness provisions deliberately tight liveness (2s heartbeat timeout, 2s
 cleanup grace) so the reclamation tests finish in seconds; production values are
@@ -427,6 +438,9 @@ interval, and why a deployment should keep `HEARTBEAT_INTERVAL_MS` well below
 whatever the KVCM admin configured.
 
 The suite pins, among others: the `RegisterInstance` fields KVCM requires, the
+environment-variable path that assembles an auto-registering backend
+(`KV_INDEXER_KVCM_*` -> `KvcmBackendConfig::from_env` -> `RegisterInstance`, so
+a renamed variable cannot silently disable the registration),
 `BLOCK_ADD`/`BLOCK_DELETE` spec-name and URI rules, `NODE_REGISTER` resend
 idempotency, reporter liveness and the `NODE_NOT_REGISTERED` self-heal, the
 reported-medium filter, `snapshot_required` semantics, and the raw
