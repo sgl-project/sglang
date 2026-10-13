@@ -29,6 +29,20 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 
+def handle_api_key_env(server_args: Any):
+    cfg = resolving_view(server_args)
+    resolved = {}
+    if cfg.api_key is None and (api_key := envs.SGLANG_API_KEY.get()) is not None:
+        resolved["api_key"] = api_key
+    if (
+        cfg.admin_api_key is None
+        and (admin_api_key := envs.SGLANG_ADMIN_API_KEY.get()) is not None
+    ):
+        resolved["admin_api_key"] = admin_api_key
+    if resolved:
+        declare_resolution(server_args, "handle_api_key_env", **resolved)
+
+
 def handle_ssl_validation(server_args: Any):
     """Ensure SSL arguments are consistent and referenced files exist."""
     cfg = resolving_view(server_args)
