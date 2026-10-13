@@ -11,10 +11,10 @@
       "engine": {
         "status": 200,
         "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+          "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
           "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
+            38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+            12092, 163589, 163588, 2778, 163589, 163586
           ],
           "meta_info": {
             "id": "r",
@@ -22,7 +22,7 @@
             "prompt_tokens": 24,
             "weight_version": "default",
             "reasoning_tokens": 6,
-            "completion_tokens": 26,
+            "completion_tokens": 19,
             "cached_tokens": 0
           }
         }
@@ -51,15 +51,15 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848748,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -69,94 +69,13 @@
           ],
           "usage": {
             "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
+            "total_tokens": 40,
+            "completion_tokens": 19,
             "prompt_tokens_details": null,
             "reasoning_tokens": 6
           },
           "metadata": {"weight_version": "default"}
         }
-      }
-    },
-    {
-      "name": "chat_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "stream": true
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "The", "output_ids": [1008], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " user", "output_ids": [2742], "meta_info": {"completion_tokens": 2}},
-          {"text": " gre", "output_ids": [23320], "meta_info": {"completion_tokens": 3}},
-          {"text": "ets", "output_ids": [2088], "meta_info": {"completion_tokens": 4}},
-          {"text": " me", "output_ids": [1019], "meta_info": {"completion_tokens": 5}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 7}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 10}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 11}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 12}},
-          {"text": "Hello", "output_ids": [19180], "meta_info": {"completion_tokens": 13}},
-          {"text": "!", "output_ids": [0], "meta_info": {"completion_tokens": 14}},
-          {"text": " How", "output_ids": [3653], "meta_info": {"completion_tokens": 15}},
-          {"text": " can", "output_ids": [691], "meta_info": {"completion_tokens": 16}},
-          {"text": " I", "output_ids": [374], "meta_info": {"completion_tokens": 17}},
-          {"text": " help", "output_ids": [1833], "meta_info": {"completion_tokens": 18}},
-          {"text": "?", "output_ids": [30], "meta_info": {"completion_tokens": 19}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 20}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 21}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 22}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 23}},
-          {"text": "message", "output_ids": [2778], "meta_info": {"completion_tokens": 24}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 25}},
-          {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 26}}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " gre"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "ets"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " me"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " How"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " can"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " help"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "?"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
-          "[DONE]"
-        ]
       }
     },
     {
@@ -172,32 +91,13 @@
       "engine": {
         "status": 200,
         "frames": [
-          {"text": "The", "output_ids": [1008], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " user", "output_ids": [2742], "meta_info": {"completion_tokens": 2}},
-          {"text": " gre", "output_ids": [23320], "meta_info": {"completion_tokens": 3}},
-          {"text": "ets", "output_ids": [2088], "meta_info": {"completion_tokens": 4}},
-          {"text": " me", "output_ids": [1019], "meta_info": {"completion_tokens": 5}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 7}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 10}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 11}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 12}},
-          {"text": "Hello", "output_ids": [19180], "meta_info": {"completion_tokens": 13}},
-          {"text": "!", "output_ids": [0], "meta_info": {"completion_tokens": 14}},
-          {"text": " How", "output_ids": [3653], "meta_info": {"completion_tokens": 15}},
-          {"text": " can", "output_ids": [691], "meta_info": {"completion_tokens": 16}},
-          {"text": " I", "output_ids": [374], "meta_info": {"completion_tokens": 17}},
-          {"text": " help", "output_ids": [1833], "meta_info": {"completion_tokens": 18}},
-          {"text": "?", "output_ids": [30], "meta_info": {"completion_tokens": 19}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 20}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 21}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 22}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 23}},
-          {"text": "message", "output_ids": [2778], "meta_info": {"completion_tokens": 24}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 25}},
-          {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 26}}
+          {"text": "Greet back", "output_ids": [38, 7673, 1636], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
+          {"text": ".<|close|>think", "output_ids": [13, 163588, 39964], "meta_info": {"completion_tokens": 6}},
+          {"text": "<|sep|><|open|>response", "output_ids": [163589, 163587, 12092], "meta_info": {"completion_tokens": 9}},
+          {"text": "<|sep|>Hello!", "output_ids": [163589, 19180, 0], "meta_info": {"completion_tokens": 12}},
+          {"text": "<|close|>response<|sep|>", "output_ids": [163588, 12092, 163589], "meta_info": {"completion_tokens": 15}},
+          {"text": "<|close|>message<|sep|>", "output_ids": [163588, 2778, 163589], "meta_info": {"completion_tokens": 18}},
+          {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 19}}
         ]
       },
       "generate": {
@@ -222,22 +122,12 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 22, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 23, "completion_tokens": 2, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " gre"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 24, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "ets"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 25, "completion_tokens": 4, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " me"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 26, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 27, "completion_tokens": 6, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 34, "completion_tokens": 13, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 35, "completion_tokens": 14, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " How"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 36, "completion_tokens": 15, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " can"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 37, "completion_tokens": 16, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 38, "completion_tokens": 17, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " help"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 39, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "?"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 40, "completion_tokens": 19, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848748, "model": "moonshotai/Kimi-K3", "choices": [], "usage": {"prompt_tokens": 21, "total_tokens": 47, "completion_tokens": 26, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet back"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 24, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 27, "completion_tokens": 6, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 21, "total_tokens": 33, "completion_tokens": 12, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [], "usage": {"prompt_tokens": 21, "total_tokens": 40, "completion_tokens": 19, "prompt_tokens_details": null, "reasoning_tokens": 0}},
           "[DONE]"
         ]
       }
@@ -285,7 +175,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848749,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -310,56 +200,6 @@
           },
           "metadata": {"weight_version": "default"}
         }
-      }
-    },
-    {
-      "name": "thinking_off_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "chat_template_kwargs": {"thinking": false},
-        "stream": true
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "Short", "output_ids": [15234], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " reply", "output_ids": [17667], "meta_info": {"completion_tokens": 2}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 3}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 4}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 5}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 7}},
-          {"text": "message", "output_ids": [2778], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
-          {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 10}}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 2482, 1, 163589, 19180, 0, 163588, 2778, 163589, 163586, 163587,
-          2778, 6244, 878, 69702, 1, 163589, 163587, 12092, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": []
-      },
-      "openai": {
-        "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Short"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " reply"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
-          "[DONE]"
-        ]
       }
     },
     {
@@ -405,7 +245,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848749,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -413,157 +253,6 @@
               "message": {
                 "role": "assistant",
                 "content": "Short reply.",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 31,
-            "completion_tokens": 10,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "effort_low",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "reasoning_effort": "low"
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 26,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 28, 1332, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848749,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "skipped_think",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {"model": "moonshotai/Kimi-K3", "messages": [{"role": "user", "content": "Hello!"}]},
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Direct answer.<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [17199, 7574, 13, 163588, 12092, 163589, 163588, 2778, 163589, 163586],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 10,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848749,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Direct answer.",
                 "reasoning_content": null,
                 "tool_calls": null
               },
@@ -595,15 +284,9 @@
       "engine": {
         "status": 200,
         "frames": [
-          {"text": "Direct", "output_ids": [17199], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " answer", "output_ids": [7574], "meta_info": {"completion_tokens": 2}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 3}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 4}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 5}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 7}},
-          {"text": "message", "output_ids": [2778], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
+          {"text": "Direct answer.", "output_ids": [17199, 7574, 13], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
+          {"text": "<|close|>response<|sep|>", "output_ids": [163588, 12092, 163589], "meta_info": {"completion_tokens": 6}},
+          {"text": "<|close|>message<|sep|>", "output_ids": [163588, 2778, 163589], "meta_info": {"completion_tokens": 9}},
           {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 10}}
         ]
       },
@@ -629,379 +312,10 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Direct"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " answer"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Direct answer."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848749, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "force_nonempty",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "chat_template_kwargs": {"force_nonempty_content": true}
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Direct answer.<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [17199, 7574, 13, 163588, 12092, 163589, 163588, 2778, 163589, 163586],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 10,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848750,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Direct answer.",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 31,
-            "completion_tokens": 10,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "thinking_cut",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "max_tokens": 7
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me and I should",
-          "output_ids": [1008, 2742, 23320, 2088, 1019, 316, 374, 1765],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "length", "length": 8},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 8,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {"max_new_tokens": 7},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848750,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": "The user greets me and I should",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "length",
-              "matched_stop": null
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 29,
-            "completion_tokens": 8,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "thinking_cut_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "max_tokens": 7,
-        "stream": true
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "The", "output_ids": [1008], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " user", "output_ids": [2742], "meta_info": {"completion_tokens": 2}},
-          {"text": " gre", "output_ids": [23320], "meta_info": {"completion_tokens": 3}},
-          {"text": "ets", "output_ids": [2088], "meta_info": {"completion_tokens": 4}},
-          {"text": " me", "output_ids": [1019], "meta_info": {"completion_tokens": 5}},
-          {"text": " and", "output_ids": [316], "meta_info": {"completion_tokens": 6}},
-          {"text": " I", "output_ids": [374], "meta_info": {"completion_tokens": 7}},
-          {"text": " should", "output_ids": [1765], "meta_info": {"finish_reason": {"type": "length", "length": 8}, "completion_tokens": 8}}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {"max_new_tokens": 7},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " gre"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "ets"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " me"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " and"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " should"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "no_separate_reasoning",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "separate_reasoning": false
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 26,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848750,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "stream_reasoning_off",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}],
-        "stream": true,
-        "stream_reasoning": false
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "The", "output_ids": [1008], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " user", "output_ids": [2742], "meta_info": {"completion_tokens": 2}},
-          {"text": " gre", "output_ids": [23320], "meta_info": {"completion_tokens": 3}},
-          {"text": "ets", "output_ids": [2088], "meta_info": {"completion_tokens": 4}},
-          {"text": " me", "output_ids": [1019], "meta_info": {"completion_tokens": 5}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 7}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 10}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 11}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 12}},
-          {"text": "Hello", "output_ids": [19180], "meta_info": {"completion_tokens": 13}},
-          {"text": "!", "output_ids": [0], "meta_info": {"completion_tokens": 14}},
-          {"text": " How", "output_ids": [3653], "meta_info": {"completion_tokens": 15}},
-          {"text": " can", "output_ids": [691], "meta_info": {"completion_tokens": 16}},
-          {"text": " I", "output_ids": [374], "meta_info": {"completion_tokens": 17}},
-          {"text": " help", "output_ids": [1833], "meta_info": {"completion_tokens": 18}},
-          {"text": "?", "output_ids": [30], "meta_info": {"completion_tokens": 19}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 20}},
-          {"text": "response", "output_ids": [12092], "meta_info": {"completion_tokens": 21}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 22}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 23}},
-          {"text": "message", "output_ids": [2778], "meta_info": {"completion_tokens": 24}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 25}},
-          {"text": "", "output_ids": [163586], "meta_info": {"finish_reason": {"type": "stop", "matched": 163586}, "completion_tokens": 26}}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "The user greets me."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " How"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " can"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " help"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "?"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848750, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Direct answer."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Direct answer."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864701, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 163586}]},
           "[DONE]"
         ]
       }
@@ -1015,11 +329,10 @@
         "status": 200,
         "body": [
           {
-            "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+            "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
             "output_ids": [
-              1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589,
-              19180, 0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589,
-              163586
+              38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+              12092, 163589, 163588, 2778, 163589, 163586
             ],
             "meta_info": {
               "id": "r",
@@ -1027,17 +340,16 @@
               "prompt_tokens": 24,
               "weight_version": "default",
               "reasoning_tokens": 0,
-              "completion_tokens": 26,
+              "completion_tokens": 19,
               "cached_tokens": 0
             },
             "index": 0
           },
           {
-            "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+            "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
             "output_ids": [
-              1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589,
-              19180, 0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589,
-              163586
+              38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+              12092, 163589, 163588, 2778, 163589, 163586
             ],
             "meta_info": {
               "id": "r",
@@ -1045,7 +357,7 @@
               "prompt_tokens": 24,
               "weight_version": "default",
               "reasoning_tokens": 0,
-              "completion_tokens": 26,
+              "completion_tokens": 19,
               "cached_tokens": 0
             },
             "index": 1
@@ -1076,15 +388,15 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848750,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -1095,8 +407,8 @@
               "index": 1,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -1106,87 +418,8 @@
           ],
           "usage": {
             "prompt_tokens": 21,
-            "total_tokens": 73,
-            "completion_tokens": 52,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
-      "name": "continue",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "Hello!"}, {"role": "assistant", "content": "Sure"}],
-        "continue_final_message": true
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 26,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
-          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
-          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
-          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
-          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
-          163589, 19180, 0, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
-          163587, 39964, 163589, 60118
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848750,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
+            "total_tokens": 59,
+            "completion_tokens": 38,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0
           },
@@ -1209,10 +442,10 @@
       "engine": {
         "status": 200,
         "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+          "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
           "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
+            38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+            12092, 163589, 163588, 2778, 163589, 163586
           ],
           "meta_info": {
             "id": "r",
@@ -1220,7 +453,7 @@
             "prompt_tokens": 24,
             "weight_version": "default",
             "reasoning_tokens": 0,
-            "completion_tokens": 26,
+            "completion_tokens": 19,
             "cached_tokens": 0
           }
         }
@@ -1253,15 +486,15 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848751,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -1271,8 +504,8 @@
           ],
           "usage": {
             "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
+            "total_tokens": 40,
+            "completion_tokens": 19,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0
           },
@@ -1292,10 +525,10 @@
       "engine": {
         "status": 200,
         "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+          "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
           "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
+            38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+            12092, 163589, 163588, 2778, 163589, 163586
           ],
           "meta_info": {
             "id": "r",
@@ -1303,7 +536,7 @@
             "prompt_tokens": 24,
             "weight_version": "default",
             "reasoning_tokens": 0,
-            "completion_tokens": 26,
+            "completion_tokens": 19,
             "cached_tokens": 0
           }
         }
@@ -1336,15 +569,15 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848751,
+          "created": 1791864701,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -1354,8 +587,8 @@
           ],
           "usage": {
             "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
+            "total_tokens": 40,
+            "completion_tokens": 19,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0
           },
@@ -1375,12 +608,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ]
@@ -1410,17 +638,16 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 306, 17374,
-          30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587,
-          39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 306, 17374, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1,
+          163589, 163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
@@ -1439,7 +666,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848751,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -1485,12 +712,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -1499,65 +721,36 @@
       "engine": {
         "status": 200,
         "frames": [
-          {"text": "I", "output_ids": [40], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " need", "output_ids": [1362], "meta_info": {"completion_tokens": 2}},
-          {"text": " the", "output_ids": [276], "meta_info": {"completion_tokens": 3}},
-          {"text": " weather", "output_ids": [10666], "meta_info": {"completion_tokens": 4}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 5}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 6}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 7}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 9}},
-          {"text": "tools", "output_ids": [25385], "meta_info": {"completion_tokens": 10}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 11}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 12}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 13}},
-          {"text": " tool", "output_ids": [4453], "meta_info": {"completion_tokens": 14}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 15}},
-          {"text": "get", "output_ids": [618], "meta_info": {"completion_tokens": 16}},
-          {"text": "_we", "output_ids": [21055], "meta_info": {"completion_tokens": 17}},
-          {"text": "ather", "output_ids": [2800], "meta_info": {"completion_tokens": 18}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 19}},
-          {"text": " index", "output_ids": [4002], "meta_info": {"completion_tokens": 20}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 21}},
-          {"text": "1", "output_ids": [16], "meta_info": {"completion_tokens": 22}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 23}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 24}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 25}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 26}},
-          {"text": " key", "output_ids": [2355], "meta_info": {"completion_tokens": 27}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 28}},
-          {"text": "city", "output_ids": [37666], "meta_info": {"completion_tokens": 29}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 30}},
-          {"text": " type", "output_ids": [1798], "meta_info": {"completion_tokens": 31}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 32}},
-          {"text": "string", "output_ids": [2033], "meta_info": {"completion_tokens": 33}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 34}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 35}},
-          {"text": "Paris", "output_ids": [113476], "meta_info": {"completion_tokens": 36}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 37}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 38}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 39}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 40}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 41}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"}, "completion_tokens": 42}}
+          {"text": "I need the", "output_ids": [40, 1362, 276], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
+          {"text": " weather.<|close|>", "output_ids": [10666, 13, 163588], "meta_info": {"completion_tokens": 6}},
+          {"text": "think<|sep|><|open|>", "output_ids": [39964, 163589, 163587], "meta_info": {"completion_tokens": 9}},
+          {"text": "tools<|sep|><|open|>", "output_ids": [25385, 163589, 163587], "meta_info": {"completion_tokens": 12}},
+          {"text": "call tool=\"", "output_ids": [10257, 4453, 878], "meta_info": {"completion_tokens": 15}},
+          {"text": "get_weather", "output_ids": [618, 21055, 2800], "meta_info": {"completion_tokens": 18}},
+          {"text": "\" index=\"", "output_ids": [1, 4002, 878], "meta_info": {"completion_tokens": 21}},
+          {"text": "1\"<|sep|>", "output_ids": [16, 1, 163589], "meta_info": {"completion_tokens": 24}},
+          {"text": "<|open|>argument key", "output_ids": [163587, 47185, 2355], "meta_info": {"completion_tokens": 27}},
+          {"text": "=\"city\"", "output_ids": [878, 37666, 1], "meta_info": {"completion_tokens": 30}},
+          {"text": " type=\"string", "output_ids": [1798, 878, 2033], "meta_info": {"completion_tokens": 33}},
+          {"text": "\"<|sep|>Paris", "output_ids": [1, 163589, 113476], "meta_info": {"completion_tokens": 36}},
+          {"text": "<|close|>argument<|sep|>", "output_ids": [163588, 47185, 163589], "meta_info": {"completion_tokens": 39}},
+          {"text": "<|close|>call<|sep|>", "output_ids": [163588, 10257, 163589], "meta_info": {"finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"}, "completion_tokens": 42}}
         ]
       },
       "generate": {
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 306, 17374,
-          30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587,
-          39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 306, 17374, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1,
+          163589, 163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
@@ -1574,144 +767,13 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " need"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " weather"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "I need the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " weather."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
           "[DONE]"
         ]
-      }
-    },
-    {
-      "name": "tools_two",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "weather and time?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}
-            }
-          }
-        ]
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Two calls.<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|open|>argument key=\"days\" type=\"number\"<|sep|>3<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"get_time\" index=\"2\"<|sep|><|open|>argument key=\"tz\" type=\"string\"<|sep|>UTC<|close|>argument<|sep|><|close|>call<|sep|>",
-          "output_ids": [
-            17285, 9971, 13, 163588, 39964, 163589, 163587, 25385, 163589, 163587, 10257, 4453, 878,
-            618, 21055, 2800, 1, 4002, 878, 16, 1, 163589, 163587, 47185, 2355, 878, 37666, 1, 1798,
-            878, 2033, 1, 163589, 113476, 163588, 47185, 163589, 163587, 47185, 2355, 878, 21030, 1,
-            1798, 878, 10006, 1, 163589, 18, 163588, 47185, 163589, 163588, 10257, 163589, 163587,
-            10257, 4453, 878, 618, 6618, 1, 4002, 878, 17, 1, 163589, 163587, 47185, 2355, 878,
-            19186, 1, 1798, 878, 2033, 1, 163589, 42464, 163588, 47185, 163589, 163588, 10257,
-            163589
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 85,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
-          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 3923, 24453, 22849, 27129,
-          22849, 19186, 22849, 2217, 7471, 2033, 60336, 2020, 2217, 7471, 3721, 60336, 2020, 2217,
-          7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
-          14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
-          418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
-          9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268, 5354,
-          16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 316, 1169,
-          30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587,
-          39964, 163589
-        ],
-        "sampling_params": {
-          "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"tz\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
-        },
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848751,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": "Two calls.",
-                "tool_calls": [
-                  {
-                    "id": "get_weather:0",
-                    "index": 0,
-                    "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\", \"days\": 3}"}
-                  },
-                  {
-                    "id": "get_time:1",
-                    "index": 1,
-                    "type": "function",
-                    "function": {"name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls",
-              "matched_stop": null
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 106,
-            "completion_tokens": 85,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
       }
     },
     {
@@ -1726,123 +788,44 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}
-            }
-          }
+          {"type": "function", "function": {"name": "get_time"}}
         ],
         "stream": true
       },
       "engine": {
         "status": 200,
         "frames": [
-          {"text": "Two", "output_ids": [17285], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " calls", "output_ids": [9971], "meta_info": {"completion_tokens": 2}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 3}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 4}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 5}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 6}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 7}},
-          {"text": "tools", "output_ids": [25385], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 9}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 10}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 11}},
-          {"text": " tool", "output_ids": [4453], "meta_info": {"completion_tokens": 12}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 13}},
-          {"text": "get", "output_ids": [618], "meta_info": {"completion_tokens": 14}},
-          {"text": "_we", "output_ids": [21055], "meta_info": {"completion_tokens": 15}},
-          {"text": "ather", "output_ids": [2800], "meta_info": {"completion_tokens": 16}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 17}},
-          {"text": " index", "output_ids": [4002], "meta_info": {"completion_tokens": 18}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 19}},
-          {"text": "1", "output_ids": [16], "meta_info": {"completion_tokens": 20}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 21}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 22}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 23}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 24}},
-          {"text": " key", "output_ids": [2355], "meta_info": {"completion_tokens": 25}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 26}},
-          {"text": "city", "output_ids": [37666], "meta_info": {"completion_tokens": 27}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 28}},
-          {"text": " type", "output_ids": [1798], "meta_info": {"completion_tokens": 29}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 30}},
-          {"text": "string", "output_ids": [2033], "meta_info": {"completion_tokens": 31}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 32}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 33}},
-          {"text": "Paris", "output_ids": [113476], "meta_info": {"completion_tokens": 34}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 35}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 36}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 37}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 38}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 39}},
-          {"text": " key", "output_ids": [2355], "meta_info": {"completion_tokens": 40}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 41}},
-          {"text": "days", "output_ids": [21030], "meta_info": {"completion_tokens": 42}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 43}},
-          {"text": " type", "output_ids": [1798], "meta_info": {"completion_tokens": 44}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 45}},
-          {"text": "number", "output_ids": [10006], "meta_info": {"completion_tokens": 46}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 47}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 48}},
-          {"text": "3", "output_ids": [18], "meta_info": {"completion_tokens": 49}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 50}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 51}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 52}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 53}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 54}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 55}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 56}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 57}},
-          {"text": " tool", "output_ids": [4453], "meta_info": {"completion_tokens": 58}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 59}},
-          {"text": "get", "output_ids": [618], "meta_info": {"completion_tokens": 60}},
-          {"text": "_time", "output_ids": [6618], "meta_info": {"completion_tokens": 61}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 62}},
-          {"text": " index", "output_ids": [4002], "meta_info": {"completion_tokens": 63}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 64}},
-          {"text": "2", "output_ids": [17], "meta_info": {"completion_tokens": 65}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 66}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 67}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 68}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 69}},
-          {"text": " key", "output_ids": [2355], "meta_info": {"completion_tokens": 70}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 71}},
-          {"text": "tz", "output_ids": [19186], "meta_info": {"completion_tokens": 72}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 73}},
-          {"text": " type", "output_ids": [1798], "meta_info": {"completion_tokens": 74}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 75}},
-          {"text": "string", "output_ids": [2033], "meta_info": {"completion_tokens": 76}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 77}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 78}},
-          {"text": "UTC", "output_ids": [42464], "meta_info": {"completion_tokens": 79}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 80}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 81}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 82}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 83}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 84}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"}, "completion_tokens": 85}}
+          {"text": "Two calls.", "output_ids": [17285, 9971, 13], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
+          {"text": "<|close|>think<|sep|>", "output_ids": [163588, 39964, 163589], "meta_info": {"completion_tokens": 6}},
+          {"text": "<|open|>tools<|sep|>", "output_ids": [163587, 25385, 163589], "meta_info": {"completion_tokens": 9}},
+          {"text": "<|open|>call tool", "output_ids": [163587, 10257, 4453], "meta_info": {"completion_tokens": 12}},
+          {"text": "=\"get_we", "output_ids": [878, 618, 21055], "meta_info": {"completion_tokens": 15}},
+          {"text": "ather\" index", "output_ids": [2800, 1, 4002], "meta_info": {"completion_tokens": 18}},
+          {"text": "=\"1\"", "output_ids": [878, 16, 1], "meta_info": {"completion_tokens": 21}},
+          {"text": "<|sep|><|open|>argument", "output_ids": [163589, 163587, 47185], "meta_info": {"completion_tokens": 24}},
+          {"text": " key=\"city", "output_ids": [2355, 878, 37666], "meta_info": {"completion_tokens": 27}},
+          {"text": "\" type=\"", "output_ids": [1, 1798, 878], "meta_info": {"completion_tokens": 30}},
+          {"text": "string\"<|sep|>", "output_ids": [2033, 1, 163589], "meta_info": {"completion_tokens": 33}},
+          {"text": "Paris<|close|>argument", "output_ids": [113476, 163588, 47185], "meta_info": {"completion_tokens": 36}},
+          {"text": "<|sep|><|close|>call", "output_ids": [163589, 163588, 10257], "meta_info": {"completion_tokens": 39}},
+          {"text": "<|sep|><|open|>call", "output_ids": [163589, 163587, 10257], "meta_info": {"completion_tokens": 42}},
+          {"text": " tool=\"get", "output_ids": [4453, 878, 618], "meta_info": {"completion_tokens": 45}},
+          {"text": "_time\" index", "output_ids": [6618, 1, 4002], "meta_info": {"completion_tokens": 48}},
+          {"text": "=\"2\"", "output_ids": [878, 17, 1], "meta_info": {"completion_tokens": 51}},
+          {"text": "<|sep|><|close|>call", "output_ids": [163589, 163588, 10257], "meta_info": {"completion_tokens": 54}},
+          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"}, "completion_tokens": 55}}
         ]
       },
       "generate": {
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 3923, 24453, 22849, 27129,
-          22849, 19186, 22849, 2217, 7471, 2033, 60336, 2020, 2217, 7471, 3721, 60336, 2020, 2217,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 60027, 2217,
           7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
           14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
           418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
@@ -1854,7 +837,7 @@
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"tz\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
         },
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -1867,13 +850,11 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Two"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " calls"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\", \"days\": 3}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_time:1", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848751, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Two calls."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_time:1", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791864702, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
           "[DONE]"
         ]
       }
@@ -1890,21 +871,10 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}
-            }
-          }
+          {"type": "function", "function": {"name": "get_time"}}
         ],
         "parallel_tool_calls": false
       },
@@ -1933,11 +903,9 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 3923, 24453, 22849, 27129,
-          22849, 19186, 22849, 2217, 7471, 2033, 60336, 2020, 2217, 7471, 3721, 60336, 2020, 2217,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 60027, 2217,
           7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
           14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
           418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
@@ -1948,7 +916,7 @@
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"tz\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}]}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": true, \"excludes\": [\"<|open|>call\"]}}"
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>call<|sep|>\"}]}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": true, \"excludes\": [\"<|open|>call\"]}}"
         },
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -1963,7 +931,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848752,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -2025,12 +993,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ]
@@ -2060,24 +1023,23 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 306, 17374,
-          30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587,
-          39964, 163589, 20082, 4453, 13, 163588, 39964, 163589, 163587, 12092, 163589, 163588,
-          12092, 163589, 163587, 25385, 163589, 163587, 10257, 4453, 878, 618, 21055, 2800, 1, 4002,
-          878, 16, 1, 163589, 163587, 47185, 2355, 878, 37666, 1, 1798, 878, 2033, 1, 163589,
-          113476, 163588, 47185, 163589, 163588, 10257, 163589, 163588, 25385, 163589, 163588, 2778,
-          163589, 163586, 163587, 2778, 6244, 878, 20960, 1, 4453, 878, 618, 21055, 2800, 1, 4002,
-          878, 16, 1, 163589, 8264, 15566, 1289, 220, 2714, 92, 163588, 2778, 163589, 163586,
-          163587, 2778, 6244, 878, 2482, 1, 163589, 516, 40484, 30, 163588, 2778, 163589, 163586,
-          163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 306, 17374, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1,
+          163589, 163587, 39964, 163589, 20082, 4453, 13, 163588, 39964, 163589, 163587, 12092,
+          163589, 163588, 12092, 163589, 163587, 25385, 163589, 163587, 10257, 4453, 878, 618,
+          21055, 2800, 1, 4002, 878, 16, 1, 163589, 163587, 47185, 2355, 878, 37666, 1, 1798, 878,
+          2033, 1, 163589, 113476, 163588, 47185, 163589, 163588, 10257, 163589, 163588, 25385,
+          163589, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 20960, 1, 4453, 878, 618,
+          21055, 2800, 1, 4002, 878, 16, 1, 163589, 8264, 15566, 1289, 220, 2714, 92, 163588, 2778,
+          163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 516, 40484, 30, 163588, 2778,
+          163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
@@ -2096,7 +1058,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848752,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -2131,242 +1093,6 @@
       }
     },
     {
-      "name": "tools_history_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [
-          {"role": "user", "content": "weather in Paris?"},
-          {
-            "role": "assistant",
-            "reasoning_content": "Need tool.",
-            "content": "",
-            "tool_calls": [
-              {
-                "id": "get_weather:0",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
-              }
-            ]
-          },
-          {"role": "tool", "tool_call_id": "get_weather:0", "content": "{\"temp\": 21}"},
-          {"role": "user", "content": "and Tokyo?"}
-        ],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
-            }
-          }
-        ],
-        "stream": true
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "I", "output_ids": [40], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 24, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 0}},
-          {"text": " need", "output_ids": [1362], "meta_info": {"completion_tokens": 2}},
-          {"text": " the", "output_ids": [276], "meta_info": {"completion_tokens": 3}},
-          {"text": " weather", "output_ids": [10666], "meta_info": {"completion_tokens": 4}},
-          {"text": ".", "output_ids": [13], "meta_info": {"completion_tokens": 5}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 6}},
-          {"text": "think", "output_ids": [39964], "meta_info": {"completion_tokens": 7}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 8}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 9}},
-          {"text": "tools", "output_ids": [25385], "meta_info": {"completion_tokens": 10}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 11}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 12}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 13}},
-          {"text": " tool", "output_ids": [4453], "meta_info": {"completion_tokens": 14}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 15}},
-          {"text": "get", "output_ids": [618], "meta_info": {"completion_tokens": 16}},
-          {"text": "_we", "output_ids": [21055], "meta_info": {"completion_tokens": 17}},
-          {"text": "ather", "output_ids": [2800], "meta_info": {"completion_tokens": 18}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 19}},
-          {"text": " index", "output_ids": [4002], "meta_info": {"completion_tokens": 20}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 21}},
-          {"text": "1", "output_ids": [16], "meta_info": {"completion_tokens": 22}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 23}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 24}},
-          {"text": "<|open|>", "output_ids": [163587], "meta_info": {"completion_tokens": 25}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 26}},
-          {"text": " key", "output_ids": [2355], "meta_info": {"completion_tokens": 27}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 28}},
-          {"text": "city", "output_ids": [37666], "meta_info": {"completion_tokens": 29}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 30}},
-          {"text": " type", "output_ids": [1798], "meta_info": {"completion_tokens": 31}},
-          {"text": "=\"", "output_ids": [878], "meta_info": {"completion_tokens": 32}},
-          {"text": "string", "output_ids": [2033], "meta_info": {"completion_tokens": 33}},
-          {"text": "\"", "output_ids": [1], "meta_info": {"completion_tokens": 34}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 35}},
-          {"text": "Paris", "output_ids": [113476], "meta_info": {"completion_tokens": 36}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 37}},
-          {"text": "argument", "output_ids": [47185], "meta_info": {"completion_tokens": 38}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"completion_tokens": 39}},
-          {"text": "<|close|>", "output_ids": [163588], "meta_info": {"completion_tokens": 40}},
-          {"text": "call", "output_ids": [10257], "meta_info": {"completion_tokens": 41}},
-          {"text": "<|sep|>", "output_ids": [163589], "meta_info": {"finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"}, "completion_tokens": 42}}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
-          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 306, 17374,
-          30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587,
-          39964, 163589, 20082, 4453, 13, 163588, 39964, 163589, 163587, 12092, 163589, 163588,
-          12092, 163589, 163587, 25385, 163589, 163587, 10257, 4453, 878, 618, 21055, 2800, 1, 4002,
-          878, 16, 1, 163589, 163587, 47185, 2355, 878, 37666, 1, 1798, 878, 2033, 1, 163589,
-          113476, 163588, 47185, 163589, 163588, 10257, 163589, 163588, 25385, 163589, 163588, 2778,
-          163589, 163586, 163587, 2778, 6244, 878, 20960, 1, 4453, 878, 618, 21055, 2800, 1, 4002,
-          878, 16, 1, 163589, 8264, 15566, 1289, 220, 2714, 92, 163588, 2778, 163589, 163586,
-          163587, 2778, 6244, 878, 2482, 1, 163589, 516, 40484, 30, 163588, 2778, 163589, 163586,
-          163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
-        ],
-        "sampling_params": {
-          "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
-        },
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " need"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " weather"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:1", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791848752, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "tools_text_reply",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "hello"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
-            }
-          }
-        ]
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
-          "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": 163586},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 26,
-            "cached_tokens": 0
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
-          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 22931, 163588,
-          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
-        ],
-        "sampling_params": {
-          "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
-        },
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848752,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 163586
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {"weight_version": "default"}
-        }
-      }
-    },
-    {
       "name": "tools_stop",
       "endpoint": "chat",
       "synthetic": true,
@@ -2378,12 +1104,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -2414,16 +1135,16 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
-          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
+          163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["END", "<|close|>tools<|sep|>"],
@@ -2442,7 +1163,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848752,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -2488,12 +1209,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -2502,10 +1218,10 @@
       "engine": {
         "status": 200,
         "body": {
-          "text": "The user greets me.<|close|>think<|sep|><|open|>response<|sep|>Hello! How can I help?<|close|>response<|sep|><|close|>message<|sep|>",
+          "text": "Greet back.<|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>",
           "output_ids": [
-            1008, 2742, 23320, 2088, 1019, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180,
-            0, 3653, 691, 374, 1833, 30, 163588, 12092, 163589, 163588, 2778, 163589, 163586
+            38, 7673, 1636, 13, 163588, 39964, 163589, 163587, 12092, 163589, 19180, 0, 163588,
+            12092, 163589, 163588, 2778, 163589, 163586
           ],
           "meta_info": {
             "id": "r",
@@ -2513,7 +1229,7 @@
             "prompt_tokens": 24,
             "weight_version": "default",
             "reasoning_tokens": 0,
-            "completion_tokens": 26,
+            "completion_tokens": 19,
             "cached_tokens": 0
           }
         }
@@ -2522,19 +1238,18 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 22931, 163588,
-          2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 135230, 1,
-          163589, 1008, 2403, 387, 42070, 472, 1268, 20960, 79535, 28, 13871, 16518, 3900, 44322,
-          5795, 2390, 1178, 7697, 306, 276, 2897, 3996, 13, 163588, 2778, 163589, 163586, 163587,
-          2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          22931, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960,
+          135230, 1, 163589, 1008, 2403, 387, 42070, 472, 1268, 20960, 79535, 28, 13871, 16518,
+          3900, 44322, 5795, 2390, 1178, 7697, 306, 276, 2897, 3996, 13, 163588, 2778, 163589,
+          163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
         ],
         "sampling_params": {},
         "return_logprob": false,
@@ -2550,15 +1265,15 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848752,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hello! How can I help?",
-                "reasoning_content": "The user greets me.",
+                "content": "Hello!",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -2568,8 +1283,8 @@
           ],
           "usage": {
             "prompt_tokens": 21,
-            "total_tokens": 47,
-            "completion_tokens": 26,
+            "total_tokens": 40,
+            "completion_tokens": 19,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0
           },
@@ -2589,12 +1304,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -2628,21 +1338,20 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
-          2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878, 12092, 46906, 1,
-          163589, 1008, 2403, 387, 42070, 472, 1268, 12092, 15764, 129392, 36512, 16518, 12080,
-          4503, 2746, 413, 10872, 11419, 1544, 2932, 66661, 3253, 13825, 347, 3251, 5534, 8, 528,
-          1178, 6031, 44768, 341, 1008, 11419, 1544, 2746, 4620, 276, 4111, 14453, 777, 3251, 5534,
-          198, 8264, 2217, 7471, 3721, 35823, 3251, 163588, 2778, 163589, 163586, 163587, 2778,
-          6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878,
+          12092, 46906, 1, 163589, 1008, 2403, 387, 42070, 472, 1268, 12092, 15764, 129392, 36512,
+          16518, 12080, 4503, 2746, 413, 10872, 11419, 1544, 2932, 66661, 3253, 13825, 347, 3251,
+          5534, 8, 528, 1178, 6031, 44768, 341, 1008, 11419, 1544, 2746, 4620, 276, 4111, 14453,
+          777, 3251, 5534, 198, 8264, 2217, 7471, 3721, 35823, 3251, 163588, 2778, 163589, 163586,
+          163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
@@ -2661,7 +1370,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848753,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -2707,12 +1416,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -2743,16 +1447,16 @@
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63,
-          28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491,
-          904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268,
-          5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
-          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
-          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
+          163587, 39964, 163589
         ],
         "sampling_params": {"stop": ["<|close|>tools<|sep|>"], "regex": ".*"},
         "return_logprob": false,
@@ -2768,7 +1472,7 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791848753,
+          "created": 1791864702,
           "model": "moonshotai/Kimi-K3",
           "choices": [
             {
@@ -2803,107 +1507,210 @@
       }
     },
     {
-      "name": "tools_thinking_off",
+      "name": "tools_schema_types",
       "endpoint": "chat",
-      "synthetic": true,
+      "lower_only": true,
       "request": {
         "model": "moonshotai/Kimi-K3",
-        "messages": [{"role": "user", "content": "weather?"}],
+        "messages": [{"role": "user", "content": "hi"}],
         "tools": [
           {
             "type": "function",
             "function": {
-              "name": "get_weather",
-              "description": "Get weather",
+              "name": "typed",
               "parameters": {
                 "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
+                "properties": {
+                  "a": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                  "b": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                  "c": {"allOf": [{"type": "number"}, {"minimum": 0}]},
+                  "d": {"const": 3},
+                  "e": {"enum": [1, 2.5]},
+                  "f": {"items": {"type": "string"}},
+                  "g": {"maxLength": 3},
+                  "h": {"minimum": 1},
+                  "i": {"properties": {}},
+                  "j": true,
+                  "k": false,
+                  "l": {"$ref": "#/$defs/T"},
+                  "m": {"enum": ["x", "y"]},
+                  "n": {"allOf": [{"type": "integer"}, {"type": "number"}]},
+                  "o": {"type": ["string", "null"]}
+                },
+                "$defs": {"T": {"type": "boolean"}}
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "ref_required",
+              "parameters": {
+                "type": "object",
+                "properties": {"l": {"$ref": "#/$defs/T"}, "r": {"$ref": "#/$defs/R"}},
+                "required": ["l"],
+                "$defs": {"T": {"type": "array", "items": {"type": "string"}}, "R": {"$ref": "#/$defs/R"}}
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "quote\"amp&",
+              "parameters": {"type": "object", "properties": {"k\"&": {"type": "string"}}, "required": ["k\"&"]}
+            }
+          },
+          {"type": "function", "function": {"name": "no_params"}},
+          {
+            "type": "function",
+            "function": {
+              "name": "nullable_required",
+              "parameters": {
+                "type": "object",
+                "properties": {"x": {"type": ["string", "null"]}},
+                "required": ["x"]
               }
             }
           }
-        ],
-        "chat_template_kwargs": {"thinking": false}
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Checking.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Rome<|close|>argument<|sep|><|close|>call<|sep|>",
-          "output_ids": [
-            67772, 13, 163588, 12092, 163589, 163587, 25385, 163589, 163587, 10257, 4453, 878, 618,
-            21055, 2800, 1, 4002, 878, 16, 1, 163589, 163587, 47185, 2355, 878, 37666, 1, 1798, 878,
-            2033, 1, 163589, 49, 873, 163588, 47185, 163589, 163588, 10257, 163589
-          ],
-          "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop", "matched": "<|close|>tools<|sep|>"},
-            "prompt_tokens": 24,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 40,
-            "cached_tokens": 0
-          }
-        }
+        ]
       },
       "generate": {
         "input_ids": [
           163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
           198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
-          81103, 3879, 22849, 11031, 7471, 1959, 10666, 3923, 1152, 7471, 618, 21055, 2800, 3923,
-          24453, 22849, 27129, 22849, 37666, 22849, 2217, 7471, 2033, 60027, 21030, 22849, 2217,
-          7471, 28641, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721, 60336, 2020,
-          2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
-          878, 2482, 1, 163589, 50171, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
-          69702, 1, 163589, 163587, 12092, 163589
+          81103, 3879, 22849, 1152, 7471, 54130, 3923, 24453, 22849, 3, 62760, 22849, 51, 22849,
+          2217, 7471, 16849, 60336, 2020, 27129, 22849, 64, 22849, 1887, 3384, 76350, 2217, 7471,
+          2033, 69622, 2217, 7471, 6562, 16934, 24216, 2020, 65, 22849, 787, 3384, 76350, 2217,
+          7471, 28641, 69622, 2217, 7471, 10006, 16934, 24216, 2020, 66, 22849, 639, 3384, 76350,
+          2217, 7471, 10006, 69622, 65151, 1289, 15, 129441, 2020, 67, 22849, 1943, 1289, 18, 38131,
+          68, 22849, 11243, 33991, 16, 11, 17, 13, 20, 24216, 2020, 69, 22849, 7989, 22849, 2217,
+          7471, 2033, 60336, 2020, 70, 22849, 5354, 6987, 1289, 18, 38131, 71, 22849, 65151, 1289,
+          16, 38131, 72, 22849, 27129, 1289, 90, 5375, 2020, 73, 1289, 4130, 2020, 74, 1289, 8092,
+          2020, 75, 22849, 3, 2113, 7471, 2, 28443, 62760, 20395, 60027, 76, 22849, 11243, 46890,
+          87, 3923, 88, 122357, 77, 22849, 639, 3384, 76350, 2217, 7471, 28641, 69622, 2217, 7471,
+          10006, 16934, 24216, 2020, 78, 22849, 2217, 46890, 2033, 3923, 6562, 3956, 5375, 2020,
+          2217, 7471, 3721, 60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 2113,
+          45559, 3923, 24453, 22849, 3, 62760, 22849, 49, 22849, 3, 2113, 7471, 2, 28443, 62760,
+          22440, 60027, 51, 22849, 7989, 22849, 2217, 7471, 2033, 60027, 2217, 7471, 4392, 60336,
+          2020, 27129, 22849, 75, 22849, 3, 2113, 7471, 2, 28443, 62760, 20395, 60027, 81, 22849, 3,
+          2113, 7471, 2, 28443, 62760, 22440, 60336, 2020, 20331, 46890, 75, 131917, 2217, 7471,
+          3721, 60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 23178, 3378, 2139, 5,
+          3923, 24453, 22849, 27129, 22849, 74, 3378, 5, 22849, 2217, 7471, 2033, 60336, 2020,
+          20331, 46890, 74, 3378, 5, 131917, 2217, 7471, 3721, 60336, 2020, 2217, 7471, 3879, 69622,
+          3879, 22849, 1152, 7471, 4069, 12212, 60027, 2217, 7471, 3879, 69622, 3879, 22849, 1152,
+          7471, 51796, 45559, 3923, 24453, 22849, 27129, 22849, 87, 22849, 2217, 46890, 2033, 3923,
+          6562, 3956, 5375, 2020, 20331, 46890, 87, 131917, 2217, 7471, 3721, 60336, 2020, 2217,
+          7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
+          14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
+          418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
+          9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268, 5354,
+          16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
+          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 9663, 163588,
+          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
         ],
         "sampling_params": {
           "stop": ["<|close|>tools<|sep|>"],
-          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"city\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"typed\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"c\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"d\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"f\\\" type=\\\"array\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"g\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"h\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"i\\\" type=\\\"object\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"l\\\" type=\\\"boolean\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"m\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"n\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"ref_required\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"l\\\" type=\\\"array\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"quote&quot;amp&amp;\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"k&quot;&amp;\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"no_params\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"nullable_required\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": false, \"excludes\": [\"<|open|>call\"]}}"
         },
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
         "return_sampling_mask": false,
         "return_text_in_logprobs": true,
-        "modalities": []
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "r",
-          "object": "chat.completion",
-          "created": 1791848753,
-          "model": "moonshotai/Kimi-K3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Checking.",
-                "reasoning_content": null,
-                "tool_calls": [
-                  {
-                    "id": "get_weather:0",
-                    "index": 0,
-                    "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls",
-              "matched_stop": null
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_schema_types_serial",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "typed",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "a": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                  "b": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                  "c": {"allOf": [{"type": "number"}, {"minimum": 0}]},
+                  "d": {"const": 3},
+                  "e": {"enum": [1, 2.5]},
+                  "f": {"items": {"type": "string"}},
+                  "g": {"maxLength": 3},
+                  "h": {"minimum": 1},
+                  "i": {"properties": {}},
+                  "j": true,
+                  "k": false,
+                  "l": {"$ref": "#/$defs/T"},
+                  "m": {"enum": ["x", "y"]},
+                  "n": {"allOf": [{"type": "integer"}, {"type": "number"}]},
+                  "o": {"type": ["string", "null"]}
+                },
+                "$defs": {"T": {"type": "boolean"}}
+              }
             }
-          ],
-          "usage": {
-            "prompt_tokens": 21,
-            "total_tokens": 61,
-            "completion_tokens": 40,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
           },
-          "metadata": {"weight_version": "default"}
-        }
+          {
+            "type": "function",
+            "function": {
+              "name": "ref_required",
+              "parameters": {
+                "type": "object",
+                "properties": {"l": {"$ref": "#/$defs/T"}, "r": {"$ref": "#/$defs/R"}},
+                "required": ["l"],
+                "$defs": {"T": {"type": "array", "items": {"type": "string"}}, "R": {"$ref": "#/$defs/R"}}
+              }
+            }
+          }
+        ],
+        "parallel_tool_calls": false
+      },
+      "generate": {
+        "input_ids": [
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
+          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
+          81103, 3879, 22849, 1152, 7471, 54130, 3923, 24453, 22849, 3, 62760, 22849, 51, 22849,
+          2217, 7471, 16849, 60336, 2020, 27129, 22849, 64, 22849, 1887, 3384, 76350, 2217, 7471,
+          2033, 69622, 2217, 7471, 6562, 16934, 24216, 2020, 65, 22849, 787, 3384, 76350, 2217,
+          7471, 28641, 69622, 2217, 7471, 10006, 16934, 24216, 2020, 66, 22849, 639, 3384, 76350,
+          2217, 7471, 10006, 69622, 65151, 1289, 15, 129441, 2020, 67, 22849, 1943, 1289, 18, 38131,
+          68, 22849, 11243, 33991, 16, 11, 17, 13, 20, 24216, 2020, 69, 22849, 7989, 22849, 2217,
+          7471, 2033, 60336, 2020, 70, 22849, 5354, 6987, 1289, 18, 38131, 71, 22849, 65151, 1289,
+          16, 38131, 72, 22849, 27129, 1289, 90, 5375, 2020, 73, 1289, 4130, 2020, 74, 1289, 8092,
+          2020, 75, 22849, 3, 2113, 7471, 2, 28443, 62760, 20395, 60027, 76, 22849, 11243, 46890,
+          87, 3923, 88, 122357, 77, 22849, 639, 3384, 76350, 2217, 7471, 28641, 69622, 2217, 7471,
+          10006, 16934, 24216, 2020, 78, 22849, 2217, 46890, 2033, 3923, 6562, 3956, 5375, 2020,
+          2217, 7471, 3721, 60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 2113,
+          45559, 3923, 24453, 22849, 3, 62760, 22849, 49, 22849, 3, 2113, 7471, 2, 28443, 62760,
+          22440, 60027, 51, 22849, 7989, 22849, 2217, 7471, 2033, 60027, 2217, 7471, 4392, 60336,
+          2020, 27129, 22849, 75, 22849, 3, 2113, 7471, 2, 28443, 62760, 20395, 60027, 81, 22849, 3,
+          2113, 7471, 2, 28443, 62760, 22440, 60336, 2020, 20331, 46890, 75, 131917, 2217, 7471,
+          3721, 60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586,
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400,
+          123074, 470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411,
+          276, 4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421,
+          5713, 316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074,
+          470, 105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1,
+          163589, 9663, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589,
+          163587, 39964, 163589
+        ],
+        "sampling_params": {
+          "stop": ["<|close|>tools<|sep|>"],
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"triggered_tags\", \"triggers\": [\"<|open|>tools<|sep|>\"], \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"typed\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"c\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"d\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"f\\\" type=\\\"array\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"g\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"h\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"i\\\" type=\\\"object\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"l\\\" type=\\\"boolean\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"m\\\" type=\\\"string\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"n\\\" type=\\\"number\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"ref_required\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"l\\\" type=\\\"array\\\"<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"exclude_token\", \"exclude_tokens\": []}, {\"type\": \"any_tokens\", \"exclude_tokens\": [], \"max_tokens\": null}]}, \"end\": {\"type\": \"token\", \"token\": \"<|close|>\"}}, {\"type\": \"const_string\", \"value\": \"argument<|sep|>\"}]}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>call\", \"<|close|>call<|sep|>\"], \"max_tokens\": null, \"max_chars\": null}]}]}, \"end\": \"<|close|>call<|sep|>\"}]}, \"end\": \"<|close|>tools<|sep|>\"}], \"at_least_one\": false, \"stop_after_first\": true, \"excludes\": [\"<|open|>call\"]}}"
+        },
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
       }
     },
     {
@@ -2918,12 +1725,7 @@
             "type": "function",
             "function": {
               "name": "get_weather",
-              "description": "Get weather",
-              "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-                "required": ["city"]
-              }
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
           }
         ],
@@ -2946,10 +1748,9 @@
                 "type": "function",
                 "function": {
                   "name": "get_weather",
-                  "description": "Get weather",
                   "parameters": {
                     "type": "object",
-                    "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                    "properties": {"city": {"type": "string"}},
                     "required": ["city"]
                   }
                 }

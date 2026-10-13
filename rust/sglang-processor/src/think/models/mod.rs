@@ -6,10 +6,6 @@ mod glm45;
 mod kimi_k3;
 
 pub(crate) use self::kimi_k3::KimiK3Detector;
-#[cfg(feature = "openai")]
-pub(crate) use self::kimi_k3::{
-    THINK_CLOSE as KIMI_K3_THINK_CLOSE, THINK_OPEN as KIMI_K3_THINK_OPEN,
-};
 use super::ThinkConfig;
 
 /// The detector a `--reasoning-parser` name selects.

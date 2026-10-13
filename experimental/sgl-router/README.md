@@ -514,11 +514,8 @@ equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
 parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`); `required`, named and strict
-tools take a constraint from the engine's xgrammar, so they go to the engine.
-`kimi_k3`'s `auto` structural tag is reproduced, as are K3's own OpenAI-layer rules:
-special tokens kept, the tools close as a stop string, `name:N` tool-call ids,
-non-strict `json_schema` left unconstrained, and the three-token generation stub
-left out of reported prompt tokens.
+tools take a constraint from the engine's xgrammar, so they go to the engine
+(`kimi_k3`'s `auto` tag is reproduced).
 With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
 grammar needs `ebnf_full_assistant`, which `/generate` does not accept.
 The router reads the model's `config.json` and `generation_config.json` beside
@@ -601,20 +598,13 @@ tools keep the engine's route (see above).
 
 ## Kimi-K3
 
-Kimi-K3 rendering comes from `rust/sglang-processor` on dynamo-render's native
-XTML formatter, following SGLang's serving path (reasoning controls, tools,
-`response_format`, continuations), and is tokenized with the checkpoint's
-chunked tiktoken encoding. `--tokenizer-path` accepts a
+Kimi-K3 renders through `rust/sglang-processor` (dynamo-render's XTML formatter
+with SGLang's request semantics) and is tokenized with the checkpoint's chunked
+tiktoken encoding; shapes the formatter renders differently go to the worker.
+`--tokenizer-path` accepts a
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
-Shapes the pinned formatter renders differently are left to the worker: an
-explicit null `thinking_effort` with thinking enabled, whitespace-only
-reasoning history, tool-call arguments that are not a JSON object, numbers
-serde_json prints unlike Python (`1e-06`, integers beyond 64 bits, `-0`),
-tokenizer arguments in `chat_template_kwargs`, and tool declarations Dynamo
-rejects. With the cookbook's `kimi_k3` reasoning and tool parsers, text chats,
-`tool_choice` `auto` and `none` included, are served through `/generate`, so the
-router also splits reasoning and parses tool calls.
+With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`.
 
 ## HTTP/2
 

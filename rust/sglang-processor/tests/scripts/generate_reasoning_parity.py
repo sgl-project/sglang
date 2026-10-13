@@ -11,6 +11,7 @@ Run from rust/sglang-processor in a SGLang Python environment:
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 # Record this checkout's SGLang, not whichever one is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
@@ -22,16 +23,10 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/reasoning_parity"
 
 
-class Request:
-    """The request fields `ReasoningParser` reads."""
-
-    def __init__(self, nonempty):
-        self.chat_template_kwargs = {"force_nonempty_content": True} if nonempty else {}
-        self.continue_final_message = False
-
-
 def split(parser, force, stream, chunks, nonempty=False):
-    request = Request(nonempty)
+    # The request fields `ReasoningParser` reads.
+    kwargs = {"force_nonempty_content": True} if nonempty else {}
+    request = SimpleNamespace(chat_template_kwargs=kwargs, continue_final_message=False)
     streaming = ReasoningParser(
         parser, stream_reasoning=stream, force_reasoning=force, request=request
     )
@@ -47,10 +42,6 @@ def split(parser, force, stream, chunks, nonempty=False):
 
 for path in sorted(FIXTURES.glob("*.json")):
     fixture = json.loads(path.read_text())
-    # `force_nonempty_content` cases only where the fixture asks for them.
-    nonempty_options = (
-        (False, True) if fixture.get("force_nonempty_content") else (False,)
-    )
     fixture["cases"] = [
         {
             "input": index,
@@ -62,6 +53,9 @@ for path in sorted(FIXTURES.glob("*.json")):
         for index, case in enumerate(fixture["inputs"])
         for force in (True, False)
         for stream in (True, False)
-        for nonempty in nonempty_options
+        # `force_nonempty_content` cases only for the inputs that ask for them.
+        for nonempty in (
+            (False, True) if case.get("force_nonempty_content") else (False,)
+        )
     ]
     path.write_text(dump(fixture))

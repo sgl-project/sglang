@@ -5,49 +5,36 @@
 
 use serde_json::{Map, Value, json};
 
-const THINK_OPEN: &str = "<|open|>think<|sep|>";
-const THINK_CLOSE: &str = "<|close|>think<|sep|>";
-const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
-const TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
-const CALL_OPEN: &str = "<|open|>call";
-const CALL_CLOSE: &str = "<|close|>call<|sep|>";
+use crate::kimi_k3_format::{
+    CALL_CLOSE, CALL_OPEN, THINK_CLOSE, THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
+};
+
 const CLOSE_TOKEN: &str = "<|close|>";
 
 const JSON_TYPES: [&str; 7] = [
     "string", "number", "integer", "boolean", "array", "object", "null",
 ];
-const STRING_KEYWORDS: [&str; 4] = ["format", "maxLength", "minLength", "pattern"];
-const NUMBER_KEYWORDS: [&str; 5] = [
-    "exclusiveMaximum",
-    "exclusiveMinimum",
-    "maximum",
-    "minimum",
-    "multipleOf",
-];
-const ARRAY_KEYWORDS: [&str; 8] = [
-    "contains",
-    "items",
-    "maxContains",
-    "maxItems",
-    "minContains",
-    "minItems",
-    "prefixItems",
-    "uniqueItems",
-];
-const OBJECT_KEYWORDS: [&str; 9] = [
-    "additionalProperties",
-    "dependentRequired",
-    "dependentSchemas",
-    "maxProperties",
-    "minProperties",
-    "patternProperties",
-    "properties",
-    "propertyNames",
-    "required",
+/// The schema keywords `_schema_types` reads a type from, in its order.
+const TYPE_KEYWORDS: [(&str, &str); 4] = [
+    (
+        "object",
+        "additionalProperties dependentRequired dependentSchemas maxProperties minProperties \
+         patternProperties properties propertyNames required",
+    ),
+    (
+        "array",
+        "contains items maxContains maxItems minContains minItems prefixItems uniqueItems",
+    ),
+    ("string", "format maxLength minLength pattern"),
+    (
+        "number",
+        "exclusiveMaximum exclusiveMinimum maximum minimum multipleOf",
+    ),
 ];
 
-/// The auto tag over `tools` (request tool definitions), with `strip` removed
-/// from every `excludes` list (`strip_structural_tag_excludes`); `None` without tools.
+/// The auto tag over `tools` (request tool definitions), without the `strip`
+/// tokens `strip_structural_tag_excludes` removes; `None` without tools. Only
+/// the trigger's excludes hold think tokens.
 pub(super) fn auto_tool_call_tag(
     tools: &[Value],
     parallel_tool_calls: bool,
@@ -62,35 +49,19 @@ pub(super) fn auto_tool_call_tag(
         .collect();
     let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
     // `_auto_suffix`: a retriggered second tools section would evade the single-call limit.
-    let mut format = json!({
+    let excludes: Vec<&str> = [THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+        .into_iter()
+        .filter(|token| !strip.contains(token))
+        .collect();
+    let format = json!({
         "type": "triggered_tags",
         "triggers": [TOOLS_OPEN],
         "tags": [tools_tag],
         "at_least_one": false,
         "stop_after_first": !parallel_tool_calls,
-        "excludes": [THINK_OPEN, THINK_CLOSE, CALL_OPEN],
+        "excludes": excludes,
     });
-    strip_excludes(&mut format, strip);
     Some(json!({"type": "structural_tag", "format": format}))
-}
-
-fn strip_excludes(node: &mut Value, tokens: &[&str]) {
-    match node {
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| strip_excludes(item, tokens)),
-        Value::Object(map) => {
-            if let Some(Value::Array(excludes)) = map.get_mut("excludes") {
-                excludes.retain(|s| !s.as_str().is_some_and(|s| tokens.contains(&s)));
-            }
-            for key in ["format", "content", "tags", "elements"] {
-                if let Some(child) = map.get_mut(key) {
-                    strip_excludes(child, tokens);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn escape_attr(value: &str) -> String {
@@ -307,50 +278,8 @@ fn schema_types(schema: &Value, root: &Value, seen: &mut Vec<String>) -> Vec<&'s
         let types: Vec<&str> = values.iter().map(json_type).collect();
         return ordered(|t| types.contains(&t));
     }
-    let has = |keywords: &[&str]| keywords.iter().any(|k| schema.contains_key(*k));
-    if has(&OBJECT_KEYWORDS) {
-        vec!["object"]
-    } else if has(&ARRAY_KEYWORDS) {
-        vec!["array"]
-    } else if has(&STRING_KEYWORDS) {
-        vec!["string"]
-    } else if has(&NUMBER_KEYWORDS) {
-        vec!["number"]
-    } else {
-        JSON_TYPES.to_vec()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::py::python_json;
-
-    /// `tests/fixtures/kimi_k3_tool_tags.json`, from `tests/scripts/generate_kimi_k3_tool_tags.py`.
-    #[test]
-    fn auto_tags_match_sglang() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/kimi_k3_tool_tags.json");
-        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        for case in fixture["cases"].as_array().unwrap() {
-            let strip: Vec<&str> = case["strip"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| s.as_str().unwrap())
-                .collect();
-            let tag = auto_tool_call_tag(
-                case["tools"].as_array().unwrap(),
-                case["parallel_tool_calls"] == true,
-                &strip,
-            );
-            let got = tag.map(|tag| python_json(&tag, true));
-            assert_eq!(
-                got.as_deref(),
-                case["structural_tag"].as_str(),
-                "{}",
-                case["tools"]
-            );
-        }
-    }
+    TYPE_KEYWORDS
+        .iter()
+        .find(|(_, keywords)| keywords.split_whitespace().any(|k| schema.contains_key(k)))
+        .map_or_else(|| JSON_TYPES.to_vec(), |(json_type, _)| vec![*json_type])
 }

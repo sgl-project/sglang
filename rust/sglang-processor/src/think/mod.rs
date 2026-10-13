@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 
 use self::models::KimiK3Detector;
 pub(crate) use self::models::think_config;
+#[cfg(feature = "openai")]
+use crate::kimi_k3_format;
 
 /// The request settings Python passes its reasoning parser. Dynamo-backed
 /// names only honour `force_reasoning`; `None` keeps the parser's default.
@@ -41,11 +43,11 @@ pub(crate) enum ThinkConfig {
     KimiK3,
 }
 
+#[cfg(feature = "openai")]
 impl ThinkConfig {
     /// `_get_reasoning_from_request` for a template without a reasoning
     /// config, by the detector's `reasoning_default`. `None` for `"always"`,
     /// which the host resolves from the template instead.
-    #[cfg(feature = "openai")]
     pub(crate) fn default_thinking(&self, kwargs: &Map<String, Value>) -> Option<bool> {
         match self {
             ThinkConfig::Tags(_) => None,
@@ -53,15 +55,12 @@ impl ThinkConfig {
             ThinkConfig::KimiK3 => Some(kwargs.get("thinking") != Some(&Value::Bool(false))),
         }
     }
-}
 
-#[cfg(feature = "openai")]
-impl ThinkConfig {
     /// The detector's `think_start_token` and `think_end_token`.
     pub(crate) fn think_tokens(&self) -> [&'static str; 2] {
         match self {
             ThinkConfig::Tags(tags) => [tags.start, tags.end],
-            ThinkConfig::KimiK3 => [models::KIMI_K3_THINK_OPEN, models::KIMI_K3_THINK_CLOSE],
+            ThinkConfig::KimiK3 => [kimi_k3_format::THINK_OPEN, kimi_k3_format::THINK_CLOSE],
         }
     }
 }
@@ -317,7 +316,7 @@ impl TagDetector {
 }
 
 /// Byte length of the longest suffix of `buffer` that is a strict prefix of `token`.
-pub(crate) fn ends_with_partial_token(buffer: &str, token: &str) -> usize {
+fn ends_with_partial_token(buffer: &str, token: &str) -> usize {
     let max = buffer
         .chars()
         .count()

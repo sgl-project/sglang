@@ -12,31 +12,16 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+use crate::kimi_k3_format::{
+    CALL_CLOSE, CALL_OPEN, MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
+    partial_suffix_len, strip_partial_marker_suffix, strip_response_wrappers,
+};
 use crate::py::python_json;
 use crate::tool_call::{Parsed, ToolCallItem, ToolDetector};
 
 const SEP: &str = "<|sep|>";
-const RESPONSE_OPEN: &str = "<|open|>response<|sep|>";
-const RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
-const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
-const TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
-const MESSAGE_CLOSE: &str = "<|close|>message<|sep|>";
-const CALL_OPEN: &str = "<|open|>call";
-const CALL_CLOSE: &str = "<|close|>call<|sep|>";
 const ARGUMENT_OPEN: &str = "<|open|>argument";
 const ARGUMENT_CLOSE: &str = "<|close|>argument<|sep|>";
-
-/// `_PARTIAL_MARKER_SUFFIXES`: where max_tokens can cut a marker before `<|sep|>`.
-const PARTIAL_MARKER_SUFFIXES: [&str; 8] = [
-    "<|open|>",
-    "<|close|>",
-    "<|close|>think",
-    "<|open|>response",
-    "<|close|>response",
-    "<|open|>tools",
-    "<|close|>tools",
-    "<|close|>message",
-];
 
 /// `_ATTR_RE`.
 static ATTR_RE: LazyLock<Regex> =
@@ -210,97 +195,4 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
 /// Python's `re` `\s` (`str.isspace`), which also matches U+001C..U+001F.
 fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
-/// `partial_suffix_len`: the longest proper prefix of a marker that `text` ends
-/// with. Markers are ASCII, so the byte length is a char boundary.
-fn partial_suffix_len(text: &str, markers: &[&str]) -> usize {
-    let mut best = 0;
-    for marker in markers {
-        let longest = (marker.len() - 1).min(text.len());
-        if let Some(len) = (best + 1..=longest)
-            .rev()
-            .find(|&len| text.ends_with(&marker[..len]))
-        {
-            best = len;
-        }
-    }
-    best
-}
-
-/// `strip_partial_marker_suffix`.
-fn strip_partial_marker_suffix(text: &str) -> &str {
-    PARTIAL_MARKER_SUFFIXES
-        .iter()
-        .find_map(|suffix| text.strip_suffix(suffix))
-        .unwrap_or(text)
-}
-
-/// `strip_response_wrappers`: the first response channel's text if there is
-/// one, else the text without response/message closes.
-fn strip_response_wrappers(text: &str) -> String {
-    let text = match text.find(RESPONSE_OPEN) {
-        Some(open_idx) => {
-            let inner = &text[open_idx + RESPONSE_OPEN.len()..];
-            inner
-                .find(RESPONSE_CLOSE)
-                .map_or(inner, |c| &inner[..c])
-                .to_owned()
-        }
-        None => text.replace(RESPONSE_CLOSE, ""),
-    };
-    strip_partial_marker_suffix(&text.replace(MESSAGE_CLOSE, "")).to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blocks_follow_the_python_regexes() {
-        let call =
-            |attrs: &str, body: &str| format!("<|open|>call{attrs}<|sep|>{body}{CALL_CLOSE}");
-        // `\s+` is required, and attributes stop at the first `<|sep|>`.
-        let text = format!(
-            "{}{}",
-            call("", "a"),
-            call(" \u{1f}tool=\"x\"", "b<|sep|>c")
-        );
-        assert_eq!(
-            blocks(&text, CALL_OPEN, CALL_CLOSE),
-            [("tool=\"x\"", "b<|sep|>c")]
-        );
-        // An unclosed call swallows the next one's opening.
-        let text = format!(
-            "<|open|>call tool=\"a\"<|sep|>x{}",
-            call(" tool=\"b\"", "y")
-        );
-        assert_eq!(
-            blocks(&text, CALL_OPEN, CALL_CLOSE),
-            [("tool=\"a\"", "x<|open|>call tool=\"b\"<|sep|>y")]
-        );
-        assert!(blocks("<|open|>call tool=\"a\"<|sep|>x", CALL_OPEN, CALL_CLOSE).is_empty());
-    }
-
-    #[test]
-    fn partial_suffixes_are_marker_prefixes() {
-        let markers = [TOOLS_OPEN, RESPONSE_OPEN];
-        assert_eq!(partial_suffix_len("é<|open|>re", &markers), 10);
-        assert_eq!(partial_suffix_len("é<", &markers), 1);
-        assert_eq!(partial_suffix_len("é", &markers), 0);
-        assert_eq!(
-            strip_partial_marker_suffix("x<|open|>tool"),
-            "x<|open|>tool"
-        );
-        assert_eq!(strip_partial_marker_suffix("x<|close|>tools"), "x");
-    }
-
-    #[test]
-    fn attributes_unescape_in_python_order() {
-        assert_eq!(
-            attr(r#"tool="a" tool="b&amp;quot;""#, "tool").unwrap(),
-            "b&quot;"
-        );
-        assert_eq!(attr(r#"key="k""#, "type"), None);
-    }
 }

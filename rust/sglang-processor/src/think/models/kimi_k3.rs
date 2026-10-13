@@ -2,27 +2,11 @@
 //! think channel, with post-reasoning content unwrapped from the `response`
 //! and `message` markers and a `tools` channel passed through raw.
 
+use crate::kimi_k3_format::{
+    MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, THINK_CLOSE, THINK_OPEN, TOOLS_OPEN,
+    partial_suffix_len, strip_partial_marker_suffix, strip_response_wrappers,
+};
 use crate::think::ReasoningOptions;
-
-pub(crate) const THINK_OPEN: &str = "<|open|>think<|sep|>";
-pub(crate) const THINK_CLOSE: &str = "<|close|>think<|sep|>";
-const RESPONSE_OPEN: &str = "<|open|>response<|sep|>";
-const RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
-const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
-const MESSAGE_CLOSE: &str = "<|close|>message<|sep|>";
-
-/// `kimik3_format._PARTIAL_MARKER_SUFFIXES`: where `max_tokens` can stop
-/// after a control token or channel name, before `<|sep|>`.
-const PARTIAL_MARKER_SUFFIXES: [&str; 8] = [
-    "<|open|>",
-    "<|close|>",
-    "<|close|>think",
-    "<|open|>response",
-    "<|close|>response",
-    "<|open|>tools",
-    "<|close|>tools",
-    "<|close|>message",
-];
 
 #[derive(Debug, Clone)]
 pub(crate) struct KimiK3Detector {
@@ -293,43 +277,4 @@ fn clean_content(text: &str) -> String {
         Some(tools) => strip_response_wrappers(&text[..tools]) + &text[tools..],
         None => strip_response_wrappers(text),
     }
-}
-
-/// `kimik3_format.strip_response_wrappers`.
-fn strip_response_wrappers(text: &str) -> String {
-    let text = match text.find(RESPONSE_OPEN) {
-        Some(open) => {
-            let body = &text[open + RESPONSE_OPEN.len()..];
-            match body.find(RESPONSE_CLOSE) {
-                Some(close) => body[..close].to_owned(),
-                None => body.to_owned(),
-            }
-        }
-        None => text.replace(RESPONSE_CLOSE, ""),
-    };
-    strip_partial_marker_suffix(&text.replace(MESSAGE_CLOSE, "")).to_owned()
-}
-
-/// `kimik3_format.strip_partial_marker_suffix`: drop the first matching suffix.
-fn strip_partial_marker_suffix(text: &str) -> &str {
-    PARTIAL_MARKER_SUFFIXES
-        .iter()
-        .find_map(|suffix| text.strip_suffix(suffix))
-        .unwrap_or(text)
-}
-
-/// `kimik3_format.partial_suffix_len`: the longest strict marker prefix
-/// `text` ends with. Markers are ASCII, so the length is a char boundary.
-fn partial_suffix_len(text: &str, markers: &[&str]) -> usize {
-    let mut best = 0;
-    for marker in markers {
-        let longest = (marker.len() - 1).min(text.len());
-        if let Some(length) = (best + 1..=longest)
-            .rev()
-            .find(|&length| text.ends_with(&marker[..length]))
-        {
-            best = length;
-        }
-    }
-    best
 }
