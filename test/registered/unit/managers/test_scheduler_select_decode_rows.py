@@ -1,4 +1,5 @@
-"""A mixed step holds decode rows back when they do not fit the KV pool, and\nkeeps them running while it runs them."""
+"""A mixed step holds decode rows back when they do not fit the KV pool, and
+keeps them running while it runs them."""
 
 import unittest
 from types import MethodType, SimpleNamespace

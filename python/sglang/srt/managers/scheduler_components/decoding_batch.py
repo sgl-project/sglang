@@ -9,11 +9,9 @@ Under get_next_batch_to_run a decode step is a copy of the rows, and ``absorb``
 takes back what its run and commit rebound before the next plan. PD decode and
 pdmux still launch the rows themselves.
 
-The normal and overlap loops change the rows at launch and commit: right after
-a step's run the rows absorb it and the rows whose last prefill chunk it ran
-join (``join_launched``); after a commit the rows it finished leave. Between
-steps the rows are then exactly the requests still decoding. The other loops
-join the step they launched last at the top of the next plan, and leave there.
+The normal and overlap loops join and leave at launch and commit
+(``rows_join_at_launch``), so between their steps the rows are exactly the
+requests still decoding.
 """
 
 from __future__ import annotations
