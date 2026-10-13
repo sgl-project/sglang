@@ -1197,11 +1197,11 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "rain_fusion_attn")
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # Laser, rain_fusion_attn is used only by the MiniMax-H3 transformer.
             # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
