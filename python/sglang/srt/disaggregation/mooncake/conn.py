@@ -193,6 +193,10 @@ class KVArgsRegisterInfo:
         )
 
 
+# Allocation failure before any transfer is submitted; not a dead session.
+_STAGING_REQUEST_FAILED = object()
+
+
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -528,7 +532,7 @@ class MooncakeKVManager(CommonKVManager):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, and CHUNK_READY notification; a chunk
-        that cannot fit returns -1 (the caller fails only this room) instead of
+        that cannot fit returns _STAGING_REQUEST_FAILED instead of
         falling back to the slice path, which would leak the decode-side
         allocation. deferred=True means caller should re-enqueue and break.
         """
@@ -548,7 +552,7 @@ class MooncakeKVManager(CommonKVManager):
                     "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
                     "reduce chunked_prefill_size."
                 )
-                return (-1, False)
+                return (_STAGING_REQUEST_FAILED, False)
             # Not ready yet (allocation in flight or watermark pending). Bounded
             # spin: STAGING_REQ was just sent and the decode-side allocation +
             # STAGING_RSP land within ms, so re-checking beats re-enqueueing.
@@ -573,7 +577,7 @@ class MooncakeKVManager(CommonKVManager):
                         "SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
                         "chunked_prefill_size."
                     )
-                    return (-1, False)
+                    return (_STAGING_REQUEST_FAILED, False)
                 with self._staging_ctx.watermark_cv:
                     ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
                         req,
@@ -604,7 +608,7 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.room,
                         kv_chunk.index_slice.start,
                     )
-                    return (-1, False)
+                    return (_STAGING_REQUEST_FAILED, False)
                 queue.put(kv_chunk)
                 return (-1, True)
 
@@ -615,15 +619,6 @@ class MooncakeKVManager(CommonKVManager):
             target_info.staging_total_size - c_offset,
             target_info,
         )
-        if ret == -1:
-            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
-            # not fall back to the slice path (leaks the decode-side allocation).
-            logger.warning_once(
-                "[Staging] a chunk does not fit the staging ring; failing affected "
-                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
-                "reduce chunked_prefill_size."
-            )
-            return (-1, False)
         if ret == 0:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
@@ -771,7 +766,7 @@ class MooncakeKVManager(CommonKVManager):
             ]
         ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
-            raise RuntimeError(
+            logger.error(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
                 f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
@@ -1952,7 +1947,7 @@ class MooncakeKVManager(CommonKVManager):
                                     prefill_unique_rank,
                                 )
                             else:
-                                ret, deferred = -1, False
+                                ret, deferred = _STAGING_REQUEST_FAILED, False
                             if deferred:
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
@@ -2008,14 +2003,20 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            if ret is not _STAGING_REQUEST_FAILED:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                                    if (
+                                        self.session_failures[req.mooncake_session_id]
+                                        >= 1
+                                    ):
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed."
+                                        )
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
