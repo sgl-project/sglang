@@ -480,10 +480,58 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_moe.check_mega_moe_shapes(256, 128, "fp8xfp4")
         mega_moe.check_mega_moe_shapes(4096, 1536, "fp8xfp4")
         mega_moe.check_mega_moe_shapes(4096, 1024, "mxf4xmxf4")
+        mega_moe.check_mega_moe_shapes(5120, 2304, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(5120, 2240, "mxf4xmxf4")
         # 768 is a multiple of 256, so the NVFP4 (g16) rule accepts it.
         mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
+
+    def test_dsv4_weight_prep_preserves_packed_byte_abi(self):
+        """DeepGEMM's FP4 payload uses int8, shared with the normal fallback."""
+        experts = SimpleNamespace()
+        for name, shape in (
+            ("w13_weight", (1, 256, 128)),
+            ("w2_weight", (1, 256, 64)),
+        ):
+            setattr(
+                experts,
+                name,
+                torch.nn.Parameter(
+                    torch.zeros(shape, dtype=torch.int8), requires_grad=False
+                ),
+            )
+        for name, shape in (
+            ("w13_weight_scale_inv", (1, 256, 8)),
+            ("w2_weight_scale_inv", (1, 256, 4)),
+        ):
+            setattr(
+                experts,
+                name,
+                torch.nn.Parameter(torch.ones(shape), requires_grad=False),
+            )
+        deep_gemm = self.deep_gemm
+        deep_gemm.transform_sf_into_required_layout = MagicMock(
+            side_effect=lambda _sf, mn, k, **kw: torch.zeros(
+                (kw["num_groups"], mn, k // 128), dtype=torch.int32
+            )
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
+            # Isolate packed-byte ABI from the separate dimension gate above.
+            patch.object(mega_moe, "check_mega_moe_shapes"),
+        ):
+            mega_moe.build_mega_moe_experts_weights(experts)
+        for parameter, prepared in (
+            (experts.w13_weight, experts.mega_l1_weights[0]),
+            (experts.w2_weight, experts.mega_l2_weights[0]),
+        ):
+            self.assertEqual(parameter.dtype, torch.int8)
+            self.assertEqual(prepared.dtype, torch.int8)
+            self.assertEqual(parameter.data_ptr(), prepared.data_ptr())
+            torch.testing.assert_close(prepared.view(torch.int8), parameter)
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
