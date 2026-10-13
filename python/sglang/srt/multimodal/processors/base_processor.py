@@ -1254,9 +1254,7 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def _placeholder_runs(input_ids, token_id):
-        """Image placeholders in pre-tokenized ids: each run of consecutive
-        ``token_id`` is one image (a client may send one id per image or the
-        expanded run), the count the multimodal-token regex gave for text."""
+        """Runs of consecutive ``token_id`` in the ids."""
         runs = 0
         previous = None
         for token in input_ids:
@@ -1278,6 +1276,24 @@ class BaseMultimodalProcessor(ABC):
             previous = token
         return out
 
+    @classmethod
+    def _placeholder_layout(cls, input_ids, token_id, n_images):
+        """The ids with one placeholder id per image. One id per image is the
+        wire form (the count of ids equals the images, adjacent ids allowed:
+        a GLM prompt has no marker between two images); else each run of
+        the id is one expanded image and is collapsed; else the request is a
+        client error."""
+        singles = sum(1 for token in input_ids if token == token_id)
+        if singles == n_images:
+            return list(input_ids)
+        runs = cls._placeholder_runs(input_ids, token_id)
+        if runs == n_images:
+            return cls._collapse_placeholder_runs(input_ids, token_id)
+        raise ValueError(
+            f"prompt ids carry {singles} image placeholder id(s) in {runs} run(s) but "
+            f"{n_images} image(s) were provided"
+        )
+
     async def _load_mm_data_by_ids(
         self, input_ids, multimodal_tokens, image_data, discard_alpha_channel=True
     ):
@@ -1285,26 +1301,24 @@ class BaseMultimodalProcessor(ABC):
         id in the ids. The HF processor receives a synthetic text of one
         image token per image (it only counts and expands them; the request
         ids are the prompt), the images in request order, and the ids with
-        each placeholder run collapsed to one id, which
-        ``process_and_combine_mm_data`` expands in place. Ordinary tokens
-        that spell an image token stay text."""
+        one placeholder id per image, which ``process_and_combine_mm_data``
+        expands in place. Ordinary tokens that spell an image token stay
+        text. The output is marked ``synthetic_text``: its text is not a
+        prompt, so a failed expansion must raise, never fall back to it."""
         token_id = multimodal_tokens.image_token_id
-        found = self._placeholder_runs(input_ids, token_id)
-        if found != len(image_data):
-            raise ValueError(
-                f"prompt ids carry {found} image placeholder(s) but "
-                f"{len(image_data)} image(s) were provided"
-            )
+        ids = self._placeholder_layout(input_ids, token_id, len(image_data))
         image_token = multimodal_tokens.image_token
         if isinstance(image_token, list):
             image_token = image_token[0]
-        return await self.fast_load_mm_data(
+        output = await self.fast_load_mm_data(
             prompt=image_token * len(image_data),
             multimodal_tokens=multimodal_tokens,
             image_data=image_data,
             discard_alpha_channel=discard_alpha_channel,
-            input_ids=self._collapse_placeholder_runs(input_ids, token_id),
+            input_ids=ids,
         )
+        output.synthetic_text = True
+        return output
 
     async def load_mm_data(
         self,
@@ -1337,7 +1351,11 @@ class BaseMultimodalProcessor(ABC):
         ids_for_media = self._ids_for_media(
             prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
         )
-        if ids_for_media is not None:
+        if (
+            ids_for_media is not None
+            and envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+            and not self.preserve_processor_input_ids
+        ):
             return await self._load_mm_data_by_ids(
                 ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
             )
@@ -1519,7 +1537,11 @@ class BaseMultimodalProcessor(ABC):
         ids_for_media = self._ids_for_media(
             prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
         )
-        if ids_for_media is not None:
+        if (
+            ids_for_media is not None
+            and envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+            and not self.preserve_processor_input_ids
+        ):
             return await self._load_mm_data_by_ids(
                 ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
             )
@@ -1985,6 +2007,12 @@ class BaseMultimodalProcessor(ABC):
                         dtype=input_ids.dtype,
                     )
                 except Exception as e:
+                    # fti image patch (deploy/patches/sglang_mm_by_ids.py): an ids prompt's text is synthetic
+                    # (one image token per image), not a prompt to fall back to.
+                    if getattr(base_output, "synthetic_text", False):
+                        raise ValueError(
+                            f"exact-token expansion failed for a pre-tokenized prompt: {e}"
+                        ) from e
                     logger.warning(
                         f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
                     )
