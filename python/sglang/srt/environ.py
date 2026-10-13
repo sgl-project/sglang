@@ -1897,6 +1897,21 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
     # ===================================================================
+    # KVPress — optional NVIDIA KV-cache compression library integration.
+    # Prototype-level prefill-phase hook. Enable only when kvpress is
+    # installed (``pip install kvpress``). Full TP/PP/DP integration is
+    # follow-up work; see ``sglang.srt.layers.kvpress_adapter``.
+    # ===================================================================
+    SGLANG_ENABLE_KVPRESS = EnvBool(False)
+    # KVPress compression method name. Must match a registered kvpress
+    # ``BasePress`` subclass (e.g. "random", "snapkv", "knorm", "tokcope",
+    # "adakv"). Method availability depends on the installed kvpress version.
+    SGLANG_KVPRESS_METHOD = EnvStr("random")
+    # Fraction of KV entries to drop (0.0 — 0.99). Only used by ScorerPress
+    # subclasses; ignored by methods that don't need it.
+    SGLANG_KVPRESS_COMPRESSION_RATIO = EnvFloat(0.5)
+
+    # ===================================================================
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)

@@ -11,6 +11,14 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+# Optional KVPress adapter — imported lazily inside the hot path so that the
+# import cost is only paid when SGLANG_ENABLE_KVPRESS is turned on.
+_KVPRESS_COMPRESS: Optional[callable] = None
+try:
+    from sglang.srt.layers.kvpress_adapter import maybe_compress_prefill_kv as _KVPRESS_COMPRESS
+except Exception:  # pragma: no cover — adapter is pure Python; should never fail
+    pass
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -296,6 +304,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
+            # KVPress prefill compression hook — optional, zero-cost when
+            # disabled or kvpress is not installed.  See
+            # ``sglang.srt.layers.kvpress_adapter`` for design notes and
+            # known limitations.
+            if _KVPRESS_COMPRESS is not None:
+                k, v = _KVPRESS_COMPRESS(k, v, layer, forward_batch)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
             )
