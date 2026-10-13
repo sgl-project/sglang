@@ -1,10 +1,9 @@
 {#-
   harmony_xml: Harmony wire format with XML tool-call bodies.
 
-  Derived by SGLang from the Beam-1.0-501B-A23B checkpoint template (revision
-  6f5405687c3a, chat_template.jinja sha256 24464504778504...), changed only to
-  emit no reasoning effort unless one is given and to render supplied built-in
-  tool definitions as given. Not a copy of any other upstream revision.
+  Derived from the Beam checkpoint chat template (SHA256
+  2446450477850424e4e94342e5d580a93a20ba8ac3e5d5ad4608c53e7ce44ab4). SGLang
+  keeps reasoning effort optional and preserves supplied built-in definitions.
 
   Channels are `analysis` and `final`; there is no commentary channel. Tools
   are declared as flat TypeScript under `# Tools` and called with
