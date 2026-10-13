@@ -418,16 +418,6 @@ class FusedMoE(torch.nn.Module):
         )
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
 
-        # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
-        # Pad the intermediate_size_per_partition if necessary
-        if (
-            self.use_flashinfer_trtllm_moe
-            and self.intermediate_size_per_partition % 128 != 0
-        ):
-            self.intermediate_size_per_partition = round_up(
-                self.intermediate_size_per_partition, 128
-            )
-
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
@@ -488,6 +478,20 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
+        # Pad the intermediate_size_per_partition if necessary
+        if (
+            self.use_flashinfer_trtllm_moe
+            and not isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and self.intermediate_size_per_partition % 128 != 0
+        ):
+            self.intermediate_size_per_partition = round_up(
+                self.intermediate_size_per_partition, 128
+            )
+        self.moe_runner_config.intermediate_size_per_partition = (
+            self.intermediate_size_per_partition
+        )
+
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         if (
