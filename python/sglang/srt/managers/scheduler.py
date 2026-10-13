@@ -2352,6 +2352,9 @@ class Scheduler(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
 
+    def get_prefill_adder_class(self) -> type[PrefillAdder]:
+        return PrefillAdder
+
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
 
@@ -4016,7 +4019,7 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder = PrefillAdder(
+        adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,

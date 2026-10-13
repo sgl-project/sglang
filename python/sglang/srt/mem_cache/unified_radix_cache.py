@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from array import array
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -309,6 +310,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
             "declined_host_oversize": 0,
+            "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
             "l3_demand_requests": 0,
@@ -494,8 +496,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa_component=swa,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
-            self.buffer_pipeline = BufferModePipeline(
-                cache=self,
+            self.buffer_pipeline = self.components[
+                ComponentType.FULL
+            ].create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
                 swa_window_pages=(
                     swa.full_window_pages
@@ -2094,6 +2097,19 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if transfers:
                 comp_xfers[ct] = transfers
+        if buffer_mode and ComponentType.FULL in self.tree_components:
+            transfers = self.components[ComponentType.FULL].build_hicache_transfers(
+                None,
+                CacheTransferPhase.PREFETCH,
+                prefix_key=RadixKey(
+                    array("q", matched_prefix_tokens or ()),
+                    extra_key=extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                    cache_salt=cache_salt,
+                ),
+            )
+            if transfers:
+                comp_xfers[ComponentType.FULL] = transfers
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
@@ -2908,6 +2924,22 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Other prefetches hold the budget; ours fits once they
                     # drain, so park rather than launch this one unprotected.
                     return False
+                if anchor == "unservable":
+                    # The device prefix is resident but unreadable; the
+                    # request recomputes and heals it instead of splicing.
+                    self._prefetch_outcome_stats["declined_unservable_prefix"] += 1
+                    logger.info(
+                        "HiCache prefetch declined req=%s reason=unservable_prefix "
+                        "device_prefix=%d hit=%d",
+                        request.rid,
+                        full_match_len,
+                        hit_tokens,
+                    )
+                    self._finish_storage_prefetch(
+                        request, fulfilled_tokens=0, reason="unservable_prefix"
+                    )
+                    self.revoke_pending_prefetch(request)
+                    return True
                 if self.buffer_pipeline.staged_span_covered(
                     request, operation.storage_hit_count
                 ):
@@ -2922,36 +2954,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 info, hit_tokens, aux_hit_tokens = self._trim_buffer_prefetch_full_head(
                     request, info, operation, full_match_len, hit_tokens
                 )
-            else:
-                aux_hit_tokens = hit_tokens
-            alloc_len = hit_tokens
-            if buffer_mode and not cc.can_fit_prefetch_host_buffers(
-                operation, alloc_len
-            ):
-                self._prefetch_outcome_stats["declined_host_oversize"] += 1
-                logger.warning(
-                    "HiCache buffer prefetch declined req=%s: the Full/sidecar "
-                    "bounce cannot fit in an empty host arena",
-                    request,
+                return self.buffer_pipeline.allocate_and_queue_prefetch(
+                    operation, info, hit_tokens, aux_hit_tokens
                 )
-                self.revoke_pending_prefetch(request)
-                return True
+            aux_hit_tokens = hit_tokens
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=not buffer_mode,
+                allow_partial=True,
                 min_tokens=self.prefetch_threshold,
                 evict_host=self.evict_host,
             )
             if host_indices is None:
-                if buffer_mode:
-                    # Parked ops hold no pin: release and re-take at the next
-                    # attempt, which is also how a moved anchor gets noticed.
-                    self.buffer_pipeline.release_anchor_lock(request)
-                    self._log_storage_prefetch_deferred(
-                        max(alloc_len, aux_hit_tokens), "host_capacity"
-                    )
-                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2966,12 +2980,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
-                if buffer_mode:
-                    self.buffer_pipeline.release_anchor_lock(request)
-                    self._log_storage_prefetch_deferred(
-                        max(alloc_len, aux_hit_tokens), "host_capacity"
-                    )
-                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2991,13 +2999,6 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
-            if buffer_mode:
-                operation.buffer_host_occupied_units = (
-                    self.buffer_pipeline.host_allocation_units(
-                        host_indices, operation.pool_transfers
-                    )
-                )
-                cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
             cc.prefetch_buffer.put(operation)
             return True
 
