@@ -62,6 +62,7 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns an error response or raises an exception from the OpenAI handler."""
 
     supports_inline_system = False
+    chat_encoding_spec = None
 
     def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
