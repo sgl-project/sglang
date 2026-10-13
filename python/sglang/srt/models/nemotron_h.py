@@ -916,7 +916,7 @@ class NemotronHForCausalLM(nn.Module):
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.n_routed_experts,
+            num_logical_experts=config.max_n_routed_experts,
             num_groups=config.n_group,
         )
 

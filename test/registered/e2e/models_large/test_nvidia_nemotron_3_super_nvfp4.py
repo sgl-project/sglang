@@ -56,8 +56,6 @@ DP_ATTENTION_EP_ARGS = [
 EPLB_ARGS = [
     "--ep-size",
     "4",
-    "--moe-runner-backend",
-    "flashinfer_trtllm_routed",
     "--enable-eplb",
     "--ep-num-redundant-experts",
     "32",
@@ -171,12 +169,7 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
 
 
 class TestNvidiaNemotron3SuperNVFP4EPLB(CustomTestCase):
-    """EP with dynamic EPLB on the hybrid Mamba/attention/MoE stack.
-
-    A wrong expert-location layer index, an unmigrated expert tensor, or routing
-    that skips the remap sends tokens to the wrong expert after a rebalance, which
-    degrades the score instead of failing.
-    """
+    """EP with dynamic EPLB rebalancing during the eval."""
 
     @classmethod
     def setUpClass(cls):
