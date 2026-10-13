@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx95_supported, is_npu
 from sglang.srt.utils.common import (
     calc_diff,
     get_bool_env_var,
@@ -19,6 +19,7 @@ from sglang.srt.utils.common import (
 )
 
 _is_npu = is_npu()
+_is_gfx95 = is_gfx95_supported()
 if _is_npu:
     import torch_npu
 
@@ -224,6 +225,18 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
     }
+    if _is_gfx95:
+        # Measured on MI350X: the fastest configuration over the bf16 GEMM shapes of
+        # Qwen3-8B and Qwen3.8-27B, M = 1-4096; it needs gfx950's 160 KB of LDS.
+        configs[torch.bfloat16] = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+            "matrix_instr_nonkdim": 16,
+        }
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
