@@ -2152,10 +2152,8 @@ def npu_hc_pre(
         # hc_post consumes is produced by the separate npu_mhc_sinkhorn op.
         import torch_npu
 
-        # npu_mhc_pre takes (T, n, D) / (B, S, n, D); reshape a flat 2-D input.
-        x_op = x if x.dim() != 2 else x.reshape(x.shape[0], hc_mult, -1)
         h_in, h_post, h_res = torch_npu.npu_mhc_pre(
-            x_op,
+            x,
             hc_fn,
             hc_scale,
             hc_base,
