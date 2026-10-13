@@ -71,6 +71,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.event_loop import (
+    PD_PREFILL_LOOP,
+    run_flat_loop,
+)
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -659,48 +663,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
-        self.inflight_steps = InflightQueue(depth=0)
-        while True:
-            if self.gracefully_exit:
-                break
-
-            # Receive requests
-            self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
-
-            # Get the next batch to run
-            plan = self.get_next_disagg_prefill_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
-            batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
-            self.cur_batch_for_debug = batch
-
-            # Launch the current batch
-            if batch:
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
-                self.inflight_steps.push(batch, result)
-                self._commit_due_step()
-            else:
-                self._sched_idled = True
-                self.on_idle()
-
-            self.process_disagg_prefill_inflight_queue()
-
-            # Update last_batch
-            self.last_batch = batch
-            if self.recv_skipper is not None:
-                self.recv_skipper.on_launch(batch)
-            self.inflight_steps.end_step()
+        run_flat_loop(self, PD_PREFILL_LOOP)
 
     def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
         """Check support once on entry to the prefill overlap loop."""

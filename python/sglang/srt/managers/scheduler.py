@@ -235,6 +235,11 @@ from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdap
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
+from sglang.srt.managers.scheduler_components.event_loop import (
+    NORMAL_LOOP,
+    OVERLAP_LOOP,
+    run_flat_loop,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -1958,121 +1963,12 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
-        self.inflight_steps = InflightQueue(depth=0)
-        self.rows_join_before_plan = True
-        while True:
-            if self.gracefully_exit:
-                break
-
-            # Receive requests
-            self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
-
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
-
-            # Launch the current batch
-            if batch:
-                result = self.run_batch(batch)
-                self._update_rows_at_launch(batch)
-                self.inflight_steps.push(batch, result)
-                self._commit_due_step()
-                self.leave_finished_rows(self.decoding_batch)
-            else:
-                # When the server is idle, do self-check and re-init some states.
-                self._sched_idled = True
-                self.on_idle()
-
-            # Update last_batch
-            self.last_batch = batch
-            if self.recv_skipper is not None:
-                self.recv_skipper.on_launch(batch)
-            self.inflight_steps.end_step()
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+        run_flat_loop(self, NORMAL_LOOP)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.enable_skip_finishing_decode = True
-        self.inflight_steps = InflightQueue(depth=1)
-        self.rows_join_before_plan = True
-
-        while True:
-            if self.gracefully_exit:
-                break
-
-            # Receive requests
-            self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
-
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
-            # The step in flight is the one launched last.
-            inflight = self.inflight_steps.newest()
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=None if inflight is None else inflight.batch
-            )
-
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                self._commit_due_step()
-                # Opportunistic flush at the disable_overlap sync boundary:
-                # forward_stream is idle (prev forward drained, next not launched),
-                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.enable_unified_memory:
-                    try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
-                    except Exception:
-                        pass
-
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.inflight_steps.push(batch.copy(), batch_result)
-                self._update_rows_at_launch(batch)
-            else:
-                batch_result = None
-                self._sched_idled = True
-
-            # Process the last batch
-            self._debug_check_commit_gate(
-                self.last_batch is not None and not disable_overlap_for_batch
-            )
-            if self.inflight_steps.has_due():
-                self._commit_due_step()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.on_idle()
-            # Rows whose finish a commit observed leave here, after the
-            # launch: a decode step copied from the rows takes back its run
-            # writes first. This also covers the commit made before the launch.
-            self.leave_finished_rows(self.decoding_batch)
-
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result, batch)
-
-            # Update last_batch
-            self.last_batch = batch
-            if self.recv_skipper is not None:
-                self.recv_skipper.on_launch(batch)
-            self.inflight_steps.end_step()
-
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+        run_flat_loop(self, OVERLAP_LOOP)
 
     def _update_rows_at_launch(self, batch: ScheduleBatch) -> None:
         """The running rows after a launch: they take back what a decode step

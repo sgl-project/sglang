@@ -76,7 +76,11 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
-from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
+from sglang.srt.managers.scheduler_components.event_loop import (
+    PD_DECODE_LOOP,
+    PD_DECODE_OVERLAP_LOOP,
+    run_flat_loop,
+)
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2994,131 +2998,11 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
-        self.inflight_steps = InflightQueue(depth=0)
-
-        while True:
-            if self.gracefully_exit:
-                break
-
-            # Pending rooms from the prior cycle can overlap request intake and
-            # the tail of the in-flight decode graph.
-            if not self._engine_paused:
-                self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
-            # Receive requests
-            self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
-            self.process_decode_queue()
-
-            # Get the next batch to run
-            plan = self.get_next_disagg_decode_batch_to_run(
-                decoding_batch=self.decoding_batch
-            )
-            batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
-            self.cur_batch_for_debug = batch
-
-            # Launch the current batch
-            if batch:
-                result = self.run_batch(batch)
-                # The rows take back what their decode step's run rebound.
-                self.decoding_batch.absorb()
-                self.inflight_steps.push(batch, result)
-                self._commit_due_step()
-                # Rows whose finish the commit observed leave here, so the
-                # readers between steps, preallocation and the prebuilt join
-                # see only the rows still decoding.
-                self.leave_finished_rows(self.decoding_batch)
-            else:
-                # When the server is idle, do self-check and re-init some states
-                self._sched_idled = True
-                self.on_idle()
-
-            # Update last_batch
-            self.last_batch = batch
-            if self.recv_skipper is not None:
-                self.recv_skipper.on_launch(batch)
-            self.inflight_steps.end_step()
+        run_flat_loop(self, PD_DECODE_LOOP)
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        self.inflight_steps = InflightQueue(depth=1)
-        self.last_batch: Optional[ScheduleBatch] = None
-        if self.recv_skipper is not None:
-            self.recv_skipper.on_launch(None)
-
-        while True:
-            if self.gracefully_exit:
-                break
-
-            # Pending rooms from the prior cycle can overlap request intake and
-            # the tail of the in-flight decode graph.
-            if not self._engine_paused:
-                self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
-            # Receive requests
-            self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
-            self.process_decode_queue()
-
-            # Get the next batch to run
-            plan = self.get_next_disagg_decode_batch_to_run(
-                decoding_batch=self.decoding_batch
-            )
-            batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
-            self.cur_batch_for_debug = batch
-            # overlap + spec + grammar is unsupported (would desync DP ranks).
-            # The step in flight is the one launched last.
-            inflight = self.inflight_steps.newest()
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=None if inflight is None else inflight.batch
-            )
-
-            if disable_overlap_for_batch and self.inflight_steps.has_due():
-                self._commit_due_step()
-
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                self._apply_war_barrier()
-                self.inflight_steps.push(batch.copy(), batch_result)
-                # The rows take back what their decode step's run rebound.
-                self.decoding_batch.absorb()
-            else:
-                batch_result = None
-                self._sched_idled = True
-
-            # Process the last batch
-            self._debug_check_commit_gate(
-                self.last_batch is not None and not disable_overlap_for_batch
-            )
-            if self.inflight_steps.has_due():
-                self._commit_due_step()
-            elif batch is None:
-                self.on_idle()
-            # Rows whose finish a commit observed leave here, after the
-            # launch: the decode step copied from the rows hands back its run
-            # writes first. This also covers the commit made before the
-            # launch. The readers between steps, preallocation and the
-            # prebuilt join then see only the rows still decoding.
-            self.leave_finished_rows(self.decoding_batch)
-
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result, batch)
-
-            # Update last_batch
-            self.last_batch = batch
-            if self.recv_skipper is not None:
-                self.recv_skipper.on_launch(batch)
-            self.inflight_steps.end_step()
+        run_flat_loop(self, PD_DECODE_OVERLAP_LOOP)
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
