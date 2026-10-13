@@ -27,7 +27,11 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from tokenizers import Tokenizer
 
-from sglang.srt.entrypoints.openai.parallel_prompt_encode import _post_processor_safe
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    _post_processor_safe,
+    parallel_prompt_encode,
+    parallel_prompt_encode_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,26 +95,35 @@ class PromptSegmentCache:
         if not self.enabled or (
             self._specials_added and encode_kwargs.get("add_special_tokens", True)
         ):
-            return self._tokenizer.encode(text, **encode_kwargs)
+            return parallel_prompt_encode(self._tokenizer, text, encode_kwargs)
         kwargs_key = tuple(sorted(encode_kwargs.items()))
-        ids: List[int] = []
-        for segment in self._split(text):
-            key = (segment, kwargs_key)
-            cached = self._segments.get(key)
-            if cached is None:
-                cached = array("i", self._tokenizer.encode(segment, **encode_kwargs))
-                self._segments[key] = cached
+        segments = list(self._split(text))
+        missing = list(
+            dict.fromkeys(
+                segment
+                for segment in segments
+                if (segment, kwargs_key) not in self._segments
+            )
+        )
+        if missing:
+            for segment, segment_ids in zip(
+                missing,
+                parallel_prompt_encode_batch(self._tokenizer, missing, encode_kwargs),
+            ):
+                self._segments[(segment, kwargs_key)] = array("i", segment_ids)
                 self._chars += len(segment)
-            else:
-                self._segments.move_to_end(key)
-            ids.extend(cached)
+        ids: List[int] = []
+        for segment in segments:
+            key = (segment, kwargs_key)
+            self._segments.move_to_end(key)
+            ids.extend(self._segments[key])
         while self._chars > self._max_chars and len(self._segments) > 1:
             (evicted, _), _ = self._segments.popitem(last=False)
             self._chars -= len(evicted)
 
         self._calls += 1
         if self._calls <= self._check_first or self._calls % self._check_every == 0:
-            full = self._tokenizer.encode(text, **encode_kwargs)
+            full = parallel_prompt_encode(self._tokenizer, text, encode_kwargs)
             if ids != full:
                 logger.warning(
                     "Per-message prompt encoding differs from a full encode. "

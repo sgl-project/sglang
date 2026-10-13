@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from tokenizers import (
     AddedToken,
+    Regex,
     Tokenizer,
     models,
     normalizers,
@@ -19,7 +20,7 @@ from tokenizers import (
     processors,
 )
 from tokenizers.trainers import BpeTrainer
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
 from sglang.srt.entrypoints.openai.prompt_segment_cache import PromptSegmentCache
@@ -55,9 +56,22 @@ TEMPLATE_LIKE_CONTENT = [
 ]
 
 
-def _tokenizer(normalizer=None, template=TEMPLATE, extra_tokens=(), **role_flags):
+def _tokenizer(
+    normalizer=None, template=TEMPLATE, extra_tokens=(), intra=False, **role_flags
+):
     backend = Tokenizer(models.BPE(unk_token="[UNK]"))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.pre_tokenizer = (
+        pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(
+                    Regex(ppe._INTRA_SPLIT_REGEX), behavior="isolated"
+                ),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        if intra
+        else pre_tokenizers.ByteLevel(add_prefix_space=False)
+    )
     if normalizer is not None:
         backend.normalizer = normalizer
     backend.train_from_iterator(
@@ -446,6 +460,93 @@ class TestRenderAndEncode(CustomTestCase):
 
                 self.assertEqual(ids, reference)
                 self.assertGreater(len(chunks), 1)
+
+    def test_cold_long_prompts_and_validation_keep_parallel_encoding(self):
+        """Cold messages and full validation must not serialize long chats.
+
+        Cover both many messages below the threshold and one long message
+        whose content needs the GLM / Llama intra-message split points.
+        """
+        original_encode = PreTrainedTokenizerBase.encode
+        original_plan = ppe._plan_for
+        for intra in (False, True):
+            for parallel in (False, True):
+                with self.subTest(intra=intra, parallel=parallel):
+                    tokenizer = _tokenizer(intra=intra)
+                    messages = (
+                        [{"role": "user", "content": CORPUS[0] * 2000}]
+                        if intra
+                        else [
+                            {"role": "user", "content": f"{i} " + CORPUS[0] * 100}
+                            for i in range(12)
+                        ]
+                    )
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    reference = tokenizer.encode(text)
+                    cache = PromptSegmentCache.create(tokenizer)
+                    server = self._server(tokenizer, cache)
+                    serial_texts, batches = [], []
+
+                    class Backend:
+                        def __init__(self, backend):
+                            self.backend = backend
+
+                        def __getattr__(self, name):
+                            return getattr(self.backend, name)
+
+                        def encode_batch(self, chunks, **kwargs):
+                            batches.append(list(chunks))
+                            return self.backend.encode_batch(chunks, **kwargs)
+
+                    def plan_for(tokenizer):
+                        backend, *plan = original_plan(tokenizer)
+                        return (Backend(backend), *plan)
+
+                    def encode(tokenizer, text, **kwargs):
+                        serial_texts.append(text)
+                        return original_encode(tokenizer, text, **kwargs)
+
+                    with (
+                        envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(parallel),
+                        envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(32768),
+                        patch.object(ppe, "_parallel_ok", True),
+                        patch.object(ppe, "_plan_for", side_effect=plan_for),
+                        patch.object(PreTrainedTokenizerBase, "encode", encode),
+                    ):
+                        # The cold call and the first three full validation checks.
+                        for _ in range(3):
+                            ids, _ = render_and_encode(
+                                server,
+                                messages,
+                                tools=None,
+                                template_kwargs={},
+                                encode_kwargs={},
+                                use_cache=False,
+                            )
+                            self.assertEqual(ids, reference)
+                        encoded_before_warm_call = (len(serial_texts), len(batches))
+                        self.assertEqual(cache.encode(text, {}), reference)
+                        self.assertEqual(
+                            (len(serial_texts), len(batches)), encoded_before_warm_call
+                        )
+
+                    self.assertTrue(cache.enabled)
+                    if parallel:
+                        self.assertEqual(len(serial_texts), 0)
+                        self.assertEqual(len(batches), 4)
+                        self.assertTrue(all(len(batch) > 1 for batch in batches))
+                        self.assertTrue(
+                            all(
+                                len(chunk) < 32768
+                                for batch in batches
+                                for chunk in batch
+                            )
+                        )
+                    else:
+                        self.assertEqual(batches, [])
+                        self.assertGreater(len(serial_texts), 3)
 
 
 if __name__ == "__main__":
