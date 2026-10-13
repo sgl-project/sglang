@@ -597,6 +597,12 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
+    def refresh_derived_weights(self) -> None:
+        fused_onorm_args = getattr(self, "_fused_onorm_args", None)
+        if fused_onorm_args is not None:
+            # Captured graphs retain this fp32 buffer; refresh its contents in place.
+            fused_onorm_args[5].copy_(self.o_norm.weight.data)
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -1953,6 +1959,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+        # The NextN model also borrows this loader without inheriting this class.
+        Glm5NextForConditionalGeneration.refresh_derived_weights(self)
+
+    def refresh_derived_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Glm5NextLinearAttention):
+                module.refresh_derived_weights()
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -1960,6 +1973,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        self.refresh_derived_weights()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

@@ -1086,6 +1086,9 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def postprocess_weights(model, target_device):
+        # Direct and custom online loaders bypass model.load_weights().
+        if hasattr(model, "refresh_derived_weights"):
+            model.refresh_derived_weights()
         if QuantizedRLModelLoader.is_reload_scenario(model):
             return
         for module, quant_method in _modules_with_quant_method(model):
