@@ -25,14 +25,13 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4RawVerifyMetadata,
     _resolve_decode_graph_seq_lens,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
     _compose_graph_width_variant,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -246,28 +245,6 @@ class TestBackendSelectsTheWidth(CustomTestCase):
         )
 
 
-class TestTboWrapperDelegatesTheWidths(CustomTestCase):
-    def test_the_wrapper_reports_the_primary_ladder_not_the_base_default(self):
-        # Under two-batch-overlap the runner's attn_backend is TboAttnBackend,
-        # which forwards unknown attributes to its primary via __getattr__.
-        # A class-level default on AttentionBackend ends normal lookup first,
-        # so __getattr__ never runs and the ladder would read as None -- the
-        # feature silently off. TboAttnBackend therefore overrides it, the
-        # same way it already overrides verify_mask.
-        wrapper = TboAttnBackend.__new__(TboAttnBackend)
-        wrapper.primary = _backend()
-
-        self.assertIsNotNone(wrapper.decode_graph_widths)
-        self.assertEqual(wrapper.decode_graph_widths.widths, WIDTHS)
-
-        # Pin the delegation itself, not just the one attribute: the setter
-        # reaches the primary only because the base declares no such method.
-        # Adding one there would silently strand the primary at full width.
-        wrapper.set_decode_graph_width(8192)
-        self.assertEqual(wrapper.primary.MAX_SEQ_LEN_FOR_CAPTURE, 8192)
-        self.assertEqual(wrapper.MAX_SEQ_LEN_FOR_CAPTURE, 8192)
-
-
 class TestUnchangedWhenNoBackendAdvertisesWidths(CustomTestCase):
     """The feature must be inert for backends that advertise nothing.
 
@@ -305,7 +282,8 @@ class TestUnchangedWhenNoBackendAdvertisesWidths(CustomTestCase):
             ShapeKey(size=4, stream_idx=1, variant_label="lora"),
         )
         self.assertEqual(
-            runner._make_graph_key(4), ShapeKey(size=4, stream_idx=None, variant_label=None)
+            runner._make_graph_key(4),
+            ShapeKey(size=4, stream_idx=None, variant_label=None),
         )
 
     def test_eligibility_never_consults_the_width_check(self):
@@ -336,12 +314,101 @@ class TestUnchangedWhenNoBackendAdvertisesWidths(CustomTestCase):
         attn_backend.select_decode_graph_width.assert_not_called()
 
 
+class TestEagerDecodeNeverInheritsAStaleWidth(CustomTestCase):
+    """A narrow replay leaves its width in force. A decode batch that cannot
+    use a graph then runs eagerly. A batch size above the largest captured
+    size is one example. The eager raw-to-full upgrade must size the page
+    table from the full context, as it did before capture widths existed, and
+    not from the width of the last replay. The slice in
+    build_page_table_positions does not compare max_seq_len with seq_lens.
+
+    These tests run the real init_forward_metadata and the real
+    init_forward_metadata_in_graph. They replace only the leaf metadata
+    builders.
+    """
+
+    def _eager_backend(self, *, widths_on=True):
+        backend = _backend(
+            req_to_token=torch.empty((1, WIDTHS[-1]), dtype=torch.int32),
+            token_to_kv_pool=Mock(),
+            page_size=256,
+            swa_page_size=0,
+            topk=0,
+            speculative_num_steps=1,
+            speculative_step_id=0,
+            mtp_enabled=False,
+            is_dspark_draft=False,
+            online_c128_mtp=Mock(prepare_forward=Mock(return_value=0)),
+            make_core_attn_metadata=Mock(return_value=Mock()),
+            init_forward_metadata_indexer=Mock(return_value=None),
+        )
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+        if widths_on:
+            backend.set_decode_graph_width(8192)  # what the last replay left behind
+        else:
+            backend.decode_graph_widths = None
+        return backend
+
+    def _decode_batch(self, seq_len):
+        return SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            out_cache_loc=torch.tensor([0], dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            batch_size=1,
+        )
+
+    def _run_eager_decode(self, backend, seq_len):
+        mod = "sglang.srt.layers.attention.deepseek_v4_backend"
+        with envs.SGLANG_PREP_IN_CUDA_GRAPH.override(True), patch(
+            f"{mod}.create_paged_compressor_data", return_value=None
+        ), patch(
+            f"{mod}._get_logical_forward_mode", return_value=ForwardMode.DECODE
+        ), patch(
+            f"{mod}._get_target_verify_bs", return_value=None
+        ):
+            backend.init_forward_metadata(self._decode_batch(seq_len))
+        return backend.make_core_attn_metadata.call_args.kwargs["max_seq_len"]
+
+    def test_eager_upgrade_uses_the_full_context_not_the_stale_width(self):
+        # The batch is longer than the stale width, so a page table sized to
+        # that width would be too short for it.
+        backend = self._eager_backend()
+        self.assertEqual(self._run_eager_decode(backend, 10000), WIDTHS[-1])
+
+    def test_eager_upgrade_with_no_widths_is_unchanged(self):
+        backend = self._eager_backend(widths_on=False)
+        self.assertEqual(self._run_eager_decode(backend, 10000), WIDTHS[-1])
+
+    def test_the_in_graph_upgrade_still_uses_the_capture_width(self):
+        # The recorded upgrade must keep sizing to the capture width.
+        # Only the eager entry supplies the full context. Together with the
+        # tests above this pins the split: in-graph narrow, eager full.
+        backend = self._eager_backend()
+        raw = DSV4RawDecodeMetadata(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            out_cache_loc=torch.tensor([0], dtype=torch.int64),
+        )
+        with patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.create_paged_compressor_data",
+            return_value=None,
+        ):
+            backend.make_forward_metadata_from_raw_decode(raw)
+
+        self.assertEqual(
+            backend.make_core_attn_metadata.call_args.kwargs["max_seq_len"], 8192
+        )
+
+
 class TestEagerFallbackUsesTheFullContext(CustomTestCase):
     def test_unknown_lengths_bound_by_full_context_not_the_active_width(self):
         # A narrowed width belongs to a graph replay. With no override and no
         # CPU mirror the real lengths are unknown, so an eager forward must be
         # bounded by the full context -- not by whatever width the last replay
-        # left in force. Regressing this line is a silent under-sizing bug.
+        # left in force. Regressing this line under-sizes the page table, and
+        # the slice has no bounds check against seq_lens.
         backend = _backend(
             req_to_token=torch.empty((1, WIDTHS[-1]), dtype=torch.int32),
             page_size=256,
@@ -417,6 +484,7 @@ class TestValidatorsLiveWithTheServerArgs(CustomTestCase):
             speculative_algorithm=None,
             dllm_algorithm=None,
             enable_pdmux=False,
+            enable_two_batch_overlap=False,
             cuda_graph_config=SimpleNamespace(
                 decode=SimpleNamespace(backend=Backend.FULL)
             ),
@@ -439,6 +507,7 @@ class TestValidatorsLiveWithTheServerArgs(CustomTestCase):
             ("speculative decoding", {"speculative_algorithm": "EAGLE"}),
             ("diffusion decoding", {"dllm_algorithm": "LLaDA2Moe"}),
             ("PDMux", {"enable_pdmux": True}),
+            ("two-batch overlap", {"enable_two_batch_overlap": True}),
             (
                 "full decode graph",
                 {

@@ -51,10 +51,6 @@ class AttentionBackend(ABC):
     # (``DecodeGraphWidths``). None means graphs capture at the full context.
     # The DSV4 backend sets it in ``__init__``; the decode graph runner reads
     # it directly, so every backend needs the attribute.
-    # NOTE: a default declared here ends normal attribute lookup, so
-    # ``TboAttnBackend.__getattr__`` no longer delegates to its primary. Any
-    # further ladder member added to this class needs a matching explicit
-    # override there, or the feature silently switches off under TBO.
     decode_graph_widths = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

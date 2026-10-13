@@ -489,7 +489,8 @@ class DecodeGraphWidths:
     """Capture widths an attention backend offers the decode graph runner.
 
     ``widths`` is ascending and its last entry is always the full configured
-    context, so no request the server accepts falls off the graph path.
+    context, so sequence length alone never takes a batch off the graph path.
+    Other eligibility checks, such as the batch size, can still run it eagerly.
     ``label`` names the namespace the runner uses to keep graphs captured at
     one width distinct from another's, which keeps the runner free of any
     backend-specific naming.
@@ -1105,16 +1106,21 @@ class DeepseekV4AttnBackend(
     def make_forward_metadata_from_raw_decode(
         self,
         raw_metadata: DSV4RawDecodeMetadata,
+        max_seq_len: Optional[int] = None,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
+        if max_seq_len is None:
+            # In-graph upgrade. Capture records this call, so it sizes the
+            # page table to the capture width in force.
+            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=max_seq_len,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -1444,6 +1450,20 @@ class DeepseekV4AttnBackend(
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
+        if self.decode_graph_widths is not None and isinstance(
+            self.forward_metadata, DSV4RawDecodeMetadata
+        ):
+            # Eager decode. No graph replay chose a width for this batch, and
+            # the width of the last replay stays in force. Upgrade with the
+            # full context, as the code did before capture widths existed.
+            # The slice in build_page_table_positions does not compare
+            # max_seq_len with seq_lens, so a page table that uses the stale
+            # width would drop the pages beyond it. The call below then finds
+            # full metadata and leaves it unchanged.
+            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=self.forward_metadata,
+                max_seq_len=self._full_seq_len_for_capture,
+            )
         self.init_forward_metadata_in_graph(forward_batch)
 
     def _build_forward_metadata(

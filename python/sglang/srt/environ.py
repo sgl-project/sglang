@@ -1295,7 +1295,7 @@ class Envs:
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
     # Opt-in XPU DSV4 decode-graph sequence widths. The full configured context
-    # is appended automatically so every accepted request retains a graph.
+    # is appended automatically, so sequence length alone never excludes a graph.
     SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS = EnvIntTuple(tuple())
 
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them

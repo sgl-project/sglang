@@ -220,6 +220,13 @@ def validate_deepseek_v4_decode_graph_widths(server_args: ServerArgs) -> None:
             "cannot be combined with diffusion decoding "
             f"({server_args.dllm_algorithm!r}). Unset one of them."
         )
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS does not support two-batch "
+            "overlap. The XPU graph runner rejects two-batch overlap, and the "
+            "overlap wrapper hides the capture widths from the runner. "
+            "Unset one of them."
+        )
     if server_args.enable_pdmux:
         raise ValueError(
             "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS does not support PDMux. "
