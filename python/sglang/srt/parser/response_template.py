@@ -571,8 +571,6 @@ class ResponseTemplateReasoningDetector:
 class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
 
-    # Reads arguments in layouts the template's grammar does not write.
-    parse_tag_pattern: str | None = None
     response_template: dict | None = None
     constrains_every_turn = False
     forwards_unknown_tools = False
@@ -592,7 +590,9 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self.response_template = template
         if _TOOL_FIELD not in loaded.fields:
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
-        self._template = _tool_extraction_template(template, self.parse_tag_pattern)
+        self._template = _tool_extraction_template(
+            template, self._parse_tag_pattern(template["fields"][_TOOL_FIELD])
+        )
         self._prefix = prefix
         self._tools = tools
         self._constrained = constrained
@@ -800,6 +800,11 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
                     adapter._parser.input_text
                 )
                 return self.tool_close_literals[0] if open_at_end else None
+        return None
+
+    def _parse_tag_pattern(self, tool_field: dict) -> str | None:
+        """A tag pattern that also reads argument layouts the declared
+        `tool_field` does not write, or None to parse with its own."""
         return None
 
     def calls_complete(self, text: str) -> bool:
