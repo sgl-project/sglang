@@ -1422,6 +1422,38 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
+            for tool_choice, expects_tools in (("none", False), ("auto", True)):
+                with self.subTest(
+                    chat_encoding_spec=chat_encoding_spec,
+                    tool_choice=tool_choice,
+                ):
+                    self.chat.chat_encoding_spec = chat_encoding_spec
+                    self.tm.tokenizer.encode.reset_mock()
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                        tools=[tool],
+                        tool_choice=tool_choice,
+                    )
+
+                    self.chat._process_messages(request, is_multimodal=False)
+
+                    prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertEqual("calculator" in prompt, expects_tools)
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -1839,6 +1871,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return a chunk with remaining arguments
@@ -1847,6 +1880,7 @@ class ServingChatTestCase(CustomTestCase):
         # Parse the result to verify content
         self.assertTrue(result.startswith("data: "))
         chunk = json.loads(result[6:])
+        self.assertEqual(chunk["created"], 123)
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
@@ -1892,6 +1926,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since no completion is needed
@@ -1930,6 +1965,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNone(result, "Should not append encoded quotes")
@@ -1965,6 +2001,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
@@ -2000,6 +2037,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since there's no parser data
@@ -2531,6 +2569,7 @@ class ServingChatTestCase(CustomTestCase):
                     content={"meta_info": {"id": "chatcmpl-test"}},
                     request=req,
                     has_tool_calls={},
+                    created=123,
                 )
                 # Get first yielded SSE line
                 line = None
@@ -2545,6 +2584,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertTrue(line.startswith("data: "))
 
             payload = json.loads(line[len("data: ") :])
+            self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
@@ -3154,12 +3194,41 @@ class ServingChatTestCase(CustomTestCase):
                 parsed.append(json.loads(c[len("data: ") :]))
         return parsed
 
+    def test_streaming_created_is_stable_across_chunks(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.time.time",
+            side_effect=[100, 101, 102, 103],
+        ) as current_time:
+            chunks = self._run_chat_stream(Mock(), req)
+
+        parsed = self._parse_chunks(chunks)
+        self.assertGreater(len(parsed), 1)
+        identities = {
+            (chunk["id"], chunk["created"], chunk["model"]) for chunk in parsed
+        }
+        self.assertEqual(len(identities), 1)
+        response_id, created, model = identities.pop()
+        self.assertTrue(response_id)
+        self.assertEqual((created, model), (100, "x"))
+        self.assertTrue(
+            any(not chunk["choices"] and chunk.get("usage") for chunk in parsed)
+        )
+        current_time.assert_called_once_with()
+
     async def _collect_stream_content(self, content, choice_logprobs, req):
         chunks = []
         async for chunk in self.chat._generate_stream_content(
             content=content,
             index=0,
             request=req,
+            created=123,
             stream_offsets={},
             reasoning_parser_dict={},
             parser_dict={},
@@ -4034,6 +4103,7 @@ class ServingChatTestCase(CustomTestCase):
                 content=content,
                 index=0,
                 request=req,
+                created=123,
                 stream_offsets={},
                 reasoning_parser_dict={},
                 parser_dict={},
@@ -4056,9 +4126,14 @@ class ServingChatTestCase(CustomTestCase):
         enter_override(
             self, get_context().override_server_args(enable_cache_report=True)
         )
-        usages = self._collect_continuous_usage(cached_tokens=6)
-        self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+        for cached_tokens in (0, 6):
+            with self.subTest(cached_tokens=cached_tokens):
+                usages = self._collect_continuous_usage(cached_tokens=cached_tokens)
+                self.assertTrue(usages, "continuous_usage_stats attached no usage")
+                self.assertEqual(
+                    usages[0]["prompt_tokens_details"]["cached_tokens"],
+                    cached_tokens,
+                )
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
@@ -4313,7 +4388,7 @@ class ServingChatTestCase(CustomTestCase):
                 response = self.chat._build_chat_response(request, [ret], created=123)
                 message = response.model_dump(mode="json")["choices"][0]["message"]
                 self.assertEqual(message["content"], "" if tool_only else "Hello")
-                self.assertEqual(bool(message["tool_calls"]), tool_only)
+                self.assertEqual(bool(message.get("tool_calls")), tool_only)
                 self._assert_empty_reasoning_replays(message)
 
     def test_empty_stream_reasoning_each_choice(self):

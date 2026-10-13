@@ -4310,11 +4310,11 @@ class HybridLinearKVPool(KVCache):
 
     @property
     def dsa_kv_cache_store_fp8(self) -> bool:
-        return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
+        return self.full_kv_pool.dsa_kv_cache_store_fp8
 
     @property
     def dsa_kv_cache_store_nvfp4(self) -> bool:
-        return getattr(self.full_kv_pool, "dsa_kv_cache_store_nvfp4", False)
+        return self.full_kv_pool.dsa_kv_cache_store_nvfp4
 
     @property
     def kv_cache_dim(self):
@@ -4567,17 +4567,6 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
-    def get_mla_kv_global_scale(self, layer_id: int) -> torch.Tensor:
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_mla_kv_global_scale(local_layer_id)
-
-    def set_mla_kv_global_scale(
-        self, layer_id: int, value: torch.Tensor | float
-    ) -> None:
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        self.full_kv_pool.set_mla_kv_global_scale(local_layer_id, value)
-
     def set_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -4709,6 +4698,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
         super().__init__(
             size,
@@ -4724,6 +4714,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        self.dcp_replicated = dcp_replicated
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -4873,11 +4864,14 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
-        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
+            return 1
+        return get_parallel().attn_dcp_size
 
     def _scatter_mla_rows(
         self,
@@ -4886,7 +4880,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
@@ -4910,7 +4904,11 @@ class MLATokenToKVPool(KVCache):
         assert not self.dsa_kv_cache_store_fp8
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
-        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+        assert (
+            self.write_loc_is_dcp_resolved
+            or self.dcp_replicated
+            or not get_parallel().dcp_enabled
+        ), (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
             "whose kernel resolves the owner rule; reaching the combined-row "
@@ -5272,6 +5270,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        dcp_replicated: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5290,6 +5289,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
+            dcp_replicated=dcp_replicated,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -5301,8 +5301,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
         self.index_page_size = self.page_size // index_kpool
+        if dcp_replicated:
+            self.index_page_size //= get_parallel().attn_dcp_size
         if index_buf_size is None:
-            index_buf_size = size
+            dcp_size = get_parallel().attn_dcp_size
+            index_buf_size = (
+                size
+                if dcp_replicated
+                else (size + self.page_size) * dcp_size - self.page_size
+            )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
@@ -5314,7 +5321,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         assert len(self.skip_topk_layers) == layer_num
 
-        physical_page_size = self.page_size // index_kpool
+        physical_page_size = self.index_page_size
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert physical_page_size % 16 == 0, (

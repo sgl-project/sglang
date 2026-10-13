@@ -281,9 +281,8 @@ def test_residual_gate_add_guards_and_eager_fallback():
     for args in rejected:
         assert not can_use_residual_gate_add_cuda(*args)
 
-    # Only [1, ..., 1, D] row-broadcast gates are supported; a batched
-    # [B>1, 1, D] gate is not row-broadcast here and must fall back.
-    batched = torch.randn((2, 8, 64), device=DEVICE, dtype=torch.bfloat16)
+    # Batched gates support contiguous BTD residuals, but not arbitrary strides.
+    batched = torch.randn((2, 16, 64), device=DEVICE, dtype=torch.bfloat16)[:, ::2]
     batched_update = torch.randn_like(batched)
     batched_gate = torch.randn((2, 1, 64), device=DEVICE, dtype=torch.bfloat16)
     assert not can_use_residual_gate_add_cuda(batched, batched_update, batched_gate)
@@ -291,6 +290,49 @@ def test_residual_gate_add_guards_and_eager_fallback():
         residual_gate_add(batched, batched_update, batched_gate),
         batched + batched_update * batched_gate,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", [(2, 17, 65), (4, 126, 2048), (4, 6144, 4096)])
+@pytest.mark.parametrize("strided_gate", [False, True])
+def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
+    batch, _, hidden = shape
+    # Offset the odd-width case to also exercise the unaligned scalar kernel.
+    offset = 1 if hidden == 65 else 0
+    residual = torch.randn(
+        (batch * shape[1] * hidden + offset,), device=DEVICE, dtype=dtype
+    )[offset:].view(shape)
+    update = torch.randn_like(residual)
+    if strided_gate:
+        # Match LTX-2's get_ada_values(...).unbind: distinct batch rows, with
+        # gaps from the other scale/shift/gate values in between them.
+        gate = torch.randn((batch, 1, 6, hidden), device=DEVICE, dtype=dtype)[
+            :, :, 2, :
+        ]
+        assert not gate.is_contiguous()
+    else:
+        gate = torch.randn((batch, 1, hidden), device=DEVICE, dtype=dtype)
+    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    expected = residual + update * gate
+    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), expected)
+    _assert_gate_add(residual_gate_add(residual, update, gate), expected)
+
+
+def test_residual_gate_add_batched_rows_cuda_graph():
+    residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn((4, 1, 6, 128), device=DEVICE, dtype=torch.bfloat16)[:, :, 2]
+    residual_gate_add_cuda(residual, update, gate)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = residual_gate_add_cuda(residual, update, gate)
+    for _ in range(2):
+        residual.normal_()
+        update.normal_()
+        gate.normal_()
+        graph.replay()
+        assert torch.equal(out, residual + update * gate)
 
 
 @torch.no_grad()

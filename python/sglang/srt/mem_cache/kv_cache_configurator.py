@@ -128,13 +128,19 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
+    # Ascend PD slices the KV list positionally (index-K rides in it, not in
+    # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
+    if _is_npu and get_disagg().disaggregation_mode != "null":
+        return False
+    # The NPU HiCache host pool has no compact index-K layout.
+    if _is_npu and memory_config.enable_hierarchical_cache:
+        return False
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
     )
 
 
@@ -686,6 +692,18 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # HiSparse's target allocator hands out logical IDs from its
+                # host-expanded address space. Draft KV is direct-indexed by
+                # those shared IDs, so its GPU pool must span the same space.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -2016,7 +2034,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )
@@ -2040,6 +2058,8 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        if self.loc_space_scale > 1:
+            pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -2077,10 +2097,7 @@ class KVCacheConfigurator:
 
     def _load_dsa_nvfp4_global_scales(self, pool: KVCache) -> None:
         """Copy calibrated per-layer K scales into the graph-stable NVFP4 pool."""
-        if isinstance(pool, HybridLinearKVPool):
-            local_layer_ids = pool.full_attention_layer_id_mapping.keys()
-        else:
-            local_layer_ids = range(pool.start_layer, pool.start_layer + pool.layer_num)
+        local_layer_ids = range(pool.start_layer, pool.start_layer + pool.layer_num)
 
         initialized = 0
         for attention in get_kv_scale_attention_layers(self.model):
@@ -2399,8 +2416,6 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
-        if token_to_kv_pool.dsa_kv_cache_store_nvfp4:
-            self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
 
     def _hybrid_full_attention_pool_class(

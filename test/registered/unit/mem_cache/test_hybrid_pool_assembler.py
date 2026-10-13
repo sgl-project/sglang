@@ -208,6 +208,23 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     self.assertEqual(req_pool.mamba_map, global_maps.get("mamba", {}))
 
 
+class TestHybridPoolCapabilities(CustomTestCase):
+    def test_full_pool_inherits_default_capabilities(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object.__new__(DSATokenToKVPool)
+
+        self.assertFalse(pool.dsa_kv_cache_store_fp8)
+        self.assertFalse(pool.dsa_kv_cache_store_nvfp4)
+
+    def test_capabilities_follow_the_full_pool(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object.__new__(DSATokenToKVPool)
+        pool.full_kv_pool.dsa_kv_cache_store_fp8 = True
+
+        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertFalse(pool.dsa_kv_cache_store_nvfp4)
+
+
 class TestDraftSidecarPoolDispatch(CustomTestCase):
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
@@ -1250,7 +1267,12 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 operation.hash_value = list(hashes)
                 operation.storage_hit_count = hit_tokens
                 operation.sidecar_hash_values = None
+                operation.prefetch_kv_page_offset = 0
                 cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertEqual(
+                    operation.prefetch_kv_page_offset,
+                    (hit_tokens - full_tokens) // page_size,
+                )
                 self.assertTrue(
                     cc.can_fit_prefetch_host_buffers(operation, full_tokens)
                 )

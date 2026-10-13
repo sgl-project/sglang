@@ -297,7 +297,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -305,7 +305,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
                 "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
@@ -338,10 +338,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     if cfg.enable_decoder_swa_bounded_replay:
         # Late layers see a per-request tail slice, not the captured prefill shape.
+        # The breakable backend is admitted: the tail switch runs as eager breaks and
+        # the tail is a fixed-capacity row block inside the captured segments.
         incompatible = (
             (
                 "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
             # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
             # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.

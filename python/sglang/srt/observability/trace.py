@@ -269,6 +269,11 @@ def get_global_tracing_enabled():
     return opentelemetry_initialized
 
 
+def fastapi_telemetry_disabled_kwargs() -> Dict[str, Any]:
+    # FastAPI traces every request under process_tracing_init's provider by default.
+    return {"telemetry": {"tracing": False, "metrics": False, "logs": False}}
+
+
 def get_otlp_span_exporter(endpoint):
     protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
     supported_protocols = {"grpc", "http/protobuf"}

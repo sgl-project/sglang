@@ -118,15 +118,8 @@ The checkpoint's per-layer K global scale is stored persistently on the GPU;
 if absent it defaults to 1.0. Sparse prefill dequantizes cached prefix rows
 to a BF16 compatibility workspace; only sparse decode consumes packed NVFP4
 directly. Prefill CP, DCP, HiSparse, and other cache shapes are unsupported.
-Historical GB300 (SM103) validation of SGLang `7c547b1094`, with CUDA 13.0,
-PyTorch 2.13, and TP4/DP4, covers full-model eager prefill, eager and
-CUDA-graphed decode, EAGLE/MTP, 200K-token prefix reuse, and a two-node NIXL
-P/D smoke with decode offload and persistent prefix reload. These results
-predate the latest review fixes and prefill-routing revert. The validation
-used the RunAI checkpoint loader; it does not establish calibrated per-layer
-K scales. B200 (SM100) is optional follow-up coverage, not a merge blocker.
-FlashMLA PR #16 still requires maintainer review and promotion to `sgl` before
-the fork-only integration pin can be replaced.
+The supported target is GB300 (SM103) with TP4/DP4, CUDA-graphed decode,
+and EAGLE/MTP.
 
 ### Scaling Factors
 
