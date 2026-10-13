@@ -1201,11 +1201,25 @@ class InklingOutputItemsTestCase(CustomTestCase):
             special("content_thinking"),
             *text("plan"),
             special("end_message"),
-            *text('[{"name": "weather", "parameters": {"city": "SF"}}]'),
+            *text(
+                '[{"name": "weather", "parameters": {"city": "SF"}}, '
+                '{"name": "weather", "parameters": {"city": "NYC"}}]'
+            ),
             special("content_model_end_sampling"),
         ]
         finish = {"type": "stop", "matched": output_ids[-1]}
-        expected = [("reasoning", "plan"), ("weather", {"city": "SF"})]
+        expected = [
+            ("reasoning", "plan"),
+            ("weather", {"city": "SF"}),
+            ("weather", {"city": "NYC"}),
+        ]
+        # Engine chunks may batch tokens; arguments must not depend on where
+        # the JSON payload is split, including a final stop-only chunk.
+        chunkings = {
+            "per_token": list(range(1, len(output_ids) + 1)),
+            "stop_only_last_chunk": [len(output_ids) - 1, len(output_ids)],
+            "single_terminal_chunk": [len(output_ids)],
+        }
 
         for tool_choice in ("required", {"type": "function", "name": "weather"}):
             request = self.request.model_copy(update={"tool_choice": tool_choice})
@@ -1221,18 +1235,19 @@ class InklingOutputItemsTestCase(CustomTestCase):
                 self.assertEqual(
                     self._summary([i.model_dump() for i in items]), expected
                 )
-            with self.subTest(tool_choice=tool_choice, stream=True):
-                chunks = []
-                for end in range(1, len(output_ids) + 1):
-                    chunk = engine_chunk("", end)
-                    chunk["output_ids"] = output_ids[:end]
-                    chunk["meta_info"]["finish_reason"] = (
-                        finish if end == len(output_ids) else None
-                    )
-                    chunks.append(chunk)
-                events = StreamFixture(self.serving, request).run(chunks)
-                output = event_payloads(events)[-1]["response"]["output"]
-                self.assertEqual(self._summary(output), expected)
+            for chunking, ends in chunkings.items():
+                with self.subTest(tool_choice=tool_choice, stream=chunking):
+                    chunks = []
+                    for end in ends:
+                        chunk = engine_chunk("", end)
+                        chunk["output_ids"] = output_ids[:end]
+                        chunk["meta_info"]["finish_reason"] = (
+                            finish if end == len(output_ids) else None
+                        )
+                        chunks.append(chunk)
+                    events = StreamFixture(self.serving, request).run(chunks)
+                    output = event_payloads(events)[-1]["response"]["output"]
+                    self.assertEqual(self._summary(output), expected)
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
