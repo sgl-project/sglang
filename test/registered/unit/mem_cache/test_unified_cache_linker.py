@@ -20,7 +20,7 @@ from test_unified_radix_cache_unittest import (
 )
 
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ReqKvInfo
-from sglang.srt.mem_cache.allocation import _prefix_kv_indices
+from sglang.srt.mem_cache.allocation import _prefix_kv_indices, alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -888,7 +889,10 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
 
 
 @pytest.fixture
-def pp_cache():
+def pp_cache(request):
+    override = get_context().override_server_args(attention_backend="torch_native")
+    override.install()
+    request.addfinalizer(override.restore)
     pool = SWAKVPool(
         size=32,
         size_swa=32,
@@ -929,6 +933,27 @@ def pp_cache():
     return cache, allocator, req, backend
 
 
+def _alloc_pp_extend(cache, req, seq_len):
+    req.extend_end = seq_len
+    seq_lens = torch.tensor([seq_len], dtype=torch.int64)
+    extend_len = seq_len - req.prefix_len
+    batch = SimpleNamespace(
+        device="cpu",
+        reqs=[req],
+        req_to_token_pool=cache.req_to_token_pool,
+        tree_cache=cache,
+        prefix_lens=[req.prefix_len],
+        extend_lens=[extend_len],
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        extend_num_tokens=extend_len,
+        maybe_evict_swa=lambda: None,
+        is_dllm=req.is_dllm,
+    )
+    out_cache_loc, _, _ = alloc_for_extend(batch)
+    return out_cache_loc
+
+
 @pytest.mark.parametrize("overlap", [0, 2, 4])
 @pytest.mark.parametrize("outcome", ["finished", "unfinished", "abort"])
 @pytest.mark.parametrize("holds_row", [False, True])
@@ -937,43 +962,65 @@ def test_pp_load_uses_normal_request_insert_and_release(
 ):
     cache, allocator, req, backend = pp_cache
     key = RadixKey(req.origin_input_ids)
+    local_prefix = torch.empty(0, dtype=torch.int64)
     if holds_row:
-        cache.req_to_token_pool.alloc([req])
+        # A continuing PP chunk owns real KV, rather than just an empty row.
+        local_prefix = _alloc_pp_extend(cache, req, seq_len=2)
+        cache.checkpoint(req, up_to=2)
+        req.init_next_round_input(cache)
+    device_hit_len = req.prefix_len
+    matched_node = req.last_node
     available_rows = cache.req_to_token_pool.available_size()
     watermarks = (req.kv.kv_allocated_len, req.kv.kv_committed_len)
     loaded_len, last_node = cache.linker.load_back(req)
 
-    assert loaded_len == 4
-    assert last_node == req.last_node == cache.root_node_handle()
-    assert req.kv.cache_protected_len == 0
-    assert cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len == 0
+    assert loaded_len == 4 - device_hit_len
+    assert last_node == req.last_node == matched_node
+    assert req.kv.cache_protected_len == device_hit_len
+    assert (
+        cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+        == device_hit_len
+    )
     assert cache.req_to_token_pool.available_size() == available_rows
     assert req.rid in cache.linker.private_load_indices
     # The extend allocator owns these clocks, even when PP reuses a row.
     assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == watermarks
 
-    req.prefix_len = loaded_len
+    req.prefix_len = device_hit_len + loaded_len
     req.extend_end = 5
     batch = SimpleNamespace(req_to_token_pool=cache.req_to_token_pool, tree_cache=cache)
     loaded = _prefix_kv_indices(batch, req)
-    assert len(loaded) == loaded_len
-    assert torch.equal(loaded, cache.linker.private_load_indices[req.rid])
+    assert len(loaded) == req.prefix_len == 4
+    assert torch.equal(loaded[:device_hit_len], local_prefix)
+    assert torch.equal(
+        loaded[device_hit_len:], cache.linker.private_load_indices[req.rid]
+    )
     assert cache.req_to_token_pool.available_size() == available_rows
-    assert cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len == 0
+    assert (
+        cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+        == device_hit_len
+    )
 
     # A different microbatch may publish overlapping KV before this PP result returns.
-    existing = allocator.alloc(overlap)
-    if overlap:
-        cache.insert(InsertParams(key=key[:overlap], value=existing))
-    values = torch.cat([loaded, allocator.alloc(1)])
-    cache.req_to_token_pool.alloc([req])
-    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
-    req.kv.kv_allocated_len = req.kv.kv_committed_len = 5
+    raced_tokens = max(0, overlap - device_hit_len)
+    existing = torch.cat([local_prefix, allocator.alloc(raced_tokens)])
+    if raced_tokens:
+        cache.insert(
+            InsertParams(
+                key=key[:overlap], value=existing, prev_prefix_len=device_hit_len
+            )
+        )
+    values = torch.cat([loaded, _alloc_pp_extend(cache, req, seq_len=5)])
+    assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (5, 5)
+    assert torch.equal(
+        cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :5].to(torch.int64),
+        values,
+    )
     cache.linker.start_layer_wise_loading()
     assert cache.linker.finish_loads() == []
     assert not cache.linker.private_load_indices
     assert not cache.linker.inflight_load_rids
-    assert allocator.full_available_size() == 32 - 5 - overlap
+    assert allocator.full_available_size() == 32 - 5 - raced_tokens
 
     if outcome == "unfinished":
         cache.checkpoint(req, up_to=5)
@@ -990,7 +1037,9 @@ def test_pp_load_uses_normal_request_insert_and_release(
         : match.device_prefix_len
     ]
     expected = (
-        existing if outcome == "abort" else torch.cat([existing, values[overlap:]])
+        existing
+        if outcome == "abort"
+        else torch.cat([existing, values[len(existing) :]])
     )
     assert torch.equal(matched, expected)
     assert allocator.full_available_size() == 32 - len(expected)
