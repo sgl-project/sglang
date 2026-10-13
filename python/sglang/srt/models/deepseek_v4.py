@@ -4192,10 +4192,16 @@ class DeepseekV4Model(nn.Module):
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
+                if cp_extend and get_moe_a2a_backend().is_none():
+                    # Under CP the tail rows are this rank's local rows, and the MoE
+                    # routes the rank-major all-gather of their hidden states; the ids
+                    # vision / hash routing read must be gathered the same way.
+                    input_ids_global = attn_cp_interleave_gather(input_ids)
+                elif cp_extend:
+                    input_ids_global = input_ids  # a2a: the MoE sees local rows
+                else:
+                    input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4606,17 +4612,22 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
+            # Prefill CP runs the tower on the whole sequence before sharding
+            # (prepare_cp_inputs); only the a2a-free MoE routes vision under CP.
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
+                or (
+                    get_parallel().attn_cp_size != 1
+                    and not get_moe_a2a_backend().is_none()
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP, and prefill CP without MoE A2A, "
+                    "but not PP; MoE A2A requires CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4774,6 +4785,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
+
+    def prepare_cp_inputs(self, forward_batch: ForwardBatch, **kwargs):
+        """Whole-sequence inputs for the prefill-CP runner, which shards them and
+        drives ``self.model`` without reaching ``forward``: image spans in the
+        embeddings and image pad hashes mapped to image_token_id, as in ``forward``.
+        The mapped ids ride back in the kwargs so the runner shards those (Engram,
+        hash and vision routing read them) and hands them to the logits step."""
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            forward_batch.input_ids, forward_batch, kwargs.get("input_embeds")
+        )
+        if input_embeds is None:
+            input_embeds = self.get_input_embeddings()(input_ids)
+        model_kwargs = {"input_ids": input_ids}
+        if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        return input_embeds, forward_batch.positions, model_kwargs
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
