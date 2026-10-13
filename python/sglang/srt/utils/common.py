@@ -4156,6 +4156,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
