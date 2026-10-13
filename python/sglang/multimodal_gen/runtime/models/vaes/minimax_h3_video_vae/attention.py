@@ -45,8 +45,9 @@ def _vit_norm_input(module, hidden_states):
 def _try_fused_qk_rmsnorm_rope(norm_q, norm_k, query, key, rotary_pos_emb):
     if not _env_flag("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1"):
         return None
-    # NVIDIA only: see _fused_blocks_available in vae_vit.py.
-    if not current_platform.is_cuda():
+    # This kernel has no inline asm, but it tracks _fused_blocks_available in
+    # vae_vit.py so the decoder runs one configuration rather than a mix.
+    if not (current_platform.is_cuda() or current_platform.is_rocm()):
         return None
     if (
         rotary_pos_emb is None
