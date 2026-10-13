@@ -4,6 +4,7 @@ These ports target H100/H20-3e (SM90), TP8/DP8/EP8, DSPARK, HiCache, `dsv4` atte
 and `flashinfer_mxfp4` MoE. They retain the existing PDMux lane submission and
 communication order. The first three kernel ports are opt-in; the #41098
 GEMM tuning tables are selected automatically for matching H20-3e shapes.
+The #40160 grouped verify indexer is a separate opt-in below.
 
 ## PR #42365: fused prefill indexer scoring
 
@@ -179,6 +180,118 @@ paths. All entries match the selected kernel's parameter names (46 Hopper,
 device/shape/block fallbacks, compile bypass and package-data inclusion passed.
 This checks configuration integration, not GPU numerical accuracy, graph
 replay, PDMux liveness or throughput.
+
+## PR #40160: H32/H64 grouped FP8 verify indexer
+
+Source: [sgl-project/sglang#40160](https://github.com/sgl-project/sglang/pull/40160),
+head `0041169143a5fdd29ac5361b95f459328d39b16f`.
+
+### Why Flash needs an adaptation
+
+The Flash checkpoint has 32 indexer heads of dimension 128; its 64 main
+attention heads are a different parameter. Upstream hard-codes an H64
+indexer and supplies an operator entry/test, without connecting it to this
+branch's model forward. The port supports logical H32 and H64, and connects
+the kernel to fixed-width DSPARK target verification on SM90.
+
+Hopper's chosen WGMMA instruction operates on a 64-row M tile. For H32, the
+kernel loads only the 32 real heads and fills the unused half with zero in
+CTA-local shared memory; inactive heads never read query scales or head
+weights from global memory. The model remains H32, with the same projections
+and head-weight scaling. This still executes a physical 64-row MMA, so H32
+does not automatically halve the tensor-core work relative to H64.
+
+### What is reused
+
+With a DSPARK block size of five, target verification processes six token
+rows per request. Those rows look at the same index-K cache, with different
+causal lengths. The existing scorer separately reads/decodes K for each row.
+The grouped kernel shares a decoded K tile across the rows, converts packed
+FP4 to FP8 for Hopper WGMMA, and keeps Q resident across multiple K tiles
+when the upstream shape heuristic permits it. ReLU, weighted head reduction
+and BF16 rounding remain part of scoring; downstream Top-K still runs.
+
+The backend passes a CPU-known `verify_group_size` through `DecodeInputs`.
+It only groups DSPARK target rows with a fixed width of 2 through 6 and an
+exact `batch_size * width` row count, with CP1 and non-compact verification.
+It never infers groups using CUDA `unique`, `item` or `tolist`. Each row's
+visible length stays on device, including during graph replay. Ordinary
+decode, draft, compact ragged verify, unsupported shapes and masked candidate
+consumers retain their existing dispatch.
+
+With #40860 enabled, compact candidate consumers continue using #40860. This
+port accelerates eligible full-range verify scoring, including the candidate
+source. It does not expand candidate consumers back into dense scoring. The
+result keeps the existing eight-float row alignment needed by source block
+amax, and stays in logical-position order for the existing Top-K mapping.
+
+### PDMux scope and activation
+
+Only upstream's rectangular-grid (`auto`) implementation is ported. CTAs
+share data internally but do not synchronize with other CTAs. Persistent and
+pipeline modes and their full-device occupancy tuning are excluded. Launches
+use the caller's current CUDA stream; the FFI entry does not reset the device
+context. Query packing and output buffers belong to the invocation, and the
+model's K cache is read-only to the scorer. There is no shared mutable lane
+scratch or additional lane/collective handshake.
+
+The port also adds `fence.proxy.async.shared::cta` after the generic shared
+Q/K stores, before the CTA barrier and WGMMA consumption. This follows the
+[PTX async-proxy ordering requirement](https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-generic-proxy);
+it is local operand visibility, not a stream synchronization or lane handshake.
+
+Add before the unchanged serve command, alongside A+C and #41098:
+
+```bash
+export SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER=1
+```
+
+Default is `0`. Set it back to `0` and restart to restore the previous verify
+scorer and recapture graphs. Initial warmup needs the CUDA JIT toolchain and
+CUTLASS headers used by `sglang.kernels.jit`; installing the Python files alone
+does not establish CUDA compile compatibility. B200/B300 use their existing
+DeepGEMM path and do not enter this SM90 dispatch.
+
+### Validation and interpreting performance
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/test_dsv41_grouped_indexer_dispatch.py \
+  test/registered/kernels/ops/attention/test_sm90_fp4_grouped_indexer.py
+```
+
+GPU coverage includes H32/H64, group widths 2/3/4/6, partial groups, compression
+ratios 1/2, odd capacities, invisible/empty rows with poisoned mapping entries,
+H32 versus explicit zero-padded H64, candidate-source amax/Top-K, and two
+independent streams replaying graphs after changing queries, request mapping
+and visibility while sharing a read-only K cache. Run Compute Sanitizer
+memcheck/racecheck/synccheck on this selection before accepting the GPU port.
+
+The FP8 conversion factors per-32 scales through a common per-head/per-K-row
+scale, inheriting upstream's representability assumptions. GPU numerical
+tests cover a bounded scale spread; they do not prove arbitrary extreme scale
+patterns or nonfinite inputs. Random-score checks require relative L2 <=0.005
+and normalized maximum absolute error <=0.01 against the current paged
+scorer. A deterministic case checks exact scores and Top-K, and replay must
+equal eager. Full-model output quality and DSPARK acceptance still need
+validation on the actual checkpoint.
+
+Upstream's large speedups include eliminating a capacity-sized slot mapping.
+This branch already uses a direct paged scorer, so that portion is already
+present. Compare the new flag off/on against the same A+C+#41098 baseline,
+with 130k cached history / 400 output, identical cache state and PDMux SM/layer
+settings. Measure total throughput and confirm that requests keep completing;
+neither the H64 microbenchmarks nor CPU tests establish H32/PDMux speedup or
+resolve the historical hang.
+
+Local validation (2026-10-13, CPU-only): the related indexer/PDMux/DSPARK
+selection passed 149 tests and 93 subtests; environment and kernel inventory
+checks passed another 76 tests. Two unrelated AMX subprocess import checks
+were deselected due to this host's known missing-Triton import limitation.
+All 36 new CUDA cases are
+skipped on this host. Python lint/format, registered-test checks, AST, C++
+format and whitespace checks passed. CUDA compilation, numerical execution,
+graph replay and multi-rank throughput/liveness remain unverified locally.
 
 ## Combination acceptance
 

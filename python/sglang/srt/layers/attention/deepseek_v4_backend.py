@@ -1198,6 +1198,9 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        self.is_dspark_target = (
+            not model_runner.is_draft_worker and spec_alg.is_dspark()
+        )
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -3150,7 +3153,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, forward_batch
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs, out)
@@ -3203,7 +3206,9 @@ class DeepseekV4AttnBackend(
             raw_indices=core.sparse_raw_indices(compress_ratio),
         )
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -3211,6 +3216,20 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+        mode = forward_batch.forward_mode
+        group_size = 1
+        if (
+            envs.SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER.get()
+            and self.is_dspark_target
+            and mode.is_target_verify()
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and get_parallel().attn_cp_size == 1
+            and self.speculative_num_draft_tokens is not None
+            and 2 <= self.speculative_num_draft_tokens <= 6
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+        ):
+            group_size = self.speculative_num_draft_tokens
         return DecodeInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -3222,6 +3241,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
+            verify_group_size=group_size,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
