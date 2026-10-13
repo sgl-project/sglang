@@ -3,10 +3,9 @@ import unittest
 from urllib.parse import urlparse
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
-    BENCHMARK_TOOL_DEFAULT,
+    BENCHSERVING,
     DEEPSEEK_R1_W8A8_MODEL_PATH,
-    run_aisbench,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import kill_process_tree, popen_launch_server
@@ -62,8 +61,8 @@ TEST_PARAMS = {
     "input_len": 2048,
     "output_len": 1024,
     "random_range_ratio": 1,
-    "benchmark_tool": BENCHMARK_TOOL_DEFAULT,
-    "aisbench_dataset_type": AISBENCHMARK_DATASET_DEFAULT,
+    "benchmark_tool": BENCHSERVING,
+    "dataset_name": "random",
 }
 
 
@@ -104,17 +103,24 @@ class TestNPUDeepSeekR1_W8A8_MLAPO(unittest.TestCase):
             env=env,
         )
 
-        metrics = run_aisbench(
+        metrics = run_bench_serving(
             host=self.host,
             port=str(self.port),
             model_path=DEEPSEEK_R1_W8A8_MODEL_PATH,
-            dataset_type=TEST_PARAMS["aisbench_dataset_type"],
+            backend="sglang",
+            dataset_name=TEST_PARAMS["dataset_name"],
             dataset_path=None,
-            input_len=TEST_PARAMS["input_len"],
-            output_len=TEST_PARAMS["output_len"],
             max_concurrency=TEST_PARAMS["max_concurrency"],
             num_prompts=TEST_PARAMS["num_prompts"],
+            input_len=TEST_PARAMS["input_len"],
+            output_len=TEST_PARAMS["output_len"],
             random_range_ratio=TEST_PARAMS["random_range_ratio"],
+        )
+
+        # run_bench_serving does not raise on benchmark failure,
+        # so verify the metric is present before using it
+        self.assertIsNotNone(
+            metrics.get("mean_tpot"), "bench_serving did not produce mean_tpot"
         )
 
         self.tearDown()
