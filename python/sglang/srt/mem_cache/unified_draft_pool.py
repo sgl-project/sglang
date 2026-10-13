@@ -15,15 +15,11 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
     """Dense draft KV over the draft parts of one host sub-pool's entries.
 
     Per-layer `k_buffer` / `v_buffer` are views of the draft parts inside
-    every slot of the host sub-pool (`UnifiedKVPool.build_dense_draft_views`);
-    ``layer_lanes`` maps each of this runner's layer ids to its region lane.
-    Locs arriving through the KVCache API are the target's PHYSICAL token ids,
-    produced by the allocator's translate (the id-space choke point binds it,
-    see KVIndexTranslator); the pool exposes `host_allocator` for that
-    binding. Relocation needs no method here: compaction moves whole page
-    envelopes on the HOST pool, which carries the draft bytes; `move_kv_cache`
-    raises so a stray per-slot move fails loudly instead of corrupting the
-    fused layout.
+    every slot of the host sub-pool; ``layer_lanes`` maps each of this
+    runner's layer ids to its region lane. Locs are the target's PHYSICAL
+    token ids, translated through `host_allocator`. Compaction moves whole
+    page envelopes on the HOST pool, draft bytes included, so `move_kv_cache`
+    raises rather than let a per-slot move corrupt the fused layout.
     """
 
     requires_physical_write_loc = True
@@ -62,7 +58,9 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         super().__init__(
             size=num_pages * page_size - page_size,
             page_size=page_size,
-            dtype=region.store_dtype,
+            # The KV dtype, not its storage: `set_kv_buffer` casts to `dtype`
+            # and views the result as `store_dtype` (uint8 for fp8).
+            dtype=region.resolved_kv_dtype(),
             head_num=region.head_num,
             head_dim=region.head_dim,
             layer_num=len(layer_ids),
@@ -120,6 +118,22 @@ def draft_kv_layer_ids(model) -> List[int]:
 
     return sorted(
         {m.layer_id for m in model.modules() if isinstance(m, RadixAttention)}
+    )
+
+
+def draft_state_layer_classes(model) -> List[str]:
+    """Class names of the BUILT draft model's recurrent / linear-attention
+    modules. A fused draft has KV lanes only, so any of these would run with
+    no state pool of its own."""
+    from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+    return sorted(
+        {
+            type(m).__name__
+            for m in model.modules()
+            if isinstance(m, (MambaMixer2, RadixLinearAttention))
+        }
     )
 
 

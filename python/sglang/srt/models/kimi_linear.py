@@ -513,8 +513,6 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # Prefill passes raw gates to chunk KDA; decode and target-verify kernels
-        # apply the activation internally.
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
@@ -522,10 +520,6 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
-                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -586,8 +580,8 @@ class KimiDecoderLayer(nn.Module):
                 reduce_results=False,
             )
 
-        sparse = _is_sparse_layer(config, layer_idx)
-        if sparse:
+        attn, ffn = self.stage_facts(config, layer_idx)
+        if ffn.sparse:
             self.block_sparse_moe = KimiMoE(
                 config=config,
                 quant_config=quant_config,
@@ -609,15 +603,22 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: KimiLinearConfig, layer_idx: int):
+        """The stages the layer at ``layer_idx`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        sparse = _is_sparse_layer(config, layer_idx)
         next_sparse = layer_idx + 1 < config.num_hidden_layers and _is_sparse_layer(
             config, layer_idx + 1
         )
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
-                self.post_attention_layernorm,
-            ),
+        return (
+            declare_attn(),
+            declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
 
     def forward(
@@ -680,6 +681,7 @@ class KimiLinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=f"{prefix}.layers",
+            stage_facts=lambda idx: KimiDecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

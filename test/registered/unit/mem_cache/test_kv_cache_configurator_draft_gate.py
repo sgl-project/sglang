@@ -11,14 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""How a draft-shaped KVCacheConfigurator binds its KV under the unified pool.
+"""How a draft worker's KVCacheConfigurator binds its KV under the unified pool.
 
-DERIVED PROPERTY (binding dispatch). The fused-vs-private draft binding
-dispatches on the spec algorithm, not the allocator kind: a non-EAGLE draft on
-a unified SWA target takes the private arm, sized by the full sub-allocator's
-VIRTUAL id space (`max_slots - 1`). The SWA allocator's `size_full` reports
-the static token budget — smaller than the id space — so sizing by it would
-put verify-window writes at high virtual ids out of bounds.
+With a fused region the draft binds `UnifiedDraftKVPool` over the target's
+allocator (a compact-window DFLASH draft with a private `req_to_token` of its
+own), refusing a KV dtype unlike the region's. Without one it takes the private
+arm, sized by the full sub-allocator's VIRTUAL id space (`max_slots - 1`), not
+`size_full`, the smaller static token budget: sizing by that would put
+verify-window writes at high virtual ids out of bounds.
 
     python -m pytest test/registered/unit/mem_cache/test_kv_cache_configurator_draft_gate.py -v
 """
@@ -39,14 +39,18 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    MHASubPoolSpec,
+    UnifiedKVPool,
+    _store_dtype_for,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, stage="weekly", runner_config="cpu")
 
 
 class _FakeKVCache:
@@ -87,10 +91,22 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
+    def _swa_allocator(
+        self,
+        *,
+        with_draft_region: bool,
+        n_full=32,
+        n_swa=16,
+        kv_dtype=torch.bfloat16,
+    ):
+        store_dtype = _store_dtype_for(kv_dtype)
         region = (
             DenseDraftRegion(
-                lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                lane_num=1,
+                head_num=1,
+                head_dim=16,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
             )
             if with_draft_region
             else None
@@ -99,8 +115,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="full",
             layer_num=2,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="down",
             draft_region=region,
         )
@@ -108,8 +124,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="swa",
             layer_num=1,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="up",
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
@@ -136,7 +152,17 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
 
-    def _run(self, *, algorithm, alloc, max_total_num_tokens, kv_dtype=torch.bfloat16):
+    def _run(
+        self,
+        *,
+        algorithm,
+        alloc,
+        max_total_num_tokens,
+        kv_dtype=torch.bfloat16,
+        req_to_token_pool="shared",
+    ):
+        if req_to_token_pool == "shared":
+            req_to_token_pool = object()
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -163,6 +189,8 @@ class TestDraftBindingDispatch(CustomTestCase):
         def _capture(self, *, sizes, **kw):
             raise _CapturedSizes(sizes)
 
+        built_req_pool = SimpleNamespace(kind="private-compact")
+
         with (
             patch.object(
                 kcc,
@@ -184,10 +212,18 @@ class TestDraftBindingDispatch(CustomTestCase):
             patch.object(kcc.KVCacheConfigurator, "_build_token_to_kv_pool", _capture),
             # The real scan walks the draft nn.Module for RadixAttention layers.
             patch.object(unified_draft_pool, "draft_kv_layer_ids", return_value=[0]),
+            patch.object(
+                unified_draft_pool, "draft_state_layer_classes", return_value=[]
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_req_to_token_pool",
+                lambda self, *, max_num_reqs: built_req_pool,
+            ),
         ):
             return cfg._init_pools(
                 sizes=sizes,
-                req_to_token_pool=object(),
+                req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=alloc,
             )
 
@@ -205,44 +241,66 @@ class TestDraftBindingDispatch(CustomTestCase):
         sized = caught.exception.sizes.max_total_num_tokens
         self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
 
-    def test_eagle_draft_still_binds_the_fused_pool(self):
+    def test_a_draft_with_a_region_binds_the_fused_pool(self):
+        """An EAGLE or DSPARK draft binds the fused pool over the target's
+        allocator when the target resolved a region; the region-less private
+        arm above is the fallback."""
         alloc = self._swa_allocator(with_draft_region=True)
+        for algorithm in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.DSPARK):
+            pools = self._run(
+                algorithm=algorithm,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+            )
+            self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+            self.assertIs(pools.token_to_kv_pool_allocator, alloc)
+
+    def test_a_draft_kv_dtype_unlike_the_region_refuses_to_bind(self):
+        """The region stores the target's KV dtype, every fp8 flavor as uint8:
+        a draft resolving the target's fp8 binds a pool that casts to it, and
+        one resolving another dtype refuses instead of reading the rows as
+        that dtype."""
+        bf16 = self._swa_allocator(with_draft_region=True)
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=bf16,
+                max_total_num_tokens=bf16.size_full,
+                kv_dtype=torch.float8_e4m3fn,
+            )
+        alloc = self._swa_allocator(
+            with_draft_region=True, kv_dtype=torch.float8_e4m3fn
+        )
         pools = self._run(
             algorithm=SpeculativeAlgorithm.EAGLE3,
             alloc=alloc,
             max_total_num_tokens=alloc.size_full,
+            kv_dtype=torch.float8_e4m3fn,
         )
-        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
-        self.assertIs(pools.token_to_kv_pool_allocator, alloc)
-
-    def test_a_draft_kv_dtype_unlike_the_region_refuses_to_bind(self):
-        """The region stores the target's KV dtype. A draft that resolved its
-        own -- `auto` picking up an fp8 quant config the target lacks, say --
-        must fail loudly rather than read those rows as another dtype."""
-        alloc = self._swa_allocator(with_draft_region=True)
+        self.assertEqual(pools.token_to_kv_pool.dtype, torch.float8_e4m3fn)
+        self.assertEqual(pools.token_to_kv_pool.store_dtype, torch.uint8)
         with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
-                kv_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e5m2,
             )
 
-    def test_eagle_draft_without_a_placement_falls_back_to_the_private_arm(self):
-        """Target boot declines a placement for legitimate configurations (a
-        draft with SWA layers of its own, asymmetric rows), so a
-        placement-less EAGLE draft binds the private pool -- sized by the id
-        space like any other private draft -- instead of failing the boot."""
-        alloc = self._swa_allocator(with_draft_region=False)
-        id_space = alloc.full_attn_allocator.max_slots - 1
-        with self.assertRaises(_CapturedSizes) as caught:
-            self._run(
-                algorithm=SpeculativeAlgorithm.EAGLE3,
-                alloc=alloc,
-                max_total_num_tokens=alloc.size_full,
-            )
-        sized = caught.exception.sizes.max_total_num_tokens
-        self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
+    def test_compact_dflash_draft_fuses_with_a_private_req_table(self):
+        """Compact-window DFLASH passes req_to_token_pool=None (it keeps a
+        private table narrowing WHICH pages the draft reads) while the KV
+        itself stays fused: the fused arm must build that table instead of
+        refusing the None."""
+        alloc = self._swa_allocator(with_draft_region=True)
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.DFLASH,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+            req_to_token_pool=None,
+        )
+        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+        self.assertEqual(pools.req_to_token_pool.kind, "private-compact")
 
 
 if __name__ == "__main__":

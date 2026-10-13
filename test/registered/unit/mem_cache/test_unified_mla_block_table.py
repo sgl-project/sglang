@@ -21,16 +21,15 @@ page ids:
 
     kernel_page(virtual_page) = v2p[virtual_page]
 
-Since the read-path translator, ONE builder computes that formula for every
-family — `build_index_table` (the canonical) — and the backends only
-differ in how they consume it:
-  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
-    into their padded block tables (`KVIndexTranslator.fill_read_table`, prefix-only so
-    the backends' own -1 / stale tail sentinels survive);
-  - the flashinfer updaters: token ids reconstructed from the canonical by
+ONE builder computes that formula for every family -- the iteration plan's
+read table (`KVLocPlan.read_table`) -- and the backends only differ in how
+they consume it:
+  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: the plan's rows
+    copied into their padded block tables (`KVIndexTranslator.copy_page_table`);
+  - the flashinfer updaters: token ids reconstructed from the table by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
-  - fa3's captured decode: `normal_decode_set_metadata` copies the canonical
-    rows' live prefixes (src_is_read_table=True).
+  - fa3's captured decode: the plan's rows copied into its captured page
+    table.
 
 Covered here:
   - the static `create_flashmla_kv_indices_triton` (no id-space knowledge left)
@@ -215,6 +214,44 @@ class TestBlockTable(unittest.TestCase):
             self.assertTrue(
                 torch.equal(gpu, cpu), f"ps={page_size}:\ngpu={gpu}\ncpu={cpu}"
             )
+
+    def test_zero_tail_fills_a_fresh_table(self):
+        """With ``zero_tail`` a fresh (garbage) table comes back whole in one
+        launch: each row's live prefix, the sink past it up to ``max_pages``,
+        and nothing past ``max_pages``. The CUDA kernel must agree with the
+        CPU path."""
+        from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            bs = rpi.shape[0]
+            max_pages = int((sl.max().item() + page_size - 1) // page_size) + 2
+
+            def fill(device):
+                # One guard column past the table catches a spill off the row.
+                out = torch.full(
+                    (bs, max_pages + 1), 7, dtype=torch.int32, device=device
+                )
+                build_kv_read_table(
+                    req_to_token=rt.to(device),
+                    req_pool_indices=rpi.to(device),
+                    seq_lens=sl.to(device=device, dtype=torch.int64),
+                    v2p=v2p.to(device),
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=out,
+                    zero_tail=True,
+                )
+                return out.cpu()
+
+            gpu, cpu = fill(_DEV), fill("cpu")
+            self.assertTrue(torch.equal(gpu, cpu), f"ps={page_size}")
+            self.assertTrue(bool((gpu[:, max_pages] == 7).all()), "spilled")
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p).cpu().to(torch.int32)
+            for b in range(bs):
+                live = int((int(sl[b]) + page_size - 1) // page_size)
+                self.assertTrue(torch.equal(gpu[b, :live], want[b, :live]))
+                self.assertTrue(bool((gpu[b, live:max_pages] == 0).all()))
 
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the

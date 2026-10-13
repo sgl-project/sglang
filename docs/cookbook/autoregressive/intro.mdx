@@ -193,4 +193,10 @@ metatags:
     href="/cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B"
     img="/cards/logos/perplexity.png"
   />
+  <Card
+    title="Cloudflare"
+    mode="card"
+    href="/cookbook/autoregressive/Cloudflare/clef"
+    img="/cards/logos/cloudflare.png"
+  />
 </CardGroup>

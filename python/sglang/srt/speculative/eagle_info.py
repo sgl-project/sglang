@@ -5,6 +5,7 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -34,6 +35,9 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The iteration's plan when the draft planned the verify window
+    # (`prepared_out_cache_loc`); verify and draft extend take it.
+    kv_loc_plan: Optional[KVLocPlan] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -90,11 +94,12 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
-        sliding_window: bool = False,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """CSR verify args, gathered straight into the packed stream. The lens
-        are widened here and handed to the translator, so nothing materializes
-        a ``[bs, max_pages]`` rectangle to repack from."""
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
         batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
@@ -113,13 +118,13 @@ class EagleVerifyInput(SpecInput):
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=total_tokens,
             out=kv_indices,
-            sliding_window=sliding_window,
+            kind=kind,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -402,10 +407,11 @@ class EagleDraftExtendInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
         translator: KVIndexTranslator,
-        sliding_window: bool = False,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """Draft-extend CSR args. The lens already include the window, so
-        unlike verify nothing is widened here."""
+        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
+        draft-extend window."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -426,12 +432,12 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        translator.fill_packed_read_stream(
+        translator.pack_read_stream(
+            plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
-            total_tokens=paged_kernel_lens_sum,
             out=kv_indices,
-            sliding_window=sliding_window,
+            kind=kind,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
