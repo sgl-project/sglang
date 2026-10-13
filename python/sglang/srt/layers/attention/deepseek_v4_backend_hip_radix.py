@@ -75,6 +75,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import hook as k2i_hook
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     build_low_ratio_decode_workspaces,
     low_ratio_candidate_span,
@@ -666,6 +667,8 @@ class DSV4Metadata:
     fp4_low_ratio_prefill_workspaces: Dict[int, FP4PrefillWorkspace] = field(
         default_factory=dict, repr=False
     )
+    # SGLANG_MONO_DSV41_K2A=1: ratio -> (rows, rows a request) whose K2i walk plan this step built
+    k2i_planned: Dict[int, tuple] = field(default_factory=dict, repr=False)
     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
     # so addresses stay pinned across replays (the builders refresh contents).
     fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
@@ -1681,18 +1684,23 @@ class DeepseekV4HipRadixBackend(
             else:
                 metadata.low_ratio_req_indices = token_req_indices(forward_batch)
                 metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
+            scored = {
+                ratio: indexer_metadata
+                for ratio, indexer_metadata in (
+                    metadata.low_ratio_indexer_metadata_by_ratio().items()
+                )
+                # Identity rows are not scored, so they need no schedule.
+                if not low_ratio_decode_rows_are_identity(self, forward_batch, ratio)
+            }
+            metadata.k2i_planned = k2i_hook.step_plans(self, scored, forward_batch)
             # same capture-safe workspace contract as the c4 ones below
             metadata.fp4_low_ratio_decode_workspaces = (
                 build_low_ratio_decode_workspaces(
                     {
                         ratio: indexer_metadata
-                        for ratio, indexer_metadata in (
-                            metadata.low_ratio_indexer_metadata_by_ratio().items()
-                        )
-                        # Identity rows are not scored, so they need no schedule.
-                        if not low_ratio_decode_rows_are_identity(
-                            self, forward_batch, ratio
-                        )
+                        for ratio, indexer_metadata in scored.items()
+                        # K2i scores these rows: no schedule for aiter's logits kernel
+                        if ratio not in metadata.k2i_planned
                     }
                 )
             )

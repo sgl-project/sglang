@@ -162,6 +162,17 @@ def indexer_layers_enabled() -> bool:
     return os.environ.get("SGLANG_MONO_DSV41_INDEXER", "0") == "1"
 
 
+def k2a_mode() -> int:
+    """Development switch (task 17): 0 = SGLang's indexer kernels, 1 = the K2i launch (ATOM's FP4 scorer + exact
+    top-k) replaces the decode / verify logits, top-k and candidate kernels of the indexer layers."""
+    mode = int(os.environ.get("SGLANG_MONO_DSV41_K2A", "0"))
+    assert mode in (0, 1), f"SGLANG_MONO_DSV41_K2A={mode}: only 0 / 1 exist"
+    assert mode == 0 or indexer_layers_enabled(), (
+        "SGLANG_MONO_DSV41_K2A=1 needs SGLANG_MONO_DSV41_INDEXER=1"
+    )
+    return mode
+
+
 def _has_indexer_side(layer) -> bool:
     attn = layer.self_attn
     return (

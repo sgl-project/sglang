@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import hook as k2i_hook
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
@@ -263,19 +264,34 @@ def low_ratio_index_topk_hip_decode(
         two_level = False
 
     q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
-    logits = aiter_fp4_paged_mqa_logits(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
-        k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
-        weights=weights,
-        page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.compressed_seq_lens,
-        weight_scale=1.0,
-        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-        is_decode=True,
-        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
-    )
+    if k2i_hook.enabled():
+        sg_logits = lambda: _aiter_decode_logits(  # noqa: E731 (K2A_CHECK only)
+            backend, layer, q_fp4, q_scale, weights, indexer_metadata, ratio
+        )
+        if two_level and indexer.uses_candidates:
+            if k2i_hook.reindex_select(
+                backend, layer, q_fp4, q_scale, weights, indexer_metadata, ratio,
+                backend.candidate_masks, page_indices, raw_indices, sg_logits,
+            ):  # fmt: skip
+                return
+            logits = None
+        else:
+            logits = k2i_hook.full_logits(
+                backend,
+                layer,
+                q_fp4,
+                q_scale,
+                weights,
+                indexer_metadata,
+                ratio,
+                sg_logits,
+            )
+    else:
+        logits = None
+    if logits is None:
+        logits = _aiter_decode_logits(
+            backend, layer, q_fp4, q_scale, weights, indexer_metadata, ratio
+        )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         candidates = backend.candidate_masks
@@ -308,6 +324,26 @@ def low_ratio_index_topk_hip_decode(
         page_indices,
         indexer_metadata.compressed_page_size,
         raw_indices,
+    )
+
+
+def _aiter_decode_logits(
+    backend, layer, q_fp4, q_scale, weights, indexer_metadata, ratio
+):
+    pool = backend.token_to_kv_pool
+    metadata = backend.forward_metadata
+    return aiter_fp4_paged_mqa_logits(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+        k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+        weights=weights,
+        page_table=indexer_metadata.page_table,
+        c4_seq_lens=indexer_metadata.compressed_seq_lens,
+        weight_scale=1.0,
+        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+        is_decode=True,
+        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
     )
 
 
