@@ -222,6 +222,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_components._req_scan import (
+    running_and_inflight_batches,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -2421,7 +2424,7 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
+            get_running_and_inflight_batches=lambda: running_and_inflight_batches(self),
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -5148,10 +5151,12 @@ class Scheduler(
         # KV cache, or stalled transfer — so they can't carry health info.
         # Batch running status
         idle = (
-            self.running_batch.is_empty()
+            all(
+                batch is None or batch.is_empty()
+                for batch in running_and_inflight_batches(self)
+            )
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
@@ -5422,7 +5427,7 @@ class Scheduler(
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
+            inflight_batches = running_and_inflight_batches(self)
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
         if self.enable_continuous_input_polling and self.result_queue:
@@ -5603,19 +5608,20 @@ class Scheduler(
             self._drain_mlx_pending_jobs()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
-        if (
-            self.last_batch is not None
-            and self.last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and self.last_batch is not self.running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
+        for batch in running_and_inflight_batches(self):
+            if (
+                batch is not None
+                # A running batch that DP attention converted to extend is
+                # last_batch itself; its requests are already listed above.
+                and batch is not self.running_batch
+                and batch.forward_mode.is_extend()
+                # Skip merge for disagg prefill: completed prefill requests are
+                # already in disagg_prefill_inflight_queue. Merging them into
+                # running_batch leaks them, since the prefill event loop never
+                # calls update_running_batch to clean them up.
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                retract_reqs += [r for r in batch.reqs if not r.finished()]
 
         if (
             self.chunked_req is not None

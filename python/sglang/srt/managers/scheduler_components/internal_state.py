@@ -17,6 +17,9 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
 )
+from sglang.srt.managers.scheduler_components._req_scan import (
+    running_and_inflight_batches,
+)
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size
@@ -255,7 +258,7 @@ class SchedulerInternalStateController:
         """Whether any unfinished request holding a sampling mask is queued or
         running, including PP micro-batches and PD decode queues."""
         scheduler = self.scheduler
-        batches = [scheduler.running_batch, scheduler.last_batch]
+        batches = running_and_inflight_batches(scheduler)
         batches.extend(getattr(scheduler, "running_mbs", ()))
         batches.extend(getattr(scheduler, "mbs", ()))
         batches.extend(getattr(scheduler, "last_mbs", ()))

@@ -64,7 +64,7 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
-    get_running_batch: Callable
+    get_running_and_inflight_batches: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
@@ -272,13 +272,14 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
+        # After decode running_batch IS last_batch; the loop below skips the
+        # repeats.
+        reqs = [
+            req
+            for batch in self.get_running_and_inflight_batches()
+            if batch is not None
+            for req in batch.reqs
+        ]
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
