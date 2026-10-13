@@ -58,7 +58,6 @@ def _build_server_args(
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
         else get_serving().grpc_port
     )
-    init_info = scheduler.get_init_info()
     deployment_info = {
         "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
         "node_rank": get_parallel().node_rank,
@@ -77,8 +76,15 @@ def _build_server_args(
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
         "hicache_write_policy": get_memory().hicache_write_policy,
-        "hicache_host_total_tokens": init_info.get("hicache_host_total_tokens"),
-        "kv_event_sources": init_info.get("kv_event_sources", []),
+        # Python's scheduler handshake only computes startup_time after all
+        # components have initialized, but the Rust frontend must start earlier
+        # to serve the disaggregation bootstrap registry. Read the already-
+        # initialized KV publisher directly instead of calling get_init_info()
+        # on a partially initialized scheduler.
+        "hicache_host_total_tokens": None,
+        "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
+            scheduler.page_size * get_parallel().dcp_size
+        ),
     }
     return ext.ServerArgs(
         model_path=get_model().model_path,

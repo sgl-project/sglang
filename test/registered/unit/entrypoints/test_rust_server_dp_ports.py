@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +24,15 @@ def _scheduler_for_typed_config():
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
-        get_init_info=lambda: {},
+        get_init_info=MagicMock(
+            side_effect=AssertionError("typed config must not read late init info")
+        ),
+        kv_events_publisher=SimpleNamespace(
+            local_kv_event_sources=MagicMock(
+                return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
+            )
+        ),
+        page_size=16,
         rust_server_tokenizer_path=lambda: "tokenizer",
         max_total_num_tokens=1024,
     )
@@ -43,17 +52,25 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
         ServerArgs=MagicMock(return_value="server-args"),
     )
+    scheduler = _scheduler_for_typed_config()
     with (
         get_context().override_server_args(grpc_port=50051, **legacy_args),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
         assert (
-            rust_config._build_server_args(_scheduler_for_typed_config())
-            == "server-args"
+            rust_config._build_server_args(scheduler) == "server-args"
         )
 
     assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
+    scheduler.get_init_info.assert_not_called()
+    scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["kv_event_sources"] == [
+        {"endpoint": "tcp://127.0.0.1:5557"}
+    ]
 
 
 @pytest.mark.parametrize(
