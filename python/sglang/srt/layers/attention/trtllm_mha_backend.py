@@ -28,9 +28,11 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -61,7 +63,7 @@ from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import get_cuda_graph_max_batch_size, is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +165,7 @@ class TRTLLMMHAMetadata:
     mixed_prefill_tokens: int = 0
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -187,7 +189,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
+        # Capture workspace size before init plumbing to preserve user's
         # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
@@ -196,9 +198,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        # Minimal plumbing that used to come from FlashInferAttnBackend.__init__:
+        # TRTLLM does not use any of the FlashInfer prefill/decode wrappers,
+        # indices updaters, or FlashInfer-specific workspace/indices, so we
+        # inline only the bits we actually need.
+        super().__init__()
+        self.skip_prefill = skip_prefill
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+
+        # SWA resolution (TRTLLMHAAttnBackend keeps its own _resolve_swa_kv_pool)
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
+
+        # kv_indptr / kv_last_page_len buffers — used by the companion
+        # TRTLLMHAAttnMultiStepDraftBackend during draft decoding.
+        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
+        if kv_indptr_buf is None:
+            self.kv_indptr = [
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+            ]
+        else:
+            self.kv_indptr = [kv_indptr_buf]
+        if kv_last_page_len_buf is None:
+            self.kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device=model_runner.device
+            )
+        else:
+            self.kv_last_page_len = kv_last_page_len_buf
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "trtllm_mha"
         )
@@ -317,7 +347,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
-        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        # (self._swa_kv_pool & self.use_sliding_window_kv_pool were resolved
+        # above in the init plumbing.)
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
