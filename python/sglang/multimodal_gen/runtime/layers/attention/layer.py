@@ -1680,10 +1680,9 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
-        # slicing along dim 1 keeps the original row stride, so the shard is
-        # contiguous only while the batch dim is 1; all_gather_into_tensor
-        # requires a contiguous input, so materialize the shard before the
-        # collective
+        # A dim-1 slice keeps the original row stride, and Flux2 K/V are views
+        # from qkv.chunk, so neither form is contiguous. all_gather_into_tensor
+        # rejects a non-contiguous input, so materialize before the collective.
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
             sharded = tensor[:, num_replicated_prefix:].contiguous()
@@ -1696,7 +1695,7 @@ class USPAttention(nn.Module):
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
-        return sequence_model_parallel_all_gather(tensor, dim=1)
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=1)
 
     def _forward_with_kv_gather(
         self,
