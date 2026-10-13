@@ -1,15 +1,17 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -249,6 +251,71 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                                     quant, PREFIX, packed, "fused_fg_b_proj"
                                 )
                             )
+
+
+class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
+    def test_output_norm_handoff_and_fallback(self):
+        tokens, heads, head_dim = 3, 2, 4
+        raw = torch.arange(tokens * heads * head_dim, dtype=torch.float32).reshape(
+            1, tokens, heads, head_dim
+        )
+        gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
+        norm = Mock(side_effect=lambda value, gate: value + 3)
+        norm.weight = torch.nn.Parameter(torch.linspace(0.5, 1.25, head_dim).half())
+        norm.eps = 1e-6
+        attn = Mock(_k3_onorm_gate=None, _k3_fused_decode_args=None)
+        attention = SimpleNamespace(
+            do_fuse_qkvbfg=False,
+            head_dim=head_dim,
+            forward_qkvbfg=lambda *_: (
+                torch.zeros(tokens, 3 * heads * head_dim),
+                torch.zeros(tokens, heads),
+                torch.zeros(tokens, heads * head_dim),
+                gate,
+            ),
+            attn=attn,
+            o_norm=norm,
+            o_proj=lambda value: (value, None),
+        )
+        hidden = torch.zeros(tokens, heads * head_dim)
+        for mode, consume in (
+            (ForwardMode.TARGET_VERIFY, True),
+            (ForwardMode.TARGET_VERIFY, False),
+            (ForwardMode.DECODE, False),
+            (ForwardMode.EXTEND, False),
+        ):
+            with self.subTest(mode=mode, consume=consume):
+                norm.reset_mock()
+                verify = mode == ForwardMode.TARGET_VERIFY
+
+                def backend(batch, **kwargs):
+                    if verify:
+                        self.assertIs(attn._k3_onorm_gate, gate)
+                        args = attn._k3_fused_decode_args
+                        self.assertEqual(args[5].dtype, torch.float32)
+                        torch.testing.assert_close(args[5], norm.weight.float())
+                        self.assertEqual(args[6], norm.eps)
+                        self.assertFalse(attn._k3_onorm_consumed)
+                        attn._k3_onorm_consumed = consume
+                    else:
+                        self.assertIsNone(attn._k3_onorm_gate)
+                        self.assertIsNone(attn._k3_fused_decode_args)
+                    return raw + 11 if consume else raw
+
+                attn.side_effect = backend
+                batch = SimpleNamespace(forward_mode=mode, attn_cp_metadata=None)
+                actual = glm5_next.Glm5NextLinearAttention.forward(
+                    attention, hidden, batch
+                )
+                expected = (raw + (11 if consume else 3)).squeeze(0).flatten(-2)
+                torch.testing.assert_close(actual, expected)
+                self.assertEqual(norm.call_count, 0 if consume else 1)
+                if not consume:
+                    torch.testing.assert_close(
+                        norm.call_args.args[1], gate.unflatten(-1, (-1, head_dim))
+                    )
+                self.assertIsNone(attn._k3_onorm_gate)
+                self.assertIsNone(attn._k3_fused_decode_args)
 
 
 if __name__ == "__main__":
