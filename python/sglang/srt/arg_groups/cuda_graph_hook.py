@@ -106,8 +106,7 @@ def apply_prefill_cp_cuda_graph_default(server_args: Any):
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     cfg = resolving_view(server_args)
-    # Preserve explicit graph choices, but enable supported CP paths even if
-    # an earlier default disabled capture before CP/backend resolution.
+    # Explicit choices win; the common resolver applies compatibility afterward.
     if (Phase.PREFILL, "backend") not in getattr(
         server_args, "_cuda_graph_config_locked", set()
     ) and supports_prefill_cp_bcg(server_args):
@@ -118,15 +117,6 @@ def apply_prefill_cp_cuda_graph_default(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
             ),
         )
-        # Keep unrelated incompatibilities and DeepEP bucket alignment intact
-        # when restoring a graph disabled before CP/backend resolution.
-        apply_cuda_graph_compatibility(server_args)
-        apply_cuda_graph_disaggregation_roles(server_args)
-        apply_deepep_adjustments(server_args)
-        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-            logger.info(
-                "Enabling breakable prefill CUDA graph for supported prefill CP."
-            )
 
 
 def apply_cuda_graph_compatibility(server_args: Any):
@@ -342,7 +332,7 @@ def apply_deepep_adjustments(server_args: Any):
 
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     """Inkling opts into full-graph prefill CUDA-graph capture. Must run
-    before _handle_cuda_graph_config: the generic breakable default is
+    before parse_cuda_graph_config: the generic breakable default is
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
     --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
@@ -384,12 +374,17 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
 
 
 def handle_cuda_graph_config(server_args: Any):
+    """Finalize graph defaults and policies after attention and CP resolution."""
     cfg = resolving_view(server_args)
 
-    parse_cuda_graph_config(server_args)
+    # The pipeline parses flags before capacity/model defaults; standalone
+    # callers may still pass an unparsed configuration.
+    if not hasattr(server_args, "_cuda_graph_config_locked"):
+        parse_cuda_graph_config(server_args)
+    apply_prefill_cp_cuda_graph_default(server_args)
     apply_cuda_graph_compatibility(server_args)
-    apply_deepep_adjustments(server_args)
     apply_cuda_graph_disaggregation_roles(server_args)
+    apply_deepep_adjustments(server_args)
     validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
