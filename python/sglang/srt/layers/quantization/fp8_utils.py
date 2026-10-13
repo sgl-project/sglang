@@ -148,8 +148,26 @@ DSV4_DENSE_MXSCALE_DEFAULT_SHAPES = frozenset(
 )
 
 
+@lru_cache(maxsize=1)
+def aiter_has_dense_mxscale() -> bool:
+    """Whether the installed aiter dispatches e8m0 block scales in
+    gemm_a8w8_blockscale_bpreshuffle. Older aiter takes the e8m0 bytes as fp32
+    scales and silently returns wrong results."""
+    try:
+        from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def set_dense_mxscale(enabled: bool = True) -> None:
     global _DENSE_MXSCALE
+    if enabled and not aiter_has_dense_mxscale():
+        logger.warning(
+            "SGLANG_DSV4_DENSE_MXSCALE is set but the installed aiter has no e8m0 "
+            "mxscale bpreshuffle GEMM; keeping the fp32-scale GEMM."
+        )
+        enabled = False
     _DENSE_MXSCALE = enabled
 
 

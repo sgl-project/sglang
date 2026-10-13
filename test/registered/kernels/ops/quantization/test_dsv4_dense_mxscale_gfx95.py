@@ -41,7 +41,15 @@ def _ue8m0_ref_quant(x: torch.Tensor):
     return q, e.view(m, k // 128).to(torch.uint8), scale.view(m, k // 128)
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 aiter mxscale GEMM")
+def _aiter_has_dense_mxscale() -> bool:
+    if not (is_hip() and is_gfx95_supported()):
+        return False
+    from sglang.srt.layers.quantization.fp8_utils import aiter_has_dense_mxscale
+
+    return aiter_has_dense_mxscale()
+
+
+@unittest.skipUnless(_aiter_has_dense_mxscale(), "gfx950 aiter mxscale GEMM")
 class TestDsv4DenseMxscale(CustomTestCase):
     @classmethod
     def setUpClass(cls):
