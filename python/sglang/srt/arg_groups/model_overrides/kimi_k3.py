@@ -74,11 +74,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-            # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
-            # signature (causal_seqs / cp_world / cp_rank). The default
-            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
-            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
+        if cfg.speculative_algorithm in ("DSPARK", "EAGLE3"):
+            # Target-verify + draft-extend must run on the decode (cutedsl_mla)
+            # backend, whose _run_decode_kernel implements the DCP signature
+            # (causal_seqs / cp_world / cp_rank). The default "prefill" routes
+            # them to trtllm_mla, which refuses DCP with q_len > 1.
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)

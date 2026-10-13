@@ -166,6 +166,25 @@ def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
     )
 
 
+class TestDcpCollapsedDraftPlan(CustomTestCase):
+    def test_collapsed_draft_takes_the_target_rows(self):
+        # Same geometry as test_one_virtual_page_explicit_rows; rank 2 owns
+        # positions 2 and 6 -> src rows 4, 8 -> local rows 14, 15 on page 7.
+        plan = _plan(
+            src=[5, 2, 11, 4],
+            dst=[7],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=2,
+            num_kv_tokens=8,
+            draft_rows_collapsed=True,
+        )
+        self.assertEqual(plan.target_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.target_dst_token_indices.tolist(), [14, 15])
+        self.assertEqual(plan.draft_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.draft_dst_token_indices.tolist(), [14, 15])
+
+
 class TestPrepareDcpTokenItemLens(CustomTestCase):
     def test_draft_tail_scales_by_dst_dcp_size(self):
         mgr = _dcp_kv_manager_stub(
