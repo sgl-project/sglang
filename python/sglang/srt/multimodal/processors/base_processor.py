@@ -1227,6 +1227,77 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
+    # fti image patch (deploy/patches/sglang_mm_by_ids.py): images of a pre-tokenized prompt are located by the
+    # placeholder id in the ids; the decoded text is never scanned.
+    @staticmethod
+    def _ids_for_media(prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data):
+        """The prompt's token ids when its images are to be located by id:
+        the prompt arrived as ids, the request carries images (none of them
+        precomputed) and no video or audio, and the processor knows its
+        image placeholder id and token. Else None, and the text path runs."""
+        ids = input_ids if input_ids is not None else (prompt if isinstance(prompt, list) else None)
+        if ids is None or not image_data or video_data or audio_data:
+            return None
+        if any(isinstance(item, dict) for item in image_data):
+            return None
+        if multimodal_tokens.image_token_id is None or not multimodal_tokens.image_token:
+            return None
+        return ids.tolist() if hasattr(ids, "tolist") else list(ids)
+
+    @staticmethod
+    def _placeholder_runs(input_ids, token_id):
+        """Image placeholders in pre-tokenized ids: each run of consecutive
+        ``token_id`` is one image (a client may send one id per image or the
+        expanded run), the count the multimodal-token regex gave for text."""
+        runs = 0
+        previous = None
+        for token in input_ids:
+            if token == token_id and previous != token_id:
+                runs += 1
+            previous = token
+        return runs
+
+    @staticmethod
+    def _collapse_placeholder_runs(input_ids, token_id):
+        """``input_ids`` with every run of ``token_id`` reduced to one id,
+        the form ``_expand_input_ids`` expands."""
+        out = []
+        previous = None
+        for token in input_ids:
+            if token == token_id and previous == token_id:
+                continue
+            out.append(token)
+            previous = token
+        return out
+
+    async def _load_mm_data_by_ids(
+        self, input_ids, multimodal_tokens, image_data, discard_alpha_channel=True
+    ):
+        """Images of a pre-tokenized prompt, located by the image placeholder
+        id in the ids. The HF processor receives a synthetic text of one
+        image token per image (it only counts and expands them; the request
+        ids are the prompt), the images in request order, and the ids with
+        each placeholder run collapsed to one id, which
+        ``process_and_combine_mm_data`` expands in place. Ordinary tokens
+        that spell an image token stay text."""
+        token_id = multimodal_tokens.image_token_id
+        found = self._placeholder_runs(input_ids, token_id)
+        if found != len(image_data):
+            raise ValueError(
+                f"prompt ids carry {found} image placeholder(s) but "
+                f"{len(image_data)} image(s) were provided"
+            )
+        image_token = multimodal_tokens.image_token
+        if isinstance(image_token, list):
+            image_token = image_token[0]
+        return await self.fast_load_mm_data(
+            prompt=image_token * len(image_data),
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            discard_alpha_channel=discard_alpha_channel,
+            input_ids=self._collapse_placeholder_runs(input_ids, token_id),
+        )
+
     async def load_mm_data(
         self,
         prompt: str,
@@ -1253,6 +1324,15 @@ class BaseMultimodalProcessor(ABC):
                 audios=list(audio_data or []),
             )
 
+        # fti image patch (deploy/patches/sglang_mm_by_ids.py): a prompt that arrives as ids locates its images by the
+        # placeholder id in the ids; its decoded text is never scanned.
+        ids_for_media = self._ids_for_media(
+            prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+        )
+        if ids_for_media is not None:
+            return await self._load_mm_data_by_ids(
+                ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
+            )
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -1426,6 +1506,15 @@ class BaseMultimodalProcessor(ABC):
 
         """
 
+        # fti image patch (deploy/patches/sglang_mm_by_ids.py): a prompt that arrives as ids locates its images by the
+        # placeholder id in the ids; its decoded text is never scanned.
+        ids_for_media = self._ids_for_media(
+            prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+        )
+        if ids_for_media is not None:
+            return await self._load_mm_data_by_ids(
+                ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
+            )
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
