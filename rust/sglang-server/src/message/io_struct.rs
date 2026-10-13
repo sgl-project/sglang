@@ -239,6 +239,49 @@ mod tests {
         );
     }
 
+    /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec
+    /// structs, so a positional array at the kv_hints slot fails to decode.
+    #[test]
+    fn header_kv_hints_are_map_encoded() {
+        use sglang_api_types::api::v1 as api;
+        let kv_hints = crate::message::request::KvHintsEnvelope::try_from(api::KvHintsEnvelope {
+            protocol_version: "1".into(),
+            message_id: "m".into(),
+            actions: vec![api::KvHintAction {
+                action_id: "a".into(),
+                action_type: "pin".into(),
+                action_version: "1".into(),
+                payload: Some(r#"{"blocks":[1,2]}"#.into()),
+            }],
+        })
+        .unwrap();
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            input_ids: Some(vec![1]),
+            kv_hints: Some(kv_hints),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let envelope = val.as_array().expect("array")[46]
+            .as_map()
+            .expect("kv_hints must be a map");
+        let get = |map: &[(rmpv::Value, rmpv::Value)], key: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing key {key}"))
+        };
+        assert_eq!(get(envelope, "protocol_version").as_str(), Some("1"));
+        assert_eq!(get(envelope, "message_id").as_str(), Some("m"));
+        let actions = get(envelope, "actions");
+        let action = actions.as_array().unwrap()[0]
+            .as_map()
+            .expect("kv_hints action must be a map");
+        assert_eq!(get(action, "action_type").as_str(), Some("pin"));
+        assert!(get(action, "payload").is_map());
+    }
+
     /// The PD block must land on Python's wire indices 25–31, with the filler
     /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.

@@ -605,19 +605,44 @@ pub struct GenerateRequest {
     pub mm_buffers: Vec<Buffer>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct KvHintsEnvelope {
     protocol_version: String,
     message_id: String,
     actions: Vec<KvHintAction>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 struct KvHintAction {
     action_id: String,
     action_type: String,
     action_version: String,
     payload: serde_json::Value,
+}
+
+// Python's kv_hints structs are not `array_like`, so they must reach msgspec as
+// maps; a derived Serialize goes through rmp_serde's struct-as-array encoding.
+impl serde::Serialize for KvHintsEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap; // codespell:ignore ser
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("protocol_version", &self.protocol_version)?;
+        map.serialize_entry("message_id", &self.message_id)?;
+        map.serialize_entry("actions", &self.actions)?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for KvHintAction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap; // codespell:ignore ser
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("action_id", &self.action_id)?;
+        map.serialize_entry("action_type", &self.action_type)?;
+        map.serialize_entry("action_version", &self.action_version)?;
+        map.serialize_entry("payload", &self.payload)?;
+        map.end()
+    }
 }
 
 impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {

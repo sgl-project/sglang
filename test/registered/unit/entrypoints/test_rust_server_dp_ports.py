@@ -58,9 +58,7 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
-        assert (
-            rust_config._build_server_args(scheduler) == "server-args"
-        )
+        assert rust_config._build_server_args(scheduler) == "server-args"
 
     assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
     scheduler.get_init_info.assert_not_called()
@@ -68,9 +66,7 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
     deployment_info = json.loads(
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
-    assert deployment_info["kv_event_sources"] == [
-        {"endpoint": "tcp://127.0.0.1:5557"}
-    ]
+    assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
 
 
 @pytest.mark.parametrize(

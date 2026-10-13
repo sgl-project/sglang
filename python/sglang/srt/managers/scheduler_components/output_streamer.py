@@ -464,6 +464,7 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        self.cached_tokens.append(req.cached_tokens)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -496,7 +497,6 @@ class _GenerationStreamAccumulator:
                 if beam_output is not None
                 else len(output_ids_)
             )
-            self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
