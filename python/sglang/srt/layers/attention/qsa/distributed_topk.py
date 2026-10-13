@@ -23,28 +23,6 @@ _INTEGER_DTYPES = (
 )
 
 
-def candidate_symm_mem_supported(
-    *,
-    world_size: int,
-    device_type: str,
-    capability: tuple[int, int],
-    local_hidden_bf16: int,
-    data_ptr: int,
-    fixed_buffer: bool,
-) -> bool:
-    """Return whether the candidate payload satisfies the multimem contract."""
-
-    return bool(
-        fixed_buffer
-        and world_size == 4
-        and device_type == "cuda"
-        and capability[0] == 9
-        and local_hidden_bf16 > 0
-        and local_hidden_bf16 % 8 == 0
-        and data_ptr % 16 == 0
-    )
-
-
 def _validate_topk(topk: int) -> None:
     if not isinstance(topk, int) or topk <= 0:
         raise ValueError(f"topk must be a positive integer, got {topk!r}")
@@ -64,33 +42,6 @@ def _validate_scores(scores: torch.Tensor, expected_width: int | None = None) ->
         )
 
 
-def pack_qsa_topk_candidates(
-    candidate_scores: torch.Tensor,
-    candidate_global_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Pack fixed-width score/index pairs for one device collective.
-
-    Global QSA block ids are exactly representable as float32 for all supported
-    model lengths. Keeping both fields in one tensor permits one graph-stable
-    ``GroupCoordinator.all_gather`` instead of two collectives.
-    """
-
-    _validate_scores(candidate_scores)
-    if candidate_global_indices.shape != candidate_scores.shape:
-        raise ValueError("candidate scores and indices must have matching shapes")
-    if candidate_global_indices.dtype not in _INTEGER_DTYPES:
-        raise TypeError("candidate indices must have integer dtype")
-    with torch.profiler.record_function("qsa.candidate_pack"):
-        packed = torch.empty(
-            (*candidate_scores.shape, 2),
-            dtype=torch.float32,
-            device=candidate_scores.device,
-        )
-        packed[..., 0].copy_(candidate_scores)
-        packed[..., 1].view(torch.int32).copy_(candidate_global_indices)
-        return packed
-
-
 def all_gather_qsa_topk_candidates(
     candidate_scores: torch.Tensor,
     candidate_global_indices: torch.Tensor,
@@ -100,12 +51,22 @@ def all_gather_qsa_topk_candidates(
 ) -> torch.Tensor:
     """All-gather fixed-width candidates through a ``GroupCoordinator``."""
 
+    _validate_scores(candidate_scores)
+    if candidate_global_indices.shape != candidate_scores.shape:
+        raise ValueError("candidate scores and indices must have matching shapes")
+    if candidate_global_indices.dtype not in _INTEGER_DTYPES:
+        raise TypeError("candidate indices must have integer dtype")
     if static_buffers is None:
-        packed = pack_qsa_topk_candidates(candidate_scores, candidate_global_indices)
+        packed = torch.empty(
+            (*candidate_scores.shape, 2),
+            dtype=torch.float32,
+            device=candidate_scores.device,
+        )
+        packed[..., 0].copy_(candidate_scores)
+        packed[..., 1].view(torch.int32).copy_(candidate_global_indices)
     else:
         rows, width = candidate_scores.shape
-        static_buffers = static_buffers.for_graph(rows)
-        static_buffers.for_batch(rows)
+        static_buffers = static_buffers.for_batch(rows)
         packed = static_buffers.candidate_transport
         packed[..., 0].fill_(float("-inf"))
         packed[..., 1].view(torch.int32).fill_(-1)
@@ -249,11 +210,10 @@ def fused_publish_and_merge_qsa_topk_candidates(
     group,
     topk: int,
     static_buffers,
-    deduplicate: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Publish local candidates with one no-pack multimem kernel, then merge."""
     rows = local_indices.shape[0]
-    static_buffers = static_buffers.for_graph(rows)
+    static_buffers = static_buffers.for_batch(rows)
     state = static_buffers.candidate_symm_state
     if state is None:
         raise RuntimeError("fused candidate publish requires symmetric memory")
@@ -288,10 +248,7 @@ def fused_publish_and_merge_qsa_topk_candidates(
         .view(torch.float32)
         .reshape(rows, group.world_size * topk, 2)
     )
-    scores, indices = merge_qsa_topk_candidates(
-        gathered, topk=topk, deduplicate=deduplicate
-    )
-    static_buffers.for_batch(rows)
+    scores, indices = merge_qsa_topk_candidates(gathered, topk=topk)
     static_buffers.candidate_scores[:rows, :topk].copy_(scores)
     static_buffers.candidate_indices[:rows, :topk].copy_(indices)
     return (
@@ -326,7 +283,6 @@ def _merge_qsa_topk_candidates_kernel(
     width: tl.constexpr,
     output_width: tl.constexpr,
     block_width: tl.constexpr,
-    deduplicate: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, block_width)
@@ -340,65 +296,47 @@ def _merge_qsa_topk_candidates_kernel(
     ).to(tl.int32, bitcast=True)
     valid = in_bounds & (indices >= 0) & (scores == scores)  # noqa: PLR0124
 
-    if not deduplicate:
-        score_bits = scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
-        score_bits = tl.where(scores == 0.0, 0, score_bits)
-        ordered_score = tl.where(
-            (score_bits & 0x80000000) != 0,
-            (~score_bits) & 0xFFFFFFFF,
-            score_bits ^ 0x80000000,
-        )
-        keys = (ordered_score - 0x80000000) * 0x100000000 + (
-            0xFFFFFFFF - indices.to(tl.int64)
-        )
-        keys = tl.where(valid, keys, -0x8000000000000000)
-        keys = tl.sort(keys, dim=0, descending=True)
-        selected = offsets < output_width
-        selected_keys = tl.where(selected, keys, -0x8000000000000000)
-        selected_valid = selected & (selected_keys != -0x8000000000000000)
-        # Arithmetic shift preserves the exact high 32-bit score key. Integer
-        # division can round negative packed keys through fp64 and flip one ulp.
-        selected_ordered_score = (selected_keys >> 32) + 0x80000000
-        selected_score_bits = tl.where(
-            (selected_ordered_score & 0x80000000) != 0,
-            selected_ordered_score ^ 0x80000000,
-            (~selected_ordered_score) & 0xFFFFFFFF,
-        )
-        selected_scores = selected_score_bits.to(tl.int32).to(tl.float32, bitcast=True)
-        selected_ids = 0xFFFFFFFF - (selected_keys & 0xFFFFFFFF)
-        tl.store(
-            output_scores_ptr + row * output_width + offsets,
-            tl.where(selected_valid, selected_scores, -float("inf")),
-            mask=selected,
-        )
-        tl.store(
-            output_indices_ptr + row * output_width + offsets,
-            tl.where(selected_valid, selected_ids, -1),
-            mask=selected,
-        )
-    else:
-        for output_column in tl.static_range(output_width):
-            any_valid = tl.sum(valid.to(tl.int32), axis=0) > 0
-            best_score = tl.max(tl.where(valid, scores, -float("inf")), axis=0)
-            score_matches = valid & (scores == best_score)
-            best_id = tl.min(tl.where(score_matches, indices, 0x7FFFFFFF), axis=0)
-            output_offset = row * output_width + output_column
-            tl.store(
-                output_scores_ptr + output_offset,
-                tl.where(any_valid, best_score, -float("inf")),
-            )
-            tl.store(
-                output_indices_ptr + output_offset,
-                tl.where(any_valid, best_id, -1),
-            )
-            valid = valid & (indices != best_id)
+    score_bits = scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    score_bits = tl.where(scores == 0.0, 0, score_bits)
+    ordered_score = tl.where(
+        (score_bits & 0x80000000) != 0,
+        (~score_bits) & 0xFFFFFFFF,
+        score_bits ^ 0x80000000,
+    )
+    keys = (ordered_score - 0x80000000) * 0x100000000 + (
+        0xFFFFFFFF - indices.to(tl.int64)
+    )
+    keys = tl.where(valid, keys, -0x8000000000000000)
+    keys = tl.sort(keys, dim=0, descending=True)
+    selected = offsets < output_width
+    selected_keys = tl.where(selected, keys, -0x8000000000000000)
+    selected_valid = selected & (selected_keys != -0x8000000000000000)
+    # Arithmetic shift preserves the exact high 32-bit score key. Integer
+    # division can round negative packed keys through fp64 and flip one ulp.
+    selected_ordered_score = (selected_keys >> 32) + 0x80000000
+    selected_score_bits = tl.where(
+        (selected_ordered_score & 0x80000000) != 0,
+        selected_ordered_score ^ 0x80000000,
+        (~selected_ordered_score) & 0xFFFFFFFF,
+    )
+    selected_scores = selected_score_bits.to(tl.int32).to(tl.float32, bitcast=True)
+    selected_ids = 0xFFFFFFFF - (selected_keys & 0xFFFFFFFF)
+    tl.store(
+        output_scores_ptr + row * output_width + offsets,
+        tl.where(selected_valid, selected_scores, -float("inf")),
+        mask=selected,
+    )
+    tl.store(
+        output_indices_ptr + row * output_width + offsets,
+        tl.where(selected_valid, selected_ids, -1),
+        mask=selected,
+    )
 
 
 def _merge_qsa_topk_candidates_triton(
     gathered_candidates: torch.Tensor,
     *,
     topk: int,
-    deduplicate: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, width, _ = gathered_candidates.shape
     output_scores = torch.empty(
@@ -415,7 +353,6 @@ def _merge_qsa_topk_candidates_triton(
         width=width,
         output_width=topk,
         block_width=block_width,
-        deduplicate=deduplicate,
         num_warps=4 if block_width <= 128 else 8,
     )
     return output_scores, output_indices
@@ -425,7 +362,6 @@ def merge_qsa_topk_candidates(
     gathered_candidates: torch.Tensor,
     *,
     topk: int,
-    deduplicate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge fixed-width candidates entirely on their current device."""
 
@@ -453,28 +389,18 @@ def merge_qsa_topk_candidates(
 
     with torch.profiler.record_function("qsa.candidate_merge"):
         if gathered_candidates.is_cuda:
-            return _merge_qsa_topk_candidates_triton(
-                gathered_candidates, topk=topk, deduplicate=deduplicate
-            )
-        return _merge_qsa_topk_candidates_impl(
-            gathered_candidates, topk=topk, deduplicate=deduplicate
-        )
+            return _merge_qsa_topk_candidates_triton(gathered_candidates, topk=topk)
+        return _merge_qsa_topk_candidates_impl(gathered_candidates, topk=topk)
 
 
 def _merge_qsa_topk_candidates_impl(
     gathered_candidates: torch.Tensor,
     *,
     topk: int,
-    deduplicate: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scores = gathered_candidates[..., 0]
     indices = gathered_candidates[..., 1].contiguous().view(torch.int32)
     valid = (indices >= 0) & ~torch.isnan(scores)
-
-    if deduplicate:
-        scores, indices, valid = _deduplicate_qsa_topk_candidates(
-            scores, indices, valid
-        )
 
     keys = _candidate_order_keys(scores, indices)
     positions = torch.topk(keys, k=topk, dim=-1, largest=True, sorted=True).indices
@@ -487,67 +413,26 @@ def _merge_qsa_topk_candidates_impl(
     )
 
 
-def _deduplicate_qsa_topk_candidates(
-    scores: torch.Tensor,
-    indices: torch.Tensor,
-    valid: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Collapse replicated candidates without leaving the device. Sorting ids
-    # assigns each equal-id run a compact group number; scatter-reduce then
-    # retains the best score for that global id in a fixed-width tensor.
-    sortable_indices = indices.to(torch.int64).masked_fill(
-        ~valid, torch.iinfo(torch.int64).max
-    )
-    by_id = torch.argsort(sortable_indices, dim=-1, stable=True)
-    ids_by_id = indices.gather(-1, by_id)
-    scores_by_id = scores.gather(-1, by_id).masked_fill(
-        ~valid.gather(-1, by_id), float("-inf")
-    )
-    starts = torch.ones_like(ids_by_id, dtype=torch.bool)
-    starts[:, 1:] = ids_by_id[:, 1:] != ids_by_id[:, :-1]
-    starts &= ids_by_id >= 0
-    groups = starts.to(torch.int64).cumsum(dim=-1).sub(1).clamp_min(0)
-    deduplicated_scores = torch.full_like(scores_by_id, float("-inf"))
-    deduplicated_scores.scatter_reduce_(
-        1, groups, scores_by_id, reduce="amax", include_self=True
-    )
-    deduplicated_indices = torch.full_like(ids_by_id, -1)
-    deduplicated_indices.scatter_reduce_(
-        1, groups, ids_by_id, reduce="amax", include_self=True
-    )
-    return (
-        deduplicated_scores,
-        deduplicated_indices,
-        deduplicated_indices >= 0,
-    )
-
-
 def gather_and_merge_qsa_topk_candidates(
     candidate_scores: torch.Tensor,
     candidate_global_indices: torch.Tensor,
     *,
     group,
     topk: int,
-    deduplicate: bool = True,
     static_buffers=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one fixed-shape all-gather and merge the global candidates."""
 
-    if static_buffers is not None:
-        static_buffers = static_buffers.for_graph(candidate_scores.shape[0])
     gathered = all_gather_qsa_topk_candidates(
         candidate_scores,
         candidate_global_indices,
         group=group,
         static_buffers=static_buffers,
     )
-    scores, indices = merge_qsa_topk_candidates(
-        gathered, topk=topk, deduplicate=deduplicate
-    )
+    scores, indices = merge_qsa_topk_candidates(gathered, topk=topk)
     if static_buffers is None:
         return scores, indices
     rows = candidate_scores.shape[0]
-    static_buffers.for_batch(rows)
     static_buffers.candidate_scores[:rows, :topk].copy_(scores)
     static_buffers.candidate_indices[:rows, :topk].copy_(indices)
     return (
@@ -558,9 +443,7 @@ def gather_and_merge_qsa_topk_candidates(
 
 __all__ = [
     "all_gather_qsa_topk_candidates",
-    "candidate_symm_mem_supported",
     "fused_publish_and_merge_qsa_topk_candidates",
     "gather_and_merge_qsa_topk_candidates",
     "merge_qsa_topk_candidates",
-    "pack_qsa_topk_candidates",
 ]

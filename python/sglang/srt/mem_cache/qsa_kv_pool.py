@@ -132,15 +132,12 @@ class QSARawKVSharding:
     """Interleaved owner mapping for the rank-local raw QSA K/V cache."""
 
     local_capacity: int
-    page_size: int
     world_size: int
     rank: int
 
     def __post_init__(self) -> None:
         if self.local_capacity < 0:
             raise ValueError("local_capacity must be non-negative")
-        if self.page_size <= 0:
-            raise ValueError("page_size must be positive")
         object.__setattr__(
             self,
             "placement",
@@ -451,7 +448,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_owner_group = cache_sharding_runtime.group
             self.qsa_raw_kv_sharding = QSARawKVSharding(
                 local_capacity=size + page_size,
-                page_size=page_size,
                 world_size=cache_sharding_runtime.size,
                 rank=cache_sharding_runtime.rank,
             )

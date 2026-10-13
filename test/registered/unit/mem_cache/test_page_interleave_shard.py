@@ -1502,11 +1502,11 @@ def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa
     ("page_table", "length", "pages", "local_length", "positions"),
     [
         (
-            [[5, 1, 5]],
+            [[5, 2, 7]],
             12,
-            [[2, 0, 2]],
-            12,
-            [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+            [[2, 3]],
+            8,
+            [[0, 1, 2, 3, 8, 9, 10, 11]],
         ),
         (
             [[0, 1, 2]],
@@ -1517,21 +1517,16 @@ def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa
         ),
     ],
 )
-def test_qsa_page_localization_preserves_reuse_and_ragged_tail(
+def test_qsa_page_localization_preserves_nonmonotonic_pages_and_ragged_tail(
     page_table, length, pages, local_length, positions
 ):
     shard = QSACompressedBlockSharding(
-        global_blocks=24 if page_table[0][0] == 5 else 12,
+        global_blocks=32 if page_table[0][0] == 5 else 12,
         compressed_page_size=4,
         world_size=2,
         rank=1 if page_table[0][0] == 5 else 0,
     )
-    (
-        actual_pages,
-        actual_length,
-        actual_length_cpu,
-        actual_positions,
-    ) = localize_compressed_page_table(
+    actual_pages, actual_length, actual_positions = localize_compressed_page_table(
         global_page_table=torch.tensor(page_table, dtype=torch.int32),
         compressed_lengths=torch.tensor([length], dtype=torch.int32),
         sharding=shard,
@@ -1540,14 +1535,13 @@ def test_qsa_page_localization_preserves_reuse_and_ragged_tail(
     torch.testing.assert_close(
         actual_length, torch.tensor([local_length], dtype=torch.int32)
     )
-    assert actual_length_cpu == (local_length,)
     torch.testing.assert_close(
         actual_positions, torch.tensor(positions, dtype=torch.int64)
     )
 
 
 def test_qsa_raw_slots_preserve_page_offsets_and_reuse():
-    shard = QSARawKVSharding(local_capacity=8, page_size=4, world_size=2, rank=1)
+    shard = QSARawKVSharding(local_capacity=8, world_size=2, rank=1)
     owner, local = shard.local_write_targets(torch.tensor([0, 1, 3, 14, 15, -1]))
     torch.testing.assert_close(
         owner, torch.tensor([False, True, True, False, True, False])
@@ -1571,7 +1565,6 @@ def test_qsa_sharding_rejects_out_of_bounds_writes(kind):
     else:
         shard = QSARawKVSharding(
             local_capacity=8,
-            page_size=4,
             world_size=2,
             rank=1,
         )

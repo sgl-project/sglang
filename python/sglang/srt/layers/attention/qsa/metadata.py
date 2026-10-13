@@ -414,7 +414,7 @@ def localize_compressed_page_table(
     global_page_table: torch.Tensor,
     compressed_lengths: torch.Tensor,
     sharding: QSACompressedBlockSharding,
-) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, ...], torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Localize owned physical pages and preserve each logit's logical position.
 
     Page-table rows may contain non-monotonic physical page ids. Ownership and
@@ -507,14 +507,17 @@ def localize_compressed_page_table(
         dim=(1, 2), dtype=torch.int32
     )
 
-    if local_page_counts.numel():
-        host_counts = torch.stack((local_page_counts, local_lengths)).cpu()
-        page_counts_cpu, local_lengths_cpu_tensor = host_counts.unbind(0)
-        output_pages = max(page_counts_cpu.tolist(), default=0)
-        local_lengths_cpu = tuple(local_lengths_cpu_tensor.tolist())
-    else:
-        output_pages = 0
-        local_lengths_cpu = ()
+    output_pages = (
+        global_page_table.shape[1] + sharding.world_size - 1
+    ) // sharding.world_size
+    within_local_capacity = torch.all(local_page_counts <= output_pages)
+    if global_page_table.is_cuda:
+        torch._assert_async(
+            within_local_capacity,
+            "compressed page ownership must follow the allocator's cyclic layout",
+        )
+    elif not bool(within_local_capacity.item()):
+        raise ValueError("compressed page ownership is not cyclic")
 
     compact_page_mask = torch.arange(
         output_pages, device=global_page_table.device
@@ -566,7 +569,7 @@ def localize_compressed_page_table(
     logical_positions = torch.where(
         compact_block_mask, compact_logical_positions, -1
     ).flatten(1)
-    return local_page_table, local_lengths, local_lengths_cpu, logical_positions
+    return local_page_table, local_lengths, logical_positions
 
 
 __all__ = [

@@ -78,7 +78,6 @@ class QSAIndexer(MultiPlatformOp):
         quant_config=None,
         prefix: str = "",
         rotary_emb=None,
-        distributed_topk_group=None,
         cache_sharding_runtime: QSACacheShardingRuntime | None = None,
     ) -> None:
         self._validate_config(config)
@@ -94,14 +93,6 @@ class QSAIndexer(MultiPlatformOp):
         expected_group = (
             cache_sharding_runtime.group if cache_sharding_runtime.enabled else None
         )
-        if (
-            distributed_topk_group is not None
-            and distributed_topk_group is not expected_group
-        ):
-            raise ValueError(
-                "indexer QSA cache-sharding collective group does not match "
-                "the runtime contract"
-            )
         self.cache_sharding_runtime = cache_sharding_runtime
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -566,8 +557,6 @@ class QSAIndexer(MultiPlatformOp):
                     group=group,
                     topk=self.block_topk,
                     static_buffers=static_buffers,
-                    # Interleaved compressed-page ownership makes ids disjoint.
-                    deduplicate=False,
                 )
             )
             return merged_indices
@@ -625,9 +614,6 @@ class QSAIndexer(MultiPlatformOp):
             global_indices,
             group=group,
             topk=self.block_topk,
-            # Interleaved compressed-page ownership partitions logical block
-            # positions across QSA cache shards, so gathered ids are disjoint.
-            deduplicate=False,
             **graph_kwargs,
         )
         return merged_indices

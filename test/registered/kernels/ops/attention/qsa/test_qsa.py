@@ -209,13 +209,15 @@ def _qsa_integration_inputs(world_size, rank, device):
     )
 
 
-def _qsa_select_integration_tokens(inputs, indexer, mode, static_buffers):
-    logical_positions = (
-        torch.arange(inputs.local_blocks, device=inputs.index_q.device)
-        * indexer.distributed_topk_group.world_size
-        + indexer.distributed_topk_group.rank_in_group
-    ).to(torch.int32)
-    logical_positions = logical_positions.unsqueeze(0).expand(inputs.rows, -1)
+def _qsa_integration_tokens(
+    inputs,
+    indexer,
+    mode,
+    compressed,
+    *,
+    logical_positions=None,
+    static_buffers=None,
+):
     query_positions = torch.full(
         (inputs.rows,),
         inputs.global_tokens - 1,
@@ -223,14 +225,21 @@ def _qsa_select_integration_tokens(inputs, indexer, mode, static_buffers):
         device=inputs.index_q.device,
     )
     sequence_lengths = query_positions + 1
+    local_blocks = compressed.shape[0]
     if mode == "prefill":
+        kwargs = {}
+        if indexer.distributed_topk_group is not None:
+            kwargs = {
+                "collective_keys": inputs.global_blocks * inputs.rows,
+                "collective_world_size": indexer.distributed_topk_group.world_size,
+            }
         return indexer.select_prefill_tokens(
             inputs.index_q,
-            inputs.local_compressed,
+            compressed,
             torch.zeros(inputs.rows, dtype=torch.int32, device=inputs.index_q.device),
             torch.full(
                 (inputs.rows,),
-                inputs.local_blocks,
+                local_blocks,
                 dtype=torch.int32,
                 device=inputs.index_q.device,
             ),
@@ -238,14 +247,11 @@ def _qsa_select_integration_tokens(inputs, indexer, mode, static_buffers):
             sequence_lengths,
             logical_block_positions=logical_positions,
             static_buffers=static_buffers,
-            collective_keys=inputs.global_blocks * inputs.rows,
-            collective_world_size=indexer.distributed_topk_group.world_size,
+            **kwargs,
         )
 
     page_size = 16
-    compressed_cache = inputs.local_compressed.reshape(
-        -1, page_size, 1, inputs.head_dim
-    )
+    compressed_cache = compressed.reshape(-1, page_size, 1, inputs.head_dim)
     page_table = (
         torch.arange(
             compressed_cache.shape[0],
@@ -261,71 +267,15 @@ def _qsa_select_integration_tokens(inputs, indexer, mode, static_buffers):
         page_table,
         torch.full(
             (inputs.rows,),
-            inputs.local_blocks,
+            local_blocks,
             dtype=torch.int32,
             device=inputs.index_q.device,
         ),
-        inputs.local_blocks,
+        local_blocks,
         query_positions,
         sequence_lengths,
         logical_block_positions=logical_positions,
         static_buffers=static_buffers,
-    )
-
-
-def _qsa_unsharded_integration_tokens(inputs, mode):
-    indexer = QSAIndexer.__new__(QSAIndexer)
-    indexer.block_topk = inputs.token_topk // inputs.compress_ratio
-    indexer.token_topk = inputs.token_topk
-    indexer.compress_ratio = inputs.compress_ratio
-    indexer.distributed_topk_group = None
-    query_positions = torch.full(
-        (inputs.rows,),
-        inputs.global_tokens - 1,
-        dtype=torch.int64,
-        device=inputs.index_q.device,
-    )
-    sequence_lengths = query_positions + 1
-    if mode == "prefill":
-        return indexer.select_prefill_tokens(
-            inputs.index_q,
-            inputs.global_compressed,
-            torch.zeros(inputs.rows, dtype=torch.int32, device=inputs.index_q.device),
-            torch.full(
-                (inputs.rows,),
-                inputs.global_blocks,
-                dtype=torch.int32,
-                device=inputs.index_q.device,
-            ),
-            query_positions,
-            sequence_lengths,
-        )
-    page_size = 16
-    compressed_cache = inputs.global_compressed.reshape(
-        -1, page_size, 1, inputs.head_dim
-    )
-    page_table = (
-        torch.arange(
-            compressed_cache.shape[0],
-            dtype=torch.int32,
-            device=inputs.index_q.device,
-        )
-        .unsqueeze(0)
-        .expand(inputs.rows, -1)
-    )
-    return indexer.select_decode_tokens(
-        inputs.index_q,
-        compressed_cache,
-        page_table,
-        torch.full(
-            (inputs.rows,),
-            inputs.global_blocks,
-            dtype=torch.int32,
-            device=inputs.index_q.device,
-        ),
-        inputs.global_blocks,
-        query_positions,
-        sequence_lengths,
     )
 
 
@@ -349,6 +299,15 @@ def _run_qsa_multirank_production_integration(rank, world_size, port):
         indexer.token_topk = inputs.token_topk
         indexer.compress_ratio = inputs.compress_ratio
         indexer.distributed_topk_group = group
+        reference_indexer = QSAIndexer.__new__(QSAIndexer)
+        reference_indexer.block_topk = indexer.block_topk
+        reference_indexer.token_topk = indexer.token_topk
+        reference_indexer.compress_ratio = indexer.compress_ratio
+        reference_indexer.distributed_topk_group = None
+        logical_positions = (
+            torch.arange(inputs.local_blocks, device=device) * world_size + rank
+        ).to(torch.int32)
+        logical_positions = logical_positions.unsqueeze(0).expand(inputs.rows, -1)
         buffers = QSACacheShardingStaticBuffers(
             max_rows=inputs.rows,
             topk=indexer.block_topk,
@@ -363,20 +322,23 @@ def _run_qsa_multirank_production_integration(rank, world_size, port):
         )
         sharding = QSARawKVSharding(
             local_capacity=inputs.local_k.shape[0],
-            page_size=1,
             world_size=world_size,
             rank=rank,
         )
         reference_sharding = QSARawKVSharding(
             local_capacity=inputs.full_k.shape[0],
-            page_size=1,
             world_size=1,
             rank=0,
         )
 
         def run(mode):
-            selected = _qsa_select_integration_tokens(
-                inputs, indexer, mode, buffers.for_layer(0)
+            selected = _qsa_integration_tokens(
+                inputs,
+                indexer,
+                mode,
+                inputs.local_compressed,
+                logical_positions=logical_positions,
+                static_buffers=buffers.for_layer(0),
             )
             output, lse = owner_sparse_attention(
                 inputs.local_q,
@@ -390,7 +352,9 @@ def _run_qsa_multirank_production_integration(rank, world_size, port):
             return selected, output, lse
 
         for mode in ("prefill", "decode"):
-            expected_selected = _qsa_unsharded_integration_tokens(inputs, mode)
+            expected_selected = _qsa_integration_tokens(
+                inputs, reference_indexer, mode, inputs.global_compressed
+            )
             expected_output, expected_lse = owner_sparse_attention(
                 inputs.full_q,
                 inputs.full_k,
@@ -434,7 +398,9 @@ def _run_qsa_multirank_production_integration(rank, world_size, port):
             inputs.full_q.add_(
                 torch.tensor(0.015625, dtype=torch.bfloat16, device=device)
             )
-            expected_selected = _qsa_unsharded_integration_tokens(inputs, mode)
+            expected_selected = _qsa_integration_tokens(
+                inputs, reference_indexer, mode, inputs.global_compressed
+            )
             expected_output, expected_lse = owner_sparse_attention(
                 inputs.full_q,
                 inputs.full_k,

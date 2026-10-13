@@ -215,18 +215,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
 
-    def __init__(
-        self,
-        runner=None,
-        *,
-        owner_sparse_attn_group=None,
-        owner_sparse_attn_runtime=None,
-    ) -> None:
-        if owner_sparse_attn_group is not None or owner_sparse_attn_runtime is not None:
-            raise ValueError(
-                "the QSA cache-sharding owner attention hot path is "
-                "temporarily disabled"
-            )
+    def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
@@ -856,7 +845,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 (
                     local_page_table,
                     local_lengths,
-                    local_lengths_cpu,
                     local_block_positions,
                 ) = localize_compressed_page_table(
                     global_page_table=global_page_table,
@@ -888,16 +876,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                             dtype=torch.long,
                         ).view(1, 1, -1)
                     ).flatten(1)
-                    local_block_parts = [
-                        local_block_table[row, :local_length]
-                        for row, local_length in enumerate(local_lengths_cpu)
-                        if local_length
-                    ]
-                    prefill_cache_indices = (
-                        torch.cat(local_block_parts)
-                        if local_block_parts
-                        else local_block_table.new_empty(0)
-                    )
+                    valid_local_blocks = torch.arange(
+                        local_block_table.shape[1],
+                        device=local_block_table.device,
+                    ).unsqueeze(0) < local_lengths.unsqueeze(1)
+                    prefill_cache_indices = local_block_table[
+                        valid_local_blocks
+                    ].contiguous()
             elif decode_like:
                 decode_page_table = global_page_table
                 decode_lengths = global_lengths

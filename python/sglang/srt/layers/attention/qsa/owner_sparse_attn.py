@@ -293,8 +293,7 @@ def merge_owner_sparse_attention(
         )
         recv = torch.empty_like(packed)
     else:
-        static_buffers = static_buffers.for_graph(rows)
-        static_buffers.for_batch(rows)
+        static_buffers = static_buffers.for_batch(rows)
         packed = static_buffers.owner_a2a_send
         recv = static_buffers.owner_a2a_recv
         packed[..., :-1].zero_()
@@ -340,7 +339,7 @@ def owner_sparse_attention(
 
     local_query_heads = q.shape[1]
     if static_buffers is not None:
-        static_buffers = static_buffers.for_graph(q.shape[0])
+        static_buffers = static_buffers.for_batch(q.shape[0])
         expected_local_heads = static_buffers.num_heads // static_buffers.world_size
         if local_query_heads != expected_local_heads:
             raise ValueError(
@@ -354,7 +353,6 @@ def owner_sparse_attention(
                 gathered_q = group.all_gather(q.contiguous(), dim=1).contiguous()
             else:
                 rows = q.shape[0]
-                static_buffers.for_batch(rows)
                 static_buffers.q_send.zero_()
                 static_buffers.q_send[:, :rows].copy_(q.permute(1, 0, 2))
                 device_group = getattr(group, "device_group", None)
@@ -406,7 +404,6 @@ def owner_sparse_attention(
             and local_k_cache.shape[1] == 1
             and local_k_cache.shape[2] == 128
         ):
-            static_buffers.for_batch(q.shape[0])
             packed_tokens = q.shape[0] * owner_width
             attention_k, attention_v, attention_slots = pack_owner_kv_contiguous(
                 local_k_cache,

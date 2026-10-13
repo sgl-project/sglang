@@ -224,25 +224,20 @@ class QSACacheShardingStaticBuffers:
         from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
             create_state,
         )
-        from sglang.srt.layers.attention.qsa.distributed_topk import (
-            candidate_symm_mem_supported,
-        )
 
         device_group = getattr(candidate_group, "device_group", None)
+        capability = (
+            torch.cuda.get_device_capability(self._device)
+            if self._device.type == "cuda"
+            else (0, 0)
+        )
         local_supported = (
             os.environ.get("SGLANG_QSA_CANDIDATE_SYMM_MEM", "1") == "1"
-            and candidate_symm_mem_supported(
-                world_size=self.world_size,
-                device_type=self._device.type,
-                capability=(
-                    torch.cuda.get_device_capability(self._device)
-                    if self._device.type == "cuda"
-                    else (0, 0)
-                ),
-                local_hidden_bf16=self.topk * 4,
-                data_ptr=self.candidate_transport.data_ptr(),
-                fixed_buffer=True,
-            )
+            and self.world_size == 4
+            and self._device.type == "cuda"
+            and capability[0] == 9
+            and self.topk * 4 % 8 == 0
+            and self.candidate_transport.data_ptr() % 16 == 0
             and type(device_group) is dist.ProcessGroup
         )
         if device_group is None:
@@ -273,10 +268,6 @@ class QSACacheShardingStaticBuffers:
             return self
         if int(layer_id) not in self._layer_ids:
             raise KeyError(f"no static transport slice for QSA layer {layer_id}")
-        return self
-
-    def for_graph(self, rows: int) -> QSACacheShardingStaticBuffers:
-        self.for_batch(rows)
         return self
 
     def for_batch(self, rows: int) -> QSACacheShardingStaticBuffers:
