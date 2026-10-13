@@ -1236,8 +1236,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        # Re-point on the insert end, not the component-validated match anchor.
+        # The match anchor is admission semantics: a fresh request may only
+        # consume the prefix where every component is device-servable, so aux
+        # validators (SWA window, C128 group endpoints) legitimately truncate it
+        # below the span this insert just absorbed -- e.g. host-backed nodes
+        # whose SWA device value is out-of-window by design. The checkpoint must
+        # lock the whole absorbed span instead; post-insert every walked node is
+        # FULL-device-resident (unevict restored them), so the FULL path from
+        # the insert end is exactly insert_match long. Keeping the shorter
+        # anchor would leave absorbed nodes unlocked and evictable while this
+        # request's row still points at them.
+        new_last_node = result.last_device_node
+        new_indices = self.tree_core.collect_full_device_indices(
+            new_last_node, self.tree_core.root_node.id
+        )
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
