@@ -1,3 +1,9 @@
+"""KL regression tests for Mamba prefix-cache correctness.
+
+Keep each scenario in its own class so server configurations and cache-pressure
+requirements remain explicit.
+"""
+
 import unittest
 
 import numpy as np
@@ -48,9 +54,19 @@ class MambaCacheKLMixin:
 
 
 class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
-    """The four-slot pool forces in-place tracking on the first decode. Delayed
-    prefill processing must not publish that state under the old checkpoint key.
-    Compare the same prompt so generated histories cannot confound the KL.
+    """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
+
+    Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
+    two cached prefixes, the request's live state, and its keep checkpoint. The
+    first decode must track in place; delayed prefill processing must not publish
+    that buffer under the old checkpoint length.
+
+    Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
+    before and after a 32-token decode seeds the cache. Comparing later free-running
+    tokens would confound cache corruption with different generated histories.
+
+    GB300 / Qwen3.5-0.8B: reverting the checkpoint invalidation gives KL=0.649448
+    and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
     """
 
     ignore_eos = True
@@ -121,6 +137,7 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
             flush=True,
         )
         self.assertGreaterEqual(kl, -1e-12)
+        # Leave room for numerical noise while staying far below the broken run.
         self.assertLess(kl, 1e-4, "Cache reuse changed the next-token distribution")
 
 
