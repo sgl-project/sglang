@@ -18,13 +18,14 @@ Scheme (fold-every-commit, no circular ring / periodic flush):
     directly as its initial state (no lag, no chunked reconstruction).
 
 The exact-fold is a BITWISE CLONE of ``fused_recurrent_gated_delta_rule_fwd_kernel``'s
-``IS_KDA`` branch (fused_recurrent.py): same [BK, BV] fp32 tile (K rows, V cols),
-same division-form L2 norm (eps inside sqrt), same per-K gate decay
-``h *= exp(gk)``, same decay→delta→rank-1 op order. Given identical inputs the
-folded checkpoint is bit-identical to the recurrent baseline's committed state
-(the delta-rule recurrence is contractive, so no length-dependent error). Do NOT
-reorder into tl.dot / reciprocal-multiply; keep num_warps=1 so the reduction
-trees match.
+``IS_KDA`` branch (fused_recurrent.py): same full-K fp32 rows with num_warps=1, so
+each V column's K reduction matches; BV only partitions independent V columns
+across programs and need not match the recurrent kernel's. Same division-form L2
+norm (eps inside sqrt), same per-K gate decay ``h *= exp(gk)``, same
+decay -> delta -> rank-1 op order. Given identical inputs the folded checkpoint
+is bit-identical to the recurrent baseline's committed state (the delta-rule
+recurrence is contractive, so no length-dependent error). Do NOT reorder into
+tl.dot / reciprocal-multiply; keep num_warps=1 so the reduction trees match.
 
 Linear chain only (dspark γ chain, topk<=1).
 """
@@ -35,6 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
+# Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
 KDA_FOLD_BLOCK_V = 8
 
 
@@ -184,11 +186,11 @@ def commit_kda_replayssm_spec(
 ) -> None:
     """Replay each request's accepted window into its fp32 checkpoint in place.
 
-    Tiling clones the recurrent kernel (full-K rows, BV = min(np2(V), KDA_FOLD_BLOCK_V)
-    cols, num_warps=1) so the folded checkpoint is bit-identical to the recurrent
-    baseline's committed state. With extra_buffer (mamba_track_indices given) the
-    same replay snapshots the interval-crossing state into the track slot in one
-    pass, so no separate track scatter / force-flush is needed.
+    Full-K rows with num_warps=1 keep each V column's K reduction identical to the
+    recurrent kernel, so the folded checkpoint is bit-identical to the recurrent
+    baseline's committed state for any BV. With extra_buffer (mamba_track_indices
+    given) the same replay snapshots the interval-crossing state into the track
+    slot in one pass, so no separate track scatter / force-flush is needed.
     """
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
