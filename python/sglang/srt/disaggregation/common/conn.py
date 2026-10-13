@@ -1230,6 +1230,26 @@ class CommonKVManager(BaseKVManager):
                     "servers (including prefill CP ranks for MLA)"
                 )
 
+        # Every send path rejects head-sharded MXFP8 block scales across
+        # attention TP sizes, so each request would fail at its first transfer.
+        if (
+            info.attn_tp_size != self.attn_tp_size
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+        ):
+            block_scale_states = [
+                st
+                for st in getattr(self.kv_args, "state_types", None) or []
+                if st in (StateType.BLOCK_SCALE, StateType.BLOCK_SCALE_SWA)
+            ]
+            if block_scale_states:
+                raise RuntimeError(
+                    "PD Disaggregation does NOT support different attention TP "
+                    "sizes with MXFP8 KV cache: prefill attn_tp_size="
+                    f"{info.attn_tp_size}, decode attn_tp_size={self.attn_tp_size}, "
+                    f"state types {[st.value for st in block_scale_states]}."
+                )
+
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
@@ -1541,6 +1561,108 @@ class CommonKVManager(BaseKVManager):
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
+    def _get_mha_head_slice_blocks(
+        self,
+        src_ptrs: List[int],
+        src_item_lens: List[int],
+        dst_ptrs: List[int],
+        dst_item_lens: List[int],
+        src_page_indices: npt.NDArray[np.int32],
+        dst_page_indices: npt.NDArray[np.int32],
+        dst_attn_tp_size: int,
+        dst_tp_rank: int,
+    ) -> List[Tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], int]]:
+        # SWA state has no layer ids and its pool starts every PP stage at layer
+        # 0, so a prefill stage's entries cannot be paired with the decode layers.
+        if self.pp_size > 1:
+            raise RuntimeError(
+                "PD Disaggregation does NOT support PD different TP sizes for "
+                "non-MLA SWA hybrid models with pipeline parallelism yet."
+            )
+        # The addresses below assume NHD pages [page_size, heads, head_dim]; HND
+        # and vectorized_5d pages have the same size in another element order.
+        if self.kv_args.swa_kv_cache_layout != "nhd":
+            raise RuntimeError(
+                "Head-sliced PD transfer needs the NHD KV cache layout, got "
+                f"{self.kv_args.swa_kv_cache_layout}"
+            )
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            resolve_total_kv_heads,
+        )
+
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
+            self.get_mha_kv_ptrs_with_pp(src_ptrs, dst_ptrs)
+        )
+        _, _, dst_k_lens, dst_v_lens, _ = self.get_mha_kv_ptrs_with_pp(
+            src_item_lens, dst_item_lens
+        )
+        entries = list(
+            zip(
+                src_k_ptrs + src_v_ptrs,
+                dst_k_ptrs + dst_v_ptrs,
+                src_item_lens,
+                dst_k_lens + dst_v_lens,
+            )
+        )
+        # A single page-envelope region (unified memory) has no per-layer K/V
+        # split to slice heads from.
+        if len(entries) != len(src_ptrs) or 2 * num_layers != len(src_ptrs):
+            raise RuntimeError(
+                "Head-sliced PD transfer needs matching per-layer K/V buffers: "
+                f"prefill has {len(src_ptrs)} entries, decode has {len(dst_ptrs)}"
+            )
+        if len(src_page_indices) != len(dst_page_indices):
+            raise RuntimeError(
+                "Head-sliced PD transfer page count mismatch: "
+                f"prefill={len(src_page_indices)}, decode={len(dst_page_indices)}"
+            )
+
+        total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+        src_head_start, num_heads, dst_head_start, _ = compute_head_slice_params(
+            src_attn_tp_size=self.attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            src_tp_rank=self.kv_args.engine_rank,
+            dst_tp_rank=dst_tp_rank,
+            total_kv_heads=total_kv_heads,
+        )
+        src_heads = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads = max(1, total_kv_heads // dst_attn_tp_size)
+        page_size = self.kv_args.page_size
+        tokens = np.arange(page_size, dtype=np.uint64)
+        src_pages = np.asarray(src_page_indices, dtype=np.uint64)[:, None]
+        dst_pages = np.asarray(dst_page_indices, dtype=np.uint64)[:, None]
+
+        blocks = []
+        for src_ptr, dst_ptr, src_item_len, dst_item_len in entries:
+            head_len = src_item_len // (page_size * src_heads)
+            # Both peers must hold whole heads of one size, or this state is
+            # sharded differently from total_kv_head_num.
+            if (
+                head_len * page_size * src_heads != src_item_len
+                or head_len * page_size * dst_heads != dst_item_len
+            ):
+                raise RuntimeError(
+                    f"KV item lengths (prefill={src_item_len}, decode={dst_item_len}) "
+                    f"do not split into {src_heads} and {dst_heads} heads of "
+                    f"{total_kv_heads} total with page_size={page_size}"
+                )
+            # Each page item is [page_size, heads, head_dim]: one block per token.
+            src_addrs = (
+                np.uint64(src_ptr)
+                + src_pages * np.uint64(src_item_len)
+                + tokens * np.uint64(src_heads * head_len)
+                + np.uint64(src_head_start * head_len)
+            )
+            dst_addrs = (
+                np.uint64(dst_ptr)
+                + dst_pages * np.uint64(dst_item_len)
+                + tokens * np.uint64(dst_heads * head_len)
+                + np.uint64(dst_head_start * head_len)
+            )
+            blocks.append((src_addrs.ravel(), dst_addrs.ravel(), num_heads * head_len))
+        return blocks
+
     def get_mla_kv_ptrs_with_pp(
         self,
         src_kv_ptrs: List[int],
@@ -1566,8 +1688,16 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         # Decode pp size should be equal to prefill pp size or 1
-        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
+        num_draft = (
+            getattr(self.kv_args, "num_draft_entries", 0) if state_type is None else 0
+        )
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(
+            len(src_kv_ptrs) - num_draft
+        )
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if num_draft:
+            # Draft entries follow the target's global layer range on both peers.
+            sliced_dst_kv_ptrs += dst_kv_ptrs[-num_draft:]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:

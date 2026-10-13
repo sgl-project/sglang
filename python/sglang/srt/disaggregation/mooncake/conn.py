@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -364,6 +365,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
+                if length == 0:
+                    # DSA index-K elision gives every shared-topk layer a 0-row
+                    # buffer so the per-layer list stays layer-aligned. There is
+                    # nothing to register, and Mooncake rejects it outright:
+                    #   transfer_engine_impl.cpp: Transfer Engine does not
+                    #   support zero length memory region
+                    # kv_args keeps the entry, so peers still pair positionally.
+                    continue
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
@@ -832,6 +841,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"{state_type} decode published {len(dst_item_lens)} item "
                         f"lengths but paired entry dst[{j}] needs one"
                     )
+                if is_elided_entry(
+                    item_lens[i],
+                    dst_item_lens,
+                    j,
+                    allow_dst_elision=state_type == StateType.DSA,
+                ):
+                    # One peer elided this shared-topk layer's index-K (e.g. a
+                    # dense HiSparse decode); no bytes move, so no stride to match.
+                    continue
                 if item_lens[i] != dst_item_lens[j]:
                     return (
                         f"{state_type} item length mismatch for paired "
@@ -853,6 +871,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"lengths for this stage's {layers_current_pp_stage} entries"
             )
         for layer_id in range(layers_current_pp_stage):
+            if is_elided_entry(
+                item_lens[layer_id],
+                mapped_dst_lens,
+                layer_id,
+                allow_dst_elision=state_type == StateType.DSA,
+            ):
+                continue  # Elided by one peer; see the paired loop above.
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
                     f"{state_type} item length mismatch for positional "
@@ -1037,8 +1062,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
+                # An entry elided on either side moves no bytes and has no
+                # registered buffer to write into.
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                    for i, j in pairs
+                    if not is_elided_entry(
+                        item_lens[i],
+                        dst_item_lens,
+                        j,
+                        allow_dst_elision=state_type == StateType.DSA,
+                    )
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1046,6 +1080,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                mapped_dst_lens = None
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1053,6 +1092,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
+                    if not is_elided_entry(
+                        item_lens[layer_id],
+                        mapped_dst_lens,
+                        layer_id,
+                        allow_dst_elision=state_type == StateType.DSA,
+                    )
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
@@ -1275,14 +1320,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
-            assert compression_ratios is not None
-            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
-                start = self.kv_args.prefill_start_layer
-                end = self.kv_args.prefill_end_layer
-                assert end is not None
-                compression_ratios = compression_ratios[start:end]
-            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
-            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+            if compression_ratios is not None:
+                if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                    start = self.kv_args.prefill_start_layer
+                    end = self.kv_args.prefill_end_layer
+                    assert end is not None
+                    compression_ratios = compression_ratios[start:end]
+                host_backed_kv_count = sum(ratio == 4 for ratio in compression_ratios)
+            else:
+                # The remote target prefix is host-backed, even across PP stages;
+                # only the draft suffix uses logical device page IDs.
+                num_draft_entries = self.kv_args.num_draft_entries
+                if not 0 < num_draft_entries < len(dst_kv_ptrs):
+                    raise ValueError(
+                        "HiSparse spec PD transfer requires an appended device-only "
+                        "draft KV buffer"
+                    )
+                host_backed_kv_count = len(dst_kv_ptrs) - num_draft_entries
+            dst_device_kv_ptrs = set(dst_kv_ptrs[host_backed_kv_count:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -1966,12 +2021,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 )
-                if (
+                slice_kv_heads = (
                     has_heterogeneous_attn_tp
                     and not self.is_mla_backend
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
-                ):
+                )
+                if slice_kv_heads and st != StateType.SWA:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -2038,6 +2094,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if slice_kv_heads:
+                    rc = (
+                        self._send_swa_state_slice(
+                            req=req,
+                            prefill_swa_page_indices=src_indices,
+                            src_state_data_ptrs=src_data_ptrs,
+                            src_state_item_lens=src_item_lens,
+                            dst_state_data_ptrs=dst_data_ptrs,
+                            dst_swa_page_indices=dst_indices_local,
+                            dst_state_item_lens=dst_item_lens,
+                            dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                            dst_attn_tp_size=(
+                                target_rank_registration_info.dst_attn_tp_size
+                            ),
+                            executor=executor,
+                        )
+                        or rc
+                    )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -2291,6 +2366,49 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_swa_state_slice(
+        self,
+        req: TransferInfo,
+        prefill_swa_page_indices: List[int],
+        src_state_data_ptrs: List[int],
+        src_state_item_lens: List[int],
+        dst_state_data_ptrs: List[int],
+        dst_swa_page_indices: List[int],
+        dst_state_item_lens: List[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        blocks = self._get_mha_head_slice_blocks(
+            src_ptrs=src_state_data_ptrs,
+            src_item_lens=src_state_item_lens,
+            dst_ptrs=dst_state_data_ptrs,
+            dst_item_lens=dst_state_item_lens,
+            src_page_indices=np.asarray(prefill_swa_page_indices),
+            dst_page_indices=np.asarray(dst_swa_page_indices),
+            dst_attn_tp_size=dst_attn_tp_size,
+            dst_tp_rank=dst_tp_rank,
+        )
+        logger.warning_once(
+            "Using SWA state head-slice transfer for different attention TP sizes: "
+            f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
+        )
+        futures = [
+            executor.submit(
+                self._transfer_data,
+                req.mooncake_session_id,
+                list(
+                    zip(
+                        src_addrs.tolist(),
+                        dst_addrs.tolist(),
+                        [length] * src_addrs.size,
+                    )
+                ),
+            )
+            for src_addrs, dst_addrs, length in blocks
+        ]
+        return self._await_transfer_futures(futures)
 
     def _poison_unsettled_send(self, room: int) -> None:
         """Keep the drain ack from firing after a submitted transfer failed.
