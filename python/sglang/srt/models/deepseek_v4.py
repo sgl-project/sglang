@@ -4152,8 +4152,6 @@ class DeepseekV4Model(nn.Module):
             if cp_extend:
                 # N-gram hashing needs each token's predecessors, so hash the
                 # whole prompt before selecting this CP rank's interleaved rows.
-                # The hasher builds request-to-token indices dynamically; keep
-                # that work at an eager break during breakable graph capture.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
                 global_input_ids = forward_batch.input_ids[:total]
                 if is_in_breakable_cuda_graph():
