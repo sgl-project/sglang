@@ -104,3 +104,86 @@ def check_parallel_layout(sgld_options: dict) -> None:
 def check_sgld_options(sgld_options: dict) -> None:
     check_attention_backends(sgld_options)
     check_parallel_layout(sgld_options)
+
+
+# ===== Model-aware rules (run once the loader has resolved the model) =====
+
+H3_MODELS = ("minimax_h3", "fast_h3", "vdn_h3")
+_DISTILLED_H3 = ("fast_h3", "vdn_h3")
+_ATTENTION_BY_MODEL = {
+    "generic": ("fa", "torch_sdpa", "sage_attn", "sage_attn_3"),
+    "minimax_h3": (
+        "fa",
+        "torch_sdpa",
+        "sage_attn",
+        "sage_attn_3",
+        "subblock_sparse_attn",
+        "video_sparse_attn_h3",
+    ),
+    "fast_h3": ("fa", "torch_sdpa", "sage_attn", "video_sparse_attn_h3"),
+    "vdn_h3": ("hybrid_window_attn_h3",),
+}
+
+
+def _unsupported(feature: str, model_type: str) -> ValueError:
+    return ValueError(
+        f"{feature} is not supported for {model_type} in ComfyUI integrated mode yet"
+    )
+
+
+def check_model_options(
+    model_type: str, sgld_options: dict, *, native_dir: bool
+) -> None:
+    """Reject combinations the resolved model cannot run, instead of ignoring them."""
+    _check_execution(model_type, sgld_options)
+    _check_attention_for_model(model_type, sgld_options)
+    _check_weights(model_type, sgld_options, native_dir=native_dir)
+
+
+def _check_execution(model_type: str, opts: dict) -> None:
+    graph = opts.get("enable_breakable_cuda_graph")
+    if graph:
+        if model_type != "minimax_h3":
+            raise _unsupported("cuda_graph", model_type)
+        if opts.get("enable_cache_dit"):
+            raise ValueError("cuda_graph cannot be combined with enable_cache_dit")
+        if opts.get("dit_layerwise_offload"):
+            raise ValueError("cuda_graph cannot be combined with layerwise offload")
+    if model_type in _DISTILLED_H3:
+        if opts.get("enable_torch_compile") or graph:
+            raise ValueError(f"{model_type} requires execution_mode=eager")
+        if (opts.get("ring_degree") or 1) > 1:
+            raise ValueError(f"{model_type} requires ring_degree=1; use Ulysses")
+    if (
+        model_type == "minimax_h3"
+        and (opts.get("ring_degree") or 1) > 1
+        and opts.get("attention_backend", "fa") != "fa"
+    ):
+        raise ValueError("MiniMax H3 ring_degree > 1 requires attention_backend=fa")
+
+
+def _check_attention_for_model(model_type: str, opts: dict) -> None:
+    backend = opts.get("attention_backend")
+    if backend is None:
+        return
+    allowed = _ATTENTION_BY_MODEL.get(model_type, _ATTENTION_BY_MODEL["generic"])
+    if backend not in allowed:
+        raise ValueError(
+            f"attention_backend={backend} does not apply to {model_type}; "
+            f"choose auto or one of {list(allowed)}"
+        )
+
+
+def _check_weights(model_type: str, opts: dict, *, native_dir: bool) -> None:
+    if opts.get("quantization") and not native_dir:
+        raise ValueError(
+            "quantization (online, at load) applies to native model directories; "
+            "ComfyUI files carry their own format, so load a pre-quantized file "
+            "(e.g. *_int8_convrot) instead"
+        )
+    kernel = opts.get("int8_kernel", "auto")
+    if kernel != "auto" and model_type not in H3_MODELS:
+        raise ValueError(
+            f"int8_kernel={kernel} has no effect on {model_type}: only MiniMax H3 "
+            "runs ConvRot INT8 weights; leave it at auto"
+        )
