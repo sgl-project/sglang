@@ -249,10 +249,6 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # of the weights next to the device copy still being read from
             # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
             # and exhausted a GB10. Take the synchronous, pageable path there.
-            # XPU takes the sync path too: a non-blocking D2H into pageable host
-            # memory can reach the backend memcpy with a null argument and fail.
-            # This is an XPU runtime bug, not a "no prefetch stream" shortcut, so
-            # do not widen this to `not is_cuda()` or drop it.
             module.to(
                 "cpu",
                 non_blocking=not current_platform.device_shares_host_memory(),
