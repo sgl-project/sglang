@@ -957,8 +957,13 @@ class KimiK3MoE(nn.Module):
         The side stream is joined before returning. It is then free for the
         existing shared-expert overlap, which is deliberately issued later.
         """
+        allow_unmerged_overlap = (
+            is_ppu()
+            and self.use_latent_moe
+            and self.routed_expert_down_proj is not None
+        )
         if (
-            not self._ep_front_eligible
+            not (allow_unmerged_overlap or self._ep_front_eligible)
             or self.alt_stream is None
             or hidden_states.shape[0] == 0
         ):
@@ -966,7 +971,10 @@ class KimiK3MoE(nn.Module):
         from sglang.kernels.ops.moe import moe_front
 
         if (
-            moe_front.get_front_strategy(hidden_states.shape[0], hidden_states.device)
+            not allow_unmerged_overlap
+            and moe_front.get_front_strategy(
+                hidden_states.shape[0], hidden_states.device
+            )
             != "overlap"
         ):
             return None
@@ -1616,6 +1624,7 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
+            self._bfa_scale: Optional[torch.Tensor] = None
             if _is_hip:
                 # ROCm only: _merge_kda_inproj_weights_hip() may merge the
                 # whole [q,k,v,g | f_a | b] in-proj instead, making _bfa_w a
@@ -1838,9 +1847,9 @@ class KimiK3DeltaAttention(nn.Module):
 
         Called once from load_weights (after all weights are loaded, before
         cuda graph capture). Block-FP8 inputs are dequantized into the BF16
-        tiny-GEMM buffers here; any other quantized or mixed-dtype
-        checkpoints keep the unfused path so the quant_method (scales,
-        packed layouts, etc.) is respected."""
+        tiny-GEMM buffers here; serialized per-channel FP8 uses a scaled
+        fused GEMM. Other quantized or mixed-dtype checkpoints keep the
+        unfused path so the quant_method (scales, packed layouts) is respected."""
         if not self.use_full_rank_gate:
             return
         if _is_npu:
@@ -1849,6 +1858,8 @@ class KimiK3DeltaAttention(nn.Module):
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
             self._bfa_f_b_w = self.f_b_proj.weight
+            return
+        if self.use_fused_input_projection and self._merge_scaled_bfa_weights():
             return
         if self.use_fused_input_projection:
             mods = [self.fused_qkvg_proj, self.f_a_proj, self.b_proj]
@@ -1932,6 +1943,41 @@ class KimiK3DeltaAttention(nn.Module):
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
+
+    def _merge_scaled_bfa_weights(self) -> bool:
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+        modules = [self.fused_qkvg_proj, self.f_a_proj, self.b_proj]
+        for layer in modules:
+            if (
+                not isinstance(layer.quant_method, W8A8Fp8LinearMethod)
+                or not layer.quant_method.quantization_config.is_checkpoint_fp8_serialized
+                or layer.weight.dtype != torch.float8_e4m3fn
+                or layer.weight_scale.numel() != layer.weight.shape[1]
+            ):
+                return False
+
+        # W8A8Fp8LinearMethod stores loaded weights in (K, N) order.
+        weights = [layer.weight.t() for layer in modules]
+        sizes = [weight.shape[0] for weight in weights]
+        scales = [layer.weight_scale.reshape(-1, 1) for layer in modules]
+        padding = (-sum(sizes)) % 128
+        if padding:
+            weights.append(weights[0].new_zeros((padding, weights[0].shape[1])))
+            scales.append(scales[0].new_ones((padding, 1)))
+
+        self._bfa_w = torch.cat(weights, dim=0).contiguous()
+        self._bfa_scale = torch.cat(scales, dim=0).contiguous()
+        self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
+        offset = 0
+        for layer, size in zip(modules, sizes):
+            weight = self._bfa_w[offset : offset + size]
+            layer.weight.data = weight.t()
+            layer.weight_scale.data = self._bfa_scale[offset : offset + size].view_as(
+                layer.weight_scale
+            )
+            offset += size
+        return True
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -2044,7 +2090,30 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
-            if self._bfa_w is not None:
+            if self._bfa_scale is not None and hidden_states.dtype == torch.bfloat16:
+                from sglang.srt.layers.deep_gemm_wrapper import gemm_nt_f8f8bf16
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    sglang_per_token_quant_fp8,
+                )
+
+                fused = hidden_states.new_empty(
+                    (hidden_states.shape[0], self._bfa_w.shape[0])
+                )
+                gemm_nt_f8f8bf16(
+                    sglang_per_token_quant_fp8(hidden_states),
+                    (self._bfa_w, self._bfa_scale),
+                    fused,
+                )
+                qkv_end, qkvg_end = self.split_sizes[0], sum(self.split_sizes)
+                f_a_end = qkvg_end + self._bfa_fa_size
+                forget_gate = self.f_b_proj(fused[:, qkvg_end:f_a_end].contiguous())[0]
+                return (
+                    fused[:, :qkv_end],
+                    fused[:, f_a_end : f_a_end + self._bfa_b_size],
+                    forget_gate,
+                    fused[:, qkv_end:qkvg_end],
+                )
+            if self._bfa_w is not None and self._bfa_scale is None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
