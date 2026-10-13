@@ -130,7 +130,7 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     elif is_musa_runtime():
-        return ["-DUSE_MUSA", "-std=c++20", "-O3"]
+        return ["-DUSE_MUSA", f"-std={musa_cxx_standard()}", "-O3"]
     else:
         if arch is None:
             arch = get_jit_cuda_arch()
@@ -140,6 +140,34 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+
+
+@cache_once
+def musa_cxx_standard() -> str:
+    """Select C++20 only when the resolved MUSA compiler advertises LLVM 20+."""
+    # Keep compiler path resolution in the MUSA toolchain owner. A probe failure
+    # is deliberately conservative: the C++17 compatibility branches remain
+    # usable with older mcc versions and unknown compiler wrappers.
+    from sglang.kernels.jit.utils.compile import toolchain
+
+    compiler = toolchain.device_compiler_path()
+    try:
+        output = subprocess.check_output(
+            [compiler, "--version"], text=True, stderr=subprocess.STDOUT
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.warning(
+            "Cannot probe MUSA compiler `%s`; using C++17: %s", compiler, error
+        )
+        return "c++17"
+
+    match = re.search(r"(?:clang|llvm)(?:\s+version)?\s+(\d+)", output, re.IGNORECASE)
+    if match is None:
+        logger.warning(
+            "Cannot parse MUSA compiler `%s --version`; using C++17", compiler
+        )
+        return "c++17"
+    return "c++20" if int(match.group(1)) >= 20 else "c++17"
 
 
 def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:

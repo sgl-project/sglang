@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_default_target_flags
-from sglang.kernels.jit.utils.common import is_hip_runtime
+from sglang.kernels.jit.utils.arch import get_default_target_flags, musa_cxx_standard
+from sglang.kernels.jit.utils.common import is_hip_runtime, is_musa_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
@@ -101,13 +101,17 @@ def load_jit(
         includes += REGISTERED_DEPENDENCIES[dep]()
 
     module_args = tuple(str(arg) for arg in args)
+    cflags = DEFAULT_CFLAGS
+    if is_musa_runtime():
+        cflags = [f"-std={musa_cxx_standard()}", *DEFAULT_CFLAGS[1:]]
+
     spec = BuildSpec(
         module_args=module_args,
         cpp_files=resolve_sources(cpp_files),
         cuda_files=resolve_sources(cuda_files),
         cpp_wrappers=tuple(cpp_wrappers or ()),
         cuda_wrappers=tuple(cuda_wrappers or ()),
-        cflags=tuple(DEFAULT_CFLAGS + (extra_cflags or [])),
+        cflags=tuple(cflags + (extra_cflags or [])),
         cuda_cflags=tuple(get_default_target_flags() + (extra_cuda_cflags or [])),
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
