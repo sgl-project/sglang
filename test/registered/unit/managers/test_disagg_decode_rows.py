@@ -83,7 +83,6 @@ def _plan_scheduler(prebuilt_reqs):
     s.chunked_req = None
     s.enable_hisparse = False
     s.last_batch = None
-    s.disagg_decode_launches_copy = False
     s.get_next_disagg_decode_batch_to_run = MethodType(
         SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run, s
     )

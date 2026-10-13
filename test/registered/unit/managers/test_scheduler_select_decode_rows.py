@@ -65,7 +65,7 @@ class _AdmitAllAdder:
         return AddReqResult.CONTINUE
 
 
-def _mixed_scheduler(running_batch, rows_join_at_launch=True):
+def _mixed_scheduler(running_batch, rows_join_before_plan=True):
     s = MagicMock()
     s.select_decode_rows = MethodType(Scheduler.select_decode_rows, s)
     s.admission_skip_reason = MethodType(Scheduler.admission_skip_reason, s)
@@ -84,8 +84,7 @@ def _mixed_scheduler(running_batch, rows_join_at_launch=True):
     s.get_num_allocatable_reqs.return_value = 8
     s.is_mixed_chunk = True
     s.enable_overlap = True
-    s.rows_join_at_launch = rows_join_at_launch
-    s.disagg_decode_launches_copy = False
+    s.rows_join_before_plan = rows_join_before_plan
     s.tp_worker.model_runner.prefill_aware_swa = False
     # Lets a mutant that retracts run to completion and reach the asserts.
     s.decode_offload_manager = None
@@ -161,8 +160,7 @@ class TestMixedStepKeepsDecodeRows(CustomTestCase):
         self.assertIs(plan.running_batch, running_batch)
         reader = SimpleNamespace(
             running_batch=decoding_batch.rows,
-            rows_join_at_launch=True,
-            disagg_decode_launches_copy=False,
+            rows_join_before_plan=True,
             inflight_steps=InflightQueue(depth=0),
             chunked_req=None,
             enable_continuous_input_polling=False,
@@ -175,7 +173,7 @@ class TestMixedStepKeepsDecodeRows(CustomTestCase):
 
     def test_a_loop_joining_at_the_next_plan_parks_the_rows(self):
         running_batch = _running_batch(fits=True)
-        s = _mixed_scheduler(running_batch, rows_join_at_launch=False)
+        s = _mixed_scheduler(running_batch, rows_join_before_plan=False)
         decoding_batch = DecodingBatch(running_batch)
 
         plan = _plan_mixed(

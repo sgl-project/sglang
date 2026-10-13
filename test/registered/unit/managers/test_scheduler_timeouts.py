@@ -79,8 +79,8 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
-    s.rows_join_at_launch = False
-    s.disagg_decode_launches_copy = False
+    s.rows_join_before_plan = False
+    s.disaggregation_mode = DisaggregationMode.NULL
     return s
 
 

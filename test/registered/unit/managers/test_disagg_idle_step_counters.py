@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -502,8 +503,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.rows_join_at_launch = False
-        scheduler.disagg_decode_launches_copy = False
+        scheduler.rows_join_before_plan = False
+        scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.recv_skipper = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
@@ -546,6 +547,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.enable_overlap = False
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        # The batches here carry no row tensors; these tests read idle step
+        # counters, not the running rows.
+        scheduler._pp_update_rows_at_commit = Mock()
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()

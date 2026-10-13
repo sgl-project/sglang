@@ -1,13 +1,12 @@
-"""Finished running rows leave at the top of the next plan: before admission,
-and in the pipeline PD decode loop before its prebuilt join. Under a loop that
-joins at the next plan, the step launched last, which readers between steps
-see as last_batch, drops them at that plan too. The PD decode normal and
-overlap loops drop them at the commit instead (test_disagg_decode_rows.py)."""
+"""Finished running rows leave at the top of the next plan, before admission.
+The step launched last, which readers between steps see as last_batch, drops
+them at that plan too. The PD decode loops and the pipeline loops drop them at
+the commit instead (test_disagg_decode_rows.py, test_scheduler_pp_slot_rows.py)."""
 
 import copy
 import unittest
-from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel, published_topology
@@ -82,8 +81,7 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
-        s.rows_join_at_launch = False
-        s.disagg_decode_launches_copy = False
+        s.rows_join_before_plan = False
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
@@ -216,31 +214,6 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
         # readers do not list the prefill step.
         step = _Batch([_Req("a")], extend=True)
         self.assertEqual(self._run(rows=[], first_step=step), [True])
-
-
-class TestLeaveBeforePPDecodePrebuiltJoin(unittest.TestCase):
-    def test_pp_prebuilt_join_sees_only_live_rows(self):
-        # The PP loop runs up to the plan of its first slot; the mocked
-        # init_pp_loop_state leaves the slot state set here.
-        s = MagicMock()
-        s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
-        s.pp_loop_size = 1
-        s.decoding_batches = [
-            DecodingBatch(_Batch([_Req("a"), _Req("b", True), _Req("c")]))
-        ]
-        s.last_mbs = [None]
-        seen = []
-
-        def get_next_disagg_decode_batch_to_run(decoding_batch):
-            seen.append(_rids(decoding_batch.rows))
-            raise _StopLoop
-
-        s.get_next_disagg_decode_batch_to_run.side_effect = (
-            get_next_disagg_decode_batch_to_run
-        )
-        with published_topology(role="scheduler"), self.assertRaises(_StopLoop):
-            Scheduler.event_loop_pp_disagg_decode(s)
-        self.assertEqual(seen, [["a", "c"]])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -524,8 +525,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
-        scheduler.rows_join_at_launch = False
-        scheduler.disagg_decode_launches_copy = False
+        scheduler.rows_join_before_plan = False
+        scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
         scheduler.running_mbs = []
