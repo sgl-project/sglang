@@ -167,6 +167,8 @@ if enable_fp8:
 include_dirs = [
     str(root / "include"),
     str(root / "csrc"),
+    # Speculative device kernels are shared with the JIT launchers.
+    str(root.parent / "jit" / "include"),
     str(_CUTLASS_DIR / "include"),
     str(_CUTLASS_DIR / "tools" / "util" / "include"),
     str(_FLASHINFER_REPO.source_dir / "include"),
