@@ -796,6 +796,29 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+    # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
+    # backend onto the tail metadata of the *live* batch (the captured args hold
+    # the capture-time batch). The sentinel keeps the break in the replay sequence.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
+    return sentinel
+
+
+def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
+    return sentinel
+
+
+bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
+    deepseek_v4_enter_late_layer_tail
+)
+bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
+    deepseek_v4_exit_late_layer_tail
+)
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -3919,6 +3942,12 @@ def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
+    if tail.scatter_indices is not None:
+        # Prefill CUDA graph: fixed-capacity tail block; padding rows land on the
+        # dummy row past the extend and are dropped by the slice.
+        full = rows.new_zeros((num_tokens + 1, rows.shape[1]))
+        full.index_copy_(0, tail.scatter_indices, rows)
+        return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
         full[tail.contiguous_start :].copy_(rows)
@@ -4181,6 +4210,12 @@ class DeepseekV4Model(nn.Module):
                     else hidden_states.shape[0]
                 ),
             )
+        tail_in_graph = (
+            tail is not None
+            and tail.scatter_indices is not None
+            and is_in_breakable_cuda_graph()
+        )
+        tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4190,7 +4225,14 @@ class DeepseekV4Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
-                saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                if tail_in_graph:
+                    # Eager break: re-run at replay so the backend swaps onto the
+                    # live batch's tail metadata; the gathers below are captured
+                    # against the persistent index buffers.
+                    tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
+                    saved_full = attn_backend.prefill_graph_late_layer_saved
+                else:
+                    saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
                 input_ids, input_ids_global = (
                     tail.rows(input_ids),
@@ -4262,7 +4304,10 @@ class DeepseekV4Model(nn.Module):
         if saved_dp is not None:
             _exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
-            attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+            if tail_in_graph:
+                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+            else:
+                attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
 
@@ -4880,6 +4925,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
+            if tail.real_rows_count is not None:
+                # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
+                n = tail.real_rows_count
+                input_ids = input_ids[:n]
+                hidden_states = hidden_states[:n]
+                pre_hc_head = pre_hc_head[:n]
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [a[:n] for a in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -4896,7 +4949,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = (
+                tail.token_indices[: tail.real_rows_count]
+                if tail.real_rows_count is not None
+                else tail.token_indices
+            )
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

@@ -338,10 +338,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     if cfg.enable_decoder_swa_bounded_replay:
         # Late layers see a per-request tail slice, not the captured prefill shape.
+        # The breakable backend is admitted: the tail switch runs as eager breaks and
+        # the tail is a fixed-capacity row block inside the captured segments.
         incompatible = (
             (
                 "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
             # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
             # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
