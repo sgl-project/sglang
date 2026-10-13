@@ -85,7 +85,7 @@ concurrency:
 
 jobs:
   e2e:
-    name: ${{ inputs.test_suite }}
+    name: ${{ inputs.test_suite }}${{ inputs.use_coverage_runner && format(' ({0})', matrix.partition) || '' }}
     strategy:
       fail-fast: false
       matrix:
