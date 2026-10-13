@@ -136,6 +136,7 @@ class _StubTokenToKVPool:
     """
 
     _unified_page_views = DeepSeekV4TokenToKVPool._unified_page_views
+    _unified_compress_owners = DeepSeekV4TokenToKVPool._unified_compress_owners
     unified_region_buffers = DeepSeekV4TokenToKVPool.unified_region_buffers
     unified_rope_region_buffers = DeepSeekV4TokenToKVPool.unified_rope_region_buffers
 
