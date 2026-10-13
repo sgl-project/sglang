@@ -20,6 +20,8 @@ class TestDsv4Bf16Fp32GemmXpu(CustomTestCase):
         cls.device = torch.device("xpu")
 
     def test_matches_fp32_reference_without_materializing_inputs(self):
+        """On XPU the helper took the fp32 fallback, which copied the bf16
+        weight to fp32 on every call, instead of one fused out_dtype=fp32 mm."""
         torch.manual_seed(0)
         x = torch.randn(1, 256, device=self.device, dtype=torch.bfloat16)
         weight = torch.randn(128, 256, device=self.device, dtype=torch.bfloat16)
