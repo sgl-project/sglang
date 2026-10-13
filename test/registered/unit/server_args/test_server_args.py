@@ -3678,18 +3678,17 @@ class TestGrpcServerArgs(CustomTestCase):
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):
-    """Non-EP DP two-batch-overlap backend requirement.
-
-    With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
-    is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
-    all_gatherv / reduce_scatterv with the other ubatch's compute), which
-    requires attention DP (--attn-dp-size). This replaced the removed opt-in
-    SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
-
-    dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestWaterfillArgs)."""
+    """Non-EP TBO accepts attention DP or interleave prefill CP."""
 
     def _args(self, **overrides):
+        self.enterContext(
+            patch(
+                "sglang.srt.arg_groups.validation_hook.model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v4")
+                ),
+            )
+        )
         args = ServerArgs(model_path="dummy")
         args.enable_two_batch_overlap = True
         args.moe_a2a_backend = "none"
@@ -3713,6 +3712,35 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
+
+    def test_interleave_cp_tbo_ok_without_dp_attention(self):
+        args = self._args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=4,
+            dp_size=1,
+        )
+        check_two_batch_overlap(args)
+
+    def test_non_interleave_cp_still_requires_dp_attention(self):
+        args = self._args(
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=4,
+            dp_size=1,
+        )
+        with self.assertRaisesRegex(ValueError, "attn-dp-size"):
+            check_two_batch_overlap(args)
+
+    def test_cp_tbo_rejects_dp_size_greater_than_one(self):
+        args = self._args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=4,
+            dp_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "attn-dp-size"):
+            check_two_batch_overlap(args)
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):

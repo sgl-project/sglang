@@ -11,9 +11,11 @@ it. CPU-only.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.batch_overlap import two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -79,6 +81,9 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertIsNone(child.forward_metadata_planned_bs)
         self.assertIsNone(child.forward_metadata_planned_num_tokens)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+        self.assertIsNone(child.tbo_cp_local_token_range)
+        self.assertIsNone(child.tbo_cp_subbatch_index)
+        self.assertIsNone(child.tbo_cp_children_ready)
 
     def test_a_rebound_parent_hands_its_mark_to_the_child(self):
         parent = _make_target_verify_batch(8)
@@ -115,6 +120,29 @@ class TestTboFilterBatchMarker(CustomTestCase):
         parent.aux_hidden_states_buffer = torch.empty(8, 12)
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child.aux_hidden_states_buffer)
+
+    def test_sequence_metadata_follows_child_sequence_range(self):
+        parent = _make_target_verify_batch(3)
+        parent.orig_seq_lens = torch.tensor([101, 202, 303], dtype=torch.int32)
+
+        # An in-sequence two-chunk split includes the shared sequence in both
+        # children. Each child must retain its own sequence slice, while the
+        # pre-shortening parent lengths remain available to strict SWA capture.
+        child_a = _filter(parent, lo=0, hi=2)
+        child_b = _filter(parent, lo=1, hi=3)
+
+        self.assertTrue(
+            torch.equal(
+                child_a.orig_seq_lens,
+                torch.tensor([101, 202], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                child_b.orig_seq_lens,
+                torch.tensor([202, 303], dtype=torch.int32),
+            )
+        )
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
@@ -184,6 +212,35 @@ class TestTboFilterBatchOnRegistryView(CustomTestCase):
             )
         # filter_batch still resets the plan marker on the child.
         self.assertFalse(view_child.forward_metadata_ready)
+
+
+class TestCpTboOutputMerge(CustomTestCase):
+    def test_merge_uses_cp_local_token_ranges(self):
+        output_a = {
+            "hidden_states": torch.tensor([[1.0], [2.0]]),
+            "residual": None,
+            "forward_batch": SimpleNamespace(tbo_cp_local_token_range=(0, 2)),
+        }
+        output_b = {
+            "hidden_states": torch.tensor([[3.0], [4.0], [5.0]]),
+            "residual": None,
+            "forward_batch": SimpleNamespace(tbo_cp_local_token_range=(2, 5)),
+        }
+
+        hidden_states = tbo._model_forward_tbo_merge_key(
+            output_a,
+            output_b,
+            name="hidden_states",
+            original_len=5,
+            token_range_field="tbo_cp_local_token_range",
+        )
+
+        self.assertTrue(
+            torch.equal(
+                hidden_states,
+                torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]]),
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+PreparedIndexer: TypeAlias = Tuple[IndexerQuery, torch.Tensor]
 
 
 _arange_cache = {}
@@ -739,6 +740,30 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def prepare_c4_indexer(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+    ) -> PreparedIndexer:
+        """Prepare the local indexer query while deferring its compressor."""
+        metadata = self.forward_metadata
+        positions = metadata.core_metadata.positions
+        if c4_indexer.use_fp4_indexer and is_hip():
+            widened = getattr(metadata, "fp4_q_positions", None)
+            if widened is not None and widened.shape == positions.shape:
+                positions = widened
+        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+        return self._forward_prepare_normal(
+            x=x[:num_queries],
+            q_lora=q_lora[:num_queries],
+            c4_indexer=c4_indexer,
+            positions=positions[:num_queries],
+            forward_batch=forward_batch,
+            skip_compressor=True,
+        )
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -749,6 +774,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        prepared: Optional[PreparedIndexer] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -765,39 +791,44 @@ class C4IndexerBackendMixin:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
         use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
 
-        positions = core_metadata.positions
-        if use_aiter_fp4:
-            widened = getattr(metadata, "fp4_q_positions", None)
-            if widened is not None and widened.shape == positions.shape:
-                positions = widened
-        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
-        if x.shape[0] != num_queries:
-            x = x[:num_queries]
-        if q_lora.shape[0] != num_queries:
-            q_lora = q_lora[:num_queries]
-        if positions.shape[0] != num_queries:
-            positions = positions[:num_queries]
-
-        if enable_multi_stream:
-            q_indexer, weights = self._forward_prepare_multi_stream(
-                x=x,
-                q_lora=q_lora,
-                c4_indexer=c4_indexer,
-                positions=positions,
-                forward_batch=forward_batch,
-                alt_streams=alt_streams,
-                q_lora_ready=q_lora_ready,
-            )
-        else:
+        if prepared is not None:
+            assert not enable_multi_stream
             assert q_lora_ready is None
-            q_indexer, weights = self._forward_prepare_normal(
-                x=x,
-                q_lora=q_lora,
-                c4_indexer=c4_indexer,
-                positions=positions,
-                forward_batch=forward_batch,
-                skip_compressor=skip_compressor,
-            )
+            q_indexer, weights = prepared
+        else:
+            positions = core_metadata.positions
+            if use_aiter_fp4:
+                widened = getattr(metadata, "fp4_q_positions", None)
+                if widened is not None and widened.shape == positions.shape:
+                    positions = widened
+            num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+            if x.shape[0] != num_queries:
+                x = x[:num_queries]
+            if q_lora.shape[0] != num_queries:
+                q_lora = q_lora[:num_queries]
+            if positions.shape[0] != num_queries:
+                positions = positions[:num_queries]
+
+            if enable_multi_stream:
+                q_indexer, weights = self._forward_prepare_multi_stream(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=c4_indexer,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    alt_streams=alt_streams,
+                    q_lora_ready=q_lora_ready,
+                )
+            else:
+                assert q_lora_ready is None
+                q_indexer, weights = self._forward_prepare_normal(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=c4_indexer,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    skip_compressor=skip_compressor,
+                )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 

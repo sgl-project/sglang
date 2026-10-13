@@ -1379,6 +1379,16 @@ class GroupCoordinator:
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
+    def cp_all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
+    ):
+        """Launch a CP all-gather without synchronizing the caller's stream."""
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            self.all_gather_into_tensor(output, input)
+        else:
+            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+
     def all_gather(
         self,
         input_: torch.Tensor,

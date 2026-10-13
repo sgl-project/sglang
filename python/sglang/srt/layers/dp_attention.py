@@ -1176,6 +1176,7 @@ def dp_gather_partial_async(
 # HSA_STATUS_ERROR_OUT_OF_RESOURCES at large prefill chunks, even though the live
 # (allocated) working set was only ~10GB.
 _TBO_PERSIST_BUF: dict = {}
+_TBO_PERSIST_TENSOR: dict = {}
 
 
 def get_tbo_persistent_buffer(
@@ -1191,6 +1192,24 @@ def get_tbo_persistent_buffer(
         buf = torch.empty((new_rows, hidden), dtype=dtype, device=device)
         _TBO_PERSIST_BUF[key] = buf
     return buf[:rows]
+
+
+def get_tbo_persistent_tensor(key, shape, dtype: torch.dtype, device) -> torch.Tensor:
+    """Return an arbitrary-shaped view of a grow-only TBO scratch buffer."""
+    shape = tuple(shape)
+    required_numel = 1
+    for dim in shape:
+        required_numel *= dim
+
+    buf = _TBO_PERSIST_TENSOR.get(key)
+    same_layout = (
+        buf is not None and buf.dtype == dtype and buf.device == torch.device(device)
+    )
+    capacity = buf.numel() if same_layout else 0
+    if buf is None or not same_layout or required_numel > capacity:
+        buf = torch.empty(required_numel, dtype=dtype, device=device)
+        _TBO_PERSIST_TENSOR[key] = buf
+    return buf[:required_numel].view(shape)
 
 
 def dp_reduce_scatterv_async(
