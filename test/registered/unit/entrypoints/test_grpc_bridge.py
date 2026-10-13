@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -193,22 +192,6 @@ class TestServerInfo(CustomTestCase):
 
                 self.assertEqual(info["model_path"], "model")
                 self.assertEqual(info["grpc_features"], features)
-
-
-class TestTokenizedMultimodalShape(CustomTestCase):
-    def test_nested_media_reaches_every_parallel_sample(self):
-        """The Rust bridge nests media lists for n > 1; every sample keeps all items."""
-        for media in (
-            {"image_data": [["a.png", "b.png"]], "mm_hashes": [["00aa", "00bb"]]},
-            {"video_data": [["v1.mp4", "v2.mp4"]], "audio_data": [["a1.wav"]]},
-        ):
-            obj = GenerateReqInput(
-                input_ids=[1, 2, 3], sampling_params={"n": 2}, **media
-            )
-            obj.normalize_batch_and_arguments()
-            for sample in (obj[0], obj[1]):
-                for name, lists in media.items():
-                    self.assertEqual(getattr(sample, name), lists[0])
 
 
 if __name__ == "__main__":

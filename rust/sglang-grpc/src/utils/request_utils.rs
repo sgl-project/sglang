@@ -326,27 +326,25 @@ pub(crate) fn build_generate_dict(
     rid: &str,
     req: &proto::GenerateRequest,
 ) -> Result<HashMap<String, serde_json::Value>, String> {
-    // GenerateReqInput matches mm_hashes to all items when n = 1 and to images when n > 1,
-    // so only image-only requests give them one meaning.
+    // TokenizerManager pairs mm_hashes with all media items in order, while GenerateReqInput
+    // counts them against images when n > 1; only image-only requests satisfy both.
     if !req.mm_hashes.is_empty()
         && (req.mm_hashes.len() != req.image_data.len()
             || !req.video_data.is_empty()
-            || !req.audio_data.is_empty())
+            || !req.audio_data.is_empty()
+            || req
+                .mm_hashes
+                .iter()
+                .any(|hash| hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit())))
     {
         return Err(
-            "mm_hashes needs one entry per image_data entry and no video_data or audio_data".into(),
+            "mm_hashes needs one hex entry per image_data entry and no video_data or audio_data"
+                .into(),
         );
     }
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
-    // GenerateReqInput turns an n > 1 request into a batch of one prompt,
-    // and a batch takes one multimodal list per prompt.
-    let parallel = req
-        .sampling_params
-        .as_ref()
-        .and_then(|params| params.n)
-        .is_some_and(|n| n > 1);
     for (name, values) in [
         ("image_data", &req.image_data),
         ("video_data", &req.video_data),
@@ -354,12 +352,7 @@ pub(crate) fn build_generate_dict(
         ("mm_hashes", &req.mm_hashes),
     ] {
         if !values.is_empty() {
-            let value = if parallel {
-                serde_json::json!([values])
-            } else {
-                serde_json::json!(values)
-            };
-            d.insert(name.into(), value);
+            d.insert(name.into(), serde_json::json!(values));
         }
     }
     d.insert(
@@ -740,34 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn tokenized_multimodal_request_nests_inputs_for_parallel_sampling() {
-        let request = proto::GenerateRequest {
-            input_ids: vec![2, 10, 20],
-            image_data: vec!["https://x/a.png".to_string(), "https://x/b.png".to_string()],
-            video_data: vec!["https://x/v.mp4".to_string()],
-            sampling_params: Some(proto::SamplingParams {
-                n: Some(2),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let mapped = build_generate_dict("request", &request).unwrap();
-
-        assert_eq!(
-            mapped["image_data"],
-            serde_json::json!([["https://x/a.png", "https://x/b.png"]])
-        );
-        assert_eq!(
-            mapped["video_data"],
-            serde_json::json!([["https://x/v.mp4"]])
-        );
-        assert!(!mapped.contains_key("audio_data"));
-    }
-
-    #[test]
     fn tokenized_image_request_forwards_one_mm_hash_per_image() {
-        let mut request = proto::GenerateRequest {
+        let request = proto::GenerateRequest {
             input_ids: vec![2, 10, 20],
             image_data: vec!["https://x/a.png".to_string(), "https://x/b.png".to_string()],
             mm_hashes: vec![
@@ -782,22 +749,17 @@ mod tests {
             mapped["mm_hashes"],
             serde_json::json!(["00112233aabbccdd", "ffeeddcc44332211"])
         );
-
-        request.sampling_params = Some(proto::SamplingParams {
-            n: Some(2),
-            ..Default::default()
-        });
-        let mapped = build_generate_dict("request", &request).unwrap();
-        assert_eq!(
-            mapped["mm_hashes"],
-            serde_json::json!([["00112233aabbccdd", "ffeeddcc44332211"]])
-        );
     }
 
     #[test]
-    fn mm_hashes_require_one_entry_per_image_and_no_other_media() {
+    fn mm_hashes_require_one_hex_entry_per_image_and_no_other_media() {
         let hashes = |count| vec!["00112233aabbccdd".to_string(); count];
         let requests = [
+            proto::GenerateRequest {
+                image_data: vec!["https://x/a.png".to_string()],
+                mm_hashes: vec!["zz".to_string()],
+                ..Default::default()
+            },
             proto::GenerateRequest {
                 image_data: vec!["https://x/a.png".to_string()],
                 mm_hashes: hashes(2),

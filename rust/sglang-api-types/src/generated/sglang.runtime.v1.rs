@@ -177,7 +177,8 @@ pub struct GenerateRequest {
     pub video_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "21")]
     pub audio_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Hex hashes, one per image_data entry; see GenerateReqInput.mm_hashes.
+    /// Hex hashes, one per image_data entry, in requests without video_data or audio_data.
+    /// Each hash becomes the image's cache identity, so it must identify the image bytes.
     #[prost(string, repeated, tag = "22")]
     pub mm_hashes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }

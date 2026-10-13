@@ -139,7 +139,8 @@ message GenerateRequest {
   repeated string image_data = 19;
   repeated string video_data = 20;
   repeated string audio_data = 21;
-  // Hex hashes, one per image_data entry; see GenerateReqInput.mm_hashes.
+  // Hex hashes, one per image_data entry, in requests without video_data or audio_data.
+  // Each hash becomes the image's cache identity, so it must identify the image bytes.
   repeated string mm_hashes = 22;
 }
 
