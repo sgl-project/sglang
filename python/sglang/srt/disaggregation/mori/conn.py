@@ -977,14 +977,19 @@ class MoriKVManager(CommonKVManager):
         for target in targets:
             peer = target.peer_info
             uid = self.engine.allocate_transfer_uid()
-            submitted = self.engine.batch_write(
-                [self._fabric_staging_descs[worker_index]],
-                [[0]],
-                [peer.dst_staging_mem_descs[worker_index]],
-                [[0]],
-                [[required]],
-                [uid],
-            )
+            with self.transfer_lock:
+                if self._stopped or self._should_skip_transfer(room):
+                    raise _MoriTransferSubmissionError(
+                        f"Fabric staging write cancelled for room={room}", statuses
+                    )
+                submitted = self.engine.batch_write(
+                    [self._fabric_staging_descs[worker_index]],
+                    [[0]],
+                    [peer.dst_staging_mem_descs[worker_index]],
+                    [[0]],
+                    [[required]],
+                    [uid],
+                )
             statuses.extend(submitted)
             self._record_submitted_statuses(submitted)
 
@@ -1655,7 +1660,8 @@ class MoriKVManager(CommonKVManager):
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mori-side registrations / sockets / engine are released.
         """
-        self._stopped = True
+        with self.transfer_lock:
+            self._stopped = True
         # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
         # timeout; push a None sentinel per shard to wake and stop them so the
         # join below returns instead of leaking the thread.

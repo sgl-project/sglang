@@ -669,6 +669,65 @@ class TestMoriFabricStaging(CustomTestCase):
         self.assertEqual([reply[6] for reply in replies], [b"0", b"0"])
         self.assertEqual(scatter.call_count, 1)
 
+    def test_abort_after_gather_stops_further_fabric_writes(self):
+        """Cancellation must stop later writes and drain any already submitted."""
+        for phase in ("gather", "between_targets"):
+            with self.subTest(phase=phase):
+                manager, _, _, storage = self.ready_fixture()
+                manager._fabric_staging_generations = [0]
+                manager._fabric_staging_descs = [object()]
+                info = manager.transfer_infos[11]["decode"]
+                info.dst_staging_epoch = b"epoch"
+                manager.transfer_infos[11] = {"decode": info, "second": info}
+                peer = manager.decode_kv_args_table["decode"]
+                peer.decode_tp_rank = 0
+                manager.decode_kv_args_table["second"] = types.SimpleNamespace(
+                    **{**vars(peer), "decode_tp_rank": 1}
+                )
+                status = MagicMock()
+                manager.engine = MagicMock()
+
+                def write(*args):
+                    self.assertNotEqual(manager.request_status[11], KVPoll.Failed)
+                    return [status]
+
+                manager.engine.batch_write.side_effect = write
+
+                def abort():
+                    manager._handle_abort_message(_abort_message())
+
+                def allocate_uid():
+                    if manager.engine.batch_write.call_count:
+                        abort()
+                    return 1
+
+                stream = manager._fabric_staging_buffers[0].get_gather_stream()
+                if phase == "gather":
+                    stream.synchronize.side_effect = abort
+                else:
+                    manager.engine.allocate_transfer_uid.side_effect = allocate_uid
+                chunk = _chunk()
+                manager._mark_transfer_started(chunk)
+                with (
+                    patch("torch.cuda.default_stream"),
+                    patch("torch.cuda.stream"),
+                    patch(
+                        "sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack"
+                    ),
+                    self.assertRaisesRegex(
+                        _MoriTransferSubmissionError, "cancelled"
+                    ) as raised,
+                ):
+                    manager._process_fabric_staging_chunk(chunk, 0)
+                submitted = [] if phase == "gather" else [status]
+                self.assertEqual(raised.exception.statuses, submitted)
+                self.assertEqual(manager.engine.batch_write.call_count, len(submitted))
+                self.assertEqual(manager.request_status[11], KVPoll.Failed)
+                self.assertEqual(manager._sent, [])
+                self.assertTrue(torch.all(storage == 165))
+                with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                    manager._release_fabric_staging_slot(0)
+
     def test_failed_wait_quarantines_slot_until_terminal_reply(self):
         manager = self.manager()
         key = (11, 0, 1, 2, 0)
