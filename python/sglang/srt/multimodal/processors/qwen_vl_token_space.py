@@ -9,9 +9,22 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+)
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.multimodal.processors.token_space_processor import (
     MultimodalProcessorOutputBuilder,
+    TokenSpaceMultimodalProcessor,
 )
+from sglang.srt.multimodal.token_space.qwen_vl import QwenTokenSpaceProcessStrategy
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -311,6 +324,13 @@ class QwenVLMultimodalProcessorOutputBuilder(MultimodalProcessorOutputBuilder):
         video_data=None,
         audio_feature_lengths=None,
     ) -> MultimodalProcessorOutput:
+        """Without audio_feature_lengths, each audio item adds one length, in request order."""
+        if audio_feature_lengths is None:
+            audio_items = [item for item in mm_items if item.is_audio()]
+            if audio_items:
+                audio_feature_lengths = torch.cat(
+                    [item.feature_attention_mask.sum(dim=1) for item in audio_items]
+                )
         self._mark_cuda_ipc_features_for_deferred_reconstruction(
             mm_items, keep_mm_features_on_device
         )
@@ -365,3 +385,27 @@ class QwenVLMultimodalProcessorOutputBuilder(MultimodalProcessorOutputBuilder):
             mrope_position_delta=mrope_position_delta,
         )
         return output
+
+
+class QwenVLTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
+    supports_transformers_backend = True
+    token_space_process_strategy_class = QwenTokenSpaceProcessStrategy
+    output_builder_class = QwenVLMultimodalProcessorOutputBuilder
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5ForCausalLMMTP,
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen4ExpForConditionalGeneration,
+    ]
+
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        if hf_config.model_type != "qwen3_omni_moe":
+            # Same worker counts as the legacy Qwen processor.
+            self.auto_mm_processor_worker_num = 2
+            self.auto_mm_io_worker_num = 16
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
