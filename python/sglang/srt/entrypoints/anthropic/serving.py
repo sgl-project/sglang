@@ -823,12 +823,12 @@ class AnthropicServing:
         return convert_to_chat_completion_request(
             anthropic_request,
             merge_inline_system=self._merge_inline_system,
-            wrap_reasoning_history=lambda reasoning_text: self.openai_serving_chat.wrap_reasoning_history(
-                reasoning_text
+            wrap_reasoning_history=lambda reasoning_text: (
+                self.openai_serving_chat.wrap_reasoning_history(reasoning_text)
             ),
             supports_native_reasoning_history=self.openai_serving_chat.supports_native_reasoning_history,
-            apply_reasoning_enabled=lambda request, enabled: self.openai_serving_chat.apply_reasoning_enabled(
-                request, enabled
+            apply_reasoning_enabled=lambda request, enabled: (
+                self.openai_serving_chat.apply_reasoning_enabled(request, enabled)
             ),
         )
 
@@ -1169,8 +1169,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")

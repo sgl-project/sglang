@@ -35,6 +35,44 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b
 dev = "cuda"
 
 
+@pytest.fixture
+def stated_tp_group():
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
+def test_sm120_mxfp8_dispatch_preserves_activation_scale_recipe(monkeypatch):
+    """SM120 group-128 activations must not use the MXFP8 weight-scale recipe."""
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
+
+    monkeypatch.setattr(deep_gemm_sm120, "_is_sm120", True)
+    monkeypatch.setattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True)
+    config = MoeRunnerConfig(
+        num_experts=2, num_local_experts=2, top_k=1, hidden_size=512
+    )
+    quant = DeepGemmMoeQuantInfo(
+        torch.empty(1, dtype=torch.float8_e4m3fn),
+        None,
+        True,
+        block_shape=[1, 32],
+        use_mxfp8=True,
+    )
+    x = torch.randn(1024, 512, device=dev, dtype=torch.bfloat16)
+    ids = (torch.arange(1024, device=dev, dtype=torch.int32) % 2).view(-1, 1)
+    weights = torch.ones(1024, 1, device=dev)
+    result = deep_gemm_sm120.maybe_pre_permute(x, ids, weights, quant, config, {})
+
+    assert quant.scale_recipes(
+        activation_block_size=result.activation_scale_block_size,
+        hidden_size=result.hidden_states.shape[-1],
+        activation_scale_width=result.hidden_states_scale.shape[-1],
+    ) == ((1, 128), (1, 32))
+
+
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize("topk", [4, 5, 8])
 @pytest.mark.parametrize("hidden,group", [(6144, 32), (2048, 32), (4096, 128)])
@@ -94,9 +132,9 @@ def test_quant_scatter_matches_quant_plus_fill(num_tokens, topk, hidden, group):
             assert torch.equal(
                 gi_new[e, m].view(torch.uint8), gi_ref[e, m].view(torch.uint8)
             ), f"fp8 mismatch token={t} slot={j} expert={e}"
-            assert torch.equal(
-                gs_new[e, :, m], gs_ref[e, :, m]
-            ), f"scale mismatch token={t} slot={j} expert={e}"
+            assert torch.equal(gs_new[e, :, m], gs_ref[e, :, m]), (
+                f"scale mismatch token={t} slot={j} expert={e}"
+            )
 
 
 def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
@@ -228,7 +266,9 @@ def test_standard_layout_auto_memory_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
-def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_dtype):
+def test_standard_masked_runner_matches_compact_end_to_end(
+    monkeypatch, weight_dtype, stated_tp_group
+):
     """Exercise both production grouped GEMMs through the standard path."""
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if arch_major <= 9:
@@ -237,11 +277,22 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     # This kernel test runs outside a model-parallel process. Bypass only the
     # symmetric-allocation context; all pre-permute, DeepGEMM, activation,
     # quantization, down-GEMM, and post-permute kernels remain real.
-    monkeypatch.setattr(deep_gemm_runner, "get_tp_group", lambda: None)
     monkeypatch.setattr(
         deep_gemm_runner,
         "use_symmetric_memory",
         lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner.deep_gemm_wrapper,
+        "get_contiguous_layout_alignment",
+        lambda expected_m, num_groups: 32,
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False)
+        ),
     )
 
     # UE8M0 packs four 128-wide scale groups into each int32. Use the smallest
@@ -357,17 +408,23 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
             ).hidden_states,
         )
 
-    compact_is_masked, compact_all_tokens, compact_m_indices, compact_output = (
-        run_with_layout("compact")
-    )
-    masked_is_masked, masked_all_tokens, masked_m_indices, masked_output = (
-        run_with_layout("masked")
-    )
+    (
+        compact_is_masked,
+        compact_all_tokens,
+        compact_m_indices,
+        compact_output,
+    ) = run_with_layout("compact")
+    (
+        masked_is_masked,
+        masked_all_tokens,
+        masked_m_indices,
+        masked_output,
+    ) = run_with_layout("masked")
     torch.cuda.synchronize()
 
     assert not compact_is_masked
     assert masked_is_masked
-    assert compact_all_tokens == 256
+    assert compact_all_tokens == 64
     assert masked_all_tokens is None
     assert masked_m_indices is None
     valid_assignments = topk_ids[topk_ids >= 0]

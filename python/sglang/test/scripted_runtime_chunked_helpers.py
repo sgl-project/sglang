@@ -10,6 +10,10 @@ VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
 
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
+RID_RELEASE_SETTLE_STEPS: int = 40
+
+DRAIN_RELEASE_STEPS: int = 12
+
 
 def base_engine_kwargs(
     *,
@@ -40,6 +44,24 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
+def run_until_finished_then_settle(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
+    yield from run_until_finished(handle, max_steps=max_steps)
+    for _ in range(RID_RELEASE_SETTLE_STEPS):
+        yield
+
+
+def drain_until_released(t, *handles, max_steps: int = DRAIN_RELEASE_STEPS):
+    for _ in range(max_steps):
+        if all(
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.kv.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
+
+
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
     done = [False] * len(handles)
     for _ in range(max_steps):
@@ -57,9 +79,9 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]
-    assert all(
-        x == token for x in prompt_tokens
-    ), "warmup_radix supports only uniform prompts"
+    assert all(x == token for x in prompt_tokens), (
+        "warmup_radix supports only uniform prompts"
+    )
     handle = t.start_req(
         prompt_len=len(prompt_tokens), max_new_tokens=1, prompt_token=token
     )
@@ -126,9 +148,9 @@ def advance_to_decode_step(
     r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
 ):
     for _ in range(max_steps):
-        assert (
-            not r.finished
-        ), f"req finished before reaching decode step {target_output_len}"
+        assert not r.finished, (
+            f"req finished before reaching decode step {target_output_len}"
+        )
         req = r.req
         if req is not None and len(req.output_ids) >= target_output_len:
             return

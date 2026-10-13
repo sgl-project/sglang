@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -50,18 +50,16 @@ class TestDeepseekV32DP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1400,
             num_threads=1400,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -73,7 +71,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 50)
 
@@ -108,18 +106,16 @@ class TestDeepseekV32TP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1400,
             num_threads=1400,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -131,7 +127,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 80)
 
@@ -169,18 +165,16 @@ class TestGLM5DP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1400,
             num_threads=1400,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -192,7 +186,7 @@ class TestGLM5DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (glm-5)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 40)
 
@@ -227,18 +221,16 @@ class TestGLM5TP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=1400,
             num_threads=1400,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -250,7 +242,7 @@ class TestGLM5TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (glm-5)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 60)
 

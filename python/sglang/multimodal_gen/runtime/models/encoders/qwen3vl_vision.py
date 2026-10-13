@@ -30,12 +30,29 @@ class Qwen3VLVisionOutput:
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    recompute_on_device_change = False
+
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
+        self.dim = dim
+        self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._inv_freq_device = inv_freq.device
 
     def forward(self, sequence_length: int) -> torch.Tensor:
+        if (
+            self.recompute_on_device_change
+            and self.inv_freq.device != self._inv_freq_device
+        ):
+            # match resident initialization: CPU and GPU pow round differently
+            indices = torch.arange(
+                0, self.dim, 2, dtype=torch.float32, device=self.inv_freq.device
+            )
+            self.inv_freq = (1.0 / (self.theta ** (indices / self.dim))).to(
+                self.inv_freq.dtype
+            )
+            self._inv_freq_device = self.inv_freq.device
         positions = torch.arange(
             sequence_length,
             device=self.inv_freq.device,
@@ -184,6 +201,8 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3VLVisionTransformer(nn.Module):
+    fp32_position_interpolation = True
+
     def __init__(
         self,
         config: Any,
@@ -250,7 +269,14 @@ class Qwen3VLVisionTransformer(nn.Module):
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.spatial_merge_size,
         )
-        return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        if self.fp32_position_interpolation:
+            return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        # Transformers 4.57 rounds each corner and each addition in the weight dtype
+        corners = (
+            self.pos_embed(indices)
+            * weights.to(self.pos_embed.weight.dtype)[:, :, None]
+        )
+        return corners[0] + corners[1] + corners[2] + corners[3]
 
     def forward(
         self,

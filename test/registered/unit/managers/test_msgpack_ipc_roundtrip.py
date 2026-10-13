@@ -33,6 +33,9 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _merge_checksum_payloads,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
@@ -41,7 +44,7 @@ from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 def _round_trip(obj):
@@ -82,7 +85,6 @@ def _checksum_info(tag: str) -> ChecksumInfo:
     return ChecksumInfo(
         checksums={f"model.layers.{tag}": "deadbeef"},
         per_gpu_checksum="cafef00d",
-        # One entry per role: the target model plus each speculative draft runner.
         parallelism_info=[_parallelism_info("target"), _parallelism_info("draft")],
     )
 
@@ -202,19 +204,13 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertIn("tp_rank", as_dict["parallelism_info"][0])
 
     def test_check_weights_producer_conversion(self):
-        # Mirrors weight_updater.check_weights end to end: each runner's
-        # WeightChecker returns a single-role ChecksumInfo.model_dump(),
-        # _merge_checksum_payloads folds the roles into one per-role payload, and
-        # that is what msgspec.convert has to accept.
-        from sglang.srt.managers.scheduler_components.weight_updater import (
-            _merge_checksum_payloads,
-        )
-
-        def _dump(role_tag):
+        # the merged per-role payload is what msgspec.convert has to accept
+        def _dump(role):
             return PydanticChecksumInfo(
-                checksums={f"model.layers.0{role_tag}": "deadbeef"},
+                checksums={"model.layers.0": "deadbeef"},
                 per_gpu_checksum="cafef00d",
                 parallelism_info=PydanticParallelismInfo(
+                    role=role,
                     tp_rank=0,
                     tp_size=2,
                     dp_rank=0,
@@ -226,9 +222,10 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
                 ),
             ).model_dump()
 
-        merged = _merge_checksum_payloads([("", _dump("")), ("draft", _dump(""))])
+        merged = _merge_checksum_payloads(
+            [("target", _dump("target")), ("draft", _dump("draft"))]
+        )
         converted = msgspec.convert(merged, ChecksumInfo)
-        # Draft keys are role-prefixed so they never collide with the target's.
         self.assertEqual(
             sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]
         )

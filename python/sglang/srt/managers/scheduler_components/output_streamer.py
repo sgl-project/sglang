@@ -19,7 +19,6 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -32,7 +31,8 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_serving
+from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
@@ -53,10 +53,8 @@ class SchedulerOutputStreamer:
 
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
-    is_multimodal_gen: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
@@ -64,6 +62,7 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -81,6 +80,8 @@ class SchedulerOutputStreamer:
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
+        elif self.server_args.enable_lmcache:
+            storage_backend_type = "LMCache"
         return storage_backend_type
 
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
@@ -208,7 +209,7 @@ class SchedulerOutputStreamer:
         if self.is_multimodal_gen:
             return
         payload = acc.to_payload(
-            dp_rank=self.ps.dp_rank,
+            dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
@@ -235,7 +236,7 @@ class SchedulerOutputStreamer:
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
             req.finished()
-            and self.ps.attn_tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
@@ -379,8 +380,7 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
-    output_token_sampling_mask: Optional[list] = None
-    output_token_sampling_logprobs: Optional[list] = None
+    output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
@@ -412,7 +412,6 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_idx = []
         if self.return_sampling_mask:
             self.output_token_sampling_mask = []
-            self.output_token_sampling_logprobs = []
 
     def _beam_admits(self, *, req: Req) -> bool:
         # Only the leader is ever streamed, and only at group finish.
@@ -629,22 +628,9 @@ class _GenerationStreamAccumulator:
 
         if self.return_sampling_mask:
             if req.return_sampling_mask:
-                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
-                sampling_mask_end = len(req.output_token_sampling_mask)
-                self.output_token_sampling_mask.append(
-                    req.output_token_sampling_mask[
-                        send_output_sampling_mask_offset:sampling_mask_end
-                    ]
-                )
-                self.output_token_sampling_logprobs.append(
-                    req.output_token_sampling_logprobs[
-                        send_output_sampling_mask_offset:sampling_mask_end
-                    ]
-                )
-                req.send_output_sampling_mask_offset = sampling_mask_end
+                self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
             else:
-                self.output_token_sampling_mask.append([])
-                self.output_token_sampling_logprobs.append([])
+                self.output_token_sampling_mask.append(None)
 
         if self.return_hidden_states:
             if req.return_hidden_states:
@@ -762,7 +748,6 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
             output_token_sampling_mask=self.output_token_sampling_mask,
-            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,

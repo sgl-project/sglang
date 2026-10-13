@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -63,7 +62,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
-    "MarlinLinearMethod",
     "QQQLinearMethod",
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
@@ -286,13 +284,13 @@ class ReplicatedLinear(LinearBase):
                     raise ValueError(f"{loaded_weight} are not all equal")
 
             if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
-                assert (
-                    param.dtype == loaded_weight.dtype
-                ), "init para dtype and loaded weight dtype should be the same"
+                assert param.dtype == loaded_weight.dtype, (
+                    "init para dtype and loaded weight dtype should be the same"
+                )
 
-        assert (
-            param.size() == loaded_weight.size()
-        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        assert param.size() == loaded_weight.size(), (
+            f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -459,9 +457,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -1416,9 +1414,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -1576,9 +1574,9 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1682,7 +1680,7 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod

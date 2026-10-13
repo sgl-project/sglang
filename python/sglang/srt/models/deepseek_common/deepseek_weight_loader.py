@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -38,6 +39,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.mxfp8_block_convert import dequant_mxfp8_2d_to_bf16
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -58,6 +60,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -82,6 +85,19 @@ def _get_indexer_weight_block_size(
     if quant_config is not None and quant_config.weight_block_size is not None:
         return quant_config.weight_block_size
     return [128, 128]
+
+
+def _dequant_fused_indexer_shard(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    quant_config: Optional[QuantizationConfig],
+) -> torch.Tensor:
+    # mxfp8 scales are UE8M0 exponents stored as uint8, not fp32 multipliers
+    if scale.dtype == torch.uint8:
+        return dequant_mxfp8_2d_to_bf16(weight, scale)
+    return block_quant_dequant(
+        weight, scale, _get_indexer_weight_block_size(quant_config), torch.bfloat16
+    )
 
 
 def _load_fused_indexer_wk(
@@ -117,9 +133,8 @@ def _load_fused_indexer_wk(
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            weights_bf16 = _dequant_fused_indexer_shard(
+                entry["weight"], entry["scale"], quant_config
             )
             fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
@@ -137,12 +152,49 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        wk_bf16 = _dequant_fused_indexer_shard(
+            entry["weight"], entry["scale"], quant_config
         )
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return True
+
+
+def _load_fused_expert_tensor(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+) -> bool:
+    mappings = (
+        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale_inv", "w13"),
+        (".experts.down_proj_scale", ".experts.w2_weight_scale_inv", "w2"),
+        (".experts.gate_up_proj", ".experts.w13_weight", "w13"),
+        (".experts.down_proj", ".experts.w2_weight", "w2"),
+    )
+    for source, target, shard_id in mappings:
+        if not name.endswith(source):
+            continue
+        param_name = name[: -len(source)] + target
+        param = params_dict.get(param_name)
+        if param is None:
+            return False
+        weight_loader = param.weight_loader
+        for expert_id, expert_weight in enumerate(loaded_weight):
+            if shard_id == "w13":
+                gate, up = expert_weight.chunk(2, dim=0)
+                weight_loader(
+                    param, gate, param_name, shard_id="w1", expert_id=expert_id
+                )
+                weight_loader(param, up, param_name, shard_id="w3", expert_id=expert_id)
+            else:
+                weight_loader(
+                    param,
+                    expert_weight,
+                    param_name,
+                    shard_id="w2",
+                    expert_id=expert_id,
+                )
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -170,18 +222,6 @@ class DeepseekV2WeightLoaderMixin:
     quant_config: Optional[QuantizationConfig]
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
-    # Weight mapping relationships determined at model initialization time.
-    fuse_qkv_a_proj: bool
-    stacked_params_mapping: List[Tuple[str, str, int]]
-    expert_params_mapping: List[Tuple[str, str, int, int]]
-
-    def mutate_weight_preload(self, name: str) -> str:
-        """Override in subclass for model-specific weight name mutations."""
-        return name
-
-    def custom_scale_remap(self, name: str) -> str:
-        """Override in subclass for model-specific scale remapping."""
-        return name
 
     def do_load_weights(
         self,
@@ -200,7 +240,33 @@ class DeepseekV2WeightLoaderMixin:
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )
 
-        cached_a_proj = {} if self.fuse_qkv_a_proj else None
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts
+            )
+
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
+        cached_a_proj = {} if fuse_qkv_a_proj else None
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -228,7 +294,11 @@ class DeepseekV2WeightLoaderMixin:
                     )
                 ):
                     continue
-                name = self.mutate_weight_preload(name)
+                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                    name = name.replace(
+                        "mlp.shared_experts",
+                        f"mlp.experts.{self.config.n_routed_experts}",
+                    )
 
                 weight_names.append(name)
 
@@ -261,6 +331,9 @@ class DeepseekV2WeightLoaderMixin:
                                 ):
                                     continue
 
+                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                    continue
+
                 if "rotary_emb.inv_freq" in name:
                     continue
 
@@ -282,7 +355,7 @@ class DeepseekV2WeightLoaderMixin:
                 ):
                     continue
 
-                for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
@@ -295,10 +368,6 @@ class DeepseekV2WeightLoaderMixin:
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                     if ("mlp.experts." in name) and name not in params_dict:
-                        continue
-                    # q_a_proj / kv_a_proj_with_mqa must bypass stacked loading
-                    # and use the cache+concat fused A-proj path below.
-                    if param_name == "fused_qkv_a_proj_with_mqa":
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
@@ -315,7 +384,7 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in self.expert_params_mapping:
+                    for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -346,13 +415,13 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # The last PP stage also owns an embedding for its NextN draft.
+                        if ".embed_tokens." in name and name not in params_dict:
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if self.fuse_qkv_a_proj and (
+                        if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
                             cached_a_proj[name] = _clone_if_runai_streamed_tensor(
@@ -422,7 +491,13 @@ class DeepseekV2WeightLoaderMixin:
                             if (
                                 "k_scale" in name or "v_scale" in name
                             ) and name not in params_dict:
-                                name = self.custom_scale_remap(name)
+                                # modelopt attn kv scale is named differently
+                                for scale in ["k_scale", "v_scale"]:
+                                    if scale in name:
+                                        name = name.replace(
+                                            f"{scale[0]}_proj", "attn_mqa"
+                                        )
+                                        break
                             if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
@@ -507,7 +582,7 @@ class DeepseekV2WeightLoaderMixin:
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        if layer_id < self.config.num_hidden_layers:
+                        if self.model.start_layer <= layer_id < self.model.end_layer:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -516,6 +591,9 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+
+            if not hasattr(self_attn, "kv_b_proj"):
+                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -562,7 +640,10 @@ class DeepseekV2WeightLoaderMixin:
                         if hasattr(self_attn.kv_b_proj, "weight_scale")
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
-                    if _is_fp8_fnuz:
+                    is_ue8m0_uint8 = (
+                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
+                    )
+                    if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=weight_scale,
@@ -572,7 +653,11 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if (
+                    if is_ue8m0_uint8:
+                        weight_scale = (weight_scale.to(torch.int32) << 23).view(
+                            torch.float32
+                        )
+                    elif (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=(
                                 self.quant_config.weight_block_size

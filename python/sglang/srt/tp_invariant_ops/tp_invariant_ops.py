@@ -441,9 +441,9 @@ def _matmul_tp_persistent_impl(
 
     M, K = A.shape
     _, N = B.shape
-    assert (
-        K % BLOCK_K == 0
-    ), f"Dimension K should be divisible by BLOCK_K. Got K={K}, BLOCK_K={BLOCK_K}."
+    assert K % BLOCK_K == 0, (
+        f"Dimension K should be divisible by BLOCK_K. Got K={K}, BLOCK_K={BLOCK_K}."
+    )
     T = K // BLOCK_K
     FIRST_LEVEL_BLOCK = T
 
@@ -992,8 +992,6 @@ def moe_sum_tree_reduce_v1(
     )
     return
 
-
-import math
 
 import torch
 import triton
@@ -1838,9 +1836,9 @@ def _launch_sparse_tree_k8_k10(
 
     # NOTE: for strict CUDA Graph safety, avoid dtype conversion here.
     # Please ensure curr_topk_ids is int32 upstream.
-    assert (
-        curr_topk_ids.dtype == torch.int32
-    ), "make ids int32 upstream for CUDA Graph stability"
+    assert curr_topk_ids.dtype == torch.int32, (
+        "make ids int32 upstream for CUDA Graph stability"
+    )
 
     if K == 8:
         _moe_tree_reduce_sparse_k8_kernel[grid](

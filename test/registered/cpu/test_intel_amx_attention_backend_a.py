@@ -1,15 +1,10 @@
-"""
-Usage:
-python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_latency_default_model
-"""
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -21,11 +16,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=685, suite="base-b-tp-test-cpu")
+register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
         min_throughput=10,
@@ -66,7 +60,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 num_examples=64,
                 num_threads=32,
             )
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             if is_in_ci():
                 self.assertGreater(metrics["score"], 0.45)
         finally:
@@ -110,7 +104,7 @@ class TestDPAttention(CustomTestCase):
             num_questions=32,
             parallel=32,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

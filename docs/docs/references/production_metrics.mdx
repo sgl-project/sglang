@@ -7,6 +7,8 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Language model metrics
+
 Here is an example of the metrics:
 
 ```text Output
@@ -133,6 +135,12 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 # TYPE sglang:spec_num_draft_tokens gauge
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
+
+## Diffusion metrics
+
+SGLang Diffusion exposes request, queue, stage and LoRA metrics with
+`--enable-metrics`. See [Diffusion production metrics](/docs/sglang-diffusion/production_metrics)
+for the metric reference, counting semantics and disaggregated scraping setup.
 
 ## Setup Guide
 

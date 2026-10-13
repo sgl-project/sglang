@@ -112,6 +112,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         tp_size=1,
         sp_size=1,
         is_compiled=False,
+        hidden_size=0,
     ):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
@@ -120,6 +121,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             tp_size=tp_size,
             sp_size=sp_size,
             is_compiled=is_compiled,
+            hidden_size=hidden_size,
         )
 
     def test_blackwell_remains_enabled(self):
@@ -138,7 +140,47 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
 
-    def test_hopper_tensor_parallel_disabled(self):
+    def test_hopper_super_t2i_tp2_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True, hidden_size=5120, tp_size=2))
+
+    def test_hopper_super_t2i_unsupported_topologies_disabled(self):
+        for overrides in (
+            {"hidden_act": "relu2"},
+            {"hidden_act": "gelu"},
+            {"hidden_size": 4096},
+            {"tp_size": 4},
+            {"sp_size": 2},
+            {"is_compiled": True},
+            {"is_hopper": False},
+        ):
+            with self.subTest(overrides=overrides):
+                settings = dict(is_hopper=True, hidden_size=5120, tp_size=2)
+                settings.update(overrides)
+                self.assertFalse(self._can_enable(**settings))
+
+    def test_hopper_edge_single_gpu_enabled(self):
+        self.assertTrue(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_hopper_edge_parallel_and_compiled_disabled(self):
+        for override in ({"tp_size": 2}, {"sp_size": 2}, {"is_compiled": True}):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    self._can_enable(
+                        is_hopper=True,
+                        hidden_act="relu2",
+                        hidden_size=2048,
+                        **override,
+                    )
+                )
+
+    def test_hopper_larger_dense_mlp_disabled(self):
+        self.assertFalse(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
+        )
+
+    def test_hopper_other_tensor_parallel_shapes_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
 
     def test_hopper_sequence_parallel_disabled(self):
@@ -1906,18 +1948,6 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
         self.assertEqual(sp.video_path, "in.mp4")
         self.assertEqual(sp.condition_frame_indexes, [0, 1])
         self.assertEqual(sp.condition_video_keep, "first")
-
-    def test_action_fields_default_none(self):
-        sp = Cosmos3SamplingParams(prompt="t")
-        for field in (
-            "action_mode",
-            "domain_id",
-            "domain_name",
-            "raw_action_dim",
-            "action_fps",
-            "action",
-        ):
-            self.assertIsNone(getattr(sp, field))
 
 
 class TestCosmos3CaptionMetadata(unittest.TestCase):

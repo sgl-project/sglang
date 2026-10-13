@@ -7,20 +7,28 @@ the MxFP4 wrapper methods borrow an `Fp8MoEMethod` for weight loading only
 and never give it a `moe_runner_config` (issue #36264).
 """
 
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _export_static_state,
+    _import_static_state,
+)
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
@@ -46,18 +54,18 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         )
 
     @staticmethod
-    def _make_layer(num_local_experts: int = 2) -> SimpleNamespace:
-        return SimpleNamespace(
-            num_local_experts=num_local_experts,
-            w13_weight=torch.empty(num_local_experts, 4),
-        )
+    def _make_layer(num_local_experts: int = 2) -> torch.nn.Module:
+        layer = torch.nn.Module()
+        layer.num_local_experts = num_local_experts
+        layer.w13_weight = torch.nn.Parameter(torch.empty(num_local_experts, 4))
+        return layer
 
-    def _run_post_load(self, method: Fp8MoEMethod, layer: SimpleNamespace) -> None:
+    def _run_post_load(self, method: Fp8MoEMethod, layer: torch.nn.Module) -> None:
         with patch.object(method, "process_weights_after_loading_block_quant") as work:
             method.process_weights_after_loading(layer)
         work.assert_called_once_with(layer)
 
-    def _assert_activation_params_absent(self, layer: SimpleNamespace) -> None:
+    def _assert_activation_params_absent(self, layer: torch.nn.Module) -> None:
         for name in _ACTIVATION_PARAMS:
             self.assertFalse(hasattr(layer, f"_flashinfer_trtllm_{name}"))
 
@@ -112,6 +120,88 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+
+    def test_activation_params_survive_memory_release_and_reload(self):
+        """Offload must restore activation constants at the addresses retained by CUDA graphs."""
+        method = self._make_block_fp8_method()
+        layer = self._make_layer()
+        method.create_moe_runner(
+            layer=layer,
+            moe_runner_config=MoeRunnerConfig(
+                gemm1_alpha=1.5, gemm1_beta=0.25, gemm1_clamp_limit=10.0
+            ),
+        )
+        self._run_post_load(method, layer)
+        retained = {
+            f"_flashinfer_trtllm_{name}": getattr(layer, f"_flashinfer_trtllm_{name}")
+            for name in _ACTIVATION_PARAMS
+        }
+        expected = {name: tensor.clone() for name, tensor in retained.items()}
+        backup = _export_static_state(layer)
+        # Discarded weight-region pages do not retain non-checkpoint constants.
+        for tensor in retained.values():
+            tensor.zero_()
+        _import_static_state(layer, backup)
+        for name, tensor in retained.items():
+            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+        self._run_post_load(method, layer)
+        for name, tensor in retained.items():
+            self.assertIs(getattr(layer, name), tensor)
+            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+            self.assertNotIn(name, layer.state_dict())
+
+        method.moe_runner_config.gemm1_alpha = None
+        with self.assertRaisesRegex(ValueError, "cannot be enabled or disabled"):
+            self._run_post_load(method, layer)
+        self.assertIs(
+            layer._flashinfer_trtllm_gemm1_alpha,
+            retained["_flashinfer_trtllm_gemm1_alpha"],
+        )
+
+
+class TestFp8MoEAiterQuantInfo(CustomTestCase):
+    """maybe_get_hip_aiter_quant_info assembles what the AITER runner consumes.
+
+    The gfx950 e2e builds AiterMoeQuantInfo by hand, so dropping the gate/up
+    layout or the clamp here would leave it passing while served experts read
+    the gate and up halves swapped.
+    """
+
+    def test_block_fp8_forwards_separated_layout_and_clamp(self):
+        method = Fp8MoEMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        # create_moe_runner is not called: it resolves a global backend and
+        # builds a MoeRunner, none of which this assembly reads.
+        method.moe_runner_config = MoeRunnerConfig(swiglu_limit=10.0)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 4), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.zeros((1, 4, 2), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            w2_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            hidden_pad=0,
+            intermediate_pad=0,
+            _aiter_gate_up_interleaved=False,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.object(fp8_module, "_use_aiter", True),
+        ):
+            quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+        self.assertIsNotNone(quant_info)
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_128X128)
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
 
 if __name__ == "__main__":

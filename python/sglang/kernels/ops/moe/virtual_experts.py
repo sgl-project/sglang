@@ -55,7 +55,9 @@ def _fused_virtual_topk_ids_kernel(
     # a real virtual-expert slot belonging to another adapter and trigger OOB
     # loads in downstream LoRA kernels.
     shifted = base + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
+    # Reject an out-of-range base ID before it can alias the next adapter.
+    result = tl.where(base >= num_experts_for_weight, -1, shifted)
+    result = tl.where(base < 0, base, result)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -542,14 +544,14 @@ def _merged_experts_fused_moe_lora_add_impl(
     assert n_b in (1, 2), f"lora_b must be length 1 or 2, got {n_b}"
     b_rank = lora_b_list[0].shape[3]
     for b in lora_b_list[1:]:
-        assert (
-            b.shape == lora_b_list[0].shape
-        ), f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
+        assert b.shape == lora_b_list[0].shape, (
+            f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
+        )
 
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    assert (
-        max_lora_rank == n_b * b_rank
-    ), f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
+    assert max_lora_rank == n_b * b_rank, (
+        f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
+    )
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
@@ -677,9 +679,10 @@ def _merged_experts_fused_moe_lora_add_impl(
         f"{topk_ids.shape[0]} (DP-gathered?) tokens; mapping was sized before the dp gather "
         f"length was known (see get_gathered_moe_num_tokens)"
     )
+    # Split-K atomic additions must accumulate before rounding to the activation dtype.
     intermediate = torch.zeros(
         [topk_ids.shape[0], topk_ids.shape[1], max_lora_rank],
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
 
@@ -709,6 +712,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
+    intermediate = intermediate.to(hidden_states.dtype)
     b_stage_config = _get_stage_config(lora_b_virtuals[0], 1)
     (
         sorted_token_ids,

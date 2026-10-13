@@ -78,6 +78,30 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+def candidate_request_length_bound(
+    reqs, pending_verify_tokens: int = 0
+) -> Optional[int]:
+    """Bound committed positions without reading asynchronous acceptance results.
+    The overlap loop can hold one unprocessed result, so reserve its full width;
+    the runner adds the current verify width. Aborted/embedding/multimodal requests
+    return None: their visible token IDs may not track cache positions."""
+    if not reqs:
+        return None
+    longest = 0
+    for req in reqs:
+        budget = req.sampling_params.max_new_tokens
+        if (
+            not isinstance(budget, int)
+            or budget < 0
+            or getattr(req, "to_finish", None) is not None
+            or getattr(req, "input_embeds", None) is not None
+            or getattr(req, "multimodal_inputs", None) is not None
+        ):
+            return None
+        longest = max(longest, len(req.origin_input_ids) + budget)
+    return longest + pending_verify_tokens
+
+
 class TargetVerifyExecutor:
     def __init__(
         self,
@@ -92,6 +116,15 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
+        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
+        self._target_is_dsv41 = (
+            getattr(
+                target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -135,6 +168,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            fused_argmax=self._target_is_dsv41,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -296,6 +330,10 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
+            verify_input.candidate_max_seq_len_upper_bound = (
+                candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
+            )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -475,11 +513,11 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    kv_injector: Optional[TargetHiddenKvInjector] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -492,7 +530,6 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,
@@ -501,9 +538,11 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fused_argmax: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -532,15 +571,22 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        self._static_step_state: Optional[tuple[int, bool]] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        if (
+            runner.model_runner.is_draft_worker
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
             or out.hidden_states is None
         ):
+            return
+        if not runner.ragged_verify_mode:
+            self._static_epilogue(out, forward_batch)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -552,6 +598,7 @@ class DsparkVerifyEpilogue:
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
+        self._static_step_state = None
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -560,6 +607,49 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
+
+    def begin_static_step(self, bs: int, armed: bool) -> None:
+        state = (bs, armed)
+        if self._static_step_state == state:
+            return
+        self.verify_lens_buf[:bs].fill_(self.stride)
+        self.verify_lens_buf[bs:].zero_()
+        self.inject_gate_buf.fill_(int(armed))
+        self._static_step_state = state
+
+    def _static_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        verify_lens = self.verify_lens_buf[:bs]
+        candidates = forward_batch.input_ids.view(bs, self.stride)
+        commit_lens = self._accept(
+            candidates=candidates,
+            logits=out.next_token_logits,
+            draft_tokens=candidates[:, 1:].contiguous(),
+            seq_lens=forward_batch.seq_lens,
+        )
+        if not self.folds_commit:
+            return
+        # Same staged locations as target verify; padded and fallback rows skip KV.
+        gated_commit_lens = (
+            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            * self.inject_gate_buf
+        )
+        cache_loc = forward_batch.out_cache_loc
+        state_slot = None
+        if is_unified_kv_triton():
+            state_slot = (
+                forward_batch.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+            )
+        self.commit_ctx.kv_injector.inject_target_hidden(
+            target_hidden=out.hidden_states,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(bs, self.stride),
+            positions=forward_batch.positions,
+            commit_lens=gated_commit_lens,
+            state_slot=state_slot,
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -612,7 +702,23 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
-        commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
+        candidates = torch.zeros(
+            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
+        )
+        scatter_compact_to_strided_into(
+            compact=input_ids.view(-1, 1),
+            verify_lens=verify_lens,
+            out=candidates,
+            stride=self.stride,
+            fill_value=0,
+        )
+        commit_lens = self._accept(
+            candidates=candidates.view(bs, self.stride),
+            logits=self.strided_logits[: bs * self.stride],
+            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            seq_lens=seq_lens,
+            cutoff_verify_lens=verify_lens,
+        )
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
@@ -634,22 +740,16 @@ class DsparkVerifyEpilogue:
             fill_value=0.0,
         )
 
-    def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
-        candidates = torch.zeros(
-            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
-        )
-        scatter_compact_to_strided_into(
-            compact=input_ids.view(-1, 1),
-            verify_lens=verify_lens,
-            out=candidates,
-            stride=self.stride,
-            fill_value=0,
-        )
+    def _accept(
+        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+    ) -> torch.Tensor:
+        bs = candidates.shape[0]
         correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
+            candidates=candidates,
+            target_logits=logits,
             verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=self._fused_argmax,
         )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
@@ -660,7 +760,7 @@ class DsparkVerifyEpilogue:
             prefix_lens=seq_lens[:bs],
         )
         out_tokens = BuildOutTokens.execute(
-            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            draft_tokens=draft_tokens,
             correct_len=correct_len,
             bonus=bonus,
             verify_num_draft_tokens=self.stride,
@@ -721,6 +821,7 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -731,6 +832,7 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
@@ -755,6 +857,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,

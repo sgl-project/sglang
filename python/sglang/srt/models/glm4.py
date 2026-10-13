@@ -23,9 +23,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -298,7 +295,7 @@ class Glm4Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -420,7 +417,7 @@ class Glm4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Glm4Model(
@@ -458,17 +455,6 @@ class Glm4ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-        # Stacked params mapping for unified weight loading API
-        self.stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -563,7 +549,14 @@ class Glm4ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = self.stacked_params_mapping
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".up_proj", 1),
+            (".gate_up_proj", ".gate_proj", 0),
+        ]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:

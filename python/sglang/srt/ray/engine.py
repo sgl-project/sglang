@@ -15,22 +15,20 @@
 
 from __future__ import annotations
 
-import contextvars
 import dataclasses
 import logging
 import threading
-from contextlib import contextmanager
 from typing import Callable, List, Optional
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _calculate_rank_ranges,
-    _compute_parallelism_ranks,
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
@@ -40,20 +38,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
-
-_caller_placement_group: contextvars.ContextVar[Optional[PlacementGroup]] = (
-    contextvars.ContextVar("sglang_ray_caller_placement_group", default=None)
-)
-
-
-@contextmanager
-def _placement_group_context(placement_group: Optional[PlacementGroup]):
-    """Expose launch-only state while Engine synchronously starts schedulers."""
-    token = _caller_placement_group.set(placement_group)
-    try:
-        yield
-    finally:
-        _caller_placement_group.reset(token)
 
 
 @dataclasses.dataclass
@@ -235,10 +219,6 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
-    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-        server_args, tp_rank
-    )
-
     rdt = server_args.enable_rdt_weight_sync
 
     return SchedulerActor.options(
@@ -267,9 +247,6 @@ def _create_scheduler_actor(
         port_args=port_args,
         gpu_id=gpu_id,
         tp_rank=tp_rank,
-        attn_cp_rank=attn_cp_rank,
-        moe_dp_rank=moe_dp_rank,
-        moe_ep_rank=moe_ep_rank,
         pp_rank=pp_rank,
         dp_rank=dp_rank,
         dist_init_addr=dist_init_addr,
@@ -277,19 +254,21 @@ def _create_scheduler_actor(
 
 
 class RayEngine(Engine):
-    """Engine using Ray actors for scheduler processes.
+    """Engine using Ray actors for scheduler processes."""
 
-    Same constructor kwargs as :class:`Engine`, plus ``placement_group`` (a Ray
-    PlacementGroup handle, not a ServerArgs field).
-    """
-
-    def __init__(self, *, placement_group: Optional[PlacementGroup] = None, **kwargs):
+    def __init__(self, **kwargs):
+        # Set before super().__init__(): it launches the subprocesses, which need
+        # the group to schedule the scheduler actors onto.
+        self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
-        # The context is read while super().__init__() launches the subprocesses,
-        # which need the group to schedule the scheduler actors onto.
-        with _placement_group_context(placement_group):
-            super().__init__(server_args=ServerArgs(**kwargs))
+        # Schedulers are separate Ray actors; default to the Ray-backed
+        # collectors so enable_metrics reaches Ray's Prometheus endpoint.
+        if kwargs.get("enable_metrics") and kwargs.get("stat_loggers") is None:
+            from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
+
+            kwargs["stat_loggers"] = build_ray_stat_loggers()
+        super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -306,6 +285,8 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
@@ -313,7 +294,6 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        placement_group = _caller_placement_group.get()
         pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
@@ -381,12 +361,7 @@ class RayEngine(Engine):
                 for node_idx in range(nnodes):
                     bundle_idx = bundle_for_node[node_idx]
                     pp_range, tp_range, pp_per_node, tp_per_node = (
-                        _calculate_rank_ranges(
-                            nnodes,
-                            get_parallel().pp_size,
-                            get_parallel().tp_size,
-                            node_rank=node_idx,
-                        )
+                        _calculate_rank_ranges(node_rank=node_idx)
                     )
                     for pp_rank in pp_range:
                         for tp_rank in tp_range:
@@ -513,12 +488,16 @@ class RayEngine(Engine):
             f"enable_dp_attention={parallel.enable_dp_attention}"
         )
 
-        # Set dist_init_addr on server_args so PortArgs.init_new() can compute
-        # TCP addresses correctly (required for DP attention path).
-        dp_server_args = server_args.replace_resolved(
+        # Declared on the record itself so `PortArgs.init_new()` can compute
+        # TCP addresses (required for the DP attention path). No copy: this
+        # process does not publish here, and every other reader of the field
+        # goes through the bags its own process projects.
+        declare_resolution(
+            server_args,
             "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
+        dp_server_args = server_args
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(

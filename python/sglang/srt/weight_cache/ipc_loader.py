@@ -503,17 +503,17 @@ class IpcModelLoader(BaseModelLoader):
             # Build engine's config fingerprint
             from sglang.srt.layers.dp_attention import get_moe_cp_size
 
-            ps = get_parallel()
-            tp_size = ps.tp_size
-            tp_rank = ps.tp_rank
+            parallel = get_parallel()
+            tp_size = parallel.tp_size
+            tp_rank = parallel.tp_rank
 
-            pp_size = ps.pp_size
-            pp_rank = ps.pp_rank
+            pp_size = parallel.pp_size
+            pp_rank = parallel.pp_rank
 
-            ep_size = ps.moe_ep_size
+            ep_size = parallel.moe_ep_size
             moe_dp_size = get_moe_cp_size()
-            moe_dp_rank = ps.moe_dp_rank
-            moe_ep_rank = ps.moe_ep_rank
+            moe_dp_rank = parallel.moe_dp_rank
+            moe_ep_rank = parallel.moe_ep_rank
 
             dp_size = get_parallel().dp_size
 
@@ -535,10 +535,10 @@ class IpcModelLoader(BaseModelLoader):
                 moe_dp_size=moe_dp_size,
                 moe_dp_rank=moe_dp_rank,
                 moe_ep_rank=moe_ep_rank,
-                enable_dp_attention=ps.enable_dp_attention,
-                enable_dp_lm_head=ps.enable_dp_lm_head,
-                attn_cp_size=ps.attn_cp_size,
-                moe_dense_tp_size=ps.moe_dense_tp_size,
+                enable_dp_attention=parallel.enable_dp_attention,
+                enable_dp_lm_head=parallel.enable_dp_lm_head,
+                attn_cp_size=parallel.attn_cp_size,
+                moe_dense_tp_size=parallel.moe_dense_tp_size,
                 moe_a2a_backend=get_exec().moe.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),

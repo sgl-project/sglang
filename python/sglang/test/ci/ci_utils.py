@@ -417,8 +417,28 @@ def run_unittest_files(
 
         if not file_passed:
             success = False
-            if not continue_on_error:
-                break
+
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
+        metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+        if metrics_path and filename in file_elapsed:
+            try:
+                incremental_record = {
+                    "kind": "file",
+                    "test_file": os.path.basename(filename),
+                    "status": "pass" if file_passed else "fail",
+                    "duration": round(file_elapsed[filename], 2),
+                }
+                if not file_passed:
+                    reason = next((r for f, r in failed_tests if f == filename), None)
+                    if reason:
+                        incremental_record["error"] = reason
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(incremental_record) + "\n")
+            except OSError:
+                pass
+
+        if not file_passed and not continue_on_error:
+            break
 
     if fork_worker is not None:
         fork_worker.close()
@@ -434,11 +454,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -451,7 +471,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest
@@ -483,28 +503,5 @@ def run_unittest_files(
         if failed_after_retry:
             summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
         write_github_step_summary(summary)
-
-    # Fully guarded auto-record for SGLANG_TEST_METRICS_FILE: unset (the default)
-    # means zero delta for every non-XPU-nightly suite. OSError is swallowed so
-    # a bad filesystem cannot turn a passing run red. Any new test file added
-    # to run_suite.py is picked up here without per-test wiring.
-    metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
-    if metrics_path:
-        passed_set = set(passed_tests)
-        failed_reasons = dict(failed_tests)
-        try:
-            with open(metrics_path, "a") as f:
-                for fname, elapsed in file_elapsed.items():
-                    record = {
-                        "kind": "file",
-                        "test_file": os.path.basename(fname),
-                        "status": "pass" if fname in passed_set else "fail",
-                        "duration": round(elapsed, 2),
-                    }
-                    if fname in failed_reasons:
-                        record["error"] = failed_reasons[fname]
-                    f.write(json.dumps(record) + "\n")
-        except OSError:
-            pass
 
     return 0 if success else -1

@@ -16,15 +16,13 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    GetWeightsChecksumReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
-    UpdateWeightFromTensorReqInput,
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -32,6 +30,17 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
@@ -42,7 +51,11 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
@@ -62,8 +75,8 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
-from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -84,13 +97,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     This class does NOT manage worker processes.
     """
 
+    metrics: DiffusionMetrics | None = None
+
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
         port_args: PortArgs,
-        task_pipes_to_slaves: list = None,
-        result_pipes_from_slaves: list = None,
         local_rank: int | None = None,
     ):
         self.server_args = server_args
@@ -111,12 +124,17 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
         self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
+        # Port actually bound by this replica's driver rank; reported to the launcher.
+        self.actual_scheduler_port = None
         if gpu_id % gpus_per_replica == 0:
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
+            self.actual_scheduler_port = int(actual_endpoint.rsplit(":", 1)[1])
+            # Readers in this process, e.g. the metrics label, see the bound port.
+            server_args.scheduler_ports[self.dp_replica] = self.actual_scheduler_port
             logger.info(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
@@ -133,8 +151,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
-        self.task_pipes_to_slaves = task_pipes_to_slaves
-        self.result_pipes_from_slaves = result_pipes_from_slaves
+        self.metrics = worker.metrics
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -154,6 +171,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            InitWeightsUpdateGroupReqInput: self._handle_init_weights_update_group,
+            UpdateWeightsFromDistributedReqInput: self._handle_update_weights_from_distributed,
+            DestroyWeightsUpdateGroupReqInput: self._handle_destroy_weights_update_group,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
@@ -562,6 +582,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._requires_sequential_multi_output(base_req, candidate_req):
+            return "sequential_multi_output"
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
+            return "pipeline_request_unsupported"
         if self._has_realtime_session(base_req) or self._has_realtime_session(
             candidate_req
         ):
@@ -592,9 +618,33 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
 
+    def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
+        pipeline_config = self.server_args.pipeline_config
+        return (
+            pipeline_config.supports_sequential_multi_output_inference()
+            and not pipeline_config.supports_sequential_dit_inference()
+            and any(max(1, int(req.num_outputs_per_prompt or 1)) > 1 for req in reqs)
+        )
+
+    def _pipeline_supports_dynamic_batching_for_request(self, *reqs: Req) -> bool:
+        checker = getattr(
+            self.server_args.pipeline_config,
+            "supports_dynamic_batching_for_request",
+            None,
+        )
+        return not callable(checker) or all(checker(req) for req in reqs)
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._requires_sequential_multi_output(base_req, candidate_req):
+            return False
+
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
             return False
 
         if self._has_realtime_session(base_req) or self._has_realtime_session(
@@ -628,6 +678,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_batch(request_count, stop_reason)
         if not self._batch_metrics_enabled:
             return
 
@@ -724,25 +776,47 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         replies to client, only on rank 0
         """
         if not should_not_return and self.receiver is not None and identity is not None:
-            # if the server is local, use temp file to spill the frame array instead of
-            # leaving it in OutputBatch to be pickled later
-            if is_local_endpoint(self.server_args.scheduler_endpoint):
-                with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.spill_arrays"
+            with maybe_record_function("REPLY spill+pickle+send"):
+                # if the server is local, use temp file to spill the frame array
+                # instead of leaving it in OutputBatch to be pickled later
+                if is_local_endpoint(
+                    self.server_args.scheduler_endpoint_for(self.dp_replica)
                 ):
-                    output_batch.output = spill_large_arrays_to_file_refs(
-                        output_batch.output
-                    )
+                    with self._record_return_stage(
+                        output_batch, "Scheduler.return_result.spill_arrays"
+                    ):
+                        output_batch.output = spill_large_arrays_to_file_refs(
+                            output_batch.output
+                        )
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.pickle"
-            ):
-                payload = pickle.dumps(output_batch)
+                    with self._record_return_stage(
+                        output_batch, "Scheduler.return_result.spill_cuda"
+                    ):
+                        # The previous reply has already been mapped: the client
+                        # only sends the next hop after materializing the last one.
+                        release_retained_producer_tensors()
+                        spill_cuda_tensors(output_batch, in_place=True)
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.pickle"
+                ):
+                    payload = pickle.dumps(output_batch)
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.send"
-            ):
-                self.receiver.send_multipart([identity, b"", payload])
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.send"
+                ):
+                    self.receiver.send_multipart([identity, b"", payload])
+
+    @staticmethod
+    def _req_label(items: list) -> str:
+        """Short request tag for profiler span names."""
+        req = items[0][1] if items else None
+        if isinstance(req, list) and req:
+            req = req[0]
+        # request_id is Optional; server warmup and bare server-test
+        # requests arrive without one.
+        if isinstance(req, Req) and req.request_id:
+            return req.request_id[:8]
+        return type(req).__name__
 
     def _return_item_result(
         self,
@@ -750,6 +824,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_batch: OutputBatch,
     ) -> None:
         identity, processed_req = item
+        if self.metrics is not None:
+            self.metrics.finish(id(processed_req), error=output_batch.error is not None)
         is_warmup = is_warmup_req(processed_req)
         self._log_warmup_result(output_batch, processed_req, is_warmup)
 
@@ -832,11 +908,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not self._can_dynamic_batch(base_req, req):
                 return None
 
+        dynamic_batch_seeds: list[int | list[int]] = []
+        try:
+            for req in reqs:
+                if max(1, int(req.num_outputs_per_prompt or 1)) == 1:
+                    dynamic_batch_seeds.append(
+                        normalize_output_seeds(
+                            req.seed,
+                            num_outputs_per_prompt=1,
+                        )[0]
+                    )
+                else:
+                    dynamic_batch_seeds.append(req.seed)
+        except (TypeError, ValueError):
+            return None
+
         merged_req = deepcopy(base_req)
         merged_req.prompt = [req.prompt for req in reqs]
 
         merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
+        merged_req.extra["dynamic_batch_seeds"] = dynamic_batch_seeds
         merged_req.return_file_paths_only = base_req.return_file_paths_only
         if merged_req.return_file_paths_only:
             dynamic_output_paths: list[str] = []
@@ -1117,7 +1208,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        For non-main schedulers, reqs are broadcasted from main using
+        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
             try:
@@ -1142,30 +1235,37 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         else:
             recv_reqs = None
 
-        # TODO: fix this condition
-        if self.server_args.sp_degree != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.sp_group.rank,
-                self.worker.sp_cpu_group,
-                src=self.worker.sp_group.ranks[0],
-            )
+        # Rebuild CUDA IPC handles on rank 0 (no-op when the payload has none).
+        if recv_reqs is not None:
+            recv_reqs = materialize_cuda_refs(recv_reqs)
 
-        if self.server_args.enable_cfg_parallel:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
+        if self.server_args.comfyui_mode and self._is_multi_rank():
+            recv_reqs = self._broadcast_recv_reqs(recv_reqs)
+        else:
+            # TODO: fix this condition
+            if self.server_args.sp_degree != 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.sp_group.rank,
+                    self.worker.sp_cpu_group,
+                    src=self.worker.sp_group.ranks[0],
+                )
 
-        if self.server_args.tp_size > 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.tp_group.rank,
-                self.worker.tp_cpu_group,
-                src=self.worker.tp_group.ranks[0],
-            )
+            if self.server_args.enable_cfg_parallel:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.cfg_group.rank,
+                    self.worker.cfg_cpu_group,
+                    src=self.worker.cfg_group.ranks[0],
+                )
+
+            if self.server_args.tp_size > 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.tp_group.rank,
+                    self.worker.tp_cpu_group,
+                    src=self.worker.tp_group.ranks[0],
+                )
 
         assert recv_reqs is not None
 
@@ -1197,6 +1297,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                if self.metrics is not None:
+                    for _, req_or_group in new_reqs:
+                        req = get_first_generation_req(req_or_group)
+                        if req is not None:
+                            self.metrics.enqueue(
+                                id(req_or_group), is_warmup=req.is_warmup, now=now
+                            )
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -1230,8 +1337,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            if self.metrics is not None:
+                for _, req in items:
+                    self.metrics.dispatch(id(req))
+                    if (
+                        isinstance(req, list)
+                        and get_first_generation_req(req) is not None
+                    ):
+                        self.metrics.observe_batch(1, "request_group")
             try:
-                handler_result = self._dispatch_items(items)
+                with maybe_record_function(
+                    f"REQ {self._req_label(items)} dispatch+forward"
+                ):
+                    handler_result = self._dispatch_items(items)
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
@@ -1244,6 +1362,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     self._return_results_sequentially(items, handler_result.outputs)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending replies sequentially: {e}")
+                finally:
+                    if self.metrics is not None:
+                        for _, req in items:
+                            self.metrics.finish(id(req), error=True)
                 continue
 
             if isinstance(handler_result, list):
@@ -1275,6 +1397,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+            finally:
+                if self.metrics is not None:
+                    for _, req in items:
+                        self.metrics.finish(id(req), error=True)
 
         self._log_batch_metrics_summary()
 
@@ -1282,21 +1408,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self.receiver.close()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
-
-    def _broadcast_task(self, payload: dict[str, Any]) -> None:
-        """Broadcast a task to all slave worker processes."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        task = {"method": method, "kwargs": kwargs}
-        for pipe in self.task_pipes_to_slaves:
-            pipe.send(task)
-
-    def _collect_slave_results(self) -> List[dict[str, Any]]:
-        """Collect results from all slave worker processes."""
-        results = []
-        for pipe in self.result_pipes_from_slaves:
-            results.append(pipe.recv())
-        return results
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")

@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 class ShmRingBuffer:
-
     def __init__(
         self,
         n_reader: int,
@@ -173,7 +172,6 @@ class Handle:
 
 
 class MessageQueue:
-
     def __init__(
         self,
         n_reader,  # number of all readers

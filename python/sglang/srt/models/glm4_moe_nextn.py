@@ -23,9 +23,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -33,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class Glm4MoeModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
+            logger.debug(
                 "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 / GLM-4.7 model."
             )
             quant_config = None
@@ -101,17 +101,15 @@ class Glm4MoeModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = self.decoder(positions, hidden_states, forward_batch)
 
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states = residual_batch.norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
 
         return hidden_states
 
@@ -148,26 +146,6 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-
-        self.num_fused_shared_experts = (
-            0 if get_exec().moe.disable_shared_experts_fusion else 1
-        )
-
-        # Weight loading mappings (must match parent for load_weights to work)
-        self.stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
 
     @torch.no_grad()
     def forward(

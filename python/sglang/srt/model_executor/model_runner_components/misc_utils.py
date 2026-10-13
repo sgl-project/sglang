@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
@@ -12,6 +12,7 @@ from sglang.srt.runtime_context import (
     attention_backends,
     get_context,
     get_observability,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
@@ -66,12 +67,13 @@ def create_msprobe_debugger() -> Optional[Any]:
 
 
 def resolve_pp_proxy_topk_size(
-    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+    *, model_config: ModelConfig, start_layer: int
 ) -> Optional[int]:
     hf_config = model_config.hf_text_config
+    parallel = get_parallel()
     if (
-        pp_size <= 1
-        or pp_rank == 0
+        parallel.pp_size <= 1
+        or parallel.pp_rank == 0
         or not is_deepseek_dsa(hf_config)
         or not dsa_layer_skips_topk(hf_config, start_layer)
     ):
@@ -80,13 +82,33 @@ def resolve_pp_proxy_topk_size(
 
 
 def resolve_pp_proxy_residual_num_blocks(
-    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+    *, model_config: ModelConfig, start_layer: int
 ) -> Optional[int]:
     """Return the inherited Kimi K3 attention-residual bank width."""
-    if pp_size <= 1 or pp_rank == 0 or not is_kimi_k3(model_config.hf_config):
+    parallel = get_parallel()
+    if (
+        parallel.pp_size <= 1
+        or parallel.pp_rank == 0
+        or not is_kimi_k3(model_config.hf_config)
+    ):
         return None
 
     block_size = getattr(model_config.hf_text_config, "attn_res_block_size", None)
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+@runtime_checkable
+class _SupportsDSparkPPProxy(Protocol):
+    def get_pp_proxy_dspark_hidden_size(self) -> int: ...
+
+
+def resolve_pp_proxy_dspark_hidden_size(
+    *, model: Any, pp_size: int, pp_rank: int
+) -> int:
+    if pp_size <= 1 or pp_rank == 0:
+        return 0
+    if isinstance(model, _SupportsDSparkPPProxy):
+        return model.get_pp_proxy_dspark_hidden_size()
+    return 0

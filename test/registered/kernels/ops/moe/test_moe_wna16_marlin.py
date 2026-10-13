@@ -20,7 +20,7 @@ from sglang.test.test_marlin_utils import (
     marlin_quantize,
 )
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 def _has_aot_moe_wna16_marlin_gemm() -> bool:
@@ -352,7 +352,8 @@ def test_moe_wna16_marlin_gemm(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
 )
-def test_fused_marlin_moe_non_gated_relu2():
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fused_marlin_moe_non_gated_relu2(compiled):
     torch.manual_seed(0)
 
     m = 17
@@ -376,7 +377,12 @@ def test_fused_marlin_moe_non_gated_relu2():
     score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(score_softmax, topk)
 
-    output = fused_marlin_moe(
+    run_moe = (
+        torch.compile(fused_marlin_moe, backend="eager", fullgraph=True)
+        if compiled
+        else fused_marlin_moe
+    )
+    output = run_moe(
         hidden_states=hidden_states,
         w1=qweight1,
         w2=qweight2,

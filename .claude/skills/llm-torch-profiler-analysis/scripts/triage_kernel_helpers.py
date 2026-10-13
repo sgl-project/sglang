@@ -391,7 +391,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         candidate_path=(
             "python/sglang/srt/layers/flashinfer_comm_fusion.py"
             "<br>python/sglang/srt/layers/layernorm.py"
-            "<br>python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
         ),
         active_keywords=(
             "allreduce_fusion",
@@ -419,7 +419,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="AITER allreduce fusion",
         candidate_path=(
             "python/sglang/srt/distributed/communication_op.py"
-            "<br>python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
             "<br>python/sglang/srt/layers/layernorm.py"
         ),
         active_keywords=(
@@ -541,7 +541,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
-            "NSA replay metadata copies are already fused into one-kernel" " families."
+            "NSA replay metadata copies are already fused into one-kernel families."
         ),
         min_share=0.02,
         likely_share=0.2,
@@ -721,7 +721,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="DeepSeek comm-prep fused RMSNorm + quant / flatten-quant",
         candidate_path=(
-            "python/sglang/srt/layers/communicator.py"
+            "python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
             "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
             "forward_mla.py"
             "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
@@ -787,7 +787,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("softmax", "sampling"),
         ),
         rationale_hint=(
-            "Decode-time sampling already has fused temperature and softmax" " kernels."
+            "Decode-time sampling already has fused temperature and softmax kernels."
         ),
         min_share=0.05,
         likely_share=0.5,
@@ -1218,8 +1218,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="vLLM fused residual add + RMSNorm",
         candidate_path=(
-            "vllm/_custom_ops.py"
-            "<br>vllm/compilation/passes/fusion/rms_quant_fusion.py"
+            "vllm/_custom_ops.py<br>vllm/compilation/passes/fusion/rms_quant_fusion.py"
         ),
         active_keywords=(
             "fused_add_rms_norm",
@@ -1236,8 +1235,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="vLLM fused activation-and-mul",
         candidate_path=(
-            "vllm/_custom_ops.py"
-            "<br>vllm/compilation/passes/fusion/act_quant_fusion.py"
+            "vllm/_custom_ops.py<br>vllm/compilation/passes/fusion/act_quant_fusion.py"
         ),
         active_keywords=(
             "silu_and_mul",

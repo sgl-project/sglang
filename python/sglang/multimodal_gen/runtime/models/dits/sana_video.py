@@ -208,8 +208,14 @@ class GLUMBTempConv(nn.Module):
         hidden_states = hidden_states.reshape(
             batch_size * num_frames, height, width, channels
         ).permute(0, 3, 1, 2)
-        hidden_states = sana_conv_bias_silu(self.conv_inverted, hidden_states)
-        hidden_states = sana_conv_bias_glu(self.conv_depth, hidden_states)
+        # Video's frame-batched activations are large enough to benefit from
+        # the rounded post-processing fusions in eager execution as well.
+        hidden_states = sana_conv_bias_silu(
+            self.conv_inverted, hidden_states, allow_eager=True
+        )
+        hidden_states = sana_conv_bias_glu(
+            self.conv_depth, hidden_states, allow_eager=True
+        )
         hidden_states = self.conv_point(hidden_states)
 
         temporal = hidden_states.reshape(

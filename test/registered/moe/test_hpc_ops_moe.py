@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 
 # Qwen3-30B-A3B-FP8 MoE shapes.
 E, TOPK, H, I = 128, 8, 2048, 768
@@ -60,7 +60,6 @@ def _quant_blockwise(w: torch.Tensor, block: int = 128):
     "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and an SM90 (Hopper) GPU",
 )
 class TestHpcOpsMoeBlockwise(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))

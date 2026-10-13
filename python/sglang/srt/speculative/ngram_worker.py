@@ -1,14 +1,12 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -33,13 +31,19 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
 
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+if is_xpu():
+    from sglang.kernels.ops.speculative.reconstruct_tree import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
+elif is_cuda():
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +80,6 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
-    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # NGRAM shares the target's model_runner -- no independent draft weights
-        # (the n-gram corpus is a CPU lookup structure built from token streams).
-        return []
-
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -93,7 +92,6 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -103,7 +101,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = ps.tp_rank
+        self.tp_rank = self.model_runner.tp_rank
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
@@ -305,9 +303,9 @@ class NGRAMWorker(BaseSpecWorker):
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
-        assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        assert total_draft_token_num == bs * self.draft_token_num, (
+            f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        )
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):

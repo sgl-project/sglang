@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-H3 released VAE decode contract."""
 
+import subprocess
+import sys
+import textwrap
 from unittest import mock
 
 import pytest
@@ -62,9 +65,7 @@ def test_unvalidated_decode_modes_are_rejected(mode):
 
 
 def test_vit_attention_uses_local_usp_backend_dispatch():
-    module = (
-        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_video_vae.attention"
-    )
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
     with (
         mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
         mock.patch(f"{module}.USPAttention", autospec=True) as usp_attention,
@@ -98,9 +99,7 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
             self.input_dtype = query.dtype
             return query
 
-    module = (
-        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_audio_vae.audio_vae"
-    )
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae"
     recording_fa = RecordingFA()
     with (
         mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
@@ -121,3 +120,35 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
     }
     assert recording_fa.input_dtype == torch.bfloat16
     assert output.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_audio_snake_first_call_matches_repeated_calls():
+    # a fresh process prevents earlier tests from warming a profiling JIT graph
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import torch
+                from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae import Snake1d
+
+                torch.manual_seed(42)
+                activation = Snake1d(64).cuda().eval()
+                with torch.inference_mode():
+                    activation.alpha.uniform_(0.1, 2.0)
+                    x = torch.randn(2, 64, 4096, device="cuda")
+                    original_x = x.clone()
+                    original_alpha = activation.alpha.clone()
+                    first = activation(x)
+                    for _ in range(4):
+                        torch.testing.assert_close(activation(x), first, rtol=0, atol=0)
+                    torch.testing.assert_close(x, original_x, rtol=0, atol=0)
+                    torch.testing.assert_close(activation.alpha, original_alpha, rtol=0, atol=0)
+                """
+            ),
+        ],
+        check=True,
+        timeout=120,
+    )

@@ -13,7 +13,7 @@ from sglang.srt.managers.io_struct import GetInternalStateReq
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerInternalStateEnvVars(unittest.TestCase):
@@ -42,6 +42,8 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
             is_dspark=lambda: False,
         )
         scheduler.draft_worker = None
+        # Set by maybe_init_rust_server in a real boot; None = no embedded Rust server.
+        scheduler.rust_server = None
 
         with get_context().override_server_args():
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())

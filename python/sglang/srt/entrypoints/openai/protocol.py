@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import (
@@ -39,11 +40,14 @@ from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
-    ResponseOutputMessage,
+)
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseTextConfig,
 )
+from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
@@ -253,6 +257,8 @@ StructuralTagResponseFormat: TypeAlias = Union[
 ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+    Tuple[Literal["ebnf"], str],
+    Tuple[Literal["full_assistant_ebnf"], str],
 ]
 
 
@@ -441,6 +447,22 @@ class SglExt(BaseModel):
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None
     )
+    input_ids: Optional[List[int]] = None
+    output_ids: Optional[List[List[int]]] = None
+
+    def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
+        """Split set fields into (non_ids, ids); a side with no set fields is None."""
+        non_ids: Dict[str, Any] = {}
+        ids: Dict[str, Any] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            (ids if name in ("input_ids", "output_ids") else non_ids)[name] = value
+        return (
+            type(self)(**non_ids) if non_ids else None,
+            type(self)(**ids) if ids else None,
+        )
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -566,6 +588,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -693,6 +719,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    phase: Optional[Literal["commentary", "final_answer"]] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
@@ -865,7 +892,10 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_input_ids_in_sglext: bool = False
+    return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
+    sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -886,7 +916,7 @@ class ChatCompletionRequest(BaseModel):
         description="DeepSeek-V4 quick instruction task. When set, the last "
         "user/developer message is treated as a single-shot classification prompt "
         "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
-        "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
+        "before generation. Only honored by the dsv4/dsv41 chat encoders; ignored otherwise.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -1148,8 +1178,9 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if self.tool_choice == "required" or isinstance(
-                self.tool_choice, ToolChoice
+            if tool_call_constraint[0] != "full_assistant_ebnf" and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
             ):
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
@@ -1167,6 +1198,9 @@ class ChatCompletionRequest(BaseModel):
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value  # type: ignore
                 )
+            elif constraint_type == "full_assistant_ebnf":
+                sampling_params["ebnf"] = constraint_value
+                sampling_params["ebnf_full_assistant"] = True
             else:
                 sampling_params[constraint_type] = constraint_value
 
@@ -1365,23 +1399,176 @@ class ScoringRequest(BaseModel):
     item_embed_overrides: Optional[List[Optional[List[List[float]]]]] = (
         None  # [num_items][num_item_embed_overrides][hidden_size]
     )
-    label_token_ids: Optional[List[int]] = (
-        None  # Token IDs to compute probabilities for
+    label_token_ids: Optional[Union[List[int], List[List[int]]]] = (
+        None  # shared candidates or one candidate list per item
     )
     apply_softmax: bool = False
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
+
+    # Setwise readout: when set, the readout is taken AT every occurrence of this
+    # token in each `query + item` sequence instead of the last token, and `scores`
+    # is returned nested (one `[Nᵢ x num_labels]` matrix per item). SeqCls pools the
+    # head there; CausalLM reads label-token logprobs there. Both support batched
+    # and --enable-mis.
+    score_extraction_token: Optional[str] = None
+
     model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):
-    scores: List[
-        List[float]
-    ]  # List of lists of probabilities, each in the order of label_token_ids
-    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
+    # Pointwise (no `score_extraction_token`): a single [num_rows x num_labels]
+    # matrix. Setwise: nested [num_items][Nᵢ x num_labels]. The nesting depth
+    # disambiguates the two shapes.
+    scores: Union[
+        List[List[float]],  # pointwise: [num_rows x num_labels]
+        List[List[List[float]]],  # setwise: [num_items][Nᵢ x num_labels]
+    ]
+    # Parallel to `scores`: flat [num_rows x hidden] (pointwise) or one such
+    # matrix per item (setwise).
+    pooled_hidden_states: Optional[
+        Union[
+            List[Optional[List[float]]],  # pointwise: [num_rows x hidden]
+            List[List[Optional[List[float]]]],  # setwise: [num_items][Nᵢ x hidden]
+        ]
+    ] = None
+    token_logprobs: Optional[List[List[float]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"
+
+
+def is_blank_decision_text(value) -> bool:
+    return not (value.strip() if isinstance(value, str) else value)
+
+
+def _nonblank_decision_text(value):
+    if is_blank_decision_text(value):
+        raise ValueError("must not be blank")
+    return value
+
+
+def check_option_names(names) -> None:
+    """Refuse option names that would make the rendered option lines ambiguous."""
+    seen = set()
+    for name in names:
+        key = name.strip().casefold()
+        if not key:
+            raise ValueError("option names must be nonempty")
+        # Each option is rendered as one prompt line.
+        if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in name):
+            raise ValueError(
+                f"option name {name!r} must not contain control or line break "
+                "characters"
+            )
+        if key in seen:
+            raise ValueError(f"option name {name!r} repeats another option")
+        seen.add(key)
+
+
+# Objects and arrays are rendered into the prompt as compact JSON.
+DecisionText = Union[str, Dict[str, Any], List[Any]]
+RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
+
+
+class DecisionOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: Optional[DecisionText] = None
+
+
+class DecisionChoiceQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["choice"]
+    question: RequiredDecisionText
+    # Options are labeled A to Z in order, so at most 26.
+    options: List[DecisionOption] = Field(min_length=2, max_length=26)
+
+    @model_validator(mode="after")
+    def _option_names_distinct(self):
+        try:
+            check_option_names(option.name for option in self.options)
+        except ValueError as e:
+            raise ValueError(f"question {self.id!r}: {e}") from None
+        return self
+
+
+class DecisionScoreQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["score"]
+    question: RequiredDecisionText
+    # Levels are labeled 0 to 9 in order, so at most 10.
+    levels: List[RequiredDecisionText] = Field(min_length=2, max_length=10)
+
+
+class DecisionYesNoQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["yes_no"]
+    question: RequiredDecisionText
+    yes: Optional[DecisionText] = None
+    no: Optional[DecisionText] = None
+
+
+DecisionQuestion = Annotated[
+    Union[DecisionChoiceQuestion, DecisionScoreQuestion, DecisionYesNoQuestion],
+    Field(discriminator="type"),
+]
+
+
+class DecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: RequiredDecisionText
+    questions: List[DecisionQuestion] = Field(min_length=1)
+    # Scales option probabilities only, not label_mass.
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    # Applied over the server defaults, with the template reasoning toggle off.
+    chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    # Pins the server-owned prompt wording. A different served version is refused.
+    prompt_format_version: Optional[int] = None
+    return_prompt_token_ids: bool = False
+    model: str = DEFAULT_MODEL_NAME
+
+    @field_validator("questions")
+    @classmethod
+    def _question_ids_distinct(cls, questions):
+        seen = set()
+        for question in questions:
+            if question.id in seen:
+                raise ValueError(
+                    f"question id {question.id!r} repeats another question"
+                )
+            seen.add(question.id)
+        return questions
+
+
+class DecisionAnswer(BaseModel):
+    type: Literal["choice", "score", "yes_no"]
+    probabilities: Dict[str, float]
+    # Full-vocabulary probability of all answer labels at the answer position.
+    label_mass: float
+    choice: Optional[str] = None
+    score: Optional[float] = None
+    # The exact /v1/score inputs, with return_prompt_token_ids.
+    prompt_token_ids: Optional[List[int]] = None
+    label_token_ids: Optional[List[int]] = None
+
+
+class DecisionResponse(BaseModel):
+    object: str = "decisions"
+    model: str
+    prompt_format_version: int
+    answers: Dict[str, DecisionAnswer]
+    usage: UsageInfo
 
 
 class V1RerankReqInput(BaseModel):
@@ -1509,6 +1696,7 @@ OpenAIServingRequest = Union[
     EmbeddingRequest,
     ClassifyRequest,
     ScoringRequest,
+    DecisionRequest,
     V1RerankReqInput,
     TokenizeRequest,
     DetokenizeRequest,
@@ -1559,6 +1747,9 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    # Input format of a ``custom`` tool: {"type": "text"} or
+    # {"type": "grammar", "syntax": ..., "definition": ...}.
+    format: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_function_tool(self) -> ResponseTool:
@@ -1567,7 +1758,17 @@ class ResponseTool(BaseModel):
         return self
 
 
+class ResponseInputMessageParam(EasyInputMessageParam, total=False):
+    phase: Optional[Literal["commentary", "final_answer"]]
+
+
+class ResponseOutputMessage(OpenAIResponseOutputMessage):
+    phase: Optional[Literal["commentary", "final_answer"]] = None
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputMessageParam,
+    ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
@@ -1630,6 +1831,18 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -1646,6 +1859,11 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -1743,20 +1961,24 @@ class ResponsesRequest(BaseModel):
     def is_include_output_logprobs(self) -> bool:
         return bool(self.include and "message.output_text.logprobs" in self.include)
 
+    def is_include_encrypted_reasoning(self) -> bool:
+        return bool(self.include and "reasoning.encrypted_content" in self.include)
+
     def has_json_schema_constraint(self) -> bool:
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
         """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` survives, the rest (web_search,
-        mcp, ...) can't be forced through the tool-call parser."""
+        object forms only a named ``function`` / ``custom`` tool survives, the
+        rest (web_search, mcp, ...) can't be forced through the tool-call
+        parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
         )
-        if tool_choice.get("type") == "function" and name:
+        if tool_choice.get("type") in ("function", "custom") and name:
             return {"type": "function", "name": name}
         return "auto"
 
@@ -1823,6 +2045,12 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
+            if tool_call_constraint[0] == "full_assistant_ebnf":
+                # Explicit output constraints take precedence over the default EBNF.
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+                return params
             # Refuse rather than silently drop the tool-call grammar.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
@@ -1837,6 +2065,9 @@ class ResponsesRequest(BaseModel):
                     if hasattr(constraint_value, "model_dump")
                     else constraint_value
                 )
+            elif constraint_type == "full_assistant_ebnf":
+                params["ebnf"] = constraint_value
+                params["ebnf_full_assistant"] = True
             else:
                 params[constraint_type] = constraint_value
 
@@ -1858,7 +2089,12 @@ class ResponsesResponse(BaseModel):
     model: str
 
     output: List[
-        Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+        Union[
+            ResponseOutputMessage,
+            ResponseOutputItem,
+            ResponseReasoningItem,
+            ResponseFunctionToolCall,
+        ]
     ] = Field(default_factory=list)
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
@@ -1918,7 +2154,12 @@ class ResponsesResponse(BaseModel):
         model_name: str,
         created_time: int,
         output: List[
-            Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+            Union[
+                ResponseOutputMessage,
+                ResponseOutputItem,
+                ResponseReasoningItem,
+                ResponseFunctionToolCall,
+            ]
         ],
         status: str,
         usage: Optional[UsageInfo],
@@ -1944,7 +2185,7 @@ class ResponsesResponse(BaseModel):
                 try:
                     if isinstance(it, ResponseOutputText):
                         continue
-                    elif isinstance(it, ResponseOutputMessage):
+                    elif isinstance(it, OpenAIResponseOutputMessage):
                         if not it.content:
                             continue
                         for c in it.content:
@@ -2025,6 +2266,7 @@ class MessageProcessingResult:
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
+    reasoning_end_token_ids: Optional[List[int]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -2043,7 +2285,11 @@ class ResponseReasoningTextContent(BaseModel):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+    ResponseInputMessageParam,
+    ResponseOutputMessage,
+    ResponseInputItemParam,
+    "ResponseReasoningItem",
+    ResponseFunctionToolCall,
 ]
 
 

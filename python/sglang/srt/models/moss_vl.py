@@ -22,8 +22,13 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1011,17 +1016,15 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=False, next_sparse=False),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn() if layer_id != 0 else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1029,12 +1032,9 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1043,16 +1043,12 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             )
 
         # MLP
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
-        hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        return hidden_states, residual
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = ffn_exit.finish(hidden_states)
+        return hidden_states
 
 
 # ==================== Text Model ====================
@@ -1109,15 +1105,12 @@ class MossVLTextModel(nn.Module):
         vision_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        residual_batch.start(forward_batch)
 
         for decoder_layer in self.layers:
             if isinstance(decoder_layer, MossVLCrossAttentionDecoderLayer):
                 if not skip_cross_attention:
-                    # Fuse residual before cross-attention
-                    if residual is not None:
-                        hidden_states = hidden_states + residual
-                        residual = None
+                    hidden_states = residual_batch.fold(hidden_states, forward_batch)
                     hidden_states = decoder_layer(
                         hidden_states=hidden_states,
                         cross_attention_states=cross_attention_states,
@@ -1127,20 +1120,17 @@ class MossVLTextModel(nn.Module):
                         positions=positions,
                         vision_position_ids=vision_position_ids,
                     )
+                    hidden_states = residual_batch.written(hidden_states, forward_batch)
             elif isinstance(decoder_layer, MossVLSelfAttentionDecoderLayer):
-                hidden_states, residual = decoder_layer(
+                hidden_states = decoder_layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=residual,
                 )
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
 
-        if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
-        else:
-            hidden_states = self.norm(hidden_states)
+        hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
         return hidden_states
 
 
@@ -1192,7 +1182,6 @@ class MossVLForCausalLM(nn.Module):
 
 
 class MossVLForConditionalGeneration(nn.Module):
-
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.config = config

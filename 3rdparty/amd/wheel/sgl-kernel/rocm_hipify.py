@@ -18,7 +18,7 @@ sources = [
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/pos_enc.cu",
-    "csrc/elementwise/topk.cu",
+    # topk.hip is maintained as native HIP instead of being generated from topk.cu.
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",

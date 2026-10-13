@@ -1,7 +1,10 @@
 """DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
-Reproduces the assert in `swa_radix_cache.cache_unfinished_req`:
+Regression test for the former SWA `cache_unfinished_req` assertion:
     assert old_prefix_len <= len(new_indices)
+The unified cache reads `req.kv.cache_protected_len` and tolerates page_size - 1
+of alignment slack, so this reproduces the historical trip conditions rather
+than a line that still exists.
 
 Trip conditions (all required):
   1. Fork-only SWA leaf early-release on (`SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
@@ -88,7 +91,6 @@ class TestDSV4FlashSWARadixRetract(CustomTestCase):
         env = {
             "SGLANG_DSV4_FP4_EXPERTS": "0",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-            "SGLANG_OPT_SWA_RADIX_CACHE_COMPACT": "0",
             "SGLANG_TEST_RETRACT": "1",
             "SGLANG_TEST_RETRACT_INTERVAL": "3",
         }
@@ -130,7 +132,7 @@ class TestDSV4FlashSWARadixRetract(CustomTestCase):
         """Stress: 64 concurrent long-prompt reqs with long generation force
         retract under SWA pool pressure. Reqs share a 30k+ token prefix so
         tombstoned leaves from retracted reqs are on the radix path of new
-        reqs. Scheduler must not crash on the swa_radix_cache assert."""
+        reqs. Scheduler must not crash on the SWA insert assert."""
 
         random.seed(0)
         concurrency = 64

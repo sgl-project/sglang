@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed.parallel_state import get_world_group
 
 logger = logging.getLogger(__name__)
 

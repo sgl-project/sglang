@@ -5,18 +5,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# Patch TP world size / rank before importing modules that read them at __init__.
-import sglang.srt.layers.linear as _linear_mod
+# Set the single-rank topology before importing the attention implementation.
 from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(
-    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    tp_size=1,
+    tp_rank=0,
+    attn_tp_size=1,
+    attn_tp_rank=0,
+    tp_group=SimpleNamespace(world_size=1),
 )
 _parallel_override.__enter__()
-
-# RowParallelLinear.forward calls get_tp_group() to manage symmetric memory.
-# Provide a stub group with world_size=1 so use_symmetric_memory short-circuits.
-_linear_mod.get_tp_group = lambda: SimpleNamespace(world_size=1)
 
 from sglang.srt.configs.falcon_h1 import FalconH1Config  # noqa: E402
 from sglang.srt.configs.mamba_utils import (  # noqa: E402
@@ -25,7 +24,6 @@ from sglang.srt.configs.mamba_utils import (  # noqa: E402
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch  # noqa: E402
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import (  # noqa: E402
     ATTENTION_BACKENDS,
 )
@@ -51,6 +49,7 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
     forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 # Tiny dims chosen to be the minimum that satisfies MambaMixer2's TP/chunk asserts:
 #   - num_heads % tp_size == 0  (tp_size=1)
@@ -274,6 +273,7 @@ class TinyMamba2ModelConfig:
         self.swa_v_head_dim = case.head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -322,7 +322,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
         self.gpu_id = 0
-        self.ps = ParallelState.trivial()
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config

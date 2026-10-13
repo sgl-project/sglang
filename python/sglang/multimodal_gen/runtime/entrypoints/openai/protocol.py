@@ -46,6 +46,10 @@ class ImageGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
+    task_type: Optional[str] = Field(
+        default=None, description="Requested task from the server supported_task_types."
+    )
+    enhance_prompt: bool = False
     model: Optional[str] = None
     n: Optional[int] = 1
     quality: Optional[str] = "auto"
@@ -105,6 +109,7 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    revised_prompt: Optional[str] = None
     action: Optional[Dict[str, Any]] = None
 
 
@@ -112,10 +117,14 @@ class VideoGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
+    enhance_prompt: bool = False
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
     video_path: Optional[str] = None
     video_url: Optional[str] = None
+    task_type: Optional[str] = Field(
+        default=None, description="Requested task from the server supported_task_types."
+    )
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None
@@ -168,6 +177,7 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    enhance_prompt: Literal[False] = False
     type: Literal["init"]
     # WebSocket does not support multipart/form-data image uploads
     first_frame: Optional[bytes | str] = None

@@ -11,39 +11,8 @@ from sglang.srt.lora.utils import (
     get_batch_token_counts,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align
-
-
-def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) -> int:
-    """Token count the MoE-LoRA mapping must cover: gathered under --enable-dp-attention, else per-rank.
-
-    In the eager path prepare_lora_batch runs from ForwardBatch.init_new, BEFORE
-    prepare_mlp_sync_batch assigns forward_batch.global_dp_buffer_len (only the cuda-graph
-    capture path pre-sets it), so that field alone under-sizes the MoE-LoRA token mapping to the
-    per-rank length and the MoE-LoRA kernels index past it (sticky CUDA IMA). When it is unset,
-    derive an upper bound of the gathered length from global_num_tokens_cpu (assigned in
-    init_new before prepare_lora_batch runs), mirroring prepare_mlp_sync_batch's attn-tp/cp
-    alignment; max*n covers both SUM_LEN and MAX_LEN padding modes. Over-allocation is harmless:
-    the kernels index at most the actual gathered length.
-    """
-    if forward_batch.global_dp_buffer_len is not None:
-        return max(forward_batch.global_dp_buffer_len, num_tokens)
-    global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
-    if not global_num_tokens:
-        return num_tokens
-    # Local import: a module-level cp import here is circular (see forward_batch_info).
-    # v0.5.16 moved this helper layers.utils.cp_utils -> layers.cp.padding.
-    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.runtime_context import get_parallel
-
-    # v0.5.16 retired dp_attention.get_attention_tp_size(); it lives on ParallelState now.
-    attn_tp_size = get_parallel().attn_tp_size
-    cp_align_size = get_cp_padding_align_size()
-    upper = max(
-        ceil_align(ceil_align(t, attn_tp_size), cp_align_size)
-        for t in global_num_tokens
-    ) * len(global_num_tokens)
-    return max(upper, num_tokens)
+from sglang.srt.runtime_context import LoRABatchLayout
+from sglang.srt.utils.common import empty_device_cache
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -56,9 +25,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
+    supports_lora_a_overlap = False
+    skip_inactive_lora_batches = False
+
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
+    # Supporting backends must handle both eager execution and decode CUDA graphs.
+    supports_dp_attention: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -75,6 +49,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+        # Separate scratch sized for the largest prefill token bucket.
+        self.prefill_moe_cg_buffers: dict | None = None
+        self._moe_cg_buffer_init_args: tuple[int, torch.dtype, object] | None = None
+        self._moe_cg_buffer_max_bs: int | None = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -84,6 +62,30 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def get_batch_info(
+        self, layout: LoRABatchLayout | None = None
+    ) -> Optional[LoRABatchInfo]:
+        """Return routing metadata for the requested token layout.
+
+        Backends that support multiple layouts override this method.
+        """
+        return self.batch_info
+
+    def prepare_global_lora_batch(self, forward_batch: ForwardBatch) -> None:
+        """Prepare routing for TP-global sections of a DP-attention forward."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} must implement "
+            "prepare_global_lora_batch() to support DP attention."
+        )
+
+    def validate_lora_targets(
+        self,
+        base_model: torch.nn.Module,
+        target_modules: set[str],
+    ) -> None:
+        """Raise before wrapping when this backend cannot execute its targets."""
+        pass
 
     def run_lora_a_embedding(
         self,
@@ -221,7 +223,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+    def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
+        """Allocate backend-specific TP-global metadata for decode graphs."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support DP attention "
+            "in the decode CUDA graph."
+        )
+
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
         """Allocate static LoRA batch metadata for the prefill CUDA graph,
         sized for the largest captured token bucket. Called before capture."""
         raise NotImplementedError(
@@ -242,61 +253,30 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_loras: int,
         compute_dtype: torch.dtype,
         moe_layer,
+        *,
+        prefill: bool = False,
     ):
-        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+        """Allocate shared MoE routing buffers for decode or prefill captures.
 
-        Called once before init_memory_pool() with a representative MoE layer
-        to extract dimensions.  All FusedMoEWithLoRA layers share the same
-        buffers since they execute sequentially during forward.
-
-        This is backend-agnostic because MoE LoRA always uses the same
-        fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
-        dense LoRA backend is selected.
+        max_bs counts tokens. Layers reuse these buffers sequentially.
         """
+        if not prefill:
+            self._moe_cg_buffer_init_args = (max_loras, compute_dtype, moe_layer)
+            self._moe_cg_buffer_max_bs = max_bs
+
         base = moe_layer.base_layer
         top_k = base.top_k
-        # Derive dims from the base FusedMoE rather than quant-specific tensors,
-        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
-        E = base.num_local_experts
-        hidden_dim = base.hidden_size
-        N = 2 * base.intermediate_size_per_partition
         device = next(base.parameters()).device
-        dtype = compute_dtype
         num_experts = base.num_experts
 
-        # Under --enable-dp-attention the MoE runs on DP-GATHERED tokens (the global DP buffer of
-        # length up to max_bs * attn_dp_size), not the per-rank batch. The per-token LoRA routing
-        # buffers below are indexed by that gathered token count, so size them for the gathered
-        # maximum; otherwise the MoE-LoRA kernels read token_lora_mapping / sorted_token_ids past a
-        # per-rank-sized buffer -> cudaErrorIllegalInstruction during cuda-graph capture. Expert- and
-        # adapter-indexed buffers (cumsum_buffer, adapter_enabled, lora_ids) are unaffected.
-        from sglang.srt.layers.dp_attention import get_attention_dp_size
-
-        dp_size = max(1, get_attention_dp_size())
-        max_moe_tokens = max_bs * dp_size
-
         block_size_m = 64
-        max_num_tokens_padded = max_moe_tokens * top_k + num_experts * (
-            block_size_m - 1
-        )
+        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
         max_num_tokens_padded = (
             (max_num_tokens_padded + block_size_m - 1) // block_size_m
         ) * block_size_m
         max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
-        self.moe_cg_buffers = {
-            "intermediate_cache1": torch.empty(
-                (max_bs, top_k, N), device=device, dtype=dtype
-            ),
-            "intermediate_cache2": torch.empty(
-                (max_bs * top_k, N // 2), device=device, dtype=dtype
-            ),
-            "intermediate_cache3": torch.empty(
-                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
-            ),
-            "out_hidden_states": torch.empty(
-                (max_bs, hidden_dim), device=device, dtype=dtype
-            ),
+        buffers = {
             "sorted_token_ids_lora": torch.empty(
                 (max_loras * max_num_tokens_padded,),
                 device=device,
@@ -311,12 +291,6 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 (max_loras,), device=device, dtype=torch.int32
             ),
             "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
-            # int64 copy of weight_indices for index_fill_(), which requires
-            # LongTensor.  weight_indices itself must stay int32 because the
-            # CUDA moe_lora_align kernel casts it to int32_t*.
-            "weight_indices_long": torch.zeros(
-                max_moe_tokens, dtype=torch.int64, device=device
-            ),
             "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
             "cumsum_buffer": torch.zeros(
                 max_loras * (num_experts + 1),
@@ -324,16 +298,31 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 device=device,
             ),
             "token_mask": torch.empty(
-                (max_loras * max_moe_tokens * top_k,),
+                (max_loras * max_bs * top_k,),
                 dtype=torch.int32,
                 device=device,
             ),
-            "max_num_tokens_padded": max_num_tokens_padded,
-            "max_num_m_blocks": max_num_m_blocks,
             "token_lora_mapping": torch.full(
-                (max_moe_tokens,), -1, dtype=torch.int32, device=device
+                (max_bs,), -1, dtype=torch.int32, device=device
             ),
         }
+
+        if prefill:
+            self.prefill_moe_cg_buffers = buffers
+        else:
+            self.moe_cg_buffers = buffers
+
+    def resize_cuda_graph_moe_buffers(self, max_bs: int) -> bool:
+        """Shrink the provisional pre-profile buffers to the captured token cap."""
+        if self._moe_cg_buffer_max_bs is None or max_bs >= self._moe_cg_buffer_max_bs:
+            return False
+
+        assert self._moe_cg_buffer_init_args is not None
+        max_loras, compute_dtype, moe_layer = self._moe_cg_buffer_init_args
+        self.moe_cg_buffers.clear()
+        empty_device_cache()
+        self.init_cuda_graph_moe_buffers(max_bs, max_loras, compute_dtype, moe_layer)
+        return True
 
     def _add_moe_lora_info(
         self, forward_batch: ForwardBatch, batch_info: LoRABatchInfo
@@ -341,41 +330,42 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         if not self.is_moe_lora:
             return batch_info
 
+        prefill = batch_info is self.prefill_cuda_graph_batch_info
         if batch_info.use_cuda_graph:
-            adapter_enabled = self.moe_cg_buffers["adapter_enabled"]
-            token_lora_mapping = self.moe_cg_buffers["token_lora_mapping"]
+            buffers = self.prefill_moe_cg_buffers if prefill else self.moe_cg_buffers
+            if prefill and buffers is None:
+                raise RuntimeError(
+                    "prefill MoE-LoRA CUDA graph buffers were not initialized"
+                )
+            adapter_enabled = buffers["adapter_enabled"]
+            token_lora_mapping = buffers["token_lora_mapping"]
         else:
             adapter_enabled = None
             token_lora_mapping = None
 
         num_tokens, max_len = get_batch_token_counts(forward_batch)
 
+        # Capture fixes the segment count; include every prefill request slot.
+        # Unused slots contain empty segments.
         if (
             batch_info.req_seg_indptr is not None
             or batch_info.req_weight_indices is not None
         ):
             assert batch_info.req_seg_indptr is not None
             assert batch_info.req_weight_indices is not None
-            num_moe_segments = batch_info.bs
+            num_moe_segments = (
+                batch_info.req_weight_indices.shape[0] if prefill else batch_info.bs
+            )
             seg_indptr = batch_info.req_seg_indptr[: num_moe_segments + 1]
             req_to_lora = batch_info.req_weight_indices[:num_moe_segments]
         else:
-            num_moe_segments = batch_info.num_segments
+            num_moe_segments = (
+                batch_info.weight_indices.shape[0]
+                if prefill
+                else batch_info.num_segments
+            )
             seg_indptr = batch_info.seg_indptr[: num_moe_segments + 1]
             req_to_lora = batch_info.weight_indices[:num_moe_segments]
-
-        # --enable-dp-attention all-gathers tokens into the MoE, so the MoE-LoRA kernels index
-        # token_lora_mapping by the GATHERED token count, not the per-rank num_tokens. Size the
-        # mapping to (an upper bound of) the gathered count so those reads stay in-bounds — see
-        # get_gathered_moe_num_tokens for why global_dp_buffer_len alone is NOT enough in the
-        # eager path (the per-rank segments still fill only [0, num_tokens); the tail stays -1).
-        moe_num_tokens = get_gathered_moe_num_tokens(forward_batch, num_tokens)
-        if batch_info.use_cuda_graph:
-            # Static capture buffers hold max_bs*dp tokens; a REAL replay's gathered length never
-            # exceeds that (the captured graph could not address it), so cap the upper bound at
-            # the buffer size. Batches whose gathered bound exceeds it are demoted to the eager
-            # prep path in LoRAManager.prepare_lora_batch before we get here.
-            moe_num_tokens = min(moe_num_tokens, token_lora_mapping.shape[0])
 
         adapter_enabled, token_lora_mapping = _compute_moe_lora_info(
             num_tokens,
@@ -385,33 +375,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled,
             token_lora_mapping,
             max_len=max_len,
-            mapping_len=moe_num_tokens,
         )
-
-        # Tier-1 (colocate RL, exactly one adapter loaded): the DP-gathered tail
-        # [num_tokens, moe_num_tokens) covers OTHER dp ranks' tokens, which under colocate RL all
-        # use that single adapter. The per-rank fill above only wrote [0, num_tokens), leaving the
-        # tail -1 (adapter-disabled) -> cross-rank gathered tokens would miss the LoRA delta on
-        # this rank's local experts. The stamps below are ARMED BY LoRAManager.prepare_lora_batch
-        # (policy lives there; both are host ints, no GPU sync -> cuda-graph safe, written each
-        # batch in the eager prep path):
-        #   * _single_loaded_buffer_id: armed only when exactly one adapter is loaded AND this
-        #     rank's local requests actively use it -> stamp the tail with that adapter.
-        #   * _idle_rank_active_buffer_id: armed only on a true idle rank (num_tokens == 0) ->
-        #     _compute_moe_lora_info left the whole mapping -1 / adapter_enabled all-0, so stamp
-        #     the whole gathered buffer and enable the adapter.
-        # Multi-adapter batches and base-only local batches arm neither stamp and keep the -1
-        # tail: foreign tokens get base rather than a delta this rank cannot attribute.
-        if moe_num_tokens > num_tokens:
-            if num_tokens > 0:
-                single_bid = getattr(self, "_single_loaded_buffer_id", None)
-                if single_bid is not None:
-                    token_lora_mapping[num_tokens:moe_num_tokens].fill_(single_bid)
-            else:
-                idle_bid = getattr(self, "_idle_rank_active_buffer_id", None)
-                if idle_bid is not None:
-                    token_lora_mapping.fill_(idle_bid)
-                    adapter_enabled[idle_bid] = 1
 
         batch_info.moe_lora_info = MoELoRABatchInfo(
             seg_indptr=seg_indptr,
@@ -437,6 +401,20 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         static decode / prefill CUDA graph batch info respectively.
         """
         pass
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Prepare explicit eager token-row LoRA segments."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support explicit "
+            "token segments."
+        )
 
 
 @triton.jit
@@ -479,33 +457,24 @@ def _compute_moe_lora_info(
     adapter_enabled: torch.Tensor | None,
     token_lora_mapping: torch.Tensor | None,
     max_len: int,
-    mapping_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # ``num_tokens`` is the PER-RANK fill count (segments cover this rank's tokens). ``mapping_len``
-    # is the length of the token_lora_mapping the MoE-LoRA kernels actually index -- under
-    # --enable-dp-attention the MoE runs on DP-GATHERED tokens (mapping_len = global_dp_buffer_len
-    # >= num_tokens), so the returned mapping must span the gathered count to keep those kernels
-    # in-bounds. The DP-gathered tail [num_tokens, mapping_len) defaults to -1 (adapter-disabled).
-    if mapping_len is None:
-        mapping_len = num_tokens
-    assert mapping_len >= num_tokens
     if token_lora_mapping is not None:
-        assert (
-            mapping_len <= token_lora_mapping.shape[0]
-        ), "mapping_len must be less than or equal to the shape of token_lora_mapping"
-        token_lora_mapping = token_lora_mapping[:mapping_len]
+        assert num_tokens <= token_lora_mapping.shape[0], (
+            "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        )
+        # Clear padded replay rows left by a larger batch.
+        if num_tokens < token_lora_mapping.shape[0]:
+            token_lora_mapping[num_tokens:].fill_(-1)
+        token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
-            (mapping_len,), dtype=torch.int32, device=seg_indptr.device
+            (num_tokens,), dtype=torch.int32, device=seg_indptr.device
         )
-    if mapping_len > num_tokens:
-        # clean the gathered tail before the per-rank fill writes [0, num_tokens)
-        token_lora_mapping.fill_(-1)
 
     if adapter_enabled is not None:
-        assert (
-            len(lora_ranks) <= adapter_enabled.shape[0]
-        ), "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        assert len(lora_ranks) <= adapter_enabled.shape[0], (
+            "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        )
     else:
         adapter_enabled = torch.empty(
             len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
@@ -514,10 +483,8 @@ def _compute_moe_lora_info(
     adapter_enabled.zero_()
 
     has_segments = weight_indices.numel() != 0
-    use_cuda_kernel = (
-        num_tokens != 0 and has_segments and seg_indptr.device.type == "cuda"
-    )
-    if use_cuda_kernel:
+    needs_launch = num_tokens != 0 and has_segments
+    if needs_launch:
         block_size = 256
         tiles_per_segment = triton.cdiv(max_len, block_size)
         grid_size = tiles_per_segment * weight_indices.numel()
@@ -525,6 +492,10 @@ def _compute_moe_lora_info(
             f"MoE LoRA token-mapping launch under-covers tokens: "
             f"{grid_size=} {block_size=} {num_tokens=}"
         )
+
+    # Triton kernel on CUDA only; every other device (e.g. XPU) falls through to
+    # the native torch path below, which yields the same mapping.
+    if needs_launch and seg_indptr.device.type == "cuda":
         _compute_moe_lora_info_kernel[(grid_size,)](
             seg_indptr,
             lora_ranks,
@@ -558,12 +529,8 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
-    # Fill only the per-rank prefix [0, num_tokens); the gathered tail keeps the -1 set above.
-    torch.index_select(
-        weight_indices.to(torch.int32),
-        0,
-        req_indices,
-        out=token_lora_mapping[:num_tokens],
+    token_lora_mapping = torch.index_select(
+        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
     )
 
     return adapter_enabled, token_lora_mapping

@@ -30,7 +30,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
@@ -43,6 +43,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
+        runner.max_context_size = None
         runner.max_num_tokens = 16
         return runner
 
@@ -176,7 +177,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
 
-        with (override_platform(is_cuda=True),):
+        with (
+            override_platform(is_cuda=True),
+        ):
             handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "disable_radix_cache"))

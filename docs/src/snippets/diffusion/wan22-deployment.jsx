@@ -11,8 +11,8 @@
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
             { id: 'mi355x', label: 'MI355X', default: false },
-            { id: 'a2', label: 'A2', default: false },
-            { id: 'a3', label: 'A3', default: false }
+            { id: 'a2', label: 'A2 Series', default: false },
+            { id: 'a3', label: 'A3 Series', default: false }
           ],
         },
         task: {
@@ -90,7 +90,7 @@
       useEffect(() => {
         const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
 
-        const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+        const targetTabName = isAscend ? 'Ascend A3 Series' : 'NVIDIA B200';
 
         const allTabs = document.querySelectorAll('button, [role="tab"]');
 
@@ -138,7 +138,7 @@
 
         if (hardware === 'a2' || hardware === 'a3') {
           const comment = hardware === 'a3'
-            ? '#One A3 card has 2 npu chips\n'
+            ? '#One A3 Series card has 2 npu chips\n'
             : '';
           const isBestPractice = bestPractice === 'on';
           let command;

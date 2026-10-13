@@ -960,9 +960,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         teacache_params = forward_batch.teacache_params
         assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(
-            teacache_params, TeaCacheParams
-        ), "teacache_params is not a TeaCacheParams"
+        assert isinstance(teacache_params, TeaCacheParams), (
+            "teacache_params is not a TeaCacheParams"
+        )
         num_inference_steps = forward_batch.num_inference_steps
         teache_thresh = teacache_params.teacache_thresh
 
@@ -1006,9 +1006,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = (
-            self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
-        )
+        ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
         normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
         modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
         if self.cnt == 0 or self.cnt == num_inference_steps - 1:
@@ -1023,9 +1021,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 9.61237896e-02,
             ]
             rescale_func = np.poly1d(coefficients)
-            assert (
-                self.previous_modulated_input is not None
-            ), "previous_modulated_input is not initialized"
+            assert self.previous_modulated_input is not None, (
+                "previous_modulated_input is not initialized"
+            )
             self.accumulated_rel_l1_distance += rescale_func(
                 (
                     (modulated_inp - self.previous_modulated_input).abs().mean()

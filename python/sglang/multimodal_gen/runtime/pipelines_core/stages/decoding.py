@@ -10,6 +10,9 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -42,8 +45,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
-    build_torch_compile_kwargs,
-    resolve_torch_compile_mode,
+    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -182,17 +184,16 @@ class DecodingStage(PipelineStage):
             compiled_callable.target_id != id(vae)
             or compiled_callable.compiled_module is None
         )
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_VAE_TORCH_COMPILE_MODE",
+            "SGLANG_TORCH_COMPILE_MODE",
+            default="default",
+            module=vae,
+        )
         if current_platform.is_npu():
-            compile_kwargs = build_torch_compile_kwargs(mode=None)
             if will_compile:
                 logger.info("Compiling VAE decode with torchair backend on NPU")
         else:
-            mode = resolve_torch_compile_mode(
-                "SGLANG_VAE_TORCH_COMPILE_MODE",
-                "SGLANG_TORCH_COMPILE_MODE",
-                default="default",
-            )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
@@ -333,14 +334,17 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
+            with use_vae_fast_path(
+                vae,
+                quality_allows_kernel_fusions(batch.sampling_params.quality),
+            ):
                 frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
-                    assert (
-                        batch.trajectory_latents is not None
-                    ), "batch should have trajectory latents"
+                    assert batch.trajectory_latents is not None, (
+                        "batch should have trajectory latents"
+                    )
 
                     # 1. Batch trajectory decoding to improve GPU utilization
                     # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]

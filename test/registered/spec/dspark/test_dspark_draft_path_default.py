@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -11,7 +13,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
@@ -118,6 +120,38 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+
+class TestDsparkFoldedSamplingDefault(CustomTestCase):
+    def test_sharded_greedy_default_and_sampling_override(self):
+        from sglang.srt.environ import DsparkFoldedSampling, envs
+        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+            _resolve_folded_sampling,
+        )
+
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
+            markov_head=SimpleNamespace(supports_sharded_greedy=True),
+        )
+        args = dict(
+            model=model,
+            gamma=5,
+            max_bs=64,
+            device="cpu",
+            tp_rank=0,
+            available_memory_gb=16,
+        )
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+            DsparkFoldedSampling.AUTO.value
+        ):
+            self.assertFalse(_resolve_folded_sampling(**args))
+            model.markov_head.supports_sharded_greedy = False
+            self.assertTrue(_resolve_folded_sampling(**args))
+        model.markov_head.supports_sharded_greedy = True
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+            DsparkFoldedSampling.FORCE.value
+        ):
+            self.assertTrue(_resolve_folded_sampling(**args))
 
 
 if __name__ == "__main__":

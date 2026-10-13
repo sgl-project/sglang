@@ -15,10 +15,12 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.moe.topk import (
+    _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
+    capture_routed_experts_if_allowed,
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
@@ -53,12 +55,26 @@ class HashTopK(nn.Module):
         self.waterfill_balancer = None
 
         if self.enable_waterfill:
+            # Routed-experts capture sizes its buffer by the model's fused
+            # shared-expert count, but under waterfill the ids captured here
+            # carry routed slots only, so the two widths disagree.
+            if get_exec().features.enable_return_routed_experts:
+                raise ValueError(
+                    "HashTopK cannot capture routed experts with waterfill enabled: "
+                    "disable --enable-waterfill or --enable-return-routed-experts."
+                )
             # Waterfill appends the shared expert after EPLB maps routed IDs.
             topk -= num_fused_shared_experts
             num_fused_shared_experts = 0
 
         self.num_experts = num_experts
         self.topk = topk
+        self.topk_config = TopKConfig(
+            top_k=topk,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            scoring_func=scoring_func,
+        )
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
@@ -157,7 +173,10 @@ class HashTopK(nn.Module):
             topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
 
             if self.score_func != "softmax":
-                topk_weights[:, :-1] /= topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                topk_weights[:, :-1] /= (
+                    topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                    + _RENORMALIZE_SUM_EPSILON
+                )
 
             topk_ids[:, -1] = torch.randint(
                 low=self.num_experts,
@@ -174,7 +193,10 @@ class HashTopK(nn.Module):
             topk_ids[:, :] = self.tid2eid[input_ids]
             topk_weights[:, :] = scores.gather(1, topk_ids[:, :])
             if self.score_func != "softmax":
-                topk_weights[:, :] /= topk_weights[:, :].sum(dim=-1, keepdim=True)
+                topk_weights[:, :] /= (
+                    topk_weights[:, :].sum(dim=-1, keepdim=True)
+                    + _RENORMALIZE_SUM_EPSILON
+                )
 
         return topk_weights, topk_ids
 
@@ -218,14 +240,14 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
-        assert (
-            input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
-        ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
+        assert input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0], (
+            f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
+        )
 
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
         elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.kernels.ops.attention.dsv4 import hash_topk
+            from sglang.kernels.ops.moe.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -243,12 +265,18 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
+        capture_routed_experts_if_allowed(
+            self.topk_config,
+            self.layer_id,
+            topk_ids,
+            num_token_non_padded,
+        )
+
         num_fused_shared_experts = self.num_fused_shared_experts
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
             if self.layer_id is None:
                 raise RuntimeError("HashTopK LP dispatch requires layer_id.")
@@ -278,11 +306,7 @@ class HashTopK(nn.Module):
                 topk_weights,
                 num_fused_shared_experts,
                 num_physical_routed_experts,
-                TopKConfig(
-                    top_k=self.topk,
-                    num_fused_shared_experts=num_fused_shared_experts,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                ),
+                self.topk_config,
             )
         else:
             topk_ids = topk_ids_logical_to_physical(

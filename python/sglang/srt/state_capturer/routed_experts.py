@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
@@ -30,10 +31,9 @@ def _is_scattered_a2a_backend() -> bool:
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
-    Routed experts share a global device buffer across DP ranks (indexed by
-    dp_rank), so `_get_local_slice` overrides the default to apply DP-rank-aware
-    slicing. The device cache also holds extra columns for any fused shared
-    experts; the host cache and user-facing return drop them via the
+    DP-concatenated routing needs a DP-rank offset at readback; DP-local routing
+    already starts at buffer offset zero. The device cache holds extra columns
+    for fused shared experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
     """
 
@@ -120,8 +120,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Gathered rows start at buffer offset zero on every DP rank.
-        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
+        # DP-local routing and attention-TP gathered rows both start at zero.
+        if is_dp_attention_enabled() and not is_moe_input_scattered_across_dp_ranks():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch
@@ -144,6 +144,12 @@ def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
     get_resources().experts_capturer = capturer
 
 
+def destroy_global_experts_capturer():
+    if (capturer := get_resources().experts_capturer) is not None:
+        capturer.destroy()
+    get_resources().experts_capturer = None
+
+
 def extract_routed_experts_from_meta_info(data):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32
@@ -158,14 +164,13 @@ def extract_routed_experts_from_meta_info(data):
 def disable_routed_experts_capture_for_draft(model: Any) -> None:
     """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
 
-    Capture is target-only; a draft ``TopK`` must never write the target's
-    process-global buffer. ``HashTopK`` has no ``topk_config`` and never
-    captures, so it is left untouched.
+    Capture is target-only; draft ``TopK`` and ``HashTopK`` modules must never
+    write the target's process-global buffer.
     """
-    # Lazy import: ``layers.moe.topk`` imports ``get_global_experts_capturer``
-    # from this module, so a top-level import here would be circular.
+    # Lazy imports avoid circular dependencies with the capture call sites.
+    from sglang.srt.layers.moe.hash_topk import HashTopK
     from sglang.srt.layers.moe.topk import TopK
 
     for module in model.modules():
-        if isinstance(module, TopK):
+        if isinstance(module, (TopK, HashTopK)):
             module.topk_config.allow_routed_experts_capture = False

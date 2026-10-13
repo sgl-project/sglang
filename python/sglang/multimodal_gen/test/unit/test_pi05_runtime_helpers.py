@@ -688,10 +688,10 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
     model.denoise_step = lambda _ctx, x_t, _t, **_kwargs: torch.zeros_like(x_t)
     layout_calls = []
     model.core_model = SimpleNamespace(
-        prepare_denoise_layout=lambda *args, **kwargs: layout_calls.append(
-            (args, kwargs)
+        prepare_denoise_layout=lambda *args, **kwargs: (
+            layout_calls.append((args, kwargs))
+            or (None, torch.zeros(1, 2, dtype=torch.long))
         )
-        or (None, torch.zeros(1, 2, dtype=torch.long))
     )
     observation = SimpleNamespace(batch_size=1)
     prefix_context = _prefix_context(1.0, "prompt")

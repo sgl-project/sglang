@@ -449,7 +449,7 @@ def _calculate_edit_dimensions(target_area, ratio):
     """Output size for LongCat-Image-Edit: fit `target_area`, ceil to /16.
 
     Copied from diffusers pipeline_longcat_image_edit.calculate_dimensions.
-    Note this intentionally differs from sglang.multimodal_gen.utils
+    Note this intentionally differs from the Qwen-Image pipeline config
     calculate_dimensions (which rounds to /32).
     """
     width = math.sqrt(target_area * ratio)
@@ -604,3 +604,52 @@ class LongCatImageEditPipelineConfig(LongCatImagePipelineConfig):
             if latents.shape[1] > expected:
                 latents = latents[:, :expected, :]
         return super().post_denoising_loop(latents, batch)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.longcat_image import (
+        LongCatImageEditSamplingParams,
+        LongCatImageEditTurboSamplingParams,
+        LongCatImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
+    register_configs(
+        sampling_param_cls=LongCatImageEditTurboSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" in hf_id.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LongCatImageEditSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" not in hf_id.lower()
+            ),
+        ],
+    )

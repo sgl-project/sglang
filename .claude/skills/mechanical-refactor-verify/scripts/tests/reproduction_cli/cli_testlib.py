@@ -2,13 +2,9 @@ import subprocess
 from pathlib import Path
 
 _PASSING_PROOF = (
-    "import sys\n"
-    'print("PASS: reproduces the commit byte-for-byte.")\n'
-    "sys.exit(0)\n"
+    'import sys\nprint("PASS: reproduces the commit byte-for-byte.")\nsys.exit(0)\n'
 )
-_FAILING_PROOF = (
-    "import sys\n" 'print("RESIDUAL (2 lines):\\n+x\\n-y")\n' "sys.exit(1)\n"
-)
+_FAILING_PROOF = 'import sys\nprint("RESIDUAL (2 lines):\\n+x\\n-y")\nsys.exit(1)\n'
 
 
 def _git(repo: Path, *args: str) -> str:

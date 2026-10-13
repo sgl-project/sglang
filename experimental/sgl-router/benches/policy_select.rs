@@ -5,10 +5,7 @@
 //!
 //! Mirrors `sgl-model-gateway/benches/manual_policy_benchmark.rs` —
 //! measures how fast the routing layer returns a worker for a given
-//! request context, across the policies sgl-router actually ships
-//! (round-robin, random, power-of-two-choices). The cache-aware-zmq
-//! policy lives in `tree_lookup.rs`; this file targets the non-tree
-//! policies' steady-state hot path.
+//! request context, across round-robin, random, and power-of-two choices.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};

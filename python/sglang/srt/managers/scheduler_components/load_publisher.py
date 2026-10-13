@@ -1,10 +1,9 @@
 """Per-scheduler load reporting for load-aware routers.
 
 Each scheduler publishes a periodic `LoadStat` gauge on its own ZMQ PUB
-socket so out-of-process load-aware routers (e.g. sgl-router's
-`cache_aware_zmq` policy) can route on real queue depth instead of a
-router-side in-flight counter. The in-deployment counterpart lives in
-`sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
+socket so out-of-process load-aware routers can route on real queue depth
+instead of a router-side in-flight counter. The in-deployment counterpart
+lives in `sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
 that only knows the worker URL cannot subscribe to; the port is instead
 advertised via `/server_info` (`runtime_context.describe_kv_events_publisher`).
 The payload is a compact tagged subset of `LoadSnapshot` so the wire
@@ -43,10 +42,10 @@ from sglang.srt.disaggregation.kv_events import (
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 logger = logging.getLogger(__name__)
@@ -80,9 +79,12 @@ class LoadStat(
     """Per-scheduler runtime load snapshot.
 
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
-    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]``. The
-    router reads the four counts; array_like always emits the trailing field
-    (null when unset), so a decoder must tolerate it.
+    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank,
+    num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
+    total_prefill_uncached_tokens, total_prefill_busy_us]``.
+
+    The first six positions are the #34608-compatible prefix. Current routers
+    ignore appended fields, so extending the payload preserves compatibility.
     """
 
     num_running_reqs: int
@@ -92,6 +94,11 @@ class LoadStat(
     # attn_dp_rank under DP attention, else the plain dp_rank; informational
     # only (the router keys by socket rank). Name follows EventBatch's.
     attn_dp_rank: Optional[int] = None
+    num_waiting_uncached_tokens: int = 0  # Uncached prompt tokens awaiting prefill
+    num_total_tokens: int = 0  # KV tokens in use plus queued request tokens
+    max_running_requests: int = 0  # Scheduler running-request limit
+    total_prefill_uncached_tokens: int = 0  # Cumulative uncached prefill tokens
+    total_prefill_busy_us: int = 0  # Cumulative prefill step time in microseconds
 
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
@@ -125,7 +132,6 @@ class SchedulerLoadPublisher:
         self,
         *,
         kv_events_config: Optional[str],
-        ps: ParallelState,
         load_publish_endpoint: Optional[str] = None,
         publish_interval: int = LOAD_PUBLISH_INTERVAL,
     ) -> None:
@@ -140,7 +146,7 @@ class SchedulerLoadPublisher:
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
         self._publish_failed = False
-        if not is_kv_publisher_rank(kv_events_config, ps):
+        if not is_kv_publisher_rank(kv_events_config):
             return
         try:
             cfg = KVEventsConfig.from_cli(kv_events_config)
@@ -158,7 +164,7 @@ class SchedulerLoadPublisher:
         resolved, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=ps.dp_size,
+            dp_size=get_parallel().dp_size,
             load_publish_endpoint=load_publish_endpoint,
         )
         if resolved is None:
@@ -166,8 +172,9 @@ class SchedulerLoadPublisher:
                 logger.warning("load-publisher disabled: %s", reason)
             return
         host, base = resolved
+        parallel = get_parallel()
         self._rank = select_kv_publisher_dp_rank(
-            ps.attn_dp_size, ps.attn_dp_rank, ps.dp_rank
+            parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
         )
         endpoint = NetworkAddress(host, base + self._rank).to_tcp()
         try:
@@ -228,6 +235,11 @@ class SchedulerLoadPublisher:
                 load.num_waiting_reqs,
                 load.num_used_tokens,
                 load.max_total_num_tokens,
+                load.num_waiting_uncached_tokens,
+                load.num_total_tokens,
+                load.max_running_requests,
+                load.total_prefill_uncached_tokens,
+                load.total_prefill_busy_us,
             )
             if (
                 counts == self._last_counts
@@ -241,6 +253,11 @@ class SchedulerLoadPublisher:
                     num_tokens=counts[2],
                     max_total_num_tokens=counts[3],
                     attn_dp_rank=self._rank,
+                    num_waiting_uncached_tokens=counts[4],
+                    num_total_tokens=counts[5],
+                    max_running_requests=counts[6],
+                    total_prefill_uncached_tokens=counts[7],
+                    total_prefill_busy_us=counts[8],
                 )
             )
             seq = next(self._seq).to_bytes(8, "big")

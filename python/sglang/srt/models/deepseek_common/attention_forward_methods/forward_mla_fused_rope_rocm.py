@@ -30,7 +30,6 @@ if _is_hip:
 
 
 class DeepseekMLAFusedRopeRocmForwardMixin:
-
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"

@@ -1,7 +1,4 @@
-"""Config-time override declarations for mimo_v2.
-
-Architectures: MiMoV2FlashForCausalLM, MiMoV2ForCausalLM.
-"""
+"""Config-time override declarations for mimo_v2."""
 
 import logging
 from typing import Any, Dict

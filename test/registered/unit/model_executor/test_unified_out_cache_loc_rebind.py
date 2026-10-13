@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -70,6 +70,9 @@ def _armed_source(v2p, swa_map):
     )
     src.is_translating = True
     src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
+    # The WRITE loc has its own translate because under DCP it arrives widened;
+    # at dcp_size == 1 it is the read translate, so arm it with the same fake.
+    src._translate_write_full = src._translate_full
     # Phase 2 derives from kernel-facing values through p2v + the swa v2p; arm
     # the inverse of the fake v2p (ps=1, both multipliers 1: kernel == physical,
     # and the expected swa loc for virtual t is swa_map[t]).

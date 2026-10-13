@@ -4,7 +4,6 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -300,7 +299,7 @@ class Spark2_5Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -385,7 +384,7 @@ class Spark2_5ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Spark2_5Model(

@@ -1,6 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
-//! (+ `/model_info` alias), plus the control-request submission path
-//! (`await_control_result`, on the shared `submit`). Data-plane endpoints (incl. `/health*`,
+//! (+ `/model_info` alias), plus the control-request path through
+//! [`crate::frontend::FrontendHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
@@ -15,13 +15,11 @@ use axum::{
 use std::sync::Arc;
 
 use super::app::AppState;
-use super::guard::AbortGuard;
-use super::submit::submit;
+use super::native_api::native_error;
+use crate::frontend::FrontendError;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
-use crate::message::request::RequestKind;
-use crate::message::response::ResponseItem;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -42,33 +40,27 @@ async fn await_control_result(
     state: &AppState,
     control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
-    let (rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
-    // Control requests register a detok entry like any other, and only
-    // `handle_result` removes it — so a request that never produces one (a stalled
-    // scheduler, a client that hangs up mid-await) leaves the entry behind. A
-    // monitor polling `/server_info` then leaks one `DetokState` per poll, forever.
-    // The guard deregisters on drop; it is disarmed below when the result lands.
-    let mut guard = AbortGuard::new(state.senders.clone(), rid.clone());
-    let received = rx.recv().await;
-    if received.is_some() {
-        guard.disarm(&rid); // completed normally — nothing to abort
-    }
-    match received {
-        Some(ResponseItem::Control(bytes)) => Ok(bytes),
-        Some(ResponseItem::Error(e)) => {
-            let code =
-                StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Err((code, e.to_string()).into_response())
+    match state.frontend.control(control).await {
+        Ok(bytes) => Ok(bytes),
+        Err(FrontendError::Unavailable) => Err(native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        )),
+        Err(FrontendError::Pipeline(error)) => {
+            let code = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Err((code, error.to_string()).into_response())
         }
-        // A control request never receives generation frames or service-call data.
-        Some(ResponseItem::Frame(_))
-        | Some(ResponseItem::Done(_))
-        | Some(ResponseItem::Data(_)) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected generation output for control request",
-        )
-            .into_response()),
-        None => Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response()),
+        Err(FrontendError::ResponseClosed) => {
+            Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response())
+        }
+        Err(FrontendError::UnexpectedResponse(message)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
+        }
+        Err(FrontendError::InvalidArgument(error)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, error).into_response())
+        }
     }
 }
 
@@ -94,6 +86,7 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
         // selected parser into `server_args` before the scheduler forks.
         "reasoning_parser": sa.reasoning_parser,
         "tool_call_parser": sa.tool_call_parser,
+        "disaggregation_mode": sa.disaggregation_mode,
     });
     (
         StatusCode::OK,
@@ -140,6 +133,7 @@ const INTERNAL_STATE_ALLOWLIST: &[&str] = &[
     "effective_max_running_requests_per_dp",
     "avg_spec_accept_length",
     "step_time_dict",
+    "rust_mm_transport",
 ];
 
 fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>, String> {
@@ -172,6 +166,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "max_context_length": server_args.model_config.context_len,
         "max_total_num_tokens": server_args.max_total_num_tokens,
         "version": server_args.version,
+        "frontend": "rust",
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
@@ -239,5 +234,6 @@ mod tests {
         assert!(state0.get("api_key").is_none());
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
+        assert_eq!(v["frontend"], "rust");
     }
 }

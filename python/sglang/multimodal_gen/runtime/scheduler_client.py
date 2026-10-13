@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import pickle
 import time
@@ -7,22 +8,33 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    GetWeightsChecksumReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
-    UpdateWeightFromTensorReqInput,
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
+from sglang.multimodal_gen.runtime.ipc_array import (
+    is_local_endpoint,
+    materialize_file_refs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
@@ -35,6 +47,14 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 )
 
 logger = init_logger(__name__)
+
+# All replicas join one process group for these ops, so they must reach every
+# replica at once; a sequential fan-out would deadlock.
+_COLLECTIVE_REQ_TYPES = (
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they must reach every replica rather than one.
@@ -174,9 +194,10 @@ class SchedulerClient:
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
-            socket.send_pyobj(batch)
+            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
             output_batch = socket.recv_pyobj()
             _materialize_output_batch_file_refs(output_batch)
+            _materialize_local_cuda_refs(endpoint, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
@@ -261,7 +282,12 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _COLLECTIVE_REQ_TYPES):
+            results = await asyncio.gather(
+                *(self._forward_one(ep, batch, timeout_ms) for ep in endpoints)
+            )
+            output_batch = _merge_fanout_results(results)
+        elif isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
             results = [
                 await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
@@ -286,10 +312,11 @@ class AsyncSchedulerClient:
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
-            await socket.send(pickle.dumps(batch))
+            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
             payload = await socket.recv()
             output_batch = pickle.loads(payload)
             _materialize_output_batch_file_refs(output_batch)
+            _materialize_local_cuda_refs(endpoint, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
@@ -329,6 +356,19 @@ class AsyncSchedulerClient:
 # Singleton instances for easy access
 async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()
+
+
+def _prepare_local_payload(endpoint: str, batch: Any) -> Any:
+    if is_local_endpoint(endpoint):
+        return spill_cuda_tensors(batch)
+    return batch
+
+
+def _materialize_local_cuda_refs(endpoint: str, output_batch: Any) -> None:
+    if is_local_endpoint(endpoint):
+        materialize_cuda_refs(output_batch)
+        # Request-side IPC retains are no longer needed after the round-trip.
+        release_retained_producer_tensors()
 
 
 def _materialize_output_batch_file_refs(output_batch: Any) -> None:

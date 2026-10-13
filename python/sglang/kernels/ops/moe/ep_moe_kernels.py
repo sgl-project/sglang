@@ -418,16 +418,16 @@ def silu_and_mul_masked_post_quant_fwd(
 
     if output_scale.dtype == torch.int32:
         assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
-        assert (
-            num_real_tokens is not None and topk is not None
-        ), "the packed schedule sizes its grid from num_real_tokens * topk"
+        assert num_real_tokens is not None and topk is not None, (
+            "the packed schedule sizes its grid from num_real_tokens * topk"
+        )
         E, m_max, _ = input.shape
         G = size_n // quant_group_size
         assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
         BLOCK_N = quant_group_size * 4
-        assert (
-            size_n % BLOCK_N == 0
-        ), "packed UE8M0 path requires size_n % (4*group) == 0"
+        assert size_n % BLOCK_N == 0, (
+            "packed UE8M0 path requires size_n % (4*group) == 0"
+        )
         hidden_dim_split = size_n // BLOCK_N
         assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
 
@@ -1155,9 +1155,12 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
+    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1175,9 +1178,9 @@ def ep_scatter(
 
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
     if is_fp8:
-        assert (
-            recv_x_scale.dtype == output_tensor_scale.dtype
-        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+            f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        )
         assert (
             recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
         )
@@ -1267,13 +1270,13 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_block_size: int = 128,
 ):
     BLOCK_E = 128
-    BLOCK_D = 128
     num_warps = 8
     num_experts = psum_num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    scale_hidden_size = hidden_size // BLOCK_D
+    scale_hidden_size = hidden_size // quant_block_size
     if scale_ue8m0:
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
@@ -1293,6 +1296,10 @@ def ep_scatter_from_psum(
         BLOCK_E=BLOCK_E,
     )
 
+    # The BF16 specialization never dereferences these scale pointers.
+    recv_x_scale_arg = recv_x_scale if is_fp8 else recv_x
+    output_tensor_scale_arg = output_tensor_scale if is_fp8 else output_tensor
+
     grid = min(recv_topk.shape[0], 1024 * 8)
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
@@ -1300,7 +1307,7 @@ def ep_scatter_from_psum(
         recv_x,
         recv_x.stride(0),
         recv_x.stride(1),
-        recv_x_scale,
+        recv_x_scale_arg,
         recv_x_scale.stride(0) if is_fp8 else 0,
         recv_x_scale.stride(1) if is_fp8 else 0,
         recv_topk,
@@ -1309,12 +1316,15 @@ def ep_scatter_from_psum(
         output_tensor,
         output_tensor.stride(0),
         output_tensor.stride(1),
-        output_tensor_scale,
+        output_tensor_scale_arg,
         output_tensor_scale.stride(0) if is_fp8 else 0,
         output_tensor_scale.stride(1) if is_fp8 else 0,
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        # DeepEP v2 already rebases recv_topk to local expert IDs.
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,

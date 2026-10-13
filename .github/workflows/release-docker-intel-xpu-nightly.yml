@@ -1,11 +1,16 @@
 name: Release Docker Images Nightly (Intel XPU)
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch or tag to build from, e.g. main, release/v0.5.20, v0.5.20.'
+        required: false
+        default: 'main'
   schedule:
     - cron: '0 12 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  group: ${{ github.workflow }}-${{ inputs.branch || 'main' }}
   cancel-in-progress: true
 
 jobs:
@@ -17,11 +22,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          # Scheduled runs always build main; manual runs may pick a release branch or tag.
+          ref: ${{ inputs.branch || 'main' }}
           path: sglang-nightly-build
           fetch-depth: 0
 
       - name: Set date and commit hash
         id: image_meta
+        env:
+          SG_LANG_BRANCH: ${{ inputs.branch || 'main' }}
         run: |
           cd sglang-nightly-build
           date_tag=$(date +%Y%m%d)
@@ -30,10 +39,18 @@ jobs:
             echo "::error::Could not resolve commit hash"
             exit 1
           fi
-          image_tag="nightly-dev-xpu-bmg-${date_tag}-${commit_hash}"
+          if [ "${SG_LANG_BRANCH}" = "main" ]; then
+            image_tag="nightly-dev-xpu-bmg-${date_tag}-${commit_hash}"
+          else
+            # Slugify the ref so it is usable in a Docker tag (e.g. release/v0.5.20 -> release-v0.5.20).
+            branch_slug=$(echo "${SG_LANG_BRANCH}" | sed 's#[^a-zA-Z0-9._-]#-#g')
+            image_tag="nightly-dev-xpu-bmg-${branch_slug}-${date_tag}-${commit_hash}"
+          fi
           echo "DATE=${date_tag}" >> $GITHUB_ENV
           echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
+          echo "SG_LANG_BRANCH=${SG_LANG_BRANCH}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "Building ref ${SG_LANG_BRANCH} at ${commit_hash}"
           echo "Image tag: ${image_tag}"
 
       - name: Login to Docker Hub (Intel)
@@ -44,14 +61,19 @@ jobs:
 
       - name: Build intel/sglang-dev
         run: |
-          echo "Building intel/sglang-dev:${{ env.IMAGE_TAG }}"
+          echo "Building intel/sglang-dev:${IMAGE_TAG} from ${SG_LANG_BRANCH}"
+          # Only main advances the rolling `latest` tag.
+          latest_tag=()
+          if [ "${SG_LANG_BRANCH}" = "main" ]; then
+            latest_tag=(-t "intel/sglang-dev:latest")
+          fi
           docker build sglang-nightly-build \
             -f sglang-nightly-build/docker/xpu.Dockerfile \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
-            --build-arg SG_LANG_BRANCH=main \
+            --build-arg SG_LANG_BRANCH="${SG_LANG_BRANCH}" \
             --no-cache --progress=plain \
-            -t "intel/sglang-dev:${{ env.IMAGE_TAG }}" \
-            -t "intel/sglang-dev:latest"
+            -t "intel/sglang-dev:${IMAGE_TAG}" \
+            "${latest_tag[@]}"
 
       - name: Push intel/sglang-dev
         run: |
@@ -63,5 +85,7 @@ jobs:
             done
             return 1
           }
-          push_with_retry "intel/sglang-dev:${{ env.IMAGE_TAG }}"
-          push_with_retry "intel/sglang-dev:latest"
+          push_with_retry "intel/sglang-dev:${IMAGE_TAG}"
+          if [ "${SG_LANG_BRANCH}" = "main" ]; then
+            push_with_retry "intel/sglang-dev:latest"
+          fi

@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -29,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import LazyValue, add_prefix
 
@@ -59,7 +59,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
             quant_config.packed_modules_mapping = self.packed_modules_mapping
@@ -143,8 +143,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         if not self.pp_group.is_last_rank:

@@ -449,3 +449,26 @@ class LingBotWorldV2CausalDMDConfig(LingBotWorldCausalDMDConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 750, 500, 250]
     )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.lingbot_world import (
+        LingBotWorldSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldCausalDMDConfig,
+        hf_model_paths=[
+            "IPostYellow/lingbot-world-fast-diffusers",
+            "robbyant/lingbot-world-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
+    )

@@ -92,6 +92,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             component_paths={},
             component_direct_gpu_weight_loading=set(),
             resolve_component_attention_backend=lambda *_names: (None, None),
+            comfyui_mode=False,
         )
 
         with patch.object(
@@ -106,6 +107,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
         load_component.assert_called_once_with(
             component_name="auxiliary_head",
             component_type="duration_head_2",
+            loader_cls=None,
             component_model_path="/model/duration_head_2",
             transformers_or_diffusers="ltx2",
             server_args=server_args,

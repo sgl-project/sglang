@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -34,12 +32,11 @@ from sglang.srt.managers.io_struct import (
     RegisterLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -55,17 +52,19 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, set_random_seed
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -84,6 +83,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def last_shared_read_runner(self):
@@ -137,14 +142,6 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
-
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,
@@ -191,12 +188,14 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.weight_updater.update_weights_from_ipc(
-            recv_req
+    def deserialize_own_rank(self, serialized_named_tensors):
+        """Each rank deserializes only its own payload (index tp_rank);
+        deserializing another rank's copy would break producer-side CUDA-IPC
+        refcounting."""
+        monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.deserialize(
+            serialized_named_tensors[self.model_runner.tp_rank]
         )
-        return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.weight_exporter.get_weights_by_name(
@@ -234,7 +233,6 @@ class TpModelWorker(BaseTpWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -247,7 +245,6 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
-        self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -299,20 +296,39 @@ class TpModelWorker(BaseTpWorker):
         self.device = self.model_runner.device
 
         # Init nccl groups
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        self.pp_group = get_parallel().pp_group
+        self.world_group = get_parallel().world_group
 
         # Sync random seed across TP workers.
         # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
         # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
             self.random_seed = random_seed
-        elif server_args.is_ep_joiner:
+        elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
+        elif (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and get_parallel().pp_size > 1
+        ):
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead — that is exactly
+            # the set of ranks holding a draft worker. The draft worker is
+            # constructed with pp_rank=0, so derive the caller's global rank
+            # from the TP group rather than tp_size * pp_rank + tp_rank.
+            tp_group = self.model_runner.tp_group
+            self.random_seed = broadcast_pyobj(
+                [get_device().random_seed],
+                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.model_runner.tp_size * get_parallel().pp_rank
+                + self.model_runner.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -345,8 +361,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
-            - 1,
+            self.model_runner.effective_logical_max_total_num_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -363,6 +378,18 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode cuda graphs for all model runners (used
+        for the on-flip capture during a runtime PD role switch)."""
+        self.model_runner.ensure_decode_cuda_graphs(capture_bs)
+        for mr in self.model_runner_list[1:]:
+            mr.ensure_decode_cuda_graphs(capture_bs)
+
+    def get_decode_cuda_graph_bs(self) -> List[int]:
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill,
+        or on a runner that never allocates a KV pool, e.g. the MLX stub)."""
+        return list(getattr(self.model_runner, "decode_cuda_graph_capture_bs", []))
 
     def start_startup_weight_load(self) -> None:
         """Start deferred checkpoint prefetching for all model runners."""
@@ -402,7 +429,6 @@ class TpModelWorker(BaseTpWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -423,7 +449,6 @@ class TpModelWorker(BaseTpWorker):
                     model_config=self.model_config,
                     mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
-                    ps=self.ps,
                     nccl_port=self.nccl_port,
                     server_args=self.server_args,
                     is_draft_worker=self.is_draft_worker,
@@ -447,10 +472,9 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
-    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
-        """(role, runner) pairs this worker owns for weight ops. The target worker
-        owns one runner and uses the empty role so its checksum keys stay unprefixed."""
-        return [("", self._model_runner)]
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; the target worker owns one."""
+        return [("target", self._model_runner)]
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
@@ -463,20 +487,25 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # The runner already reports logical DCP capacity.
+        kv_capacity = (
+            self.model_runner.effective_logical_max_total_num_tokens
+            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
-            - 1,
+            kv_capacity - 1,
         )
+        max_req_input_len = max_req_len - 5
+        if self.dllm_algorithm is not None:
+            max_req_input_len -= self.dllm_algorithm.block_size
         return (
-            self.model_runner.req_to_token_pool.schedulable_token_capacity(
-                self.model_runner.max_total_num_tokens
-            ),
+            self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,
@@ -513,6 +542,10 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
+        if self.model_runner._elastic_cuda_graph_enabled():
+            self.model_runner.maybe_join_ep_ranks()
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -528,6 +561,14 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
+            if get_exec().features.enable_encoder_swa_bounded_replay:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    run_encoder_swa_replay,
+                )
+
+                # Replay reads restored main/indexer KV before the normal extend.
+                run_encoder_swa_replay(self, batch)
+
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
@@ -537,9 +578,9 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+            assert capture_hidden_mode is None, (
+                "capture_hidden_mode override requires a ScheduleBatch input"
+            )
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -585,6 +626,7 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -612,6 +654,7 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -644,6 +687,7 @@ class TpModelWorker(BaseTpWorker):
             )
         else:
             next_token_ids = None
+        self._maybe_finalize_elastic_cuda_graph_scale()
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

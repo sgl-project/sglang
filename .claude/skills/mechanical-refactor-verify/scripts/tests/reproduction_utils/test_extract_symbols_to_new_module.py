@@ -111,11 +111,7 @@ def test_extract_symbols_to_new_module_drops_relocated_assigns(tmp_path: Path) -
         "    return _FLAG\n"
     )
     header = (
-        "from __future__ import annotations\n"
-        "\n"
-        "import os\n"
-        "\n"
-        "_FLAG = os.cpu_count()\n"
+        "from __future__ import annotations\n\nimport os\n\n_FLAG = os.cpu_count()\n"
     )
     r = Repro("b", "t").extract_symbols_to_new_module(
         "src.py",

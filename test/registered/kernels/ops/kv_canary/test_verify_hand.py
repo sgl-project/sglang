@@ -20,6 +20,7 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     launch_canary_verify_kernel_torch_reference,
+    materialize_real_kv_sources,
 )
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
@@ -380,9 +381,9 @@ class TestChain:
                 buf_pair=buf_pair, plan_pair=plan_pair, assert_equal=False
             )
 
-            assert (
-                _n_violations(cuda_log) == 0
-            ), f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
+            assert _n_violations(cuda_log) == 0, (
+                f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
+            )
 
     def test_prev_slot_padding_skips_chain_check_arbitrary_stored_hash(self) -> None:
         """prev_slot_idx == TOKEN_TO_KV_SLOT_PADDING → chain check is skipped, regardless of stored chain hash."""
@@ -692,9 +693,9 @@ class TestViolationField:
                 f"(bit_to_trigger={bit_to_trigger} injection_position={injection_position})"
             )
         else:
-            assert (
-                _n_violations(cuda_log) > ring_capacity
-            ), "write_index did not advance beyond ring_capacity after overflow"
+            assert _n_violations(cuda_log) > ring_capacity, (
+                "write_index did not advance beyond ring_capacity after overflow"
+            )
 
     def test_position_mismatch_sets_position_bit_only(self) -> None:
         """Plan.position != stored.position with chain hash correct → only POSITION bit set."""
@@ -706,12 +707,12 @@ class TestViolationField:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 1
         bits = _fail_bits(cuda_log)
-        assert (
-            bits & consts.FailReason.VERIFY_POSITION_MISMATCH
-        ), f"expected POSITION bit, got {bits:#b}"
-        assert (
-            bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
-        ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
+        assert bits & consts.FailReason.VERIFY_POSITION_MISMATCH, (
+            f"expected POSITION bit, got {bits:#b}"
+        )
+        assert (bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH) == 0, (
+            f"chain hash bit unexpectedly set: {bits:#b}"
+        )
 
 
 class TestRealKvHash:
@@ -917,14 +918,18 @@ class TestRealKvHash:
         positions = [0, 1, 2]
 
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
+        host_sources = materialize_real_kv_sources(
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+            slot_indices=slot_indices,
+            work_device=torch.device("cpu"),
+        )
         real_kv_hashes: list[int] = []
         for slot_idx in slot_indices:
             real_kv_hashes.append(
                 _compute_real_kv_hash_scalar(
-                    real_kv_sources=sources_cuda,
-                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
                     slot_idx=slot_idx,
-                    work_device=torch.device("cpu"),
+                    host_sources=host_sources,
                 )
             )
 
@@ -990,9 +995,9 @@ class TestRealKvHash:
 
         assert _n_violations(cuda_log) >= 1
         bits = _fail_bits(cuda_log)
-        assert (
-            bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
-        ), f"expected REAL_KV_HASH bit, got {bits:#b}"
+        assert bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH, (
+            f"expected REAL_KV_HASH bit, got {bits:#b}"
+        )
 
     def test_real_kv_off_does_not_deref_real_kv_sources(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
@@ -1028,6 +1033,21 @@ class TestRealKvSource:
                 page_size=1,
                 num_bytes_per_token=16,
                 read_bytes=0,
+            )
+
+    def test_real_kv_source_rejects_row_narrower_than_page(self) -> None:
+        """A row too narrow for its page must raise: neither fold reports it.
+
+        The CUDA fold reads past the row and the torch fold's dim-1 slice clamps to
+        the row end, so the tail slots of the page hash 0 bytes and the chain still
+        verifies clean.
+        """
+        with pytest.raises(ValueError, match="page_size"):
+            RealKvSource(
+                tensor=torch.zeros((1, 16), dtype=torch.uint8, device=_DEVICE),
+                page_size=2,
+                num_bytes_per_token=16,
+                read_bytes=16,
             )
 
     def test_real_kv_source_padding_below_4(self) -> None:
@@ -1310,12 +1330,16 @@ class TestLayoutAndScheduling:
         # byte-by-byte loop, so the stamped real_kv_hash matches what the kernel /
         # verify reference will recompute. A byte-by-byte fold was the previous bug
         # here and triggered REAL_KV_HASH violations on otherwise clean chains.
+        host_sources = materialize_real_kv_sources(
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+            slot_indices=slot_indices,
+            work_device=_DEVICE,
+        )
         rkv_values = [
             _compute_real_kv_hash_scalar(
                 slot_idx=slot_idx,
-                real_kv_sources=sources_cuda,
-                real_kv_hash_mode=consts.RealKvHashMode.ALL,
-                work_device=_DEVICE,
+                host_sources=host_sources,
             )
             for slot_idx in slot_indices
         ]
@@ -1738,9 +1762,9 @@ class TestViolationRing:
         plan_slot_set = set(slot_indices)
         for row in range(n_violations):
             kind = int(cuda_log.ring[row, consts.VIOLATION_FIELD_KERNEL_KIND].item())
-            assert kind == int(
-                launch_tag
-            ), f"row {row} kind {kind} != {int(launch_tag)}"
+            assert kind == int(launch_tag), (
+                f"row {row} kind {kind} != {int(launch_tag)}"
+            )
             slot = int(cuda_log.ring[row, 1].item())
             assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"
 

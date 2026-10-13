@@ -46,6 +46,9 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -57,10 +60,15 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
+    swap_peft_swiglu_fc1_lora_b,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -184,6 +192,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     and returns an HTTP error.
     """
     with torch.inference_mode():
+        restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
@@ -258,12 +267,18 @@ def _resolve_lora_ipc_layer_dict_key(
     if map_name is None:
         return None, layer_prefix, None
 
-    mapped_name, merge_index = map_name(f"{layer_prefix}.weight")
-    mapped = _strip_param_weight_suffix(mapped_name)
-    if mapped != layer_prefix:
-        layer = layer_dict.get(mapped)
-        if layer is not None:
-            return layer, mapped, merge_index
+    # miles-h3 disk mapping is LoRA-suffix-only; main also maps ".weight".
+    for suffix in (".weight", ".lora_A"):
+        mapped_name, merge_index = map_name(f"{layer_prefix}{suffix}")
+        mapped = (
+            mapped_name[: -len(suffix)]
+            if mapped_name.endswith(suffix)
+            else _strip_param_weight_suffix(mapped_name)
+        )
+        if mapped != layer_prefix:
+            layer = layer_dict.get(mapped)
+            if layer is not None:
+                return layer, mapped, merge_index
 
     return None, layer_prefix, None
 
@@ -364,6 +379,7 @@ class WeightsUpdater:
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Update model weights from disk without restarting the server."""
+        invalidate_conditioning_caches()
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -397,6 +413,16 @@ class WeightsUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+        try:
+            for module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(
+                        weights_path=weights_map[module_name]
+                    )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         logger.info(
             f"Updating {len(weights_map)} modules: "
             + ", ".join(f"{n} <- {p}" for n, p in weights_map.items())
@@ -409,6 +435,14 @@ class WeightsUpdater:
                 self._module_weight_dirs[module_name] = weights_map[module_name]
             if target_modules is None:
                 self.pipeline.model_path = local_model_path
+            for module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    # Weight-derived caches must not survive a weight swap
+                    # (regardless of flush_cache, which only governs
+                    # optimization caches like TeaCache).
+                    module.refresh_weight_derived_caches(
+                        weights_path=weights_map[module_name]
+                    )
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -508,6 +542,7 @@ class WeightsUpdater:
         lora_alpha: int | None = None,
         lora_rank: int | None = None,
     ) -> tuple[bool, str]:
+        invalidate_conditioning_caches()
         if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
             return self._update_lora_from_tensor(
                 named_tensors=named_tensors,
@@ -543,6 +578,14 @@ class WeightsUpdater:
             logger.error(str(e))
             return False, str(e)
 
+        try:
+            for _module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(weights_path=None)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         updated_modules: list[str] = []
         for module_name, module in modules_to_update:
             try:
@@ -558,6 +601,13 @@ class WeightsUpdater:
                 )
                 logger.error(error_msg, exc_info=True)
                 return False, error_msg
+
+        for module_name, module in modules_to_update:
+            if isinstance(module, BaseDiT):
+                # Same invariant as the disk path. Any model whose derived
+                # state needs an on-disk source rejected this update above, so
+                # what reaches here only has caches to drop.
+                module.refresh_weight_derived_caches(weights_path=None)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -620,6 +670,19 @@ class WeightsUpdater:
         if not pairs:
             return False, "No LoRA A/B tensor pairs found in payload"
 
+        dit_module = dict(modules_to_update).get(target_module)
+        if dit_module is None:
+            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
+        if isinstance(dit_module, BaseDiT):
+            # Before convert_to_lora_layers() wraps anything: a layer the model
+            # cannot host is skipped as "unknown" further down, which would
+            # publish success for a partially applied adapter.
+            try:
+                dit_module.validate_lora_layers(list(pairs))
+            except ValueError as e:
+                logger.error(str(e))
+                return False, str(e)
+
         lora_pipeline: LoRAPipeline = self.pipeline
         if not lora_pipeline.lora_initialized:
             convert_target = (
@@ -645,10 +708,6 @@ class WeightsUpdater:
             logger.error(str(e))
             return False, str(e)
 
-        dit_module = dict(modules_to_update).get(target_module)
-        if dit_module is None:
-            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
-
         updated = 0
         skipped = 0
         unknown_layers: list[str] = []
@@ -660,7 +719,7 @@ class WeightsUpdater:
         plain_pairs: list[tuple[torch.Tensor, torch.Tensor, Any]] = []
         fused_sections: dict[Any, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         for layer_name, (lora_a, lora_b) in pairs.items():
-            layer, _resolved_key, merge_index = _resolve_lora_ipc_layer_dict_key(
+            layer, resolved_key, merge_index = _resolve_lora_ipc_layer_dict_key(
                 layer_name, layer_dict, dit_module
             )
             if layer is None:
@@ -672,6 +731,15 @@ class WeightsUpdater:
                 unknown_layers.append(layer_name)
                 skipped += 1
                 continue
+            # Same PEFT → native rewrite as disk load_lora_adapter: fused QKV
+            # uses merge_index; H3 gated FFN swaps [up, gate] → [gate, up].
+            # Native names already in lora_layers skip both transforms.
+            lora_a = swap_peft_swiglu_fc1_lora_b(
+                f"{layer_name}.lora_A", f"{resolved_key}.lora_A", lora_a
+            )
+            lora_b = swap_peft_swiglu_fc1_lora_b(
+                f"{layer_name}.lora_B", f"{resolved_key}.lora_B", lora_b
+            )
             inferred_rank = int(lora_a.shape[-2])
             if lora_rank is not None and lora_rank != inferred_rank:
                 logger.warning(

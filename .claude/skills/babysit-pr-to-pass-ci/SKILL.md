@@ -30,7 +30,7 @@ Examples:
 $babysit-pr-to-pass-ci
 $babysit-pr-to-pass-ci 12345
 $babysit-pr-to-pass-ci https://github.com/sgl-project/sglang/pull/12345 pr-test-extra.yml
-$babysit-pr-to-pass-ci 12345 --only pr-test-amd-rocm720.yml
+$babysit-pr-to-pass-ci 12345 --only pr-test-amd.yml
 ```
 
 ## Start or continue the durable goal

@@ -23,11 +23,8 @@ from unittest import mock
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
@@ -87,7 +84,7 @@ def _stub(
     stub._max_mamba_cache_size = max_mamba_cache_size
     stub._disable_radix_cache = disable_radix_cache
     stub.max_total_num_tokens = max_total_num_tokens
-    stub.ps = SimpleNamespace(attn_dp_size=dp_size)
+    stub.attn_dp_size = dp_size
     return stub
 
 
@@ -97,7 +94,7 @@ def _hybrid_stub_for_initialize(
     """A stub carrying what the real initialize() reads (hybrid path)."""
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool
-    stub.ps = SimpleNamespace(attn_dp_size=1)
+    stub.attn_dp_size = 1
     stub.device = "cpu"  # read by init_ngram_embedding_manager
     # Evaluated as a call argument in init_ngram_embedding_manager before
     # the use_ngram_embedding short-circuit; never read.
@@ -114,6 +111,8 @@ def _hybrid_stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,  # short-circuits NgramEmbeddingManager
+        ngram_embedding_n=0,
+        use_engram=False,
     )
     return stub
 
@@ -226,8 +225,10 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         stub = _hybrid_stub_for_initialize(
             max_running_requests=4, max_mamba_cache_size=2
         )
-        with _arch(hybrid=True), _published(stub), self.assertRaisesRegex(
-            RuntimeError, "max_mamba_cache_size"
+        with (
+            _arch(hybrid=True),
+            _published(stub),
+            self.assertRaisesRegex(RuntimeError, "max_mamba_cache_size"),
         ):
             stub.initialize()
 

@@ -17,11 +17,11 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -37,6 +37,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    shared_experts_count,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
@@ -131,6 +132,8 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
+    supports_dp_attention_overlap_loading = False
+
     def __init__(
         self,
         base_hf_config: AutoConfig,
@@ -147,7 +150,13 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_no_cpu_backup: bool = False,
     ):
+        assert not (lora_no_cpu_backup and enable_lora_overlap_loading), (
+            "--lora-no-cpu-backup drops the staged weights right after install, which overlap loading still reads"
+        )
+        self.lora_no_cpu_backup: bool = lora_no_cpu_backup
+        self.invalid_uids: Set[str] = set()
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
@@ -248,7 +257,9 @@ class LoRAMemoryPool:
                 return False
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
-            target_module_names = get_normalized_target_modules(config.target_modules)
+            target_module_names = get_normalized_target_modules(
+                config.target_modules, base_model=self.base_model
+            )
             if "all" in target_module_names:
                 return True
             return target_module_names.issubset(self.target_modules)
@@ -280,6 +291,38 @@ class LoRAMemoryPool:
         if module_name in ATTN_TP_LORA_MODULE_NAMES:
             return self.attn_tp_size
         return self.tp_size
+
+    def _dense_local_dim(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+        axis: str,
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
+            return None
+        linears = getattr(self, "_dense_linears", None)
+        if linears is None:
+            linears = {}
+            for name, module in base_model.named_modules():
+                layer_id = get_layer_id(name)
+                base_layer = unwrap_lora_layer(module)
+                if layer_id is not None and (
+                    hasattr(base_layer, "input_size_per_partition")
+                    or hasattr(base_layer, "output_partition_sizes")
+                ):
+                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+            self._dense_linears = linears
+        base_layer = linears.get((module_name, layer_idx))
+        if base_layer is None:
+            return None
+        if axis == "input":
+            return getattr(base_layer, "input_size_per_partition", None)
+        partitions = getattr(base_layer, "output_partition_sizes", None)
+        if not partitions:
+            return None
+        return sum(partitions[: get_stacked_multiply(module_name, base_model)])
 
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
@@ -317,6 +360,38 @@ class LoRAMemoryPool:
 
         return any(isinstance(m, FusedMoE) for m in base_model.modules())
 
+    @staticmethod
+    def _get_fused_shared_moe(base_model: torch.nn.Module, layer_idx: int):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        return next(
+            (
+                module
+                for module in base_model.modules()
+                if isinstance(module, FusedMoE)
+                and module.layer_id == layer_idx
+                and module.num_fused_shared_experts > 0
+            ),
+            None,
+        )
+
+    def _get_moe_pool_expert_dim(self, base_model, layer_idx):
+        fused_moe = self._get_fused_shared_moe(base_model, layer_idx)
+        if fused_moe is None:
+            return self._get_num_local_experts(base_model)
+        assert not self.experts_shared_outer_loras, (
+            "fused shared experts require per-expert LoRA factors"
+        )
+        assert self.moe_use_local_expert_ids or (
+            fused_moe.num_experts
+            == fused_moe._num_global_routed + fused_moe.num_fused_shared_experts
+        ), "LoRA does not support global IDs with per-rank fused shared slots"
+        return (
+            fused_moe.num_local_experts
+            if self.moe_use_local_expert_ids
+            else fused_moe.num_experts
+        )
+
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Experts owned by this rank. Equals the global count when EP is
         off, the runner keeps global IDs, or the split isn't even (all
@@ -341,6 +416,7 @@ class LoRAMemoryPool:
         cache_keys: Union[str, Dict[int, str]],
         *,
         localize: bool = True,
+        fused_moe=None,
     ) -> Iterator[Tuple[int, torch.Tensor, str]]:
         """Yield `(expert_id, weight, cache_key)` triples for MoE LoRA A/B weights.
 
@@ -350,7 +426,12 @@ class LoRAMemoryPool:
         if isinstance(weights, dict):
             assert isinstance(cache_keys, dict)
             for gid, w in weights.items():
-                lid = self._global_to_local_expert_id(gid) if localize else gid
+                if fused_moe is not None and localize and self.moe_use_local_expert_ids:
+                    lid = fused_moe._map_global_expert_id_to_local_expert_id(gid)
+                    if lid < 0:
+                        continue
+                else:
+                    lid = self._global_to_local_expert_id(gid) if localize else gid
                 if lid is not None:
                     yield lid, w, cache_keys[gid]
             return
@@ -375,157 +456,6 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
-    def _row_parallel_shard_tp(
-        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
-    ) -> int:
-        """Shard count for a non-MoE row-parallel module's activation axis.
-
-        Probes the base module's ``input_size // input_size_per_partition`` so
-        the LoRA buffer matches the actual shard regardless of which TP group
-        owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
-        shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
-        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
-
-        MoE-internal names go through ``self.moe_tp_size`` upstream.
-        """
-        cache = getattr(self, "_row_parallel_tp_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(self, "_row_parallel_tp_cache", cache)
-        key = (module_name, layer_idx)
-        if key in cache:
-            return cache[key]
-
-        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
-
-        def _probe(m):
-            in_size = getattr(m, "input_size", None)
-            per_part = getattr(m, "input_size_per_partition", None)
-            if in_size is not None and per_part is not None and per_part > 0:
-                return max(1, in_size // per_part)
-            inner = getattr(m, "base_layer", None)
-            if inner is not None and inner is not m:
-                return _probe(inner)
-            return None
-
-        suffix = f".{module_name}"
-        found = None
-        for _name, module in base_model.named_modules():
-            if not _name.endswith(suffix):
-                continue
-            if not any(marker in _name for marker in layer_markers):
-                continue
-            r = _probe(module)
-            if r is not None:
-                found = r
-                break
-
-        out = found if found is not None else self.tp_size
-        cache[key] = out
-        return out
-
-    def _column_parallel_shard_tp(
-        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
-    ) -> int:
-        """Shard count for a non-MoE column-parallel module's output axis.
-
-        Probes the base module's ``output_size // output_size_per_partition``.
-        The input-axis probe used for row-parallel modules is poisoned here:
-        quantized linear methods (e.g. ``Fp8LinearMethod.create_weights``)
-        stamp ``input_size_per_partition == input_size`` on column-parallel
-        layers (whose input is never sharded), which reports a shard count of
-        1 and leaves the LoRA-B buffer at the full output dim while the base
-        stays TP-sharded -- ``set_lora_info`` then fails with "LoRA B output
-        dim != base partition prefix dim" (e.g. blockwise-fp8 GLM-5.2
-        ``shared_experts.gate_up_proj``). The output-axis ratio is
-        quantization-independent: ``output_size_per_partition`` is set in
-        ``ColumnParallelLinear.__init__`` before the quant method runs. Falls
-        back to ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
-        """
-        cache = getattr(self, "_col_parallel_tp_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(self, "_col_parallel_tp_cache", cache)
-        key = (module_name, layer_idx)
-        if key in cache:
-            return cache[key]
-
-        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
-
-        def _probe(m):
-            out_size = getattr(m, "output_size", None)
-            per_part = getattr(m, "output_size_per_partition", None)
-            if out_size is not None and per_part is not None and per_part > 0:
-                return max(1, out_size // per_part)
-            inner = getattr(m, "base_layer", None)
-            if inner is not None and inner is not m:
-                return _probe(inner)
-            return None
-
-        suffix = f".{module_name}"
-        found = None
-        for _name, module in base_model.named_modules():
-            if not _name.endswith(suffix):
-                continue
-            if not any(marker in _name for marker in layer_markers):
-                continue
-            r = _probe(module)
-            if r is not None:
-                found = r
-                break
-
-        out = found if found is not None else self.tp_size
-        cache[key] = out
-        return out
-
-    def _column_parallel_out_partition(
-        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
-    ):
-        """Actual per-rank output dim of a non-MoE column-parallel base module.
-
-        Reads ``output_size_per_partition`` from the matching base linear -- the
-        ground truth that ``set_lora_info`` validates against. Critically handles
-        the dense MLP ``gate_up_proj`` that is fully REPLICATED under
-        ``--moe-dense-tp-size 1`` (``output_size_per_partition == output_size``),
-        where dividing ``get_hidden_dim``'s output by the global ``tp_size``
-        undersizes LoRA-B and raises "LoRA B output dim != base partition prefix
-        dim". Returns ``None`` if no base module is found. Cached per
-        ``(module_name, layer_idx)``.
-        """
-        cache = getattr(self, "_col_parallel_out_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(self, "_col_parallel_out_cache", cache)
-        key = (module_name, layer_idx)
-        if key in cache:
-            return cache[key]
-
-        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
-
-        def _probe(m):
-            ops = getattr(m, "output_size_per_partition", None)
-            if ops is not None and ops > 0:
-                return ops
-            inner = getattr(m, "base_layer", None)
-            if inner is not None and inner is not m:
-                return _probe(inner)
-            return None
-
-        suffix = f".{module_name}"
-        found = None
-        for _name, module in base_model.named_modules():
-            if not _name.endswith(suffix):
-                continue
-            if not any(marker in _name for marker in layer_markers):
-                continue
-            r = _probe(module)
-            if r is not None:
-                found = r
-                break
-
-        cache[key] = found
-        return found
-
     def _get_standard_shape(
         self,
         module_name: str,
@@ -538,12 +468,8 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        # Non-MoE row-parallel modules: probe the actual shard size so o_proj /
-        # down_proj match attn_tp under DP-attention and the shared-experts
-        # dense-vs-MoE per-layer-TP differences.
-        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
-        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, row_tp)
+        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
@@ -566,17 +492,22 @@ class LoRAMemoryPool:
         c = get_stacked_multiply(module_name, base_model)
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "input"
+            )
+            if local_dim is not None:
+                input_dim = local_dim
+            elif effective_tp_size > 1:
+                input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
                 expert_dim = self._get_num_shared_experts(base_model)
             else:
-                expert_dim = self._get_num_local_experts(base_model)
+                expert_dim = self._get_moe_pool_expert_dim(base_model, layer_idx)
             if self.experts_shared_outer_loras and module_name in (
                 "gate_up_proj_moe",
                 "gate_up_proj_shared_moe",
@@ -664,26 +595,15 @@ class LoRAMemoryPool:
         # Same sharding rule as get_lora_A_shape above.
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            # If the base column-parallel module is fully REPLICATED (its actual
-            # output_size_per_partition still equals the full output_dim -- e.g. the
-            # dense MLP gate_up under --moe-dense-tp-size 1), its output is NOT
-            # sharded, so keep LoRA-B at the full output dim. Dividing by the global
-            # tp_size here undersizes B and crashes set_lora_info ("LoRA B output dim
-            # != base partition prefix dim"). Non-MoE only; MoE shards by moe_tp_size.
-            probed_out = (
-                None
-                if self.is_moe_module(module_name)
-                else self._column_parallel_out_partition(
-                    module_name, base_model, layer_idx
-                )
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "output"
             )
-            if probed_out is not None and probed_out == output_dim:
-                pass  # replicated base: keep full B output dim
-            else:
+            if local_dim is not None:
+                output_dim = local_dim
+            elif effective_tp_size > 1:
                 output_dim = self._column_parallel_lora_b_per_rank_dim(
                     module_name, output_dim, effective_tp_size
                 )
@@ -693,7 +613,7 @@ class LoRAMemoryPool:
             if self.is_shared_moe_module(module_name):
                 expert_dim = self._get_num_shared_experts(base_model)
             else:
-                expert_dim = self._get_num_local_experts(base_model)
+                expert_dim = self._get_moe_pool_expert_dim(base_model, layer_idx)
             if self.experts_shared_outer_loras and module_name in (
                 "down_proj_moe",
                 "down_proj_shared_moe",
@@ -743,9 +663,8 @@ class LoRAMemoryPool:
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
             has_shared_experts = (
-                hasattr(cfg, "shared_expert_intermediate_size")
-                and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+                getattr(cfg, "shared_expert_intermediate_size", 0) or 0
+            ) > 0 or (shared_experts_count(cfg) or 0) > 0
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
@@ -769,16 +688,24 @@ class LoRAMemoryPool:
 
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = [
-                        torch.zeros(
-                            get_lora_shape_fn(
-                                moe_key, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
+                    buffer[moe_key] = []
+                    for idx in range(self.num_layer):
+                        shape = get_lora_shape_fn(
+                            moe_key, base_model, self.max_lora_rank, idx
                         )
-                        for idx in range(self.num_layer)
-                    ]
+                        fused_moe = self._get_fused_shared_moe(base_model, idx)
+                        if fused_moe is not None:
+                            num_experts = (
+                                fused_moe.num_local_experts
+                                if self.moe_use_local_expert_ids
+                                else fused_moe.num_experts
+                            )
+                            assert shape[1] == num_experts, (
+                                "LoRA/base expert layout mismatch"
+                            )
+                        buffer[moe_key].append(
+                            torch.zeros(shape, dtype=self.dtype, device=device)
+                        )
 
                     # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):
@@ -917,6 +844,7 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        self.check_valid()
         # Python hash seeds differ by TP process; slot and LRU updates must not.
         ordered_uids = sorted(cur_uids, key=lambda uid: (uid is not None, uid or ""))
 
@@ -962,6 +890,12 @@ class LoRAMemoryPool:
 
             # Select victim using eviction policy
             victim_uid = self.eviction_policy.select_victim(candidates_to_use)
+            if victim_uid is not None and self.lora_no_cpu_backup:
+                raise RuntimeError(
+                    f"Refusing to evict LoRA adapter '{victim_uid}': --lora-no-cpu-backup dropped its "
+                    "staged weights after installation, so it could never be reloaded. Increase "
+                    "--max-loras-per-batch."
+                )
 
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]
@@ -991,6 +925,60 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                if self.lora_no_cpu_backup and lora_adapter is not None:
+                    lora_adapter.release_staged_weights()
+
+    def check_valid(self):
+        if self.invalid_uids:
+            raise RuntimeError(
+                f"LoRA adapters {sorted(self.invalid_uids)} have incomplete GPU installs; "
+                "reload or unload them before resuming inference."
+            )
+
+    def install_streamed_adapter(
+        self,
+        uid: str,
+        lora_adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, torch.nn.Module]],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+    ) -> None:
+        """Validate a streamed adapter before overwriting its only resident copy."""
+        if uid in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id[uid]
+        elif EMPTY_SLOT in self.buffer_id_to_uid:
+            buffer_id = self.buffer_id_to_uid.index(EMPTY_SLOT)
+        elif None in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id[None]
+        else:
+            raise RuntimeError(
+                f"No free LoRA memory pool slot for streamed adapter '{uid}'; "
+                "--lora-no-cpu-backup cannot evict, increase --max-loras-per-batch."
+            )
+        load_args = (
+            uid,
+            buffer_id,
+            lora_adapter,
+            lora_modules,
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+        )
+        self.load_lora_weight_to_buffer(*load_args, validate_only=True)
+
+        # No backup exists: a failed write must block inference until a complete reload.
+        self.invalid_uids.add(uid)
+        if self.buffer_id_to_uid[buffer_id] is None:
+            del self.uid_to_buffer_id[None]
+            self.eviction_policy.remove(None)
+        self.uid_to_buffer_id[uid] = buffer_id
+        self.buffer_id_to_uid[buffer_id] = uid
+        self.load_lora_weight_to_buffer(*load_args)
+        device = next(self.base_model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()
+        self.invalid_uids.remove(uid)
+        self.eviction_policy.mark_used(uid)
+        lora_adapter.release_staged_weights()
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
@@ -1017,6 +1005,7 @@ class LoRAMemoryPool:
         del self.uid_to_buffer_id[uid]
         self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
         self.eviction_policy.remove(uid)
+        self.invalid_uids.discard(uid)
         return buffer_id
 
     def load_lora_weight_to_buffer(
@@ -1027,21 +1016,25 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        *,
+        validate_only: bool = False,
     ):
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
+            if weight is not None:
+                assert buffer_view.shape == weight.shape, (
+                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                )
+            if validate_only:
+                return
             if weight is None:
-                # If the particular weight is not present in the adapter, we initialize the buffer to zero
-                # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
+            assert not validate_only
             self._clear_buffer_slot_for_base(buffer_id)
             return
 
@@ -1110,12 +1103,22 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
 
+            fused_moe = self._get_fused_shared_moe(self.base_model, layer_id)
             for name, weights in layer_weights.items():
+                cache_name = name
+                if fused_moe is not None and re.search(r"\.shared_experts?\.", name):
+                    assert fused_moe.num_fused_shared_experts == 1
+                    assert weights.dim() == 2
+                    name = re.sub(
+                        r"\.shared_experts?\.",
+                        f".experts.{fused_moe._num_global_routed}.",
+                        name,
+                    )
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
                 expert_match = re.search(r"experts\.(\d+)\.", name)
-                is_shared_expert = "shared_experts." in name
+                is_shared_expert = re.search(r"\.shared_experts?\.", name) is not None
                 shared_moe_target = f"{target_module}_shared_moe"
 
                 if is_shared_expert and (
@@ -1134,16 +1137,16 @@ class LoRAMemoryPool:
                         expert_id = int(expert_match.group(1))
                         if "lora_A" in name:
                             temp_A_buffer[target_module][expert_id] = weights
-                            temp_A_cache_keys[target_module][expert_id] = name
+                            temp_A_cache_keys[target_module][expert_id] = cache_name
                         else:
                             temp_B_buffer[target_module][expert_id] = weights
-                            temp_B_cache_keys[target_module][expert_id] = name
+                            temp_B_cache_keys[target_module][expert_id] = cache_name
                     elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
-                        temp_A_cache_keys[target_module] = name
+                        temp_A_cache_keys[target_module] = cache_name
                     else:
                         temp_B_buffer[target_module] = weights
-                        temp_B_cache_keys[target_module] = name
+                        temp_B_cache_keys[target_module] = cache_name
                 elif expert_match:
                     # Per-expert MoE weight — 2D tensors, one per expert.
                     # Init A and B INDEPENDENTLY (both buffer and cache_keys). Under
@@ -1171,7 +1174,7 @@ class LoRAMemoryPool:
                         if temp_A_cache_keys[target_module] is None:
                             temp_A_cache_keys[target_module] = {}
                         temp_A_buffer[target_module][expert_id] = weights
-                        temp_A_cache_keys[target_module][expert_id] = name
+                        temp_A_cache_keys[target_module][expert_id] = cache_name
                     else:
                         assert not isinstance(
                             temp_B_buffer[target_module], torch.Tensor
@@ -1185,24 +1188,41 @@ class LoRAMemoryPool:
                         if temp_B_cache_keys[target_module] is None:
                             temp_B_cache_keys[target_module] = {}
                         temp_B_buffer[target_module][expert_id] = weights
-                        temp_B_cache_keys[target_module][expert_id] = name
+                        temp_B_cache_keys[target_module][expert_id] = cache_name
                 elif "experts" in name and weights.dim() == 3:
-                    # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
+                    # Packed routed or shared-outer MoE factors
                     target_module = target_module + "_moe"
-                    if "lora_A" in name:
+                    if fused_moe is not None:
+                        # Merge packed routed factors with separately named shared factors.
+                        buffer, cache_keys = (
+                            (temp_A_buffer, temp_A_cache_keys)
+                            if "lora_A" in name
+                            else (temp_B_buffer, temp_B_cache_keys)
+                        )
+                        if buffer[target_module] is None:
+                            buffer[target_module] = {}
+                            cache_keys[target_module] = {}
+                        for expert_id, weight in enumerate(weights):
+                            buffer[target_module][expert_id] = weight
+                            cache_keys[target_module][expert_id] = (
+                                append_cache_key_suffix(
+                                    cache_name, f"expert{expert_id}"
+                                )
+                            )
+                    elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
-                        temp_A_cache_keys[target_module] = name
+                        temp_A_cache_keys[target_module] = cache_name
                     else:
                         temp_B_buffer[target_module] = weights
-                        temp_B_cache_keys[target_module] = name
+                        temp_B_cache_keys[target_module] = cache_name
                 else:
                     # Standard weight — single tensor per module
                     if "lora_A" in name:
                         temp_A_buffer[target_module] = weights
-                        temp_A_cache_keys[target_module] = name
+                        temp_A_cache_keys[target_module] = cache_name
                     else:
                         temp_B_buffer[target_module] = weights
-                        temp_B_cache_keys[target_module] = name
+                        temp_B_cache_keys[target_module] = cache_name
 
             # Track which buffer keys correspond to a real wrapped module on
             # this layer. `temp_A/B_buffer` is seeded with every key in the
@@ -1360,7 +1380,7 @@ class LoRAMemoryPool:
                         # Place each stacked component at max_rank-spaced
                         # positions so the kernel's [:max_r] / [max_r:2*max_r]
                         # slicing is correct.
-                        target_buffer[buffer_id, 0].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id, 0], None)
                         if representative_weight is not None:
                             for ci in range(c):
                                 buffer_view = target_buffer[
@@ -1373,14 +1393,14 @@ class LoRAMemoryPool:
                                     ],
                                 )
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero first so any local-expert slot the adapter
                         # doesn't fill (e.g. out-of-rank under EP) is clean;
                         # then load owned slots at max_rank-spaced offsets so
                         # the MoE kernel's [:max_r] / [max_r:2*max_r] slicing
                         # is correct.
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1390,6 +1410,7 @@ class LoRAMemoryPool:
                             weights,
                             weights_cache_key,
                             localize=not self.is_shared_moe_module(name),
+                            fused_moe=fused_moe,
                         ):
                             if expert_weight is None:
                                 continue
@@ -1489,14 +1510,16 @@ class LoRAMemoryPool:
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
                         # Zero beyond loaded rank — MoE kernel reads full max_rank.
-                        target_buffer[buffer_id, 0, :, lora_rank:].zero_()
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, 0, :, lora_rank:], None
+                        )
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero out slots this rank owns but the adapter
                         # doesn't fill (padded-out / out-of-rank experts);
                         # then scale+load the ones it does.
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1506,6 +1529,7 @@ class LoRAMemoryPool:
                             weights,
                             weights_cache_key,
                             localize=not self.is_shared_moe_module(name),
+                            fused_moe=fused_moe,
                         ):
                             if w is not None:
                                 w = w * lora_adapter.scaling
@@ -1531,7 +1555,9 @@ class LoRAMemoryPool:
                     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
-                        target_buffer[buffer_id, :, lora_rank:].zero_()
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, :, lora_rank:], None
+                        )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
@@ -1654,26 +1680,28 @@ class LoRAMemoryPool:
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
-                    assert (
-                        not get_pp_group().is_last_rank
-                    ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    assert not get_parallel().pp_group.is_last_rank, (
+                        f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    )
                     continue
         else:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA
             # to avoid using garbage values from uninitialized memory
             for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.embedding_A_buffer[k][buffer_id], None)
             for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.embedding_B_buffer[k][buffer_id], None)
             for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.lm_head_A_buffer[k][buffer_id], None)
             for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.lm_head_B_buffer[k][buffer_id], None)
             if (
                 self.lora_added_tokens_size > 0
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+                load_lora_weight_tensor(
+                    self.new_embeddings_buffer["input_embeddings"][buffer_id], None
+                )
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

@@ -8,10 +8,16 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    post_load_weights,
+    refresh_gemma_weights,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -32,7 +38,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_derived_weight_cache_error() -> Optional[str]:
+def _unsupported_derived_weight_cache_error(
+    model: Optional[torch.nn.Module] = None,
+) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
     The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
@@ -40,7 +48,26 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
-    from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
+    if model is not None and any(
+        getattr(module, "_hc_attn_tf32_parts", None) is not None
+        or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        for module in model.modules()
+    ):
+        return (
+            "Online weight updates are not supported while compensated mHC "
+            "weight splits are active: captured CUDA graphs retain these derived "
+            "weights. Restart with SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 to use "
+            "online weight updates."
+        )
+
+    if model is not None:
+        # Model-owned caches can publish the same rank-uniform constraint
+        # without importing individual model implementations in the updater.
+        for module in model.modules():
+            reason = getattr(module, "_derived_weight_cache_error", None)
+            if reason is not None:
+                return reason
+    from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
         return (
@@ -83,9 +110,9 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -128,7 +155,7 @@ class WeightUpdater:
         param.data is the daemon's master copy shared with every co-attached
         engine, so an in-place update would silently corrupt them all.
         """
-        mode = self.get_model_runner().server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} is not supported while the weight cache is "
@@ -147,7 +174,7 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -219,25 +246,16 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
-    def load_weights(self: WeightUpdater, weights) -> None:
-        """Load an in-memory list of (name, tensor) weights into this runner's model."""
-        self.get_model().load_weights(weights)
-
     def receive_weights_from_distributed(
         self: WeightUpdater,
+        *,
         names,
         dtypes,
         shapes,
         group_name,
         load_format: Optional[str] = None,
     ):
-        """Receive one weight broadcast from the training engine over this runner's
-        `_model_update_group` and return the named tensors WITHOUT loading them.
-
-        Only the runner that joined the group (the target / main model) can receive;
-        the caller loads the result into each runner it wants updated. Speculative
-        draft runners never join the group, so they are fed from here.
-        """
+        """Receive one broadcast without loading it; only the target runner joined the group."""
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -245,7 +263,7 @@ class WeightUpdater:
 
         if load_format == "flattened_bucket":
             return self._receive_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
+                names=names, dtypes=dtypes, shapes=shapes, group_name=group_name
             )
 
         weights = []
@@ -269,17 +287,9 @@ class WeightUpdater:
         return weights
 
     def _receive_bucketed_weights_from_distributed(
-        self: WeightUpdater, names, dtypes, shapes, group_name
+        self: WeightUpdater, *, names, dtypes, shapes, group_name
     ):
-        named_tensors = []
-        for name, dtype, shape in zip(names, dtypes, shapes):
-            target_dtype = (
-                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            )
-            named_tensors.append(
-                (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-            )
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.empty(names, dtypes, shapes, self.device)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(
             flattened_tensor,
@@ -288,44 +298,58 @@ class WeightUpdater:
         )
         return bucket.reconstruct_tensors()
 
-    def update_weights_from_distributed(
-        self: WeightUpdater,
-        names,
-        dtypes,
-        shapes,
-        group_name,
-        load_format: Optional[str] = None,
-    ):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
+    def begin_weight_update(self: WeightUpdater) -> None:
+        DefaultModelLoader.restore_weights_before_loading(
+            self.get_model(), torch.device(self.device)
+        )
+        self._assert_published_storage_unmoved()
 
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
-        self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error()
-        if error is not None:
-            return False, error
+    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+        if run_post_load:
+            post_load_weights(self.get_model())
+        else:
+            refresh_gemma_weights(self.get_model())
+        DefaultModelLoader.postprocess_weights(
+            self.get_model(), torch.device(self.device)
+        )
+        self._assert_published_storage_unmoved()
 
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
+    def _assert_published_storage_unmoved(self: WeightUpdater) -> None:
+        """Peers write weight updates straight into the addresses this rank published at startup (p2p), so a
+        weight-update session must leave every published parameter's storage where it was."""
+        published_weight_info = (
+            self.get_model_runner().remote_instance_weight_transporter.weight_info
+        )
+        # nothing published: nobody writes by address
+        if published_weight_info is None:
+            return
+        params = dict(self.get_model().named_parameters())
+        moved = []
+        for name, (address, numel, element_size) in published_weight_info.items():
+            param = params.get(name)
+            now = (
+                None
+                if param is None
+                else (param.data_ptr(), param.numel() * param.element_size())
+            )
+            if now != (address, numel * element_size):
+                moved.append(
+                    f"{name} published at {(address, numel * element_size)}, now {now}"
+                )
+        assert not moved, (
+            "a weight-update session moved published parameters, so peer writes would land in freed memory: "
+            f"{', '.join(moved[:5])} ({len(moved)} in all)"
         )
 
-        if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
-            )
+    def load_weights_from_distributed(
+        self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
+    ) -> Tuple[bool, str]:
+        self._assert_weight_cache_inactive("update_weights_from_distributed")
+        error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is not None:
+            return False, error
         try:
-            weights = self.receive_weights_from_distributed(
-                names, dtypes, shapes, group_name, load_format
-            )
-            self.load_weights(weights)
-            return True, "Succeeded to update parameter online."
-
+            self.get_model().load_weights(named_tensors)
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -334,67 +358,43 @@ class WeightUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
-
-    def _update_bucketed_weights_from_distributed(
-        self: WeightUpdater, names, dtypes, shapes, group_name
-    ):
-        try:
-            named_tensors = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                named_tensors.append(
-                    (
-                        name,
-                        torch.empty(shape, dtype=target_dtype, device=self.device),
-                    )
-                )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flattened_tensor = bucket.get_flattened_tensor()
-            torch.distributed.broadcast(
-                flattened_tensor,
-                src=0,
-                group=self._model_update_group[group_name],
-            )
-            reconstructed_tensors = bucket.reconstruct_tensors()
-            self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
+        return True, "Succeeded to update parameter online."
 
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 
         monkey_patch_torch_reductions()
         self._assert_weight_cache_inactive("update_weights_from_tensor")
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
+        # Two input shapes reach this point. The per-tensor formats hand over a
+        # list of (name, tensor) pairs, where a tensor may still be a
+        # LocalSerializedTensor carrying one CUDA IPC handle per TP rank: open
+        # this rank's handle and move the result to this device before loading.
+        # A flattened bucket is instead a dict holding one big device tensor and
+        # the metadata that says how to slice it; its loader below does that.
+        if load_format != "flattened_bucket":
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
+
+        if load_format == "flattened_bucket":
+            self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+        elif load_format == "direct":
             _model_load_weights_direct(self.get_model(), named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
@@ -403,13 +403,18 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        # Tensors deserialized from CUDA IPC handles alias storage owned by the
+        # sender, who may free or reuse it as soon as this call returns. The
+        # loads above only enqueue device-to-device copies, so wait for them
+        # before handing control back.
+        device_module.synchronize()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,
         flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
+    ) -> None:
+        """Load a flattened bucket, raising if reconstruction or loading fails."""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
@@ -435,12 +440,10 @@ class WeightUpdater:
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
 
-        return True, "Success"
-
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
 

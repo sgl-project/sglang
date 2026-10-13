@@ -79,6 +79,8 @@ class RolloutRequest(BaseModel):
     fps: Optional[int] = None
 
     rollout: bool = True
+    # "uint8": quantise the video engine-side; None: ship unchanged
+    rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
@@ -113,3 +115,30 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+
+
+@dataclass
+class InitWeightsUpdateGroupReqInput:
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+    group_name: str
+    backend: str = "nccl"
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqInput:
+    names: list[str]
+    dtypes: list[str]
+    shapes: list[list[int]]
+    group_name: str
+    target_modules: list[str] | None = None
+    weight_update_mode: str | None = None
+    lora_alpha: int | None = None
+    lora_rank: int | None = None
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str

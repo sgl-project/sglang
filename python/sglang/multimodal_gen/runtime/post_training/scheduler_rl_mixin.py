@@ -88,9 +88,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             assert B == 1, "Generator must be a list if batch size is not 1"
             generator = [generator]
         else:
-            assert (
-                len(generator) == B
-            ), "Generator list must have the same length as batch size"
+            assert len(generator) == B, (
+                "Generator list must have the same length as batch size"
+            )
 
         buffer = self._get_or_create_rollout_noise_buffer(
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
@@ -136,9 +136,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
         if not log_prob_no_const and sde_type != "ode":
-            assert (
-                noise_level > 0
-            ), "True log-probability computation requires a non-zero noise level."
+            assert noise_level > 0, (
+                "True log-probability computation requires a non-zero noise level."
+            )
 
         dt = next_sigma - current_sigma
 
@@ -230,9 +230,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             # Only enforce the "no full log-prob with ODE" constraint when the
             # user explicitly chose ODE globally.
             if sde_type == "ode":
-                assert (
-                    log_prob_no_const
-                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                assert log_prob_no_const, (
+                    "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                )
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")

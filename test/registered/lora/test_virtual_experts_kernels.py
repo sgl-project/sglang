@@ -15,9 +15,10 @@ Covers two regression bugs that surface only with `--lora-use-virtual-experts`
   wrap, or past-end) and don't get assigned to a real expert in the
   consumer-block table.
 
-Both kernels run on CUDA. The fallback is gated on `virtual_num_experts >= 1024`
-in production, but we exercise it directly here at smaller sizes for cheaper
-iteration; one test sticks to the >1024 regime to mirror the production trigger.
+Both kernels run on CUDA or XPU; only the CUDA-JIT align variant is CUDA-only.
+The fallback is gated on `virtual_num_experts >= 1024` in production, but we
+exercise it directly here at smaller sizes for cheaper iteration; one test
+sticks to the >1024 regime to mirror the production trigger.
 
 Usage:
     python -m pytest test/registered/lora/test_virtual_experts_kernels.py -v
@@ -27,10 +28,19 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device, is_cuda, is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
+
+
+def _require_accelerator_device():
+    if not (is_cuda() or is_xpu()):
+        raise unittest.SkipTest("CUDA or XPU required")
+    return get_device(0)
+
 
 from sglang.kernels.ops.moe.virtual_experts import (
     _align_block_size_jit,
@@ -45,9 +55,7 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda:0"
+        cls.device = _require_accelerator_device()
 
     def test_negative_sentinels_preserved(self):
         # Mix of valid topk_ids in [0, num_experts), -1 sentinels (typical
@@ -116,6 +124,16 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                 expected = base + max(lora, 0) * num_experts
                 self.assertEqual(virtual_ids[m, k].item(), expected)
 
+    def test_out_of_range_expert_cannot_alias_another_adapter(self):
+        slots = torch.arange(4, dtype=torch.int32, device=self.device)
+        ids = torch.tensor([[255, 256]], dtype=torch.int32, device=self.device).repeat(
+            4, 1
+        )
+        invalid, _, _ = _fused_virtual_topk_ids(ids, slots, 256, False, 4)
+        self.assertTrue(torch.all(invalid[:, 1] == -1))
+        valid, _, _ = _fused_virtual_topk_ids(ids, slots, 257, False, 4)
+        torch.testing.assert_close(valid[:, 1], slots * 257 + 256)
+
     def test_no_lora_token_does_not_shift_base(self):
         """`token_lora_mapping[m] == -1` (no LoRA) keeps `safe_lora=0`,
         so positive bases pass through unchanged and the row mask is False."""
@@ -139,11 +157,9 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
         if cls is _AlignBlockSizeSentinelBucketBase:
             raise unittest.SkipTest("Base class")
-        cls.device = "cuda:0"
+        cls.device = _require_accelerator_device()
 
     def _align(self, topk_ids, block_size, num_experts):
         raise NotImplementedError
@@ -264,6 +280,13 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         return _align_block_size_torch(topk_ids, block_size, num_experts)
 
 
+@unittest.skipIf(
+    is_xpu(),
+    "_align_block_size_jit builds a CUDA JIT kernel via tvm_ffi.load_inline "
+    "(requires a CUDA/nvcc install); it cannot run on XPU. The torch variant "
+    "(TestAlignBlockSizeTorchSentinelBucket) covers the same alignment logic "
+    "on that platform.",
+)
 class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
     """Test the CUDA JIT kernel path (with fused_sanitize_expert_ids, as in
     production)."""

@@ -53,7 +53,6 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -386,9 +385,9 @@ class CCA(nn.Module):
         # Full (global) head counts retained for weight loading and shape asserts.
         self.num_q_heads_full = int(cca_num_q_heads)
         self.num_k_heads_full = int(cca_num_k_heads)
-        assert (
-            self.num_q_heads_full % self.num_k_heads_full == 0
-        ), "num_q_heads must be a multiple of num_k_heads"
+        assert self.num_q_heads_full % self.num_k_heads_full == 0, (
+            "num_q_heads must be a multiple of num_k_heads"
+        )
         self.gqa_groups = self.num_q_heads_full // self.num_k_heads_full
 
         # Head-parallel TP requires both head counts to be divisible by tp_size.
@@ -558,16 +557,16 @@ class CCA(nn.Module):
                 [loaded_weight[q_start:q_end], loaded_weight[k_start:k_end]],
                 dim=0,
             )
-            assert (
-                sliced.shape == param.data.shape
-            ), f"conv shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            assert sliced.shape == param.data.shape, (
+                f"conv shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            )
             param.data.copy_(sliced)
 
         def temp_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             sliced = loaded_weight[k_temp_start:k_temp_end]
-            assert (
-                sliced.shape == param.data.shape
-            ), f"temp shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            assert sliced.shape == param.data.shape, (
+                f"temp shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            )
             param.data.copy_(sliced)
 
         set_weight_attrs(self.conv_qk[0].weight, {"weight_loader": conv_row_loader})
@@ -1147,9 +1146,9 @@ class ZayaBlock(nn.Module):
                 f"number of experts {self.num_moe_experts}"
             )
 
-        assert (
-            config.activation_func == "swiglu"
-        ), "ZayaBlock only supports SwiGLU activation"
+        assert config.activation_func == "swiglu", (
+            "ZayaBlock only supports SwiGLU activation"
+        )
         assert config.gated_linear_unit, "ZayaBlock requires gated_linear_unit=True"
 
         self.router = ZayaRouter(
@@ -1389,7 +1388,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1489,7 +1488,7 @@ class ZayaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = ZayaModel(
             config=config,

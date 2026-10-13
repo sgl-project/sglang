@@ -52,11 +52,12 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "smg-grpc-servicer>=0.5.0",
+  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -65,7 +66,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.7",
 ]
 
 [project.optional-dependencies]
@@ -104,6 +105,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.2",
   "tabulate",
 ]
 

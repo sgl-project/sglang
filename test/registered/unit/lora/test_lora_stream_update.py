@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _sha256_tensor,
     _split_lora_named_tensors,
+    _WeightUpdateSession,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
@@ -91,7 +92,7 @@ class TestLoraStash(CustomTestCase):
         """A LoRA tensor never reaches the base loader, so the stash is the last
         place a per-rank payload can be reduced to this rank's tensor."""
         tp_worker = MagicMock()
-        tp_worker.ps.tp_rank = 1
+        tp_worker.model_runner.tp_rank = 1
         mgr = _make_manager(tp_worker=tp_worker)
         rank_tensors = [torch.zeros(2), torch.ones(2)]
         payload = LocalSerializedTensor(
@@ -273,14 +274,14 @@ class TestWeightVersionDeferredToCommit(CustomTestCase):
 
     def _manager(self):
         mgr = _make_manager(scheduler=Mock())
-        mgr._weight_update_in_progress = True
+        mgr._session = _WeightUpdateSession(selector="all")
         return mgr
 
     def test_bucket_version_is_held_while_the_session_is_open(self):
         mgr = self._manager()
         mgr.record_weight_version_after_update("7")
         mgr.scheduler.record_weight_version_change.assert_not_called()
-        self.assertEqual(mgr._weight_update_pending_version, "7")
+        self.assertEqual(mgr._session.pending_version, "7")
 
     def test_outside_a_session_the_version_is_recorded_at_once(self):
         mgr = _make_manager(scheduler=Mock())
@@ -292,8 +293,9 @@ class TestWeightVersionDeferredToCommit(CustomTestCase):
     def test_commit_records_the_held_version(self):
         mgr = self._manager()
         mgr.record_weight_version_after_update("7")
-        mgr._weight_update_in_progress = False
-        mgr.record_weight_version_after_update(mgr._weight_update_pending_version)
+        pending_version = mgr._session.pending_version
+        mgr._session = None
+        mgr.record_weight_version_after_update(pending_version)
         mgr.scheduler.record_weight_version_change.assert_called_once_with(
             new_version="7"
         )

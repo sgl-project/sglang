@@ -34,15 +34,15 @@ def launch_engine(
     placement_group: Optional[PlacementGroup] = None,
 ):
     """Create RayEngine subprocesses / SchedulerActors."""
-    from sglang.srt.ray.engine import RayEngine, _placement_group_context
+    from sglang.srt.ray.engine import RayEngine
 
-    with _placement_group_context(placement_group):
-        return RayEngine._launch_subprocesses(
-            server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    return RayEngine._launch_subprocesses(
+        server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
+        placement_group=placement_group,
+    )
 
 
 def serve_http(

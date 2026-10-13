@@ -211,7 +211,7 @@ impl PdPoolResolver {
 ///
 /// 1. **Same-host preference.** Parse the host portion of both URLs
 ///    (`url::Url::host_str`). If any candidate shares the host AND has
-///    a closed circuit breaker AND has `active_load <=
+///    a closed circuit breaker AND has `router_inflight_load <=
 ///    AFFINITY_LOAD_TOLERANCE × median(decode_pool_load)`, return it.
 /// 2. **Fallback: min-load among closed-breaker candidates.** No
 ///    same-host peer, or the same-host peer was filtered by rule 1's
@@ -228,7 +228,7 @@ impl PdPoolResolver {
 ///
 /// The current `Policy` trait carries `(workers, ctx)`; adding an
 /// `affinity_hint` argument would touch every policy implementation
-/// (`round_robin`, `random`, `power_of_two`, `cache_aware_zmq`).
+/// (`round_robin`, `random`, `power_of_two`, `cache_aware`).
 /// Affinity is a PD-routing concern — orthogonal to the in-pool
 /// scoring the trait abstracts — so keeping it as a sibling helper
 /// keeps the trait's responsibility narrow.
@@ -257,7 +257,7 @@ pub fn select_decode_with_affinity(
     let load_tolerance = if healthy.is_empty() {
         0
     } else {
-        let mut loads: Vec<usize> = healthy.iter().map(|w| w.active_load()).collect();
+        let mut loads: Vec<usize> = healthy.iter().map(|w| w.router_inflight_load()).collect();
         loads.sort_unstable();
         let median = loads[loads.len() / 2];
         ((median as f64) * AFFINITY_LOAD_TOLERANCE).ceil() as usize
@@ -267,7 +267,7 @@ pub fn select_decode_with_affinity(
     if let Some(host) = prefill_host.as_deref() {
         let affinity_peer = healthy.iter().find(|w| {
             host_of(&w.url).as_deref() == Some(host)
-                && (load_tolerance == 0 || w.active_load() <= load_tolerance)
+                && (load_tolerance == 0 || w.router_inflight_load() <= load_tolerance)
         });
         if let Some(w) = affinity_peer {
             return Some(Arc::clone(w));
@@ -275,14 +275,17 @@ pub fn select_decode_with_affinity(
     }
 
     // Rule 2: min-load among healthy.
-    if let Some(w) = healthy.iter().min_by_key(|w| w.active_load()) {
+    if let Some(w) = healthy.iter().min_by_key(|w| w.router_inflight_load()) {
         return Some(Arc::clone(w));
     }
 
     // Rule 3: last-resort min-load over all candidates (every
     // breaker is open). The caller's dispatch will likely fail and
     // surface `BreakerOpen`, but the selection function stays total.
-    candidates.iter().min_by_key(|w| w.active_load()).cloned()
+    candidates
+        .iter()
+        .min_by_key(|w| w.router_inflight_load())
+        .cloned()
 }
 
 /// Parse the host portion of a worker URL. Returns `None` when the URL

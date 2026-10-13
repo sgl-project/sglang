@@ -8,7 +8,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,7 +59,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -87,8 +85,7 @@ class SolarMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -100,7 +97,6 @@ class SolarMLP(nn.Module):
 
 
 class SolarAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -186,7 +182,6 @@ class SolarAttention(nn.Module):
 
 
 class SolarDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -263,7 +258,6 @@ class SolarDecoderLayer(nn.Module):
 
 
 class SolarModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -275,7 +269,7 @@ class SolarModel(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -295,7 +289,7 @@ class SolarModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -380,12 +374,11 @@ class SolarModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
 class SolarForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "qkv_proj": [
             ("q_proj", "q"),
@@ -423,7 +416,7 @@ class SolarForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SolarModel(
@@ -475,12 +468,10 @@ class SolarForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-
             is_packed = False
             for packed_name, sources in self.packed_modules_mapping.items():
                 for src_name, shard_id in sources:
                     if src_name in name:
-
                         model_param_name = name.replace(src_name, packed_name)
 
                         if model_param_name in params_dict:

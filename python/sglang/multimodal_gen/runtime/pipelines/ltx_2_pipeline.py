@@ -388,14 +388,30 @@ class _BaseLTX2Pipeline(LoRAPipeline):
 
     @staticmethod
     def _declares_component(model_path: str, component_name: str) -> bool:
+        """Whether `model_index.json` names a real component.
+
+        Falls through to the hub when `model_path` is a repo id rather than a
+        directory. Reading it as a directory alone makes every optional
+        component look absent -- silently for `duration_head`, and as a
+        spurious "checkpoint does not declare it" for the diffusion decoder.
+        """
         index_path = os.path.join(str(model_path), "model_index.json")
-        if not os.path.exists(index_path):
-            return False
-        try:
-            with open(index_path) as f:
-                model_index = json.load(f)
-        except (OSError, ValueError):
-            return False
+        if os.path.exists(index_path):
+            try:
+                with open(index_path) as f:
+                    model_index = json.load(f)
+            except (OSError, ValueError):
+                return False
+        else:
+            from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+                maybe_download_model_index,
+            )
+
+            try:
+                model_index = maybe_download_model_index(str(model_path))
+            except Exception as e:
+                logger.debug("No model_index.json for %s: %s", model_path, e)
+                return False
         entry = model_index.get(component_name)
         # model_index.json records absent optional components as [null, null].
         return bool(entry) and entry[0] is not None

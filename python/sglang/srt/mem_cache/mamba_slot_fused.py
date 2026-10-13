@@ -24,11 +24,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+
 _BLOCK = 1024
 
 
 class ConvSlotDescriptor(NamedTuple):
-    ptr: torch.Tensor  # [T] int64 base byte-addresses
+    ptr: torch.Tensor  # [T] int64-viewed base byte-addresses (make_ptr_table)
     feat: torch.Tensor  # [T] int64 per-slot feature length (elements)
     layer_stride: torch.Tensor  # [T] int64 element stride between layers
     slot_stride: torch.Tensor  # [T] int64 element stride between slots
@@ -116,7 +118,7 @@ def build_conv_slot_descriptor(tensors: List[torch.Tensor]) -> ConvSlotDescripto
         max_feat = max(max_feat, t[0, 0].numel())
     to_i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=device)
     return ConvSlotDescriptor(
-        ptr=to_i64(ptr),
+        ptr=make_ptr_table(ptr, device=device),
         feat=to_i64(feat),
         layer_stride=to_i64(layer_stride),
         slot_stride=to_i64(slot_stride),

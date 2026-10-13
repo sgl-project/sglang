@@ -162,7 +162,7 @@ Picking between `ENABLE_FOO` and `DISABLE_FOO`: both verbs are valid. The only f
 For a rename where the old key must keep working with a warning:
 
 ```python
-SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
+SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
 ```
 
 Use `EnvBoolWithAlias` / `EnvIntWithAlias`. The fallback emits a `DeprecationWarning` and copies the old value over.

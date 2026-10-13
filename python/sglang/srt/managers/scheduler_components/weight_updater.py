@@ -50,8 +50,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
-from sglang.srt.utils import MultiprocessingSerializer
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -69,9 +68,9 @@ def _split_lora_named_tensors(named_tensors):
         if ":" in name:
             lora_tensors.append((name, tensor))
         else:
-            assert (
-                ".lora_A." not in name and ".lora_B." not in name
-            ), f"LoRA tensor {name!r} arrived without a '{{lora_name}}:' prefix"
+            assert ".lora_A." not in name and ".lora_B." not in name, (
+                f"LoRA tensor {name!r} arrived without a '{{lora_name}}:' prefix"
+            )
             base_tensors.append((name, tensor))
     return base_tensors, lora_tensors
 
@@ -87,12 +86,12 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
     parallelism_infos = []
     for role, p in role_payloads:
         for name, chk in p["checksums"].items():
-            # Only non-target roles are prefixed, so target keys stay stable.
-            key = name if role == "" else f"{role}.{name}"
+            # only draft roles are prefixed, so target keys stay stable
+            key = name if role == "target" else f"{role}.{name}"
             if key in merged:
                 raise ValueError(f"checksum key collision: {key}")
             merged[key] = chk
-        parallelism_infos.append({"role": role or "target", **p["parallelism_info"]})
+        parallelism_infos.append(p["parallelism_info"])
     return {
         "checksums": merged,
         "per_gpu_checksum": overall_checksum(merged),
@@ -101,7 +100,6 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
 
 
 def _parse_runner_selector(selector: str) -> Set[str]:
-    """Map a {target, draft, all} weight-op selector to the set of roles it covers."""
     if selector == "all":
         return {"target", "draft"}
     if selector in ("target", "draft"):
@@ -109,6 +107,14 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     raise ValueError(
         f"invalid selector {selector!r}; expected 'target', 'draft', or 'all'"
     )
+
+
+class _WeightUpdateSession(msgspec.Struct, frozen=True):
+    # recorded at begin so end finalizes the same runners
+    selector: str
+    loaded_weights: bool = False
+    sync_base: bool = True
+    pending_version: Optional[str] = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -123,24 +129,10 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
-    _weight_update_in_progress: bool = False
-    _weight_update_loaded: bool = False
-    # Runner selector for the open session, recorded at begin_weight_update and
-    # reused by end_weight_update so the same set is restored and finalized.
-    _weight_update_selector: str = "all"
-    # Session scope, recorded at begin_weight_update: only sync_base sessions
-    # unpack/re-finalize base weights, and only they accept base tensors.
-    _weight_update_sync_base: bool = True
-    # Streamed adapter tensors accumulated this session: {lora_name: {hf_key: tensor}}.
-    # Applied and cleared by end_weight_update; discarded by the next begin.
+    # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
+    _session: Optional[_WeightUpdateSession] = None
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
-    # Name set of each adapter's last applied stream. The set is static for an
-    # adapter's lifetime; a change means a partial stream, which the manager's
-    # whole-adapter replace would silently zero.
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
-    # Version reported by the buckets of the open session; recorded only when
-    # end_weight_update commits, so a version never names a half-applied update.
-    _weight_update_pending_version: Optional[str] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -165,20 +157,30 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
-        if self._weight_update_in_progress:
+        if self._session is not None:
             if weight_version is not None:
-                self._weight_update_pending_version = weight_version
+                self._session = msgspec.structs.replace(
+                    self._session, pending_version=weight_version
+                )
             return
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
-            success, message = self.tp_worker.update_weights_from_disk(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
+            success, message = True, "Succeeded to update model weights."
+            target_updated = False
+            for role, runner in self._select_runners():
+                success, message = runner.weight_updater.update_weights_from_disk(
+                    recv_req.model_path,
+                    recv_req.load_format,
+                    recapture_cuda_graph=recv_req.recapture_cuda_graph,
+                )
+                if not success:
+                    break
+                target_updated |= role == "target"
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
                 self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -239,27 +241,13 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
-    def iter_weight_update_workers(
-        self, selector: str = "all"
-    ) -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
-        first. This is the worker-level inclusion decision; each worker then
-        contributes its own runners via iter_runners()."""
-        parsed = _parse_runner_selector(selector)
-        workers: List[Tuple[str, Any]] = []
-        if "target" in parsed:
-            workers.append(("target", self.tp_worker))
-        if "draft" in parsed and self.draft_worker is not None:
-            workers.append(("draft", self.draft_worker))
-        return workers
-
-    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs,
-        target first. Role is "" for the target runner; draft roles come from the
-        draft worker's iter_runners()."""
+    def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
+        roles = _parse_runner_selector(selector)
         runners: List[Tuple[str, Any]] = []
-        for _, worker in self.iter_weight_update_workers(selector):
-            runners += worker.iter_runners()
+        if "target" in roles:
+            runners += self.tp_worker.weight_update_runners()
+        if "draft" in roles and self.draft_worker is not None:
+            runners += self.draft_worker.weight_update_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -267,40 +255,48 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        assert (
-            self._weight_update_in_progress
-        ), "update_weights_from_distributed requires an open begin_weight_update session"
+        if self._session is None:
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message="update_weights_from_distributed must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
         with self._observe_weight_load("distributed"):
-            # Only the target (main) model joined this process's update group, so it
-            # receives the broadcast once; the received weights are then loaded into
-            # each selected runner locally. Draft runners never join the group.
+            # only the target runner joined the update group; drafts load its receive
+            target = self.tp_worker.model_runner.weight_updater
             try:
-                weights = self.tp_worker.model_runner.weight_updater.receive_weights_from_distributed(
-                    recv_req.names,
-                    recv_req.dtypes,
-                    recv_req.shapes,
-                    recv_req.group_name,
-                    recv_req.load_format,
+                weights = target.receive_weights_from_distributed(
+                    names=recv_req.names,
+                    dtypes=recv_req.dtypes,
+                    shapes=recv_req.shapes,
+                    group_name=recv_req.group_name,
+                    load_format=recv_req.load_format,
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
-                self._stash_lora_tensors(lora_tensors)
                 if base_tensors:
-                    assert (
-                        self._weight_update_sync_base
-                    ), "base tensors arrived in a sync_base=False weight-update session"
-                    for _, runner in self.get_model_runners(recv_req.selector):
-                        runner.weight_updater.load_weights(base_tensors)
-                success, message = True, "Succeeded to update parameter online."
+                    assert self._session.sync_base, (
+                        "base tensors arrived in a sync_base=False weight-update session"
+                    )
+                self._stash_lora_tensors(lora_tensors)
             except Exception as e:
-                success = False
-                message = (
-                    f"Failed to update parameter online: {e}. The full weights of the "
-                    "ModelRunner are partially updated. Please discard the whole weights."
-                )
+                success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
+            else:
+                success, message = True, "Succeeded to update parameter online."
+                if base_tensors:
+                    for _, runner in self._select_runners(recv_req.selector):
+                        success, message = (
+                            runner.weight_updater.load_weights_from_distributed(
+                                base_tensors
+                            )
+                        )
+                        if not success:
+                            break
             if success:
                 if base_tensors:
-                    self._weight_update_loaded = True
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
@@ -308,15 +304,16 @@ class SchedulerWeightUpdaterManager:
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        """Update the online model parameter from tensors, fanning out to the
-        selected runners."""
-        assert (
-            self._weight_update_in_progress
-        ), "update_weights_from_tensor requires an open begin_weight_update session"
+        """Update the online model parameter from tensors on the selected runners."""
+        if self._session is None:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message="update_weights_from_tensor must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
         with self._observe_weight_load("tensor"):
-            monkey_patch_torch_reductions()
-            named_tensors = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_worker.ps.tp_rank]
+            named_tensors = self.tp_worker.deserialize_own_rank(
+                recv_req.serialized_named_tensors
             )
             load_format = recv_req.load_format
             if load_format == "flattened_bucket":
@@ -336,10 +333,10 @@ class SchedulerWeightUpdaterManager:
             self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
             if base_tensors:
-                assert (
-                    self._weight_update_sync_base
-                ), "base tensors arrived in a sync_base=False weight-update session"
-                for _, runner in self.get_model_runners(recv_req.selector):
+                assert self._session.sync_base, (
+                    "base tensors arrived in a sync_base=False weight-update session"
+                )
+                for _, runner in self._select_runners(recv_req.selector):
                     success, message = runner.weight_updater.update_weights_from_tensor(
                         named_tensors=named_tensors,
                         load_format=load_format,
@@ -347,7 +344,9 @@ class SchedulerWeightUpdaterManager:
                     if not success:
                         break
                 if success:
-                    self._weight_update_loaded = True
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
             if success:
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -359,11 +358,17 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
-            success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_ipc(recv_req)
-            if tp_success:
+            success, message = True, "Succeeded to update model weights."
+            target_updated = False
+            for role, runner in self._select_runners():
+                success, message = runner.weight_updater.update_weights_from_ipc(
+                    recv_req
+                )
+                if not success:
+                    break
+                target_updated |= role == "target"
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
                 self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -382,7 +387,7 @@ class SchedulerWeightUpdaterManager:
         freeing them would leave the daemon and every peer pointing at released
         memory.
         """
-        mode = self.tp_worker.model_runner.server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} of model weights is not supported while the "
@@ -393,45 +398,43 @@ class SchedulerWeightUpdaterManager:
             )
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
-        """Begin a weight-update session: restore in-place-packed weights to a
-        loadable state on the selected runners (target and/or draft), so the draft
-        model is prepared identically to the target. The selector is recorded and
-        reused by end_weight_update so the same set is finalized."""
-        assert (
-            not self._weight_update_in_progress
-        ), "begin_weight_update called while a weight-update session is already open"
-        self._weight_update_selector = recv_req.selector
-        self._weight_update_sync_base = recv_req.sync_base
+        """Open the session: restore in-place-packed weights on the selected runners."""
+        if self._session is not None:
+            return BeginWeightUpdateReqOutput(
+                success=False,
+                message="a weight-update session is already open; "
+                "call end_weight_update() first",
+            )
         self._lora_stash = {}
-        self._weight_update_pending_version = None
         if recv_req.sync_base:
-            for _, runner in self.get_model_runners(recv_req.selector):
-                runner.begin_weight_update()
-        self._weight_update_in_progress = True
-        self._weight_update_loaded = False
+            for _, runner in self._select_runners(recv_req.selector):
+                runner.weight_updater.begin_weight_update()
+        self._session = _WeightUpdateSession(
+            selector=recv_req.selector, sync_base=recv_req.sync_base
+        )
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
-        """End the weight-update session on the runners begin_weight_update opened
-        (its recorded selector): quant finalize on each, plus model.post_load_weights
-        only when load_weights was bypassed this session (e.g. P2P/RDMA)."""
-        assert (
-            self._weight_update_in_progress
-        ), "end_weight_update called without begin_weight_update"
-        if self._weight_update_sync_base:
-            run_post_load = not self._weight_update_loaded
-            for _, runner in self.get_model_runners(self._weight_update_selector):
-                runner.end_weight_update(run_post_load=run_post_load)
+        """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
+        if self._session is None:
+            return EndWeightUpdateReqOutput(
+                success=False,
+                message="no weight-update session is open; call begin_weight_update() first",
+            )
+        if self._session.sync_base:
+            run_post_load = not self._session.loaded_weights
+            for _, runner in self._select_runners(self._session.selector):
+                runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         if recv_req.abort:
             self._lora_stash = {}
             success, message = True, "Aborted: streamed adapters discarded"
         else:
             success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
-        self._weight_update_in_progress = False
+        pending_version = self._session.pending_version
+        self._session = None
         if success and not recv_req.abort:
-            self.record_weight_version_after_update(self._weight_update_pending_version)
-        self._weight_update_pending_version = None
+            self.record_weight_version_after_update(pending_version)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
 
@@ -445,10 +448,10 @@ class SchedulerWeightUpdaterManager:
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
-                tensor = tensor.get(self.tp_worker.ps.tp_rank)
-            assert isinstance(
-                tensor, torch.Tensor
-            ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
+                tensor = tensor.get(self.tp_worker.model_runner.tp_rank)
+            assert isinstance(tensor, torch.Tensor), (
+                f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
+            )
             if copy_tensors:
                 # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
                 tensor = tensor.clone()
@@ -515,9 +518,6 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
-
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -532,8 +532,16 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # flush_cache is a no-op once KV is tagged as offloaded, so flush before tagging
             self.flush_cache()
+
+        for tag in tags:
+            self.offload_tags.add(tag)
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            # Cache-clearing kernels must finish before KV memory is unmapped.
+            torch.get_device_module().synchronize()
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -594,11 +602,12 @@ class SchedulerWeightUpdaterManager:
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
             role_payloads = []
-            for role, runner in self.get_model_runners(recv_req.selector):
+            for role, runner in self._select_runners(recv_req.selector):
                 p = runner.check_weights(
                     action=recv_req.action,
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
+                    role=role,
                 )
                 if p is not None:
                     role_payloads.append((role, p))
@@ -631,9 +640,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
+            assert draft_url is not None, (
+                "draft_url must be provided when draft model is enabled"
+            )
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):

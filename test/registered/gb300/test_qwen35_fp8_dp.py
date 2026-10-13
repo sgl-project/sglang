@@ -18,7 +18,7 @@ COMMON_ARGS = [
     "--enable-flashinfer-allreduce-fusion",
     "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
-    "--mamba-scheduler-strategy=extra_buffer",
+    "--mamba-radix-cache-strategy=extra_buffer",
     "--enable-multimodal",
     "--enable-metrics",
     "--nccl-port",
@@ -59,7 +59,6 @@ class TestQwen35Fp8Dp(CustomTestCase):
                 max_tokens=32768,
                 temperature=0.7,
                 seed=0,
-                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],

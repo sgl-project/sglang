@@ -706,6 +706,7 @@ def _compare_prefill(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    beta_is_raw: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.size(-1)
@@ -740,7 +741,8 @@ def _compare_prefill(
     k_rows = reference_k.view(batch * tokens, heads, key_dim)
     v_rows = v.view(batch * tokens, heads, value_dim).float()
     gate_rows = reference_gate.view(batch * tokens, heads, key_dim)
-    beta_rows = beta.view(batch * tokens, heads).float()
+    reference_beta = beta.float().sigmoid() if beta_is_raw else beta
+    beta_rows = reference_beta.view(batch * tokens, heads).float()
     out_rows = reference_out.view(batch * tokens, heads, value_dim)
 
     if cu_seqlens is None:
@@ -811,6 +813,7 @@ def _compare_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        beta_is_raw=beta_is_raw,
     )
 
     assert helion_out.data_ptr() == helion_v.data_ptr()
@@ -850,6 +853,42 @@ def test_fixed_partial_prefill_and_state_pool_contract() -> None:
 
     untouched = torch.tensor([0, 2, 4], device="cuda")
     assert torch.equal(helion_state[untouched], state[untouched])
+
+
+def test_raw_beta_prefill_contract() -> None:
+    torch.manual_seed(811)
+    batch, tokens, heads, key_dim, value_dim = 2, 17, 2, 32, 32
+    q = torch.randn(batch, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+    # Keep the unnormalized recurrence numerically contractive while still
+    # exercising the no-QK-L2-normalization path. Unit-scale random keys make
+    # (I - beta * k k^T) expansive and obscure the raw-beta contract with
+    # exponentially amplified BF16 round-off.
+    k = torch.randn_like(q) * 0.05
+    v = torch.randn(
+        batch, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+    # Keep the recurrent decay contractive so the raw-beta check measures the
+    # sigmoid conversion instead of amplifying BF16 round-off exponentially.
+    gate = -torch.rand_like(q) * 0.2
+    raw_beta = torch.linspace(
+        -2,
+        2,
+        steps=batch * tokens * heads,
+        device="cuda",
+    ).reshape(batch, tokens, heads)
+    indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    state = torch.randn(5, heads, value_dim, key_dim, device="cuda") * 0.01
+
+    _compare_prefill(
+        q,
+        k,
+        v,
+        gate,
+        raw_beta,
+        state,
+        indices,
+        beta_is_raw=True,
+    )
 
 
 @pytest.mark.parametrize("is_varlen", [False, True], ids=["fixed", "varlen"])

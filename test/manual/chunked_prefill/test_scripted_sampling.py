@@ -34,8 +34,7 @@ class TestSamplingBasic(ScriptedTestCase):
             if r.rid in rec.rids and rec.mode == "decode"
         ]
         assert len(decode_records) == 0, (
-            f"max_new_tokens=0 must run zero decode forwards; got "
-            f"{len(decode_records)}"
+            f"max_new_tokens=0 must run zero decode forwards; got {len(decode_records)}"
         )
 
     def test_max_new_tokens_one_long_chunked(self):
@@ -100,8 +99,7 @@ class TestSamplingBasic(ScriptedTestCase):
         assert r.chunks_done >= 2
         assert len(r.req.output_ids) == 16
         assert isinstance(r.req.finished_reason, FINISH_LENGTH), (
-            f"ignore_eos=True must finish via length cap; got "
-            f"{r.req.finished_reason!r}"
+            f"ignore_eos=True must finish via length cap; got {r.req.finished_reason!r}"
         )
 
     def test_return_logprob_top_logprobs_chunked(self):
@@ -176,9 +174,9 @@ class TestSamplingBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert (
-            r.chunks_done >= 2
-        ), f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
+        assert r.chunks_done >= 2, (
+            f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
+        )
         assert r.req.logprob is not None
         input_lp = r.req.logprob.input_token_logprobs_val
         assert len(input_lp) == prompt_len, (
@@ -201,9 +199,9 @@ class TestSamplingBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert (
-            r.chunks_done >= 3
-        ), f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
+        assert r.chunks_done >= 3, (
+            f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
+        )
         assert r.req.logprob is not None
         input_lp = r.req.logprob.input_token_logprobs_val
         assert len(input_lp) == prompt_len - start_len, (
@@ -246,9 +244,9 @@ class TestSamplingBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r_eos, max_steps=2000)
         assert r_eos.finished
-        assert (
-            r_eos.chunks_done >= 2
-        ), f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
+        assert r_eos.chunks_done >= 2, (
+            f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
+        )
         assert isinstance(r_eos.req.finished_reason, FINISH_MATCHED_TOKEN), (
             f"a stop token the model deterministically produces under greedy must "
             f"finish via the matched-token path; got {r_eos.req.finished_reason!r}"
@@ -261,9 +259,9 @@ class TestSamplingBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r_length)
         assert r_length.finished
-        assert (
-            r_length.chunks_done >= 2
-        ), f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
+        assert r_length.chunks_done >= 2, (
+            f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
+        )
         assert isinstance(r_length.req.finished_reason, FINISH_LENGTH), (
             f"ignore_eos=True + max_new_tokens=4 chunked must finish via "
             f"length cap; got {r_length.req.finished_reason!r}"

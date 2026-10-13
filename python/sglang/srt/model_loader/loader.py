@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -52,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_server_args,
 )
 from sglang.srt.utils import get_available_gpu_memory
@@ -83,11 +85,15 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -214,7 +220,19 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            if (
+                quant_config.is_fp4_experts
+                and not quant_config.dequant_fp4_to_fp8
+                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                and not get_platform().is_sm100
+            ):
+                raise ValueError(
+                    "flashinfer_trtllm_routed with MXFP4 experts requires SM100."
+                )
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
@@ -259,7 +277,11 @@ def _get_quantization_config(
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
-        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        get_hf_to_sglang_mapper = getattr(model_class, "get_hf_to_sglang_mapper", None)
+        if get_hf_to_sglang_mapper is not None:
+            hf_to_sglang_mapper = get_hf_to_sglang_mapper(model_config.hf_config)
+        else:
+            hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
         # pass mappings by reference to quant_config
         if hf_to_sglang_mapper is not None and quant_config is not None:
             quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -304,45 +326,26 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    refresh_gemma_weights(model)
 
 
-def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
-    """Run a quant_method hook (restore/process) on every quantized module.
+def refresh_gemma_weights(model: nn.Module) -> None:
+    # its weight loader derives the buffer, so writes that bypass the loader leave it stale
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_gemma_weight()
 
-    LoRA wrappers forward `quant_method` for forward-path dispatch but don't own
-    the packed params; skip them so the inner base layer (yielded separately by
-    `named_modules`) handles it.
-    """
+
+def _modules_with_quant_method(model: nn.Module):
     from sglang.srt.lora.layers import BaseLayerWithLoRA
 
     for _, module in model.named_modules():
+        # LoRA wrappers forward quant_method but do not own the packed params
         if isinstance(module, BaseLayerWithLoRA):
             continue
         quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None and hasattr(quant_method, hook_name):
-            with device_loading_context(module, target_device):
-                getattr(quant_method, hook_name)(module)
-
-
-def restore_weight(model: nn.Module, target_device) -> None:
-    """Undo in-place quant packing so fresh weights can be loaded
-    (no-op for schemes that don't repack, e.g. plain fp8)."""
-    _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
-
-
-def postprocess_weight(model: nn.Module, target_device) -> None:
-    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant,
-    transpose, ...)."""
-    _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
-
-
-def _post_load_weights(model: nn.Module) -> None:
-    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
-    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
-    # would normally do it internally. NextN subclasses override the method to fill in
-    # `is_nextn=True`, so the loader doesn't need to know.
-    if hasattr(model, "post_load_weights"):
-        model.post_load_weights()
+        if quant_method is not None:
+            yield module, quant_method
 
 
 class BaseModelLoader(ABC):
@@ -417,6 +420,12 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        allow_patterns_overrides: Optional[list[str]] = None
+        """If defined, weights will load exclusively using these patterns.
+
+        Used by checkpoints whose weights live in subfolders (e.g. the Cosmos3
+        diffusers-style layout with ``transformer/`` and ``vision_encoder/``)."""
+
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
@@ -427,6 +436,9 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                allow_patterns_overrides=getattr(
+                    model, "allow_patterns_overrides", None
+                ),
                 model_config=model_config,
             )
 
@@ -476,7 +488,11 @@ class DefaultModelLoader(BaseModelLoader):
         return model
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool,
+        allow_patterns_overrides: Optional[list[str]] = None,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -516,6 +532,9 @@ class DefaultModelLoader(BaseModelLoader):
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
+        if allow_patterns_overrides is not None:
+            allow_patterns = allow_patterns_overrides
+
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
@@ -538,7 +557,7 @@ class DefaultModelLoader(BaseModelLoader):
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
-                if pattern == "*.safetensors":
+                if pattern.endswith(".safetensors"):
                     use_safetensors = True
                 break
 
@@ -556,7 +575,12 @@ class DefaultModelLoader(BaseModelLoader):
                     revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                allow_patterns=(
+                    allow_patterns if allow_patterns_overrides is not None else None
+                ),
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -596,9 +620,13 @@ class DefaultModelLoader(BaseModelLoader):
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
+
         if resolved_source is None:
             hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-                source.model_or_path, source.revision, source.fall_back_to_pt
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -654,7 +682,7 @@ class DefaultModelLoader(BaseModelLoader):
                     {"enable_multithread_load", "num_threads"} & extra_config.keys()
                 )
             ):
-                logger.warning(
+                logger.debug(
                     "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "
@@ -766,6 +794,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.model_or_path,
                 source.revision,
                 source.fall_back_to_pt,
+                source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(
@@ -818,6 +847,33 @@ class DefaultModelLoader(BaseModelLoader):
                 )
         return model
 
+    def initialize_model_without_storage(
+        self,
+        *,
+        model_config: ModelConfig,
+        device: torch.device,
+    ) -> Tuple[nn.Module, Dict[str, torch.Size]]:
+        """Build the model of `initialize_model_for_startup` without allocating parameter storage.
+
+        Returns the model, with every parameter 0-size on `device`, and the shape each parameter was built with,
+        by name. Parameters keep their subclass, attributes and ties; other tensors stay on meta, so the model
+        cannot run forward. For a trainer that binds its own buffers before loading weights in this rank's layout
+        (p2p weight updates).
+        """
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        built_shapes_by_name = {
+            name: param.shape for name, param in model.named_parameters()
+        }
+        _replace_parameters_with_empty(model, device)
+        return model, built_shapes_by_name
+
     def prepare_model_for_capture(
         self,
         *,
@@ -842,7 +898,7 @@ class DefaultModelLoader(BaseModelLoader):
         """
         with set_default_torch_dtype(model_config.dtype):
             initialize_capture_safe_weights(model)
-            _post_load_weights(model)
+            post_load_weights(model)
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
@@ -1000,6 +1056,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        DefaultModelLoader.postprocess_weights(model, target_device)
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1055,16 +1116,43 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
+    @staticmethod
+    def postprocess_weights(model, target_device):
+        for module, quant_method in _modules_with_quant_method(model):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Undo in-place quant packing so fresh weights can be loaded."""
+        for module, quant_method in _modules_with_quant_method(model):
+            # Duck-typed methods without the quantization hook contract cannot restore.
+            if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                    quant_method.restore_weights_before_loading(module)
+
+
+def _replace_parameters_with_empty(model: nn.Module, device: torch.device) -> None:
+    # by the original's id, so a parameter shared by several modules stays shared
+    replacements: Dict[int, nn.Parameter] = {}
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            if id(param) not in replacements:
+                replacement = torch.Tensor._make_subclass(
+                    type(param),
+                    torch.empty(0, dtype=param.dtype, device=device),
+                    param.requires_grad,
+                )
+                replacement.__dict__.update(param.__dict__)
+                replacements[id(param)] = replacement
+            module._parameters[name] = replacements[id(param)]
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -2045,9 +2133,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
         try:
-            from sglang.srt.distributed import get_world_group
+            from sglang.srt.runtime_context import get_parallel
 
-            group = get_world_group()
+            group = get_parallel().world_group
             if group.world_size <= 1:
                 return local_sig
             all_sigs = group.all_gather_object(local_sig)
@@ -2067,21 +2155,21 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            g = get_world_group()
+            g = get_parallel().world_group
             return g.rank_in_group, g.world_size
-        except (AssertionError, AttributeError):
+        except (AssertionError, AttributeError, RuntimeError):
             return 0, 1
 
     @staticmethod
     def _world_barrier() -> None:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            get_world_group().barrier()
-        except (AssertionError, AttributeError):
+            get_parallel().world_group.barrier()
+        except (AssertionError, AttributeError, RuntimeError):
             pass
 
     @staticmethod
@@ -2933,7 +3021,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -2957,7 +3044,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -2967,7 +3053,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -3028,7 +3113,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -3040,8 +3125,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -3363,6 +3447,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 load_config.remote_instance_weight_loader_transfer_engine,
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
                 load_config.tp_rank,
+                role="draft" if model_config.is_draft_model else "target",
             )
             if not success:
                 raise RuntimeError(
@@ -3441,21 +3526,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self, model, transfer_engine, seed_url, tp_rank, role
     ) -> bool:
-        # get remote weights metadata from source instance.
-        # The seed now publishes a backend-tagged dict instead of a positional
-        # (session_id, weights_info_dict) tuple, so read the fields by key.
-        seed_transfer_engine_info = get_remote_instance_transfer_engine_info_per_rank(
-            seed_url, tp_rank
-        )
-        if not seed_transfer_engine_info:
-            logger.error("Cannot get transfer engine session or weight info.")
-            return False
-
-        seed_transfer_engine_session_id = seed_transfer_engine_info.get("session_id")
-        seed_transfer_engine_weight_info = seed_transfer_engine_info.get(
-            "weights_info_dict"
+        # get remote weights metadata from source instance
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank, role)
         )
         if (
             seed_transfer_engine_session_id is None
@@ -3582,7 +3657,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -4138,7 +4213,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+        from sglang.srt.utils.runai_utils import (
+            ObjectStorageModel,
+            is_runai_obj_uri,
+            list_safetensors,
+        )
 
         is_object_storage_path = is_runai_obj_uri(model_name_or_path)
         if self._is_distributed is None:
@@ -4179,6 +4258,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 index_file,
                 self.load_config.download_dir,
                 revision,
+            )
+        if is_object_storage_path:
+            index_file = os.path.abspath(
+                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
             )
         hf_weights_files = filter_duplicate_safetensors_files(
             hf_weights_files, hf_folder, index_file
