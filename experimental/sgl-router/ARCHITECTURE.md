@@ -36,21 +36,19 @@ matching, or session affinity), **choosing engine(s)**, **forwarding** the
 request, and **handling output tokens** (e.g. tool parsing). Along the way it
 also applies **admission control**, **failure handling**, and **retries**.
 
-#### Example load-aware routing
+### 1.3 Example: load-aware routing
 
-The router walks the buckets that fit the request's length, ordered by SLO
-preference, then smaller capacity, then `rank`.
-In each bucket it samples engines, picks the less loaded one, and checks
-admission. If the admission policy rejects the request, the router moves to the next
-bucket; if every bucket rejects it, the request fails with 503. An admitted
-request is dispatched. If dispatch fails before any response is sent and retries
-remain, the router excludes the failed engine and starts again from the first
-bucket.
+The router tries each **bucket** that fits the request's length, ordered by SLO
+preference, capacity, then `rank`. In each bucket it picks the **less loaded of
+two sampled engines** and checks **admission**; on rejection it moves to the
+next bucket, and returns **503** when none admit. If **dispatch** fails before
+any response and **retries** remain, it excludes that engine and restarts from
+the first bucket.
 
-Load is a vector of engine metrics compared field by field, and the first
-difference decides. For unified and prefill engines the order is estimated
+**Load** is a vector of engine metrics compared field by field, and the first
+difference decides. For **unified and prefill** engines the order is estimated
 prefill queue time, waiting uncached tokens, waiting requests, running requests,
-then in-flight requests; decode engines rank by waiting and running requests,
+then in-flight requests; **decode** engines rank by waiting and running requests,
 then KV usage.
 
 ```mermaid
@@ -72,10 +70,10 @@ flowchart TD
     class E done;
 ```
 
-#### Example cache-aware and session-aware routing
+### 1.4 Example: cache-aware and session-aware routing
 
 These policies replace steps **2–3** above. `cache_aware` serves plain and
-prefill groups only; decode groups use `power_of_two` unless they set
+prefill groups only; decode groups use load-aware (`power_of_two`) unless they set
 `session_aware`. Both policies split the group's engines in two:
 
 - **Preferred engine (A):** for `cache_aware`, the best-ranked prefix owner that
@@ -97,48 +95,88 @@ A and B are checked against the same group admission limits (for example
       plus the tokens this request would prefill on it. For `cache_aware` that
       subtracts the engine's cached prefix, so A's cache hit counts in its favor.
     - **`running_requests`:** the engine's reported running requests.
-- **No A, or A fails admission (either mode):** fall back to B. If B also fails
-  admission, the group rejects the request and the router tries the next bucket.
+- **No A, or A fails admission (either mode):** fall back to B.
 
 ## 2. Configuration examples
 
-Settings resolve as **group JSON field > CLI flag > built-in default**. Without
-`--bucket-config`, the router uses two default buckets that cover every engine:
-`plain` for unified engines and `pd` for P/D engines.
+**CLI flags** set the defaults for every engine group. A **bucket file**
+(`--bucket-config`) defines the buckets, and each group in it can override the
+policy, admission, and affinity settings for itself. Without a bucket file,
+there are no length tiers: every request can go to any engine.
 
-### Example A: cache-aware, CLI only
+Settings fall into these categories:
+
+| Category | What it controls | CLI flags | Bucket-file group key |
+| --- | --- | --- | --- |
+| **Engines** | Plain or P/D, and where engines come from | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) | `worker_services`, `worker_ids` |
+| **Policy** | How the router scores engines within a group | `--policy` | `policy` |
+| **Affinity** | When the preferred engine (prefix owner or session binding) wins over a normal engine | `--affinity-*`, `--cache-affinity-*`, `--session-id-header` | `affinity` |
+| **Admission** | Limits that make an engine reject a request | `--max-*` | `admission` |
+| **Buckets** | Which buckets a request fits and the order they are tried | `--bucket-config` | `max_input_tokens`, `max_context_tokens`, `rank`, ... |
+
+How policies apply to each group:
+
+- **Plain and prefill groups** use `--policy` (default `power_of_two`).
+- **Decode groups** always default to `power_of_two`; under reorg,
+  `--decode-policy` must stay `power_of_two`.
+- **A bucket-file group** can set `"policy"` to `power_of_two` or to the
+  `--policy` value, nothing else. `cache_aware` cannot be used on decode, so
+  only `session_aware` can replace `power_of_two` there.
+
+### Example A: plain engines, cache-aware
 
 ```bash
-sgl-router --chat-routing reorg --policy cache_aware \
-  --affinity-mode prefer \
-  --cache-affinity-min-match-ratio 0.2 \
-  --max-waiting-requests 16 --max-in-flight 56 ...
+sgl-router --model-id qwen3 --chat-routing reorg \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy cache_aware \
+  --affinity-mode prefer --cache-affinity-min-match-ratio 0.2 \
+  --max-waiting-requests 16 --max-in-flight 56
 ```
 
-- A prefill engine owns the prefix if it holds at least 1024 matched tokens
-  (the default) **and** 20% of the prompt.
-- `prefer` sends the request to the best owner that passes admission.
-- Every group, decode included, rejects an engine that reports 16 or more
-  waiting requests, or has 56 or more requests in flight from this router.
+- **Engines:** two plain engines; each handles both prefill and decode.
+- **Policy:** every engine is scored with `cache_aware`.
+- **Affinity:**
+  - An engine owns the prefix if it holds at least 1024 matched tokens (the
+    default) **and** 20% of the prompt.
+  - `prefer` sends the request to the best owner that passes admission.
+- **Admission:** an engine is rejected when it reports 16 or more waiting
+  requests, or has 56 or more requests in flight from this router.
 
-### Example B: session-aware, balanced by running requests
+### Example B: P/D engines, session-aware
 
 ```bash
-sgl-router --chat-routing reorg --policy session_aware \
+sgl-router --model-id qwen3 --chat-routing reorg \
+  --service-discovery --service-discovery-namespace inference \
+  --prefill-selector app=qwen3,role=prefill \
+  --decode-selector app=qwen3,role=decode \
+  --policy session_aware --session-id-header x-session-id \
   --affinity-mode balanced --affinity-balanced-by running-requests \
-  --session-id-header x-session-id ...
+  --max-kv-usage 0.9
 ```
 
-- Requests with the same `x-session-id` stick to the engine they are bound to.
-- The session moves to another engine only when the bound engine has more than
-  2x its running requests **and** more than 4 extra (the defaults).
-- Plain and prefill groups use `session_aware`; decode groups stay on
-  `power_of_two` unless a group sets `"policy": "session_aware"`.
+- **Engines:** Kubernetes discovery finds prefill and decode engines by label.
+- **Policy:**
+  - Prefill engines use `session_aware`: requests with the same
+    `x-session-id` stick to the prefill engine they are bound to.
+  - Decode engines use `power_of_two`. To make decode session-aware too, use a
+    bucket file whose decode group sets `"policy": "session_aware"`.
+- **Affinity:** the session moves to another engine only when the bound engine
+  has more than 2x its running requests **and** more than 4 extra (the
+  defaults).
+- **Admission:** prefill and decode engines are rejected at 90% KV usage.
 
 ### Example C: P/D buckets from a file
 
-Pass this file with `--bucket-config` and `--policy cache_aware`. It defines a
-short tier with a TTFT estimate and a long tier:
+```bash
+sgl-router --model-id qwen3 --chat-routing reorg \
+  --service-discovery --service-discovery-namespace inference \
+  --prefill-selector app=qwen3,role=prefill \
+  --decode-selector app=qwen3,role=decode \
+  --policy cache_aware \
+  --bucket-config buckets.json
+```
+
+`buckets.json` defines a short tier with a TTFT estimate and a long tier:
 
 ```json
 {
@@ -163,16 +201,30 @@ short tier with a TTFT estimate and a long tier:
       "id": "long",
       "rank": 1,
       "max_context_tokens": 131072,
-      "prefill": {"worker_services": ["inference/prefill-long"]},
+      "prefill": {
+        "worker_services": ["inference/prefill-long"],
+        "policy": "power_of_two"
+      },
       "decode": {"worker_services": ["inference/decode-long"]}
     }
   ]
 }
 ```
 
-- Requests that fit within 4k input and 8k context fit both buckets; `short` is
-  tried first because it is smaller. Longer requests go only to `long`.
-- `short` prefill engines use cache-aware routing in balanced mode and reject
-  requests while 32k or more uncached tokens are waiting. `short` decode engines
-  use `power_of_two` and reject requests at 90% KV usage.
-- If `short` rejects a request, the router tries `long`.
+- **Engines:** each group takes the discovered engines of its role that belong
+  to the listed Kubernetes Services.
+- **Buckets:**
+  - Requests that fit within 4k input and 8k context fit both buckets; `short`
+    is tried first because it is smaller. Longer requests go only to `long`.
+  - If `short` rejects a request, the router tries `long`.
+- **Policy:**
+  - `short` prefill uses `cache_aware` from `--policy`.
+  - `long` prefill overrides it with `power_of_two`.
+  - Both decode groups use `power_of_two`.
+- **Affinity:** `short` prefill uses balanced mode with a load factor of 1.5.
+  `power_of_two` groups have no affinity settings.
+- **Admission:**
+  - `short` prefill engines reject requests while 32k or more uncached tokens
+    are waiting.
+  - `short` decode engines reject requests at 90% KV usage.
+  - `long` engines set no limits.
