@@ -252,7 +252,7 @@ def _update_and_read_residual_aiter_fp8_group(
     # takes (bf16, fp8, scale), the DSA indexer takes (fp8, scale, bf16).
     if keep_bf16:
         output = (unquantized, output[0], output[1])
-    elif dsa_needs_bf16:
+    elif needs_bf16:
         output = (output[0], output[1], unquantized)
     return output, hidden_states if residual is None else residual_out
 

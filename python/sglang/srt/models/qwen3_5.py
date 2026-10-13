@@ -1274,6 +1274,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         accepts_fp8_input = _linear_accepts_quant_tuple(self.linear_attn.in_proj_qkvz)
         # The bf16 sidecar is only needed when in_proj_ba cannot take the tuple.
         ba_reads_tuple = _linear_accepts_quant_tuple(self.linear_attn.in_proj_ba)
+        is_layer_sparse = is_next_layer_sparse = _qwen3_5_is_moe(config)
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
@@ -1503,6 +1504,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_quant_tuple(self.qkv_proj)
+        is_layer_sparse = is_next_layer_sparse = _qwen3_5_is_moe(config)
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
