@@ -1771,7 +1771,7 @@ def _unpack_latent(buf, locs, packed):
 
 
 class _IndexerCacheCheck:
-    def __init__(self, group, packed):
+    def __init__(self, group, packed, *, raw_fp8=False, prefix_contexts=8):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
         from sglang.srt.mem_cache.page_interleave import PageShardSpec
         from sglang.srt.mem_cache.page_interleave_pool import (
@@ -1783,10 +1783,11 @@ class _IndexerCacheCheck:
         self.rank = group.rank_in_group
         self.device = group.device
         self.packed = packed
+        assert not (packed and raw_fp8)
         self.kwargs = kwargs = dict(
             page_size=_INDEXER_PAGE_SIZE,
             kv_lora_rank=_INDEXER_KV_LORA_RANK,
-            dtype=torch.float8_e4m3fn if packed else torch.bfloat16,
+            dtype=torch.float8_e4m3fn if packed or raw_fp8 else torch.bfloat16,
             qk_rope_head_dim=_INDEXER_QK_ROPE,
             layer_num=len(_INDEXER_SKIP_TOPK),
             device=str(self.device),
@@ -1804,7 +1805,7 @@ class _IndexerCacheCheck:
                 shard_rank=self.rank,
                 shard_size=self.world,
                 page_size=_INDEXER_PAGE_SIZE,
-                max_prefix_tokens=8 * self.world * _INDEXER_PAGE_SIZE,
+                max_prefix_tokens=prefix_contexts * self.world * _INDEXER_PAGE_SIZE,
                 chunk_tokens=8 * _INDEXER_PAGE_SIZE,
             ),
             shard_group=group,

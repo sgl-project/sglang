@@ -148,6 +148,7 @@ if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1007,6 +1008,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
         if (
             not _is_fp8_fnuz
+            and get_kv_shard_pool(pool) is None
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -1492,7 +1494,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
+            block_tables = metadata.get_cache_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1802,7 +1804,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
-        if (
+        can_fuse_store = (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
@@ -1810,7 +1812,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out_cache_loc.dtype,
                 pool.page_size,
             )
-        ):
+        )
+        # Sharded stores must stage all keys in scratch and persist only
+        # owner-local rows through the pool's address-aware setter.
+        if can_fuse_store and get_kv_shard_pool(pool) is None:
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
@@ -1843,9 +1848,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return
 
-        # Fallback: original path
+        # The CUDA fused writers store unrounded FP32 scales. Preserve that
+        # quantization when sharding routes an otherwise eligible fused write
+        # through the pool setter; UE8M0 rounding would change keys and top-k.
         assert act_quant is not None
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        if can_fuse_store:
+            k_fp8, k_scale = act_quant(
+                key, self.block_size, None, use_fused_store_math=True
+            )
+        else:
+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()
