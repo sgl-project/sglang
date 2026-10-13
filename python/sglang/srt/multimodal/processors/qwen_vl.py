@@ -177,6 +177,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
+        self.image_token_id = hf_config.image_token_id
+        self.video_token_id = hf_config.video_token_id
 
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
@@ -307,8 +309,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self._spatial_merge_size,
-            image_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.model_type,
             tokens_per_second=self._tokens_per_second,
@@ -726,7 +728,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             input_ids_list, mm_items
         )
         mm_items = self._prepare_mm_items_for_transport(mm_items)
-        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(
+            mm_items, self.keep_mm_features_on_device
+        )
         return MultimodalProcessorOutput(
             input_ids=input_ids_list,
             padded_input_ids=padded_input_ids,
@@ -836,8 +840,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         if mrope_result is None:
             mrope_result = MRotaryEmbedding.get_rope_index(
                 spatial_merge_size=self._spatial_merge_size,
-                image_token_id=self.mm_tokens.image_token_id,
-                video_token_id=self.mm_tokens.video_token_id,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
                 tokens_per_second=self._tokens_per_second,
@@ -933,6 +937,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             ret,
             mm_items,
             input_ids,
+            keep_mm_features_on_device=self.keep_mm_features_on_device,
             base_input_ids=base_input_ids,
             image_data=image_data,
             video_data=video_data,
@@ -987,13 +992,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             image_data, input_text, request_obj, *args, **kwargs
         )
 
-    def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
+    def _mark_cuda_ipc_features_for_deferred_reconstruction(
+        self, mm_items, keep_mm_features_on_device
+    ):
         supports_deferred_reconstruction = get_mm().mm_enable_dp_encoder or (
             get_parallel().tp_size == 1
             and self.model_type in ("qwen3_vl", "qwen3_vl_moe")
         )
         if not (
-            self.keep_mm_features_on_device
+            keep_mm_features_on_device
             and supports_deferred_reconstruction
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
@@ -1011,12 +1018,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         mm_items: list[MultimodalDataItem],
         input_ids: torch.Tensor,
         *,
+        keep_mm_features_on_device,
         base_input_ids: Optional[list[int]] = None,
         image_data=None,
         video_data=None,
         audio_feature_lengths=None,
     ) -> MultimodalProcessorOutput:
-        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(
+            mm_items, keep_mm_features_on_device
+        )
 
         second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")
         if second_per_grid_ts is None:
@@ -1061,9 +1071,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
-            im_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            audio_token_id=self.mm_tokens.audio_token_id,
+            im_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            audio_token_id=self.audio_token_id,
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
