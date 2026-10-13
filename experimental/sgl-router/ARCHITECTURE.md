@@ -37,37 +37,36 @@ forwards the request. In P/D, it sends the request to both the prefill and decod
 engines; the prefill engine transfers KV directly to the decode engine.
 
 ### 1.2 Request routing lifecycle
-Routing of a request typically goes through: preprocessing (render/tokenizing), picking a bucket, get candidate engine "scores" (load/prefix-matching or session affinity), choose engine(s), forward requests, and handle output tokens (e.g. tool parsing).
-
-It also considers other factors like: admission control, failure, retry etc.
+Routing of a request typically goes through: preprocessing (render/tokenizing), picking a bucket, get candidate engine "scores" (load/prefix-matching or session affinity), choose engine(s), forward requests, and handle output tokens (e.g. tool parsing). It also considers other factors like: admission control, failure, retry etc.
 
 #### Example load-aware routing
 
-Follow the main path from top to bottom. Rejection moves to the next bucket;
-a dispatch retry starts bucket selection again.
+The router walks the compatible buckets in order (see [Buckets](#3-buckets)).
+In each bucket it samples engines, picks the less loaded one, and checks
+admission. If the admission policy rejects the request, the router moves to the next
+bucket; if every bucket rejects it, the request fails with 503. An admitted
+request is dispatched. If dispatch fails before any response is sent and retries
+remain, the router excludes the failed engine and starts again from the first
+bucket.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 30, "nodeSpacing": 30}}}%%
 flowchart TD
-    R([Request]) --> B["1. Try next compatible bucket"]
-    B --> S["2. Sample engines<br/>Choose the lower load"]
-    S --> A{"3. Admission passes?"}
-    A -->|yes| D["4. Dispatch<br/>Send request"]
-    D -->|response or final error| E([Return to client])
-    A -->|no: next bucket| B
-    D -->|retry allowed| T["Exclude failed engine"]
-    T -->|restart from first bucket| B
+    R([Request]) --> B["1. Take next compatible bucket"]
+    B --> S["2. Sample two engines<br/>Pick the less loaded one"]
+    S --> A{"3. Engine admits<br/>the request?"}
+    A -->|yes| D["4. Dispatch to engine"]
+    A -->|no| M{"More buckets?"}
+    M -->|no| X(["503 to client"])
+    D -->|success, or<br/>out of retries| E([Response to client])
+    D -->|failed before response,<br/>retries left| T["Exclude failed engine"]
+    M -.->|yes: next bucket| B
+    T -.->|restart at first bucket| B
     classDef next fill:#fff5e6,stroke:#ac762c,color:#654516;
     classDef done fill:#e8f5ef,stroke:#46826a,color:#234d3c;
-    class T next;
+    class T,X next;
     class E done;
 ```
-
-With one candidate, choose it directly. Admission checks only the chosen engine;
-a rejection does **not** try the other sample. If no bucket remains, return an
-error. A dispatch retry excludes the failed engine and restarts from the first
-bucket; it requires a retryable failure, remaining budget, and no response started
-([retry details](#7-failures-and-retries)).
 
 #### Example cache-aware and session-aware routing
 
