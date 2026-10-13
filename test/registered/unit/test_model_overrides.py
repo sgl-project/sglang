@@ -218,6 +218,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "reasoning_parser",
+                    "tool_call_parser",
                 }
             ),
         )
@@ -2145,6 +2147,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
+                reasoning_parser="ling3",
+                tool_call_parser="ling3",
                 _model_config=SimpleNamespace(quantization="fp8", is_fp4_experts=True),
             )
             defaults.update(kw)
@@ -2204,6 +2208,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             is_sm90=False, is_sm100=False, is_sm120=False, is_hip=False
         ):
             self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
+
+    def test_bailing_v3_defaults_ling3_parsers(self):
+        """An unset or auto parser on Bailing V3 must resolve to ling3; an
+        explicit or already-declared parser is kept."""
+        from sglang.srt.arg_groups.model_overrides.bailing_moe_v3 import (
+            _bailing_moe_v3_parser_overrides,
+        )
+
+        hf = SimpleNamespace(architectures=["BailingMoeV3ForCausalLM"])
+
+        def _overrides(**kw):
+            args = dict(tool_call_parser=None, reasoning_parser=None)
+            args.update(kw)
+            return _bailing_moe_v3_parser_overrides(SimpleNamespace(**args), hf)
+
+        self.assertEqual(_overrides(), {"tool_call_parser": "ling3"})
+        self.assertEqual(
+            _overrides(tool_call_parser="auto", reasoning_parser="auto"),
+            {"tool_call_parser": "ling3", "reasoning_parser": "ling3"},
+        )
+        self.assertEqual(
+            _overrides(tool_call_parser="glm45", reasoning_parser="deepseek-r1"), {}
+        )
+        self.assertEqual(
+            _overrides(
+                _resolved_overrides=[
+                    ("_handle_deprecated_args", {"tool_call_parser": "glm"})
+                ]
+            ),
+            {},
+        )
+        for other in (
+            "BailingMoeV2_5ForCausalLM",
+            "BailingMoeV2ForCausalLM",
+            "BailingMoEForCausalLM",
+        ):
+            self.assertNotIn(
+                _bailing_moe_v3_parser_overrides,
+                base_module._MODEL_OVERRIDE_FNS.get(other, ()),
+            )
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
