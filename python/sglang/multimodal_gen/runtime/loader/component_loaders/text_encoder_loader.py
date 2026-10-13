@@ -79,6 +79,9 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
     finalize_encoder_folding,
     get_folding_tp_group,
 )
+from sglang.multimodal_gen.runtime.models.encoders.gemma_4_unified import (
+    NATIVE_LAYERWISE_ADAPTERS,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -472,6 +475,24 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 if transformers_model_class is not None:
                     return transformers_model_class
         return transformers.AutoModel
+
+    def load_native(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str,
+        component_name: str | None = None,
+    ):
+        model = super().load_native(
+            component_model_path,
+            server_args,
+            transformers_or_diffusers,
+            component_name,
+        )
+        # A native encoder with no SGLang port can still stream its decoder
+        # stack when its layout is known; see NATIVE_LAYERWISE_ADAPTERS.
+        adapter = NATIVE_LAYERWISE_ADAPTERS.get(type(model).__name__)
+        return model if adapter is None else adapter(model)
 
     def _get_all_weights(
         self,
