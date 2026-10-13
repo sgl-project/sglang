@@ -2111,7 +2111,10 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                and (
+                    is_cp_active(forward_batch)
+                    or not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -4137,11 +4140,16 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4562,6 +4570,11 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4599,15 +4612,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 

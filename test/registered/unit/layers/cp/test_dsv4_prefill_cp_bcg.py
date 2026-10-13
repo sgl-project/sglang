@@ -17,13 +17,61 @@ from sglang.srt.layers.cp.bcg import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestDSV4PrefillCPBCG(unittest.TestCase):
+class TestDSV4PrefillCPBCG(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_low_ratio_cp_sources_exclude_capture_padding(self):
+        """A 91-token request replaying a 96-token bucket must map only live rows."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        global_x = torch.arange(96, dtype=torch.float32)[:, None]
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=96),
+            req_pool_indices=torch.tensor([2, 4]),
+            extend_seq_lens=torch.tensor([3, 88]),
+            extend_seq_lens_cpu=[3, 88],
+            positions=torch.arange(96),
+        )
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+            _low_ratio_compress_torch=Mock(),
+            _low_ratio_index_topk=Mock(),
+        )
+        layer = SimpleNamespace(compressor=object(), indexer=object())
+        with (
+            get_parallel().override(attn_cp_size=4, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.cp_materialize_global_token_order",
+                return_value=global_x,
+            ),
+            patch("torch.cuda.current_stream", return_value=None),
+        ):
+            DeepseekV4AttnBackend._forward_low_ratio_sources_cp(
+                backend,
+                layer=layer,
+                x=torch.zeros(24, 1),
+                q_lora=torch.zeros(24, 1),
+                positions=torch.arange(24),
+                forward_batch=batch,
+                run_compressor=True,
+                run_indexer=True,
+            )
+        _, x, req, pos = backend._low_ratio_compress_torch.call_args.args
+        torch.testing.assert_close(x, global_x[:91])
+        torch.testing.assert_close(req, torch.tensor([2] * 3 + [4] * 88))
+        torch.testing.assert_close(pos, torch.arange(91))
+        args, kwargs = backend._low_ratio_index_topk.call_args
+        self.assertEqual(args[1].shape[0], 23)
+        self.assertEqual(kwargs["rows_per_request"], [1, 22])
 
     def test_sparse_prefill_never_uses_cp_local_queries(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -207,7 +255,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
 
     def test_interleave_capacity_is_independent_of_request_boundaries(self):
         init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
-        inputs = PrefillCPBCGInput(torch.empty(0), torch.empty(0), {16: 4, 32: 8})
+        inputs = PrefillCPBCGInput(
+            torch.empty(0), torch.empty(0), bucket_local_tokens={16: 4, 32: 8}
+        )
         with patch(
             "sglang.srt.layers.cp.bcg.get_cp_padding_align_size", return_value=4
         ):
@@ -243,6 +293,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             seq_lens_cpu=[length + 20 for length in lengths],
             global_num_tokens_cpu=None,
             attn_cp_metadata=None,
+            num_token_non_padded=None,
         )
 
     def test_repeated_padded_replay_preserves_addresses_and_global_order(self):
@@ -252,7 +303,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
             inputs = [
                 PrefillCPBCGInput(
-                    torch.zeros(bucket, 1), torch.zeros(bucket, dtype=torch.int64)
+                    torch.zeros(bucket, 1),
+                    torch.zeros(bucket, dtype=torch.int64),
+                    input_ids=torch.zeros(bucket, dtype=torch.int64),
                 )
                 for _ in range(cp_size)
             ]
@@ -291,7 +344,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         batch.input_embeds[: len(local_ids), 0], local_ids
                     )
                     torch.testing.assert_close(
-                        batch.positions[: len(local_ids)],
+                        batch._cp_positions[: len(local_ids)],
                         global_positions[:n][rank::cp_size],
                     )
                     self.assertEqual(
@@ -301,15 +354,20 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         0,
                     )
                     self.assertEqual(
-                        torch.count_nonzero(batch.positions[len(local_ids) :]).item(), 0
+                        torch.count_nonzero(
+                            batch._cp_positions[len(local_ids) :]
+                        ).item(),
+                        0,
                     )
                     self.assertEqual(
                         batch.input_embeds.data_ptr(),
                         inputs[rank].input_embeds.data_ptr(),
                     )
                     self.assertEqual(
-                        batch.positions.data_ptr(), inputs[rank].positions.data_ptr()
+                        batch._cp_positions.data_ptr(),
+                        inputs[rank].positions.data_ptr(),
                     )
+                    torch.testing.assert_close(batch.positions, global_positions)
                     self.assertIs(batch.out_cache_loc, cache_loc)
                     self.assertEqual(batch.out_cache_loc.shape[0], bucket)
                     self.assertEqual(batch.attn_cp_metadata.total_seq_lens, bucket)
