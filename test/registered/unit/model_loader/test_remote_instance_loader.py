@@ -103,7 +103,7 @@ class TestRemoteInstanceTransferEngineRole(CustomTestCase):
                     patch.object(
                         loader_mod,
                         "get_remote_instance_transfer_engine_info_per_rank",
-                        side_effect=lambda *args: queried.append(args) or (None, None),
+                        side_effect=lambda *args: queried.append(args),
                     ),
                 ):
                     with self.assertRaises(RuntimeError):

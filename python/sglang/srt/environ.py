@@ -830,6 +830,9 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
+    # NIXL plugin the remote-instance weight agents use
+    SGLANG_REMOTE_INSTANCE_NIXL_BACKEND = EnvStr("UCX")
+
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     # ===================================================================

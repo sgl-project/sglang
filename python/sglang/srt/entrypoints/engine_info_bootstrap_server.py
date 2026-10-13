@@ -43,8 +43,8 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {(role, tp_rank): (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[Tuple[str, int], Tuple] = {}
+        # Storage: {(role, tp_rank): what a peer needs to write the weights over the runner's transport}
+        self.transfer_engine_info: Dict[Tuple[str, int], dict] = {}
         # Storage: {(role, tp_rank): parallelism_config_dict}
         self.parallelism_config: Dict[Tuple[str, int], dict] = {}
         self.lock = threading.Lock()
@@ -61,18 +61,12 @@ class EngineInfoBootstrapServer:
                 role = data["role"]
                 tp_rank = data["tp_rank"]
                 info = data["transfer_engine_info"]
-                session_id = info["session_id"]
-                weights_info_dict = info["weights_info_dict"]
 
                 with self.lock:
-                    self.transfer_engine_info[(role, tp_rank)] = (
-                        session_id,
-                        weights_info_dict,
-                    )
+                    self.transfer_engine_info[(role, tp_rank)] = info
 
                 logger.info(
-                    f"Registered transfer engine info for role={role} tp_rank={tp_rank}, "
-                    f"session_id={session_id}"
+                    f"Registered {info['transport']} transfer engine info for role={role} tp_rank={tp_rank}"
                 )
                 return PlainTextResponse("OK")
             except Exception as e:
@@ -93,7 +87,7 @@ class EngineInfoBootstrapServer:
                     detail=f"No transfer engine info for role {role} rank {rank}",
                 )
 
-            return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
+            return {"rank": rank, "remote_instance_transfer_engine_info": info}
 
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
@@ -145,7 +139,7 @@ class EngineInfoBootstrapServer:
 
     def get_transfer_engine_info(
         self, rank: int, role: str = "target"
-    ) -> Optional[Tuple]:
+    ) -> Optional[dict]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
         return self.transfer_engine_info.get((role, rank))
 
