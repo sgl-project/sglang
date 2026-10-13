@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     VideoSparseAttentionH3Impl,
     VideoSparseAttentionH3MetadataBuilder,
     _topk_tile_lists,
+    vsa_h3_fold_gate,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+    vsa_h3_topk_lists,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -163,6 +167,29 @@ def test_topk_tile_list_semantics() -> None:
     assert (_lists_to_mask(compete, n_tiles).sum(dim=-1) == keep + num_prefix).all()
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "num_prefix, num_video, sparsity",
+    [(29, 528, 0.8), (0, 64, 0.9), (30, 1541, 0.05)],
+)
+def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -> None:
+    """The unsorted-top-k list kernel must emit the sorted lists and leave its
+    scratch mask zeroed for the next layer."""
+    n_tiles = num_prefix + num_video
+    scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
+    reference = _topk_tile_lists(scores, num_prefix, num_video, sparsity, True)
+    keep = reference.shape[-1] - num_prefix
+    out = torch.full((HEADS, num_video, n_tiles), -1, dtype=torch.int32, device="cuda")
+    out[..., :num_prefix] = torch.arange(num_prefix, dtype=torch.int32, device="cuda")
+    mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
+    for _ in range(2):  # the scratch mask must come back zeroed
+        picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
+        vsa_h3_topk_lists(picked, mask, out, num_prefix)
+        assert torch.equal(out[..., : num_prefix + keep], reference)
+        assert not mask.any()
+    assert (out[..., num_prefix + keep :] == -1).all()
+
+
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):
     """fp32 reference over the padded tile layout with the top-k tile mask."""
     n_tiles = meta.num_tiles
@@ -213,6 +240,68 @@ def test_sparse_gated_matches_masked_dense_reference() -> None:
         diff = (out[:used].float() - reference).abs().max().item()
         assert diff < 2e-2, f"exempt={exempt}: sparse+gate vs reference {diff}"
         assert torch.all(out[used:] == 0)
+
+
+@requires_cuda
+def test_return_compress_fold_on_row_shards_is_bit_identical() -> None:
+    """The deferred row-shard fold (Ulysses) must reproduce the in-kernel fold
+    bit for bit: same tile index derivation, same fp32 FMA order."""
+    device = torch.device("cuda")
+    meta = _build_metadata(0.5, device)
+    used, total, (q, k, v) = _packed_qkv(device)
+    gate = (torch.randn_like(q) * 0.1).to(torch.bfloat16)
+    impl = _impl()
+
+    folded = _run(impl, meta, used, total, q, k, v, gate=gate)
+    cu = torch.tensor([0, used, total], dtype=torch.int32, device=device)
+    out, out_compress = impl.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens=cu,
+        max_seqlen=used,
+        cu_seqlens_host=(0, used, total),
+        attn_metadata=meta,
+        return_compress=True,
+    )
+    shard = total // 2
+    for row_start in (0, shard):
+        rows = slice(row_start, row_start + shard)
+        vsa_h3_fold_gate(out[rows], gate[rows], out_compress, meta, row_start)
+    assert torch.equal(out, folded)
+
+
+@requires_cuda
+@pytest.mark.parametrize("sparsity", [0.0, 0.8])
+def test_odd_tile_count_matches_reference(sparsity: float) -> None:
+    """An odd tile count (padded to even for the SM100 kernel) must keep the
+    pooled means, the top-k lists and the gate fold on the real tiles."""
+    device = torch.device("cuda")
+    prefix = (70, 0, 40)
+    meta = VideoSparseAttentionH3MetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=VIDEO_SHAPE,
+        patch_size=(1, 1, 1),
+        VSA_sparsity=sparsity,
+        prefix_segments=prefix,
+        device=device,
+    )
+    assert meta.num_tiles % 2 == 1
+    used = sum(prefix) + math.prod(VIDEO_SHAPE)
+    total = (used + 63) // 64 * 64
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    q, k, v, gate = (
+        torch.randn((total, HEADS, HEAD_DIM), generator=generator).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(4)
+    )
+    gate = gate * 0.1
+    out = _run(_impl(), meta, used, total, q, k, v, gate=gate)
+    reference = _masked_dense_reference(meta, used, q, k, v, gate, sparsity)
+    diff = (out[:used].float() - reference).abs().max().item()
+    assert diff < 2e-2, f"odd tile count, sparsity {sparsity}: max diff {diff}"
+    assert torch.all(out[used:] == 0)
 
 
 def test_metadata_tile_geometry_accounts_every_row() -> None:
