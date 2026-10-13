@@ -700,7 +700,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         base_input_ids = getattr(base_output, "input_ids", None)
         video_data = request_obj.video_data
-        output = self.output_builder._build_mm_output(
+        output = self.output_builder.build(
             ret,
             mm_items,
             input_ids,

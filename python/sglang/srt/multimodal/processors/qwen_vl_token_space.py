@@ -299,7 +299,7 @@ class QwenVLMultimodalProcessorOutputBuilder(MultimodalProcessorOutputBuilder):
                     True
                 )
 
-    def _build_mm_output(
+    def build(
         self,
         ret: BatchFeature,
         mm_items: list[MultimodalDataItem],
