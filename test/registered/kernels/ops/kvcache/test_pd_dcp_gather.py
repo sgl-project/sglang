@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.kvcache.pd_dcp_gather import (
     copy_mla_rows_into_pack,
     copy_pack_into_mla_rows,
+    mla_pack_required_bytes,
 )
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
@@ -72,6 +73,25 @@ class TestPdDcpGather(CustomTestCase):
         untouched = torch.ones(16, dtype=torch.bool, device="cuda")
         untouched[dst_rows] = False
         self.assertTrue(torch.all(dst[untouched] == 0xA5))
+
+    def test_gather_rejects_oversize_before_launch_and_preserves_guard(self):
+        source = torch.arange(64, dtype=torch.uint8, device="cuda").view(8, 8)
+        rows = torch.tensor([1, 3, 5], dtype=torch.int64, device="cuda")
+        required = mla_pack_required_bytes(rows.numel(), [8], 4)
+        storage = torch.full((required + 16,), 165, dtype=torch.uint8, device="cuda")
+
+        with self.assertRaisesRegex(ValueError, "overflow before gather"):
+            copy_mla_rows_into_pack(
+                [source.data_ptr()], rows, storage[: required - 1], [8],
+                pack_offset_bytes=4,
+            )
+        copy_mla_rows_into_pack(
+            [source.data_ptr()], rows, storage[:required], [8], pack_offset_bytes=4
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(storage[:4], torch.full_like(storage[:4], 165))
+        torch.testing.assert_close(storage[required:], torch.full_like(storage[required:], 165))
 
     def test_packed_tp2_pp2_to_dcp4_preserves_kv(self):
         """Packing must preserve both target rows and draft head shards across PP stages."""

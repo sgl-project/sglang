@@ -57,6 +57,21 @@ def _copy_pack_into_mla_rows_kernel(
     tl.store(dst + dst_row * dst_row_stride + byte, values, mask=mask)
 
 
+def mla_pack_required_bytes(
+    row_count: int,
+    token_item_lens: Sequence[int],
+    pack_offset_bytes: int = 0,
+) -> int:
+    row_count = int(row_count)
+    offset = int(pack_offset_bytes)
+    if row_count < 0 or offset < 0:
+        raise ValueError(f"Invalid pack layout: rows={row_count}, offset={offset}")
+    widths = [int(item_len) for item_len in token_item_lens]
+    if any(item_len <= 0 for item_len in widths):
+        raise ValueError(f"MLA token item lengths must be positive, got {widths}")
+    return offset + row_count * sum(widths)
+
+
 def copy_mla_rows_into_pack(
     kv_data_ptrs: Sequence[int],
     row_indices: torch.Tensor,
@@ -76,15 +91,26 @@ def copy_mla_rows_into_pack(
         return
 
     n = int(row_indices.numel())
+    required = mla_pack_required_bytes(n, token_item_lens, pack_offset_bytes)
+    capacity = int(pack.numel()) * int(pack.element_size())
+    if required > capacity:
+        raise ValueError(
+            f"MLA pack overflow before gather: need={required}, capacity={capacity}"
+        )
     metadata = []
     offset = int(pack_offset_bytes)
     for ptr, item_len, src_item_len in zip(
         kv_data_ptrs, token_item_lens, src_token_item_lens
     ):
+        ptr = int(ptr)
         item_len = int(item_len)
-        if item_len <= 0:
-            raise ValueError(f"MLA token item length must be positive, got {item_len}")
-        metadata.extend((int(ptr), item_len, offset, int(src_item_len)))
+        src_item_len = int(src_item_len)
+        if ptr <= 0 or src_item_len < item_len:
+            raise ValueError(
+                f"Invalid MLA source range: ptr={ptr}, width={item_len}, "
+                f"stride={src_item_len}"
+            )
+        metadata.extend((ptr, item_len, offset, src_item_len))
         offset += n * item_len
 
     src_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
@@ -119,15 +145,26 @@ def copy_pack_into_mla_rows(
         return
 
     n = int(row_indices.numel())
+    required = mla_pack_required_bytes(n, token_item_lens, pack_offset_bytes)
+    capacity = int(pack.numel()) * int(pack.element_size())
+    if required > capacity:
+        raise ValueError(
+            f"MLA pack overflow before scatter: need={required}, capacity={capacity}"
+        )
     metadata = []
     offset = int(pack_offset_bytes)
     for ptr, item_len, dst_item_len in zip(
         kv_data_ptrs, token_item_lens, dst_token_item_lens
     ):
+        ptr = int(ptr)
         item_len = int(item_len)
-        if item_len <= 0:
-            raise ValueError(f"MLA token item length must be positive, got {item_len}")
-        metadata.extend((int(ptr), item_len, offset, int(dst_item_len)))
+        dst_item_len = int(dst_item_len)
+        if ptr <= 0 or dst_item_len < item_len:
+            raise ValueError(
+                f"Invalid MLA destination range: ptr={ptr}, width={item_len}, "
+                f"stride={dst_item_len}"
+            )
+        metadata.extend((ptr, item_len, offset, dst_item_len))
         offset += n * item_len
 
     dst_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
