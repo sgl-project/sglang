@@ -153,11 +153,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.swa_replay_dp import (
-    enter_late_layer_dp,
-    exit_late_layer_dp,
-    late_layer_dp_counts,
-)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
@@ -168,6 +163,11 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+)
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    enter_late_layer_dp,
+    exit_late_layer_dp,
+    late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
