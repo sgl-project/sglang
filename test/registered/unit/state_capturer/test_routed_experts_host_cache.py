@@ -14,18 +14,22 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestRoutedExpertsHostCache(CustomTestCase):
-    def _host_dtype(self, num_physical_experts):
+    def _host_dtype(self, num_logical_experts):
         metadata = (
             None
-            if num_physical_experts is None
-            else SimpleNamespace(num_physical_experts=num_physical_experts)
+            if num_logical_experts is None
+            else SimpleNamespace(
+                num_logical_experts=num_logical_experts,
+                num_physical_experts=num_logical_experts + 32,
+            )
         )
         with mock.patch.object(
             re_mod, "get_global_expert_location_metadata", return_value=metadata
         ):
             return re_mod._host_dtype()
 
-    def test_host_dtype_holds_every_physical_expert_id(self):
+    def test_host_dtype_follows_logical_experts_not_redundant_slots(self):
+        # 256 logical experts stay uint8 even with 32 redundant physical slots
         self.assertEqual(self._host_dtype(128), torch.uint8)
         self.assertEqual(self._host_dtype(256), torch.uint8)
         self.assertEqual(self._host_dtype(288), torch.int16)

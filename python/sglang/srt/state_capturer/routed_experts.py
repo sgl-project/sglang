@@ -24,14 +24,14 @@ from sglang.srt.state_capturer.routed_experts_codec import decode_routed_experts
 
 
 def _host_dtype() -> torch.dtype:
-    """Narrowest dtype holding every captured id: logical, or physical on some
-    backends, so all below num_physical_experts."""
+    """Narrowest dtype holding every captured id: capture records logical ids, whose
+    count, unlike the physical one, never changes at runtime."""
     metadata = get_global_expert_location_metadata()
     if metadata is None:
         return torch.int32
-    if metadata.num_physical_experts <= 1 << 8:
+    if metadata.num_logical_experts <= 1 << 8:
         return torch.uint8
-    if metadata.num_physical_experts <= 1 << 15:
+    if metadata.num_logical_experts <= 1 << 15:
         return torch.int16  # CPU indexing has no uint16 kernels
     return torch.int32
 
