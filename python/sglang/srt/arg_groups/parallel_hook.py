@@ -186,41 +186,12 @@ def handle_context_parallelism(server_args: Any):
         )
 
     from sglang.srt.layers.cp.base import init_cp_strategy
-    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
     )
-
-    # Backend and CP topology are now resolved. Preserve explicit graph choices,
-    # but enable supported CP paths even if an earlier default disabled capture.
-    if (Phase.PREFILL, "backend") not in getattr(
-        server_args, "_cuda_graph_config_locked", set()
-    ) and supports_prefill_cp_bcg(server_args):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            apply_cuda_graph_compatibility,
-            apply_cuda_graph_disaggregation_roles,
-            apply_deepep_adjustments,
-        )
-
-        declare_resolution(
-            server_args,
-            "_handle_context_parallelism",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
-            ),
-        )
-        # Keep unrelated incompatibilities and DeepEP bucket alignment intact
-        # when restoring a graph disabled before CP/backend resolution.
-        apply_cuda_graph_compatibility(server_args)
-        apply_cuda_graph_disaggregation_roles(server_args)
-        apply_deepep_adjustments(server_args)
-        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-            logger.info(
-                "Enabling breakable prefill CUDA graph for supported prefill CP."
-            )
 
 
 def handle_shared_experts_tp(server_args: Any):

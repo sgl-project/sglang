@@ -101,6 +101,34 @@ def parse_cuda_graph_config(server_args: Any):
     server_args._cuda_graph_config_locked = locked
 
 
+def apply_prefill_cp_cuda_graph_default(server_args: Any):
+    """Select BCG for supported CP after the backend and topology resolve."""
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    cfg = resolving_view(server_args)
+    # Preserve explicit graph choices, but enable supported CP paths even if
+    # an earlier default disabled capture before CP/backend resolution.
+    if (Phase.PREFILL, "backend") not in getattr(
+        server_args, "_cuda_graph_config_locked", set()
+    ) and supports_prefill_cp_bcg(server_args):
+        declare_resolution(
+            server_args,
+            "apply_prefill_cp_cuda_graph_default",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+            ),
+        )
+        # Keep unrelated incompatibilities and DeepEP bucket alignment intact
+        # when restoring a graph disabled before CP/backend resolution.
+        apply_cuda_graph_compatibility(server_args)
+        apply_cuda_graph_disaggregation_roles(server_args)
+        apply_deepep_adjustments(server_args)
+        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            logger.info(
+                "Enabling breakable prefill CUDA graph for supported prefill CP."
+            )
+
+
 def apply_cuda_graph_compatibility(server_args: Any):
     """Auto-disable prefill cuda graph for incompatible configs.
     Breakable and Full have different constraints. Skip automatic selection
