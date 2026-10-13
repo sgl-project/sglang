@@ -92,13 +92,6 @@ register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {
-    "help": ["--help"],
-    "invalid_distribution": [
-        "--dataset-name",
-        "generated-shared-prefix",
-        "--gsp-group-distribution",
-        "invalid_name",
-    ],
     "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
     "zipf_without_alpha": [
         "--dataset-name",

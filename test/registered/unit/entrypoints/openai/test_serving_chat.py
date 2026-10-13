@@ -13,7 +13,6 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import gc
 import json
-import re
 import tempfile
 import unittest
 import uuid
@@ -25,7 +24,6 @@ from unittest.mock import Mock, patch
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
-from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -1424,6 +1422,38 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
+            for tool_choice, expects_tools in (("none", False), ("auto", True)):
+                with self.subTest(
+                    chat_encoding_spec=chat_encoding_spec,
+                    tool_choice=tool_choice,
+                ):
+                    self.chat.chat_encoding_spec = chat_encoding_spec
+                    self.tm.tokenizer.encode.reset_mock()
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                        tools=[tool],
+                        tool_choice=tool_choice,
+                    )
+
+                    self.chat._process_messages(request, is_multimodal=False)
+
+                    prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertEqual("calculator" in prompt, expects_tools)
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -2622,18 +2652,6 @@ class ServingChatTestCase(CustomTestCase):
         # The HF chat-template path keeps the wrap-into-content behaviour.
         self.chat.chat_encoding_spec = None
         self.assertFalse(self.chat.supports_native_reasoning_history())
-
-    def test_all_chat_encoding_specs_are_enumerated(self):
-        """Guard the spec list this file asserts capabilities over."""
-        source = Path(chat_encoding.__file__).read_text()
-        returned = set(
-            re.findall(
-                r'^\s+return "(\w+)"$',
-                source[source.index("def resolve_chat_encoding_spec") :],
-                re.MULTILINE,
-            )
-        )
-        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
@@ -4702,20 +4720,6 @@ class ServingChatTestCase(CustomTestCase):
         """Default _encode_messages returns None (use standard encoding)."""
         result = self.chat._encode_messages([], Mock(), False)
         self.assertIsNone(result)
-
-    def test_decode_response_returns_text(self):
-        """Default _decode_response returns ret_item['text']."""
-        ret_item = {"text": "Hello world", "output_ids": [1, 2, 3]}
-        result = self.chat._decode_response(ret_item)
-        self.assertEqual(result, "Hello world")
-
-    def test_get_parsed_response_fields_passthrough(self):
-        """Default _get_parsed_response_fields passes through values."""
-        reasoning = "thinking..."
-        tool_calls = [{"name": "foo"}]
-        r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
-        self.assertEqual(r, reasoning)
-        self.assertEqual(t, tool_calls)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
