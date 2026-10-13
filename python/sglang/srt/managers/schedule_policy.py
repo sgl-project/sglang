@@ -814,6 +814,10 @@ class PrefillAdder:
             slots += req.mamba_host_hit_length
         return slots * self._mamba_slot_cost
 
+    def _defer_staged_admission(self, req: Req, pool: str) -> None:
+        if self.tree_cache.buffer_pipeline is not None:
+            self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -1324,11 +1328,7 @@ class PrefillAdder:
         if self.rem_mamba_slots is not None:
             required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
             if required_mamba_slots > self.rem_mamba_slots:
-                if (
-                    isinstance(self.tree_cache, UnifiedRadixCache)
-                    and self.tree_cache.buffer_pipeline is not None
-                ):
-                    self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
+                self._defer_staged_admission(req, "mamba")
                 return AddReqResult.NO_TOKEN
 
         # The temporary pin excludes this prefix from the evictable budget.
@@ -1343,6 +1343,9 @@ class PrefillAdder:
                 has_chunked_req=has_chunked_req,
             )
             if isinstance(admission, AddReqResult):
+                if admission == AddReqResult.NO_TOKEN:
+                    # A staged hit can need more shared bytes than recomputing.
+                    self._defer_staged_admission(req, "full_or_aux")
                 return admission
 
             # A rejected candidate must not report prefillable or queue H2D.
@@ -1399,6 +1402,7 @@ class PrefillAdder:
                         swa_host_hit_length=req.swa_host_hit_length,
                         chunk_limit=self.rem_chunk_tokens,
                     ):
+                        self._defer_staged_admission(req, "full_or_aux")
                         return AddReqResult.NO_TOKEN
                     promised_host_hit = req.host_hit_length
                     loaded = self.tree_cache.init_load_back(
