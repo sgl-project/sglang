@@ -1238,17 +1238,26 @@ class BaseMultimodalProcessor(ABC):
     # Images of a pre-tokenized prompt are located by the
     # placeholder id in the ids; the decoded text is never scanned.
     @staticmethod
-    def _ids_for_media(prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data):
+    def _ids_for_media(
+        prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+    ):
         """The prompt's token ids when its images are to be located by id:
         the prompt arrived as ids, the request carries images (none of them
         precomputed) and no video or audio, and the processor knows its
         image placeholder id and token. Else None, and the text path runs."""
-        ids = input_ids if input_ids is not None else (prompt if isinstance(prompt, list) else None)
+        ids = (
+            input_ids
+            if input_ids is not None
+            else (prompt if isinstance(prompt, list) else None)
+        )
         if ids is None or not image_data or video_data or audio_data:
             return None
         if any(isinstance(item, dict) for item in image_data):
             return None
-        if multimodal_tokens.image_token_id is None or not multimodal_tokens.image_token:
+        if (
+            multimodal_tokens.image_token_id is None
+            or not multimodal_tokens.image_token
+        ):
             return None
         return ids.tolist() if hasattr(ids, "tolist") else list(ids)
 
