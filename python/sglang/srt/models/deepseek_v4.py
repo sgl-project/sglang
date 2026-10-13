@@ -79,6 +79,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     _tbo_event,
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
@@ -2676,6 +2677,28 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+def _attn_tp_all_gather_chunks(
+    local: torch.Tensor, chunk_rows: List[int]
+) -> torch.Tensor:
+    # Tensor all_gather stays on aiter AG / pynccl under graph capture; the list
+    # all_gather falls back to ProcessGroupNCCL, which invalidates HIP capture.
+    max_rows = max(chunk_rows)
+    padded = local
+    if local.shape[0] != max_rows:
+        padded = local.new_zeros((max_rows, *local.shape[1:]))
+        padded[: local.shape[0]].copy_(local)
+    gathered = local.new_empty((len(chunk_rows) * max_rows, *local.shape[1:]))
+    attn_tp_all_gather_into_tensor(gathered, padded.contiguous())
+    if all(rows == max_rows for rows in chunk_rows):
+        return gathered
+    return torch.cat(
+        [
+            gathered[i * max_rows : i * max_rows + rows]
+            for i, rows in enumerate(chunk_rows)
+        ]
+    )
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2726,7 +2749,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3300,17 +3324,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-        seam_open: bool = True,
-        mega_mhc_seam_open: bool = True,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix. ``seam_open`` preserves the existing tail-mode boundary policy;
-        ``mega_mhc_seam_open`` disables Mega mHC for both sublayers in the layer
-        immediately before row selection."""
+        pre-mix."""
         self._init_boundaries()
-        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(
-            self.hc_cfg, seam_open=mega_mhc_seam_open
-        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3345,7 +3362,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=self.local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
-                mega_mhc=mega_mhc_prefill,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3356,7 +3372,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             precomputed = state.stats
             state.release()
             del state
-            nxt = self.next_boundary if seam_open else None
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
@@ -3373,10 +3388,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=nxt,
+                next=self.next_boundary,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
-                mega_next=self.next_boundary if mega_mhc_prefill else None,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -3519,7 +3533,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+            if self.config.model_type == "deepseek_v41":
+                parallel = get_parallel()
+                hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
+                    parallel.attn_cp_rank
+                ].contiguous()
+            else:
+                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -3556,9 +3577,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
-            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            attn_tp_all_gather(gathered, hidden_states.contiguous())
-            hidden_states = torch.cat(gathered)
+            if _is_hip:
+                hidden_states = _attn_tp_all_gather_chunks(
+                    hidden_states, chunk_rows=[t.shape[0] for t in _a2a_scatter_chunks]
+                )
+            else:
+                gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
+                attn_tp_all_gather(gathered, hidden_states.contiguous())
+                hidden_states = torch.cat(gathered)
         return hidden_states
 
     # ------------------------------------------------------------------
@@ -4230,8 +4256,6 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
-                    mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         # saved_dp is only not None on hip
@@ -4569,7 +4593,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
@@ -4787,16 +4815,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -4805,7 +4836,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -4815,6 +4846,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
