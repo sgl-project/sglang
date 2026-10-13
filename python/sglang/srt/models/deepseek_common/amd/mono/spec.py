@@ -77,15 +77,14 @@ def refuse_config(cfg, hf_config) -> list[str]:
         reasons.append(
             "SGLANG_USE_AITER_MOE_GU_ITLV=0: the kernels read gate/up interleaved (GUGU)"
         )
-    if whole_layers_enabled():
-        main = os.environ.get("SGLANG_DSV4_KV_LAYOUT", "auto").lower()
-        comp = os.environ.get("SGLANG_DSV4_COMPRESSED_KV_LAYOUT", "auto").lower()
-        flashmla = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "auto").lower()
-        v41 = main == "v41" or (main == "auto" and flashmla in ("auto", "aiter_sparse"))
-        if not v41 and comp not in ("auto", "fp8"):
-            reasons.append(
-                "V4 main cache: SGLANG_DSV4_COMPRESSED_KV_LAYOUT must be auto or fp8"
-            )
+    main = os.environ.get("SGLANG_DSV4_KV_LAYOUT", "auto").lower()
+    comp = os.environ.get("SGLANG_DSV4_COMPRESSED_KV_LAYOUT", "auto").lower()
+    flashmla = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "auto").lower()
+    v41 = main == "v41" or (main == "auto" and flashmla in ("auto", "aiter_sparse"))
+    if not v41 and comp not in ("auto", "fp8"):
+        reasons.append(
+            "V4 main cache: SGLANG_DSV4_COMPRESSED_KV_LAYOUT must be auto or fp8"
+        )
     return reasons
 
 
@@ -157,19 +156,17 @@ def _wo_a(attn) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def indexer_layers_enabled() -> bool:
-    """Development switch: indexer / compressor layers as K1 -> SGLang's indexer + compressor -> K2."""
-    return os.environ.get("SGLANG_MONO_DSV41_INDEXER", "0") == "1"
-
-
 def k2a_mode() -> int:
-    """Development switch (task 17): 0 = SGLang's indexer kernels, 1 = the K2i launch (ATOM's FP4 scorer + exact
-    top-k) replaces the decode / verify logits, top-k and candidate kernels of the indexer layers."""
-    mode = int(os.environ.get("SGLANG_MONO_DSV41_K2A", "0"))
+    """With ``--layer-backend mono``: 1 (default) = the K2i launch (ATOM's FP4 scorer) feeds SGLang's top-k and
+    candidate kernels on the indexer layers; ``SGLANG_MONO_DSV41_K2A=0`` (A/B only) keeps SGLang's indexer logits.
+    0 whenever mono is off."""
+    from sglang.srt.layers.mono.guards import mono_enabled
+    from sglang.srt.runtime_context import get_server_args
+
+    if not mono_enabled(get_server_args()):
+        return 0
+    mode = int(os.environ.get("SGLANG_MONO_DSV41_K2A", "1"))
     assert mode in (0, 1), f"SGLANG_MONO_DSV41_K2A={mode}: only 0 / 1 exist"
-    assert mode == 0 or indexer_layers_enabled(), (
-        "SGLANG_MONO_DSV41_K2A=1 needs SGLANG_MONO_DSV41_INDEXER=1"
-    )
     return mode
 
 
@@ -181,27 +178,13 @@ def _has_indexer_side(layer) -> bool:
     )
 
 
-def edge_layers_enabled() -> bool:
-    """Development switch: layer 0 (no previous pre: a one-hot pre reproduces SGLang's copy-0 collapse), the
-    Engram layers (Engram runs before the layer, the launch takes the materialized residual) and ratio-0 layers."""
-    return os.environ.get("SGLANG_MONO_DSV41_EDGE", "0") == "1"
-
-
 def _whole_layer_ok(layer_id: int, layer) -> bool:
-    """Whole-layer launch: consumer layers (ratio 1/2, no own compressor / indexer) always; compressor / indexer
-    layers with SGLANG_MONO_DSV41_INDEXER=1 (their indexer + compressor run between the launches); layer 0, Engram
-    and ratio-0 layers with SGLANG_MONO_DSV41_EDGE=1."""
+    """Whole-layer launch (K1 + K2) on every layer of ratio 0 / 1 / 2 with the fused wqa/wkv projection: compressor /
+    indexer layers run their indexer + compressor between the launches; layer 0 takes a one-hot pre (SGLang's copy-0
+    collapse); Engram layers run Engram before the layer. Any other layer takes the FFN launch."""
     attn = layer.self_attn
-    edge = (
-        layer_id == 0
-        or getattr(layer, "engram", None) is not None
-        or getattr(attn, "compress_ratio", 0) == 0
-    )
-    return (
-        getattr(attn, "compress_ratio", 0) in (0, 1, 2)
-        and (not edge or edge_layers_enabled())
-        and (not _has_indexer_side(layer) or indexer_layers_enabled())
-        and getattr(attn, "fuse_wqa_wkv", False)
+    return getattr(attn, "compress_ratio", 0) in (0, 1, 2) and getattr(
+        attn, "fuse_wqa_wkv", False
     )
 
 
@@ -293,22 +276,16 @@ class Packed:
     )  # whole layers whose indexer / compressor run between K1 and K2
 
 
-def whole_layers_enabled() -> bool:
-    """Development switch for the whole-layer launch (K1 + K2) until it is validated; FFN launch everywhere otherwise."""
-    return os.environ.get("SGLANG_MONO_DSV41_WHOLE", "0") == "1"
-
-
 def pack(model, ctx: MonoContext) -> Packed:
-    from sglang.srt.models.deepseek_common.amd.mono.kernels import runner
+    from sglang.kernels.ops.mono.gfx950.deepseek_v41 import runner
 
     weights, modes, between = {}, {}, set()
-    whole = whole_layers_enabled()
     for i, layer in enumerate(model.layers):
         w = _layer_weights(layer, runner)
         modes[i] = LayerMode.FFN
         try:
             w.check(ctx.tp_size)
-            if whole and _whole_layer_ok(i, layer):
+            if _whole_layer_ok(i, layer):
                 w.attn = _attn_weights(i, layer, runner, ctx.tp_rank)
                 w.attn.check(runner.Dims(ctx.tp_size))
                 modes[i] = LayerMode.WHOLE
@@ -318,22 +295,20 @@ def pack(model, ctx: MonoContext) -> Packed:
             from sglang.srt.layers.mono.guards import MonoRefused
 
             raise MonoRefused(
-                f"--enable-mono-kernel refused (deepseek_v41, model): layer {i}: {e}"
+                f"--layer-backend mono refused (deepseek_v41, model): layer {i}: {e}"
             ) from None
         weights[i] = w
-    kv41 = cfp4 = False
-    if whole:
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            resolve_compressed_kv_layout,
-            select_dsv4_kv_layout,
-        )
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        resolve_compressed_kv_layout,
+        select_dsv4_kv_layout,
+    )
 
-        layout, option = select_dsv4_kv_layout()
-        kv41 = layout.value == "v41"
-        # ratio 1 and 2 resolve alike (auto -> V41_FP4 next to V41, "lossless for the e2m1 latents")
-        comp = {resolve_compressed_kv_layout(layout, r_, option).value for r_ in (1, 2)}
-        assert len(comp) == 1, comp
-        cfp4 = comp == {"v41_fp4"}
+    layout, option = select_dsv4_kv_layout()
+    kv41 = layout.value == "v41"
+    # ratio 1 and 2 resolve alike (auto -> V41_FP4 next to V41, "lossless for the e2m1 latents")
+    comp = {resolve_compressed_kv_layout(layout, r_, option).value for r_ in (1, 2)}
+    assert len(comp) == 1, comp
+    cfp4 = comp == {"v41_fp4"}
     r = runner.DSV41MonoLayer(
         ctx.tp_size, ctx.tp_rank, ctx.cpu_group, ctx.device, kv41=kv41, cfp4=cfp4
     )
@@ -480,19 +455,14 @@ def build(ctx: MonoContext, packed: Packed, rows: int) -> MonoKernel:
     return MonoKernel(packed, rows)
 
 
-def draft_layers_enabled() -> bool:
-    """Development switch: the DSpark draft stages as whole-layer launches (task 8)."""
-    return os.environ.get("SGLANG_MONO_DSV41_DRAFT", "0") == "1"
-
-
 def draft_pack(model, ctx: MonoContext) -> Packed:
     """The DSpark draft (``DeepseekV4ForCausalLMDSpark``): every stage whole (window-only attention, ratio 0, no
     indexer) on a runner of its own -- the draft's routing (128 / 3, one FP4 group an ug task, as ATOM's
     DraftMonoRunner) and its block-window keys: a row reads its request's window up to the anchor and the whole block,
     the indices SGLang's draft backend builds (window + block, padded to 64 slots)."""
+    from sglang.kernels.ops.mono.gfx950.deepseek_v41 import runner
     from sglang.srt.layers.mono.guards import MonoRefused
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
-    from sglang.srt.models.deepseek_common.amd.mono.kernels import runner
 
     t = _text_config(ctx.hf_config)
     experts, topk = int(t.dspark_n_routed_experts), int(t.dspark_num_experts_per_tok)
@@ -511,7 +481,7 @@ def draft_pack(model, ctx: MonoContext) -> Packed:
             w.attn.check(runner.Dims(ctx.tp_size))
         except (AssertionError, AttributeError, ValueError) as e:
             raise MonoRefused(
-                f"--enable-mono-kernel refused (deepseek_v41 DSpark draft): stage {lid}: {e}"
+                f"--layer-backend mono refused (deepseek_v41 DSpark draft): stage {lid}: {e}"
             ) from None
         weights[lid], modes[lid] = w, LayerMode.WHOLE
     layout, _ = select_dsv4_kv_layout()

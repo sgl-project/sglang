@@ -2,11 +2,18 @@
 
 import types
 import unittest
+import unittest.mock
 
 import torch
 
-from sglang.srt.layers.mono import failstop, guards, layer, routing
-from sglang.srt.layers.mono.spec import Feature, LayerMode, MonoContext, MonoSpec
+from sglang.srt.layers.mono import check, failstop, guards, layer, routing
+from sglang.srt.layers.mono.spec import (
+    Feature,
+    LayerMode,
+    LayerStateBinding,
+    MonoContext,
+    MonoSpec,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -129,6 +136,17 @@ class TestRouting(CustomTestCase):
         self.assertIsNotNone(routing.decide_for_batch(s, c, batch("decode", 2, 2)).step)
         d = routing.decide_for_batch(s, c, batch("verify", 12, 2))
         self.assertTrue(d.step.is_verify and d.step.rows == 12)
+        self.assertEqual(d.step.query_len, 6)
+        self.assertEqual(
+            routing.decide_for_batch(s, c, batch("decode", 2, 2)).step.query_len, 1
+        )
+
+    def test_rows_must_split_evenly_over_the_batch(self):
+        s, c = fake_spec(), ctx()
+        self.assertEqual(
+            routing.decide_for_batch(s, c, batch("verify", 6, 4)).reason,
+            "rows not a multiple of the batch",
+        )
 
     def test_fallbacks(self):
         s, c = fake_spec(), ctx()
@@ -172,8 +190,9 @@ class TestRuntime(CustomTestCase):
         self.assertEqual(rt.routed(0)[0], LayerMode.FFN)
         self.assertEqual(rt.routed(1)[0], LayerMode.WHOLE)
         self.assertIsNone(rt.routed(2))
-        mode, kernel, step, _ = rt.routed(3)
-        self.assertEqual((kernel.rows, step.rows), (6, 6))
+        route = rt.routed(3)
+        self.assertEqual((route.kernel.rows, route.step.rows), (6, 6))
+        self.assertIsNone(route.checker)
         rt.begin_step(batch("extend", 6, 1))
         self.assertIsNone(rt.routed(0))
         self.assertEqual(rt.counts["mono"], 1)
@@ -207,6 +226,94 @@ class TestRuntime(CustomTestCase):
                 device="cpu",
             )
         )
+
+    def test_layer_backend_switch(self):
+        on = types.SimpleNamespace(layer_backend="mono")
+        self.assertTrue(guards.mono_enabled(on))
+        self.assertFalse(
+            guards.mono_enabled(types.SimpleNamespace(layer_backend="module"))
+        )
+        self.assertFalse(guards.mono_enabled(types.SimpleNamespace()))
+        with self.assertRaises(guards.MonoRefused):
+            layer.attach(
+                object(),
+                server_args=on,
+                hf_config=types.SimpleNamespace(architectures=["NoSuchForCausalLM"]),
+                tp_rank=0,
+                tp_size=1,
+                cpu_group=None,
+                device="cpu",
+            )
+
+    def test_new_width_inside_a_capture_raises(self):
+        rt = layer.MonoRuntime(
+            fake_spec(), ctx(), packed=None, modes=fake_spec().layers(None)
+        )
+        rt.begin_step(batch("decode", 2, 2))
+        with unittest.mock.patch(
+            "torch.cuda.is_current_stream_capturing", return_value=True
+        ):
+            self.assertIsNotNone(rt.begin_step(batch("decode", 2, 2)).step)
+            with self.assertRaises(RuntimeError):
+                rt.begin_step(batch("decode", 6, 6))
+
+
+class TestStateBindings(CustomTestCase):
+    def test_routed_layer_waits_for_its_state(self):
+        waits = []
+        kv = torch.zeros(4)
+
+        def bindings(ctx, packed):
+            return {1: LayerStateBinding(1, (kv,), waits.append)}
+
+        spec = fake_spec(state_bindings=bindings)
+        rt = layer.MonoRuntime(spec, ctx(), packed=None, modes=spec.layers(None))
+        rt.begin_step(batch("decode", 2, 2))
+        rt.routed(0)
+        self.assertEqual(waits, [])
+        rt.routed(1)
+        self.assertEqual(waits, [1])
+        rt.begin_step(batch("extend", 6, 1))
+        self.assertIsNone(rt.routed(1))
+        self.assertEqual(waits, [1])
+
+
+class TestCheckMode(CustomTestCase):
+    def test_first_steps_carry_the_checker_then_stop(self):
+        env = {"SGLANG_MONO_CHECK": "1", "SGLANG_MONO_CHECK_STEPS": "2"}
+        with unittest.mock.patch.dict("os.environ", env):
+            rt = layer.MonoRuntime(
+                fake_spec(), ctx(), packed=None, modes=fake_spec().layers(None)
+            )
+        seen = []
+        for _ in range(4):
+            rt.begin_step(batch("decode", 2, 2))
+            route = rt.routed(1)
+            seen.append(route.checker is not None)
+            if route.checker is not None:
+                diffs = route.checker.compare(
+                    1, 2, {"hidden": (torch.ones(2, 4), torch.zeros(2, 4))}
+                )
+                self.assertEqual(diffs, {"hidden": 1.0})
+        self.assertEqual(seen, [True, True, False, False])
+
+    def test_fallback_steps_do_not_count(self):
+        with unittest.mock.patch.dict("os.environ", {"SGLANG_MONO_CHECK": "1"}):
+            rt = layer.MonoRuntime(
+                fake_spec(), ctx(), packed=None, modes=fake_spec().layers(None)
+            )
+        rt.begin_step(batch("extend", 6, 1))
+        self.assertEqual(rt.checker.steps, 0)
+        rt.begin_step(batch("decode", 2, 2))
+        self.assertIsNotNone(rt.routed(1).checker)
+
+    def test_off_by_default(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(check.requested())
+            rt = layer.MonoRuntime(
+                fake_spec(), ctx(), packed=None, modes=fake_spec().layers(None)
+            )
+        self.assertIsNone(rt.checker)
 
 
 class TestFailStop(CustomTestCase):

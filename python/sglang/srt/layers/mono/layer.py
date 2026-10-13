@@ -12,8 +12,8 @@ from typing import Any, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.layers.mono import failstop, guards, registry, routing
-from sglang.srt.layers.mono.common.runtime.consensus import tp_agree
+from sglang.srt.layers.mono import check, failstop, guards, registry, routing
+from sglang.srt.layers.mono.runtime.consensus import tp_agree
 from sglang.srt.layers.mono.spec import (
     LayerKernel,
     LayerMode,
@@ -30,6 +30,9 @@ class Route(NamedTuple):
     kernel: LayerKernel
     step: MonoStep
     cache: dict  # per-step memo the spec's glue may fill once and share across the step's layers
+    checker: Optional[check.Checker] = (
+        None  # set on the steps check mode compares against the module path
+    )
 
 
 class MonoRuntime:
@@ -43,6 +46,9 @@ class MonoRuntime:
         self.step_cache: dict = {}
         self.counts: Counter = Counter()
         self.bindings = routing.CacheBinding()
+        self.state = dict(spec.state_bindings(ctx, packed))
+        self.checker = check.Checker(ctx.tp_rank) if check.requested() else None
+        self._checking = False
         logger.info(
             "mono kernels on: spec=%s widths=%s layers=%d (%s)",
             spec.name,
@@ -59,6 +65,11 @@ class MonoRuntime:
         if d.step is not None and not self._prepare(d.step.rows):
             d = routing.Decision(None, "width refused at build")
         self.decision = d
+        self._checking = (
+            d.step is not None
+            and self.checker is not None
+            and self.checker.begin_step()
+        )
         self.counts["mono" if d.step is not None else f"fallback:{d.reason}"] += 1
         if torch.cuda.is_current_stream_capturing() and self.ctx.tp_rank == 0:
             # replays never reach Python: the capture is where a graph's path is decided
@@ -77,7 +88,16 @@ class MonoRuntime:
         mode = self.modes.get(layer_id)
         if mode is None:
             return None
-        return Route(mode, self._kernels[step.rows], step, self.step_cache)
+        binding = self.state.get(layer_id)
+        if binding is not None:
+            binding.wait_ready()
+        return Route(
+            mode,
+            self._kernels[step.rows],
+            step,
+            self.step_cache,
+            self.checker if self._checking else None,
+        )
 
     def health(self) -> Optional[torch.Tensor]:
         return failstop.gather_health(k.health() for k in self._kernels.values())
@@ -120,12 +140,12 @@ def attach(
 ) -> Optional[MonoRuntime]:
     """The model's mono runtime, or None with the switch off. Raises ``MonoRefused`` (every reason) when the switch is
     on and the loaded model cannot run the spec."""
-    if not getattr(server_args, "enable_mono_kernel", False):
+    if not guards.mono_enabled(server_args):
         return None
     arch = (getattr(hf_config, "architectures", None) or [type(model).__name__])[0]
     spec = registry.load_spec(arch) or registry.load_spec(type(model).__name__)
     if spec is None:
-        raise guards.MonoRefused(f"--enable-mono-kernel: no mono spec for {arch}")
+        raise guards.MonoRefused(f"--layer-backend mono: no mono spec for {arch}")
     return attach_spec(
         model,
         spec,

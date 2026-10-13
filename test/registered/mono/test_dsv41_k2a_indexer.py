@@ -1,10 +1,14 @@
-"""DSV4.1 mono K2a stage 1 (``SGLANG_MONO_DSV41_K2A=1``): the vendored indexer against its references."""
+"""DSV4.1 mono K2a stage 1 (K2i, on by default with ``--layer-backend mono``): the vendored indexer against its
+references."""
 
 import numpy as np
 import pytest
 import torch
 
-from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import index_plan as ip
+from sglang.kernels.ops.mono.gfx950.deepseek_v41.indexer import index_plan as ip
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -39,7 +43,7 @@ def _walk_case(rng, n):
 @cuda
 @pytest.mark.parametrize("seed", range(4))
 def test_walk_plan_device_equals_host(seed):
-    from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer.walk_plan import (
+    from sglang.kernels.ops.mono.gfx950.deepseek_v41.indexer.walk_plan import (
         fill_walk_plan_device,
         new_plan,
     )
@@ -205,7 +209,7 @@ def check_selection(case, logits, raw, page):
     "ctxs", [[8192], [300, 8192], [131072], [524288]], ids=["8k", "mix", "128k", "512k"]
 )
 def test_k2i_logits_and_selection(ctxs):
-    from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer.runner import (
+    from sglang.kernels.ops.mono.gfx950.deepseek_v41.indexer.runner import (
         K2iRunner,
     )
 
@@ -275,7 +279,7 @@ def sglang_select(case, logits, two_level=None):
 def test_k2i_vs_sglang_selection(ctxs):
     """(b) the same logits -> the same sets (ties aside); (c) the layer pipeline (FULL, the candidate producer, a
     REINDEX consumer on the producer's plane) vs SGLang's: per-row Jaccard."""
-    from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer.runner import (
+    from sglang.kernels.ops.mono.gfx950.deepseek_v41.indexer.runner import (
         K2iRunner,
     )
 
@@ -339,7 +343,7 @@ def test_hook_hybrid_vs_sglang(ctxs):
     K2i's compact candidate logits -> per-row Jaccard vs SGLang's own path (median 1.0, p1 >= 0.99)."""
     from types import SimpleNamespace
 
-    from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import hook
+    from sglang.srt.models.deepseek_common.amd.mono import indexer_hook as hook
 
     hook._MODE[:] = [1]
     hook._RUNNERS.clear()

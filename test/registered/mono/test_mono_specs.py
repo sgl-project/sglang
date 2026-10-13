@@ -1,6 +1,7 @@
 """CPU tests: the two model specs (DeepSeek-V4.1 FFN-only, MiniMax-M3 skeleton) through the same runtime, and the
 runtime itself free of model constants."""
 
+import ast
 import re
 import types
 import unittest
@@ -132,13 +133,51 @@ class TestRuntimeHasNoModelConstants(CustomTestCase):
         pattern = re.compile(
             r"\b(5120|6144|384|deepseek|minimax|mhc|hc_mult|sinkhorn|dspark)\b", re.I
         )
-        for name in ("spec.py", "guards.py", "routing.py", "layer.py", "failstop.py"):
+        for name in (
+            "spec.py",
+            "guards.py",
+            "routing.py",
+            "layer.py",
+            "failstop.py",
+            "check.py",
+        ):
             hits = [
                 ln
                 for ln in (root / name).read_text().splitlines()
                 if pattern.search(ln) and not ln.lstrip().startswith("#")
             ]
             self.assertEqual(hits, [], f"{name} mentions a model: {hits[:3]}")
+
+
+class TestFamiliesUseSharedCommon(CustomTestCase):
+    # same name, different helper: aiter's symbol namespace; the attention timeline's stamp(c, point)
+    ALLOWED = {
+        ("deepseek_v41/attention/device.py", "kernel_symbol"),
+        ("deepseek_v41/attention/device.py", "stamp"),
+    }
+
+    def test_no_family_redefines_a_shared_helper(self):
+        gfx950 = Path(registry.__file__).parents[3] / "kernels/ops/mono/gfx950"
+
+        def top_level(path):
+            tree = ast.parse(path.read_text())
+            return {
+                n.name
+                for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+            }
+
+        shared = set().union(*map(top_level, (gfx950 / "common").rglob("*.py")))
+        families = [d for d in gfx950.iterdir() if d.is_dir() and d.name != "common"]
+        self.assertTrue(families)
+        clashes = sorted(
+            (str(f.relative_to(gfx950)), name)
+            for d in families
+            for f in d.rglob("*.py")
+            for name in top_level(f) & shared
+            if (str(f.relative_to(gfx950)), name) not in self.ALLOWED
+        )
+        self.assertEqual(clashes, [], "import these from gfx950/common instead")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """MiniMax-M3 mono spec (gfx950, TP4) -- skeleton: shapes, widths, layer modes and refusals are declared; the kernels
-(ROCm/ATOM atom/models/minimax_m3/mono, built on the same L0 as sglang.srt.layers.mono.common) are not vendored yet,
-so enabling refuses at model load with that reason. Its contract differs from DeepSeek-V4.1's on purpose: whole-layer
+(ROCm/aiter PR6047, as ported to SGLang in zijiecode/sglang-mono-amd m3-mono) are not vendored yet, so enabling
+refuses at model load with that reason. Its contract differs from DeepSeek-V4.1's on purpose: whole-layer
 launches carrying the plain (hidden, residual) pair, at most 16 rows, TP4 only.
 """
 

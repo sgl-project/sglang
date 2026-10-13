@@ -34,10 +34,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
-from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import hook as k2i_hook
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
+from sglang.srt.models.deepseek_common.amd.mono import indexer_hook as k2i_hook
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata

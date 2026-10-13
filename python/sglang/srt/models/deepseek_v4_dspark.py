@@ -929,20 +929,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def _mono_requested(self) -> bool:
         if not self.hc_pre_from_prev_sublayer or _is_npu:
             return False
+        from sglang.srt.layers.mono.guards import mono_enabled
         from sglang.srt.runtime_context import get_server_args
 
-        if not getattr(get_server_args(), "enable_mono_kernel", False):
-            return False
-        from sglang.srt.models.deepseek_common.amd.mono.spec import (
-            draft_layers_enabled,
-        )
-
-        return draft_layers_enabled()
+        return mono_enabled(get_server_args())
 
     def _attach_mono(self) -> None:
-        from sglang.srt.runtime_context import get_parallel, get_server_args
         from sglang.srt.layers.mono.layer import attach_spec
         from sglang.srt.models.deepseek_common.amd.mono.spec import DRAFT_SPEC
+        from sglang.srt.runtime_context import get_parallel, get_server_args
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(

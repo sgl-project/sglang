@@ -48,12 +48,27 @@ class CacheReq:
 
 
 @dataclass(frozen=True)
+class LayerStateBinding:
+    """A layer's cache tensors the kernels address by pointer, and their provider's per-layer readiness wait (e.g.
+    hierarchical cache H2D loads, which the model's own path waits for inside ``get_key_buffer``). The runtime waits
+    before routing the layer; the tensors are held so their storage outlives the kernels' pointers."""
+
+    layer_id: int
+    tensors: tuple[torch.Tensor, ...]
+    wait_for_layer: Callable[[int], None]
+
+    def wait_ready(self) -> None:
+        self.wait_for_layer(self.layer_id)
+
+
+@dataclass(frozen=True)
 class MonoStep:
     """What every rank knows alike about the step (the routing decision may depend on nothing else)."""
 
     rows: int  # token rows of the step = the launch width
     batch_size: int
     is_verify: bool
+    query_len: int = 1  # rows a request (rows // batch_size): 1 for decode, the draft tokens + 1 for linear verify
 
 
 @dataclass
@@ -100,6 +115,10 @@ class MonoSpec:
         lambda ctx, caches: []
     )
     eligible: Callable[[MonoContext, MonoStep], Optional[str]] = lambda ctx, step: None
+    # (ctx, packed) -> {layer id: binding}; a spec listing Feature.HIERARCHICAL_CACHE must provide its layers' waits
+    state_bindings: Callable[[MonoContext, Any], Mapping[int, LayerStateBinding]] = (
+        lambda ctx, packed: {}
+    )
     build: Optional[Callable[[MonoContext, Any, int], LayerKernel]] = (
         None  # (ctx, packed, width), compiled here
     )

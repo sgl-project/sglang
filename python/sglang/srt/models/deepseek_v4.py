@@ -4987,9 +4987,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         # The loader runs process_weights_after_loading (MoE shuffle / pad) after this hook: attach on the first
         # forward, an eager step every rank takes together before any graph capture.
-        self.model.mono_pending = bool(
-            getattr(get_server_args(), "enable_mono_kernel", False)
-        )
+        from sglang.srt.layers.mono.guards import mono_enabled
+
+        self.model.mono_pending = mono_enabled(get_server_args())
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn

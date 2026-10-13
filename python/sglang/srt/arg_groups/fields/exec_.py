@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.choices import (
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
     FP8_GEMM_RUNNER_BACKEND_CHOICES,
     GRAMMAR_BACKEND_CHOICES,
+    LAYER_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
@@ -353,11 +354,18 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
-    enable_mono_kernel: A[
-        bool,
-        "Run decode steps through the model's mono (persistent fused decode-layer) kernels, when the model declares "
-        "a mono spec. Unsupported deployments are refused at startup with every reason listed.",
-    ] = False
+    layer_backend: A[
+        str,
+        Arg(
+            help=(
+                "How decoder layers run. 'module' runs each layer's modules. 'mono' runs the decode and "
+                "speculative-verify steps the model's mono spec supports as persistent fused whole-layer kernels "
+                "(ROCm gfx950) and every other step on the modules. A model without a mono spec, or a deployment "
+                "the spec does not support, is refused at startup with every reason listed."
+            ),
+            choices=LAYER_BACKEND_CHOICES,
+        ),
+    ] = "module"
 
 
 class ExecMamba(msgspec.Struct):

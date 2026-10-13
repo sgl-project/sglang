@@ -75,7 +75,6 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.models.deepseek_common.amd.mono.kernels.indexer import hook as k2i_hook
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     build_low_ratio_decode_workspaces,
     low_ratio_candidate_span,
@@ -105,6 +104,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models.deepseek_common.amd.mono import indexer_hook as k2i_hook
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

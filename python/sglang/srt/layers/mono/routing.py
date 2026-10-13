@@ -36,7 +36,14 @@ def decide(
         return Decision(None, "verify unsupported")
     if rows not in spec.widths:
         return Decision(None, "width")
-    step = MonoStep(rows=rows, batch_size=batch_size, is_verify=is_verify)
+    if batch_size < 1 or rows % batch_size:
+        return Decision(None, "rows not a multiple of the batch")
+    step = MonoStep(
+        rows=rows,
+        batch_size=batch_size,
+        is_verify=is_verify,
+        query_len=rows // batch_size,
+    )
     why = spec.eligible(ctx, step)
     if why:
         return Decision(None, why)

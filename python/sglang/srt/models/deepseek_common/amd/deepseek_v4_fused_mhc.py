@@ -589,6 +589,19 @@ def forward_hc_pre_from_prev_fused_boundary(
     comb); with defer_post this layer's is returned the same way and hidden_states is None.
     mono_route (mode, kernel, step) runs everything after attention -- its all-reduce, the FFN
     seam, the MoE and the MoE all-reduce -- as the mono FFN launch."""
+    if mono_route is not None and mono_route.checker is not None:
+        return _mono_checked(
+            layer,
+            positions,
+            hidden_states,
+            input_ids,
+            forward_batch,
+            input_ids_global,
+            prev_pre,
+            pending_post,
+            defer_post,
+            mono_route,
+        )
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
     if mono_route is not None and mono_route.mode.value == "whole":
@@ -688,7 +701,7 @@ def _mono_ffn(
     """Attention with its output all-reduce deferred, then the mono FFN launch on the unreduced partial."""
     from sglang.srt.layers.mono.spec import LayerMode
 
-    mode, kernel, step, _ = mono_route
+    mode, kernel, step = mono_route.mode, mono_route.kernel, mono_route.step
     assert mode is LayerMode.FFN, mode
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         x = layer.self_attn(
@@ -718,6 +731,61 @@ def _mono_ffn(
     return layer.hc_post(out, res_out, post_out, comb_out), pre_out, None
 
 
+def _mono_checked(
+    layer,
+    positions,
+    hidden_states,
+    input_ids,
+    forward_batch,
+    input_ids_global,
+    prev_pre,
+    pending_post,
+    defer_post: bool,
+    mono_route,
+):
+    """Check mode: the module path on copies of the layer's inputs, then the kernels; logs the layer output's and the
+    next pre's max |diff| (a deferred post is applied to compare)."""
+
+    def copy(t):
+        return t.clone() if isinstance(t, torch.Tensor) else t
+
+    ref = forward_hc_pre_from_prev_fused_boundary(
+        layer,
+        positions,
+        copy(hidden_states),
+        input_ids,
+        forward_batch,
+        input_ids_global,
+        copy(prev_pre),
+        None if pending_post is None else tuple(copy(t) for t in pending_post),
+        defer_post,
+        mono_route=None,
+    )
+    out = forward_hc_pre_from_prev_fused_boundary(
+        layer,
+        positions,
+        hidden_states,
+        input_ids,
+        forward_batch,
+        input_ids_global,
+        prev_pre,
+        pending_post,
+        defer_post,
+        mono_route=mono_route._replace(checker=None),
+    )
+
+    def hidden(result):
+        h, _, pending = result
+        return layer.hc_post(*(copy(t) for t in pending)) if pending is not None else h
+
+    mono_route.checker.compare(
+        layer.layer_id,
+        mono_route.step.rows,
+        {"hidden": (hidden(out), hidden(ref)), "pre": (out[1], ref[1])},
+    )
+    return out
+
+
 def _mono_whole(
     layer,
     mono_route,
@@ -732,7 +800,7 @@ def _mono_whole(
     comb = I."""
     from sglang.srt.models.deepseek_common.amd.mono.spec import whole_layer_meta
 
-    _, kernel, step, cache = mono_route
+    kernel, step, cache = mono_route.kernel, mono_route.step, mono_route.cache
     x, residual, post, comb = pending_post
     m, hc = residual.shape[0], residual.shape[1]
     if x is None:

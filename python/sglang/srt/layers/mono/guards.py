@@ -15,6 +15,11 @@ class MonoRefused(ValueError):
     pass
 
 
+def mono_enabled(cfg: Any) -> bool:
+    """``--layer-backend mono`` on the (resolved) server args."""
+    return getattr(cfg, "layer_backend", "module") == "mono"
+
+
 def _get(cfg: Any, name: str, default=None):
     return getattr(cfg, name, default)
 
@@ -83,7 +88,7 @@ def raise_if_refused(stage: str, spec_name: str, reasons: list[str]) -> None:
     if reasons:
         lines = "\n  - ".join(reasons)
         raise MonoRefused(
-            f"--enable-mono-kernel refused ({spec_name}, {stage}):\n  - {lines}"
+            f"--layer-backend mono refused ({spec_name}, {stage}):\n  - {lines}"
         )
 
 

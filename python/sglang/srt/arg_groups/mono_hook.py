@@ -12,23 +12,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def handle_mono_kernel(server_args: ServerArgs) -> None:
-    """--enable-mono-kernel: refuse at startup (every reason at once) when the model has no mono spec or the resolved
+def handle_layer_backend(server_args: ServerArgs) -> None:
+    """--layer-backend mono: refuse at startup (every reason at once) when the model has no mono spec or the resolved
     deployment uses a feature the spec does not support. Runs after every other resolution."""
     cfg = resolving_view(server_args)
-    if not cfg.enable_mono_kernel:
-        return
     from sglang.srt.layers.mono import guards, registry
+
+    if not guards.mono_enabled(cfg):
+        return
 
     hf_config = model_config_of(server_args).hf_config
     arch = (hf_config.architectures or ["?"])[0]
     spec = registry.load_spec(arch)
     if spec is None:
-        raise guards.MonoRefused(f"--enable-mono-kernel: no mono spec for {arch}")
+        raise guards.MonoRefused(f"--layer-backend mono: no mono spec for {arch}")
     guards.raise_if_refused(
         "config", spec.name, guards.config_refusals(cfg, hf_config, spec)
     )
     guards.warn_eager(cfg, spec)
     logger.info(
-        "--enable-mono-kernel: %s mono spec accepted the configuration", spec.name
+        "--layer-backend mono: %s mono spec accepted the configuration", spec.name
     )
