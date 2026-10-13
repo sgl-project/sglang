@@ -1007,15 +1007,16 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
-        freqs_cis = precompute_freqs_cis(
-            dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
-            original_seq_len=original_seq_len,
-            base=self.rope_base,
-            factor=scaling.get("factor", 1.0),
-            beta_fast=scaling.get("beta_fast", 32),
-            beta_slow=scaling.get("beta_slow", 1),
+        self.rope_cache_key = (
+            self.qk_rope_head_dim,
+            config.max_position_embeddings,
+            original_seq_len,
+            self.rope_base,
+            scaling.get("factor", 1.0),
+            scaling.get("beta_fast", 32),
+            scaling.get("beta_slow", 1),
         )
+        freqs_cis = precompute_freqs_cis(*self.rope_cache_key)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -1270,13 +1271,14 @@ class MQALayer(MqaAttentionBase):
                     "MegaAttention requires DeepSeek-V4.1 with eight 512-dim "
                     "heads per WO-A group and BF16 source WO-A weights"
                 )
-            self.register_buffer(
-                "mega_cos_sin_cache",
-                torch.cat(
-                    (self.freqs_cis.real, self.freqs_cis.imag), dim=-1
-                ).contiguous(),
-                persistent=False,
+            from sglang.srt.layers.attention.dsv4.mega_attention import (
+                get_mega_cos_sin_cache,
             )
+
+            self.mega_cos_sin_cache = get_mega_cos_sin_cache(
+                self.freqs_cis, self.rope_cache_key
+            )
+            self.mega_wq_b = None
             self.register_buffer("mega_wo_weight", None, persistent=False)
             self.register_buffer("mega_wo_scale", None, persistent=False)
 
@@ -1302,6 +1304,14 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
+        if self.use_mega_attention:
+            from sglang.srt.layers.attention.dsv4.mega_attention import (
+                get_mega_cos_sin_cache,
+            )
+
+            self.mega_cos_sin_cache = get_mega_cos_sin_cache(
+                self.freqs_cis, self.rope_cache_key
+            )
         if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
@@ -1313,7 +1323,10 @@ class MQALayer(MqaAttentionBase):
         from sglang.kernels.ops.attention.dsv4.mega_attention import (
             require_mega_attention,
         )
-        from sglang.srt.layers.attention.dsv4.mega_attention import prepare_mega_wo_a
+        from sglang.srt.layers.attention.dsv4.mega_attention import (
+            prepare_mega_q_projection,
+            prepare_mega_wo_a,
+        )
 
         require_mega_attention()
         weight = getattr(self.wo_a, "weight", None)
@@ -1324,6 +1337,7 @@ class MQALayer(MqaAttentionBase):
         self.mega_wo_weight, self.mega_wo_scale = prepare_mega_wo_a(
             weight.view(self.n_local_groups, self.o_lora_rank, -1)
         )
+        self.mega_wq_b = prepare_mega_q_projection(self.wq_b, self.n_local_heads)
 
     def _get_npu_rope_position_cache(
         self,
@@ -1427,17 +1441,25 @@ class MQALayer(MqaAttentionBase):
             q, _ = self.wq_a(x)
         return self._normalize_q_lora(q)
 
+    def _use_mega_q_projection(self) -> bool:
+        return (
+            self.use_mega_attention
+            and self.mega_wq_b is not None
+            and not get_forward().sp_active
+        )
+
     def _compute_q_b(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        if self._use_mega_q_projection():
+            q = self.wq_b.quant_method.apply(self.mega_wq_b, q)
+        else:
+            q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_mega_attention:
-            # The fused kernel owns Q RoPE. Query packing happens once after
-            # the prepare streams join, including zeroing padded heads.
             return q
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
@@ -2484,7 +2506,8 @@ class MQALayer(MqaAttentionBase):
                 # An idle DP rank may have padded rows, but no attention work.
                 o = x.new_zeros(x.shape[0], self.n_local_groups, self.o_lora_rank)
             else:
-                q = pack_mega_query(q, kernel_num_heads)
+                if not self._use_mega_q_projection():
+                    q = pack_mega_query(q, kernel_num_heads)
                 out = attn_backend.forward(
                     q=q,
                     k=q,

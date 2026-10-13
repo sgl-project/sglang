@@ -10,6 +10,8 @@ from torch import nn
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.mega_attention import get_mega_cos_sin_cache
+from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +43,29 @@ class _RotaryEmbeddingStub(_ModuleStub):
 
 
 class TestDeepseekV4RoPEPolicy(CustomTestCase):
+    def test_mega_rope_sharing_preserves_layer_policy_and_device_apply(self):
+        with get_resources().override(buffers={}):
+            swa = self._make_layer(0)
+            compressed = self._make_layer(4)
+            same = self._make_layer(128)
+            compressed.indexer.compressor = _ModuleStub()
+            for layer in (swa, compressed, same):
+                layer.use_mega_attention = True
+                layer.mega_cos_sin_cache = get_mega_cos_sin_cache(
+                    layer.freqs_cis, layer.rope_cache_key
+                )
+            self.assertIs(compressed.mega_cos_sin_cache, same.mega_cos_sin_cache)
+            self.assertIsNot(swa.mega_cos_sin_cache, compressed.mega_cos_sin_cache)
+            expected = torch.cat(
+                (compressed.freqs_cis.real, compressed.freqs_cis.imag), dim=-1
+            )
+            torch.testing.assert_close(compressed.mega_cos_sin_cache, expected)
+            compressed._apply(lambda tensor: tensor.clone())
+            same._apply(lambda tensor: tensor.clone())
+            self.assertIs(compressed.mega_cos_sin_cache, same.mega_cos_sin_cache)
+            self.assertEqual(compressed.mega_cos_sin_cache.dtype, torch.float32)
+            self.assertNotIn("mega_cos_sin_cache", compressed.state_dict())
+
     @staticmethod
     def _config(compress_ratio):
         return SimpleNamespace(

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -12,6 +13,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
     quantize_k_cache_v41,
 )
 from sglang.srt.layers.attention.dsv4.mega_attention import (
+    prepare_mega_q_projection,
     prepare_mega_wo_a,
     project_mega_attention,
 )
@@ -48,6 +50,110 @@ def paged_view(raw, page_size, bytes_per_token):
     "MegaAttention requires SM100/SM103",
 )
 class TestMegaAttention(CustomTestCase):
+    def test_query_projection_preserves_scales_and_reload(self):
+        from sglang.srt.layers.quantization import fp8_utils
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+        from sglang.srt.models.deepseek_v4 import MQALayer
+
+        for backend in (
+            fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
+            fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            with patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", backend):
+                method = Fp8LinearMethod(
+                    Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        use_mxfp8=True,
+                        weight_block_size=[1, 32],
+                        scale_fmt="ue8m0",
+                    )
+                )
+            for heads in (64, 128):
+                with self.subTest(backend=backend, heads=heads):
+                    linear = torch.nn.Module()
+                    linear.quant_method = method
+                    linear.register_buffer(
+                        "weight",
+                        torch.randn(heads * 512, 1280, device="cuda").to(
+                            torch.float8_e4m3fn
+                        ),
+                    )
+                    linear.register_buffer(
+                        "weight_scale_inv",
+                        torch.randint(
+                            119,
+                            129,
+                            (heads * 512, 40),
+                            device="cuda",
+                            dtype=torch.uint8,
+                        ),
+                    )
+                    layer = MQALayer.__new__(MQALayer)
+                    torch.nn.Module.__init__(layer)
+                    layer.use_mega_attention = True
+                    layer.n_local_heads, layer.head_dim = heads, 512
+                    layer.wq_b = linear
+                    for reload in range(2):
+                        if reload:
+                            linear.weight.copy_(linear.weight.float().neg())
+                            linear.weight_scale_inv.sub_(1)
+                        original = linear.weight.view(torch.uint8).clone()
+                        scales = linear.weight_scale_inv.clone()
+                        method._process_mxfp8_linear_weight_scale(linear)
+                        layer.mega_wq_b = prepare_mega_q_projection(linear, heads)
+                        self.assertIsNotNone(layer.mega_wq_b)
+                        for tokens in (3, 96, 1536):
+                            x = torch.randn(
+                                tokens, 1280, device="cuda", dtype=torch.bfloat16
+                            )
+
+                            def run():
+                                return layer._compute_q_b(x, None)
+
+                            expected = pack_mega_query(
+                                method.apply(linear, x).view(tokens, heads, 512), heads
+                            )
+                            torch.testing.assert_close(run(), expected, rtol=0, atol=0)
+                            if tokens == 3:
+                                data, scales_swizzled = (
+                                    fp8_utils.flashinfer_mxfp8_quantize(
+                                        x, is_sf_swizzled_layout=True, alignment=32
+                                    )
+                                )
+                                quantized = Mxfp8SwizzledInput(data, scales_swizzled)
+                                expected_quantized = pack_mega_query(
+                                    method.apply(linear, quantized).view(
+                                        tokens, heads, 512
+                                    ),
+                                    heads,
+                                )
+                                torch.testing.assert_close(
+                                    layer._compute_q_b(quantized, None),
+                                    expected_quantized,
+                                    rtol=0,
+                                    atol=0,
+                                )
+                        torch.testing.assert_close(
+                            linear.weight.view(torch.uint8), original
+                        )
+                        torch.testing.assert_close(linear.weight_scale_inv, scales)
+
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        run()
+                    torch.cuda.current_stream().wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured = run()
+                    x.mul_(0.5)
+                    graph.replay()
+                    torch.testing.assert_close(captured, run(), rtol=0, atol=0)
+                    self.assertIsNone(prepare_mega_q_projection(linear, 16))
+                    with patch.object(method, "use_mxfp8", False):
+                        self.assertIsNone(prepare_mega_q_projection(linear, heads))
+
     def test_query_packing_zeroes_padded_heads(self):
         for heads in (8, 16, 32, 64, 128):
             with self.subTest(heads=heads):
