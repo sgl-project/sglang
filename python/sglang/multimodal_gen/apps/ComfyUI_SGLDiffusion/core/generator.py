@@ -142,6 +142,25 @@ def _h3_detect_companion(gguf_ref: str) -> str:
     )
 
 
+def _check_native_batching(enabled: bool, adapter, sgld_options: dict) -> None:
+    """Allow native batching only where it was checked against the per-row path."""
+    if not enabled:
+        return
+    if not adapter.supports_native_batching:
+        verified = sorted(
+            model_type
+            for cls in _EXECUTOR_CLASSES
+            if cls.adapter_cls.supports_native_batching
+            for model_type in cls.adapter_cls.model_types
+        )
+        raise ValueError(
+            f"native_batching is only verified for model types {verified}; "
+            f"turn it off for {adapter.model_types[0]!r}"
+        )
+    if (sgld_options.get("num_gpus") or 1) > 1:
+        raise ValueError("native_batching is only verified on one GPU (num_gpus=1)")
+
+
 def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
         raise ValueError(
@@ -499,6 +518,7 @@ class SGLDiffusionGenerator:
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
+        native_batching = bool(sgld_options.pop("native_batching", False))
         set_model_type = sgld_options.pop("model_type", None)
         runtime_model_path = sgld_options.pop("runtime_model_path", None)
         if bool(runtime_model_path) != (set_model_type in ("fast_h3", "vdn_h3")):
@@ -531,7 +551,9 @@ class SGLDiffusionGenerator:
             "runtime_model_path": runtime_model_path,
         }
         if self._can_reuse(gather_options):
+            _check_native_batching(native_batching, self.executor.adapter, sgld_options)
             self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+            self.executor.native_batching = native_batching
             return self._patcher
 
         self.close_generator()
@@ -551,17 +573,22 @@ class SGLDiffusionGenerator:
         if model_type == "minimax_h3":
             _check_h3_single_file(detect_path, sgld_options)
 
+        executor_class = self.executor_class_dict[model_type]
+        _check_native_batching(
+            native_batching, executor_class.adapter_cls, sgld_options
+        )
+
         pipeline_class_name = self.pipeline_class_dict[model_type]
         worker_model_path = runtime_model_path or detect_path
         self.generator = self.init_generator(
             worker_model_path, pipeline_class_name, sgld_options
         )
 
-        executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
         )
         self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+        self.executor.native_batching = native_batching
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor

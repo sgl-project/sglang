@@ -146,10 +146,24 @@ def _reject_unapplied_conditioning(adapter, kwargs) -> None:
         )
 
 
+def _check_native_batch(batch: int, timestep, context) -> None:
+    """Native batching sends per-row values as-is, so each must have ``batch`` rows."""
+    for name, value in (("timestep", timestep), ("context", context)):
+        rows = value.shape[0] if torch.is_tensor(value) and value.ndim > 0 else None
+        if rows != batch:
+            shape = tuple(value.shape) if torch.is_tensor(value) else type(value)
+            raise ValueError(
+                f"native batching needs one {name} row per latent row "
+                f"(batch {batch}), got {shape}"
+            )
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # SGLDOptions.native_batching: send a ComfyUI batch as one worker request.
+    native_batching = False
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -183,7 +197,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
     def should_suppress_logs(timestep):
         """Determine if logs should be suppressed based on timestep value."""
         if torch.is_tensor(timestep):
-            return bool((timestep < 1.0).item())
+            return bool((timestep < 1.0).all())
         return bool(timestep < 1.0)
 
     def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
@@ -336,6 +350,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
         batch = int(x.shape[0]) if torch.is_tensor(x) else 1
         if batch == 1:
             return self._forward_one(x, timestep, context, **kwargs)
+        if self.native_batching:
+            return self._forward_batch(x, timestep, context, batch, **kwargs)
         # ComfyUI batches CFG cond/uncond (and batch_size > 1) into one call,
         # but the worker's comfyui path is per-sample: req.timesteps is its
         # schedule and seq lens are per request. Send one request per row.
@@ -358,6 +374,22 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 for i in range(batch)
             ]
         )
+
+    def _forward_batch(self, x, timestep, context, batch, **kwargs):
+        """Send the whole batch as one worker request (opt-in, verified models)."""
+        _check_native_batch(batch, timestep, context)
+        packed = self.adapter.pack(x, timestep, context, **kwargs)
+        # The worker walks req.timesteps as the step schedule, so keep that one
+        # step and send each row's timestep separately.
+        packed.extra_req["comfyui_row_timesteps"] = packed.timesteps
+        packed.timesteps = packed.timesteps[:1]
+        cond_uuid = _cond_uuid_from_transformer_options(
+            kwargs.get("transformer_options")
+        )
+        packed.unpack_ctx["comfyui_cond_uuid"] = (
+            None if cond_uuid is None else (cond_uuid, "batch")
+        )
+        return self._execute_packed(packed, x, timestep)
 
     def _forward_one(self, x, timestep, context, _cond_row=None, **kwargs):
         packed = self.adapter.pack(x, timestep, context, **kwargs)
