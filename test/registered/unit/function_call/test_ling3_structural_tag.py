@@ -7,9 +7,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import xgrammar as xgr
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
@@ -19,6 +22,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.environ import ToolStrictLevel
 from sglang.srt.function_call.core_types import NativeToolConstraintError
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.reasoning_parser import Ling3Detector as Ling3ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -111,6 +115,66 @@ class TestLing3StructuralTag(CustomTestCase):
         self.assertEqual(
             [call.name for call in calls if call.name], ["weather", "get_date"]
         )
+
+    def test_tool_start_without_think_end_activates_native_masks(self):
+        """With thinking on and no </think>, the required native constraint must
+        take effect at <tool_call> instead of leaving the call unconstrained."""
+        text = (
+            "<tool_call>weather\n"
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
+            "</tool_call>"
+        )
+        chat = self._chat()
+        chat.reasoning_parser = "ling3"
+        chat._reasoning_detector = Ling3ReasoningDetector()
+        request = ChatCompletionRequest(
+            model="ling",
+            messages=[{"role": "user", "content": "weather?"}],
+            input_ids=[1],
+            tools=self.tools,
+            tool_choice="required",
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        processed = chat._process_messages(request, is_multimodal=False)
+        self.assertTrue(processed.require_reasoning)
+        self.assertEqual(processed.tool_call_constraint[0], "structural_tag")
+        # Byte vocabulary drives the real matcher without model weights.
+        tokenizer_info = xgr.TokenizerInfo(
+            [bytes([i]) for i in range(256)] + [b"<eos>"],
+            vocab_type=xgr.VocabType.RAW,
+            stop_token_ids=[256],
+        )
+        compiled = xgr.GrammarCompiler(tokenizer_info).compile_structural_tag(
+            processed.tool_call_constraint[1]
+        )
+        wrapper = ReasonerGrammarObject(
+            XGrammarGrammar(
+                xgr.GrammarMatcher(compiled, max_rollback_tokens=256),
+                257,
+                compiled,
+                [256],
+            ),
+            think_end_ids=list(b"</think>"),
+            tool_start_ids=list(b"<tool_call>"),
+        )
+        wrapper.maybe_init_reasoning(True)
+        mask = torch.full((1, 9), -1, dtype=torch.int32)
+
+        def allowed(token):
+            mask.fill_(-1)
+            wrapper.fill_vocab_mask(mask, 0)
+            return bool(int(mask[0, token // 32]) & (1 << (token % 32)))
+
+        prefix = "<tool_call>"
+        for token in prefix.encode():
+            wrapper.accept_token(token)
+        self.assertTrue(wrapper._is_generation())
+        self.assertFalse(allowed(ord("!")), "unknown tool name must be masked")
+        self.assertFalse(allowed(256), "EOS must wait for a complete required call")
+        for token in text[len(prefix) :].encode():
+            self.assertTrue(allowed(token))
+            wrapper.accept_token(token)
+        self.assertTrue(allowed(256))
 
     def _decoded_arguments(self, text, tools):
         _, calls = self._parser(tools).parse_non_stream(text)
