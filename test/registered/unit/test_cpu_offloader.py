@@ -1,4 +1,4 @@
-"""CPU offload must preserve cached convolution views during weight loading."""
+"""CPU offload must preserve device buffers and cached convolution views."""
 
 import unittest
 
@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.utils.offloader import OffloaderV1
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
@@ -35,23 +36,38 @@ class CachedConvolution(nn.Module):
 
 
 class TestCpuOffloader(unittest.TestCase):
-    def test_checkpoint_load_updates_cached_convolution(self) -> None:
-        device = torch.accelerator.current_accelerator(check_available=True)
-        if device is None:
+    def setUp(self) -> None:
+        self.device = torch.accelerator.current_accelerator(check_available=True)
+        if self.device is None:
             self.skipTest("An accelerator is required to exercise CPU offload")
+
+    def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
+        norm = GemmaRMSNorm(16).to(self.device)
+        norm = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(norm)
+        buffer_address = norm.gemma_weight.data_ptr()
+        loaded_weights = torch.randn(16, device="cpu")
+
+        norm.weight.weight_loader(norm.weight, loaded_weights)
+
+        self.assertEqual(norm.weight.device.type, "cpu")
+        self.assertEqual(norm.gemma_weight.device.type, self.device.type)
+        self.assertEqual(norm.gemma_weight.data_ptr(), buffer_address)
+        torch.testing.assert_close(norm.gemma_weight.cpu(), loaded_weights + 1.0)
+
+    def test_checkpoint_load_updates_cached_convolution(self) -> None:
         for projection_name in ("qkv_conv1d", "conv1d"):
             with self.subTest(projection_name=projection_name), torch.no_grad():
-                model = CachedConvolution(projection_name, device)
+                model = CachedConvolution(projection_name, self.device)
                 model = OffloaderV1(
                     cpu_offload_max_bytes=1024**2
                 ).maybe_offload_to_cpu(model)
                 getattr(model, projection_name).weight.fill_(1)
                 model.projection.weight.fill_(1)
 
-                output = model(torch.ones((1, 2, 3), device=device))
+                output = model(torch.ones((1, 2, 3), device=self.device))
 
                 torch.testing.assert_close(
-                    output, torch.full((1, 2), 6.0, device=device)
+                    output, torch.full((1, 2), 6.0, device=self.device)
                 )
                 self.assertEqual(model.projection.weight.device.type, "cpu")
 
