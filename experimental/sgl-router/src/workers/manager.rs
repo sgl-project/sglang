@@ -35,7 +35,7 @@ const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 ///
 /// The router serves a single configured model; apply its circuit-breaker
 /// config when this worker advertises that model id. Falls back to `None`
-/// (default config) otherwise.
+/// (a breaker that never opens) otherwise.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
     let model = &cfg.model;
     let cbc = model.circuit_breaker.as_ref()?;
@@ -119,8 +119,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `router_inflight_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
-/// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3).
+/// `cfg` is `None` no worker's circuit breaker ever opens.
 ///
 /// Introspects workers with a 2-second timeout, sending `--worker-api-key`
 /// when set.  Tests that want a tighter timeout call

@@ -680,7 +680,8 @@ EndpointSlice to `ready=false`, which is a `Removed` → `Added` cycle and so a
 fresh reading; under `--worker-urls` the fan-out happens once at startup and
 nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
-is re-registered; its circuit breaker will open in the meantime.
+is re-registered; with `--cb-threshold`, its circuit breaker will open in
+the meantime.
 
 ## Upgrading from `cache_aware_zmq`
 
