@@ -78,16 +78,58 @@ with configure_subprocess():
 PY
 ```
 
-`--file-path` is the only workload-related command-line option. File sizes,
-page sizes, concurrency, and iteration counts are fixed in the scripts.
+### Workload options
+
+All scripts accept `--file-path` and the following options. Defaults preserve
+the original workloads. Use `--help` for each script's options.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--file-size` | `1099511627776` (1 TiB) | Logical file size in bytes for the throughput phase |
+| `--numjobs` | `16` | Number of clients |
+| `--entries` | `8` | I/O ring entries per client in the throughput phase |
+
+Client and storage benchmarks also accept:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--bytes-per-page` | `16777216` (16 MiB) | Bytes per client I/O block or storage cache slot |
+| `--warmup` | `50` | Warmup iterations per direction |
+| `--iterations` | `100` | Measured iterations per direction |
+| `--batch-pages` | `128` | Storage benchmark only: cache slots transferred per iteration |
+
+The client transfers `numjobs * entries` blocks per iteration. Its correctness
+test checks up to 128 blocks, using 32 ring entries. The storage correctness
+test always uses eight cache slots and two ring entries per client; its file
+size is derived from `--bytes-per-page` independently of `--file-size`.
+
+The zero-copy benchmark accepts these options instead of byte page sizes and
+iteration counts:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--page-size` | `64` | Tokens per logical KV page |
+| `--tokens-per-batch` | `1024` | Tokens transferred per batch |
+| `--num-batches` | `16` | Batches per direction |
+
+Its model geometry, dtype, and host-to-device capacity ratio stay fixed.
+GPU pool capacity is `tokens_per_batch * num_batches`; page bytes are derived
+from the pool geometry. Each token occupies 256 KiB of K/V data.
+
+Sizes and counts must be positive; warmup may be zero. Byte page sizes must
+be divisible by the bfloat16 element size (two bytes). The client file must
+hold `(warmup + iterations) * numjobs * entries` blocks. The storage file must
+hold at least `batch_pages` slots; older keys may be evicted as writes fill it.
+Zero-copy batches must be divisible by the token page size, and the file must
+hold all K/V data written in the run.
 
 ## Workloads and results
 
 ### Raw client
 
-`bench_client.py` first writes and reads 128 distinct 16 MiB blocks and checks
-exact tensor equality. It then uses 16 clients with eight I/O ring entries each,
-with independent read and write tensors per client.
+With default options, `bench_client.py` first writes and reads 128 distinct
+16 MiB blocks and checks exact tensor equality. It then uses 16 clients with
+eight I/O ring entries each, with independent read and write tensors per client.
 
 Each throughput iteration transfers 2 GiB at randomized block-aligned offsets.
 There are 50 warmup and 100 measured iterations per direction: 300 GiB written
@@ -96,7 +138,8 @@ The read phase uses the same offsets as the write phase.
 
 ### Storage adapter
 
-`bench_storage.py` first uses a 128 MiB file with eight 16 MiB cache slots.
+With default options, `bench_storage.py` first uses a 128 MiB file with eight
+16 MiB cache slots.
 It checks single-key writes, eviction of the oldest keys when full, reads,
 deletion and slot reuse, clearing metadata, and a batch round trip. Tensor
 contents are compared with `torch.equal`.
@@ -118,8 +161,8 @@ an `MHATokenToKVPoolHost` with the adapter. It does not create a cache controlle
 Its synthetic MHA geometry has 64 layers, eight KV heads, head dimension 128,
 and `bfloat16` data.
 
-Here, `page_size = 64` means 64 tokens per logical KV page. Each logical page
-contains 16 MiB of K/V data; this HF3FS path stores separate 8 MiB K and V
+By default, `page_size = 64` means 64 tokens per logical KV page. Each logical
+page contains 16 MiB of K/V data; this HF3FS path stores separate 8 MiB K and V
 components. There are 16 operations of 1,024 tokens each: 256 logical pages,
 or 4 GiB per direction.
 
@@ -134,13 +177,13 @@ copy-free.
 
 ## Capacity and interpretation
 
-All throughput phases use a 1 TiB **logical** file. Resizing establishes its
-length without writing 1 TiB of payload. The default client and adapter runs
-subsequently write approximately 300 GiB each, so account for real storage
+By default, all throughput phases use a 1 TiB **logical** file. Resizing
+establishes its length without writing 1 TiB of payload. The default client and
+adapter runs subsequently write approximately 300 GiB each, so account for real storage
 capacity as well as the logical file size.
 
-Approximate benchmark buffer sizes, excluding padding, library overhead, and
-additional GPU staging buffers:
+Approximate default benchmark buffer sizes, excluding padding, library
+overhead, and additional GPU staging buffers:
 
 | Script | CPU tensors / host KV pool | Shared-memory buffers | GPU KV buffers |
 | --- | --- | --- | --- |
@@ -153,22 +196,54 @@ allocate GPU transfer staging buffers. The table is not a complete minimum
 machine-memory requirement.
 
 Client and storage-adapter statistics report mean, min, p25, p50, p75, and max
-for the 100 measured throughput samples, in **GiB/s** (`2^30` bytes per GiB).
+for the measured throughput samples (100 by default), in **GiB/s**
+(`2^30` bytes per GiB).
 Timings include client processing and memory copies, rather than isolating
 disk or network bandwidth. They wait for I/O completion without an explicit
 `fsync()` in the timed region.
 
 ## Functional checks and troubleshooting
 
-For a small functional run, use temporary copies with reduced tensor sizes,
-file sizes, concurrency, and iterations. Keep block sizes consistent with the
-tensor byte count. The client needs enough file blocks for every warmup and
-measured batch; the storage correctness test expects eight cache slots. In the
-host-pool benchmark, keep operation sizes divisible by the token page size.
+For small functional runs, use the command-line options:
 
-Reduced-workload copies of all three scripts passed against a real local 3FS
-mount using Python 3.12, PyTorch 2.14.1 with CUDA 13.0, and an RTX 5050. An
-additional check cleared the zero-copy host pages after writing and verified
+```bash
+python3 benchmark/hf3fs/bench_client.py \
+  --file-path "$hf3fs_bench_dir/client-small.bin" \
+  --file-size 8388608 --bytes-per-page 65536 \
+  --numjobs 2 --entries 2 --warmup 1 --iterations 3
+
+python3 benchmark/hf3fs/bench_storage.py \
+  --file-path "$hf3fs_bench_dir/storage-small.bin" \
+  --file-size 65536 --bytes-per-page 4096 --batch-pages 4 \
+  --numjobs 2 --entries 2 --warmup 1 --iterations 3
+```
+
+For zero-copy, use the same preload setup:
+
+```bash
+python3 - --file-path "$hf3fs_bench_dir/zerocopy-small.bin" \
+  --file-size 16777216 --numjobs 2 --entries 2 \
+  --page-size 4 --tokens-per-batch 8 --num-batches 2 <<'PY'
+import subprocess
+import sys
+
+from torch_memory_saver import configure_subprocess
+
+with configure_subprocess():
+    subprocess.run(
+        [sys.executable, "benchmark/hf3fs/bench_zerocopy.py", *sys.argv[1:]],
+        check=True,
+    )
+PY
+```
+
+This zero-copy workload transfers 4 MiB per direction while retaining the
+same model geometry and CUDA/host-pool path. It still requires the host RAM
+reserve and additional GPU staging allocations described above.
+
+All three scripts passed reduced workloads configured through the CLI against
+a real local 3FS mount using Python 3.12, PyTorch 2.14.1 with CUDA 13.0, and
+an RTX 5050. An earlier additional check cleared the zero-copy host pages after writing and verified
 exact K/V restoration after reading. This establishes functional coverage;
 default-size workloads and representative performance were not measured.
 

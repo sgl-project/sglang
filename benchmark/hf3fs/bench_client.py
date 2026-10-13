@@ -25,20 +25,20 @@ def print_stats(x: List[int]):
     )
 
 
-def test(file_path):
-    file_size = 1 << 40
-    bytes_per_page = 16 << 20
+def test(args):
     entries = 32
-    file_ops = Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries, 5)
+    file_ops = Hf3fsUsrBioClient(
+        args.file_path, args.file_size, args.bytes_per_page, entries, 5
+    )
 
     print("test batch_read / batch_write")
-    num_pages = 128
+    num_pages = min(128, args.file_size // args.bytes_per_page)
     dtype = torch.bfloat16
-    numel = bytes_per_page // dtype.itemsize
-    offsets = list(range(file_size // bytes_per_page))
+    numel = args.bytes_per_page // dtype.itemsize
+    offsets = list(range(args.file_size // args.bytes_per_page))
     random.shuffle(offsets)
     offsets = offsets[:num_pages]
-    offsets = [i * bytes_per_page for i in offsets]
+    offsets = [i * args.bytes_per_page for i in offsets]
     tensor_writes = [
         torch.randn(numel, dtype=dtype)
         for _ in tqdm(range(num_pages), desc="prepare tensor")
@@ -63,49 +63,46 @@ def test(file_path):
     print("test done")
 
 
-def bench(file_path):
-    file_size = 1 << 40
-    bytes_per_page = 16 << 20
-    entries = 8
-    numjobs = 16
-
+def bench(args):
     dtype = torch.bfloat16
-    numel = bytes_per_page // dtype.itemsize
+    numel = args.bytes_per_page // dtype.itemsize
 
     file_ops = [
-        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries, 5)
-        for _ in range(numjobs)
+        Hf3fsUsrBioClient(
+            args.file_path, args.file_size, args.bytes_per_page, args.entries, 5
+        )
+        for _ in range(args.numjobs)
     ]
 
-    num_page = entries
+    num_page = args.entries
 
-    offsets = list(range(file_size // bytes_per_page))
+    offsets = list(range(args.file_size // args.bytes_per_page))
     tensors_write = [
         [torch.randn(numel, dtype=dtype) for _ in range(num_page)]
-        for _ in range(numjobs)
+        for _ in range(args.numjobs)
     ]
     tensors_read = [
         [torch.empty(numel, dtype=dtype) for _ in range(num_page)]
-        for _ in range(numjobs)
+        for _ in range(args.numjobs)
     ]
     random.shuffle(offsets)
 
-    warmup = 50
-    iteration = 100
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=numjobs)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.numjobs)
 
     w_bw = []
-    w_size = num_page * numjobs * bytes_per_page / (1 << 30)
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking write (GiB/s)"):
+    w_size = num_page * args.numjobs * args.bytes_per_page / (1 << 30)
+    for i in tqdm(
+        range(args.warmup + args.iterations), desc="Benchmarking write (GiB/s)"
+    ):
         _offsets = [
             [
-                offset * bytes_per_page
+                offset * args.bytes_per_page
                 for offset in offsets[
-                    (i * numjobs + j) * num_page : (i * numjobs + j + 1) * num_page
+                    (i * args.numjobs + j) * num_page : (i * args.numjobs + j + 1)
+                    * num_page
                 ]
             ]
-            for j in range(numjobs)
+            for j in range(args.numjobs)
         ]
         tik = time.perf_counter()
         futures = [
@@ -114,26 +111,29 @@ def bench(file_path):
         ]
         results = [future.result() for future in futures]
         tok = time.perf_counter()
-        if i < warmup:
+        if i < args.warmup:
             continue
         w_bw.append(w_size / (tok - tik))
         results = [
-            _result == bytes_per_page for result in results for _result in result
+            _result == args.bytes_per_page for result in results for _result in result
         ]
         assert all(results)
     print_stats(w_bw)
 
     r_bw = []
     r_size = w_size
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking read (GiB/s)"):
+    for i in tqdm(
+        range(args.warmup + args.iterations), desc="Benchmarking read (GiB/s)"
+    ):
         _offsets = [
             [
-                offset * bytes_per_page
+                offset * args.bytes_per_page
                 for offset in offsets[
-                    (i * numjobs + j) * num_page : (i * numjobs + j + 1) * num_page
+                    (i * args.numjobs + j) * num_page : (i * args.numjobs + j + 1)
+                    * num_page
                 ]
             ]
-            for j in range(numjobs)
+            for j in range(args.numjobs)
         ]
         tik = time.perf_counter()
         futures = [
@@ -142,11 +142,11 @@ def bench(file_path):
         ]
         results = [future.result() for future in futures]
         tok = time.perf_counter()
-        if i < warmup:
+        if i < args.warmup:
             continue
         r_bw.append(r_size / (tok - tik))
         results = [
-            _result == bytes_per_page for result in results for _result in result
+            _result == args.bytes_per_page for result in results for _result in result
         ]
         assert all(results)
     print_stats(r_bw)
@@ -157,13 +157,44 @@ def bench(file_path):
     print("bench done")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--file-path", default="/data/bench.bin")
+    parser.add_argument(
+        "--file-size", type=int, default=1 << 40, help="File size in bytes"
+    )
+    parser.add_argument(
+        "--bytes-per-page", type=int, default=16 << 20, help="Bytes per I/O block"
+    )
+    parser.add_argument("--numjobs", type=int, default=16, help="Concurrent clients")
+    parser.add_argument(
+        "--entries", type=int, default=8, help="I/O ring entries per client"
+    )
+    parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations")
+    parser.add_argument(
+        "--iterations", type=int, default=100, help="Measured iterations"
+    )
     args = parser.parse_args()
+    for name in ("file_size", "bytes_per_page", "numjobs", "entries", "iterations"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be nonnegative")
+    if args.bytes_per_page % torch.bfloat16.itemsize:
+        parser.error("--bytes-per-page must be divisible by the bfloat16 element size")
+    required_pages = (args.warmup + args.iterations) * args.numjobs * args.entries
+    if args.file_size // args.bytes_per_page < required_pages:
+        parser.error("--file-size must hold every warmup and measured batch")
+    return args
+
+
+def main():
+    args = parse_args()
     logging.basicConfig(level=logging.INFO)
-    test(args.file_path)
-    bench(args.file_path)
+    test(args)
+    bench(args)
     os.remove(args.file_path)
 
 

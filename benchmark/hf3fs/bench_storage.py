@@ -28,33 +28,24 @@ def print_stats(x: List[int]):
     )
 
 
-def test(file_path):
-    # Qwen3-32B
-    layer_num = 64
-    head_num, head_dim = 8, 128
-    store_dtype = torch.bfloat16
-    tokens_per_page = 64
-
-    file_size = 128 << 20
-    numjobs = 16
-    bytes_per_page = 16 << 20
+def test(args):
+    file_size = 8 * args.bytes_per_page
     entries = 2
-    dtype = store_dtype
+    dtype = torch.bfloat16
 
     hicache_hf3fs = HiCacheHF3FS(
         rank=0,
-        file_path=file_path,
+        file_path=args.file_path,
         file_size=file_size,
-        numjobs=numjobs,
-        bytes_per_page=bytes_per_page,
+        numjobs=args.numjobs,
+        bytes_per_page=args.bytes_per_page,
         entries=entries,
         client_timeout=5,
         dtype=dtype,
         metadata_client=Hf3fsLocalMetadataClient(),
     )
 
-    numel = 2 * tokens_per_page * layer_num * head_num * head_dim
-    assert numel * dtype.itemsize == bytes_per_page
+    numel = args.bytes_per_page // dtype.itemsize
 
     num_pages = 10
     tensors = {}
@@ -117,59 +108,49 @@ def test(file_path):
     print("All test cases passed.")
 
 
-def bench(file_path):
-    # Qwen3-32B
-    layer_num = 64
-    head_num, head_dim = 8, 128
-    store_dtype = torch.bfloat16
-    tokens_per_page = 64
-
-    file_size = 1 << 40
-    numjobs = 16
-    bytes_per_page = 16 << 20
-    entries = 8
-    dtype = store_dtype
+def bench(args):
+    dtype = torch.bfloat16
     hicache_hf3fs = HiCacheHF3FS(
         rank=0,
-        file_path=file_path,
-        file_size=file_size,
-        numjobs=numjobs,
-        bytes_per_page=bytes_per_page,
-        entries=entries,
+        file_path=args.file_path,
+        file_size=args.file_size,
+        numjobs=args.numjobs,
+        bytes_per_page=args.bytes_per_page,
+        entries=args.entries,
         client_timeout=5,
         dtype=dtype,
         metadata_client=Hf3fsLocalMetadataClient(),
     )
 
-    numel = 2 * tokens_per_page * layer_num * head_num * head_dim
-    assert numel * dtype.itemsize == bytes_per_page
+    numel = args.bytes_per_page // dtype.itemsize
 
-    num_page = 128
+    num_page = args.batch_pages
     values = [torch.randn((numel,)).to(dtype=dtype) for _ in tqdm(range(num_page))]
     read_values = [torch.empty_like(value) for value in values]
     rank_metadata = hicache_hf3fs.metadata_client._get_metadata(
         hicache_hf3fs.rank, PoolName.KV
     )
 
-    warmup = 50
-    iteration = 100
-
     w_bw = []
-    w_size = num_page * bytes_per_page / (1 << 30)
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking write (GiB/s)"):
+    w_size = num_page * args.bytes_per_page / (1 << 30)
+    for i in tqdm(
+        range(args.warmup + args.iterations), desc="Benchmarking write (GiB/s)"
+    ):
         keys = [f"{j}" for j in range(i * num_page, (i + 1) * num_page)]
         tik = time.perf_counter()
         ok = hicache_hf3fs._batch_set(keys, values)
         tok = time.perf_counter()
-        if i < warmup:
+        if i < args.warmup:
             continue
         w_bw.append(w_size / (tok - tik))
         assert all(ok)
     print_stats(w_bw)
 
     r_bw = []
-    r_size = num_page * bytes_per_page / (1 << 30)
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking read (GiB/s)"):
+    r_size = num_page * args.bytes_per_page / (1 << 30)
+    for i in tqdm(
+        range(args.warmup + args.iterations), desc="Benchmarking read (GiB/s)"
+    ):
         keys = random.sample(
             list(rank_metadata.key_to_index.keys()),
             num_page,
@@ -177,7 +158,7 @@ def bench(file_path):
         tik = time.perf_counter()
         results = hicache_hf3fs._batch_get(keys, read_values)
         tok = time.perf_counter()
-        if i < warmup:
+        if i < args.warmup:
             continue
         r_bw.append(r_size / (tok - tik))
         assert all(results)
@@ -186,13 +167,53 @@ def bench(file_path):
     hicache_hf3fs.close()
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--file-path", default="/data/test.bin")
+    parser.add_argument(
+        "--file-size", type=int, default=1 << 40, help="File size in bytes"
+    )
+    parser.add_argument(
+        "--bytes-per-page", type=int, default=16 << 20, help="Bytes per cache slot"
+    )
+    parser.add_argument("--numjobs", type=int, default=16, help="Concurrent clients")
+    parser.add_argument(
+        "--entries", type=int, default=8, help="I/O ring entries per client"
+    )
+    parser.add_argument(
+        "--batch-pages", type=int, default=128, help="Cache pages per batch"
+    )
+    parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations")
+    parser.add_argument(
+        "--iterations", type=int, default=100, help="Measured iterations"
+    )
     args = parser.parse_args()
+    for name in (
+        "file_size",
+        "bytes_per_page",
+        "numjobs",
+        "entries",
+        "batch_pages",
+        "iterations",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be nonnegative")
+    if args.bytes_per_page % torch.bfloat16.itemsize:
+        parser.error("--bytes-per-page must be divisible by the bfloat16 element size")
+    if args.file_size // args.bytes_per_page < args.batch_pages:
+        parser.error("--file-size must hold at least --batch-pages cache pages")
+    return args
+
+
+def main():
+    args = parse_args()
     logging.basicConfig(level=logging.INFO)
-    test(args.file_path)
-    bench(args.file_path)
+    test(args)
+    bench(args)
     os.remove(args.file_path)
 
 
