@@ -4269,6 +4269,7 @@ class Scheduler(
                     reqs=[], batch_is_full=running_batch.batch_is_full
                 )
         else:
+            running_batch.filter_batch()
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
