@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -26,6 +27,10 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+# LOCAL_DISK reads stage a whole RPC batch in the remote Store's SSD buffer.
+# Bound bytes as well as objects: a full-layer component page is much larger than
+# a rank-local shard. The Store must provision this budget across all readers.
+_LAYER_SPLIT_MAX_GET_BYTES = 64 * 1024 * 1024
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
@@ -335,6 +340,9 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    layer_shard = None
+    external_buffer_pools = frozenset()
+
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -385,6 +393,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        if storage_config is not None:
+            self.layer_shard = storage_config.layer_shard
+            self.external_buffer_pools = frozenset(storage_config.external_buffer_pools)
+        if self.layer_shard is not None and (
+            self.external_buffer_pools or not storage_config.is_mla_model
+        ):
+            raise ValueError(
+                "Direct LayerSplit requires unpacked rank-local MLA objects"
+            )
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -393,6 +410,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
+            if self.external_buffer_pools or self.layer_shard is not None:
+                if self.config.standalone_storage:
+                    raise ValueError(
+                        "LayerSplit requires an in-process Mooncake client, not shared-memory dummy mode"
+                    )
+            if self.layer_shard is not None:
+                # Direct layer-first shards need multi-buffer I/O. Staging
+                # objects are contiguous and use ordinary single-buffer I/O.
+                try:
+                    self.store.batch_put_from_multi_buffers
+                    self.store.batch_get_into_multi_buffers
+                except AttributeError as exc:
+                    raise RuntimeError(
+                        "LayerSplit requires Mooncake multi-buffer I/O support"
+                    ) from exc
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
@@ -599,6 +631,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
 
+            if self.layer_shard is not None:
+                self.mla_suffix = (
+                    f"{self.mla_suffix}_{self.layer_shard.key_suffix}".lstrip("_")
+                )
+
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
@@ -702,6 +739,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if PoolName.KV in self.external_buffer_pools:
+            # Staging binds separate slabs below; do not register persistent L2.
+            return
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
@@ -729,6 +769,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
+
+        if host_pool_name in self.external_buffer_pools:
+            return
 
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
@@ -764,6 +807,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
+        if transfer.name == PoolName.KV and self.is_mla_backend:
+            return [f"{key}_{self.mla_suffix}_k" for key in page_keys], 1
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
@@ -860,6 +905,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        if self.layer_shard is not None and self.layer_shard.empty:
+            return PoolTransferResult(
+                len(keys), {t.name: len(keys) for t in pool_transfers or []}
+            )
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
@@ -880,6 +929,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         prepared = []
         all_component_keys = []
         for transfer in pool_transfers or []:
+            if self._empty_direct_component(transfer.name):
+                hit_count[transfer.name] = kv_pages
+                continue
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -937,9 +989,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
+    def _empty_direct_component(self, name):
+        if self.layer_shard is None:
+            return False
+        return self.layer_shard.empty or (
+            name == PoolName.INDEXER and self.registered_pools[name].layer_num == 0
+        )
+
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
-        # Expand every pool first so one logical operation becomes one Mooncake
-        # RPC rather than one RPC per hybrid-cache component.
+        # Batch ordinary pools together; LayerSplit keeps its per-component
+        # geometry validation and bounded reads.
+        results: dict = {}
         prepared = []
         all_key_strs = []
         all_ptrs = []
@@ -947,11 +1007,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         all_group_ids = []
         buffer_requests = []
         for transfer in transfers:
-            host_pool = self.registered_pools.get(transfer.name)
+            if self._empty_direct_component(transfer.name):
+                results[transfer.name] = [True] * len(transfer.keys)
+                continue
+            layer_split_io = (
+                self.layer_shard is not None or transfer.buffer_pool_name is not None
+            )
+            if layer_split_io or transfer.name in self.external_buffer_pools:
+                host_pool = self._transfer_buffer_pool(transfer)
+            else:
+                host_pool = self.registered_pools.get(transfer.name)
+                if host_pool is None:
+                    raise ValueError(
+                        f"Unregistered Mooncake hybrid pool: {transfer.name}"
+                    )
             keys = transfer.keys
-            if host_pool is None:
-                raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-            page_size = host_pool.page_size or 1
+            # Physical slab bindings use one slot index per complete object.
+            page_size = (
+                1
+                if transfer.buffer_pool_name is not None
+                else (getattr(host_pool, "page_size", 1) or 1)
+            )
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
@@ -961,6 +1037,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if layer_split_io:
+                ptr_list, element_size_list = host_pool.get_page_buffer_meta(
+                    host_indices
+                )
+                if self.layer_shard is not None:
+                    layers = (
+                        self.layer_shard.end - self.layer_shard.start
+                        if transfer.name == PoolName.KV
+                        else host_pool.layer_num
+                    )
+                    if len(ptr_list) != len(keys) * layers:
+                        raise ValueError(
+                            "Direct LayerSplit page/span geometry mismatch"
+                        )
+                if len(ptr_list) != len(key_strs):
+                    ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                        key_strs, ptr_list, element_size_list
+                    )
+                results[transfer.name] = self._layer_split_io(
+                    key_strs, ptr_list, element_size_list, is_set
+                )
+                continue
+
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
             buffer_requests.append(
@@ -973,7 +1072,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
 
         if not prepared:
-            return {}
+            return results
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
@@ -1020,7 +1119,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_key_strs, all_ptrs, all_sizes
             )
 
-        results: dict = {}
         for name, key_multiplier, start, end in prepared:
             results[name] = self._batch_postprocess(
                 io_results[start:end],
@@ -1094,6 +1192,60 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> dict:
         return self._batch_io_v2(transfers, is_set=True)
 
+    def _layer_split_io(self, keys, pointers, sizes, is_set):
+        if len(keys) != len(pointers) or len(keys) != len(sizes):
+            raise ValueError("LayerSplit object/buffer count mismatch")
+        if not keys:
+            return []
+        expected = [sum(size) if isinstance(size, Sequence) else size for size in sizes]
+        if any(size <= 0 for size in expected):
+            raise ValueError("LayerSplit objects must not be empty")
+        if not is_set:
+            # Hybrid sidecar transfers can span an entire request, unlike the
+            # primary KV path's STORAGE_BATCH_SIZE batches. Passing that whole
+            # prefix to the SDK can exhaust the remote SSD read buffer even
+            # though all destination L2 buffers are already registered.
+            result = []
+            start = 0
+            while start < len(keys):
+                end, batch_bytes = start, 0
+                while end < min(start + STORAGE_BATCH_SIZE, len(keys)):
+                    # Keep a single oversized object intact; splitting its
+                    # value would change the persistent object contract.
+                    if end > start and (
+                        batch_bytes + expected[end] > _LAYER_SPLIT_MAX_GET_BYTES
+                    ):
+                        break
+                    batch_bytes += expected[end]
+                    end += 1
+                values = self._get_batch_zero_copy_impl(
+                    keys[start:end], pointers[start:end], sizes[start:end]
+                )
+                if len(values) != end - start:
+                    return [False] * len(keys)
+                # A positive short GET is not a complete page/component.
+                result.extend(
+                    value == size for value, size in zip(values, expected[start:end])
+                )
+                start = end
+            return result
+        existing = self._batch_exist(keys)
+        if len(existing) != len(keys):
+            return [False] * len(keys)
+        mask = [value == 1 for value in existing]
+        missing = [i for i, found in enumerate(mask) if not found]
+        if missing:
+            values = self._put_batch_zero_copy_impl(
+                [keys[i] for i in missing],
+                [pointers[i] for i in missing],
+                [sizes[i] for i in missing],
+            )
+            if len(values) != len(missing):
+                return [False] * len(keys)
+            for i, value in zip(missing, values):
+                mask[i] = value == 0
+        return mask
+
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
@@ -1146,6 +1298,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        if self.layer_shard is not None and len(ptr_list) != len(keys) * (
+            self.layer_shard.end - self.layer_shard.start
+        ):
+            raise ValueError("Direct LayerSplit page/span geometry mismatch")
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
@@ -1203,6 +1359,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if PoolName.KV in self.external_buffer_pools:
+            raise ValueError("External anchor buffers require v2 transfer descriptors")
+        if self.layer_shard is not None and self.layer_shard.empty:
+            return [True] * len(keys)
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1211,6 +1371,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        if self.layer_shard is not None:
+            return self._layer_split_io(key_strs, buffer_ptrs, buffer_sizes, False)
 
         start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
@@ -1232,6 +1395,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if PoolName.KV in self.external_buffer_pools:
+            raise ValueError("External anchor buffers require v2 transfer descriptors")
+        if self.layer_shard is not None and self.layer_shard.empty:
+            return [True] * len(keys)
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1240,6 +1407,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        if self.layer_shard is not None:
+            return self._layer_split_io(key_strs, buffer_ptrs, buffer_sizes, True)
         key_multiplier = len(key_strs) // len(keys)
         group_ids = (
             self._expand_group_ids(keys, key_multiplier)
@@ -1410,6 +1579,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if self.layer_shard is not None and self.layer_shard.empty:
+            return len(keys)
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 

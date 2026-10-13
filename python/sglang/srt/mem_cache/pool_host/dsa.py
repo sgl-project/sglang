@@ -605,6 +605,16 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
         assert len(indices) % self.page_size == 0
+        if self.layout == "layer_first":
+            ptrs = [
+                self.index_k_with_scale_buffer[
+                    layer, int(token) // self.page_size
+                ].data_ptr()
+                for token in indices[:: self.page_size]
+                for layer in range(self.layer_num)
+            ]
+            size = self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            return ptrs, [size] * len(ptrs)
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []
