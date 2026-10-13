@@ -921,7 +921,7 @@ class Envs:
     # Requires SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.
     SGLANG_OPT_BEAM_DECODE_GEMV = EnvBool(False)
     # Beam router: cublas, cutile (Hopper or Blackwell), or torch.
-    SGLANG_BEAM_ROUTER_BACKEND = EnvStr("cublas")
+    SGLANG_BEAM_ROUTER_BACKEND = EnvStr("cutile")
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of

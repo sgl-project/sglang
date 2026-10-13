@@ -1,6 +1,7 @@
 """Beam router dispatch and prepared-weight refresh under CUDA graphs."""
 
 import sys
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -36,7 +37,11 @@ def _router(backend, nvfp4=False):
         else None
     )
     with (
-        envs.SGLANG_BEAM_ROUTER_BACKEND.override(backend),
+        (
+            envs.SGLANG_BEAM_ROUTER_BACKEND.override(backend)
+            if backend is not None
+            else nullcontext()
+        ),
         get_context().override_server_args(
             moe_runner_backend="flashinfer_trtllm" if nvfp4 else "triton",
             moe_a2a_backend="none",
@@ -102,16 +107,19 @@ def test_router_refresh_and_dispatch(m, nvfp4):
         ).sqrt() < 1e-6
 
 
-@pytest.mark.parametrize("backend", ["cublas", "cutile"])
-def test_backend_dispatch(backend):
+@pytest.mark.parametrize("backend", [None, "cublas", "cutile"])
+@pytest.mark.parametrize("nvfp4", [False, True])
+def test_backend_dispatch(backend, nvfp4, monkeypatch):
     """Selecting cutile must run cuTile, not fall back to the cuBLAS BF16x3 path."""
-    router = _router(backend)
-    assert router.use_cutile_router == (backend == "cutile")
+    monkeypatch.delenv("SGLANG_BEAM_ROUTER_BACKEND", raising=False)
+    router = _router(backend, nvfp4)
+    expected_backend = backend or "cutile"
+    assert router.use_cutile_router == (expected_backend == "cutile")
     x = torch.randn(64, 5120, device="cuda", dtype=torch.bfloat16)
     with patch(
         "sglang.srt.models.beam.router_gemm_bf16x3", wraps=router_gemm_bf16x3
     ) as cublas:
-        if backend == "cutile":
+        if expected_backend == "cutile":
             with patch.object(
                 router, "cutile_router_gemm", wraps=router.cutile_router_gemm
             ) as cutile:
@@ -119,7 +127,7 @@ def test_backend_dispatch(backend):
             assert cutile.call_count == 1
         else:
             router._router_logits(x)
-    assert cublas.call_count == int(backend == "cublas")
+    assert cublas.call_count == int(expected_backend == "cublas")
 
 
 @pytest.mark.parametrize("backend", ["torch", "cublas", "cutile"])
