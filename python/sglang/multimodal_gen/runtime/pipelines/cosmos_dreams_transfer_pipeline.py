@@ -14,11 +14,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
-    Cosmos3DecodingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_transfer import (
     CosmosDreamsControlVideoStage,
+    CosmosDreamsTransferDecodingStage,
     CosmosDreamsTransferPrepareStage,
     CosmosDreamsTransferRolloutStage,
 )
@@ -63,6 +61,7 @@ class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
                 manifest=manifest,
                 canvas_tier=pipeline_config.canvas_tier,
                 max_pixels=pipeline_config.max_pixels,
+                resize_mode=pipeline_config.transfer_resize_mode,
             )
         )
         self.add_stage(
@@ -70,6 +69,7 @@ class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
                 vae=vae,
                 tokenizer=self.get_module("text_tokenizer"),
                 manifest=manifest,
+                emphasize_control_default=pipeline_config.emphasize_control_default,
             )
         )
         history_profile = pipeline_config.transfer_history_profile(manifest)
@@ -82,14 +82,17 @@ class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
             )
         )
         self.add_stage(
-            Cosmos3DecodingStage(vae, guardrails=False, sound_tokenizer=None)
+            CosmosDreamsTransferDecodingStage(
+                vae, guardrails=False, sound_tokenizer=None
+            )
         )
         logger.info(
             "Cosmos-Dreams-Transfer pipeline stages created (checkpoint %s, hints %s, "
-            "chunk_size=%d, %s history%s)",
+            "chunk_size=%d, control %s, %s history%s)",
             manifest.checkpoint_id,
             list(manifest.control_contract.hints),
             manifest.chunk_size,
+            pipeline_config.transfer_resize_mode,
             history_profile.history_mode,
             (
                 ""

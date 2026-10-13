@@ -43,11 +43,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     CONTROL_EMPHASIS_TEMPLATE,
     TRANSFER_SYSTEM_PROMPT,
     align_pixel_frames_to_chunks,
+    check_direct_distortion,
+    direct_resize_control,
     format_transfer_prompt,
+    normalize_control_pixels,
     read_video_fps,
     resize_center_crop_uint8,
+    restore_transfer_output_size,
+    select_direct_canvas,
     synthetic_control_frames,
     tokenize_transfer_prompt,
+    transfer_scale_ratio,
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
@@ -608,3 +614,130 @@ class TestTransferSamplingParams(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTransferDirectResize(unittest.TestCase):
+    """The Oct 2026 Transfer export trained on whole frames resized onto the nearest
+    canvas (no reflection padding); preprocessing must follow that recipe."""
+
+    def test_canvas_selection_minimizes_distortion_within_three_percent(self):
+        cases = {
+            (1080, 1920): (832, 480, 0.0256),
+            (720, 1280): (832, 480, 0.0256),
+            (384, 384): (640, 640, 0.0),
+            (216, 384): (832, 480, 0.0256),
+            (480, 640): (736, 544, 0.0147),
+            (1920, 1080): (480, 832, 0.0256),
+        }
+        for (height, width), (canvas_w, canvas_h, distortion) in cases.items():
+            with self.subTest(size=(height, width)):
+                got_w, got_h, got_d = select_direct_canvas(
+                    height=height, width=width, tier="480"
+                )
+                self.assertEqual((got_w, got_h), (canvas_w, canvas_h))
+                self.assertAlmostEqual(got_d, distortion, places=3)
+        with self.assertRaisesRegex(ValueError, "distorts the aspect"):
+            select_direct_canvas(height=1080, width=2560, tier="480")
+        with self.assertRaisesRegex(ValueError, "distorts the aspect"):
+            check_direct_distortion(source_hw=(384, 384), canvas_hw=(480, 832))
+        self.assertAlmostEqual(
+            transfer_scale_ratio((216, 384), (480, 832)), 1.0256, places=3
+        )
+        with self.assertRaises(ValueError):
+            select_direct_canvas(height=100, width=100, tier="360")
+
+    def test_direct_resize_follows_modality_interpolation(self):
+        labels = torch.zeros((3, 2, 8, 8), dtype=torch.uint8)
+        labels[:, :, :, 4:] = 200
+        labels[1, :, 2:6, :] = 77
+        seg = direct_resize_control(labels, height=6, width=12, hint="seg")
+        self.assertEqual(seg.dtype, torch.uint8)
+        self.assertEqual(seg.shape, (3, 2, 6, 12))
+        self.assertEqual(set(seg.unique().tolist()), {0, 77, 200})
+        depth = direct_resize_control(labels, height=6, width=12, hint="depth")
+        self.assertEqual(depth.dtype, torch.float32)
+        self.assertTrue(((depth != depth.round()) & (depth > 0)).any())
+        blur = direct_resize_control(labels, height=6, width=12, hint="blur")
+        self.assertEqual(blur.dtype, torch.uint8)
+        same = direct_resize_control(labels, height=8, width=8, hint="edge")
+        self.assertTrue(torch.equal(same, labels))
+        with self.assertRaises(ValueError):
+            direct_resize_control(labels[0], height=6, width=12, hint="seg")
+
+    def test_output_restore_resizes_each_panel_and_pads_odd_sizes(self):
+        video = torch.rand((1, 3, 5, 480, 832 * 2))
+        restored = restore_transfer_output_size(
+            video, original_hw=(216, 384), model_hw=(480, 832)
+        )
+        self.assertEqual(restored.shape, (1, 3, 5, 216, 384 * 2))
+        odd = restore_transfer_output_size(
+            video[..., :832], original_hw=(215, 383), model_hw=(480, 832)
+        )
+        self.assertEqual(odd.shape, (1, 3, 5, 216, 384))
+        torch.testing.assert_close(odd[..., 215, :], odd[..., 214, :])
+        self.assertIs(
+            restore_transfer_output_size(
+                video, original_hw=(480, 832), model_hw=(480, 832)
+            ),
+            video,
+        )
+        with self.assertRaises(ValueError):
+            restore_transfer_output_size(
+                video, original_hw=(216, 384), model_hw=(480, 800)
+            )
+
+    def test_config_mode_and_control_sentence_default(self):
+        config = CosmosDreamsTransferConfig()
+        self.assertEqual(config.transfer_resize_mode, "direct_resize")
+        self.assertIs(config.emphasize_control_default, False)
+        config.update_pipeline_config({"transfer_resize_mode": "center_crop"})
+        self.assertIsNone(config.emphasize_control_default)
+        bad = CosmosDreamsTransferConfig()
+        bad.update_pipeline_config({"transfer_resize_mode": "pad"})
+        with self.assertRaisesRegex(ValueError, "transfer_resize_mode"):
+            bad.update_config_from_dict({})
+
+    def test_output_size_request_field(self):
+        params = CosmosDreamsTransferSamplingParams(
+            prompt="x",
+            control_path="depth.mp4",
+            control_hint="depth",
+            transfer_output_size="original",
+        )
+        self.assertEqual(params.transfer_output_size, "original")
+        self.assertIn(
+            "transfer_output_size",
+            CosmosDreamsTransferSamplingParams.video_request_extra_fields(),
+        )
+        with self.assertRaisesRegex(ValueError, "transfer_output_size"):
+            CosmosDreamsTransferSamplingParams(
+                prompt="x",
+                control_path="depth.mp4",
+                control_hint="depth",
+                transfer_output_size="source",
+            )
+        legacy = CosmosDreamsTransferConfig()
+        legacy.update_pipeline_config({"transfer_resize_mode": "center_crop"})
+        with self.assertRaisesRegex(ValueError, "directly resized"):
+            params._validate_with_pipeline_config(legacy)
+        params._validate_with_pipeline_config(CosmosDreamsTransferConfig())
+
+    def test_control_normalization_order_follows_the_recipe(self):
+        pixels = torch.tensor([[[[100.4, 255.0]]]], dtype=torch.float32)
+        direct = normalize_control_pixels(
+            pixels, dtype=torch.bfloat16, float32_first=True
+        )
+        legacy = normalize_control_pixels(
+            pixels, dtype=torch.bfloat16, float32_first=False
+        )
+        self.assertEqual(direct.dtype, torch.bfloat16)
+        self.assertEqual(
+            direct[..., 0].item(),
+            (torch.tensor(100.4 / 127.5 - 1.0)).to(torch.bfloat16).item(),
+        )
+        self.assertEqual(
+            legacy[..., 0].item(),
+            (torch.tensor(100.4).to(torch.bfloat16) / 127.5 - 1.0).item(),
+        )
+        self.assertAlmostEqual(direct[..., 1].item(), 1.0)
+        self.assertAlmostEqual(legacy[..., 1].item(), 1.0)

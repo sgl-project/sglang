@@ -11,7 +11,13 @@ the control-adherence sentence.
 
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import TRANSFER_HINTS
+from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
+    TRANSFER_HINTS,
+    TRANSFER_OUTPUT_MODEL,
+    TRANSFER_OUTPUT_ORIGINAL,
+    TRANSFER_OUTPUT_SIZES,
+    TRANSFER_RESIZE_DIRECT,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
     COSMOS_DREAMS_480P_CANVASES,
@@ -43,10 +49,14 @@ class CosmosDreamsTransferSamplingParams(Cosmos3SamplingParams):
     # is then snapped to the trained size closest to the control clip's aspect.
     canvas_from_control: bool = False
 
+    # "model" returns the trained canvas; "original" restores the control clip's
+    # own size with bicubic interpolation (direct-resize deployments only).
+    transfer_output_size: str = TRANSFER_OUTPUT_MODEL
+
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
         return super().video_request_extra_fields() | frozenset(
-            {"emphasize_control_in_prompt"}
+            {"emphasize_control_in_prompt", "transfer_output_size"}
         )
 
     @property
@@ -112,8 +122,21 @@ class CosmosDreamsTransferSamplingParams(Cosmos3SamplingParams):
             self.emphasize_control_in_prompt, bool
         ):
             raise ValueError("emphasize_control_in_prompt must be a boolean or null.")
+        if self.transfer_output_size not in TRANSFER_OUTPUT_SIZES:
+            raise ValueError(
+                f"transfer_output_size must be one of {TRANSFER_OUTPUT_SIZES}, "
+                f"got {self.transfer_output_size!r}."
+            )
 
     def _validate_with_pipeline_config(self, pipeline_config) -> None:
+        if (
+            self.transfer_output_size == TRANSFER_OUTPUT_ORIGINAL
+            and pipeline_config.transfer_resize_mode != TRANSFER_RESIZE_DIRECT
+        ):
+            raise ValueError(
+                "transfer_output_size='original' restores a directly resized clip; this "
+                f"deployment runs transfer_resize_mode={pipeline_config.transfer_resize_mode!r}."
+            )
         super()._validate_with_pipeline_config(pipeline_config)
         _ = self.resolved_control_path
         _ = self.resolved_control_hint

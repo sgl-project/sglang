@@ -13,6 +13,8 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     HISTORY_MODE_AUTO,
     HISTORY_MODE_FULL,
     HISTORY_MODE_SLIDING,
+    TRANSFER_RESIZE_DIRECT,
+    TRANSFER_RESIZE_MODES,
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
     resolve_transfer_history_profile,
@@ -46,6 +48,28 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
     # kv_cache_inference_size was set (Sim-Transfer: 51 frames, 1 sink) and keeps the
     # whole clip otherwise. The artifact's no_eviction flag is an exporter constant.
     history_mode: str = HISTORY_MODE_AUTO
+
+    # How the control clip reaches the trained canvas. The current Hub export
+    # (``*_direct_resize_caption_mix*``) trained without reflection padding: full
+    # frame, per-modality interpolation, at most 3% aspect distortion, and its
+    # reference preset leaves the caption without the control-adherence sentence.
+    # ``center_crop`` reproduces the Sep/Oct-1 exports (aspect-preserving resize
+    # plus center crop, control sentence per the artifact).
+    transfer_resize_mode: str = TRANSFER_RESIZE_DIRECT
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        if self.transfer_resize_mode not in TRANSFER_RESIZE_MODES:
+            raise ValueError(
+                "Cosmos-Dreams-Transfer transfer_resize_mode must be one of "
+                f"{TRANSFER_RESIZE_MODES}, got {self.transfer_resize_mode!r}."
+            )
+
+    @property
+    def emphasize_control_default(self) -> bool | None:
+        """Request default for the control-adherence sentence: the direct-resize
+        reference preset keeps captions as supplied; legacy exports follow the artifact."""
+        return False if self.transfer_resize_mode == TRANSFER_RESIZE_DIRECT else None
 
     def transfer_history_profile(
         self,

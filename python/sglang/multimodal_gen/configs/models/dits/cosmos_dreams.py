@@ -42,6 +42,18 @@ HISTORY_MODE_SLIDING = "sliding"
 HISTORY_MODES = (HISTORY_MODE_FULL, HISTORY_MODE_SLIDING)
 # Transfer only: slide when the export's training config recorded a KV window.
 HISTORY_MODE_AUTO = "auto"
+
+# Control-video preprocessing recipes. ``direct_resize``: the Oct 2026 Transfer
+# checkpoints trained without reflection padding, so the whole frame is resized
+# to the nearest trained canvas (at most 3% aspect distortion). ``center_crop``:
+# the earlier exports, aspect-preserving resize plus center crop.
+TRANSFER_RESIZE_DIRECT = "direct_resize"
+TRANSFER_RESIZE_CENTER_CROP = "center_crop"
+TRANSFER_RESIZE_MODES = (TRANSFER_RESIZE_DIRECT, TRANSFER_RESIZE_CENTER_CROP)
+TRANSFER_MAX_ASPECT_DISTORTION = 0.03
+TRANSFER_OUTPUT_MODEL = "model"
+TRANSFER_OUTPUT_ORIGINAL = "original"
+TRANSFER_OUTPUT_SIZES = (TRANSFER_OUTPUT_MODEL, TRANSFER_OUTPUT_ORIGINAL)
 ACTION_CONDITIONING_MODE = "action"
 CONTROL_VIDEO_CONDITIONING_MODE = "control_video"
 TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
