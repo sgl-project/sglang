@@ -2916,6 +2916,7 @@ class DeepseekV4HipRadixBackend(
             swa_page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
             num_qo_tokens=num_tokens,
             max_seq_len=max(seq_lens_cpu),
+            seq_lens_cpu=seq_lens_cpu,
             total_swa=total_swa,
         )
 
