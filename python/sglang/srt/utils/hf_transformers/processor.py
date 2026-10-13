@@ -355,6 +355,39 @@ def get_processor(
     ):
         processor = wrap_as_pixtral(processor, config)
 
+    # Guarding against AutoProcessor silently returning a bare tokenizer
+    # when the installed transformer package lacks support for the multimodal model.
+    architectures = getattr(config, "architectures", []) or []
+    has_vision = getattr(config, "vision_config", None) is not None
+    try:
+        from sglang.srt.configs.model_config import is_multimodal_model
+
+        is_multimodal = is_multimodal_model(architectures) or has_vision
+    except ImportError:
+        is_multimodal = has_vision
+    is_lm_only = getattr(config, "language_model_only", False)
+
+    is_intentional_tokenizer = (
+        is_lm_only
+        or any("InternVL" in arch for arch in architectures)
+        or "InternVL3_5" in tokenizer_name
+    )
+
+    if (
+        is_multimodal
+        and not is_intentional_tokenizer
+        and isinstance(processor, PreTrainedTokenizerBase)
+    ):
+        import transformers
+
+        raise RuntimeError(
+            f"AutoProcessor returned a bare tokenizer ({type(processor).__name__}) "
+            f"for multimodal model '{tokenizer_name}'. This usually indicates that the "
+            f"installed transformers package (v{transformers.__version__}) lacks the "
+            f"processor class for architecture {architectures}. "
+            f"Please update transformers to a version supporting this model."
+        )
+
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
