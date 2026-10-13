@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import logging
 import math
-import weakref
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -68,10 +67,12 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    allocate_symmetric_buffer,
+)
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCL_CTA_POLICY_ZERO,
     NCCLLibrary,
-    ncclWindow_t,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
@@ -144,60 +145,6 @@ def _symmetric_scratch_layout(
             )
         offsets.append(slot_offsets)
     return offsets, nbytes
-
-
-class _NcclMemOwner:
-    """Exposes one ncclMemAlloc buffer to torch, which keeps this object alive
-    as long as any view of the wrapping tensor exists."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "version": 3,
-        }
-
-
-def _release_nccl_window_buffer(
-    comm: PyNcclCommunicator, ptr: int, window: Optional[ncclWindow_t]
-) -> None:
-    # A gather queued on the side stream may still be touching the buffer.
-    torch.cuda.synchronize(comm.device)
-    if window is not None:
-        comm.deregister_comm_window(window)
-    comm.nccl.ncclMemFree(ptr)
-
-
-def _alloc_nccl_window_buffer(
-    comm: PyNcclCommunicator, nbytes: int
-) -> Tuple[torch.Tensor, bool]:
-    """Zeroed uint8 tensor over ncclMemAlloc memory registered as a symmetric
-    window on ``comm`` (a collective call), and whether NCCL returned a window.
-
-    The memory is deregistered and freed once the last view of the tensor dies.
-    """
-    with torch.cuda.device(comm.device):
-        ptr = comm.nccl.ncclMemAlloc(nbytes)
-        window = comm.register_comm_window_raw(ptr, nbytes)
-        # NULL when NCCL runs without cuMem: ncclMemAlloc is then a cudaMalloc.
-        window = window if window.value else None
-        if window is not None:
-            # Workaround: with NVLS, NCCL 2.30 builds the multicast team inside
-            # the first CE collective's sync (ncclDevrGetLsaTeamPtrMC) with no
-            # barrier after binding, so a fast rank's ready flag can miss a
-            # peer and both hang. Build it now and barrier; drop once NCCL does.
-            comm.nccl.ncclGetLsaMultimemDevicePointer(window, 0)
-            torch.distributed.barrier(group=comm.group)
-        owner = _NcclMemOwner(ptr, nbytes)
-        release = weakref.finalize(
-            owner, _release_nccl_window_buffer, comm, ptr, window
-        )
-        # The process teardown reclaims the memory; NCCL may already be gone.
-        release.atexit = False
-        buf = torch.as_tensor(owner)
-    buf.zero_()
-    return buf, window is not None
 
 
 def _view_bytes(
@@ -352,7 +299,7 @@ class PageInterleaveKVPoolMixin:
         self, specs: Dict[str, _TensorSpec]
     ) -> Tuple[List[Dict[str, torch.Tensor]], bool]:
         offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=_NUM_SCRATCH_SLOTS)
-        buf, registered = _alloc_nccl_window_buffer(self.kv_gather_comm, nbytes)
+        buf, registered = allocate_symmetric_buffer(self.kv_gather_comm, nbytes)
         if not registered:
             logger.warning(
                 "NCCL returned no symmetric window for the KV-shard gather "
