@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: Apache-2.0
+"""BF16 router activations times prepared FP32 weights on Blackwell."""
+
+import cuda.tile as ct
+import torch
+
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@ct.kernel(num_ctas=1)
+def _gemm(
+    X,
+    W,
+    WR,
+    Y,
+    BM: ct.Constant[int],
+    BN: ct.Constant[int],
+    SPLIT_K: ct.Constant[int],
+    EXPERT_MAJOR: ct.Constant[bool],
+):
+    col, row, part = ct.bid(0), ct.bid(1), ct.bid(2)
+    steps = ct.cdiv(ct.cdiv(X.shape[1], 256), SPLIT_K)
+    if EXPERT_MAJOR:
+        total = ct.full((4 * BN, BM), 0, ct.float32)
+    else:
+        total = ct.full((BM, BN), 0, ct.float32)
+        residual = ct.full((BM, 2 * BN), 0, ct.float32)
+    for step in range(steps):
+        k = part * steps + step
+        x = ct.load(
+            X,
+            (row, k),
+            (BM, 256),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=4 if EXPERT_MAJOR else 8,
+        )
+        if EXPERT_MAJOR:
+            w = ct.load(
+                W,
+                (0, col, k),
+                (4, BN, 256),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=4,
+            )
+            local = ct.mma(
+                ct.reshape(w, (4 * BN, 256)),
+                ct.transpose(x),
+                ct.full((4 * BN, BM), 0, ct.float32),
+            )
+        else:
+            w0 = ct.load(
+                W,
+                (0, col, k),
+                (1, BN, 256),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=8,
+            )
+            wr = ct.load(
+                WR,
+                (0, col, k),
+                (2, BN, 256),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=8,
+            )
+            local = ct.mma(
+                x,
+                ct.transpose(ct.reshape(w0, (BN, 256))),
+                ct.full((BM, BN), 0, ct.float32),
+            )
+            residual = ct.mma(
+                x,
+                ct.transpose(ct.reshape(wr, (2 * BN, 256))),
+                residual,
+            )
+        # Round each K256 main-product sum before adding the next tile.
+        total = ct.add(total, local, rounding_mode=ct.RoundingMode.RN)
+    if EXPERT_MAJOR:
+        main = ct.extract(total, (0, 0), (BN, BM))
+        mid = ct.extract(total, (1, 0), (BN, BM))
+        low = ct.extract(total, (2, 0), (BN, BM))
+        value = ct.transpose(
+            ct.add(
+                main,
+                ct.add(mid, low, rounding_mode=ct.RoundingMode.RN),
+                rounding_mode=ct.RoundingMode.RN,
+            )
+        )
+    else:
+        correction = ct.sum(
+            ct.reshape(residual, (BM, 2, BN)),
+            axis=1,
+            rounding_mode=ct.RoundingMode.RN,
+        )
+        value = ct.add(total, correction, rounding_mode=ct.RoundingMode.RN)
+    ct.store(
+        Y,
+        (part, row, col),
+        ct.reshape(value, (1, BM, BN)),
+        allow_tma=not (BM == 256 and SPLIT_K > 1),
+    )
+
+
+@ct.kernel
+def _reduce(P, Y, SPLIT_K: ct.Constant[int]):
+    if SPLIT_K == 2:
+        values = ct.load(
+            P,
+            (0, ct.bid(0)),
+            (SPLIT_K, 1024),
+            padding_mode=ct.PaddingMode.ZERO,
+            allow_tma=False,
+        )
+        total = ct.sum(values, axis=0, rounding_mode=ct.RoundingMode.RN)
+    else:
+        total = ct.full((1024,), 0, ct.float32)
+        for part in range(SPLIT_K):
+            value = ct.load(
+                P,
+                (part, ct.bid(0)),
+                (1, 1024),
+                padding_mode=ct.PaddingMode.ZERO,
+                allow_tma=False,
+            )
+            total = ct.add(
+                total,
+                ct.reshape(value, (1024,)),
+                rounding_mode=ct.RoundingMode.RN,
+            )
+    ct.store(Y, (ct.bid(0),), total, allow_tma=False)
+
+
+_KERNELS = {1: _gemm, 2: _gemm.replace_hints(num_ctas=2)}
+_CONFIGS = (
+    (64, (32, 16, 4, 1)),
+    (128, (64, 32, 4, 1)),
+    (512, (128, 64, 8, 1)),
+    (1024, (128, 64, 4, 1)),
+    (2048, (128, 64, 2, 1)),
+    (4096, (256, 128, 2, 2)),
+)
+
+
+def _fake_router_gemm(x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], parts.shape[0] // 3), dtype=torch.float32)
+
+
+@register_custom_op(fake_impl=_fake_router_gemm)
+def router_gemm_bf16x3_cutile(x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
+    """Multiply BF16 [M, K] by prepared BF16 [3N, K], producing FP32 [M, N]."""
+    m, k = x.shape
+    n = parts.shape[0] // 3
+    bm, bn, splits, ctas = next(
+        (config for limit, config in _CONFIGS if m <= limit),
+        (256, 128, 1, 2),
+    )
+    out = torch.empty((m, n), device=x.device, dtype=torch.float32)
+    if m == 0 or n == 0:
+        return out
+    partial = (
+        torch.empty((splits, m, n), device=x.device, dtype=torch.float32)
+        if splits > 1
+        else out.unsqueeze(0)
+    )
+    with torch.cuda.device(x.device):
+        stream = torch.cuda.current_stream()
+        ct.launch(
+            stream,
+            (ct.cdiv(n, bn), ct.cdiv(m, bm), splits),
+            _KERNELS[ctas],
+            (
+                x,
+                parts.view(3, n, k),
+                parts[n:].view(2, n, k),
+                partial,
+                bm,
+                bn,
+                splits,
+                m <= 64,
+            ),
+        )
+        if splits > 1:
+            ct.launch(
+                stream,
+                (ct.cdiv(out.numel(), 1024),),
+                _reduce,
+                (partial.view(splits, -1), out.view(-1), splits),
+            )
+    return out
