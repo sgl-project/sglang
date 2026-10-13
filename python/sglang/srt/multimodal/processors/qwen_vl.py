@@ -1017,6 +1017,12 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            # A pre-tokenized prompt (list[int]) keeps its ids: with them,
+            # process_and_combine_mm_data expands one placeholder per image in
+            # place (SGLANG_MM_AVOID_RETOKENIZE) instead of re-tokenizing the
+            # decoded text, which merges split tokens and drifts from the
+            # client's ids.
+            input_ids=input_text if isinstance(input_text, list) else None,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
