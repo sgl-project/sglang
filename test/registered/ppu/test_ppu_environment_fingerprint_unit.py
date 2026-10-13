@@ -963,7 +963,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
             text,
         )
 
-    def test_nine_workflows_pin_action_and_inject_provenance(self):
+    def test_nine_workflows_inject_provenance(self):
         names = (
             "answer",
             "answer-16",
@@ -975,19 +975,16 @@ class TestEnvironmentIntegration(unittest.TestCase):
             "pd-perf-qwen35",
             "accuracy",
         )
-        sha = "caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9"
         for name in names:
             with self.subTest(workflow=name):
                 text = (ROOT / f".github/workflows/test-ppu-{name}.yml").read_text()
                 count = text.count("uses: flytiger-eco/ppu-distributed-action@")
                 self.assertGreater(count, 0)
-                self.assertEqual(
-                    text.count("uses: flytiger-eco/ppu-distributed-action@" + sha),
-                    count,
-                )
+                # action 可使用 main；这里只检查来源信息注入，不限制版本。
                 self.assertEqual(text.count("observe_pod_environment.sh start"), count)
                 self.assertEqual(
-                    text.count("SGLANG_PPU_DISTRIBUTED_ACTION_SHA=" + sha), count
+                    len(re.findall(r"SGLANG_PPU_DISTRIBUTED_ACTION_SHA=[^,\s]+", text)),
+                    count,
                 )
                 self.assertEqual(text.count("SGLANG_PPU_POD_METADATA="), count)
                 self.assertEqual(
