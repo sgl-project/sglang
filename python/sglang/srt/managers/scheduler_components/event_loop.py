@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 class LoopSpec:
     # Writes the mode's flags and installs its in-flight queue.
     enter: Callable[[Scheduler], None]
-    # Plans the next step.
     plan: Callable[[Scheduler], Optional[ScheduleBatch]]
     # Advances the PD queues after intake; the requests they have ready join
     # the waiting queue.
@@ -96,12 +95,10 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         elif batch is None:
             # When the server is idle, do self-check and re-init some states
             self.on_idle()
-        # Rows whose finish a commit observed leave here, after the launch: a
-        # decode step copied from the rows hands back its run writes first.
-        # This also covers the commit made before the launch; a depth-0 loop
-        # commits only the step it launched. The readers between steps (in PD
-        # decode, preallocation and the prebuilt join) then see only the rows
-        # still decoding.
+        # Rows whose finish a commit observed leave here, after the launch, so a
+        # decode step copied from the rows hands back its run writes first. The
+        # readers between steps (in PD decode, preallocation and the prebuilt
+        # join) then see only the rows still decoding.
         if spec.leave_finished_rows and (overlapped or batch):
             self.leave_finished_rows(self.decoding_batch)
         if spec.after_commit:
