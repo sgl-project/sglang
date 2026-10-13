@@ -126,15 +126,19 @@ def test_cache_dit_context_refreshes_once_per_sampler_run() -> None:
     of that run continue it, and the next run (new id) starts fresh."""
     family = uuid.uuid4().hex
 
-    def call(run):
+    def call(run, separate_cfg=False):
         req = _Req()
-        req.extra = {"comfyui_session_id": f"{family}:{run}", "comfyui_num_steps": 25}
+        req.extra = {
+            "comfyui_session_id": f"{family}:{run}",
+            "comfyui_num_steps": 25,
+            "comfyui_separate_cfg": separate_cfg,
+        }
         bind_comfyui_session(req)
         return comfyui_cache_dit_run(req)
 
-    assert call(1) == (25, True)
-    assert call(1) == (25, False)
-    assert call(2) == (25, True)
+    assert call(1) == (25, True, False)
+    assert call(1) == (25, False, False)
+    assert call(2, separate_cfg=True) == (25, True, True)
     plain = _Req()
     plain.extra = {"comfyui_session_id": f"{family}:2"}
     assert comfyui_cache_dit_run(plain) is None

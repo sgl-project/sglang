@@ -535,6 +535,7 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     has_separate_cfg: bool = False,
+    separate_cfg_override: bool | None = None,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -587,6 +588,8 @@ def enable_cache_on_transformer(
         # SCM fields
         steps_computation_mask=config.steps_computation_mask,
         steps_computation_policy=config.steps_computation_policy,
+        # None keeps the registered adapter's default for its diffusers pipeline.
+        enable_separate_cfg=separate_cfg_override,
     )
 
     # Build calibrator config. DMD and TaylorSeer are mutually exclusive

@@ -21,6 +21,7 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
     CACHE_OPTIONS_KEY,
     build_cache_options,
+    guider_runs_cfg,
     read_cache_options,
     request_cache_dit_for_run,
     with_cache_options,
@@ -428,20 +429,35 @@ def test_cache_options_reject_bad_requests() -> None:
         build_cache_options(None, {"max_warmup_steps": 2})
 
 
-def test_cache_dit_run_sends_sampler_steps_and_rejects_uncond() -> None:
+def test_cache_dit_run_sends_sampler_steps_and_cfg_mode() -> None:
     """The worker counts DiT calls as Cache-DiT steps, so it needs the run's
-    step count and exactly one call per step."""
+    step count and whether cond and uncond calls alternate within a step."""
+    sigmas = torch.linspace(1, 0, 26)
     packed = SimpleNamespace(extra_req={})
     request_cache_dit_for_run(
-        packed, {"sample_sigmas": torch.linspace(1, 0, 26), "cond_or_uncond": [0]}
+        packed, {"sample_sigmas": sigmas, "cond_or_uncond": [0]}, False
     )
     assert packed.extra_req["comfyui_num_steps"] == 25
-    with pytest.raises(ValueError, match="one DiT call per step"):
+    assert packed.extra_req["comfyui_separate_cfg"] is False
+    request_cache_dit_for_run(
+        packed, {"sample_sigmas": sigmas, "cond_or_uncond": [1]}, True
+    )
+    assert packed.extra_req["comfyui_separate_cfg"] is True
+    with pytest.raises(ValueError, match="does not run CFG"):
         request_cache_dit_for_run(
-            packed, {"sample_sigmas": [1.0, 0.0], "cond_or_uncond": [1]}
+            packed, {"sample_sigmas": [1.0, 0.0], "cond_or_uncond": [1]}, False
         )
     with pytest.raises(ValueError, match="sample_sigmas"):
-        request_cache_dit_for_run(packed, {"cond_or_uncond": [0]})
+        request_cache_dit_for_run(packed, {"cond_or_uncond": [0]}, False)
+
+
+def test_only_a_cfg_guider_with_a_negative_runs_both_branches() -> None:
+    """ComfyUI skips the uncond call at cfg 1, and BasicGuider has no cfg."""
+    conds = {"positive": [], "negative": []}
+    assert guider_runs_cfg(SimpleNamespace(cfg=4.0, conds=conds))
+    assert not guider_runs_cfg(SimpleNamespace(cfg=1.0, conds=conds))
+    assert not guider_runs_cfg(SimpleNamespace(cfg=4.0, conds={"positive": []}))
+    assert not guider_runs_cfg(SimpleNamespace(conds={"positive": []}))
 
 
 def _h3_kwargs(executor, cache_options):

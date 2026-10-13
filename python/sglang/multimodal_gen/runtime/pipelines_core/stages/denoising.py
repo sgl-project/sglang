@@ -1084,9 +1084,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
+        # A ComfyUI CFG step arrives as one request per branch, so the request
+        # itself carries no CFG; the sampler run says whether branches alternate.
         has_separate_cfg = (
             requested
-            and batch.do_classifier_free_guidance
+            and (
+                batch.do_classifier_free_guidance
+                or (comfyui_run is not None and comfyui_run[2])
+            )
             and not self.server_args.enable_cfg_parallel
         )
         desired_key = (
@@ -1216,6 +1221,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 sp_group=sp_group,
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
+                # Registered adapters ignore has_separate_cfg and assume a diffusers
+                # pipeline that batches CFG; ComfyUI sends one request per branch.
+                separate_cfg_override=(
+                    True if comfyui_run is not None and comfyui_run[2] else None
+                ),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",

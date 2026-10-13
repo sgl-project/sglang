@@ -29,22 +29,34 @@ def build_cache_options(
     return {"enable_cache_dit": enable_cache_dit, "cache_dit_params": params or None}
 
 
-def request_cache_dit_for_run(packed, transformer_options) -> None:
+def request_cache_dit_for_run(packed, transformer_options, separate_cfg: bool) -> None:
     """Ask the worker to keep one Cache-DiT context for the whole sampler run.
 
-    ComfyUI sends one request per DiT call, and the worker's cache context counts
-    calls as steps, so a step with a separate uncond call would desync it.
+    ComfyUI sends one request per DiT call. With CFG the cond and uncond calls
+    alternate, which Cache-DiT counts as one step when mounted with separate CFG.
     """
     options = transformer_options or {}
-    if 1 in (options.get("cond_or_uncond") or ()):
+    if 1 in (options.get("cond_or_uncond") or ()) and not separate_cfg:
         raise ValueError(
-            "Cache-DiT through ComfyUI needs one DiT call per step; set cfg to 1 "
-            "or turn Cache-DiT off for this run."
+            "Cache-DiT through ComfyUI got an uncond call in a run whose guider "
+            "does not run CFG; set cfg to 1 or turn Cache-DiT off for this run."
         )
     sigmas = options.get("sample_sigmas")
     if sigmas is None or len(sigmas) < 2:
         raise ValueError("Cache-DiT through ComfyUI needs the sampler's sample_sigmas")
     packed.extra_req["comfyui_num_steps"] = len(sigmas) - 1
+    packed.extra_req["comfyui_separate_cfg"] = separate_cfg
+
+
+def guider_runs_cfg(guider) -> bool:
+    """Whether this sampler run evaluates cond and uncond every step.
+
+    ComfyUI skips the uncond branch at cfg == 1; guiders other than CFGGuider
+    (BasicGuider, custom ones) carry no cfg and run a single branch.
+    """
+    cfg = getattr(guider, "cfg", 1.0)
+    conds = getattr(guider, "conds", None) or {}
+    return cfg != 1.0 and "negative" in conds
 
 
 def with_cache_options(model, options: dict[str, Any]):

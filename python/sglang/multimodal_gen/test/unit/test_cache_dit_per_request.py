@@ -134,11 +134,13 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.disable_calls = []
         self.refresh_calls = []
         self.cfg_modes = []
+        self.cfg_overrides = []
         self.refresh_options = []
 
         def fake_enable(transformer, config, **kwargs):
             self.enable_calls.append(config)
             self.cfg_modes.append(kwargs["has_separate_cfg"])
+            self.cfg_overrides.append(kwargs.get("separate_cfg_override"))
             return transformer
 
         def fake_disable(transformer):
@@ -195,6 +197,26 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.assertEqual(len(self.enable_calls), 1)
         self.assertEqual(self.enable_calls[0].num_inference_steps, 25)
         self.assertEqual(self.refresh_calls, [25])
+
+    def test_comfyui_cfg_run_mounts_with_separate_cfg(self):
+        """ComfyUI sends cond and uncond as separate one-row requests, so the
+        request has no CFG of its own; a CFG run must still mount separate CFG,
+        and registered adapters only honor it through the explicit override."""
+        self.stage.server_args.comfyui_mode = True
+        family = uuid.uuid4().hex
+        try:
+            for run, separate_cfg in ((1, False), (2, True)):
+                batch = _batch(enable_cache_dit=True)
+                batch.extra = {
+                    "comfyui_session_id": f"{family}:{run}",
+                    "comfyui_num_steps": 25,
+                    "comfyui_separate_cfg": separate_cfg,
+                }
+                self.stage._maybe_enable_cache_dit(1, batch)
+        finally:
+            release_comfyui_session(f"{family}:2")
+        self.assertEqual(self.cfg_modes, [False, True])
+        self.assertEqual(self.cfg_overrides, [None, True])
 
     def test_cfg_change_remounts_and_parallel_cfg_has_one_branch_per_rank(self):
         self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))

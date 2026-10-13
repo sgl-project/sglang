@@ -8,6 +8,7 @@ import uuid
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
+    guider_runs_cfg,
     read_cache_options,
     request_cache_dit_for_run,
 )
@@ -159,6 +160,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     cache_dit_needs_run_steps = True
     # Loader-option default (SGLDOptions); a per-run SGLDCacheOptions value wins.
     enable_cache_dit: bool | None = None
+    # Whether the current sampler run alternates cond and uncond requests.
+    _run_separate_cfg: bool = False
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -226,6 +229,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         if self._ensure_runtime is not None:
             self._ensure_runtime(self)
         model_wrap = args[0] if args else kwargs["model_wrap"]
+        self._run_separate_cfg = guider_runs_cfg(model_wrap)
         desired = model_wrap.model_patcher.model_options.get("sgld_lora_input")
         if desired != self._lora_input:
             if self._lora_input is not None:
@@ -339,7 +343,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter.fill_req(req, packed)
         extra = dict(req.extra or {})
         extra["comfyui_session_id"] = self.comfyui_session_id()
-        for key in ("comfyui_cond_key", "comfyui_cache_fp", "comfyui_num_steps"):
+        for key in (
+            "comfyui_cond_key",
+            "comfyui_cache_fp",
+            "comfyui_num_steps",
+            "comfyui_separate_cfg",
+        ):
             value = packed.extra_req.get(key)
             if value is not None:
                 extra[key] = value
@@ -394,5 +403,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         )
         packed.cache_options = read_cache_options(kwargs.get("transformer_options"))
         if self.cache_dit_needs_run_steps and self._cache_dit_enabled_for(packed):
-            request_cache_dit_for_run(packed, kwargs.get("transformer_options"))
+            request_cache_dit_for_run(
+                packed, kwargs.get("transformer_options"), self._run_separate_cfg
+            )
         return self._execute_packed(packed, x, timestep)
