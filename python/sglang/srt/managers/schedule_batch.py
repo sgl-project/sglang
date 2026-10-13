@@ -2795,10 +2795,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "encoder SWA replay cannot return cached prompt logprobs"
                     )
             self.encoder_swa_reset = [
-                self.dsv41_cache_only_replay
-                or r.kv.req_pool_idx is None
-                or r.is_retracted
-                for r in reqs
+                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(

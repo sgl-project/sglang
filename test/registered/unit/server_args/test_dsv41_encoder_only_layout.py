@@ -7,6 +7,7 @@ from sglang.srt.arg_groups.deepseek_v4_hook import (
     validate_deepseek_v41_features,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -15,6 +16,9 @@ def _official_config(**overrides):
     values = dict(
         num_hidden_layers=40,
         num_nextn_predict_layers=3,
+        kv_source_layer_ids=[2, 8, 14, 20],
+        window_size=128,
+        vision_n_layers=0,
         compress_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
     )
     values.update(overrides)
@@ -54,7 +58,7 @@ def _encoder_only_args(**overrides):
     return SimpleNamespace(**values)
 
 
-class TestDsv41EncoderOnlyRatioLayout(unittest.TestCase):
+class TestDsv41EncoderOnlyRatioLayout(CustomTestCase):
     def test_accepts_official_target_plus_bundled_mtp_layout(self):
         _validate_dsv41_encoder_only_ratio_layout(_official_config())
 
@@ -86,6 +90,65 @@ class TestDsv41EncoderOnlyRatioLayout(unittest.TestCase):
             _validate_dsv41_encoder_only_ratio_layout(
                 _official_config(compress_ratios=ratios)
             )
+
+    def test_ratio_layout_derives_boundary_from_valid_source_ids(self):
+        _validate_dsv41_encoder_only_ratio_layout(
+            _official_config(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=0,
+                kv_source_layer_ids=[2],
+                compress_ratios=[0, 0, 2, 1],
+            )
+        )
+        for sources in ([], [-1], [40]):
+            with self.subTest(sources=sources):
+                with self.assertRaisesRegex(ValueError, "valid target KV source"):
+                    _validate_dsv41_encoder_only_ratio_layout(
+                        _official_config(kv_source_layer_ids=sources)
+                    )
+
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.get_platform")
+    def test_encoder_only_rejects_unsupported_window_and_vision(
+        self, platform, view, model
+    ):
+        """Do not advertise a discarded vision tower or silently replay too few tokens."""
+        platform.return_value.is_cuda = True
+        for role in ("prefill", "decode"):
+            view.return_value = _encoder_only_args(disaggregation_mode=role)
+            for override, message in (
+                ({"window_size": 256}, "window_size=128"),
+                ({"vision_n_layers": 24}, "text-only model"),
+            ):
+                with self.subTest(role=role, override=override):
+                    model.return_value = SimpleNamespace(
+                        hf_config=_official_config(
+                            model_type="deepseek_v41",
+                            hc_pre_from_prev_sublayer=True,
+                            index_source_layer_ids=[2, 8, 14, 20],
+                            engram_layer_ids=[],
+                            **override,
+                        )
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate_deepseek_v41_features(SimpleNamespace())
+
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
+    def test_encoder_only_accepts_explicit_language_only_config(self, view, model):
+        view.return_value = _encoder_only_args()
+        model.return_value = SimpleNamespace(
+            hf_config=_official_config(
+                model_type="deepseek_v41",
+                hc_pre_from_prev_sublayer=True,
+                index_source_layer_ids=[2, 8, 14, 20],
+                engram_layer_ids=[],
+                vision_n_layers=24,
+                language_model_only=True,
+            )
+        )
+        validate_deepseek_v41_features(SimpleNamespace())
 
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")

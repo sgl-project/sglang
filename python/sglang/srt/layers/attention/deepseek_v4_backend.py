@@ -2765,13 +2765,15 @@ class DeepseekV4AttnBackend(
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
             return
-        state_only_replay = forward_batch.encoder_swa_replay
-        if state_only_replay:
+        state_only_replay = forward_batch.dsv41_cache_only_replay
+        if forward_batch.encoder_swa_replay:
             # The transferred ratio-1/2 Main-KV and Indexer-K rows are
             # authoritative.  Ratio-2 nevertheless has a request-local pending
             # pair which must be reconstructed by the bounded tail replay for
             # the next decode token.
-            run_compressor = layer.compress_ratio == 2
+            # Keep the existing non-PD encoder replay read-only. Only the
+            # asymmetric handoff needs to reconstruct the ratio-2 pending pair.
+            run_compressor = state_only_replay and layer.compress_ratio == 2
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -2800,6 +2802,7 @@ class DeepseekV4AttnBackend(
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
+            and not state_only_replay
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
@@ -2861,7 +2864,11 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress(
         self, layer, x, req, pos, forward_batch, *, state_only=False
     ) -> None:
-        if forward_batch.forward_mode.is_decode():
+        if state_only:
+            # Fused compression also publishes Main-KV/Indexer-K. During
+            # cache-only replay those transferred rows must remain untouched.
+            self._low_ratio_compress_torch(layer, x, req, pos, state_only=True)
+        elif forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
             forward_batch.forward_mode.is_target_verify()

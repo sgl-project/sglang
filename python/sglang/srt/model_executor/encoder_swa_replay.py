@@ -2,6 +2,8 @@ from copy import copy
 
 import torch
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
+
 
 def run_encoder_swa_replay(worker, batch):
     from sglang.srt.model_executor.forward_batch_info import (
@@ -18,11 +20,6 @@ def run_encoder_swa_replay(worker, batch):
             continue
         slot = batch.req_pool_indices[i : i + 1]
         window.reset(slot)
-        # The cache-only handoff's ordinary EXTEND is itself the bounded replay.
-        # Only reset request-local SWA state here; an extra replay would execute
-        # the same tail twice.
-        if batch.dsv41_cache_only_replay:
-            continue
         end = batch.prefix_lens[i]
         if not end:
             continue
@@ -30,7 +27,7 @@ def run_encoder_swa_replay(worker, batch):
             raise ValueError(
                 "encoder SWA replay requires an even cached-prefix boundary"
             )
-        start = max(0, end - 128)
+        start = max(0, end - DSV41_REPLAY_WINDOW)
         req = batch.reqs[i]
         replay = copy(batch)
         replay.reqs = [req]
