@@ -927,6 +927,7 @@ class BeamModel(nn.Module):
             or not _beam_owns_tp_boundaries()
             # The global FlashInfer all-reduce already serves every size.
             or get_exec().comm.flashinfer_allreduce_fusion_backend is not None
+            or get_exec().comm.enforce_disable_flashinfer_allreduce_fusion
             or not torch.cuda.is_available()
         ):
             return None
