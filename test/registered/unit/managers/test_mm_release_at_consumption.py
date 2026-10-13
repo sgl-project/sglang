@@ -96,31 +96,45 @@ def test_release_policy_requires_opt_in_radix_and_pp1() -> None:
         assert not should_release_mm_features(args(pp_size=2))
 
 
-def test_released_feature_cache_miss_aborts_retryable_503() -> None:
+def _abort_scheduler():
     from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    finished: list[object] = []
+    scheduler.tree_cache = SimpleNamespace(
+        finish=lambda handle, outcome: finished.append(handle)
+    )
+    retired: list[object] = []
+    scheduler.beam_coordinator = SimpleNamespace(retire_group=retired.append)
+    sent: list[tuple[object, object]] = []
+    object.__setattr__(
+        scheduler,
+        "ipc_channels",
+        SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(
+                send_output=lambda out, req=None: sent.append((out, req))
+            )
+        ),
+    )
+    return scheduler, sent, retired, finished
+
+
+def _assert_retryable_abort(sent: list[tuple[object, object]], req: Req) -> None:
+    abort_output, abort_target = sent[0]
+    abort_req = cast("AbortReq", abort_output)
+    assert abort_target is req
+    assert abort_req.finished_reason is not None
+    assert abort_req.finished_reason["status_code"] == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_released_feature_cache_miss_aborts_retryable_503() -> None:
     from sglang.srt.runtime_context import get_context
 
     _, _, _, MultimodalInputs, _ = _types()
     override = get_context().override_server_args()
     override.install()
     try:
-        scheduler = object.__new__(Scheduler)
-        finished: list[object] = []
-        scheduler.tree_cache = SimpleNamespace(
-            finish=lambda handle, outcome: finished.append(handle)
-        )
-        retired: list[object] = []
-        scheduler.beam_coordinator = SimpleNamespace(retire_group=retired.append)
-        sent: list[tuple[object, object]] = []
-        object.__setattr__(
-            scheduler,
-            "ipc_channels",
-            SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda out, req=None: sent.append((out, req))
-                )
-            ),
-        )
+        scheduler, sent, retired, finished = _abort_scheduler()
 
         req = _req("rid-mm-abort")
         released = _image_item([(0, 99)], torch.zeros(4, 2))
@@ -131,13 +145,7 @@ def test_released_feature_cache_miss_aborts_retryable_503() -> None:
 
         scheduler._abort_mm_req_with_released_features(req)
 
-        abort_output, abort_target = sent[0]
-        abort_req = cast("AbortReq", abort_output)
-        assert abort_target is req
-        assert abort_req.finished_reason is not None
-        assert (
-            abort_req.finished_reason["status_code"] == HTTPStatus.SERVICE_UNAVAILABLE
-        )
+        _assert_retryable_abort(sent, req)
         # Terminal cleanup: remaining features dropped, beam group retired.
         assert pending.feature is None
         assert retired == [req]
@@ -146,40 +154,31 @@ def test_released_feature_cache_miss_aborts_retryable_503() -> None:
         override.restore()
 
 
-def test_terminal_release_spares_session_features() -> None:
-    from sglang.srt.managers.scheduler import Scheduler
+def test_session_turn_with_evicted_released_history_aborts_503() -> None:
     from sglang.srt.runtime_context import get_context
 
-    _, _, _, MultimodalInputs, _ = _types()
+    release, _, _, MultimodalInputs, _ = _types()
     override = get_context().override_server_args()
     override.install()
     try:
-        scheduler = object.__new__(Scheduler)
-        scheduler.enable_hicache_storage = False
-        scheduler.enable_priority_scheduling = False
-        scheduler.max_queued_requests = 0
-        scheduler.waiting_queue = []
-        object.__setattr__(
-            scheduler,
-            "ipc_channels",
-            SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda out, req=None: None
-                )
-            ),
-        )
+        scheduler, sent, retired, _ = _abort_scheduler()
 
-        session_req = _req("rid-session", input_len=1)
-        session_req.session = object()  # later turns share these mm_inputs
-        session_item = _image_item([(0, 0)], torch.zeros(1, 2))
-        session_req.multimodal_inputs = MultimodalInputs(mm_items=[session_item])
-        assert scheduler._abort_on_queued_limit(session_req)
-        assert session_item.feature is not None
+        history = _image_item([(0, 9)], torch.zeros(4, 2))
+        release([MultimodalInputs(mm_items=[history])], [0], [10])
+        assert history.feature_released
 
-        plain_req = _req("rid-plain", input_len=1)
-        plain_item = _image_item([(0, 0)], torch.zeros(1, 2))
-        plain_req.multimodal_inputs = MultimodalInputs(mm_items=[plain_item])
-        assert scheduler._abort_on_queued_limit(plain_req)
-        assert plain_item.feature is None
+        req = _req("rid-session-turn", input_len=20)
+        req.session = SimpleNamespace(streaming=False)
+        new_media = _image_item([(12, 15)], torch.zeros(4, 2))
+        req.multimodal_inputs = MultimodalInputs(mm_items=[history, new_media])
+        req._session_mm_items = [new_media]
+        assert req.multimodal_inputs.has_released_items_beyond_prefix(0)
+
+        scheduler._abort_mm_req_with_released_features(req)
+
+        _assert_retryable_abort(sent, req)
+        assert new_media.feature is None
+        assert req.multimodal_inputs is None
+        assert retired == [req]
     finally:
         override.restore()
