@@ -123,6 +123,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             next_token_ids=torch.tensor([42]),
             next_draft_input=None,
             new_seq_lens=None,
+            kv_loc_plan=object(),
         )
         target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
@@ -135,7 +136,10 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         worker._target_worker = target_worker
         worker._target_hidden_projection_enabled = False
         worker._tp_sync = SimpleNamespace(sync=mock.Mock())
-        worker._kv_injector = SimpleNamespace(inject_target_hidden=mock.Mock())
+        worker._kv_injector = SimpleNamespace(
+            inject_target_hidden=mock.Mock(),
+            ids_for=mock.Mock(side_effect=lambda _plan: batch.out_cache_loc),
+        )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),
             dsv41_cache_only_replay=True,
