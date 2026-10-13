@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.managers.scheduler_components import request_queries  # noqa: E402
 from sglang.srt.managers.scheduler_components.decoding_batch import (  # noqa: E402
     DecodingBatch,
 )
@@ -167,6 +166,10 @@ class _Loop:
             "_commit_due_step",
             "_debug_check_commit_gate",
             "leave_finished_rows",
+            "is_fully_idle",
+            "_pp_microbatches_drained",
+            "collect_inflight_reqs",
+            "_collect_inflight_req_list",
         ):
             setattr(s, name, MethodType(getattr(Scheduler, name), s))
         steps = iter(steps)
@@ -176,7 +179,7 @@ class _Loop:
             rows = s.decoding_batch.rows
             self.intake.append((_rids(rows.reqs), getattr(rows, "launch", None)))
             self.intake_inflight.append(
-                sorted(r.rid for r in request_queries.inflight_reqs(s))
+                sorted(r.rid for r in s.collect_inflight_reqs())
             )
             if len(self.intake) > self.num_steps:
                 raise _StopLoop
@@ -216,8 +219,8 @@ class _Loop:
         def on_idle():
             self.idle.append(
                 (
-                    request_queries.is_idle(s),
-                    sorted(r.rid for r in request_queries.inflight_reqs(s)),
+                    s.is_fully_idle(),
+                    sorted(r.rid for r in s.collect_inflight_reqs()),
                 )
             )
 
