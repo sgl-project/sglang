@@ -13,10 +13,12 @@ def moe_fused_mul_sum_kernel(
     outputs_ptr,
     top_ids_ptr,
     expert_map_ptr,
+    output_add_ptr,
     num_tokens,
     stride_m,
     has_expert_map: tl.constexpr,
     is_ep: tl.constexpr,
+    has_output_add: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
     routed_scaling_factor: tl.constexpr,
@@ -66,10 +68,18 @@ def moe_fused_mul_sum_kernel(
             ).to(tl.float32)
         acc += a_vec * b_val[:, None]
 
+    out = acc.to(outputs_ptr.dtype.element_ty)
+    if has_output_add:
+        # Round, add in fp32, round again: bit-identical to the unfused
+        # `moe_fused_mul_sum(...) + output_add`.
+        add_ptrs = output_add_ptr + (offs_m * size)[:, None] + offs_k[None, :]
+        add_val = tl.load(add_ptrs, mask=mask, other=0.0).to(tl.float32)
+        out = (out.to(tl.float32) + add_val).to(outputs_ptr.dtype.element_ty)
+
     out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
     tl.store(
         out_ptrs,
-        acc.to(outputs_ptr.dtype.element_ty),
+        out,
         mask=mask,
     )
 
@@ -152,6 +162,7 @@ def moe_fused_mul_sum(
     expert_map: torch.Tensor | None = None,
     routed_scaling_factor: float | None = None,
     is_ep: bool = False,
+    output_add: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -168,6 +179,8 @@ def moe_fused_mul_sum(
             `expert_map` is provided. Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped.
+        output_add: Optional (num_tokens, hidden_size) tensor added in the
+            epilogue; bit-identical to adding it afterwards in torch.
 
     Returns:
         The fused weighted sum of expert outputs.
@@ -187,6 +200,10 @@ def moe_fused_mul_sum(
 
     assert outputs.shape == output_shape
     assert topk_weights.shape == (num_tokens, top_k)
+    if output_add is not None:
+        assert output_add.shape == output_shape
+        assert output_add.dtype == outputs.dtype
+        assert output_add.is_contiguous()
 
     if not isinstance(inputs, FakeTensor):
         BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
@@ -202,10 +219,12 @@ def moe_fused_mul_sum(
             outputs,
             topk_ids,
             expert_map,
+            output_add,
             num_tokens,
             top_k * size,
             expert_map is not None,
             is_ep,
+            output_add is not None,
             top_k,
             size,
             1.0 if routed_scaling_factor is None else routed_scaling_factor,

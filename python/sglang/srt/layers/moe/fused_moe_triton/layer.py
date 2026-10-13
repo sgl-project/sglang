@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
@@ -545,6 +546,12 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
+        )
+        self.supports_fused_output_add = (
+            envs.SGLANG_OPT_MOE_FUSED_OUTPUT_ADD.get()
+            and isinstance(self.quant_method, FusedMoEMethodBase)
+            and isinstance(self.quant_method.runner, MoeRunner)
+            and self.quant_method.runner.supports_fused_output_add
         )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
@@ -1511,22 +1518,27 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        output_add: Optional[torch.Tensor] = None,
     ):
+        # output_add: [num_tokens, hidden_size] added before any post-experts
+        # all-reduce, either in the runner's finalize epilogue or as a plain add.
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
-            return forward_fuseep(self, hidden_states, topk_output)
+            out = forward_fuseep(self, hidden_states, topk_output)
+            return out if output_add is None else out + output_add
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
-                return moe_forward_piecewise_cuda_graph_impl(
+                out = moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.topk_weights,
                     topk_output.topk_ids,
                     topk_output.router_logits,
                     self.layer_id,
                 )
+                return out if output_add is None else out + output_add
             elif TopKOutputChecker.format_is_bypassed(topk_output):
-                return fused_moe_bypassed_piecewise_cuda_graph_impl(
+                out = fused_moe_bypassed_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.router_logits,
                     topk_output.topk_config.top_k,
@@ -1537,14 +1549,21 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id,
                     topk_output.topk_config.allow_routed_experts_capture,
                 )
+                return out if output_add is None else out + output_add
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
                 return self.forward_impl(
-                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                    output_add=output_add,
                 )
         else:
             return self.forward_impl(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                output_add=output_add,
             )
 
     def forward_impl(
@@ -1552,6 +1571,7 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        output_add: Optional[torch.Tensor] = None,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1563,6 +1583,20 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self._dispatch_with_pre_quant(
             hidden_states, topk_output, pre_quant_input
         )
+
+        fuse_output_add = (
+            output_add is not None
+            and self.supports_fused_output_add
+            and dispatch_output.format.is_standard()
+            # The epilogue output lines up with output_add only when dispatch
+            # kept the rows and the hidden dim is unpadded.
+            and output_add.shape
+            == (dispatch_output.hidden_states.shape[0], self.hidden_size)
+            and output_add.dtype == self.params_dtype
+            and output_add.is_contiguous()
+        )
+        if fuse_output_add:
+            dispatch_output = dispatch_output._replace(output_add=output_add)
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
@@ -1580,6 +1614,9 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+
+        if output_add is not None and not fuse_output_add:
+            final_hidden_states = final_hidden_states + output_add
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

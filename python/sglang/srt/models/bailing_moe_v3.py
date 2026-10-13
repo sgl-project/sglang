@@ -732,9 +732,11 @@ class BailingMoE(nn.Module):
                 hidden_states, forward_batch
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
+            # Fold the shared output into MoE finalize when supported.
+            output_add = self._forward_shared_experts(hidden_states)
+            shared_output = None
             final_hidden_states = self._forward_router_experts(
-                hidden_states, forward_batch
+                hidden_states, forward_batch, output_add=output_add
             )
 
         if shared_output is not None:
@@ -784,6 +786,7 @@ class BailingMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch],
+        output_add: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         router_logits, dynamic_expert_bias = self._forward_gate(
             hidden_states, forward_batch
@@ -793,7 +796,7 @@ class BailingMoE(nn.Module):
             router_logits,
             dynamic_expert_bias=dynamic_expert_bias,
         )
-        return self.experts(hidden_states, topk_output)
+        return self.experts(hidden_states, topk_output, output_add=output_add)
 
     def forward_normal_dual_stream(
         self,

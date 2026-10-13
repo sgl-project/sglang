@@ -69,6 +69,8 @@ class StandardDispatchOutput(NamedTuple):
     # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
     # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
     hidden_states_pre_quant: Optional[Tuple] = None
+    # Shared output folded into the runner finalize when supported.
+    output_add: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:

@@ -142,6 +142,10 @@ class MoeRunnerCore(ABC):
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
 
+    @property
+    def supports_fused_output_add(self) -> bool:
+        return False
+
     def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
         return self.runner_backend == MoeRunnerBackend.TRITON
 
@@ -156,6 +160,10 @@ class DispatchMoeRunnerCore(ABC):
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackendLike: ...
 
+    @property
+    def supports_fused_output_add(self) -> bool:
+        return False
+
     @abstractmethod
     def run_from_dispatch(
         self,
@@ -168,10 +176,15 @@ class DispatchMoeRunnerCore(ABC):
 
 class FusedOpPool:
     _fused_funcs: dict[str, Callable] = {}
+    _output_add_fused_funcs: set[Callable] = set()
 
     @classmethod
     def register_fused_func(
-        cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
+        cls,
+        a2a_backend_name: str,
+        runner_backend_name: str,
+        fused_func: Callable,
+        folds_output_add: bool = False,
     ):
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
@@ -185,6 +198,12 @@ class FusedOpPool:
             f"Invalid runner name: {runner_backend_name}"
         )
         cls._fused_funcs[key] = fused_func
+        if folds_output_add:
+            cls._output_add_fused_funcs.add(fused_func)
+
+    @classmethod
+    def folds_output_add(cls, fused_func: Callable) -> bool:
+        return fused_func in cls._output_add_fused_funcs
 
     @classmethod
     def get_fused_func(cls, dispatch_name: str, runner_name: str) -> Optional[Callable]:
@@ -289,6 +308,8 @@ class PermuteMethodPool:
 def register_fused_func(
     a2a_backend_name: str,
     runner_backend_name: str,
+    *,
+    folds_output_add: bool = False,
 ) -> Callable:
     """
     Decorator to register a fused function for the given DispatchOutputFormat and MoeRunnerBackend.
@@ -300,7 +321,10 @@ def register_fused_func(
 
     def decorator(fused_func: Callable):
         FusedOpPool.register_fused_func(
-            a2a_backend_name, runner_backend_name, fused_func
+            a2a_backend_name,
+            runner_backend_name,
+            fused_func,
+            folds_output_add=folds_output_add,
         )
         return fused_func
 

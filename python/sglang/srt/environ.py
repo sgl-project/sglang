@@ -1317,6 +1317,9 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Fold the shared-expert output into the MoE finalize epilogue when the
+    # runner supports it (Humming indexed gemm); bit-identical to a separate add.
+    SGLANG_OPT_MOE_FUSED_OUTPUT_ADD = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM Mega MoE
