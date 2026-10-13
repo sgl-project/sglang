@@ -680,5 +680,248 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
 
 
+class TestNPUMlaHostAllocation(CustomTestCase):
+    @contextlib.contextmanager
+    def _native_pool(self, *, packed=False, indexed=True, memfabric=False, dcp_size=1):
+        import os
+
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.pool_host import mla
+
+        allocations = []
+
+        def allocate(dims, *, dtype, device, **_):
+            # Substitute NPU allocation/registration; keep tensor geometry real.
+            tensor = torch.empty(dims, dtype=dtype, device=device)
+            self.assertGreater(tensor.numel(), 0)
+            allocations.append(tensor)
+            return tensor
+
+        parallel = SimpleNamespace(
+            attn_dcp_size=dcp_size, attn_dcp_rank=0, dcp_enabled=dcp_size > 1
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch(
+                    "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+                    return_value=parallel,
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "false",
+                        "SGLANG_USE_FIA_NZ": "false",
+                    },
+                )
+            )
+            pool = NPUMLATokenToKVPool(
+                size=32,
+                page_size=4,
+                dtype=torch.float8_e4m3fn if packed else torch.bfloat16,
+                kv_lora_rank=128,
+                qk_rope_head_dim=16,
+                layer_num=3,
+                start_layer=7,
+                end_layer=10,
+                device="cpu",
+                enable_memory_saver=False,
+                index_head_dim=128 if indexed else None,
+                index_size=64,
+                index_page_size=8,
+                indexer_layer_ids=(9, 7) if indexed else None,
+                kv_cache_dim=164 if packed else None,
+            )
+            for name, value in (
+                ("_is_npu", True),
+                ("_is_cuda", False),
+                ("_is_hip", False),
+            ):
+                stack.enter_context(unittest.mock.patch.object(mla, name, value))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    assembler, "get_parallel", return_value=parallel
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_ratio=2,
+                        hicache_size=0,
+                        hicache_mem_layout="page_first_kv_split",
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    assembler, "_get_allocator_type", return_value="default"
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    mla, "memfabric_host_memory_enabled", return_value=memfabric
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.dict(mla.ALLOC_MEMORY_FUNCS, {"cpu": allocate})
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    mla, "alloc_with_memfabric", side_effect=allocate
+                )
+            )
+            reserve = stack.enter_context(
+                unittest.mock.patch.object(mla, "ensure_memfabric_capacity")
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+                )
+            )
+            # Hosts use CPU tensors here; no CUDA registration is performed.
+            stack.enter_context(unittest.mock.patch.object(base, "_is_cuda", False))
+            stack.enter_context(unittest.mock.patch.object(base, "_is_hip", False))
+            yield pool, assembler, allocations, reserve
+
+    def test_split_allocation_matches_device_components_and_budget(self):
+        """Builder K-only overrides omitted BF16 RoPE, and packed FP8 allocated it twice."""
+        for packed, indexed in ((False, False), (False, True), (True, True)):
+            for memfabric in (False, True):
+                with self.subTest(packed=packed, indexed=indexed, memfabric=memfabric):
+                    with self._native_pool(
+                        packed=packed, indexed=indexed, memfabric=memfabric
+                    ) as (pool, assembler, allocations, reserve):
+                        host = assembler.build_kv_host_pool(kv_pool=pool, page_size=4)
+                        try:
+                            actual_bytes = sum(t.nbytes for t in allocations)
+                            self.assertEqual(
+                                actual_bytes, host.size * host.size_per_token
+                            )
+                            self.assertEqual(
+                                host.v_buffer.shape[-1], pool.v_buffer.shape[-1]
+                            )
+                            self.assertEqual(
+                                host.k_buffer.shape[-1], pool.k_buffer.shape[-1]
+                            )
+                            self.assertEqual(host.kv_cache_dim, pool.kv_cache_dim)
+                            if indexed:
+                                self.assertEqual(host.index_k_buffer.shape[1], 2)
+                                self.assertEqual(len(allocations), 3)
+                            else:
+                                self.assertIsNone(host.index_k_buffer)
+                                self.assertEqual(len(allocations), 2)
+                            if packed:
+                                self.assertEqual(host.v_buffer.numel(), 0)
+                                self.assertEqual(
+                                    host.index_k_scale_buffer.dtype, torch.float32
+                                )
+                            else:
+                                self.assertGreater(host.v_buffer.numel(), 0)
+                                self.assertIsNone(host.index_k_scale_buffer)
+                            if memfabric:
+                                reserve.assert_called_once_with(actual_bytes, 0)
+                            else:
+                                reserve.assert_not_called()
+                        finally:
+                            host.destroy()
+
+    def test_fixed_size_includes_rope(self):
+        """Builder K-only overrides must not increase fixed-byte host capacity."""
+        with self._native_pool() as (pool, assembler, allocations, _):
+            # Three BF16 latent128+RoPE16 layers plus two BF16 index128 layers.
+            bytes_per_token = 1376
+            host = assembler.build_kv_host_pool(
+                kv_pool=pool, page_size=4, host_size=100_000 / 1e9
+            )
+            try:
+                actual_bytes = sum(t.nbytes for t in allocations)
+                self.assertEqual(host.size, 76)
+                self.assertEqual(actual_bytes, host.size * bytes_per_token)
+                # The existing allocator adds one padding page even on exact division.
+                self.assertLessEqual(actual_bytes, 100_000 + 4 * bytes_per_token)
+            finally:
+                host.destroy()
+
+    def test_available_memory_includes_rope(self):
+        """Reject the actual combined allocation before consuming any host memory."""
+        with self._native_pool() as (pool, assembler, allocations, _):
+            with base.host_memory_budget_scope(90_000):
+                with self.assertRaisesRegex(ValueError, "Not enough host memory"):
+                    assembler.build_kv_host_pool(kv_pool=pool, page_size=4)
+            self.assertEqual(allocations, [])
+            with base.host_memory_budget_scope(93_568):
+                host = assembler.build_kv_host_pool(kv_pool=pool, page_size=4)
+                try:
+                    self.assertEqual(sum(t.nbytes for t in allocations), 93_568)
+                    self.assertEqual(base.host_memory_budget_bytes(), 0)
+                finally:
+                    host.destroy()
+
+    def test_dummy_uses_same_budget_without_allocations(self):
+        with self._native_pool() as (pool, _, allocations, reserve):
+            host = MLATokenToKVPoolHost(
+                pool,
+                2,
+                100_000 / 1e9,
+                4,
+                "page_first_kv_split",
+                override_kv_cache_dim=pool.kv_cache_dim,
+                is_dummy=True,
+            )
+            try:
+                self.assertEqual(host.size, 76)
+                self.assertEqual(host.size_per_token, 1376)
+                self.assertEqual(host.get_contiguous_buf_infos(), ([], [], []))
+                self.assertIsNone(host.kv_buffer)
+                indices = torch.tensor([0])
+                with self.assertRaisesRegex(AssertionError, "dummy"):
+                    host.backup_from_device_all_layer(
+                        pool, indices, indices, "kernel_ascend"
+                    )
+                with self.assertRaisesRegex(AssertionError, "dummy"):
+                    host.load_to_device_per_layer(
+                        pool, indices, indices, 0, "kernel_ascend"
+                    )
+                indices = host.alloc(4)
+                self.assertEqual(host.available_size(), 72)
+                host.free(indices)
+                self.assertEqual(host.available_size(), 76)
+                self.assertEqual(allocations, [])
+                reserve.assert_not_called()
+            finally:
+                host.destroy()
+
+    def test_dcp_target_and_replicated_draft_keep_distinct_capacity(self):
+        with self._native_pool(dcp_size=4) as (pool, assembler, allocations, _):
+            target = assembler.build_kv_host_pool(kv_pool=pool, page_size=16)
+            try:
+                self.assertEqual(
+                    (target.page_size, target.size, target.logical_size), (4, 68, 272)
+                )
+                self.assertEqual(sum(t.nbytes for t in allocations), 93_568)
+                allocations.clear()
+                draft = assembler._build_mha_mla_host_pool(
+                    pool=pool,
+                    host_to_device_ratio=target.logical_size / pool.size,
+                    page_size=16,
+                    layout="page_first_kv_split",
+                    allocator_type="default",
+                    pool_label="draft",
+                )
+                try:
+                    self.assertEqual(
+                        (draft.page_size, draft.size, draft.dcp_size), (16, 288, 1)
+                    )
+                    self.assertEqual(sum(t.nbytes for t in allocations), 288 * 1376)
+                finally:
+                    draft.destroy()
+            finally:
+                target.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()

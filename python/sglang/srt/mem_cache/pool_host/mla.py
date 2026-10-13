@@ -209,7 +209,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
-        size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        payload_width = self.kv_cache_dim
+        if self.layout == "page_first_kv_split":
+            # Native BF16's width override describes K alone, whereas host
+            # capacity must also cover the independently allocated RoPE.
+            self._split_k_width = (
+                self.device_pool.kv_cache_dim
+                if self.dsa_kv_cache_store_fp8
+                else self.kv_lora_rank
+            )
+            self._split_v_width = (
+                0 if self.dsa_kv_cache_store_fp8 else self.qk_rope_head_dim
+            )
+            payload_width = self._split_k_width + self._split_v_width
+        size_per_token = payload_width * self.dtype.itemsize * self.layer_num
         if (
             self.layout == "page_first_kv_split"
             and self.device_pool.index_head_dim is not None
@@ -271,52 +284,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 num_indexer_layers = self.layer_num
             indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
             alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-            if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
-                # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
-                # mirror the packed width so the 2D memcpy row width matches.
-                k_width = self.device_pool.kv_cache_dim
-            else:
-                k_width = self.kv_lora_rank
             if _is_npu and memfabric_host_memory_enabled():
-                # Memfabric-mapped host DRAM (single switch): required by the
-                # AIV sparse-copy IO path and usable by the legacy memcpy2d
-                # path unchanged.  Size the GB-aligned reserve with the
-                # combined bytes of all buffers allocated below.
-                total_bytes = (
-                    self.page_num
-                    * self.page_size
-                    * self.layer_num
-                    * (k_width + self.qk_rope_head_dim)
-                    * self.dtype.itemsize
+                ensure_memfabric_capacity(
+                    self.size * self.size_per_token, torch.npu.current_device()
                 )
-                if self.device_pool.index_head_dim is not None:
-                    total_bytes += (
-                        self.page_num
-                        * self.page_size
-                        * num_indexer_layers
-                        * self.device_pool.index_head_dim
-                        * self.dtype.itemsize
-                    )
-                if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                    # FP32 scale mirror
-                    total_bytes += (
-                        self.page_num * self.page_size * num_indexer_layers * 4
-                    )
-                ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
             self.k_buffer = alloc_func(
-                (*base_dims, k_width),
+                (*base_dims, self._split_k_width),
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.v_buffer = alloc_func(
-                (*base_dims, self.qk_rope_head_dim),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
+            # Packed FP8 already carries RoPE in K; keep an empty transfer view
+            # without allocating or registering a second host component.
+            self.v_buffer = (
+                self.k_buffer[..., :0]
+                if self._split_v_width == 0
+                else alloc_func(
+                    (*base_dims, self._split_v_width),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
