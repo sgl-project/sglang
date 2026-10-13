@@ -55,20 +55,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             raise ValueError("--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1")
         if cfg.device != "cuda" or not is_sm100_supported():
             raise ValueError("--dsv4-attn-backend flashmla_mega requires SM100/SM103")
-        if cfg.dtype not in ("auto", "bfloat16"):
-            raise ValueError(
-                "--dsv4-attn-backend flashmla_mega requires BF16 activations"
-            )
-        if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"):
-            raise ValueError(
-                "--dsv4-attn-backend flashmla_mega requires --kv-cache-dtype fp8_e4m3"
-            )
         unsupported = (
-            (
-                "context parallelism",
-                cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp,
-            ),
-            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            # The breakable prefill graph routes attention through a BF16-output op.
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,

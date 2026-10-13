@@ -39,10 +39,6 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
     def test_flashmla_mega_launch_policy(self):
         rejected = (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
-            ("BF16 activations", dict(dtype="float16")),
-            ("fp8_e4m3", dict(kv_cache_dtype="bfloat16")),
-            ("context parallelism", dict(attn_cp_size=2)),
-            ("PD disaggregation", dict(disaggregation_mode="decode")),
             ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.BREAKABLE)),
             ("SWA bounded replay", dict(enable_decoder_swa_bounded_replay=True)),
         )
