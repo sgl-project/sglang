@@ -15,7 +15,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "1b", quant: "bf16", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 84.08 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -28,7 +27,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "1b", quant: "bf16", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 83.24 },
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
@@ -41,7 +39,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "bf16", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.36 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -54,7 +51,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "bf16", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.97 },
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
@@ -67,7 +63,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "fp8", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.97 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -80,7 +75,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "fp8", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.97 },
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
@@ -93,7 +87,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "int4", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.97 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -106,7 +99,6 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "35b-a3b", quant: "int4", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     accuracy: { gsm8k_pct: 96.44 },
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
@@ -119,7 +111,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "1b", quant: "bf16", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 81.49, tpot_ms: 1.55, tokens_per_sec_per_gpu: 5523 },
@@ -131,7 +122,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "1b", quant: "bf16", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
         ttft_ms: 51.55, tpot_ms: 1.65, tokens_per_sec_per_gpu: 1189 },
@@ -143,7 +133,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "bf16", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 208.83, tpot_ms: 3.69, tokens_per_sec_per_gpu: 2311 },
@@ -155,7 +144,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "bf16", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
         ttft_ms: 155.49, tpot_ms: 3.02, tokens_per_sec_per_gpu: 593 },
@@ -167,7 +155,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "fp8", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 183.85, tpot_ms: 3.55, tokens_per_sec_per_gpu: 2413 },
@@ -179,7 +166,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "fp8", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
         ttft_ms: 129.71, tpot_ms: 2.61, tokens_per_sec_per_gpu: 694 },
@@ -191,7 +177,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "int4", nodes: "single", spec: "none" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 228.26, tpot_ms: 3.47, tokens_per_sec_per_gpu: 2439 },
@@ -203,7 +188,6 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "int4", nodes: "single", spec: "dspark" },
     sglang_version: "PR #41993",
-    latencyPercentile: "Mean",
     speed: [
       { workload: { dataset: "sharegpt", max_concurrency: 1 },
         ttft_ms: 92.01, tpot_ms: 2.38, tokens_per_sec_per_gpu: 781 },

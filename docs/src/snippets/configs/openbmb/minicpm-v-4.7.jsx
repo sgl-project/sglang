@@ -5,10 +5,13 @@
 // hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. Every recipe is
 // single-GPU. H100 has no 35B-A3B BF16 cell: its ~66 GB of weights exceed the
 // default static memory fraction of an 80 GB card, so the server cannot start.
-// DSpark is an overlay; its draft path follows the variant.
+// DSpark is an overlay; its draft path follows the variant. Measured on real
+// text it lowers TPOT at concurrency 1 and raises it at 16, hence the subtitles.
 
 export const config = {
   modelName: "MiniCPM-V 4.7",
+
+  latencyPercentile: "Mean",
 
   supportedHardware: ["gb300", "h200", "h100"],
 
@@ -33,9 +36,9 @@ export const config = {
       title: "Speculative Decoding",
       default: "none",
       options: [
-        { id: "none", label: "None" },
+        { id: "none", label: "Off", subtitle: "High throughput" },
         {
-          id: "dspark", label: "DSPARK",
+          id: "dspark", label: "DSPARK", subtitle: "Low latency",
           flags: (s) => [
             "--speculative-algorithm DSPARK",
             s.variant === "1b"
@@ -51,7 +54,7 @@ export const config = {
     "1b|bf16":      "openbmb/MiniCPM-V-4.7-1B",
     "35b-a3b|bf16": "openbmb/MiniCPM-V-4.7-35B-A3B",
     "35b-a3b|fp8":  "openbmb/MiniCPM-V-4.7-35B-A3B-FP8",
-    "35b-a3b|int4": "openbmb/MiniCPM-V-4.7-35B-A3B-INT4",
+    "35b-a3b|int4": "openbmb/MiniCPM-V-4.7-35B-A3B-int4",
   },
 
   placeholders: {
@@ -103,6 +106,20 @@ sgl-eval run gsm8k \\
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser auto" },
+      ],
+    },
+
+    // Same flags as the Deploy overlay, one chip per variant's draft checkpoint.
+    speculative: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off",     label: "Off" },
+        { id: "dspark-1b", label: "DSPARK", hide: { variant: ["35b-a3b"] },
+          flags: ["--speculative-algorithm DSPARK",
+                  "--speculative-draft-model-path openbmb/MiniCPM-V-4.7-1B-DSpark"] },
+        { id: "dspark-35b-a3b", label: "DSPARK", hide: { variant: ["1b"] },
+          flags: ["--speculative-algorithm DSPARK",
+                  "--speculative-draft-model-path openbmb/MiniCPM-V-4.7-35B-A3B-DSpark"] },
       ],
     },
   },

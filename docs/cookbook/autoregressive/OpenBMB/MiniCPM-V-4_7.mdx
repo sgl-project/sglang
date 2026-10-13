@@ -4,10 +4,6 @@ description: "Deploy OpenBMB MiniCPM-V 4.7 with SGLang — 1B dense and 35B-A3B 
 tag: NEW
 ---
 
-<Note>
-  OpenBMB publishes the MiniCPM-V 4.7 checkpoints on Hugging Face at release. The repository ids on this page are the release ids.
-</Note>
-
 ## Deployment
 
 <a id="install" />
@@ -47,7 +43,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick the hardware, variant, and quantization to generate the launch command. Every recipe runs on a single GPU and is verified on GB300 and H200; the H100 recipes (1B, FP8, INT4) are unverified. The optional **DSPARK** row loads the matching DSpark draft checkpoint.
+Pick the hardware, variant, and quantization to generate the launch command. Every recipe runs on a single GPU and is verified on GB300 and H200; the H100 recipes (1B, FP8, INT4) are unverified. The **Speculative Decoding** row trades throughput for latency: turn **DSPARK** on for single-user or low-concurrency chat, and leave it off for multi-user and batch serving (see §2).
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/openbmb/minicpm-v-4.7.jsx";
@@ -65,9 +61,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen3.5-style hybrid language backbone — Gated DeltaNet linear-attention layers interleaved with full-attention layers — with a vision encoder that slices high-resolution images into tiles and places image tokens with a canvas M-RoPE layout. It comes in a 1B dense size and a 35B-A3B Mixture-of-Experts size, and thinks by default.
+MiniCPM-V 4.7 is the latest model in OpenBMB's MiniCPM-V series, covering single-image, multi-image, and video understanding. It ships in two sizes: a 1B dense model and a 35B-A3B Mixture-of-Experts model, the series' first MoE.
 
-{/* TODO: add the license once the Hugging Face model cards are public. */}
+Both sizes use a Qwen3.5-style hybrid language backbone in which every fourth layer is full attention and the rest are Gated DeltaNet linear attention: 24 layers for 1B, and 40 layers with 256 experts (8 active per token) for 35B-A3B. Native context length is 262,144 tokens. The vision encoder compresses visual tokens early inside the ViT, slices high-resolution images into up to 9 tiles, and supports mixed 4x/16x visual token compression (see §3.3). Thinking is on by default.
+
+**License:** [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -84,43 +82,47 @@ MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-1B">openbmb/MiniCPM-V-4.7-1B</a></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B dense base.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B dense base (1.55B parameters including the vision encoder).</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B">openbmb/MiniCPM-V-4.7-35B-A3B</a></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B MoE base.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B MoE base (35.2B total parameters, about 3B active).</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-FP8</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (compressed-tensors)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-FP8">openbmb/MiniCPM-V-4.7-35B-A3B-FP8</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 W8A8 (compressed-tensors)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35B-A3B FP8.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-INT4</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT4 W4A16 (llm-compressor)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-int4">openbmb/MiniCPM-V-4.7-35B-A3B-int4</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT4 W4A16, group size 128 (compressed-tensors)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B INT4.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B-DSpark</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-DSpark">openbmb/MiniCPM-V-4.7-1B-DSpark</a></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16 draft</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Draft model for the 1B <strong>DSPARK</strong> row; not served on its own.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-DSpark</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-DSpark">openbmb/MiniCPM-V-4.7-35B-A3B-DSpark</a></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 draft</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft model for the 35B-A3B <strong>DSPARK</strong> row; not served on its own.</td>
     </tr>
   </tbody>
 </table>
 
-**Resources:** [OpenBMB on Hugging Face](https://huggingface.co/openbmb) · [SGLang model support (#41993)](https://github.com/sgl-project/sglang/pull/41993).
+OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. They are not part of the matrix above.
+
+**Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20`, from the 35B-A3B checkpoints' `generation_config.json`. SGLang applies these defaults, so do not hardcode them in client code.
+
+**Resources:** [Hugging Face (1B)](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) · [Hugging Face (35B-A3B)](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B) · [OpenBMB documentation](https://github.com/OpenBMB/MiniCPM-V/blob/main/docs/minicpm_v4dot7_en.md) · [SGLang model support (#41993)](https://github.com/sgl-project/sglang/pull/41993).
 
 ## 2. Configuration Tips
 
-- Every variant needs `--trust-remote-code` and `--mamba-radix-cache-strategy extra_buffer`; both are in every generated command.
+- Every generated command carries `--trust-remote-code` and `--mamba-radix-cache-strategy extra_buffer`, the radix-cache strategy for the Gated DeltaNet hybrid backbone.
 - Every recipe runs on one GPU. On H100 the 35B-A3B BF16 checkpoint (about 66 GB of weights) does not fit the default static memory fraction of an 80 GB card; use FP8 or INT4 there.
 - Pick the quantization by platform. On H200, quantization is a speed win: at concurrency 16, INT4 and FP8 reach 15,808 and 15,280 tokens/s per GPU against 12,103 for BF16, and INT4 has the fastest 35B-A3B decode (TPOT 3.47 ms at concurrency 1). On GB300, BF16 decodes fastest (TPOT 4.36 ms), FP8 is on par (4.44 ms), and INT4 is slower (8.56 ms), so FP8 and INT4 there save memory, not time.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
@@ -129,17 +131,6 @@ MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen
 - Every command carries `--reasoning-parser auto --tool-call-parser auto`. SGLang resolves both from the chat template, to `qwen3` for reasoning and `qwen3_coder` for tool calls, so the thinking trace lands in `message.reasoning_content` and tool calls in `message.tool_calls` (see §3.1 and §3.2). To turn either off, toggle it in the **Parsers** card of the [Playground](#playground).
 - Thinking is on by default. To get a direct answer for one request, pass `"chat_template_kwargs": {"enable_thinking": false}` (in the OpenAI Python client, `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); `reasoning_content` then comes back empty.
 - Image and video requests need no extra server flags.
-
-<Warning>
-  The FP8 and INT4 checkpoints' remote code fails to import on transformers 5.16 and later. `video_processing_minicpmv4_7.py` imports `BASE_VIDEO_PROCESSOR_DOCSTRING` from `transformers.video_processing_utils`. That code targets transformers 5.12 and earlier; the constant is gone from 5.16 onward, so upgrading transformers does not fix the import. In your local copy of the checkpoint, drop the name from that import and define it in the file instead:
-
-  ```python Example
-  from transformers.video_processing_utils import BaseVideoProcessor
-  BASE_VIDEO_PROCESSOR_DOCSTRING = ""
-  ```
-
-  The BF16 checkpoints are not affected.
-</Warning>
 
 ## 3. Advanced Usage
 
