@@ -63,6 +63,9 @@ def _assert_stacked_matches_by_value(test, engine, stacked, **kwargs):
     torch.testing.assert_close(torch.tensor(actual), torch.tensor(by_value))
     test.assertIsNotNone(engine.tokenizer_manager.positional_embeds_transport._pool)
     test.assertFalse(torch.allclose(torch.tensor(actual), torch.tensor(without)))
+    # Override KV must stay out of the radix cache, or the same tokens reuse it.
+    after = engine.score(**kwargs).scores
+    torch.testing.assert_close(torch.tensor(after), torch.tensor(without))
 
 
 # ---------------------------------------------------------------------------
