@@ -43,8 +43,6 @@ class InflightQueue:
         # Completed loop steps; only end_step advances it.
         self.step = 0
         self._records: Deque[StepRecord] = deque()
-        # A ring keeps its last committed record, which still shows in its
-        # slot until the next push to that slot.
         self.ring = ring
         self._last_committed: Optional[StepRecord] = None
 
