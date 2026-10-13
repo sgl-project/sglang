@@ -56,8 +56,14 @@ class TritonKDAKernel(LinearAttnKernelBase):
         pair = self._tree_factor_scratch.get(key)
         if pair is None:
             pair = (
-                torch.empty((n, hv, tree_width, k), device=q.device, dtype=torch.float32),
-                torch.empty((n, hv, tree_width, tree_width), device=q.device, dtype=torch.float32),
+                torch.empty(
+                    (n, hv, tree_width, k), device=q.device, dtype=torch.float32
+                ),
+                torch.empty(
+                    (n, hv, tree_width, tree_width),
+                    device=q.device,
+                    dtype=torch.float32,
+                ),
             )
             self._tree_factor_scratch[key] = pair
         return pair
@@ -218,7 +224,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     ) -> torch.Tensor:
         factorized_tree = (
             retrieve_parent_token is not None
-            and cache_steps in (17, 25, 27, 29, 31, 32, 33, 49, 65)
+            and cache_steps in (32, 49)
             and tree_max_depth > 0
             and cache_ring
             and kwargs.get("factor_cache_indices") is not None

@@ -27,7 +27,6 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -184,14 +183,6 @@ def maybe_register_debug_tensor_dump_hook(
     pp_rank: int,
 ) -> None:
     if get_observability().debug_tensor_dump_output_folder is not None:
-        # Hybrid speculative debugging may need target-model tensors only.
-        # Some lightweight draft models do not expose the conventional
-        # top-level ``model`` module expected by TensorDumper.
-        if (
-            is_draft_worker
-            and envs.SGLANG_DEBUG_TENSOR_DUMP_TARGET_ONLY.get()
-        ):
-            return
         dump_folder = get_observability().debug_tensor_dump_output_folder
         if spec_algorithm.is_eagle():
             role = "draft" if is_draft_worker else "target"

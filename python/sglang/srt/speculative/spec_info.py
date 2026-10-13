@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -171,10 +170,6 @@ class SpeculativeAlgorithm(Enum):
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
-    def can_run_cuda_graph(self, forward_batch, *, is_draft_worker: bool) -> bool:
-        """Return whether this algorithm permits graph replay for this batch."""
-        return True
-
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
@@ -303,35 +298,6 @@ class SpeculativeAlgorithm(Enum):
         if self.is_dspark() and is_draft_worker:
             return num_draft_tokens - 1
         return num_draft_tokens
-
-    def get_cuda_graph_capture_req_widths(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> tuple[int, ...]:
-        """Return uniform per-request widths to capture for target verify.
-
-        Static algorithms keep one width. Adaptive plugin algorithms may
-        override this and return several positive widths up to the configured
-        maximum.
-        """
-        return (
-            self.get_num_tokens_per_req_for_target_verify(
-                num_draft_tokens, is_draft_worker
-            ),
-        )
-
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
 
     def create_worker(
         self, server_args: ServerArgs
@@ -509,8 +475,9 @@ def create_dummy_verify_input(
     """
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-    if isinstance(spec_algorithm, CustomSpecAlgo):
-        spec_info = spec_algorithm.create_cuda_graph_verify_input(
+    custom_builder = getattr(spec_algorithm, "create_cuda_graph_verify_input", None)
+    if custom_builder is not None:
+        spec_info = custom_builder(
             custom_mask=custom_mask,
             num_tokens_per_req=num_tokens_per_req,
             is_draft_worker=is_draft_worker,
@@ -519,6 +486,7 @@ def create_dummy_verify_input(
             return spec_info
 
     spec = get_spec_config()
+
     spec_info = None
     if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
         from sglang.srt.speculative.eagle_info import EagleVerifyInput

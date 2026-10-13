@@ -571,8 +571,9 @@ def _fused_conv_tree_raw_commit_kernel(
         for step in tl.static_range(MAX_ACCEPT):
             active = step < n_commit
             node = (
-                tl.load(accept_index_ptr + row_base + step, mask=active, other=-1)
-                .to(tl.int64)
+                tl.load(accept_index_ptr + row_base + step, mask=active, other=-1).to(
+                    tl.int64
+                )
                 - request_node_base
             )
             track_len = tl.where(active & (node == track_node), step + 1, track_len)
@@ -623,7 +624,7 @@ def _fused_conv_tree_raw_commit_kernel(
                 mask=mask_d & valid_track,
             )
 
-    # Primary committed state after the complete accepted path.
+    # Primary committed state after the complete accept path.
     main_base = (
         dst_ptr
         + layer * dst_layer_stride
@@ -693,6 +694,10 @@ def fused_conv_tree_raw_commit_with_mask(
     if any(x.ndim != 1 for x in (state_indices, factor_indices, accept_lens)):
         raise ValueError("state_indices, factor_indices and accept_lens must be 1D")
     batch = accept_lens.shape[0]
+    if batch != 1:
+        raise ValueError(
+            f"factorized UBTree conv commit supports only BS=1, got {batch}"
+        )
     if not (
         state_indices.shape[0] == factor_indices.shape[0] == batch
         and accept_index.ndim == 2
@@ -702,7 +707,10 @@ def fused_conv_tree_raw_commit_with_mask(
     has_track = track_indices is not None and track_nodes is not None
     if (track_indices is None) != (track_nodes is None):
         raise ValueError("track_indices and track_nodes must be provided together")
-    if has_track and (track_indices.shape != accept_lens.shape or track_nodes.shape != accept_lens.shape):
+    if has_track and (
+        track_indices.shape != accept_lens.shape
+        or track_nodes.shape != accept_lens.shape
+    ):
         raise ValueError("track tensors must match accept_lens")
     tensors = (state_indices, factor_indices, accept_index, accept_lens)
     if has_track:
@@ -716,7 +724,9 @@ def fused_conv_tree_raw_commit_with_mask(
     # kernel consumes a transposed [..., dim, window] view. Support both using
     # real strides; do not require an entry-contiguous layout here.
     trailing = dst.shape[-2:]
-    window_axes = [axis for axis, size in enumerate(trailing, start=2) if 1 <= size <= 4]
+    window_axes = [
+        axis for axis, size in enumerate(trailing, start=2) if 1 <= size <= 4
+    ]
     if len(window_axes) != 1:
         raise ValueError(f"cannot identify conv window axis from {dst.shape=}")
     win_axis = window_axes[0]
@@ -724,7 +734,9 @@ def fused_conv_tree_raw_commit_with_mask(
     km1 = dst.shape[win_axis]
     dim = dst.shape[dim_axis]
     if raw_src.shape[3:] != dst.shape[2:]:
-        raise ValueError(f"Conv trailing shapes mismatch: {dst.shape=} {raw_src.shape=}")
+        raise ValueError(
+            f"Conv trailing shapes mismatch: {dst.shape=} {raw_src.shape=}"
+        )
     if raw_src.shape[2] < tree_width:
         raise ValueError("raw source does not cover tree_width")
     block_size = min(triton.next_power_of_2(dim), 256)
@@ -1090,7 +1102,9 @@ def fused_commit_track_indices(
             or last_correct_out.device != accept_lens.device
             or not last_correct_out.is_contiguous()
         ):
-            raise ValueError("last_correct_out must be contiguous int64 CUDA storage for bs rows")
+            raise ValueError(
+                "last_correct_out must be contiguous int64 CUDA storage for bs rows"
+            )
         last_correct_step_indices = last_correct_out[:bs]
     has_track = seq_lens is not None
     if has_track:
@@ -1106,7 +1120,9 @@ def fused_commit_track_indices(
                 or track_steps_out.device != accept_lens.device
                 or not track_steps_out.is_contiguous()
             ):
-                raise ValueError("track_steps_out must be contiguous int64 CUDA storage for bs rows")
+                raise ValueError(
+                    "track_steps_out must be contiguous int64 CUDA storage for bs rows"
+                )
             mamba_steps_to_track = track_steps_out[:bs]
     else:
         mamba_steps_to_track = last_correct_step_indices

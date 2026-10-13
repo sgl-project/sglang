@@ -737,7 +737,7 @@ def _causal_conv1d_update_kernel(
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # STEP 2: assume state_len > seqlen. Factorized tree verify keeps the
-    # persistent pre-tree window intact; accepted-path commit reconstructs the
+    # persistent pre-tree window intact; accept-path commit reconstructs the
     # final window from raw node inputs after sampling.
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
@@ -807,8 +807,7 @@ def _causal_conv1d_update_kernel(
         # Update parent mapping for all tokens at once using vectorized operations
         mask_retrieve = idx_tokens < seqlen
         retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + idx_seq * stride_retrieve_parent_token_seq
+            retrieve_parent_token_ptr + idx_seq * stride_retrieve_parent_token_seq
         )
         if not HAS_DIRECT_PARENT:
             retrieve_next_token_base = (
@@ -854,7 +853,9 @@ def _causal_conv1d_update_kernel(
                 )
                 if retrieve_next_token_idx != -1:
                     parent_idx_tokens = tl.where(
-                        idx_tokens == retrieve_next_token_idx, idx_token, parent_idx_tokens
+                        idx_tokens == retrieve_next_token_idx,
+                        idx_token,
+                        parent_idx_tokens,
                     )
                 retrieve_sibling_token_idx = tl.sum(
                     tl.where(idx_tokens == idx_token, retrieve_next_siblings, 0)
@@ -900,7 +901,7 @@ def _causal_conv1d_update_kernel(
                 if SAVE_INTERMEDIATE:
                     # Dense mode saves the full post-node window. The factorized
                     # tree mode stores only this node's raw x in the last slot;
-                    # accepted-path commit combines it with the untouched pre-tree
+                    # accept-path commit combines it with the untouched pre-tree
                     # conv state. This removes ancestor/rejected-branch writes.
                     base_ptr = (
                         intermediate_conv_window_ptr

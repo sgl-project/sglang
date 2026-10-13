@@ -105,9 +105,7 @@ def _extract_target_verify_tree_mask(
     offsets = torch.arange(verify_width, device=device).unsqueeze(0)
     cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
     cum_len = torch.nn.functional.pad(
-        torch.cumsum(
-            (seq_lens + verify_width).repeat_interleave(verify_width), dim=0
-        ),
+        torch.cumsum((seq_lens + verify_width).repeat_interleave(verify_width), dim=0),
         (1, 0),
     )[:-1]
     mask_extraction_indices = (
@@ -381,12 +379,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             attention_tp_size
         )
-        hf_text_config = model_runner.model_config.hf_text_config
-        self.mla_qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", None)
-        self.mla_kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", None)
-        if self.use_mla:
-            assert self.mla_qk_rope_head_dim is not None
-            assert self.mla_kv_lora_rank is not None
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
@@ -476,28 +468,17 @@ class FlashAttentionBackend(AttentionBackend):
         causal,
     ):
         """Compute reusable FA3 tile scheduling metadata for one attention leg."""
-        if self._get_scheduler_metadata is None:
+        if self._get_scheduler_metadata is None or self.use_mla:
             return None
         if self._disable_scheduler_metadata_precompute:
             return None
-        if self.use_mla:
-            # Absorbed MLA presents FA3 with the RoPE-only Q/K head and a
-            # single latent KV head. The value path is the KV-LoRA latent.
-            num_heads_k = 1
-            headdim = self.mla_qk_rope_head_dim
-            headdim_v = self.mla_kv_lora_rank
-        else:
-            num_heads_k = self.num_kv_heads
-            headdim = self.head_dim
-            headdim_v = None
         return self._get_scheduler_metadata(
             batch_size=batch_size,
             max_seqlen_q=max_seq_len_q,
             max_seqlen_k=max_seq_len_k,
             num_heads=self.num_attention_heads,
-            num_heads_k=num_heads_k,
-            headdim=headdim,
-            headdim_v=headdim_v,
+            num_heads_k=self.num_kv_heads,
+            headdim=self.head_dim,
             cache_seqlens=cache_seqlens,
             qkv_dtype=self.kv_cache_dtype,
             cu_seqlens_q=cu_seqlens_q,
@@ -744,7 +725,7 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_mode.is_target_verify() and self.topk > 1:
                 # topk>1 target verify: replay needs spec_info.positions and .custom_mask
                 # which are not populated at capture time.
-                verify_key = self._target_verify_metadata_key(spec_info, bs)
+                verify_key = bs
                 self.forward_metadata = self.target_verify_metadata_topk_normal[
                     verify_key
                 ]
@@ -812,7 +793,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # captured target graph.  Only bind the already-captured views
                 # here; launching the op chain on the proposal→target seam
                 # would duplicate the work and preserve the host-side gap.
-                verify_key = self._target_verify_metadata_key(spec_info, bs)
+                verify_key = bs
                 self.forward_metadata = self.target_verify_metadata_topk_normal[
                     verify_key
                 ]
@@ -2775,21 +2756,6 @@ class FlashAttentionBackend(AttentionBackend):
             # For decoder-only models, skip encoder_metadata allocation
             self.encoder_metadata = {}
 
-    def _target_verify_width(self, spec_info: Optional[SpecInput], bs: int) -> int:
-        width = getattr(spec_info, "draft_token_num", None)
-        if width is None:
-            positions = getattr(spec_info, "positions", None)
-            if positions is not None and bs > 0:
-                width = positions.numel() // bs
-        if width is None:
-            width = self.speculative_num_draft_tokens
-        return int(width)
-
-    def _target_verify_metadata_key(
-        self, spec_info: Optional[SpecInput], bs: int
-    ) -> tuple[int, int]:
-        return (int(bs), self._target_verify_width(spec_info, bs))
-
     def _bind_metadata_buffers(
         self,
         bs: int,
@@ -2896,8 +2862,8 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
-            verify_width = num_tokens // bs
-            verify_key = (bs, verify_width)
+            verify_width = self.speculative_num_draft_tokens
+            verify_key = bs
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
@@ -3251,8 +3217,8 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
 
         elif forward_mode.is_target_verify():
-            verify_width = self._target_verify_width(spec_info, bs)
-            verify_key = (bs, verify_width)
+            verify_width = self.speculative_num_draft_tokens
+            verify_key = bs
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[verify_key]
                 ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
@@ -3303,9 +3269,9 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(
-                    verify_width, device=device
-                ).unsqueeze(0)  # shape: (1, verify_width)
+                offsets = torch.arange(verify_width, device=device).unsqueeze(
+                    0
+                )  # shape: (1, verify_width)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 mask = _extract_target_verify_tree_mask(
@@ -3317,9 +3283,7 @@ class FlashAttentionBackend(AttentionBackend):
                     valid_num_tokens=spec_info.positions.numel(),
                 )
 
-                col_indices = offsets.expand(
-                    mask.shape[0], verify_width
-                )
+                col_indices = offsets.expand(mask.shape[0], verify_width)
                 keys = torch.where(
                     mask,
                     col_indices,
@@ -3353,16 +3317,14 @@ class FlashAttentionBackend(AttentionBackend):
                     envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
                     and not self.has_swa
                 ):
-                    metadata.scheduler_metadata = (
-                        self._compute_scheduler_metadata_for(
-                            batch_size=bs,
-                            max_seq_len_q=verify_width,
-                            max_seq_len_k=self.max_context_len,
-                            cache_seqlens=metadata.cache_seqlens_int32,
-                            cu_seqlens_q=metadata.cu_seqlens_q,
-                            cu_seqlens_k_new=metadata.cu_seqlens_k,
-                            causal=False,
-                        )
+                    metadata.scheduler_metadata = self._compute_scheduler_metadata_for(
+                        batch_size=bs,
+                        max_seq_len_q=verify_width,
+                        max_seq_len_k=self.max_context_len,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        cu_seqlens_k_new=metadata.cu_seqlens_k,
+                        causal=False,
                     )
                     metadata_expand.scheduler_metadata = (
                         self._compute_scheduler_metadata_for(

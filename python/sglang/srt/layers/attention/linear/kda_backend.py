@@ -32,7 +32,6 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
-
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
 if is_npu():
@@ -1237,13 +1236,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
         tree_rawv = getattr(mamba_cache_params, "tree_rawv", None)
+        verify_batch_size = query_start_loc.shape[0] - 1
+        if tree_rawv is not None and verify_batch_size != 1:
+            raise RuntimeError(
+                "factorized UBTree KDA verify supports only BS=1, got "
+                f"{verify_batch_size}"
+            )
         tree_factorized_on = (
             tree_rawv is not None
+            and verify_batch_size == 1
             and retrieve_parent_token is not None
-            and retrieve_parent_token.shape[1] in (17, 25, 27, 29, 31, 32, 33, 49, 65)
+            and retrieve_parent_token.shape[1] in (32, 49)
             and fm.tree_max_depth > 0
         )
-        if intermediate_state_cache is None and not replayssm_on and not tree_factorized_on:
+        if (
+            intermediate_state_cache is None
+            and not replayssm_on
+            and not tree_factorized_on
+        ):
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -1402,7 +1412,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tree_transforms = None
         use_fused_tree_conv = (
             tree_factorized_on
-            and draft_token_num in (17, 25, 27, 29, 31, 32, 33, 49, 65)
+            and draft_token_num in (32, 49)
             and fm.has_direct_parent
             and isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
             and mixed_qkv_reshaped.dtype == torch.bfloat16
@@ -1416,12 +1426,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and layer.head_k_dim == 128
         )
         if use_fused_tree_conv:
-            tree_transforms = self.kernel_dispatcher.triton_kernel.get_tree_transform_scratch(
-                mixed_qkv_reshaped.device,
-                batch_size,
-                layer.num_v_heads,
-                draft_token_num,
-                layer.head_k_dim,
+            tree_transforms = (
+                self.kernel_dispatcher.triton_kernel.get_tree_transform_scratch(
+                    mixed_qkv_reshaped.device,
+                    batch_size,
+                    layer.num_v_heads,
+                    draft_token_num,
+                    layer.head_k_dim,
+                )
             )
             mixed_qkv_processed = fused_kda_conv_tree_transform(
                 x=mixed_qkv_reshaped,

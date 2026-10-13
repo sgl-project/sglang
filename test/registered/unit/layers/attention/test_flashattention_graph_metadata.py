@@ -52,69 +52,6 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         with self.assertRaisesRegex(AssertionError, "used 9 > capacity 8"):
             backend._init_full_cg_prefill_metadata(forward_batch, in_capture=False)
 
-    def test_target_verify_metadata_is_keyed_by_capture_width(self):
-        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        backend.speculative_num_draft_tokens = 49
-        backend.topk = 4
-        backend.has_swa = False
-        backend.use_sliding_window_kv_pool = False
-        backend.target_verify_metadata_topk_normal = {
-            "cache_seqlens": torch.zeros(8, dtype=torch.int32),
-            "cu_seqlens_k": torch.zeros(9, dtype=torch.int32),
-            "page_table": torch.zeros((8, 64), dtype=torch.int32),
-        }
-        backend.target_verify_metadata_topk_expand = {
-            "cache_seqlens": torch.zeros(8 * 49, dtype=torch.int32),
-            "cu_seqlens_k": torch.zeros(8 * 49 + 1, dtype=torch.int32),
-            "page_table": torch.zeros((8 * 49, 49), dtype=torch.int32),
-        }
-
-        for width in (31, 49):
-            backend._bind_metadata_buffers(
-                bs=2,
-                num_tokens=2 * width,
-                encoder_lens=None,
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                spec_info=None,
-                device=torch.device("cpu"),
-            )
-
-        metadata31 = backend.target_verify_metadata_topk_normal[(2, 31)]
-        metadata49 = backend.target_verify_metadata_topk_normal[(2, 49)]
-        expand31 = backend.target_verify_metadata_topk_expand[(2, 31)]
-        expand49 = backend.target_verify_metadata_topk_expand[(2, 49)]
-
-        self.assertEqual(metadata31.max_seq_len_q, 31)
-        self.assertEqual(metadata49.max_seq_len_q, 49)
-        self.assertTrue(
-            torch.equal(metadata31.cu_seqlens_q, torch.tensor([0, 31, 62]))
-        )
-        self.assertTrue(
-            torch.equal(metadata49.cu_seqlens_q, torch.tensor([0, 49, 98]))
-        )
-        self.assertEqual(expand31.page_table.shape, (62, 31))
-        self.assertEqual(expand49.page_table.shape, (98, 49))
-        self.assertEqual(expand31.cu_seqlens_q.numel(), 63)
-        self.assertEqual(expand49.cu_seqlens_q.numel(), 99)
-
-    def test_target_verify_width_prefers_spec_width(self):
-        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        backend.speculative_num_draft_tokens = 49
-
-        self.assertEqual(
-            backend._target_verify_metadata_key(
-                SimpleNamespace(draft_token_num=31, positions=torch.empty(98)), 2
-            ),
-            (2, 31),
-        )
-        self.assertEqual(
-            backend._target_verify_metadata_key(
-                SimpleNamespace(positions=torch.empty(98)), 2
-            ),
-            (2, 49),
-        )
-        self.assertEqual(backend._target_verify_metadata_key(None, 2), (2, 49))
-
     def test_empty_cpu_sequence_lengths_use_static_bound(self):
         backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
         backend.max_context_len = 16

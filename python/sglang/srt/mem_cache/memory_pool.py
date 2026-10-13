@@ -685,7 +685,7 @@ class MambaPool:
             and cache_params.is_kda
             and speculative_eagle_topk is not None
             and speculative_eagle_topk > 1
-            and speculative_num_draft_tokens in (17, 25, 27, 29, 31, 32, 33, 49, 65)
+            and speculative_num_draft_tokens in (32, 49)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
@@ -830,7 +830,7 @@ class MambaPool:
                 if enable_linear_replayssm_spec and cache_params.is_kda:
                     if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
-                        # sized with the final adaptive-aware draft maximum.
+                        # sized with the configured fixed verify width.
                         if L & (L - 1) != 0:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"

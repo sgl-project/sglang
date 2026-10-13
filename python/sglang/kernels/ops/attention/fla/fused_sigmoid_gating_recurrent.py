@@ -597,9 +597,7 @@ def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
         other=0.0,
     ).to(tl.float32)
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
-    b_dt_bias = tl.load(
-        dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0
-    ).to(tl.float32)
+    b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
     x = b_a + b_dt_bias
     if USE_LOWER_BOUND:
         b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
@@ -784,9 +782,7 @@ def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
         safe_idx = tl.maximum(current_idx, 0)
         current_token_idx = bos + safe_idx
         if USE_PRECOMPUTED_TRANSFORMS:
-            transform_base = (
-                (i_n * HV * TREE_WIDTH + i_hv * TREE_WIDTH + safe_idx) * K
-            )
+            transform_base = (i_n * HV * TREE_WIDTH + i_hv * TREE_WIDTH + safe_idx) * K
             b_k = tl.load(
                 processed_k + transform_base + o_k,
                 mask=path_active & mask_k,
@@ -1180,13 +1176,13 @@ def fused_sigmoid_gating_delta_rule_update(
         and initial_state_indices is not None
     )
     if use_factorized_tree:
-        # Bole-like factorized verify path for the production UBTree buckets. It
-        # computes every node output without materializing per-node [V, K]
-        # states; the post-sampling tree commit folds only the accepted path.
+        # Factorized verify for the fixed-width UBTree path. It computes every
+        # node output without materializing per-node [V, K] states; the
+        # post-sampling tree commit folds only the accept path.
         tree_width = retrieve_parent_token.shape[1]
-        assert 17 <= tree_width <= 65, (
-            "factorized tree experimental fixed width must be in [17, 65], got "
-            f"{tree_width}"
+        assert N == 1, f"factorized tree verify supports only BS=1, got {N}"
+        assert tree_width in (32, 49), (
+            f"factorized tree verify supports only widths 32 and 49, got {tree_width}"
         )
         assert retrieve_parent_token.shape == (N, tree_width)
         assert tree_query_factors.shape == (N, HV, tree_width, K)
@@ -1283,17 +1279,15 @@ def fused_sigmoid_gating_delta_rule_update(
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
-        # Keep one output-row tile through width 64. Widths up to 32 use a
-        # 32-row CTA; width 65 is split to avoid a costly 128x128 tile. This
-        # also permits controlled fixed-width sweeps without changing the
-        # production adaptive/batch-aware buckets.
+        # Use the validated fixed-width schedules: one 32-row CTA for width 32
+        # and one 64-row CTA for width 49.
         if factor_verify_bm is None:
-            factor_verify_bm = 32 if tree_width <= 32 or tree_width == 65 else 64
+            factor_verify_bm = 32 if tree_width == 32 else 64
         assert factor_verify_bm in (16, 32, 64)
         if factor_verify_num_warps is None:
-            factor_verify_num_warps = 2 if tree_width == 32 else (4 if tree_width < 32 else 8)
+            factor_verify_num_warps = 2 if tree_width == 32 else 8
         if factor_verify_num_stages is None:
-            factor_verify_num_stages = 1 if tree_width == 32 else (2 if tree_width < 32 else 3)
+            factor_verify_num_stages = 1 if tree_width == 32 else 3
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
         factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
         fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](

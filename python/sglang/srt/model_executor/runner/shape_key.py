@@ -28,6 +28,3 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
-    # Per-request token width for adaptive uniform target-verify graphs.
-    # None preserves the legacy batch-size-only key.
-    req_width: Optional[int] = None

@@ -981,8 +981,8 @@ def commit_mamba_states_after_verify(
     )
 
     # UBTree KDA factorized verify: all tree-node outputs were computed without
-    # materializing per-node [V,K] states. Replay only the sampled root-to-node
-    # path from compact raw factors, then perform the existing conv rollback.
+    # materializing per-node [V,K] states. Replay only the sampled
+    # root-to-node accept path, then perform the existing conv rollback.
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "factorized_kda_tree", False) is True

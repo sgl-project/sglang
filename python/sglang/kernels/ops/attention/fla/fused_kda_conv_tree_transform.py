@@ -1,9 +1,7 @@
-"""Experimental fused UBTree causal-conv and KDA node transform.
+"""Fused UBTree causal-conv and KDA node transform.
 
-The kernel is deliberately shape-restricted to the production factorized
-UBTree contract (25/27/29/31/32/33/49/65 nodes, conv width 4, H == HV, K == V). It supports
-multiple batches through an explicit batch program axis. It
-replaces the tree causal-conv launch plus
+The production path is restricted to BS=1, 32/49 verify nodes, convolution
+width 4, H == HV, and K == V. It replaces the tree causal-conv launch plus
 ``fused_sigmoid_gating_delta_rule_tree_transform_kernel`` while preserving the
 materialized post-conv Q/K/V tensor consumed by factor generation.
 """
@@ -84,43 +82,80 @@ def _fused_kda_conv_tree_transform_kernel(
     current = node.to(tl.int64)
 
     if HAS_BIAS:
-        acc_q = tl.load(conv_bias + q_dim_base + offsets, mask=mask, other=0.0).to(tl.float32)
-        acc_k = tl.load(conv_bias + k_dim_base + offsets, mask=mask, other=0.0).to(tl.float32)
-        acc_v = tl.load(conv_bias + v_dim_base + offsets, mask=mask, other=0.0).to(tl.float32)
+        acc_q = tl.load(conv_bias + q_dim_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        acc_k = tl.load(conv_bias + k_dim_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        acc_v = tl.load(conv_bias + v_dim_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
     else:
         acc_q = tl.zeros((BK,), dtype=tl.float32)
         acc_k = tl.zeros((BK,), dtype=tl.float32)
         acc_v = tl.zeros((BK,), dtype=tl.float32)
 
-    # Preserve the node-local raw input used by accepted-path conv commit.
+    # Preserve the node-local raw input used by accept-path conv commit.
     raw_q = tl.load(
-        x + batch * stride_x_batch + (q_dim_base + offsets) * stride_x_dim + node * stride_x_token,
+        x
+        + batch * stride_x_batch
+        + (q_dim_base + offsets) * stride_x_dim
+        + node * stride_x_token,
         mask=mask,
         other=0.0,
     )
     raw_k_input = tl.load(
-        x + batch * stride_x_batch + (k_dim_base + offsets) * stride_x_dim + node * stride_x_token,
+        x
+        + batch * stride_x_batch
+        + (k_dim_base + offsets) * stride_x_dim
+        + node * stride_x_token,
         mask=mask,
         other=0.0,
     )
     raw_v_input = tl.load(
-        x + batch * stride_x_batch + (v_dim_base + offsets) * stride_x_dim + node * stride_x_token,
+        x
+        + batch * stride_x_batch
+        + (v_dim_base + offsets) * stride_x_dim
+        + node * stride_x_token,
         mask=mask,
         other=0.0,
     )
-    inter_base = intermediate_conv_window + factor_slot * stride_inter_slot + node * stride_inter_step
-    tl.store(inter_base + (q_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win, raw_q, mask=mask & (factor_slot >= 0))
-    tl.store(inter_base + (k_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win, raw_k_input, mask=mask & (factor_slot >= 0))
-    tl.store(inter_base + (v_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win, raw_v_input, mask=mask & (factor_slot >= 0))
+    inter_base = (
+        intermediate_conv_window
+        + factor_slot * stride_inter_slot
+        + node * stride_inter_step
+    )
+    tl.store(
+        inter_base + (q_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win,
+        raw_q,
+        mask=mask & (factor_slot >= 0),
+    )
+    tl.store(
+        inter_base + (k_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win,
+        raw_k_input,
+        mask=mask & (factor_slot >= 0),
+    )
+    tl.store(
+        inter_base + (v_dim_base + offsets) * stride_inter_dim + 2 * stride_inter_win,
+        raw_v_input,
+        mask=mask & (factor_slot >= 0),
+    )
 
     value_q = raw_q
     value_k = raw_k_input
     value_v = raw_v_input
     for tap in tl.static_range(4):
         weight_col = 3 - tap
-        wq = tl.load(conv_weight + (q_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0).to(tl.float32)
-        wk = tl.load(conv_weight + (k_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0).to(tl.float32)
-        wv = tl.load(conv_weight + (v_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0).to(tl.float32)
+        wq = tl.load(
+            conv_weight + (q_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0
+        ).to(tl.float32)
+        wk = tl.load(
+            conv_weight + (k_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0
+        ).to(tl.float32)
+        wv = tl.load(
+            conv_weight + (v_dim_base + offsets) * 4 + weight_col, mask=mask, other=0.0
+        ).to(tl.float32)
         acc_q += value_q.to(tl.float32) * wq
         acc_k += value_k.to(tl.float32) * wk
         acc_v += value_v.to(tl.float32) * wv
@@ -198,9 +233,30 @@ def _fused_kda_conv_tree_transform_kernel(
     q_conv = (acc_q * tl.sigmoid(acc_q)).to(out.dtype.element_ty)
     k_conv = (acc_k * tl.sigmoid(acc_k)).to(out.dtype.element_ty)
     v_conv = (acc_v * tl.sigmoid(acc_v)).to(out.dtype.element_ty)
-    tl.store(out + batch * stride_out_batch + (q_dim_base + offsets) * stride_out_dim + node * stride_out_token, q_conv, mask=mask)
-    tl.store(out + batch * stride_out_batch + (k_dim_base + offsets) * stride_out_dim + node * stride_out_token, k_conv, mask=mask)
-    tl.store(out + batch * stride_out_batch + (v_dim_base + offsets) * stride_out_dim + node * stride_out_token, v_conv, mask=mask)
+    tl.store(
+        out
+        + batch * stride_out_batch
+        + (q_dim_base + offsets) * stride_out_dim
+        + node * stride_out_token,
+        q_conv,
+        mask=mask,
+    )
+    tl.store(
+        out
+        + batch * stride_out_batch
+        + (k_dim_base + offsets) * stride_out_dim
+        + node * stride_out_token,
+        k_conv,
+        mask=mask,
+    )
+    tl.store(
+        out
+        + batch * stride_out_batch
+        + (v_dim_base + offsets) * stride_out_dim
+        + node * stride_out_token,
+        v_conv,
+        mask=mask,
+    )
 
     raw_k_conv = k_conv.to(tl.float32)
     k_conv_fp32 = k_conv.to(tl.float32)
@@ -208,13 +264,15 @@ def _fused_kda_conv_tree_transform_kernel(
     norm = tl.sqrt(tl.sum(k_conv_fp32 * k_conv_fp32, axis=0) + 1e-6)
     k_norm = k_conv_fp32 / norm
     token = batch * TREE_WIDTH + node
-    a_value = tl.load(a + token * stride_a_token + hv * K + offsets, mask=mask, other=0.0).to(tl.float32)
+    a_value = tl.load(
+        a + token * stride_a_token + hv * K + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
     b_value = tl.load(b + token * stride_b_token + hv).to(tl.float32)
-    alog = tl.load(A_log + hv).to(tl.float32)
+    a_log = tl.load(A_log + hv).to(tl.float32)
     dt = tl.load(dt_bias + hv * K + offsets, mask=mask, other=0.0).to(tl.float32)
     gate_input = a_value + dt
     if USE_LOWER_BOUND:
-        g = LOWER_BOUND * tl.sigmoid(tl.exp(alog) * gate_input)
+        g = LOWER_BOUND * tl.sigmoid(tl.exp(a_log) * gate_input)
     else:
         beta_x = SOFTPLUS_BETA * gate_input
         softplus_x = tl.where(
@@ -222,7 +280,7 @@ def _fused_kda_conv_tree_transform_kernel(
             tl.log(1.0 + tl.exp(beta_x)) / SOFTPLUS_BETA,
             gate_input,
         )
-        g = -tl.exp(alog) * softplus_x
+        g = -tl.exp(a_log) * softplus_x
     decay = tl.exp(g)
     beta = tl.sigmoid(b_value)
 
@@ -233,10 +291,35 @@ def _fused_kda_conv_tree_transform_kernel(
 
     if CACHE_TREE_FACTORS:
         cache_mask = mask & (factor_slot >= 0)
-        tl.store(tree_rawv + factor_slot * stride_rawv_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, v_conv_fp32, mask=cache_mask)
-        tl.store(tree_rawk + factor_slot * stride_rawk_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, raw_k_conv, mask=cache_mask)
-        tl.store(tree_g + factor_slot * stride_g_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, g, mask=cache_mask)
-        tl.store(tree_beta + factor_slot * stride_beta_slot + hv * CACHE_TREE_WIDTH + node, beta, mask=factor_slot >= 0)
+        tl.store(
+            tree_rawv
+            + factor_slot * stride_rawv_slot
+            + (hv * CACHE_TREE_WIDTH + node) * K
+            + offsets,
+            v_conv_fp32,
+            mask=cache_mask,
+        )
+        tl.store(
+            tree_rawk
+            + factor_slot * stride_rawk_slot
+            + (hv * CACHE_TREE_WIDTH + node) * K
+            + offsets,
+            raw_k_conv,
+            mask=cache_mask,
+        )
+        tl.store(
+            tree_g
+            + factor_slot * stride_g_slot
+            + (hv * CACHE_TREE_WIDTH + node) * K
+            + offsets,
+            g,
+            mask=cache_mask,
+        )
+        tl.store(
+            tree_beta + factor_slot * stride_beta_slot + hv * CACHE_TREE_WIDTH + node,
+            beta,
+            mask=factor_slot >= 0,
+        )
 
 
 def fused_kda_conv_tree_transform(
@@ -265,18 +348,24 @@ def fused_kda_conv_tree_transform(
     softplus_threshold: float = 20.0,
     lower_bound: float | None = None,
 ) -> torch.Tensor:
-    """Run the restricted experimental fused conv + node-transform kernel."""
+    """Run fused conv + node transform for the fixed-width BS=1 path."""
     if x.ndim != 3:
         raise ValueError("x must be [batch, 3 * HV * K, tree_width]")
     batch, dim, tree_width = x.shape
-    if tree_width not in (17, 25, 27, 29, 31, 32, 33, 49, 65):
-        raise ValueError(f"tree_width must be 17, 25, 27, 29, 31, 32, 33, 49, or 65, got {tree_width}")
+    if batch != 1:
+        raise ValueError(f"factorized UBTree conv supports only BS=1, got {batch}")
+    if tree_width not in (32, 49):
+        raise ValueError(f"tree_width must be 32 or 49, got {tree_width}")
     hv, key_dim = processed_beta.shape[1], processed_k.shape[-1]
     if dim != 3 * hv * key_dim or processed_k.shape != (batch, hv, tree_width, key_dim):
         raise ValueError("only equal Q/K/V head geometry is supported")
     if conv_weight.shape != (dim, 4) or conv_state.shape[-1] != 3:
         raise ValueError("only conv width 4 is supported")
-    if processed_decay.shape != processed_k.shape or processed_beta.shape != (batch, hv, tree_width):
+    if processed_decay.shape != processed_k.shape or processed_beta.shape != (
+        batch,
+        hv,
+        tree_width,
+    ):
         raise ValueError("processed transform shapes do not match")
     if retrieve_parent_token.shape != (batch, tree_width):
         raise ValueError("retrieve_parent_token shape mismatch")
@@ -284,31 +373,67 @@ def fused_kda_conv_tree_transform(
     if cache_tree_width < tree_width:
         raise ValueError("tree factor cache does not cover logical tree width")
     if x.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
-        raise ValueError("the experimental kernel requires BF16 activations and conv state")
+        raise ValueError("the fused kernel requires BF16 activations and conv state")
     if conv_weight.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("the experimental kernel requires BF16 or FP32 conv weights")
+        raise ValueError("the fused kernel requires BF16 or FP32 conv weights")
     if conv_bias is not None and conv_bias.dtype != torch.bfloat16:
-        raise ValueError("the experimental kernel currently requires a BF16 conv bias")
+        raise ValueError("the fused kernel requires a BF16 conv bias")
     out = torch.empty_like(x)
     bk = triton.next_power_of_2(key_dim)
     _fused_kda_conv_tree_transform_kernel[(batch, tree_width, hv)](
-        x, conv_weight, conv_bias, conv_state, conv_state_indices,
-        intermediate_conv_window, factor_cache_indices, retrieve_parent_token,
-        a, b, A_log, dt_bias, out, processed_k, processed_decay, processed_beta,
-        tree_rawv, tree_rawk, tree_g, tree_beta,
-        x.stride(0), x.stride(1), x.stride(2),
-        conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
-        intermediate_conv_window.stride(0), intermediate_conv_window.stride(1),
-        intermediate_conv_window.stride(2), intermediate_conv_window.stride(3),
-        retrieve_parent_token.stride(0), retrieve_parent_token.stride(1),
-        (a.stride(1) if a.ndim == 4 else a.stride(-2)), b.stride(-2),
-        out.stride(0), out.stride(1), out.stride(2),
-        tree_rawv.stride(0), tree_rawk.stride(0), tree_g.stride(0), tree_beta.stride(0),
-        SOFTPLUS_BETA=softplus_beta, SOFTPLUS_THRESHOLD=softplus_threshold,
+        x,
+        conv_weight,
+        conv_bias,
+        conv_state,
+        conv_state_indices,
+        intermediate_conv_window,
+        factor_cache_indices,
+        retrieve_parent_token,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        out,
+        processed_k,
+        processed_decay,
+        processed_beta,
+        tree_rawv,
+        tree_rawk,
+        tree_g,
+        tree_beta,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        intermediate_conv_window.stride(0),
+        intermediate_conv_window.stride(1),
+        intermediate_conv_window.stride(2),
+        intermediate_conv_window.stride(3),
+        retrieve_parent_token.stride(0),
+        retrieve_parent_token.stride(1),
+        (a.stride(1) if a.ndim == 4 else a.stride(-2)),
+        b.stride(-2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        tree_rawv.stride(0),
+        tree_rawk.stride(0),
+        tree_g.stride(0),
+        tree_beta.stride(0),
+        SOFTPLUS_BETA=softplus_beta,
+        SOFTPLUS_THRESHOLD=softplus_threshold,
         LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
-        TREE_WIDTH=tree_width, CACHE_TREE_WIDTH=cache_tree_width,
-        HV=hv, K=key_dim, BK=bk,
-        USE_LOWER_BOUND=lower_bound is not None, CACHE_TREE_FACTORS=True,
-        HAS_BIAS=conv_bias is not None, num_warps=2, num_stages=1,
+        TREE_WIDTH=tree_width,
+        CACHE_TREE_WIDTH=cache_tree_width,
+        HV=hv,
+        K=key_dim,
+        BK=bk,
+        USE_LOWER_BOUND=lower_bound is not None,
+        CACHE_TREE_FACTORS=True,
+        HAS_BIAS=conv_bias is not None,
+        num_warps=2,
+        num_stages=1,
     )
     return out

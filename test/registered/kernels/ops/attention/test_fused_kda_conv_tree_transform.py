@@ -26,22 +26,8 @@ def _outputs(batch, heads, nodes, dim, device):
     return pk, pd, pb, rv, rk, g, beta
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8])
-@pytest.mark.parametrize(
-    "nodes,cache_nodes",
-    [
-        (25, 25),
-        (27, 27),
-        (29, 29),
-        (31, 31),
-        (31, 49),
-        (32, 32),
-        (32, 49),
-        (33, 33),
-        (49, 49),
-        (65, 65),
-    ],
-)
+@pytest.mark.parametrize("batch", [1])
+@pytest.mark.parametrize("nodes,cache_nodes", [(32, 32), (49, 49)])
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 def test_fused_conv_tree_transform_matches_reference(
     batch, nodes, cache_nodes, weight_dtype
@@ -56,9 +42,7 @@ def test_fused_conv_tree_transform_matches_reference(
     state_indices = torch.arange(batch, dtype=torch.int32, device=device)
     factor_indices = state_indices.clone()
     parent_row = [-1] + [(i - 1) // 4 for i in range(1, nodes)]
-    parents = torch.tensor(
-        [parent_row] * batch, dtype=torch.int32, device=device
-    )
+    parents = torch.tensor([parent_row] * batch, dtype=torch.int32, device=device)
     tree_marker = torch.zeros_like(parents)
     inter_ref = torch.empty(
         batch, nodes, model_dim, 3, device=device, dtype=torch.bfloat16
