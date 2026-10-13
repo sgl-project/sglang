@@ -255,10 +255,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # do not widen this to `not is_cuda()` or drop it.
             module.to(
                 "cpu",
-                non_blocking=not (
-                    current_platform.device_shares_host_memory()
-                    or current_platform.is_xpu()
-                ),
+                non_blocking=not current_platform.device_shares_host_memory(),
             )
         self._ready_events.pop(use.component_name, None)
 
