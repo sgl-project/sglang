@@ -122,6 +122,9 @@ fn python_float(f: f64) -> String {
 /// raises `RecursionError` (its C recursion limit, less the caller's frames).
 const MAX_DEPTH: usize = 10_000;
 
+/// `sys.get_int_max_str_digits()`: Python's `int` reads at most this many digits.
+pub(crate) const MAX_INT_DIGITS: usize = 4300;
+
 /// `json.dumps(json.loads(text), ensure_ascii=False)`, or `None` where
 /// `json.loads` raises. Integers keep their digits, as Python's `int` does; a
 /// duplicate key keeps its first position and last value. Lone surrogates,
@@ -384,6 +387,7 @@ impl PyJsonScanner<'_> {
         let literal = &self.text[self.pos..self.pos + end];
         self.pos += end;
         match end == int_end {
+            true if literal.trim_start_matches('-').len() > MAX_INT_DIGITS => None,
             // `int("-0")` is 0.
             true if literal == "-0" => Some("0".into()),
             true => Some(literal.into()),
@@ -483,6 +487,17 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// `json.loads` reads integers through `int`, which takes at most 4300 digits.
+    #[test]
+    fn long_integers_are_not_json() {
+        let digits = |n: usize| "1".repeat(n);
+        let negative = format!("-{}", digits(MAX_INT_DIGITS));
+        assert_eq!(python_json_reencode(&negative), Some(negative.clone()));
+        assert_eq!(python_json_reencode(&digits(MAX_INT_DIGITS + 1)), None);
+        let float = format!("{}.0", digits(MAX_INT_DIGITS + 1));
+        assert!(python_json_reencode(&float).is_some());
     }
 
     #[test]
