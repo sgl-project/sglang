@@ -129,6 +129,10 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 if _is_xpu:
     from sgl_kernel import store_cache_xpu
 
+    # Dtypes accepted by sgl-kernel-xpu store_cache; fp32 K/V (e.g. the
+    # bge-reranker cross-encoder) takes the naive path.
+    _XPU_STORE_CACHE_DTYPES = (torch.float16, torch.bfloat16, torch.uint8)
+
 
 def conv_window_dedup_enabled(
     is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
@@ -182,7 +186,12 @@ def _set_kv_buffer_impl(
             size_limit=size_limit,
         )
 
-    if _is_xpu and v_row_dim == row_dim:
+    if (
+        _is_xpu
+        and v_row_dim == row_dim
+        and k.dtype in _XPU_STORE_CACHE_DTYPES
+        and v.dtype in _XPU_STORE_CACHE_DTYPES
+    ):
         return store_cache_xpu(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
