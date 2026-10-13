@@ -126,7 +126,15 @@ OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. The
 - Every recipe runs on one GPU. On H100 the 35B-A3B BF16 checkpoint (about 66 GB of weights) does not fit the default static memory fraction of an 80 GB card; use FP8 or INT4 there.
 - Pick the quantization by platform. On H200, quantization is a speed win: at concurrency 16, INT4 and FP8 reach 15,808 and 15,280 tokens/s per GPU against 12,103 for BF16, and INT4 has the fastest 35B-A3B decode (TPOT 3.47 ms at concurrency 1). On GB300, BF16 and FP8 decode at about the same speed at concurrency 1 (TPOT 4.36 vs 4.44 ms), and FP8 pulls ahead at concurrency 16 (16,059 vs 14,094 tokens/s per GPU). INT4 is slower on GB300 at every concurrency (TPOT 8.56 ms at concurrency 1), so use it there only to save memory.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
-- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. On GB300, turn it on only for 35B-A3B BF16 and FP8 at low concurrency; on H200, turn it on for 35B-A3B BF16 at both measured concurrencies and for FP8 and INT4 at low concurrency; leave it off for 1B. Matched sharegpt runs (TPOT ms, DSPARK off → on) back this: at concurrency 1, GB300 BF16 2.99 → 2.80, FP8 3.08 → 2.76, INT4 7.19 → 11.05, 1B 1.75 → 2.02, and H200 BF16 3.56 → 3.02, FP8 3.42 → 2.61, INT4 3.34 → 2.38, 1B 1.56 → 1.65; at concurrency 16, DSPARK is slower on every GB300 configuration and on H200 except BF16 (13.51 → 11.92; FP8 11.11 → 12.40, INT4 9.33 → 11.20, 1B 4.43 → 6.27).
+- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. On GB300, turn it on only for 35B-A3B BF16 and FP8 at low concurrency; on H200, turn it on for 35B-A3B BF16 at both measured concurrencies and for FP8 and INT4 at low concurrency; leave it off for 1B. Matched sharegpt runs back this (TPOT ms, DSPARK off → on):
+
+| Configuration | GB300, conc 1 | GB300, conc 16 | H200, conc 1 | H200, conc 16 |
+|---|---|---|---|---|
+| 1B BF16 | 1.75 → 2.02 | 4.00 → 5.73 | 1.56 → 1.65 | 4.43 → 6.27 |
+| 35B-A3B BF16 | 2.99 → 2.80 | 11.17 → 13.69 | 3.56 → 3.02 | 13.51 → 11.92 |
+| 35B-A3B FP8 | 3.08 → 2.76 | 10.53 → 12.60 | 3.42 → 2.61 | 11.11 → 12.40 |
+| 35B-A3B INT4 | 7.19 → 11.05 | 47.92 → 54.80 | 3.34 → 2.38 | 9.33 → 11.20 |
+
 - Benchmark speculative decoding on real text. Random-token prompts collapse draft acceptance, so they say nothing about DSPARK. For a real-workload reference, GSM8K accept length is about 2.6 on 1B, 4.1 on 35B-A3B BF16, 4.0 on FP8, and 3.8 on INT4.
 - Every command carries `--reasoning-parser auto --tool-call-parser auto`. SGLang resolves both from the chat template, to `qwen3` for reasoning and `qwen3_coder` for tool calls, so the thinking trace lands in `message.reasoning_content` and tool calls in `message.tool_calls` (see §3.1 and §3.2). To turn either off, toggle it in the **Parsers** card of the [Playground](#playground).
 - Thinking is on by default. To get a direct answer for one request, pass `"chat_template_kwargs": {"enable_thinking": false}` (in the OpenAI Python client, `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); `reasoning_content` then comes back empty.
