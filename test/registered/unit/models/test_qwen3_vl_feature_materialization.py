@@ -14,6 +14,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.srt.multimodal.processors.qwen_vl_token_space import (
+    QwenVLMultimodalProcessorOutputBuilder,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
@@ -71,6 +74,12 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
                 processor.mm_feature_transport = transport
                 processor.model_type = "qwen3_vl"
+                processor.output_builder = (
+                    QwenVLMultimodalProcessorOutputBuilder.__new__(
+                        QwenVLMultimodalProcessorOutputBuilder
+                    )
+                )
+                processor.output_builder.model_type = "qwen3_vl"
                 items = [
                     MultimodalDataItem(modality=Modality.IMAGE),
                     MultimodalDataItem(modality=Modality.VIDEO),
@@ -101,6 +110,10 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
             processor.mm_feature_transport = "cpu"
             processor.model_type = "qwen3_vl"
+            processor.output_builder = QwenVLMultimodalProcessorOutputBuilder.__new__(
+                QwenVLMultimodalProcessorOutputBuilder
+            )
+            processor.output_builder.model_type = "qwen3_vl"
             item = MultimodalDataItem(modality=Modality.IMAGE)
 
             processor._mark_cuda_ipc_features_for_deferred_reconstruction(
@@ -116,6 +129,10 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         processor.mm_feature_transport = "cuda_ipc"
         processor.model_type = "qwen3_vl"
+        processor.output_builder = QwenVLMultimodalProcessorOutputBuilder.__new__(
+            QwenVLMultimodalProcessorOutputBuilder
+        )
+        processor.output_builder.model_type = "qwen3_vl"
         item = MultimodalDataItem(modality=Modality.IMAGE)
 
         processor._mark_cuda_ipc_features_for_deferred_reconstruction(
