@@ -3323,15 +3323,14 @@ class DeepseekV4AttnBackend(
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
         # The negation of the sparse-prefill gate in forward(), which reads only
-        # raw_indices; the query-count clause is dropped, so this errs to True.
+        # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
+        # to True. Paged attention under active CP needs the page indices.
         return (
             self.trtllm_attn
-            or not forward_batch.forward_mode.is_extend_without_speculative()
-            or get_platform().is_sm120
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
-            or not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
