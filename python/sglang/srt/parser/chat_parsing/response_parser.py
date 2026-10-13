@@ -69,7 +69,14 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
     for type_name in types:
         try:
             if type_name == "integer":
-                return int(raw)
+                try:
+                    return int(raw)
+                except ValueError:
+                    # JSON Schema integers include whole numbers written as floats, e.g. "3.0"
+                    number = float(raw)
+                    if not number.is_integer():
+                        continue
+                    return int(number)
             if type_name == "number":
                 try:
                     return int(raw)  # exact, where float() rounds integers beyond 2**53
