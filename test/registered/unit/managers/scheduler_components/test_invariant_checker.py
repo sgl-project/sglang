@@ -60,7 +60,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             req_to_token_pool=MagicMock(),
             pool_stats_observer=MagicMock(),
             get_last_batch=lambda: None,
-            get_running_batch=lambda: None,
+            get_running_and_inflight_batches=lambda: [],
             scheduler_stage_metrics=None,
         )
 
@@ -200,7 +200,10 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
+            get_running_and_inflight_batches=lambda: [
+                self.running_batch,
+                self.last_batch,
+            ],
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=None,
         )

@@ -35,7 +35,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
         get_last_batch = lambda self: None
-        get_running_batch = lambda self: None
+        get_running_and_inflight_batches = lambda self: [self.get_last_batch()]
         get_chunked_req = lambda self: None
         count_memory_leak_warnings = 0
 
@@ -110,7 +110,9 @@ class TestKVPageInvariants(CustomTestCase):
                 )
                 owner = _FakeOwner(0, 3, 3, rid="a")
                 if where == "running":
-                    chk.get_running_batch = lambda: SimpleNamespace(reqs=[owner])
+                    chk.get_running_and_inflight_batches = lambda: [
+                        SimpleNamespace(reqs=[owner])
+                    ]
                 else:
                     chk.get_chunked_req = lambda: owner
                 with self.assertRaises(ValueError):
