@@ -284,28 +284,27 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_mla_rank0_owns_eviction(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=0, tp_size=2)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
-    def test_mla_rank1_only_owns_its_mamba_files(self):
+    def test_mla_rank1_only_creates_its_mamba_files(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
-        self.assertTrue(b._evictor.enabled)
-        # Replicated MLA files are still created by rank 0 only.
+        # Replicated MLA files are created by rank 0 only.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
-        self.assertTrue(b.set("a.mamba", _t(50)))
+        self.assertTrue(b.set("a", _t(50), pool_name=PoolName.MAMBA))
         self.assertEqual(b._evictor._total_bytes, 50)
 
     def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
-        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
+        """MLA shares KV files, but Mamba pages must not overwrite another rank's."""
         ranks = [
             self.make_backend(is_mla=True, tp_rank=rank, tp_size=2, subdir="shared")
             for rank in range(2)
         ]
         for rank, b in enumerate(ranks):
-            self.assertTrue(b.set("a.mamba", _t(16, rank + 1)))
+            self.assertTrue(b.set("a", _t(16, rank + 1), pool_name=PoolName.MAMBA))
         for rank, b in enumerate(ranks):
-            self.assertTrue(torch.equal(b.get("a.mamba", _t(16)), _t(16, rank + 1)))
+            page = b.get("a", _t(16), pool_name=PoolName.MAMBA)
+            self.assertTrue(torch.equal(page, _t(16, rank + 1)))
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.
@@ -320,7 +319,6 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_non_mla_each_rank_owns_its_files(self):
         # Non-MLA: even rank > 0 is its own owner because suffix isolates files.
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
 

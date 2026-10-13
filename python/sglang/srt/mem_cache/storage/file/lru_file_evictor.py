@@ -66,26 +66,18 @@ class LRUFileEvictor:
     def __init__(
         self,
         file_path: str,
-        config_suffix: str,
         *,
+        owned_suffixes: Tuple[str, ...],
         tp_rank: int,
-        is_mla_model: bool,
-        tp_config_suffix: Optional[str] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.file_path = file_path
-        self.config_suffix = config_suffix
+        # Files ending in one of these suffixes are created and evicted by this
+        # rank; other files in the shared directory are only read.
+        self._owned_suffixes = owned_suffixes
         self._tp_rank = tp_rank
         self._on_evict = on_evict
-
-        # MLA ranks share the same physical files, so centralize LRU bookkeeping
-        # on rank 0; non-MLA ranks each own their own files via the suffix.
-        # Every rank owns its TP-sharded files (tp_config_suffix).
-        self._owned_suffixes = (tp_config_suffix,) if tp_config_suffix else ()
-        if not is_mla_model or tp_rank == 0:
-            self._owned_suffixes += (config_suffix,)
-        self._is_storage_owner = bool(self._owned_suffixes)
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -95,14 +87,7 @@ class LRUFileEvictor:
 
         self._load_config(extra_config or {})
 
-        self._eviction_configured = self.max_size_bytes > 0 or self.min_free_bytes > 0
-        self._eviction_enabled = self._eviction_configured and self._is_storage_owner
-        if self._eviction_configured and not self._is_storage_owner:
-            logger.info(
-                f"HiCacheFile rank {self._tp_rank} (MLA): eviction handled by rank 0; "
-                f"this rank skips LRU bookkeeping and will not create new files."
-            )
-
+        self._eviction_enabled = self.max_size_bytes > 0 or self.min_free_bytes > 0
         if not self._eviction_enabled:
             return
 
@@ -154,21 +139,11 @@ class LRUFileEvictor:
 
     @property
     def enabled(self) -> bool:
-        """True when this rank actively evicts (configured AND storage owner)."""
+        """True when a cap or free-space watermark is set."""
         return self._eviction_enabled
-
-    @property
-    def configured(self) -> bool:
-        """True when a cap or free-space watermark is set (on any rank)."""
-        return self._eviction_configured
 
     def _owns(self, suffixed_key: str) -> bool:
         return suffixed_key.endswith(self._owned_suffixes)
-
-    @property
-    def is_storage_owner(self) -> bool:
-        """True when this rank owns (and may create/evict) the on-disk files."""
-        return self._is_storage_owner
 
     def reserve(self, suffixed_key: str, value_bytes: int, key: str = "") -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
@@ -181,12 +156,12 @@ class LRUFileEvictor:
         the cap, there is no evictable space, or the free-space watermark cannot
         be met. When eviction is not configured the write is always admitted.
         """
-        if not self._eviction_configured:
+        if not self._eviction_enabled:
             return True  # unbounded storage: nothing to enforce
         if not self._owns(suffixed_key):
             logger.warning(
-                f"HiCacheFile rank {self._tp_rank} is not the MLA storage owner; "
-                f"not caching new key {key} because file eviction is enabled."
+                f"HiCacheFile rank {self._tp_rank} does not own key {key}; "
+                f"not caching it because file eviction is enabled."
             )
             return False
         if self.max_size_bytes > 0 and value_bytes > self.max_size_bytes:

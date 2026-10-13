@@ -397,15 +397,16 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        rank_suffix = f"_{tp_rank}_{tp_size}"
-        stage_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
+        shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
-            stage_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
-        self.tp_config_suffix = f"_{model_name}{rank_suffix}{stage_suffix}"
+            shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # MLA KV is replicated across TP ranks and shares one file per page;
+        # TP-sharded state is keyed by tp_config_suffix instead.
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
         self.config_suffix = (
-            f"_{model_name}{stage_suffix}" if is_mla_model else self.tp_config_suffix
+            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
         )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
@@ -442,28 +443,31 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        # Each rank creates and evicts its TP-sharded files; rank 0 also owns
+        # the shared MLA files.
+        owned_suffixes = (self.tp_config_suffix,)
+        if is_mla_model and tp_rank == 0:
+            owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
-            self.config_suffix,
+            owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
-            tp_config_suffix=self.tp_config_suffix,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
 
-    def _get_suffixed_key(self, key: str) -> str:
+    def _get_suffixed_key(self, key: str, pool_name: Optional[str] = None) -> str:
         # Mamba state is TP-sharded even when the model's MLA KV is replicated.
-        if key.endswith(f".{PoolName.MAMBA.value}"):
+        if pool_name == PoolName.MAMBA:
             return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(f"{key}.{component_name}", component_name)
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -483,8 +487,10 @@ class HiCacheFile(HiCacheStorage):
         key: str,
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
+        *,
+        pool_name: Optional[str] = None,
     ) -> torch.Tensor | None:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, pool_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
@@ -521,12 +527,14 @@ class HiCacheFile(HiCacheStorage):
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        *,
+        pool_name: Optional[str] = None,
     ) -> bool:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, pool_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
-        if self.exists(key):
+        if self.exists(key, pool_name=pool_name):
             logger.debug(f"Key {key} already exists. Skipped.")
             self._evictor.touch(suffixed, tensor_path)
             return True
@@ -573,8 +581,8 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
-    def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
+    def exists(self, key: str, *, pool_name: Optional[str] = None) -> bool:
+        key = self._get_component_key(key, pool_name)
         if self.metadata_cache is not None and self.metadata_cache.contains(key):
             return True
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
@@ -663,13 +671,11 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
-    def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
-
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        data_page = self.get(
+            key, host_pool.get_dummy_flat_data_page(), pool_name=pool_name
+        )
         if data_page is None:
             return False
         host_pool.set_from_flat_data_page(page_offset, data_page)
@@ -679,9 +685,8 @@ class HiCacheFile(HiCacheStorage):
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
-        storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(storage_key, data_page)
+        return self.set(key, data_page, pool_name=pool_name)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}
