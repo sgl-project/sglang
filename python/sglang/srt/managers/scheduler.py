@@ -4680,6 +4680,9 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        # Admission now protects the prefix these requests matched.
+        for req in can_run_list:
+            req.release_mm_prefix_hold(self.tree_cache)
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.

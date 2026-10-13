@@ -100,7 +100,7 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
-    def retract(self, req: Req, *, offload_kv: bool) -> bool:
+    def retract(self, req: Req, *, offload_kv: bool, requeue: bool = False) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.retract_req(req)
@@ -119,9 +119,19 @@ class RequestRetirer:
             )
         else:
             resumable = req.resumable_by_rebootstrap
+        prompt_node = req.lock.node if req.lock is not None else None
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
+        if (
+            requeue
+            and resumable
+            and prompt_node is not None
+            and get_disagg().disaggregation_mode != "decode"
+            and req.multimodal_inputs is not None
+            and req.multimodal_inputs.has_released_items_beyond_prefix(0)
+        ):
+            req.mm_prefix_hold = self.tree_cache.lock(prompt_node)
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
@@ -143,6 +153,7 @@ class RequestRetirer:
         # Counted before the media goes: the output sent after still reports it.
         req.get_mm_token_counts()
         req.release_mm_inputs_on_abort()
+        req.release_mm_prefix_hold(self.tree_cache)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
         if self.uocr_runtime is not None:
