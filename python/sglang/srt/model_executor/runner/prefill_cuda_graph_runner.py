@@ -117,9 +117,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import (
-    maybe_publish_prefill_shared_read_done,
-)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -129,6 +126,9 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
