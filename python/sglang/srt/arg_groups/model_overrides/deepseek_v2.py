@@ -77,6 +77,29 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
                     )
 
+    if is_deepseek_dsa(hf_config) and getattr(cfg, "dcp_size", 1) > 1:
+        # DSA + DCP covers ROCm decode and chain EAGLE/MTP on the plain DSA
+        # pool; the draft shards its KV like the target.
+        if not get_platform().is_hip:
+            raise ValueError(
+                "--dcp-size > 1 with DSA models is only supported on ROCm."
+            )
+        if cfg.speculative_algorithm not in (None, "EAGLE", "NEXTN"):
+            raise ValueError(
+                "--dcp-size > 1 with DSA models only supports EAGLE/NEXTN "
+                "speculative decoding."
+            )
+        if cfg.speculative_algorithm is not None and (
+            cfg.speculative_eagle_topk not in (None, 1)
+        ):
+            raise ValueError(
+                "--dcp-size > 1 with DSA models requires --speculative-eagle-topk 1."
+            )
+        if cfg.enable_hisparse:
+            raise ValueError(
+                "--dcp-size > 1 with DSA models does not support --enable-hisparse yet."
+            )
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):

@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
@@ -120,10 +121,20 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    # A DSA EAGLE/NEXTN draft shards its KV like the target, so its rows ride
+    # the target's translated host rows.
+    draft_shards_like_target = cfg.speculative_algorithm in (
+        "EAGLE",
+        "NEXTN",
+    ) and is_deepseek_dsa(model_config_of(server_args).hf_config)
+    if cfg.speculative_algorithm not in (None, "DSPARK") and not (
+        draft_shards_like_target
+    ):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
+            "HiCache with --dcp-size > 1 only supports DSPARK, and EAGLE/NEXTN "
+            "on DSA models; other draft-model host pools have no DCP index "
             "translation."
         )
     if cfg.enable_lmcache:

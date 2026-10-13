@@ -188,8 +188,11 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     pd_index_share_seed = (
         get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
-        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
+    # DCP needs raw global positions: the owner filter runs on the unfused table.
+    return (
+        envs.SGLANG_DSA_FUSE_TOPK.get()
+        and not get_parallel().dcp_enabled
+        and (not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots())
     )
 
 

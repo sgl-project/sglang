@@ -81,6 +81,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.dcp.dsa import dcp_forward_scope
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -3035,6 +3036,23 @@ class DeepseekV2Model(nn.Module):
         return not getattr(backend, "use_mha", False)
 
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if not (self.use_dsa and get_parallel().dcp_enabled):
+            return self._forward(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        with dcp_forward_scope(forward_batch):
+            return self._forward(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+
+    def _forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,

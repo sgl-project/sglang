@@ -35,3 +35,5 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+    # DSA prefill: [bs, max_len] position -> dcp_kv_buffer row, built lazily.
+    dsa_page_table_1: Optional[torch.Tensor] = None
