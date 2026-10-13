@@ -249,12 +249,13 @@ class MinimaxM3Detector(BaseFormatDetector):
         if gt == -1:
             return False
 
+        tag = self._buffer[start + len(self.PARAM_START_PREFIX) : gt].strip()
+        end_token = self._parameter_end_token(tag)
         rest = self._buffer[gt + 1 :]
-        if rest and self.PARAM_START_PREFIX.startswith(rest):
+        if rest and len(rest) < len(end_token) and end_token.startswith(rest):
             # The next tag may open a child or close this parameter; wait for it.
             return False
 
-        tag = self._buffer[start + len(self.PARAM_START_PREFIX) : gt].strip()
         self._buffer = rest
         self._current_param_name = tag
         self._current_param_schema = self._get_child_schema(
@@ -262,9 +263,9 @@ class MinimaxM3Detector(BaseFormatDetector):
         )
         self._current_param_buffer = ""
         # Mirrors _parse_parameter: an empty scalar value is not an empty container.
-        closes_empty_scalar = self._buffer.startswith(
-            self.PARAM_START_PREFIX + "/"
-        ) and self._is_scalar_schema(self._current_param_schema)
+        closes_empty_scalar = rest.startswith(end_token) and self._is_scalar_schema(
+            self._current_param_schema
+        )
         self._current_param_is_complex = self._schema_has_type(
             self._current_param_schema, ("object", "array")
         ) or (

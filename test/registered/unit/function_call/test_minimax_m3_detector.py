@@ -572,6 +572,25 @@ class TestMinimaxM3Malformed(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
 
+    def test_mismatched_closing_tag_after_opening_tag_in_one_chunk(self):
+        """A wrong closing tag right after a scalar's opening tag is not streamed as its value."""
+        text = _wire(
+            "<tool_call>",
+            '<invoke name="add_note">',
+            "<note>",
+            "</wrong>",
+            "</note>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        try:
+            calls = (
+                MinimaxM3Detector().parse_streaming_increment(text, self.tools).calls
+            )
+        except ValueError:
+            calls = []
+        self.assertNotIn("wrong", "".join(c.parameters or "" for c in calls))
+
     def test_truncated_streaming_does_not_crash(self):
         segments = (
             "<tool_call>",
