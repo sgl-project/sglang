@@ -207,7 +207,9 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
         set_autotune_process_group(previous)
 
 
-def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
+def _autotune_cache_digest(
+    cache_path: Path, env: dict[str, str], include_policy: bool = False
+) -> str:
     """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
     Includes the environment: ``load_configs`` ignores the whole file when its
@@ -223,6 +225,15 @@ def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
     if not isinstance(configs, dict):
         return ""
     payload = {"file": configs, "env": env}
+    if include_policy:
+        # A missing or different sidecar must not make only some ranks skip
+        # a distributed profiling pass while their peers enter its collectives.
+        try:
+            payload["policy"] = json.loads(
+                cache_path.with_suffix(".policies.json").read_text()
+            )
+        except (OSError, ValueError):
+            payload["policy"] = None
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -235,7 +246,11 @@ def _drop_diverged_autotune_cache(
     """
     digests: list[str] = [""] * torch.distributed.get_world_size(group)
     torch.distributed.all_gather_object(
-        digests, _autotune_cache_digest(cache_path, env), group=group
+        digests,
+        _autotune_cache_digest(
+            cache_path, env, include_policy=envs.SGLANG_FLASHINFER_POLICY_CACHE.get()
+        ),
+        group=group,
     )
     if len(set(digests)) == 1:
         return
@@ -284,18 +299,24 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
-        with (
-            _autotune_process_group(sync_group),
-            autotune(
-                True,
-                cache=None if reuse_cache else str(autotune_cache),
-                skip_ops=skip_ops,
-            ),
-            autotune_dummy_run_mode(run_lm_head=run_lm_head),
-        ):
-            yield
-        if reuse_cache:
-            tuner.save_configs(str(autotune_cache))
+        policy_context = contextlib.nullcontext()
+        if reuse_cache and envs.SGLANG_FLASHINFER_POLICY_CACHE.get():
+            from .flashinfer_cache_policy import persisted_profiling_policies
+
+            policy_context = persisted_profiling_policies(tuner, autotune_cache)
+        with policy_context:
+            with (
+                _autotune_process_group(sync_group),
+                autotune(
+                    True,
+                    cache=None if reuse_cache else str(autotune_cache),
+                    skip_ops=skip_ops,
+                ),
+                autotune_dummy_run_mode(run_lm_head=run_lm_head),
+            ):
+                yield
+            if reuse_cache:
+                tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
