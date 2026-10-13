@@ -10,6 +10,7 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.moe_replicate_tp_hook import resolve_moe_replicate_tp
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
@@ -141,6 +142,7 @@ def handle_context_parallelism(server_args: Any):
                     "--language-only."
                 )
         resolve_cp_tp_group_sharing(server_args, model_config)
+        resolve_moe_replicate_tp(server_args, model_config)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
@@ -180,9 +182,12 @@ def handle_context_parallelism(server_args: Any):
             "Aiter allreduce fusion is not supported with context parallelism"
         )
 
+    if cfg.moe_replicate_tp and cfg.moe_dp_size != cfg.tp_size:
+        raise ValueError("--moe-replicate-tp needs a model config to validate.")
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert cfg.moe_dp_size == 1, (
-            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        assert cfg.moe_dp_size == 1 or cfg.moe_replicate_tp, (
+            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1 "
+            "or with --moe-replicate-tp"
         )
 
     from sglang.srt.layers.cp.base import init_cp_strategy

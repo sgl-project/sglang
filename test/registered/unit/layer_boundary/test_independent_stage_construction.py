@@ -47,6 +47,7 @@ class TestIndependentStageConstruction(CustomTestCase):
         for variant in BatchVariant:
             plan = stub_plan()
             plan._unpadded_attn_tp_size = 2
+            plan._binds_replicated_moe_sp = True
             ordinary = object()
             plan.paths[BatchVariant.ORDINARY] = ordinary
             with (
@@ -55,7 +56,10 @@ class TestIndependentStageConstruction(CustomTestCase):
                     construction,
                     "get_forward",
                     return_value=SimpleNamespace(
-                        sp_active=variant is BatchVariant.SEQUENCE_PARALLEL
+                        sp_active=variant is BatchVariant.SEQUENCE_PARALLEL,
+                        replicated_moe_sp_rows=int(
+                            variant is BatchVariant.REPLICATED_MOE_SP
+                        ),
                     ),
                 ),
                 patch.object(

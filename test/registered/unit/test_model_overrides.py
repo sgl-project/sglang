@@ -59,6 +59,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_prefill_cp=False,
                     enable_attn_tp_input_scattered=False,
                     moe_dp_size=1,
+                    moe_replicate_tp=False,
                     cp_strategy=None,
                     tp_size=4,
                     dp_size=1,

@@ -83,6 +83,7 @@ POSITIONAL_FIELD_ORDER = (
     "load_balance_method",
     "attn_cp_size",
     "moe_dp_size",
+    "moe_replicate_tp",
     "dwdp_size",
     "dcp_comm_backend",
     "dcp_replicate_q_proj",

@@ -54,6 +54,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
+from sglang.srt.layers.moe.utils import moe_replicated_over_tp
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -104,6 +105,8 @@ def _active_variants():
         yield BatchVariant.SEQUENCE_PARALLEL
     if _unpadded_possible():
         yield BatchVariant.UNPADDED
+    if moe_replicated_over_tp(get_parallel()):
+        yield BatchVariant.REPLICATED_MOE_SP
 
 
 def _row_layouts(variant):
@@ -154,7 +157,9 @@ def _resolve_ffn(
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
-    on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
+    on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size) or (
+        sparse and variant is BatchVariant.REPLICATED_MOE_SP
+    )
     if variant is BatchVariant.UNPADDED and on_rank_rows:
         # Rows that do not divide over attention TP stay whole: the FFN runs on
         # the attention's rows (an a2a MoE dispatches them from every
@@ -186,7 +191,12 @@ def _resolve_ffn(
     else:
         group = SumGroup.ATTN_TP if on_attention_rows else SumGroup.TP
     # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update.writes_stream or output_complete
+    complete = (
+        on_rank_rows
+        or update.writes_stream
+        or output_complete
+        or (sparse and moe_replicated_over_tp(get_parallel()))
+    )
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageContract(

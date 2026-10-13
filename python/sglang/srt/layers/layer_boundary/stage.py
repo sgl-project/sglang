@@ -333,6 +333,14 @@ class StageBoundary:
                 )
                 if get_forward().sp_active:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+            if (
+                plan.paths.get(BatchVariant.REPLICATED_MOE_SP) is not None
+                and plan.enters_stack
+            ):
+                get_forward().set(
+                    "replicated_moe_sp_rows",
+                    _replicated_moe_sp_rows(hidden_states, forward_batch),
+                )
         steps = plan.path_for(forward_batch)
         if self.kind is StageKind.FFN:
             publish_ffn_lora_rows(plan._publish_lora_layout, steps.entry.input_rows)
@@ -412,6 +420,17 @@ class StageBoundary:
                 ),
             )
         return hidden_states, stream
+
+
+def _replicated_moe_sp_rows(hidden_states, forward_batch: ForwardBatch) -> int:
+    """The rows of a prefill that runs the replicated MoE on each rank's slice,
+    or 0: decode, target-verify and idle batches keep every row on every rank."""
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_target_verify():
+        return 0
+    if isinstance(hidden_states, tuple):
+        return 0
+    return hidden_states.shape[0]
 
 
 def check_stage_producers(model: torch.nn.Module) -> None:

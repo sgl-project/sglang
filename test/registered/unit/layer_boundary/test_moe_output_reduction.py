@@ -39,6 +39,7 @@ def moe_config(
     tp_size=2,
     tp_rank=0,
     dwdp_size=1,
+    moe_dp_size=1,
     backend=None,
     fp4_allgather=False,
     reduce_scatterv=False,
@@ -48,7 +49,11 @@ def moe_config(
             moe_utils,
             "get_parallel",
             return_value=types.SimpleNamespace(
-                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                dwdp_size=dwdp_size,
+                moe_dp_size=moe_dp_size,
+                attn_cp_size=1,
             ),
         ),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a(backend)),
@@ -104,6 +109,8 @@ class TestReduceMoeOutput(CustomTestCase):
             {"backend": "flashinfer_megamoe"},
             {"dwdp_size": 2},
             {"fp4_allgather": True},
+            # --moe-replicate-tp: every rank holds all experts.
+            {"moe_dp_size": 2},
         ):
             with self.subTest(**config), moe_config(**config):
                 self.assertEqual(self.all_reduces()[0], 0)

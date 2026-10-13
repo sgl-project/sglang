@@ -140,6 +140,7 @@ class StagePlan:
         self._unpadded_attn_tp_size = (
             get_parallel().attn_tp_size if BatchVariant.UNPADDED in self.edges else None
         )
+        self._binds_replicated_moe_sp = BatchVariant.REPLICATED_MOE_SP in self.edges
         self.enters_stack = enters_stack
         self.terminal = terminal
         self.finishes_directly = finishes_directly
@@ -219,6 +220,8 @@ class StagePlan:
             return BatchVariant.SEQUENCE_PARALLEL
         if get_attn_tp_context().input_scattered:
             return BatchVariant.INPUT_SCATTERED
+        if self._binds_replicated_moe_sp and get_forward().replicated_moe_sp_rows:
+            return BatchVariant.REPLICATED_MOE_SP
         if _batch_shards_over_cp(forward_batch):
             return BatchVariant.CONTEXT_PARALLEL
         if self._unpadded_attn_tp_size is not None and _rows_indivisible_over_attn_tp(

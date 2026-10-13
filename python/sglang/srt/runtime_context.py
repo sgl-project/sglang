@@ -697,6 +697,9 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # Rows of a --moe-replicate-tp prefill, before its padding to the TP
+        # size; 0 outside one. Set at the layer stack's entry.
+        "replicated_moe_sp_rows": 0,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -714,6 +717,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "replicated_moe_sp_rows",
         }
     )
 

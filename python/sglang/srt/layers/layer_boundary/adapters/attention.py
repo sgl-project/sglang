@@ -144,8 +144,17 @@ def get_attn_tp_context():
 def attn_tp_gather(tensor: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
     """Gather this rank's attention-TP slice of the rows into all of them: in
     the local DP buffer, or in a buffer of its own for an output that
-    outlives the next use of that buffer (``owned``)."""
+    outlives the next use of that buffer (``owned``). A --moe-replicate-tp
+    prefill drops the rows its slices were padded with."""
     parallel = get_parallel()
+    rows = get_forward().replicated_moe_sp_rows
+    if rows:
+        # MLP sync, which sizes the local DP buffer, does not run under plain TP.
+        gathered = tensor.new_empty(
+            (tensor.shape[0] * parallel.attn_tp_size, tensor.shape[-1])
+        )
+        attn_tp_all_gather_into_tensor(gathered, tensor)
+        return gathered[:rows]
     if owned or batches_are_unpadded():
         # MLP sync, which sizes the local DP buffer for a batch, does not run
         # for an unpadded one.
@@ -170,4 +179,20 @@ def tp_gather(hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch
 
 def attn_tp_slice(tensor: torch.Tensor) -> torch.Tensor:
     parallel = get_parallel()
+    tensor = pad_rows_to_attn_tp(tensor)
     return tensor.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]
+
+
+def pad_rows_to_attn_tp(tensor: torch.Tensor) -> torch.Tensor:
+    """Pad the rows of a --moe-replicate-tp prefill with zeros to a multiple of
+    the attention TP size, so its attention-TP slices have equal sizes; an
+    unpadded batch otherwise splits unevenly."""
+    if not get_forward().replicated_moe_sp_rows:
+        return tensor
+    remainder = tensor.shape[0] % get_parallel().attn_tp_size
+    if remainder == 0:
+        return tensor
+    return torch.nn.functional.pad(
+        tensor,
+        [0, 0] * (tensor.dim() - 1) + [0, get_parallel().attn_tp_size - remainder],
+    )
