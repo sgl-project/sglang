@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
 
@@ -295,8 +295,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 raise ValueError(
                     "--dsv41-encoder-only-prefill does not support " + feature
                 )
-
-        from sglang.srt.model_executor.cuda_graph_config import Backend
 
         if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
             raise ValueError(
