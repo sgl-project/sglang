@@ -143,6 +143,8 @@ class _SWAPathCapFixtureBase:
 
     def _insert(self, cache, allocator, tokens, swa_evicted_seqlen):
         value = self._alloc(allocator, len(tokens))
+        # A request frees its out-of-window SWA slots before it inserts.
+        allocator.free_swa(value[:swa_evicted_seqlen])
         cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
