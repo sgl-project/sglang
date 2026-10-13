@@ -3109,7 +3109,7 @@ class Scheduler(
         ):
             error_msg = (
                 "DeepSeek-V4.1 encoder-only prefill currently supports only "
-                "text token requests without prompt logprobs, sampling masks, "
+                "text token requests without logprobs, sampling masks, "
                 "or auxiliary hidden/routing captures"
             )
             prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)

@@ -51,6 +51,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -691,6 +692,14 @@ class TpModelWorker(BaseTpWorker):
             )
 
             if logits_output is None:
+                if not (
+                    get_disagg().dsv41_encoder_only_prefill
+                    and get_disagg().disaggregation_mode == "prefill"
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                ):
+                    raise RuntimeError(
+                        "Missing logits outside DeepSeek-V4.1 encoder-only Prefill"
+                    )
                 # DeepSeek-V4.1 asymmetric prefill intentionally terminates at
                 # the layer-20 global-cache producer.
                 batch_result.cache_only = True

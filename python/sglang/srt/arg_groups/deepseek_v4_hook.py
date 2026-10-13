@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -58,14 +59,20 @@ def _validate_dsv41_encoder_only_ratio_layout(hf_config) -> None:
 
     target_ratios = ratios[:num_target_layers]
     mtp_ratios = ratios[num_target_layers:]
+    kv_sources = tuple(getattr(hf_config, "kv_source_layer_ids", ()) or ())
+    if not kv_sources or any(i < 0 or i >= num_target_layers for i in kv_sources):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires valid target KV source layer ids"
+        )
+    boundary = max(kv_sources)
     if (
-        target_ratios[20] not in (1, 2)
+        target_ratios[boundary] not in (1, 2)
         or any(ratio not in (0, 1, 2) for ratio in target_ratios)
         or any(ratio != 0 for ratio in mtp_ratios)
     ):
         raise ValueError(
             "--dsv41-encoder-only-prefill requires the official target-layer "
-            "ratio-0/1/2 layout, layer 20 to be a global-cache producer, and "
+            f"ratio-0/1/2 layout, layer {boundary} to be a global-cache producer, and "
             "bundled MTP layers to have ratio 0"
         )
 
@@ -287,6 +294,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         hf_config = model_config_of(server_args).hf_config
         if hf_config.model_type != "deepseek_v41":
             raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
+        if getattr(hf_config, "vision_n_layers", 0) > 0 and not getattr(
+            hf_config, "language_model_only", False
+        ):
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires a text-only model "
+                "(vision_n_layers=0 or --language-model-only)"
+            )
+        if getattr(hf_config, "window_size", None) != DSV41_REPLAY_WINDOW:
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires "
+                f"window_size={DSV41_REPLAY_WINDOW}"
+            )
         if cfg.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError(
                 "--dsv41-encoder-only-prefill requires --disaggregation-mode "
@@ -350,6 +369,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "to be disabled"
             )
         if cfg.disaggregation_mode == "decode":
+            # Reuse encoder replay's token-input validation and DSpark paged
+            # draft budgeting. The cache-only EXTEND itself performs replay;
+            # this role retains paged SWA and never allocates RequestWindow.
             declare_resolution(
                 server_args,
                 "validate_deepseek_v41_features",

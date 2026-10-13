@@ -4,6 +4,8 @@ from typing import Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
+
 
 class FoldedExtend(msgspec.Struct, frozen=True):
     """An extend batch whose prefix hits start at their replay start."""
@@ -37,7 +39,7 @@ def resets_swa_window(req) -> bool:
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
     The prefill budget, the MLP-sync row count and the fold all read this."""
-    return min(prefix_len, 128)
+    return min(prefix_len, DSV41_REPLAY_WINDOW)
 
 
 def folded_replay_rows(batch) -> int:
@@ -118,13 +120,7 @@ def _reset_windows_and_collect_hits(*, batch, window):
     for i, reset in enumerate(batch.encoder_swa_reset):
         if not reset:
             continue
-        slot = batch.req_pool_indices[i : i + 1]
-        window.reset(slot)
-        # The cache-only handoff's ordinary EXTEND is itself the bounded replay.
-        # Only reset request-local SWA state here; an extra replay would execute
-        # the same tail twice.
-        if batch.dsv41_cache_only_replay:
-            continue
+        window.reset(batch.req_pool_indices[i : i + 1])
         end = batch.prefix_lens[i]
         if not end:
             continue

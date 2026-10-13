@@ -20,15 +20,16 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import published_topology
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
@@ -911,6 +912,50 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
     commits = output.consume.call_args.args[1]
     assert commits[0].output_index == 1
     assert commits[0].token_ids == (11,)
+
+
+class TestCacheOnlyWorkerOutput(CustomTestCase):
+    def test_missing_logits_only_marks_encoder_only_prefill_extend(self):
+        """A missing generation result must not authorize a normal PD handoff."""
+        for enabled, role, mode, allowed in (
+            (False, "prefill", ForwardMode.EXTEND, False),
+            (True, "decode", ForwardMode.EXTEND, False),
+            (True, "prefill", ForwardMode.DECODE, False),
+            (True, "prefill", ForwardMode.EXTEND, True),
+        ):
+            with (
+                self.subTest(enabled=enabled, role=role, mode=mode),
+                get_context().override_server_args(
+                    dsv41_encoder_only_prefill=enabled, disaggregation_mode=role
+                ),
+            ):
+                worker = SimpleNamespace(
+                    pp_group=SimpleNamespace(is_last_rank=True),
+                    is_dllm=lambda: False,
+                    model_runner=Mock(),
+                )
+                worker.model_runner.forward.return_value = SimpleNamespace(
+                    logits_output=None,
+                    can_run_graph=False,
+                    expert_distribution_metrics=None,
+                    routed_experts_output=None,
+                    indexer_topk_output=None,
+                )
+                forward_batch = SimpleNamespace(
+                    forward_mode=mode,
+                    apply_deprecated_skip_attn_backend_init=lambda _: None,
+                )
+                if allowed:
+                    result = TpModelWorker.forward_batch_generation(
+                        worker, None, forward_batch
+                    )
+                    self.assertTrue(result.cache_only)
+                    self.assertIsNone(result.next_token_ids)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "Missing logits outside"):
+                        TpModelWorker.forward_batch_generation(
+                            worker, None, forward_batch
+                        )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -416,6 +417,81 @@ class TestDSV41CacheOnlyReplayAllocation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "preallocated request slots"):
             alloc_for_extend(batch)
         allocator.assert_not_called()
+
+
+class TestReplayPairStateIsolation(CustomTestCase):
+    def test_only_cache_only_replay_rebuilds_pending_pair(self):
+        """Non-PD replay stays read-only; cache-only replay never rewrites global KV."""
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        for cache_only, ratio, fused in product((False, True), (1, 2), (False, True)):
+            with self.subTest(cache_only=cache_only, ratio=ratio, fused=fused):
+                state = CompressStatePool(
+                    size=4,
+                    ring_size=2,
+                    overlap=False,
+                    head_dim=2,
+                    dtype=torch.float32,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    ratio=2,
+                    request_scoped=True,
+                )
+                state.kv_score_buffer.clear()
+                before = state.kv_score_buffer.clone()
+                backend = object.__new__(DeepseekV4AttnBackend)
+                backend.low_ratios = ()
+                backend.forward_metadata = SimpleNamespace(
+                    low_ratio_req_indices=torch.tensor([0]),
+                    low_ratio_pos_i64=torch.tensor([126]),
+                    core_metadata=SimpleNamespace(raw_out_loc=torch.tensor([1])),
+                )
+                backend.token_to_kv_pool = SimpleNamespace(
+                    get_attention_compress_states=lambda _: state
+                )
+                # A global-store dispatch is forbidden even when fused compress
+                # is enabled. These mocks fail before any GPU kernel can run.
+                backend._low_ratio_compress_fused = MagicMock(
+                    side_effect=AssertionError("global fused store")
+                )
+                backend._low_ratio_write_group = MagicMock(
+                    side_effect=AssertionError("global KV store")
+                )
+                layer = SimpleNamespace(
+                    layer_id=2,
+                    compress_ratio=ratio,
+                    indexer=None,
+                    compressor=SimpleNamespace(
+                        use_fused_compress=fused,
+                        project=lambda x: (x, torch.ones_like(x)),
+                    ),
+                )
+                fb = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    encoder_swa_replay=True,
+                    dsv41_cache_only_replay=cache_only,
+                    attn_cp_metadata=None,
+                    extend_start_loc=torch.tensor([0]),
+                    extend_seq_lens=torch.tensor([1]),
+                )
+                x = torch.tensor([[3.0, 4.0]])
+                backend.forward_low_ratio_sources(
+                    layer=layer,
+                    x=x,
+                    q_lora=None,
+                    positions=torch.tensor([126]),
+                    forward_batch=fb,
+                    run_indexer=False,
+                )
+                if cache_only and ratio == 2:
+                    pending = state.get_state_by_state_loc(torch.tensor([0]))
+                    self.assertTrue(torch.equal(pending.kv, x))
+                    self.assertTrue(torch.equal(pending.score, torch.ones_like(x)))
+                else:
+                    self.assertTrue(
+                        torch.equal(state.kv_score_buffer.kv_score, before.kv_score)
+                    )
 
 
 HEAD_DIM = 512

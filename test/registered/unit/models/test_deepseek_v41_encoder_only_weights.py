@@ -7,6 +7,9 @@ from torch import nn
 
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    resolve_layer_indices,
+)
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Model,
@@ -16,11 +19,12 @@ from sglang.srt.models.deepseek_v4 import (
 from sglang.srt.models.deepseek_v4_mhc import HcConfig, HcNormed, HcState
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestDsv41EncoderOnlyWeights(unittest.TestCase):
+class TestDsv41EncoderOnlyWeights(CustomTestCase):
     def test_weight_filter_keeps_only_boundary_producers(self):
         boundary = 20
         kept = (
@@ -99,6 +103,7 @@ class TestDsv41EncoderOnlyWeights(unittest.TestCase):
         boundary_layer.side_effect = lambda **kw: nn.Identity()
         config = SimpleNamespace(
             hidden_size=16,
+            q_lora_rank=4,
             vocab_size=32,
             rms_norm_eps=1e-5,
             num_hidden_layers=40,
@@ -115,6 +120,32 @@ class TestDsv41EncoderOnlyWeights(unittest.TestCase):
             disaggregation_mode="prefill",
         ):
             model = DeepseekV4Model(config)
+            with (
+                patch(
+                    "sglang.srt.models.deepseek_v4.DeepseekV4Model", return_value=model
+                ),
+                patch.object(
+                    DeepseekV4ForCausalLM, "determine_num_fused_shared_experts"
+                ),
+                patch("sglang.srt.models.deepseek_v4.LogitsProcessor"),
+                patch("sglang.srt.models.deepseek_v4.get_attn_tp_context"),
+            ):
+                wrapper = DeepseekV4ForCausalLM(config)
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+                num_hidden_layers=40,
+                num_attention_layers=40,
+                num_nextn_predict_layers=3,
+                is_hybrid_swa=False,
+                swa_attention_layer_ids=None,
+            )
+            layer_info = resolve_layer_indices(
+                model=wrapper, model_config=model_config, is_draft_worker=False
+            )
+            # KV configurators consume this runner range, not the original
+            # 40-layer checkpoint config or the placeholder ModuleList length.
+            self.assertEqual((layer_info.start_layer, layer_info.end_layer), (0, 21))
+            self.assertEqual(layer_info.num_effective_layers, 21)
 
         self.assertEqual(len(model.layers), 40)
         self.assertEqual(model.start_layer, 0)

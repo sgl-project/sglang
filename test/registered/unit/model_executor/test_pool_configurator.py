@@ -1674,6 +1674,50 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertGreater(sizes.swa_max_total_num_tokens, 0)
         self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
 
+    def test_encoder_only_prefill_pool_prices_only_resident_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(
+            self,
+            dsv41_encoder_only_prefill=True,
+            disaggregation_mode="prefill",
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            window_size=128,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=cfg,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=21),
+            pp_size=1,
+            attn_dp_size=1,
+            sliding_window_size=128,
+            page_size=256,
+            spec_algorithm=SimpleNamespace(
+                is_dspark=lambda: False, is_none=lambda: True
+            ),
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=0),
+        )
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.num_layers_total, 21)
+        self.assertEqual(planner.bytes_per_swa_token, 21 * 585)
+        self.assertEqual(planner.stage_owner_layers, {1: [20], 2: [2, 8, 14]})
+        sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
+        self.assertLessEqual(
+            sizes.full_max_total_num_tokens * planner.bytes_per_full_token
+            + planner._get_swa_fixed_bytes(),
+            256 * 1024 * 1024,
+        )
+
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 

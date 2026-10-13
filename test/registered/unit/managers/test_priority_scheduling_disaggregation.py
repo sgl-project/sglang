@@ -2,6 +2,7 @@ import json
 import sys
 import threading
 import unittest
+from array import array
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
+    ScheduleBatch,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -33,7 +35,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: 
 from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -930,7 +934,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         self.assertEqual(mgr.failure_records, {})
 
 
-class TestDecodePrebuilt(unittest.TestCase):
+class TestDecodePrebuilt(CustomTestCase):
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()
@@ -1279,6 +1283,67 @@ class TestDecodePrebuilt(unittest.TestCase):
                 self.assertIs(ret, new_batch)
                 new_batch.prepare_for_extend.assert_called_once()
                 new_batch.process_prebuilt.assert_not_called()
+
+    def test_cache_only_admission_preserves_prefill_cache_accounting(self):
+        """Transferred coverage must not become hits or overwrite P's tier breakdown."""
+        for prompt_len, p_cached in (
+            (1, 0),
+            (127, 127),
+            (8192, 0),
+            (8192, 4096),
+            (8192, 8192),
+        ):
+            with self.subTest(prompt_len=prompt_len, p_cached=p_cached):
+                scheduler = self._new_scheduler(enable_overlap=False)
+                req = Req(
+                    rid="cache-accounting",
+                    origin_input_text="",
+                    origin_input_ids=array("q", range(prompt_len)),
+                    sampling_params=SamplingParams(max_new_tokens=16),
+                )
+                req.init_next_round_input(None)
+                req.kv = ReqKvInfo(
+                    req_pool_idx=0,
+                    kv_allocated_len=prompt_len,
+                    kv_committed_len=prompt_len,
+                )
+                req.dsv41_cache_only_replay = True
+                req.dsv41_cache_only_coverage = prompt_len
+                req.cached_tokens = req.already_computed = p_cached
+                req.cached_tokens_device = p_cached // 2
+                req.cached_tokens_host = p_cached - req.cached_tokens_device
+                req.cached_tokens_storage = 0
+                expected_tiers = (req.cached_tokens_device, req.cached_tokens_host, 0)
+                scheduler.waiting_queue = [req]
+                scheduler.req_to_token_pool = SimpleNamespace(
+                    size=1,
+                    device="cpu",
+                    req_to_token=torch.arange(prompt_len, dtype=torch.int32).reshape(
+                        1, prompt_len
+                    ),
+                )
+                scheduler.model_config = SimpleNamespace(
+                    vocab_size=16384, is_encoder_decoder=False
+                )
+                scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                with patch(
+                    "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
+                ):
+                    batch = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                        scheduler, scheduler.running_batch
+                    )
+                self.assertIsInstance(batch, ScheduleBatch)
+                self.assertEqual(batch.extend_num_tokens, min(prompt_len, 128))
+                self.assertEqual(req.cached_tokens, p_cached)
+                self.assertEqual(
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ),
+                    expected_tiers,
+                )
+                self.assertEqual(req.already_computed, prompt_len)
 
     def test_cache_only_replay_rejects_non_full_coverage(self):
         scheduler = self._new_scheduler(enable_overlap=False)

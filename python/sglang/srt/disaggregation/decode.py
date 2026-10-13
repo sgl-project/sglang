@@ -33,7 +33,7 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.constants import DSV41_REPLAY_WINDOW, GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVTransferDestination, StateType
 from sglang.srt.disaggregation.checksum import (
@@ -3202,6 +3202,10 @@ class SchedulerDisaggregationDecodeMixin:
         if getattr(self, "dsv41_suspended_decode_batch", None) is None:
             return
 
+        # Do not restore the suspended batch after losing an in-flight result:
+        # its KV writes and output commit cannot be proven complete, so resuming
+        # could reuse live rows or serve inconsistent state. Fail closed rather
+        # than turning scheduler corruption into a recoverable request error.
         if (
             self.last_batch is None
             or not self.last_batch.dsv41_cache_only_replay
@@ -3394,6 +3398,10 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
+        # Select the highest-priority (or FIFO-oldest) request's forward type.
+        # Requests of the other type retain their queue order and compete again
+        # on the next admission; strict priority can defer a lower-priority type,
+        # just as it can defer lower-priority requests within a single type.
         cache_only_batch = bool(self.waiting_queue[0].dsv41_cache_only_replay)
         admitted = 0
         for i in range(len(self.waiting_queue)):
@@ -3423,10 +3431,15 @@ class SchedulerDisaggregationDecodeMixin:
                             f"request={req.rid} fill_len="
                             f"{len(req.full_untruncated_fill_ids)} coverage={coverage}"
                         )
-                    start = max(0, coverage - 128)
+                    start = max(0, coverage - DSV41_REPLAY_WINDOW)
                     row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
                     req.prefix_indices = row[:start].clone()
                     req.prefix_len = start
+                    # Transferred KV is already computed, not a Decode cache
+                    # hit. Preserve both the count and tier breakdown from P,
+                    # even when P's hit extends into the replayed tail.
+                    req.already_computed = start
+                    req._cache_breakdown_computed = True
                     req.extend_end = end
                     continue
                 # `pop_preallocated` matched and locked new requests; a retracted or
