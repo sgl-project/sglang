@@ -171,34 +171,7 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def _matmul_persistent_triton(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out_dtype: torch.dtype,
-    bias: torch.Tensor | None = None,
-):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
-    NUM_SMS = get_device_core_count()
-    M, K = a.shape
-    K, N = b.shape
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
-
-    # 1D launch kernel where each block gets its own program.
-    def grid(META):
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            ),
-        )
-
+def _matmul_persistent_configs() -> dict:
     configs = {
         torch.bfloat16: {
             "BLOCK_SIZE_M": 128,
@@ -237,6 +210,38 @@ def _matmul_persistent_triton(
             "num_warps": 8,
             "matrix_instr_nonkdim": 16,
         }
+    return configs
+
+
+def _matmul_persistent_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
+    NUM_SMS = get_device_core_count()
+    M, K = a.shape
+    K, N = b.shape
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+
+    # 1D launch kernel where each block gets its own program.
+    def grid(META):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    configs = _matmul_persistent_configs()
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
