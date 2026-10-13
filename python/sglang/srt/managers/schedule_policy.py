@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -132,8 +131,8 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 
 # Arbitrary; bounds per-round prefix work on the waiting queue.
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
-# Arbitrary; bounds the walk cost of touching waiting prefixes.
-WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
+# Bound the walk cost using scheduling passes, which agree across TP ranks.
+WAITING_PREFIX_REFRESH_INTERVAL = 32
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -202,7 +201,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
-        self._last_waiting_prefix_refresh = float("-inf")
+        self._waiting_prefix_refresh_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -289,10 +288,12 @@ class SchedulePolicy:
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
-        now = time.monotonic()
-        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
+        refresh = (
+            self._waiting_prefix_refresh_calls % WAITING_PREFIX_REFRESH_INTERVAL == 0
+        )
+        self._waiting_prefix_refresh_calls += 1
+        if not refresh:
             return
-        self._last_waiting_prefix_refresh = now
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
@@ -751,12 +752,14 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        # Fixed-length requests cannot benefit from the early-EOS estimate.
+        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * self.new_token_ratio
+            * ratio
         )
 
     @property
@@ -794,20 +797,22 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
         )
 
-    def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+    def _mamba_gap_budget_for_req(
+        self, req: Req, *, include_host_hit: bool = False
+    ) -> int:
+        """Reserve full-token equivalents for shared-pool Mamba state slots.
 
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        also account for missing tracking buffers)."""
-        if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return self._mamba_slot_cost
-        return 0
+        Admission includes the host checkpoint before load-back binds the
+        request slot. Continuing chunks only need the request-state budget;
+        their host-hit metadata may still describe an already consumed hit.
+        Tracking buffers and radix CoW headroom are not included here.
+        """
+        if not self._mamba_slot_cost:
+            return 0
+        slots = int(not req.kv.holds_mamba)
+        if include_host_hit:
+            slots += req.mamba_host_hit_length
+        return slots * self._mamba_slot_cost
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -870,10 +875,9 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
+        # Debit every reserved state slot, including the load-back checkpoint.
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1313,12 +1317,19 @@ class PrefillAdder:
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
-        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        # Read before `init_load_back` binds `req.mamba_pool_idx` — after that
-        # this returns 0, so the debit sites below reuse the value.
-        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        # Reserve request and load-back state slots before init_load_back binds
+        # the request slot. Reuse this reservation when committing admission.
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)
         total_tokens += mamba_gap_reserve
+        if self.rem_mamba_slots is not None:
+            required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
+            if required_mamba_slots > self.rem_mamba_slots:
+                if (
+                    isinstance(self.tree_cache, UnifiedRadixCache)
+                    and self.tree_cache.buffer_pipeline is not None
+                ):
+                    self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
+                return AddReqResult.NO_TOKEN
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
@@ -1357,7 +1368,8 @@ class PrefillAdder:
                 ):
                     full_load_tokens = req.host_hit_length
                     if (
-                        isinstance(self.tree_cache, UnifiedRadixCache)
+                        self.memory_budget.load_back_needs_full_tokens
+                        and isinstance(self.tree_cache, UnifiedRadixCache)
                         and self.tree_cache.buffer_pipeline is None
                         and not (
                             self.tree_cache.linker is not None
@@ -1438,7 +1450,8 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_len += req.host_loaded_length
-                req.kv.cache_protected_len = req.prefix_len
+                if self.tree_cache.load_back_is_cache_owned():
+                    req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
