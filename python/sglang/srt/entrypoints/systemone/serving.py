@@ -21,6 +21,7 @@ from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
     OpenAIServingDecisions,
     QuestionView,
+    _encode_all,
     default_labels,
     label_context,
     label_mass,
@@ -416,28 +417,38 @@ class SystemOneServing(OpenAIServingDecisions):
             return await self._answer_pointer(
                 adapted_request, request, views, raw_request
             )
-        _, _, result = await self._score(
-            adapted_request=adapted_request,
-            raw_request=raw_request,
-            temperature=(
-                1.0
-                if self.decision_config is None
-                else self.decision_config["temperature"]
-            ),
-        )
+        if self.compact_decision_readout:
+            scores, prompt_tokens = await self._score_compact_decider(
+                adapted_request, raw_request
+            )
+        else:
+            _, _, result = await self._score(
+                adapted_request=adapted_request,
+                raw_request=raw_request,
+                temperature=(
+                    1.0
+                    if self.decision_config is None
+                    else self.decision_config["temperature"]
+                ),
+            )
+            scores, prompt_tokens = result.scores, result.prompt_tokens
         answers = {}
         for i, question_id in enumerate(request.questions):
             answers[question_id] = _answer(
                 view=views[i],
-                probabilities=result.scores[i],
-                mass=label_mass(result.token_logprobs[i]),
+                probabilities=scores[i],
+                mass=(
+                    1.0
+                    if self.compact_decision_readout
+                    else label_mass(result.token_logprobs[i])
+                ),
                 question_id=question_id,
             )
         response = SystemOneResponse(
             # The served model answered, whatever name the request used.
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
-            usage=SystemOneUsage(input_tokens=result.prompt_tokens),
+            usage=SystemOneUsage(input_tokens=prompt_tokens),
         )
         # A decision checkpoint's readout has no full-vocabulary distribution.
         exclude = (
@@ -446,6 +457,38 @@ class SystemOneServing(OpenAIServingDecisions):
             else {"answers": {"__all__": {"x_label_mass"}}}
         )
         return ORJSONResponse(content=response.model_dump(exclude=exclude))
+
+    async def _score_compact_decider(
+        self, encoded: Iterator[EncodedQuestion], raw_request: Request
+    ) -> Tuple[List[List[float]], int]:
+        """Keep the trained prompts and media, replacing only the output readout."""
+        prompts, label_ids, images = await _encode_all(encoded)
+        temperature = self.decision_config["temperature"]
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Decision temperature must be finite and positive")
+        token_ids = self.decision_config["token_ids"]
+        row_by_token = {token: row for row, token in enumerate(token_ids)}
+        request = EmbeddingReqInput(
+            input_ids=prompts,
+            image_data=images if any(images) else None,
+        )
+        results = await self.tokenizer_manager.generate_request(
+            request, raw_request
+        ).__anext__()
+        if len(results) != len(prompts):
+            raise RuntimeError("Compact readout returned the wrong number of questions")
+        scores, prompt_tokens = [], 0
+        for result, labels in zip(results, label_ids):
+            logits = result["embedding"]
+            if len(logits) != len(token_ids):
+                raise RuntimeError("Compact readout returned the wrong number of codes")
+            selected = [logits[row_by_token[token]] for token in labels]
+            top = max(selected)
+            weights = [math.exp((value - top) / temperature) for value in selected]
+            total = math.fsum(weights)
+            scores.append([weight / total for weight in weights])
+            prompt_tokens += result["meta_info"]["prompt_tokens"]
+        return scores, prompt_tokens
 
 
 def _view(question: SystemOneQuestion) -> QuestionView:
