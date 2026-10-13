@@ -20,6 +20,8 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _refresh_deepstack_replay_slot,
+    _resolve_deepstack_replay_width,
+    _SupportsDeepStackReplay,
 )
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -136,8 +138,29 @@ class TestQwen3VLCapabilityOptIn(CustomTestCase):
             (Qwen3ForCausalLM, False),
         ]:
             with self.subTest(cls=cls.__name__):
+                self.assertEqual(issubclass(cls, _SupportsDeepStackReplay), expected)
+
+    def test_replay_width_requires_eager_tail_and_model_support(self):
+        class Model:
+            def get_num_deepstack_embeddings(self):
+                return 3
+
+        for model, uses_eager_prefill_tail, expected in (
+            (Model(), True, 192),
+            # tc_piecewise never binds or refreshes the slot, so it gets none.
+            (Model(), False, 0),
+            (object(), True, 0),
+        ):
+            with self.subTest(
+                uses_eager_prefill_tail=uses_eager_prefill_tail, expected=expected
+            ):
                 self.assertEqual(
-                    getattr(cls, "supports_bcg_deepstack_replay", False), expected
+                    _resolve_deepstack_replay_width(
+                        model=model,
+                        hidden_size=64,
+                        uses_eager_prefill_tail=uses_eager_prefill_tail,
+                    ),
+                    expected,
                 )
 
 

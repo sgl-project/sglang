@@ -44,7 +44,15 @@ import logging
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
 
 import torch
 import tqdm
@@ -237,6 +245,23 @@ def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     if isinstance(output, list):
         return [_slice_output_rows(item, num_tokens) for item in output]
     raise TypeError(f"Unsupported full prefill CUDA graph output: {type(output)}")
+
+
+@runtime_checkable
+class _SupportsDeepStackReplay(Protocol):
+    def get_num_deepstack_embeddings(self) -> int: ...
+
+
+def _resolve_deepstack_replay_width(
+    *, model: Any, hidden_size: int, uses_eager_prefill_tail: bool
+) -> int:
+    # Only the eager-tail backends (BREAKABLE/FULL) bind and refresh this slot;
+    # tc_piecewise captures the outer forward and never reads it.
+    if not uses_eager_prefill_tail:
+        return 0
+    if isinstance(model, _SupportsDeepStackReplay):
+        return hidden_size * model.get_num_deepstack_embeddings()
+    return 0
 
 
 def _refresh_deepstack_replay_slot(
@@ -435,14 +460,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
-        # Only the eager-tail backends (BREAKABLE/FULL) bind and refresh this
-        # slot; tc_piecewise captures the outer forward and never reads it.
-        deepstack_replay_width = (
-            self.model_runner.model_config.hidden_size
-            * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
-            if self._uses_eager_prefill_tail()
-            and getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
-            else 0
+        deepstack_replay_width = _resolve_deepstack_replay_width(
+            model=self.model_runner.model,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            uses_eager_prefill_tail=self._uses_eager_prefill_tail(),
         )
 
         # --- buffers ---------------------------------------------------

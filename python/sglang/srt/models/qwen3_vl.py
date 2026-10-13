@@ -1295,9 +1295,6 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
-    # Opt-in consumed by PrefillCudaGraphRunner; the slot activates only
-    # when num_deepstack_embeddings > 0 on the instance.
-    supports_bcg_deepstack_replay = True
     supports_cuda_vmm_feature_transport = True
 
     # To ensure correct weight loading and mapping.
@@ -1413,6 +1410,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    # Opt-in for the prefill graph runner's DeepStack replay slot; 0 means no slot.
+    def get_num_deepstack_embeddings(self) -> int:
+        return self.num_deepstack_embeddings
 
     def separate_deepstack_embeds(self, embedding):
         assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
