@@ -153,6 +153,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                 req = SimpleNamespace(
                     output_ids=[7, 8],
                     bootstrap_host="prefill",
+                    multimodal_inputs=None,
                     time_stats=Mock(),
                     offload_kv_cache=Mock(),
                 )
@@ -170,25 +171,16 @@ class TestDSV41DSparkPD(CustomTestCase):
                     pending_reqs=[],
                 )
                 DecodePreallocQueue.add(queue, req, is_retracted=True)
-                if algorithm == "DSPARK":
-                    req.offload_kv_cache.assert_not_called()
-                    device_module.return_value.synchronize.assert_called_once_with(
-                        "cuda"
-                    )
-                    self.assertEqual(req.output_ids, [7])
-                    self.assertEqual(req.pd_rebootstrap_forced_output_id, 8)
-                    self.assertTrue(req.pd_rebootstrap_in_progress)
-                    queue._create_receiver_and_enqueue.assert_called_once_with(
-                        req, is_rebootstrap=True
-                    )
-                    self.assertFalse(queue.retracted_queue)
-                else:
-                    req.offload_kv_cache.assert_called_once_with(
-                        request_pool, allocator
-                    )
-                    device_module.assert_not_called()
-                    self.assertEqual(req.output_ids, [7, 8])
-                    self.assertEqual(queue.retracted_queue, [req])
+                # All V4 pools recompute on prefill; none keep a CPU KV backup.
+                req.offload_kv_cache.assert_not_called()
+                device_module.return_value.synchronize.assert_called_once_with("cuda")
+                self.assertEqual(req.output_ids, [7])
+                self.assertEqual(req.pd_rebootstrap_forced_output_id, 8)
+                self.assertTrue(req.pd_rebootstrap_in_progress)
+                queue._create_receiver_and_enqueue.assert_called_once_with(
+                    req, is_rebootstrap=True
+                )
+                self.assertFalse(queue.retracted_queue)
 
 
 class TestDSV41CPPDHandshake(CustomTestCase):
@@ -387,9 +379,10 @@ class TestDSV41PDFeatureValidation(CustomTestCase):
             ("decode_prefill_cp_flag", dict(enable_prefill_cp=True), False),
             ("decode_attention_cp", dict(attn_cp_size=2), False),
             ("decode_dcp", dict(dcp_size=2), False),
+            ("nixl_transfer", dict(disaggregation_transfer_backend="nixl"), True),
             (
                 "unsupported_transfer",
-                dict(disaggregation_transfer_backend="nixl"),
+                dict(disaggregation_transfer_backend="fake"),
                 False,
             ),
         ]
