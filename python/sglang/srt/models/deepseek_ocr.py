@@ -22,6 +22,7 @@
 import copy
 import logging
 import math
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Type, TypeAlias, Union
 
@@ -1763,7 +1764,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

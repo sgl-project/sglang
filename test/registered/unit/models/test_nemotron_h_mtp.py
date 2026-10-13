@@ -26,9 +26,9 @@ class _RecordingLayer(nn.Module):
         super().__init__()
         self.inputs_embeds = None
 
-    def forward(self, *, inputs_embeds, hidden_states, residual, forward_batch):
+    def forward(self, *, inputs_embeds, hidden_states, forward_batch):
         self.inputs_embeds = inputs_embeds
-        return hidden_states, residual
+        return hidden_states
 
 
 class TestNemotronHMultiTokenPredictor(CustomTestCase):

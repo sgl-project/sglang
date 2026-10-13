@@ -3,7 +3,8 @@
 Regression for the cross-chunk stitching accounting: zero-logprob-row
 sequences (logprob opt-outs in mixed batches, mid-chunked-prefill segments)
 were skipped or double-emitted, drifting the per-request entry counts that
-the scheduler asserts on.
+the scheduler asserts on. Next-token token-ids logprobs of mixed batches
+must also copy to the CPU like the eager path.
 """
 
 import unittest
@@ -13,7 +14,13 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import InputLogprobProcessor
+from sglang.srt.layers.logprob_processor import (
+    InputLogprobProcessor,
+    get_token_ids_logprobs,
+)
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
@@ -157,6 +164,34 @@ class TestLogprobChunkStitching(CustomTestCase):
         output.input_token_ids_logprobs_val = rows
         output.finalize_input_logprobs()
         self.assertIs(output.input_token_ids_logprobs_val, rows)
+
+    def test_mixed_batch_token_ids_copy_to_cpu_like_the_eager_path(self):
+        # One request with token ids, one without, and one with an empty probe set.
+        token_ids = [[1, 3], None, []]
+        logprobs = torch.log_softmax(torch.randn(len(token_ids), 5), dim=-1)
+        vals, idxs = get_token_ids_logprobs(logprobs, token_ids, no_copy_to_cpu=True)
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_token_ids_logprobs_val=vals,
+            next_token_token_ids_logprobs_idx=idxs,
+        )
+        SchedulerBatchResultProcessor.move_logprobs_to_cpu(
+            None,
+            batch=SimpleNamespace(return_logprob=True),
+            logits_output=output,
+        )
+        # The empty entry must not be a view that keeps the full logprobs alive.
+        self.assertIsNone(vals[1]._base)
+        expected = get_token_ids_logprobs(logprobs, token_ids, no_copy_to_cpu=False)
+        self.assertEqual(
+            (
+                output.next_token_token_ids_logprobs_val,
+                output.next_token_token_ids_logprobs_idx,
+            ),
+            expected,
+        )
+        self.assertEqual(expected[0][1:], [[], []])
+        self.assertEqual(expected[1], [[1, 3], [], []])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -98,11 +98,9 @@ class TestGemma4DFlash31B(CustomTestCase):
             base_url=cls.base_url,
             model=TARGET_PATH,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            num_shots=5,
         )
 
     @staticmethod
@@ -144,7 +142,7 @@ class TestGemma4DFlash31B(CustomTestCase):
                 f"{MODEL_NAME}: CUDA graph is disabled",
             )
 
-            metrics = run_eval(self._gsm8k_args())
+            metrics = run_sgl_eval(self._gsm8k_args())
             dflash_score = float(metrics["score"])
             avg_accept = get_avg_spec_accept_length(self.base_url)
         finally:

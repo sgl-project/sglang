@@ -88,7 +88,8 @@ fn spec(id: &str, mode: Stage, model: &str) -> WorkerSpec {
         url: format!("http://{id}"),
         mode,
         model_ids: vec![ModelId(model.into())],
-        bootstrap_port: None,
+        bootstrap_port: (mode == Stage::Prefill).then_some(8997),
+        ..Default::default()
     }
 }
 
@@ -113,6 +114,7 @@ fn registry() -> Arc<WorkerRegistry> {
 
 fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
     }
@@ -186,17 +188,20 @@ fn resolve_orders_all_length_fits_by_capacity_rank_and_id() {
     .unwrap();
     assert_eq!(
         resolver
-            .resolve(10, None)
+            .resolve(10, None, None, None)
             .unwrap()
             .iter()
             .map(|bucket| bucket.id.as_str())
             .collect::<Vec<_>>(),
         ["a", "z", "later", "catch-all"]
     );
-    assert_eq!(resolver.resolve(11, None).unwrap()[0].id, "min");
-    assert_eq!(resolver.resolve(15, None).unwrap()[0].id, "min");
-    assert_eq!(resolver.resolve(20, None).unwrap()[0].id, "a");
-    assert_eq!(resolver.resolve(21, None).unwrap()[0].id, "catch-all");
+    assert_eq!(resolver.resolve(11, None, None, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(15, None, None, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(20, None, None, None).unwrap()[0].id, "a");
+    assert_eq!(
+        resolver.resolve(21, None, None, None).unwrap()[0].id,
+        "catch-all"
+    );
 }
 
 #[test]
@@ -207,17 +212,29 @@ fn context_capacity_checks_peak_when_known_and_input_otherwise() {
     let mut long = bucket("long", None, policy);
     long.max_context_tokens = Some(30);
     let resolver = BucketResolver::new(vec![long, short]).unwrap();
-    assert_eq!(resolver.resolve(10, None).unwrap()[0].id, "short");
-    assert_eq!(resolver.resolve(10, Some(20)).unwrap()[0].id, "short");
-    assert_eq!(resolver.resolve(10, Some(21)).unwrap()[0].id, "long");
-    assert!(resolver.resolve(10, Some(31)).unwrap().is_empty());
-    assert!(resolver.resolve(31, None).unwrap().is_empty());
+    assert_eq!(
+        resolver.resolve(10, None, None, None).unwrap()[0].id,
+        "short"
+    );
+    assert_eq!(
+        resolver.resolve(10, Some(20), None, None).unwrap()[0].id,
+        "short"
+    );
+    assert_eq!(
+        resolver.resolve(10, Some(21), None, None).unwrap()[0].id,
+        "long"
+    );
+    assert!(resolver
+        .resolve(10, Some(31), None, None)
+        .unwrap()
+        .is_empty());
+    assert!(resolver.resolve(31, None, None, None).unwrap().is_empty());
     assert!(matches!(
-        resolver.resolve(10, Some(9)),
+        resolver.resolve(10, Some(9), None, None),
         Err(PickError::InvalidSignal(_))
     ));
     assert!(BucketResolver::default()
-        .resolve(1, None)
+        .resolve(1, None, None, None)
         .unwrap()
         .is_empty());
 }
@@ -238,21 +255,75 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         },
     )])
     .unwrap();
-    let bucket = resolver.resolve(10, Some(20)).unwrap()[0];
+    let bucket = resolver.resolve(10, Some(20), None, None).unwrap()[0];
     let request = BucketRequest {
         prefix: None,
         model: &model,
         input_tokens: 10,
+        total_input_tokens: 10,
         expected_peak_tokens: Some(20),
         token_ids: None,
         session_key: None,
         routing_key: None,
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "p2");
     assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
     assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
+}
+
+#[tokio::test]
+async fn excluded_engines_are_never_offered() {
+    let workers = registry();
+    workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
+    let ids =
+        |ids: &[&str]| -> Vec<WorkerId> { ids.iter().map(|id| WorkerId((*id).into())).collect() };
+    let policy = || -> Arc<dyn Policy> { Arc::new(TestPolicy::default()) };
+    let request = |model, excluded| BucketRequest {
+        prefix: None,
+        model,
+        input_tokens: 10,
+        total_input_tokens: 10,
+        expected_peak_tokens: None,
+        token_ids: None,
+        session_key: None,
+        routing_key: None,
+        excluded,
+    };
+
+    let model = ModelId("m".into());
+    let plain = Bucket::new("plain", BucketGroups::Plain(group(&["a", "b"], policy())));
+    let excluded = ids(&["a"]);
+    let picks = plain
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "b");
+    let excluded = ids(&["a", "b"]);
+    assert!(matches!(
+        plain
+            .pick_engines(&workers, &request(&model, &excluded))
+            .await,
+        Err((Stage::Plain, PickError::NoCandidates))
+    ));
+
+    let model = ModelId("pd".into());
+    let pd = Bucket::new(
+        "pd",
+        BucketGroups::Pd {
+            prefill: group(&["p"], policy()),
+            decode: group(&["d", "d2"], policy()),
+        },
+    );
+    let excluded = ids(&["d"]);
+    let picks = pd
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "p");
+    assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
 }
 
 #[tokio::test]
@@ -270,7 +341,7 @@ async fn resolver_includes_empty_groups_without_invoking_policies() {
     };
     let resolver =
         BucketResolver::new(vec![empty, bucket("available", Some(20), policy.clone())]).unwrap();
-    let buckets = resolver.resolve(10, None).unwrap();
+    let buckets = resolver.resolve(10, None, None, None).unwrap();
     assert_eq!(
         buckets
             .iter()
@@ -411,10 +482,12 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         prefix: None,
         model: &model,
         input_tokens: 2,
+        total_input_tokens: 2,
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
         session_key: Some("session"),
         routing_key: Some("routing"),
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "b");

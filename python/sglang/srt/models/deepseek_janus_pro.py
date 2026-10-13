@@ -19,6 +19,7 @@
 import collections
 import math
 import os
+from array import array
 from dataclasses import field
 from enum import Enum
 from functools import partial
@@ -1995,7 +1996,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
