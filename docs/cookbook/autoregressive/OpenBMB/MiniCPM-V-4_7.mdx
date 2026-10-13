@@ -126,7 +126,7 @@ OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. The
 - Every recipe runs on one GPU. On H100 the 35B-A3B BF16 checkpoint (about 66 GB of weights) does not fit the default static memory fraction of an 80 GB card; use FP8 or INT4 there.
 - Pick the quantization by platform. On H200, quantization is a speed win: at concurrency 16, INT4 and FP8 reach 15,808 and 15,280 tokens/s per GPU against 12,103 for BF16, and INT4 has the fastest 35B-A3B decode (TPOT 3.47 ms at concurrency 1). On GB300, BF16 and FP8 decode at about the same speed at concurrency 1 (TPOT 4.36 vs 4.44 ms), and FP8 pulls ahead at concurrency 16 (16,059 vs 14,094 tokens/s per GPU). INT4 is slower on GB300 at every concurrency (TPOT 8.56 ms at concurrency 1), so use it there only to save memory.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
-- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Use it at low concurrency for 35B-A3B BF16 and FP8, and for INT4 on H200. At concurrency 1 on sharegpt it decodes at TPOT 2.80 ms (BF16) and 2.76 ms (FP8) on GB300, and 3.02 ms (BF16), 2.61 ms (FP8), and 2.38 ms (INT4) on H200. The base rows use random 8192/1024, a longer context than sharegpt, so they are not a like-for-like baseline. Leave DSPARK off for INT4 on GB300 (TPOT 11.05 ms with it, 8.56 ms without, even with the shorter sharegpt context), for 1B (2.02 vs 1.85 ms on GB300, 1.65 vs 1.55 ms on H200), and at concurrency 16, where it raises TPOT on every configuration.
+- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Use it at low concurrency for 35B-A3B BF16 and FP8, and for INT4 on H200. On GB300, a matched sharegpt run at concurrency 1 (DSPARK off vs on) gives TPOT 2.99 vs 2.80 ms for BF16 and 3.08 vs 2.76 ms for FP8; it is slower for 1B (1.75 vs 2.02 ms) and INT4 (7.19 vs 11.05 ms), so leave it off there. At concurrency 16 it raises TPOT on every configuration. On H200, DSPARK on sharegpt at concurrency 1 reaches TPOT 3.02 ms (BF16), 2.61 ms (FP8), and 2.38 ms (INT4); the H200 base rows use random 8192/1024, a longer context than sharegpt, so they are not a like-for-like baseline.
 - Benchmark speculative decoding on real text. Random-token prompts collapse draft acceptance, so they say nothing about DSPARK. For a real-workload reference, GSM8K accept length is about 2.6 on 1B, 4.1 on 35B-A3B BF16, 4.0 on FP8, and 3.8 on INT4.
 - Every command carries `--reasoning-parser auto --tool-call-parser auto`. SGLang resolves both from the chat template, to `qwen3` for reasoning and `qwen3_coder` for tool calls, so the thinking trace lands in `message.reasoning_content` and tool calls in `message.tool_calls` (see §3.1 and §3.2). To turn either off, toggle it in the **Parsers** card of the [Playground](#playground).
 - Thinking is on by default. To get a direct answer for one request, pass `"chat_template_kwargs": {"enable_thinking": false}` (in the OpenAI Python client, `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); `reasoning_content` then comes back empty.
@@ -304,27 +304,41 @@ for overrides in ({}, {"downsample_mode": "4x"}, {"max_slice_nums": 1}):
 
 </Accordion>
 
-Prompt token counts measured on a 1568×448 image with the same text prompt:
+Prompt token counts from the validation probes. The counts depend on the image sizes and the text prompt, so the example above, which uses a different image, returns different values. The first two rows send the same image and text prompt and differ only in `downsample_mode`.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "46%"}} />
+    <col style={{width: "34%"}} />
+    <col style={{width: "20%"}} />
+  </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Input</th>
       <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}><code>mm_processor_kwargs</code></th>
       <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Prompt tokens</th>
     </tr>
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>One 1568×448 image</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>none (<code>"16x"</code>)</td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>355</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>One 1568×448 image</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>{`{"downsample_mode": "4x"}`}</code></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>1291</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"max_slice_nums": 1}`}</code></td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>93</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Two images (1568×448 and 768×384) in one request</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>none (<code>"16x"</code>)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>556</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>One 768×384 image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>{`{"max_slice_nums": 1}`}</code></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>93</td>
     </tr>
   </tbody>
 </table>

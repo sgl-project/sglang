@@ -196,4 +196,7 @@ export const benchmarks = [
     ],
     notes: "1×H200, TP=1, DSPARK with openbmb/MiniCPM-V-4.7-35B-A3B-DSpark. Speed: bench_serving sharegpt, --flush-cache.",
   },
+  { match: { hw: "h100", variant: "1b",      quant: "bf16", nodes: "single" } },
+  { match: { hw: "h100", variant: "35b-a3b", quant: "fp8",  nodes: "single" } },
+  { match: { hw: "h100", variant: "35b-a3b", quant: "int4", nodes: "single" } },
 ];
