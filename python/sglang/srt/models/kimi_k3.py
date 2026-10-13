@@ -438,6 +438,7 @@ def _uses_ep_a2a() -> bool:
     _a2a_backend = get_moe_a2a_backend()
     return (
         _a2a_backend.is_megamoe()
+        or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
@@ -546,6 +547,7 @@ class KimiK3MoE(nn.Module):
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
         )
