@@ -85,6 +85,7 @@ def _mixed_scheduler(running_batch, rows_join_at_launch=True):
     s.is_mixed_chunk = True
     s.enable_overlap = True
     s.rows_join_at_launch = rows_join_at_launch
+    s.disagg_decode_launches_copy = False
     s.tp_worker.model_runner.prefill_aware_swa = False
     # Lets a mutant that retracts run to completion and reach the asserts.
     s.decode_offload_manager = None
@@ -161,6 +162,7 @@ class TestMixedStepKeepsDecodeRows(CustomTestCase):
         reader = SimpleNamespace(
             running_batch=decoding_batch.rows,
             rows_join_at_launch=True,
+            disagg_decode_launches_copy=False,
             inflight_steps=InflightQueue(depth=0),
             chunked_req=None,
             enable_continuous_input_polling=False,

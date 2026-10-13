@@ -224,6 +224,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components._req_scan import (
+    rows_hold_launched,
     running_and_inflight_batches,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -1304,10 +1305,13 @@ class Scheduler(
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
-        # Set by the event loops that join a launched step's finished-prefill
-        # rows into the running rows at launch and drop finished rows at
-        # commit; the other loops do both at the top of the next plan.
+        # Set by the normal and overlap loops, which join a launched step's
+        # finished-prefill rows into the running rows at launch and drop
+        # finished rows at commit.
         self.rows_join_at_launch = False
+        # Set by the PD decode loops that launch a copy of the running rows as
+        # their decode step; the pipeline PD decode loop launches the rows.
+        self.disagg_decode_launches_copy = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -3830,7 +3834,10 @@ class Scheduler(
 
         # The step launched last stays last_batch until the loop launches the
         # next one, and the idle checks and request queries read its requests,
-        # so it drops here the requests that leave the rows.
+        # so it drops here the requests that leave the rows. After a drop it is
+        # only a listing of requests: its tensors, num_decode_rows and beam
+        # tails still describe the launched rows, so nothing may filter, merge
+        # or plan it again.
         if last_batch is not None and not last_batch.has_prefill_rows():
             # A decode step, or its DP extend view: a copy of the running rows,
             # which have dropped their finished rows by the leave below. Filter
@@ -5247,7 +5254,7 @@ class Scheduler(
             and not (
                 self.rows_join_at_launch
                 and self.hisparse_coordinator is not None
-                and self.hisparse_coordinator.ack_staging_queue
+                and len(self.hisparse_coordinator.ack_staging_queue) > 0
             )
         )
 
@@ -5523,7 +5530,7 @@ class Scheduler(
             # Polling can run intake before the newest queued batch becomes last_batch.
             batches.extend(record.batch for record in self.inflight_steps)
         reqs = [req for batch in batches if batch is not None for req in batch.reqs]
-        if self.rows_join_at_launch and self.chunked_req is not None:
+        if rows_hold_launched(self) and self.chunked_req is not None:
             # The request still chunking, which no rows hold.
             reqs.append(self.chunked_req)
         return reqs
@@ -6072,6 +6079,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
     scheduler.rows_join_at_launch = False
+    scheduler.disagg_decode_launches_copy = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

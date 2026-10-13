@@ -525,6 +525,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
         scheduler.rows_join_at_launch = False
+        scheduler.disagg_decode_launches_copy = False
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
         scheduler.running_mbs = []

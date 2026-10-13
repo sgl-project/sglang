@@ -2995,6 +2995,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
         self.inflight_steps = InflightQueue(depth=0)
+        self.disagg_decode_launches_copy = True
 
         while True:
             if self.gracefully_exit:
@@ -3009,9 +3010,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            # Finished rows leave before preallocation and the prebuilt join
-            # size their budgets from the running batch.
-            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3027,8 +3025,14 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                # The rows take back what their decode step's run rebound.
+                self.decoding_batch.absorb()
                 self.inflight_steps.push(batch, result)
                 self._commit_due_step()
+                # Rows whose finish the commit observed leave here, so the
+                # readers between steps, preallocation and the prebuilt join
+                # see only the rows still decoding.
+                self.leave_finished_rows(self.decoding_batch)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -3043,6 +3047,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.inflight_steps = InflightQueue(depth=1)
+        self.disagg_decode_launches_copy = True
         self.last_batch: Optional[ScheduleBatch] = None
         if self.recv_skipper is not None:
             self.recv_skipper.on_launch(None)
@@ -3060,9 +3065,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            # Finished rows leave before preallocation and the prebuilt join
-            # size their budgets from the running batch.
-            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3075,8 +3077,10 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
+            # The step in flight is the one launched last.
+            inflight = self.inflight_steps.newest()
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+                batch, last_batch=None if inflight is None else inflight.batch
             )
 
             if disable_overlap_for_batch and self.inflight_steps.has_due():
@@ -3087,6 +3091,8 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.inflight_steps.push(batch.copy(), batch_result)
+                # The rows take back what their decode step's run rebound.
+                self.decoding_batch.absorb()
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -3099,6 +3105,12 @@ class SchedulerDisaggregationDecodeMixin:
                 self._commit_due_step()
             elif batch is None:
                 self.on_idle()
+            # Rows whose finish a commit observed leave here, after the
+            # launch: the decode step copied from the rows hands back its run
+            # writes first. This also covers the commit made before the
+            # launch. The readers between steps, preallocation and the
+            # prebuilt join then see only the rows still decoding.
+            self.leave_finished_rows(self.decoding_batch)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -3127,7 +3139,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # Rows adopted from a prebuilt batch take the HiSparse coordinator.
                 if self.enable_hisparse and decoding_batch.rows.is_empty():
                     new_prebuilt_batch.hisparse_coordinator = self.hisparse_coordinator
-                decoding_batch.join(new_prebuilt_batch)
+                # A copy joins: the prebuilt batch never becomes the running
+                # rows.
+                decoding_batch.join(new_prebuilt_batch.shallow_copy())
 
         # Schedule decode batch
         if decoding_batch.rows.is_empty():
@@ -3135,6 +3149,8 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             running_batch = self.update_running_batch(decoding_batch)
             ret = running_batch if not running_batch.is_empty() else None
+            if ret is not None and self.disagg_decode_launches_copy:
+                ret = decoding_batch.decode_step()
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:

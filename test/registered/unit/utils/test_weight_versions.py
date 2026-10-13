@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
@@ -314,6 +315,8 @@ class _SchedulerStub:
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.rows_join_at_launch = False
+        self.disagg_decode_launches_copy = False
+        self.disaggregation_mode = DisaggregationMode.NULL
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse

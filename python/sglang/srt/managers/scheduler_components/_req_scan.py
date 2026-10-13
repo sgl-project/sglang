@@ -14,12 +14,19 @@ def running_and_inflight_batches(
     scheduler: Scheduler,
 ) -> List[Optional[ScheduleBatch]]:
     """The running batch, then the launched batches whose requests it does not
-    hold yet: the batch launched last, or under a loop that joins its rows at
-    launch, the steps in flight. Any may be None, and the running and last
+    hold yet: the batch launched last, or when the rows hold the steps
+    launched, the steps in flight. Any may be None, and the running and last
     batch may be the same. Under PP they are the current micro-batch's."""
-    if scheduler.rows_join_at_launch:
+    if rows_hold_launched(scheduler):
         return [
             scheduler.running_batch,
             *(record.batch for record in scheduler.inflight_steps),
         ]
     return [scheduler.running_batch, scheduler.last_batch]
+
+
+def rows_hold_launched(scheduler: Scheduler) -> bool:
+    """Whether the rows hold every unfinished request of the steps launched,
+    except the steps in flight and the request still chunking: the loops that
+    join at launch, and the PD decode loops, whose step is a copy of the rows."""
+    return scheduler.rows_join_at_launch or scheduler.disagg_decode_launches_copy
