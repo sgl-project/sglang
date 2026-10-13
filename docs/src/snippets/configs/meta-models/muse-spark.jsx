@@ -205,7 +205,7 @@ export const config = {
     nvfp4: "meta-models/Muse-Spark-open-816B-A42B-NVFP4",
     mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
     bf16: "meta-models/Muse-Spark-open-816B-A42B",
-    int4: "intel-ai/Muse-Spark-1.2-open-816B-A42B-INT4",
+    int4: "intel-ai/Muse-Spark-open-816B-A42B-INT4",
   },
   dockerImages: {
     b300: "lmsysorg/sglang:dev-muse-spark",

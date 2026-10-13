@@ -13,7 +13,7 @@ tag: NEW
 ```bash Command
 docker pull lmsysorg/sglang:dev-muse-spark          # NVIDIA B300 / GB300 / B200
 docker pull lmsysorg/sglang-rocm:muse-spark-1.2     # AMD MI355X
-docker pull lmsysorg/sglang:muse-spark-1.2-xeon     # Intel Xeon CPU
+docker pull lmsysorg/sglang:dev-muse-spark-xeon     # Intel Xeon CPU
 ```
 
 The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup. The CUDA tag does not run on MI355X; use the ROCm image there; Use Xeon image for Xeon CPU and for more SGLang CPU installation approaches, see the [CPU version installation guide](/docs/hardware-platforms/cpu_server#installation).
@@ -28,7 +28,7 @@ Choose your hardware and deployment options below. The default is **B300 / NVFP4
 
 **Xeon CPU service configuration:**
 
-- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-1.2-open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
+- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
 - Set `--page-size 1` for the `intel_amx` attention backend (the CPU default attention backend).
 - We recommend setting the TP size equal to the NUMA count. See the **Notes** under [Launch of the Serving Engine](/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) in the SGLang CPU server document for how to configure the arguments, especially TP and NUMA binding.
 
@@ -47,6 +47,7 @@ This cookbook provides deployment recipes for the Muse Spark 816B-A42B checkpoin
 
 - **NVFP4:** `meta-models/Muse-Spark-open-816B-A42B-NVFP4` (NVIDIA default).
 - **MXFP4:** `amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
+- **INT4** `intel-ai/Muse-Spark-open-816B-A42B-INT4` (Xeon default; AutoRound-quantized).
 - **BF16:** `meta-models/Muse-Spark-open-816B-A42B`.
 
 ## 2. Configuration tips
