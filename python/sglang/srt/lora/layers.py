@@ -1174,6 +1174,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         lora_info,
+        output_add: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -1217,7 +1218,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
-
+        if output_add is not None:
+            final_hidden_states = final_hidden_states + output_add
         return final_hidden_states
 
     def slice_lora_a_weights(self, A: torch.Tensor):

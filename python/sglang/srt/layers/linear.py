@@ -27,6 +27,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers.chunked_gemm_ar import (
+    chunked_gemm_ar_enabled,
+    try_forward_chunked_gemm_ar,
+)
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -1771,6 +1775,25 @@ class RowParallelLinear(LinearBase):
             output = layernorm_sp.row_parallel_gbar_matmul(self, input_parallel, bias_)
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
+
+        # Large-M prefill: overlap the GEMM with its TP all-reduce by pipelining
+        # row chunks (layers/chunked_gemm_ar.py); falls through when ineligible.
+        if (
+            chunked_gemm_ar_enabled()
+            and not isinstance(input_parallel, tuple)
+            and output_tensor is None
+            and not skip_all_reduce
+            and self.reduce_results
+            and tp_size > 1
+            and not self.use_dp_attention_reduce
+            and not self.use_decode_attn_tp
+        ):
+            chunked_output = try_forward_chunked_gemm_ar(
+                self, input_parallel, bias_, forward_batch
+            )
+            if chunked_output is not None:
+                output_bias = self.bias if self.skip_bias_add else None
+                return chunked_output, output_bias
 
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)

@@ -9,6 +9,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_schedule,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -655,6 +656,14 @@ class PrefillAdder:
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        # One extend tracks a single Mamba state; ending a prefill on the cached
+        # fork lets that chunk donate the fork state and the next one the tail.
+        self.split_prefill_at_mamba_fork = (
+            self.is_hybrid_ssm_cache
+            and dllm_config is None
+            and get_exec().mamba.enable_mamba_extra_buffer
+            and envs.SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK.get()
+        )
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
         # ALLOCATOR: the reservation holds with the radix cache disabled too.
@@ -816,6 +825,28 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _mamba_fork_split_len(
+        self,
+        req: Req,
+        *,
+        prefix_len: int,
+        truncation_align_size: Optional[int] = None,
+    ) -> Optional[int]:
+        """Extend length that ends on the cached Mamba fork, if it can be donated."""
+        if not self.split_prefill_at_mamba_fork:
+            return None
+        branch = req.mamba_branching_seqlen
+        if branch is None:
+            return None
+        split_len = branch - prefix_len
+        if split_len <= 0 or branch >= len(req.full_untruncated_fill_ids):
+            return None
+        if split_len % mamba_cache_chunk_size() or split_len % self.page_size:
+            return None
+        if truncation_align_size is not None and split_len % truncation_align_size:
+            return None
+        return split_len
 
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
@@ -1118,6 +1149,10 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        fork_split_len = self._mamba_fork_split_len(req, prefix_len=req.prefix_len)
+        if fork_split_len is not None and fork_split_len < new_len:
+            new_len = fork_split_len
+            truncated = True
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=req.prefix_len, extend_len=new_len
@@ -1426,6 +1461,16 @@ class PrefillAdder:
                         extend_len = min(
                             extend_len, len(req.full_untruncated_fill_ids) - prefix_len
                         )
+                    if admission.is_chunked:
+                        # The larger host hit moved the prefix; the extend must
+                        # still stop at the Mamba fork.
+                        fork_split_len = self._mamba_fork_split_len(
+                            req,
+                            prefix_len=prefix_len,
+                            truncation_align_size=truncation_align_size,
+                        )
+                        if fork_split_len is not None and fork_split_len < extend_len:
+                            extend_len = fork_split_len
                     is_chunked = admission.is_chunked and (
                         prefix_len + extend_len < len(req.full_untruncated_fill_ids)
                     )
@@ -1460,6 +1505,19 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
+
+            if (
+                admission.is_chunked
+                and self._mamba_fork_split_len(
+                    req,
+                    prefix_len=admission.prefix_len,
+                    truncation_align_size=truncation_align_size,
+                )
+                == admission.extend_len
+            ):
+                # This chunk must donate the fork state before another prefill
+                # can take the single chunked-request slot.
+                return AddReqResult.OTHER
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -1511,11 +1569,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
-                # Only one unfinished chunked request can be tracked.
+            if has_chunked_req:
+                # Only one unfinished chunked request can be tracked; a short
+                # continuation (SPF limit, Mamba fork) leaves budget behind.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
@@ -1541,6 +1597,20 @@ class PrefillAdder:
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
+
+        if (
+            chunk_tokens_limit is not None
+            and not has_chunked_req
+            and self.new_chunked_req is None
+        ):
+            fork_split_len = self._mamba_fork_split_len(
+                req, prefix_len=prefix_len, truncation_align_size=truncation_align_size
+            )
+            if fork_split_len is not None and fork_split_len < extend_len:
+                extend_len = fork_split_len
+                is_chunked = True
+                max_new_tokens = 0
+                tile_tokens = extend_len
 
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict

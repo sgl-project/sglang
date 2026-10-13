@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module, Parameter
 
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class Mxfp4HummingMoEMethod:
+class Mxfp4HummingMoEMethod(FusedMoEMethodBase):
     """MXFP4 (E8M0 scales) MoE quantization method using the Humming runner.
 
     Used for DeepSeek-V4 FP8 checkpoints when `--moe-runner-backend humming` is

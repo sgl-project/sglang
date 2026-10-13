@@ -2299,6 +2299,11 @@ class DeepseekV2AttentionMLA(
         else:
             state.hidden_states_after_attn = result
 
+    # Per-forward inline attention-TP reduce state (layers/chunked_gemm_ar.py):
+    # permission in, outcome out; the split prepare/core entry never grants it.
+    _inline_tp_reduce: bool = False
+    _inline_tp_reduced: bool = False
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2308,17 +2313,42 @@ class DeepseekV2AttentionMLA(
         input_on_attn_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        inline_tp_reduce: bool = False,
     ):
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            input_on_attn_tp_slices=input_on_attn_tp_slices,
-            llama_4_scaling=llama_4_scaling,
-            prev_topk_indices=prev_topk_indices,
-        )
-        return self.forward_core(s)
+        self._inline_tp_reduce = inline_tp_reduce
+        self._inline_tp_reduced = False
+        try:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=input_on_attn_tp_slices,
+                llama_4_scaling=llama_4_scaling,
+                prev_topk_indices=prev_topk_indices,
+            )
+            return self.forward_core(s)
+        finally:
+            self._inline_tp_reduce = False
+
+    def _apply_o_proj(
+        self, attn_output: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if self._inline_tp_reduce:
+            from sglang.srt.layers.chunked_gemm_ar import (
+                try_forward_chunked_gemm_ar_inline,
+            )
+
+            reduced = try_forward_chunked_gemm_ar_inline(
+                layer=self.o_proj,
+                input_parallel=attn_output,
+                forward_batch=forward_batch,
+                reduce_on_attn_tp=True,
+            )
+            if reduced is not None:
+                self._inline_tp_reduced = True
+                return reduced
+        return self.o_proj(attn_output)[0]
 
     def forward_prepare(
         self,

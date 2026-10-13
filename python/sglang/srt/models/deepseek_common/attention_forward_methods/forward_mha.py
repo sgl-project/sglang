@@ -312,8 +312,7 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self._apply_o_proj(attn_output, forward_batch)
 
     def forward_normal_chunked_kv_prepare(
         self: DeepseekV2AttentionMLA,
@@ -376,8 +375,7 @@ class DeepseekMHAForwardMixin:
             attn_output = attn_output.reshape(
                 -1, self.num_local_heads * self.v_head_dim
             )
-            output, _ = self.o_proj(attn_output)
-            return output
+            return self._apply_o_proj(attn_output, forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -398,8 +396,7 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self._apply_o_proj(attn_output, forward_batch)
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,

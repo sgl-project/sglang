@@ -118,6 +118,55 @@ def test_runner_core_registration_can_override_builtin_backend(
     assert runner.runner_core.runner_backend is backend
 
 
+def test_humming_fused_route_folds_output_add(
+    monkeypatch, isolated_runner_registries
+) -> None:
+    from sglang.srt.layers.moe.moe_runner import humming as humming_module
+
+    indexed = object()
+    monkeypatch.delenv("SGLANG_CI_DISABLE_MOE_FUSED_FUNC", raising=False)
+    monkeypatch.setattr(humming_module, "_humming_available", True)
+    monkeypatch.setattr(
+        humming_module,
+        "HummingGemmType",
+        SimpleNamespace(INDEXED=indexed),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        humming_module, "get_standard_humming_moe_gemm_type", lambda: indexed
+    )
+    runner = runner_module.MoeRunner(
+        MoeRunnerBackend.HUMMING, MoeRunnerConfig(num_experts=2, num_local_experts=2)
+    )
+    assert runner.fused_func is humming_module.fused_experts_none_to_humming
+    assert runner.supports_fused_output_add
+
+    seen = []
+
+    class _Core:
+        def __init__(self, config):
+            pass
+
+        def run(self, runner_input, quant_info, running_state):
+            seen.append(runner_input.output_add)
+            return SimpleNamespace(hidden_states=runner_input.hidden_states)
+
+    monkeypatch.setattr(humming_module, "HummingRunnerCore", _Core)
+    output_add = torch.ones(1, 2)
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=torch.zeros(1, 2),
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=torch.ones(1, 1),
+            topk_ids=torch.zeros(1, 1, dtype=torch.int64),
+            router_logits=torch.zeros(1, 1),
+        ),
+        output_add=output_add,
+    )
+    runner.run(dispatch_output, MoeQuantInfo())
+    assert len(seen) == 1 and seen[0] is output_add
+
+
 def test_runner_backend_names_must_be_builtin_or_registered(
     isolated_runner_registries,
 ) -> None:

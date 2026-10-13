@@ -192,6 +192,18 @@ class MoeRunner:
             )
             self.fused_func = None
 
+    @property
+    def supports_fused_output_add(self) -> bool:
+        if self.runner_core is None:
+            return False
+        if (
+            self.fused_func is not None
+            and not self.lora_enabled
+            and not FusedOpPool.folds_output_add(self.fused_func)
+        ):
+            return False
+        return self.runner_core.supports_fused_output_add
+
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
