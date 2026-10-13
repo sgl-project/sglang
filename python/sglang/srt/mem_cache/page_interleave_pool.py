@@ -34,9 +34,9 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   single-node shard groups): both slots are carved out of one ``ncclMemAlloc``
   buffer registered as a symmetric window. Every rank carves the same offsets,
   because CE addresses a peer's buffer by the local offset into the window.
-  Set ``NCCL_CTA_POLICY=2`` before launching SGLang to request copy engines
-  (zero SMs) for eligible collectives on all NCCL communicators, including
-  the dedicated gather communicator.
+  The dedicated gather communicator requests ``NCCL_CTA_POLICY_ZERO``
+  for eligible copy-engine transfers. Leave the global ``NCCL_CTA_POLICY``
+  unset so forward-pass communicators retain their default policy.
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
   write; MLA latent is replicated across the shard group at write time).
@@ -71,7 +71,10 @@ from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicato
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+    NCCL_CTA_POLICY_ZERO,
+    NCCLLibrary,
+)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
@@ -206,7 +209,9 @@ class PageInterleaveKVPoolMixin:
         # Dedicated communicator + stream so the layer-ahead gathers never
         # interleave with the group's main collectives.
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
-            group=shard_group.cpu_group, device=shard_group.device
+            group=shard_group.cpu_group,
+            device=shard_group.device,
+            cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
         )
         self.kv_gather_stream = self.device_module.Stream()
 

@@ -1793,10 +1793,10 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         the pool and every scratch view are gone."""
         if torch.cuda.nccl.version() < (2, 28, 0):
             self.skipTest("copy-engine collectives need NCCL >= 2.28")
-        # Fresh workers inherit the policy before NCCL initializes, and cuMem
-        # enables symmetric window registration.
+        # Clear the global override before spawning: only the dedicated
+        # gather communicator requests ZERO. cuMem enables window registration.
         with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY="2"),
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
         ):
             mp.spawn(
@@ -1810,7 +1810,7 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         """A shard group spanning nodes keeps the torch scratch and the SM
         allgather, even with cuMem on."""
         with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY="2"),
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
         ):
             mp.spawn(

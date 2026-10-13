@@ -568,8 +568,8 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
     # --enable-kv-cache-sharding: register single-node prefix gather scratch
-    # as NCCL symmetric memory. Set NCCL_CTA_POLICY=2 before process startup
-    # to request copy engines for eligible collectives on all NCCL communicators.
+    # as NCCL symmetric memory and request copy engines on its dedicated
+    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
