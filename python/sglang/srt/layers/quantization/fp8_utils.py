@@ -284,6 +284,7 @@ def use_rowwise_torch_scaled_mm():
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
     if _is_xpu:
+        # XPU's torch._scaled_mm backend supports rowwise scaling.
         return True
     return False
 
@@ -2162,7 +2163,6 @@ def apply_fp8_linear(
         and weight_scale.ndim == 2
         and weight_scale.shape[1] == 1
         and weight_scale.t().is_contiguous()
-        and qinput.shape[0] >= 8
     )
     if (
         use_per_token_if_dynamic

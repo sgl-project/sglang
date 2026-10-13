@@ -336,7 +336,7 @@ class TestXPUFP8Linear(CustomTestCase):
         torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
 
     def test_channelwise_xpu_rowwise_scaled_mm_gate(self):
-        """Use fused rowwise scaled_mm for M>=8 without changing accuracy."""
+        """Use fused rowwise scaled_mm without changing accuracy."""
         method = Fp8LinearMethod(
             Fp8Config(is_checkpoint_fp8_serialized=False, weight_block_size=None)
         )
@@ -398,7 +398,7 @@ class TestXPUFP8Linear(CustomTestCase):
                 torch.testing.assert_close(
                     output, reference.to(torch.bfloat16), rtol=0.01, atol=0.1
                 )
-                expected_scale_shapes = ((m, 1), (1, N)) if m >= 8 else ((1,), (1,))
+                expected_scale_shapes = ((m, 1), (1, N))
                 self.assertEqual(calls, [expected_scale_shapes])
 
 
