@@ -764,7 +764,6 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     batch_result = None
 
-            self._debug_check_commit_gate(self.last_batch is not None)
             if self.inflight_steps.has_due():
                 if not self.inflight_steps.blocking:
                     # Resume intake until the oldest result is ready on all TP ranks.
@@ -790,9 +789,8 @@ class SchedulerDisaggregationPrefillMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # Update last_batch and scheduler status
+            # Update scheduler status
             self._sched_idled = batch is None
-            self.last_batch = batch
             if self.recv_skipper is not None:
                 self.recv_skipper.on_launch(batch)
             self.inflight_steps.end_step()

@@ -514,7 +514,6 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.enable_lora = False
         scheduler.waiting_queue = []
-        scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue

@@ -42,7 +42,6 @@ _WATCHED = frozenset(
         "enable_continuous_input_polling",
         "cur_batch_for_debug",
         "_sched_idled",
-        "last_batch",
         "decoding_batch",
         "launch_event",
         "send_req_work",
@@ -152,7 +151,6 @@ def _make_scheduler(log):
     s.enable_unified_memory = True
     s._deferred_input_requests = []
     s.chunked_req = None
-    s.last_batch = None
     s.ngram_embedding_manager.prepare_for_forward.side_effect = (
         lambda batch, chunked_req: batch
     )

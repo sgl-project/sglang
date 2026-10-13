@@ -36,7 +36,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
-        scheduler.last_batch = None
         scheduler.hisparse_coordinator = None
         scheduler.recv_skipper = None
         scheduler.cur_batch = None

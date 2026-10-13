@@ -121,7 +121,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _commit_due_step = Scheduler._commit_due_step
-    _debug_check_commit_gate = Scheduler._debug_check_commit_gate
     pause_generation = Scheduler.pause_generation
     running_batch = Scheduler.running_batch
     continue_generation = Scheduler.continue_generation
@@ -164,7 +163,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.tp_size = 1
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
-        self.last_batch = None
         self.recv_skipper = None
         self.inflight_steps = InflightQueue(depth=0)
         self.chunked_req = None
@@ -279,7 +277,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def _record_scheduler_state_for_paused_engine(self):
         self.actions.append((self.iteration, "pause", None))
         pending = tuple((record.batch, record.result) for record in self.inflight_steps)
-        self.paused_states.append((self.last_batch, pending))
+        self.paused_states.append((self.cur_batch_for_debug, pending))
 
     def process_prefill_chunk(self):
         # The step whose chunk this processes: the one the last plan launched.
@@ -880,7 +878,7 @@ class TestPrefillResultPolling(CustomTestCase):
             ],
         )
         self.assertFalse(scheduler.inflight_steps)
-        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.cur_batch_for_debug)
         self.assertEqual(
             [req.rid for req in scheduler.disagg_prefill_inflight_queue],
             ["1", "2", "3"],
@@ -982,8 +980,8 @@ class TestPrefillResultPolling(CustomTestCase):
                 _run_loop(scheduler)
 
                 self.assertEqual(len(scheduler.paused_states), 1)
-                for last_batch, pending in scheduler.paused_states:
-                    self.assertIs(last_batch, second)
+                for launched, pending in scheduler.paused_states:
+                    self.assertIs(launched, second)
                     self.assertEqual([b.forward_iter for b, _ in pending], [2])
                 self.assertEqual(
                     [a for a in scheduler.actions if a[1] == "dispatch"],
@@ -1064,7 +1062,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         self.assertEqual(event.records, 1)
                         self.assertIsNone(results[name].delay_sample_func)
                 self.assertFalse(scheduler.inflight_steps)
-                self.assertIsNone(scheduler.last_batch)
+                self.assertIsNone(scheduler.cur_batch_for_debug)
 
     def test_shutdown_during_intake_stops_new_batches_in_both_modes(self):
         class StoppingScheduler(_Scheduler):

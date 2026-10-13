@@ -67,10 +67,12 @@ def _batch(reqs):
     return SimpleNamespace(reqs=reqs, is_empty=lambda: not reqs)
 
 
-def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
+def _scheduler(waiting_queue, running_reqs=(), inflight_reqs=()):
     s = Scheduler.__new__(Scheduler)
     s.enable_continuous_input_polling = False
     s.inflight_steps = InflightQueue(depth=1)
+    if inflight_reqs:
+        s.inflight_steps.push(_batch(list(inflight_reqs)), None)
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
@@ -78,7 +80,6 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
-    s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     s.hisparse_coordinator = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.chunked_req = None
@@ -162,9 +163,9 @@ class TestRunningTimeout(CustomTestCase):
         self.assertIsNone(fresh.to_finish)
         self.assertIsNone(done.to_finish, "a finished req must not be aborted")
 
-    def test_req_in_both_running_and_last_batch_is_emitted_once(self):
+    def test_req_in_both_running_and_a_step_in_flight_is_emitted_once(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
-        s = _scheduler([], running_reqs=[stale], last_batch_reqs=[stale])
+        s = _scheduler([], running_reqs=[stale], inflight_reqs=[stale])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
         self.assertEqual([a.rid for a in aborts], ["stale"])
@@ -172,10 +173,10 @@ class TestRunningTimeout(CustomTestCase):
     def test_pending_abort_is_not_emitted_again_while_forward_is_running(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
         fresh = _req("fresh", forward_entry=time.perf_counter())
-        s = _scheduler([], last_batch_reqs=[fresh])
+        s = _scheduler([])
         s.enable_continuous_input_polling = True
         s.inflight_steps.push(_batch([stale]), None)
-        s.inflight_steps.push(s.last_batch, None)
+        s.inflight_steps.push(_batch([fresh]), None)
         s.disaggregation_mode = DisaggregationMode.PREFILL
         s.chunked_req = None
         s.mm_receiver = None
@@ -203,9 +204,8 @@ class TestRunningTimeout(CustomTestCase):
                 self.subTest(pp_size=pp_size),
                 get_parallel().override(pp_size=pp_size),
             ):
-                # Polling re-enters intake before last_batch advances to newer.
-                last_req = older if pp_size == 1 else newer
-                s = _scheduler([], last_batch_reqs=[last_req])
+                # Polling re-enters intake while both steps are in flight.
+                s = _scheduler([])
                 if pp_size == 1:
                     # Only the PD prefill overlap loop polls.
                     s.enable_continuous_input_polling = True
@@ -216,7 +216,7 @@ class TestRunningTimeout(CustomTestCase):
                     s.inflight_steps.push(_batch([newer]), None)
                 else:
                     s.inflight_steps = InflightQueue(depth=1, ring=True)
-                    s.inflight_steps.push(s.last_batch, None)
+                    s.inflight_steps.push(_batch([newer]), None)
                     s.inflight_steps.end_step()
                     s.inflight_steps.push(_batch([older]), None)
 

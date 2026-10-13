@@ -21,8 +21,16 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     else:
         if s.running_batch is not None:
             yield from s.running_batch.reqs
-        if s.last_batch is not None:
-            yield from s.last_batch.reqs
+        if (batch := _launched_batch(ctx)) is not None:
+            yield from batch.reqs
+
+
+def _launched_batch(ctx: ScriptedContext):
+    # Scripts run at intake, where a flat loop's last plan is the step it
+    # launched last. The pipeline loops plan per slot; none is reported.
+    if get_parallel().pp_size > 1:
+        return None
+    return ctx.scheduler.cur_batch_for_debug
 
 
 def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
@@ -39,7 +47,7 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
 
     prefill: List[str] = []
     decode: List[str] = []
-    batch = s.last_batch
+    batch = _launched_batch(ctx)
     if batch is not None and not batch.is_empty() and batch.forward_mode is not None:
         bucket = prefill if batch.forward_mode.is_extend() else decode
         bucket.extend(r.rid for r in batch.reqs if r.rid != chunked_rid)
@@ -62,14 +70,14 @@ def is_idle(ctx: ScriptedContext) -> bool:
 
 
 def is_fully_idle(ctx: ScriptedContext) -> bool:
-    s = ctx.scheduler
-    return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
+    batch = _launched_batch(ctx)
+    return is_idle(ctx) and (batch is None or batch.is_empty())
 
 
 def last_batch_forward_mode(ctx: ScriptedContext) -> Optional[str]:
-    s = ctx.scheduler
-    if s.last_batch is not None and s.last_batch.forward_mode is not None:
-        return s.last_batch.forward_mode.name
+    batch = _launched_batch(ctx)
+    if batch is not None and batch.forward_mode is not None:
+        return batch.forward_mode.name
     return None
 
 

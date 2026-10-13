@@ -82,7 +82,6 @@ def _plan_scheduler(prebuilt_reqs):
     s = MagicMock()
     s.chunked_req = None
     s.enable_hisparse = False
-    s.last_batch = None
     s.get_next_disagg_decode_batch_to_run = MethodType(
         SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run, s
     )
@@ -148,7 +147,6 @@ class _Loop:
         s._engine_paused = False
         s.enable_hisparse = False
         s.chunked_req = None
-        s.last_batch = None
         s.waiting_queue = []
         s.disaggregation_mode = DisaggregationMode.DECODE
         s.decode_offload_manager = None
@@ -163,7 +161,6 @@ class _Loop:
         for name in (
             "get_next_disagg_decode_batch_to_run",
             "_commit_due_step",
-            "_debug_check_commit_gate",
             "leave_finished_rows",
             "is_fully_idle",
             "_pp_microbatches_drained",
@@ -265,8 +262,8 @@ class TestDecodeStepCopy(CustomTestCase):
                 )
 
     def test_on_idle_after_the_last_row_finishes(self):
-        # The step that decoded the row is a copy of the rows and stays
-        # last_batch; it drops the row at the plan that finds nothing to run.
+        # The step that decoded the row is a copy of the rows; the rows drop
+        # the finished row at its commit.
         loop = _Loop(self, [{"finish": {"a"}}, {}], rows=[_Req("a")])
         loop.run(
             SchedulerDisaggregationDecodeMixin.event_loop_normal_disagg_decode,

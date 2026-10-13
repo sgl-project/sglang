@@ -618,7 +618,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     def test_retract_pause_no_leak_on_prefill(self):
         """Retract-mode pause on a disagg prefill node must not leak prefill
         requests into running_batch. Without the fix, each retract pause merges
-        last_batch into running_batch, but the prefill event loop never cleans
+        the launched prefill step into running_batch, but the prefill event loop never cleans
         them up via update_running_batch. After enough cycles the
         max-running-requests budget is exhausted and all new prefills hang."""
         asyncio.run(self._run_pause_resume_leak_test("retract"))

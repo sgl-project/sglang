@@ -524,7 +524,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
-        scheduler.last_batch = None
         scheduler.hisparse_coordinator = None
         scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.cur_batch_for_debug = None

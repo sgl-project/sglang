@@ -224,7 +224,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components._req_scan import (
-    launched_reqs_held,
     running_and_inflight_batches,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -1302,8 +1301,6 @@ class Scheduler(
         self.decoding_batch = DecodingBatch(ScheduleBatch(reqs=[]))
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
-        # The last forward batch
-        self.last_batch: Optional[ScheduleBatch] = None
         # Launched batches whose results are not committed yet. The normal,
         # overlap, PD and pipeline event loops install their own on entry;
         # the MLX loop keeps its own holder.
@@ -1980,12 +1977,8 @@ class Scheduler(
         record = self.inflight_steps.pop_due()
         self.process_batch_result(record.batch, record.result)
 
-    def _debug_check_commit_gate(self, last_batch_gate: bool) -> None:
-        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
-            assert self.inflight_steps.has_due() == last_batch_gate
-
     def is_disable_overlap_for_batch(
-        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+        self, batch: ScheduleBatch, inflight_batch: Optional[ScheduleBatch]
     ) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
@@ -1998,12 +1991,12 @@ class Scheduler(
             is_extend = lambda b: b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(last_batch)
+        inflight_batch_is_extend = is_extend(inflight_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch_is_extend
-            and last_batch_is_extend
+            and inflight_batch_is_extend
         )
 
         # Sync so the FSM advance lands before the next batch's bitmask. Permanent
@@ -5275,7 +5268,6 @@ class Scheduler(
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
-            self.last_batch = None
             if self.recv_skipper is not None:
                 self.recv_skipper.on_launch(None)
             self.tree_cache.reset()
@@ -5376,7 +5368,7 @@ class Scheduler(
         else:
             batches = [*self.running_mbs, *self.inflight_steps.slot_batches()]
         reqs = [req for batch in batches if batch is not None for req in batch.reqs]
-        if launched_reqs_held(self) and self.chunked_req is not None:
+        if not self.inflight_steps.ring and self.chunked_req is not None:
             # The request still chunking, which no other holder lists.
             reqs.append(self.chunked_req)
         return reqs
@@ -5533,10 +5525,9 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # inflight_steps) is left untouched. On resume, the event loop
-            # handles any last_batch merge, chunked_req cleanup, and overlap
-            # result processing through the standard code paths. This avoids
+            # All scheduler state (running_batch, chunked_req, inflight_steps)
+            # is left untouched. On resume, the event loop handles any
+            # chunked_req cleanup and overlap result processing through the standard code paths. This avoids
             # duplicating batch manipulation logic and the accounting bugs
             # that come with it.
             return
@@ -5598,7 +5589,6 @@ class Scheduler(
                 ]
                 retract_reqs += staged
 
-        self.last_batch = None
         if self.recv_skipper is not None:
             self.recv_skipper.on_launch(None)
         self.cur_batch_for_debug = None

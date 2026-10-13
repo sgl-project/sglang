@@ -169,7 +169,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue.scheduler = MagicMock()
         queue.scheduler.running_batch.reqs = []
         queue.scheduler.sliding_window_size = 128
-        queue.scheduler.last_batch = None
         queue.retracted_queue = []
         queue._need_space_for_single_req = MagicMock(return_value=0)
         queue._active_req_count = MagicMock(return_value=1)
@@ -551,7 +550,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         scheduler.enable_decode_hicache = False
         scheduler.enable_priority_scheduling = False
         scheduler.waiting_queue = []
-        scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 

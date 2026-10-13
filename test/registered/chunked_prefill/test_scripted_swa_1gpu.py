@@ -160,7 +160,7 @@ class TestScriptedSwaMixedChunkDecodeFit(ScriptedTestCase):
         decode_held_back = False
         decoder_rids = {h.rid for h in decoders}
         for _ in range(_MIXED_MAX_STEPS):
-            batch = s.last_batch
+            batch = s.cur_batch_for_debug
             if (
                 batch is not None
                 and batch.forward_mode is not None

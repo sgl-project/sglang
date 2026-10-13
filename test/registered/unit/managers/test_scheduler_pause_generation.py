@@ -74,7 +74,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
-        scheduler.last_batch = None
         scheduler.recv_skipper = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -259,11 +258,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
         scheduler.chunked_req = MagicMock()
 
-        original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch_for_debug
         original_chunked_req = scheduler.chunked_req
 
@@ -271,7 +268,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertTrue(scheduler._engine_paused)
         # All state must be preserved — no mutation
-        self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
@@ -297,7 +293,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """in_place should not process the overlap in-flight steps."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
-        scheduler.last_batch = MagicMock()
         scheduler.inflight_steps.push(MagicMock(), MagicMock())
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
@@ -306,15 +301,15 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(len(scheduler.inflight_steps), 1)
 
     def test_inplace_does_not_merge_batch(self):
-        """in_place should not filter or merge last_batch into running_batch."""
+        """in_place should not filter or merge a step in flight into running_batch."""
         scheduler = self._new_scheduler()
-        last_batch = MagicMock()
-        last_batch.forward_mode.is_extend.return_value = True
-        scheduler.last_batch = last_batch
+        launched = MagicMock()
+        launched.forward_mode.is_extend.return_value = True
+        scheduler.inflight_steps.push(launched, MagicMock())
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        last_batch.filter_batch.assert_not_called()
+        launched.filter_batch.assert_not_called()
         scheduler.running_batch.merge_batch.assert_not_called()
 
     def test_abort_mode_rejected_at_scheduler(self):
@@ -331,17 +326,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         with self.assertRaises(AssertionError):
             scheduler.pause_generation(PauseGenerationReqInput())
 
-    def test_retract_clears_last_batch_state(self):
-        """retract mode should clear last_batch and cur_batch_for_debug."""
+    def test_retract_clears_cur_batch_state(self):
+        """retract mode should clear cur_batch_for_debug."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = MagicMock()
-        scheduler.last_batch.forward_mode.is_extend.return_value = False
         scheduler.cur_batch_for_debug = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
-        self.assertIsNone(scheduler.last_batch)
         self.assertIsNone(scheduler.cur_batch_for_debug)
 
     def test_retract_requeues_running_then_last_fold_in(self):
@@ -377,7 +369,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertIsNone(scheduler.chunked_req)
-        self.assertIsNone(scheduler.last_batch)
 
     def test_retract_order_is_kept_when_the_rows_joined_at_launch(self):
         """A loop that joins at launch already holds the last step's finished
@@ -626,7 +617,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._add_request_to_queue = MagicMock()
-        scheduler.last_batch = None
 
         chunked_req = MagicMock()
         chunked_req.finished.return_value = False
@@ -652,7 +642,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.disaggregation_mode = mode
                 batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
                 result = SimpleNamespace(delay_sample_func=None)
-                scheduler.last_batch = batch
                 scheduler.inflight_steps.push(batch, result)
                 scheduler.process_batch_result = MagicMock()
 
@@ -665,7 +654,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.last_batch = None
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 

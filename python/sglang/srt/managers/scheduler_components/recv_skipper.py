@@ -51,15 +51,15 @@ class SchedulerRecvSkipper:
         following recv calls."""
         self._last_mode = self._pick_mode(batch)
 
-    def _pick_mode(self, last_batch: Optional[ScheduleBatch]) -> Optional[ForwardMode]:
+    def _pick_mode(self, batch: Optional[ScheduleBatch]) -> Optional[ForwardMode]:
         # The recv decision must be identical on every rank in the request
         # broadcast. Local modes differ across DP ranks (IDLE vs DECODE), so
         # use the rank-consistent mode derived from the MLP sync all-gather.
-        if last_batch is None:
+        if batch is None:
             return None
         if self._use_synced_mode:
-            return last_batch.recv_skipper_forward_mode
-        return last_batch.forward_mode
+            return batch.recv_skipper_forward_mode
+        return batch.forward_mode
 
     def handle(self) -> bool:
         should_recv = False

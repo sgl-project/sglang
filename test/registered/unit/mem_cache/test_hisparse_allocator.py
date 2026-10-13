@@ -211,7 +211,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             logical_attn_allocator=logical_allocator
         )
-        queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
+        queue.scheduler = SimpleNamespace(enable_hisparse=True)
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)

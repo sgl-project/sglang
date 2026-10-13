@@ -36,9 +36,8 @@ class LoopSpec:
     advance_pd_queues: Optional[Callable[[Scheduler], None]] = None
     # PD decode: query the prefill DP ranks before intake.
     prefetch_prefill_dp_ranks: bool = False
-    # Commits the due step before a launch that must not overlap it; returns
-    # whether it disabled the overlap.
-    commit_before_launch: Optional[Callable[[Scheduler, ScheduleBatch], bool]] = None
+    # Commits the due step before a launch that must not overlap it.
+    commit_before_launch: Optional[Callable[[Scheduler, ScheduleBatch], None]] = None
     # PD prefill: when staging is on, ask decode to allocate the batch's
     # staging before its forward.
     prefetch_staging: bool = False
@@ -79,16 +78,11 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         # Plan and launch
         batch = spec.plan(self)
         self.cur_batch_for_debug = batch
-        disable_overlap_for_batch = False
         if spec.commit_before_launch:
-            disable_overlap_for_batch = spec.commit_before_launch(self, batch)
+            spec.commit_before_launch(self, batch)
         batch_result = _launch(self, spec, batch, overlapped)
 
         # Commit the due step
-        if overlapped:
-            self._debug_check_commit_gate(
-                self.last_batch is not None and not disable_overlap_for_batch
-            )
         if self.inflight_steps.has_due():
             # Process the oldest batch result.
             self._commit_due_step()
@@ -111,8 +105,6 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         ):
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-        # Update last_batch
-        self.last_batch = batch
         if self.recv_skipper is not None:
             self.recv_skipper.on_launch(batch)
         self.inflight_steps.end_step()
@@ -168,7 +160,6 @@ def _enter_pd(self: Scheduler) -> None:
 
 def _enter_pd_decode_overlap(self: Scheduler) -> None:
     self.inflight_steps = InflightQueue(depth=1)
-    self.last_batch: Optional[ScheduleBatch] = None
     if self.recv_skipper is not None:
         self.recv_skipper.on_launch(None)
 
@@ -211,11 +202,11 @@ def _plan_pd_decode(self: Scheduler) -> Optional[ScheduleBatch]:
 # Commits before a launch: the due step a launch must not overlap.
 
 
-def _commit_if_overlap_disabled(self: Scheduler, batch: ScheduleBatch) -> bool:
+def _commit_if_overlap_disabled(self: Scheduler, batch: ScheduleBatch) -> None:
     # The step in flight is the one launched last.
     inflight = self.inflight_steps.newest()
     disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-        batch, last_batch=None if inflight is None else inflight.batch
+        batch, inflight_batch=None if inflight is None else inflight.batch
     )
 
     # If we do not need to overlap the current batch with the last batch,
@@ -230,22 +221,20 @@ def _commit_if_overlap_disabled(self: Scheduler, batch: ScheduleBatch) -> bool:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
                 pass
-    return disable_overlap_for_batch
 
 
 def _commit_if_overlap_disabled_pd_decode(
     self: Scheduler, batch: ScheduleBatch
-) -> bool:
+) -> None:
     # overlap + spec + grammar is unsupported (would desync DP ranks).
     # The step in flight is the one launched last.
     inflight = self.inflight_steps.newest()
     disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-        batch, last_batch=None if inflight is None else inflight.batch
+        batch, inflight_batch=None if inflight is None else inflight.batch
     )
 
     if disable_overlap_for_batch and self.inflight_steps.has_due():
         self._commit_due_step()
-    return disable_overlap_for_batch
 
 
 # Running rows at a launch.

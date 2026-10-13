@@ -73,9 +73,9 @@ class TestInflightQueue(CustomTestCase):
         self.assertEqual(committed, ["b0", None])
         self.assertEqual(len(q), 2)
 
-    def test_step_rule_matches_last_batch_gate(self):
+    def test_step_rule_matches_previous_launch_gate(self):
         # Differential against the gate the loops used before the queue: commit
-        # the oldest launched batch iff last_batch (what the previous completed
+        # the oldest launched batch iff prev_launch (what the previous completed
         # step launched) is set. Depth 0 commits in the launching step instead;
         # the overlap loop may commit early before a launch; a retract pause
         # commits what is pending; the PD prefill polling loop may wait a pass
@@ -87,15 +87,15 @@ class TestInflightQueue(CustomTestCase):
                 depth=0 if mode == "normal" else 1, blocking=mode != "polling"
             )
             pending = deque()  # launched and not yet committed, oldest first
-            last_batch = batch = None
+            prev_launch = batch = None
             waiting = False
             for i in range(rng.randint(1, 40)):
                 if mode != "normal" and not waiting and rng.random() < 0.1:
-                    self.assertEqual(len(q), int(last_batch is not None))
+                    self.assertEqual(len(q), int(prev_launch is not None))
                     drained = [record.batch for record in q.drain()]
                     self.assertEqual(drained, list(pending))
                     pending.clear()
-                    last_batch = None
+                    prev_launch = None
                     continue
 
                 launched = False
@@ -115,14 +115,14 @@ class TestInflightQueue(CustomTestCase):
                 if mode == "normal":
                     gate = launched
                 else:
-                    gate = last_batch is not None and not disable
+                    gate = prev_launch is not None and not disable
                 self.assertEqual(q.has_due(), gate)
                 if gate:
                     if mode == "polling" and rng.random() < 0.5:
                         waiting = True
                         continue
                     self.assertEqual(q.pop_due().batch, pending.popleft())
-                last_batch = batch
+                prev_launch = batch
                 q.end_step()
                 waiting = False
                 self.assertLessEqual(len(q), q.depth)

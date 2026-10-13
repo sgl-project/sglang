@@ -487,7 +487,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
-        scheduler.last_batch = None
         scheduler.hisparse_coordinator = None
         scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.recv_skipper = None

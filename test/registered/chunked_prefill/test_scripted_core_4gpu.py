@@ -82,7 +82,6 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                     scheduler.cur_batch_for_debug is None
                     or scheduler.cur_batch_for_debug.is_empty()
                 )
-                and (scheduler.last_batch is None or scheduler.last_batch.is_empty())
             )
             if in_flight and queues_clear:
                 t.flush_cache()

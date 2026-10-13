@@ -141,7 +141,6 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
         s.gracefully_exit = False
         s._engine_paused = False
         s.enable_overlap = False
-        s.last_batch = None
         s.recv_skipper = None
         s.hisparse_coordinator = None
         s.waiting_queue = []

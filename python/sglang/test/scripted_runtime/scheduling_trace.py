@@ -84,7 +84,7 @@ class SchedulingTraceWriter:
         """Snapshot reader values at the top of an iteration for the next record.
 
         Not taken in record_schedule: readers run between plans, and a recorded
-        plan has already changed what they read (the running rows, last_batch).
+        plan has already changed what they read (the running rows).
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {

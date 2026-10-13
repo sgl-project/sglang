@@ -49,7 +49,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
-    sched.last_batch = None
     sched.hisparse_coordinator = None
     return sched
 
