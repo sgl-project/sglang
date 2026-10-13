@@ -5255,7 +5255,7 @@ class Scheduler(
             and not (
                 self.rows_join_at_launch
                 and self.hisparse_coordinator is not None
-                and self.hisparse_coordinator.ack_staging_queue
+                and len(self.hisparse_coordinator.ack_staging_queue) > 0
             )
         )
 
