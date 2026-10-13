@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
     support_triton,
 )
@@ -38,6 +39,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -262,9 +264,10 @@ def _kv_shard_rotation_bases(
       allocator draws from the least-full class at that request's turn (so
       the draw sees earlier requests' pops in the same batch) and resolves
       the entry in place.
-    - ChunkCache has no tree nodes (``last_node`` is None); its chunked
-      continuations fall back to the base recorded on the request at the
-      previous chunk's alloc (no cross-request reuse, no rebind there).
+    - A radix-disabled cache keeps no nodes past the root, which carries no
+      base; its chunked continuations fall back to the base recorded on the
+      request at the previous chunk's alloc (no cross-request reuse, no
+      rebind there).
     """
     assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
     bases = []
@@ -345,7 +348,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 

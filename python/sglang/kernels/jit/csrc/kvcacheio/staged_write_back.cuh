@@ -325,4 +325,72 @@ struct HiCacheStagedWriteBackKernel {
   }
 };
 
+template <int64_t kGroupBytes, bool kIsMLA = false>
+struct HiCachePageUnifiedWriteBackKernel {
+  static void
+  run(const tvm::ffi::TensorView dst,
+      const tvm::ffi::TensorView staging,
+      const tvm::ffi::TensorView k_ptr_src,
+      const tvm::ffi::TensorView v_ptr_src,
+      const tvm::ffi::TensorView src_pages,
+      const tvm::ffi::TensorView dst_pages,
+      const int64_t num_groups,
+      const int64_t page_size) {
+    using namespace host;
+    auto P = SymbolicSize{"page count"};
+    auto L = SymbolicSize{"layer count"};
+    auto B = SymbolicSize{"page elements"};
+    auto dtype = SymbolicDType{};
+    auto index_dtype = SymbolicDType{};
+    auto device = SymbolicDevice{};
+    TensorMatcher({L}).with_dtype<uint64_t>().with_device<kDLGPU>(device).verify(k_ptr_src);
+    if constexpr (!kIsMLA) {
+      TensorMatcher({L}).with_dtype<uint64_t>().with_device<kDLGPU>(device).verify(v_ptr_src);
+    }
+    TensorMatcher({P}).with_dtype<int32_t, int64_t>(index_dtype).with_device<kDLGPU>(device).verify(src_pages);
+    TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLCPU, kDLGPUHost>().verify(dst_pages);
+    TensorMatcher({P, B}).with_dtype(dtype).with_device<kDLGPU>(device).verify(staging);
+    TensorMatcher({-1, B}).with_dtype(dtype).with_device<kDLCPU, kDLGPUHost>().verify(dst);
+    RuntimeCheck(num_groups > 0 && page_size > 0 && L.unwrap() > 0, "Page-unified write-back: invalid dimensions");
+    RuntimeCheck(!kIsMLA || num_groups == 1, "Page-unified MLA write-back: expected one latent group");
+    constexpr int64_t kComponents = kIsMLA ? 1 : 2;
+    RuntimeCheck(
+        B.unwrap() * dtype_bytes(dtype.unwrap()) == num_groups * L.unwrap() * kComponents * page_size * kGroupBytes,
+        "Page-unified write-back: page byte size mismatch");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(staging.data_ptr()) % 16 == 0, "Staging must be 16-byte aligned");
+    const auto dst_ids = static_cast<const int64_t*>(dst_pages.data_ptr());
+    for (int64_t i = 0; i < P.unwrap(); ++i) {
+      RuntimeCheck(
+          dst_ids[i] >= 0 && dst_ids[i] < dst.size(0), "Page-unified write-back: destination page out of range");
+    }
+    if (P.unwrap() == 0) {
+      return;
+    }
+    const auto params = HicachePageUnifiedRelayoutParams{
+        .staging = staging.data_ptr(),
+        .k_ptr_src = k_ptr_src.data_ptr(),
+        .v_ptr_src = kIsMLA ? nullptr : v_ptr_src.data_ptr(),
+        .src_pages = src_pages.data_ptr(),
+        .total_vecs = static_cast<uint64_t>(P.unwrap()) * B.unwrap() * dtype_bytes(dtype.unwrap()) / 16,
+        .num_groups = num_groups,
+        .num_layers = L.unwrap(),
+        .page_size = page_size,
+    };
+    // Grid-stride traversal keeps large transfers within CUDA's grid limits.
+    constexpr uint32_t kThreads = 256;
+    const auto blocks =
+        static_cast<uint32_t>(std::min<uint64_t>(div_ceil(params.total_vecs, uint64_t{kThreads}), 65535));
+    const auto kernel = index_dtype.unwrap().bits == 32
+                            ? hicache_page_unified_relayout_kernel<int32_t, kGroupBytes, kIsMLA>
+                            : hicache_page_unified_relayout_kernel<int64_t, kGroupBytes, kIsMLA>;
+    const auto dev = device.unwrap();
+    LaunchKernel(blocks, kThreads, dev)(kernel, params);
+    const auto stream = LaunchKernel::resolve_device(dev);
+    // The flattened tensors have one row per page (a single latent cache for MLA).
+    if (!try_copy_page_first_pages_batch({staging}, {dst}, dst_ids, P.unwrap(), 1, dev.device_id, stream)) {
+      copy_page_first_pages_fallback({staging}, {dst}, dst_ids, P.unwrap(), 1, stream);
+    }
+  }
+};
+
 }  // namespace sglang
