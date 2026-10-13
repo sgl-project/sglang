@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    DropSubtreeNoHostResult,
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
@@ -81,10 +82,22 @@ def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
         return RustUnifiedTreeCore(params)
 
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
-    cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+    cache = SimpleNamespace(
+        enable_session_radix_cache=False,
+        token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+    )
+    components = {ComponentType.FULL: FullComponent(cache, params)}
+    if ComponentType.SWA in params.tree_components:
+        components[ComponentType.SWA] = SWAComponent(cache, params)
+    if ComponentType.MAMBA in params.tree_components:
+        components[ComponentType.MAMBA] = MambaComponent(cache, params)
+    core = UnifiedTreeCore(params, components)
+    cache.tree_core = core
+    return core
 
 
 def _path_indices(core: RustUnifiedTreeCore, node_id) -> torch.Tensor:
@@ -4252,6 +4265,7 @@ def test_every_pool_name_crosses_the_prefetch_commit_boundary():
 
 
 def _mamba_tree_core(
+    backend: str = "rust",
     page_size: int = 1,
     mamba_max_states_per_path: int = -1,
     **params_overrides,
@@ -4260,7 +4274,14 @@ def _mamba_tree_core(
         _mamba_cache_chunk_size=256,
         mamba_max_states_per_path=mamba_max_states_per_path,
     ):
+        if backend == "python":
+            from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+            params_overrides.setdefault(
+                "req_to_token_pool", Mock(spec=HybridReqToTokenPool)
+            )
         return _tree_core(
+            backend=backend,
             tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             page_size=page_size,
             **params_overrides,
@@ -4432,6 +4453,76 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     lock = core.inc_lock_ref(internal)
     core.dec_lock_ref(internal, lock.to_dec_params())
     core.sanity_check([], [])
+
+
+def test_python_orphan_full_kv_reclaim_preserves_state_anchored_paths():
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.unified_cache.components import EvictLayer
+
+    core = _mamba_tree_core(backend="python")
+
+    _mamba_insert(core, [1], [10], 7)
+    orphan = _mamba_insert(core, [1, 2], [10, 11], 8).last_device_node
+    _mamba_insert(core, [3, 4], [20, 21], 9)
+
+    retired_host_frees = defaultdict(list)
+    retired_tracker = defaultdict(int)
+    core._evict_component_and_detach_lru(
+        core.node_by_id(orphan),
+        core.components_by_type[ComponentType.MAMBA],
+        defaultdict(list),
+        retired_host_frees,
+        target=EvictLayer.DEVICE,
+        tracker=retired_tracker,
+    )
+
+    step = core.reclaim_orphan_full_kv(1)
+    tracker: dict = {}
+    device_frees: dict = {}
+    host_frees: dict = {}
+    dropped = step.is_dropped
+    _accumulate_step(step, tracker, device_frees, host_frees)
+
+    assert dropped
+    assert tracker[ComponentType.FULL] == 1
+    assert tracker.get(ComponentType.MAMBA, 0) == 0
+    assert [value.tolist() for value in device_frees[ComponentType.FULL]] == [[11]]
+    assert ComponentType.MAMBA not in device_frees
+    assert core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_prefix_len == 1
+    assert core.match_prefix(MatchPrefixParams(key=_key([3, 4]))).device_prefix_len == 2
+    core.sanity_check([], [])
+
+
+def test_full_pressure_runs_orphan_reclaim_before_the_eviction_walk():
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+    cache.is_mamba_enabled = True
+    cache.tree_core = Mock()
+    cache.tree_core.reclaim_orphan_full_kv.return_value = DropSubtreeNoHostResult(
+        is_dropped=True,
+        tracker=defaultdict(int, {ComponentType.FULL: 4}),
+    )
+    tracker = defaultdict(int)
+
+    with envs.SGLANG_OPT_UNIFIED_CACHE_RECLAIM_ORPHAN_FULL_KV.override(True):
+        cache._evict_components(
+            {
+                ComponentType.FULL: 4,
+                ComponentType.MAMBA: 0,
+                ComponentType.SWA: 0,
+                ComponentType.C128: 0,
+            },
+            tracker,
+        )
+
+    assert tracker[ComponentType.FULL] == 4
+    cache.tree_core.reclaim_orphan_full_kv.assert_called_once_with(4)
+    cache.tree_core.evict_device_start.assert_not_called()
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])

@@ -2705,6 +2705,91 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((true, result))
     }
 
+    /// Reclaim recovery-incomplete Full-KV subtrees under allocation pressure.
+    ///
+    /// A hybrid prefix can skip computation only when its path reaches a
+    /// reusable Mamba state. Maximal subtrees without a device/host Mamba state
+    /// are therefore orphaned. Runtime locks, host/external copies and in-flight
+    /// transfers make a subtree ineligible until their dependency disappears.
+    pub fn reclaim_orphan_full_kv(&mut self, num_tokens: usize) -> (bool, EvictionStepResult) {
+        let mut result = EvictionStepResult::default();
+        if num_tokens == 0 || self.components_by_type[MAMBA.idx()].is_none() {
+            return (false, result);
+        }
+
+        let root = self.arena.root();
+        let mut order = Vec::new();
+        let mut stack: Vec<NodeIdx_> = self.arena.node(root).children.values().copied().collect();
+        while let Some(node_id) = stack.pop() {
+            order.push(node_id);
+            stack.extend(self.arena.node(node_id).children.values().copied());
+        }
+
+        let mut subtree_has_anchor: HashMap<NodeIdx_, bool> = HashMap::new();
+        for &node_id in order.iter().rev() {
+            let node = self.arena.node(node_id);
+            let own_anchor = node.has_device_value(MAMBA)
+                || node.has_host_value(MAMBA)
+                || node.is_device_locked()
+                || node.is_host_locked()
+                || node.external_cache_stored
+                || node.write_through_pending_id.is_some()
+                || node.is_load_back_pending()
+                || self
+                    .components
+                    .iter()
+                    .any(|component| node.has_host_value(component.component_type()));
+            let descendant_anchor = node
+                .children
+                .values()
+                .any(|child| subtree_has_anchor.get(child).copied().unwrap_or(false));
+            subtree_has_anchor.insert(node_id, own_anchor || descendant_anchor);
+        }
+
+        let mut candidates = Vec::new();
+        let mut parents = vec![root];
+        while let Some(parent) = parents.pop() {
+            for &child in self.arena.node(parent).children.values() {
+                if subtree_has_anchor.get(&child).copied().unwrap_or(false) {
+                    parents.push(child);
+                } else {
+                    candidates.push(child);
+                }
+            }
+        }
+        candidates.sort_by_key(|node_id| {
+            let node = self.arena.node(*node_id);
+            (node.last_access_counter, node.id)
+        });
+
+        let mut dropped = false;
+        for candidate in candidates {
+            if result.tracker.get(&FULL).copied().unwrap_or(0) >= num_tokens {
+                break;
+            }
+            let parent = self.arena.node(candidate).parent();
+            let mut nodes = Vec::new();
+            let mut subtree = vec![candidate];
+            while let Some(node_id) = subtree.pop() {
+                nodes.push(node_id);
+                subtree.extend(self.arena.node(node_id).children.values().copied());
+            }
+            for &node_id in nodes.iter().rev() {
+                self.release_all_component_layers_(
+                    node_id,
+                    StorageMedium::Gpu,
+                    &mut result.tracker,
+                    &mut result.device_frees,
+                    &mut result.host_frees,
+                );
+                self.remove_leaf_from_parent_(node_id);
+            }
+            self.update_evictable_leaf_sets_(parent);
+            dropped = true;
+        }
+        (dropped, result)
+    }
+
     /// Free every component layer on the node and detach it from the LRU
     /// lists and evictable leaf sets.
     pub fn release_all_component_layers_(

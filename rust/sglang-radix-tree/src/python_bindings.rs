@@ -2234,6 +2234,21 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
+    /// Reclaim recovery-incomplete Full-KV subtrees under allocation pressure.
+    fn reclaim_orphan_full_kv(
+        &self,
+        py: Python<'_>,
+        num_tokens: usize,
+    ) -> PyResult<DropSubtreeResultBinding> {
+        let (dropped, result) = py.detach(move || self.core().reclaim_orphan_full_kv(num_tokens));
+        Ok(DropSubtreeResultBinding {
+            dropped,
+            tracker: tracker_to_py(result.tracker),
+            new_device_frees: frees_to_py(py, result.device_frees)?,
+            new_host_frees: frees_to_py(py, result.host_frees)?,
+        })
+    }
+
     /// Mark the nodes one write-through backup covers; returns them ancestors first.
     fn mark_write_through_pending(
         &self,
@@ -3508,6 +3523,15 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
             ) -> PyResult<DropSubtreeResultBinding> {
                 catch_native_panic(|| self.inner.drop_subtree_no_host(py, node_id))
+            }
+
+            /// Reclaim recovery-incomplete Full-KV subtrees under allocation pressure.
+            fn reclaim_orphan_full_kv(
+                &self,
+                py: Python<'_>,
+                num_tokens: usize,
+            ) -> PyResult<DropSubtreeResultBinding> {
+                catch_native_panic(|| self.inner.reclaim_orphan_full_kv(py, num_tokens))
             }
 
             /// Mark the nodes one write-through backup covers; returns them ancestors first.

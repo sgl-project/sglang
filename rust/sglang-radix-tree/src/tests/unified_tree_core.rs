@@ -17,6 +17,58 @@ fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, ke
 }
 
 #[test]
+fn orphan_full_kv_reclaim_preserves_state_anchored_paths() {
+    let params = CacheInitParams {
+        mamba_cache_chunk_size: Some(256),
+        ..Default::default()
+    };
+    let mut core: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
+    let root = core.arena.root();
+    let anchor = add_leaf(&mut core, root, vec![1]);
+    let orphan = add_leaf(&mut core, anchor, vec![2]);
+    let live = add_leaf(&mut core, root, vec![3, 4]);
+    core.set_component_device_value(
+        core.arena.node(anchor).id,
+        MAMBA,
+        Tensor::from_slice(&[7i64]),
+    )
+    .unwrap();
+    core.set_component_device_value(
+        core.arena.node(orphan).id,
+        MAMBA,
+        Tensor::from_slice(&[8i64]),
+    )
+    .unwrap();
+    core.set_component_device_value(core.arena.node(live).id, MAMBA, Tensor::from_slice(&[9i64]))
+        .unwrap();
+
+    let mut tracker = HashMap::new();
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    core.evict_component_and_detach_lru_(
+        orphan,
+        MAMBA,
+        &mut device_frees,
+        &mut host_frees,
+        EvictLayer::Device,
+        Some(&mut tracker),
+    );
+
+    let orphan_id = core.arena.node(orphan).id;
+    let anchor_id = core.arena.node(anchor).id;
+    let live_id = core.arena.node(live).id;
+    let (dropped, result) = core.reclaim_orphan_full_kv(1);
+    assert!(dropped);
+    assert_eq!(result.tracker.get(&FULL), Some(&1));
+    assert_eq!(result.tracker.get(&MAMBA).copied().unwrap_or(0), 0);
+    assert_eq!(result.device_frees[&FULL][0].size(), [1]);
+    assert!(core.arena.resolve(orphan_id).is_err());
+    assert!(core.arena.resolve(anchor_id).is_ok());
+    assert!(core.arena.resolve(live_id).is_ok());
+    core.sanity_check(&[], &[]);
+}
+
+#[test]
 fn component_size_adjustment_tracks_changed_backing_through_locks_and_eviction() {
     let mut core = core();
     let root = core.arena.root();

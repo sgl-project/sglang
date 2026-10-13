@@ -1841,6 +1841,82 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result.is_dropped = True
         return result
 
+    def reclaim_orphan_full_kv(self, num_tokens: int) -> DropSubtreeNoHostResult:
+        """Drop recovery-incomplete hybrid subtrees under Full-KV pressure.
+
+        Full KV in a hybrid model can skip computation only when the matched
+        path reaches a reusable recurrent state. A subtree with no device or
+        host Mamba state cannot provide such a boundary. It is reclaimable as
+        one unit unless a lock, host/external copy, session reference, or
+        in-flight transfer still depends on any node in the subtree.
+        """
+        result = DropSubtreeNoHostResult(is_dropped=False)
+        if num_tokens <= 0 or ComponentType.MAMBA not in self.component_types:
+            return result
+
+        root = self.root_node
+        subtree_has_anchor: dict[int, bool] = {}
+        order: list[UnifiedTreeNode] = []
+        stack = list(root.children.values())
+        while stack:
+            node = stack.pop()
+            order.append(node)
+            stack.extend(node.children.values())
+
+        for node in reversed(order):
+            mamba = node.component_data[ComponentType.MAMBA]
+            anchored = (
+                mamba.value is not None
+                or mamba.host_value is not None
+                or node.external_cache_stored
+                or node.write_through_pending_id is not None
+                or node.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0
+                    or cd.host_lock_ref > 0
+                    or cd.session_ref > 0
+                    or cd.host_value is not None
+                    for cd in node.component_data
+                )
+            )
+            for child in node.children.values():
+                anchored = subtree_has_anchor[child.id] or anchored
+            subtree_has_anchor[node.id] = anchored
+        candidates: list[UnifiedTreeNode] = []
+        stack = list(root.children.values())
+        while stack:
+            node = stack.pop()
+            if subtree_has_anchor[node.id]:
+                stack.extend(node.children.values())
+            else:
+                candidates.append(node)
+        candidates.sort(key=lambda node: (node.last_access_time, node.id))
+
+        for candidate in candidates:
+            if result.tracker[BASE_COMPONENT_TYPE] >= num_tokens:
+                break
+            nodes: list[UnifiedTreeNode] = []
+            stack = [candidate]
+            while stack:
+                node = stack.pop()
+                nodes.append(node)
+                stack.extend(node.children.values())
+            parent = candidate.parent
+            for node in reversed(nodes):
+                self._release_all_component_layers(
+                    node,
+                    StorageMedium.GPU,
+                    result.tracker,
+                    result.device_frees,
+                    result.host_frees,
+                )
+                self._remove_leaf_from_parent(node)
+            assert parent is not None
+            self._update_evictable_leaf_sets(parent)
+            result.is_dropped = True
+
+        return result
+
     def _release_all_component_layers(
         self,
         node: UnifiedTreeNode,
