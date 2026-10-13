@@ -1136,7 +1136,8 @@ class UnifiedMambaPool(MambaPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Compaction moves disjoint physical slots. Copy their whole envelopes
-        # without the state-sized gather temporary used by copy_from (COW).
+        # without the conv/temporal gather temporary used by copy_from (COW).
+        # Sibling callbacks retain their own copy and scratch-allocation contracts.
         if tgt_loc.numel() == 0:
             return
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
