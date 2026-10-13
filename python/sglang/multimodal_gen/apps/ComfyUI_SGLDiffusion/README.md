@@ -24,7 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
-- **Qwen-Image-2.1**: Integrated mode (`model_type=qwen_image21`, auto-detected) for Comfy-Org's `qwen_image_2.1_bf16.safetensors` or INT8 `qwen_image_2.1_int8_convrot.safetensors`. Text-to-image and reference-image edit work with the official templates after swapping `UNETLoader` for `SGLDUNETLoader`. The worker manages the prefix K/V cache itself, so the `Qwen Image 2.1 Cache` node's options are ignored. Multi-GPU: `sp_degree` or `tp_size` (`enable_cfg_parallel` is rejected; ComfyUI runs CFG). DiT patches (Fun-Control, attention hooks) are not supported. LoRA: use `SGLDiffusion LoRA Loader` instead of `LoraLoaderModelOnly`. Tested with `Viggle/Qwen-Image-2.1-viggle-turbo` (`...-v0.3-6step-lora-r128.safetensors`): euler, `BasicGuider`, `ManualSigmas` `1.0, 0.967754, 0.933358, 0.857192, 0.666756, 0.400096, 0` at 1024x1024.
+- **Qwen-Image-2.1**: Integrated mode (`model_type=qwen_image21`, auto-detected) for Comfy-Org's `qwen_image_2.1_bf16.safetensors` or INT8 `qwen_image_2.1_int8_convrot.safetensors`. Text-to-image and reference-image edit work with the official templates after swapping `UNETLoader` for `SGLDUNETLoader`. The worker manages the prefix K/V cache itself, so the `Qwen Image 2.1 Cache` node's options are ignored. Multi-GPU: Ulysses / Ring or TP through the manual layout in `SGLDiffusion Options`. DiT patches (Fun-Control, attention hooks) are not supported. LoRA: use `SGLDiffusion LoRA Loader` instead of `LoraLoaderModelOnly`. Tested with `Viggle/Qwen-Image-2.1-viggle-turbo` (`...-v0.3-6step-lora-r128.safetensors`): euler, `BasicGuider`, `ManualSigmas` `1.0, 0.967754, 0.933358, 0.857192, 0.666756, 0.400096, 0` at 1024x1024.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -43,10 +43,42 @@ ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and
 runs one forward per sampler step (pass-through scheduler, no text encode /
 decode on the worker).
 
-1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
-2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
+1. **Load Model**: `SGLDiffusion UNET Loader` loads ComfyUI single files (Qwen-Image, FLUX, Z-Image, MiniMax H3, including pre-quantized `*_int8_convrot` files). It takes the same file as the stock UNET loader, so a workflow switches by replacing that node. `SGLDiffusion Native Model Loader` loads native SGLang model directories that have no ComfyUI file: FastH3 8-Step V2 and VDN-H3 (the model type is read from `model_index.json`).
+2. **Configure Options** (optional): connect `SGLDiffusion Options` to the loader. Without it the worker uses auto-detection and defaults.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+### Options
+
+`SGLDiffusion Options` keeps `model_type`, `num_gpus` and the parallel mode on
+top; the other groups fold, and each folded header shows its current choice.
+The fields are plain ComfyUI widgets, so the node works without the JavaScript
+extension, which only changes the presentation.
+
+| Group | Fields |
+| --- | --- |
+| Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
+| Attention | `attention_backend` (auto = model default), `attention_backend_config` |
+| Cache-DiT | `enable_cache_dit` (lossy step caching; currently effective for the MiniMax H3 family) |
+| Memory | `memory_mode`: resident or DiT layerwise offload; `resident_layers`, `prefetch_layers` |
+| Manual parallel layout | `tp_size`, `ulysses_degree`, `ring_degree`; their product must equal `num_gpus` |
+| Weights & quantization | `transformer_weights_path` (GGUF or other override), `quantization` (online, native directories only), `int8_kernel`: auto, jit, comfy_kitchen for ConvRot INT8 |
+
+The loader checks the options against the resolved model before starting the
+worker and raises instead of dropping a setting. Current limits in integrated mode:
+
+| Option | Supported for |
+| --- | --- |
+| cuda_graph | MiniMax H3, without `enable_cache_dit` or layerwise offload |
+| torch_compile | all but FastH3 and VDN-H3 |
+| ring_degree > 1 | not FastH3 / VDN-H3; MiniMax H3 needs `fa` |
+| quantization | native model directories; ComfyUI files carry their own format |
+
+Changing anything but `enable_cache_dit` restarts the worker on the next run.
+
+For development, run `node --test web/options_state.test.mjs` in this plugin
+folder and `python -m pytest python/sglang/multimodal_gen/test/unit/test_comfyui_options.py`
+from the SGLang repository root.
 
 ## Adding a Model
 
