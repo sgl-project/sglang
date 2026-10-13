@@ -195,6 +195,20 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
 
+    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Compact accepted tree nodes in the NPU page-major allocation.
+
+        Snapshot sources before writing: a branch can move into slots occupied
+        by other source nodes. The CUDA pointer-copy kernel cannot address this
+        layout, and token indices must span page and slot axes together.
+        """
+        if tgt_loc.numel() == 0:
+            return
+        keys = self._hicache_k_buffer.flatten(1, 2)
+        values = self._hicache_v_buffer.flatten(1, 2)
+        keys.index_copy_(1, tgt_loc, keys.index_select(1, src_loc))
+        values.index_copy_(1, tgt_loc, values.index_select(1, src_loc))
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]

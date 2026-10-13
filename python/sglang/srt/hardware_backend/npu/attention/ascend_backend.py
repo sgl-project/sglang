@@ -23,6 +23,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.ngram import build_ngram_attention_mask
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -66,6 +67,13 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
         and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
+
+
+def _is_ngram_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.NGRAM_VERIFY
     )
 
 
@@ -119,6 +127,8 @@ class ForwardMetadata:
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
+
+    ngram_attn_mask: Optional[torch.Tensor] = None
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
@@ -416,6 +426,19 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        if model_runner.spec_algorithm.is_ngram() and (
+            self.use_mla
+            or self.is_hybrid_swa
+            or model_runner.model_config.linear_attn_registry_result is not None
+        ):
+            raise ValueError(
+                "NGRAM on Ascend currently requires full-attention MHA/GQA."
+            )
+        if model_runner.spec_algorithm.is_ngram() and self.kv_cache_dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("NGRAM on Ascend requires FP16 or BF16 KV caches.")
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
@@ -565,6 +588,16 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+        if (
+            _is_ngram_verify(forward_batch.spec_info)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self.forward_metadata.ngram_attn_mask = build_ngram_attention_mask(
+                forward_batch.spec_info.custom_mask,
+                forward_batch.seq_lens,
+                int(forward_batch.spec_info.draft_token_num),
+                self.forward_metadata.block_tables.shape[1] * self.page_size,
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -1557,6 +1590,12 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            if _is_ngram_verify(forward_batch.spec_info):
+                if sinks is not None or slopes is not None:
+                    raise ValueError(
+                        "NGRAM on Ascend does not support attention sinks or ALiBi."
+                    )
+                return self.forward_ngram(q, k, v, layer, forward_batch, save_kv_cache)
             return self.forward_mtp(
                 q,
                 k,
@@ -2331,6 +2370,52 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         return attn_output
+
+    def forward_ngram(self, q, k, v, layer, forward_batch, save_kv_cache):
+        """Verify irregular trees using FIA's paged BSH full-mask path.
+
+        TND split-fuse only accepts compressed causal/band masks on Ascend.
+        BSH with sparse_mode=0 preserves arbitrary ancestor masks without
+        gathering or duplicating the prefix KV cache for each branch.
+        """
+        if (
+            layer.sliding_window_size != -1
+            or layer.attn_type != AttentionType.DECODER
+            or layer.logit_cap != 0
+            or getattr(self, "use_alibi", False)
+        ):
+            raise ValueError("NGRAM on Ascend requires full decoder attention.")
+        if save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(forward_batch.out_cache_loc), k, v
+            )
+        bs = forward_batch.batch_size
+        d = int(forward_batch.spec_info.draft_token_num)
+        query = q[: bs * d].reshape(bs, d, layer.tp_q_head_num * layer.qk_head_dim)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+        )
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+        )
+        output, _ = torch_npu.npu_fused_infer_attention_score(
+            query.contiguous(),
+            k_cache,
+            v_cache,
+            block_table=self.forward_metadata.block_tables,
+            block_size=self.page_size,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="BSH",
+            atten_mask=self.forward_metadata.ngram_attn_mask,
+            scale=layer.scaling,
+            actual_seq_lengths=[d] * bs,
+            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int.tolist(),
+            sparse_mode=0,
+            pre_tokens=FULL_ATTENTION_WINDOW,
+            next_tokens=FULL_ATTENTION_WINDOW,
+        )
+        return output.reshape(bs * d, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_mtp(
         self,
