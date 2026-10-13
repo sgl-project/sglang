@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -51,9 +51,7 @@ ACCURACY_THRESHOLD = 0.94
 SERVER_LAUNCH_TIMEOUT = int(
     os.environ.get("QWEN38_FLASH_NEXT_FP8_SERVER_LAUNCH_TIMEOUT", "1800")
 )
-NUM_REQUESTED_EXAMPLES = 1319
-NUM_SHOTS = 5
-NUM_EVALUATED_EXAMPLES = NUM_REQUESTED_EXAMPLES - NUM_SHOTS
+NUM_EXAMPLES = 1319
 IMAGE_PATH = Path(__file__).resolve().parents[4] / "examples/assets/example_image.png"
 TP_SIZE = int(os.environ.get("QWEN38_FLASH_NEXT_FP8_TP_SIZE", "1"))
 EP_SIZE = int(os.environ.get("QWEN38_FLASH_NEXT_FP8_EP_SIZE", "1"))
@@ -163,13 +161,12 @@ class TestQwen38FlashNextFP8AMD(CustomTestCase):
                 base_url=DEFAULT_URL_FOR_TEST,
                 model=MODEL_ID,
                 eval_name="gsm8k",
-                num_examples=NUM_REQUESTED_EXAMPLES,
+                num_examples=NUM_EXAMPLES,
                 num_threads=512,
-                num_shots=NUM_SHOTS,
                 max_tokens=4096,
                 chat_template_kwargs={"enable_thinking": False},
             )
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             score = metrics["score"]
             latency = metrics.get("latency", 0.0)
             output_throughput = metrics.get("output_throughput", 0.0)
@@ -209,7 +206,7 @@ class TestQwen38FlashNextFP8AMD(CustomTestCase):
                 summary += "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |\n"
                 summary += (
                     f"| `{MODEL_REVISION}` | {TP_SIZE} | {EP_SIZE} | yes | "
-                    f"{NUM_EVALUATED_EXAMPLES} | "
+                    f"{NUM_EXAMPLES} | "
                     f"{score:.3f} | {ACCURACY_THRESHOLD:.2f} | {latency:.1f}s | "
                     f"{output_throughput:.1f} tok/s | {status} |\n"
                 )
