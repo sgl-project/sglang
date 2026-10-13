@@ -48,6 +48,21 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+# gfx950 aiter's small-M group32 MXFP8 GEMM tile returns NaN for DeepSeek-V4.1's
+# wqkv_a (N=1792, K=5120, M=5..8); shards that small run unsharded instead.
+_HIP_MIN_TOKENS_PER_RANK = 16
+
+
+def interleave_cp_min_tokens(cp_size: int) -> int:
+    """Fewest extend tokens interleave CP shards; smaller batches run unsharded.
+
+    Also bounds the CP breakable-graph capture buckets: a bucket below it never
+    activates CP, so its CP-local capture could not be prepared.
+    """
+    return cp_size * _HIP_MIN_TOKENS_PER_RANK if _is_hip else cp_size
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -158,7 +173,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        return seq_len > 0 and seq_len >= cp_size and cp_size > 1
+        return cp_size > 1 and seq_len >= interleave_cp_min_tokens(cp_size)
 
     def build_metadata(
         self,

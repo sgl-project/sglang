@@ -273,7 +273,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: events.append("attach")
         )
         forward_batch = SimpleNamespace(
-            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2, 2])
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_actual_token=[2, 2], local_index=None
+            )
         )
 
         with (
@@ -306,7 +308,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(
             backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
         )
-        core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
+        core.apply_cp_reindex.assert_called_once_with(num_tokens=3, local_index=None)
         # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
         self.assertEqual(
             events, ["attach", "reindex"] + (["flashmla"] if need_compress else [])
@@ -360,6 +362,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 pf_chunk_start=torch.tensor([5, 5, 5, 0], dtype=torch.int64),
                 pf_cu_q=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
                 pf_final_pos=torch.tensor([7, 7, 7, 128], dtype=torch.int64),
+                pf_swa_floor=None,
             ),
             c128_page_indices=None,
             c4_sparse_page_indices=None,
@@ -372,6 +375,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 is_decode_or_idle=lambda: False,
             ),
             positions=torch.tensor([5, 6, 7], dtype=torch.int64),
+            attn_cp_metadata=None,
         )
         kv = torch.arange(12, dtype=torch.float32).view(3, 4)
         output = torch.zeros(2, 1, 4)

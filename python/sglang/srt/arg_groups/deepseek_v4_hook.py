@@ -138,15 +138,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
+        is_dsv41 = model_config_of(server_args).hf_config.model_type == "deepseek_v41"
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
-            (
-                "DeepSeek-V4.1",
-                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
-            ),
+            # V4.1 carries its own bounded-replay tail layout; V4 has none.
             (
                 "--enable-decoder-swa-bounded-replay",
-                cfg.enable_decoder_swa_bounded_replay,
+                cfg.enable_decoder_swa_bounded_replay and not is_dsv41,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
         )
@@ -203,6 +201,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
         is_unified_kv_triton,
     )
 
@@ -264,7 +263,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
         ("HiSparse", cfg.enable_hisparse),
-        ("the unified KV layout", is_unified_kv_triton()),
+        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups), incl. PD
+        # transfer and the external cache linker; the bf16 rows, encoder replay,
+        # spec and HiCache are not wired / validated for them.
+        (
+            "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
+            is_unified_kv_triton() and not is_unified_kv_fp8(),
+        ),
+        # the decoder replay floors the late layers' window (pf_swa_floor); the
+        # encoder replay moves the window into a RequestWindow pool unified lacks
+        (
+            "the unified KV layout with encoder SWA bounded replay",
+            is_unified_kv_triton() and cfg.enable_encoder_swa_bounded_replay,
+        ),
+        (
+            "the unified KV layout with speculative decoding",
+            is_unified_kv_triton() and cfg.speculative_algorithm is not None,
+        ),
+        (
+            "the unified KV layout with HiCache",
+            is_unified_kv_triton() and cfg.enable_hierarchical_cache,
+        ),
         (
             "TRT-LLM with SWA bounded replay",
             cfg.dsv4_attn_backend == "trtllm"

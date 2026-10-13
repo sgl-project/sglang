@@ -1304,7 +1304,7 @@ class Scheduler(
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
+            is_fully_idle=self.is_idle_for_pool_reset,
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
@@ -5114,10 +5114,7 @@ class Scheduler(
         # Also skipped while deferred KV releases are pending: they hold pages out
         # of the allocator by design, so the pool is transiently below `total` and
         # would trip the idle leak invariant. Resumes once the holds resolve.
-        deferred_pending = (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-        )
+        deferred_pending = self.has_pending_deferred_kv_releases()
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
             if not self.enable_hisparse and not deferred_pending:
                 has_leak, messages = self.invariant_checker._check_all_pools(
@@ -5242,6 +5239,28 @@ class Scheduler(
             mb is None or mb.is_empty() for mb in self.mbs
         )
 
+    def has_pending_deferred_kv_releases(self) -> bool:
+        # Decode KV pages of aborted / failed transfers, held out of the allocator
+        # until prefill acks its writes drained (or the hold times out). The queue
+        # is None once a PD role switch has torn the decode role down.
+        queue = getattr(self, "disagg_decode_transfer_queue", None)
+        return (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and queue is not None
+            and queue.has_pending_deferred_releases()
+        )
+
+    def is_idle_for_pool_reset(self, ignore_waiting=False) -> bool:
+        # is_fully_idle() treats held deferred KV releases as idle (no request
+        # left), but a pool reset must wait for them: the reset hands their pages
+        # back to the allocator, and the held release then frees them a second
+        # time (free > total, token usage < 0), while a write still in flight
+        # from prefill lands in pages already handed out again.
+        return (
+            self.is_fully_idle(ignore_waiting=ignore_waiting)
+            and not self.has_pending_deferred_kv_releases()
+        )
+
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
@@ -5347,7 +5366,7 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self._engine_paused):
+        if self.is_idle_for_pool_reset(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -5368,10 +5387,16 @@ class Scheduler(
                 logger.info("Cache flushed successfully!")
             success = True
         else:
+            deferred = (
+                f", #deferred-kv-release: "
+                f"{self.disagg_decode_transfer_queue.num_pending_deferred_releases()}"
+                if self.disaggregation_mode == DisaggregationMode.DECODE
+                else ""
+            )
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}{deferred}"
             )
             success = False
         return success

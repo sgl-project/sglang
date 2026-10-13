@@ -1551,10 +1551,14 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        q_rope_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``q_rope_out`` given: fp8 two-pool unified_kv decode -- Q packed into
+        ``q_out`` / ``q_rope_out``, K stored into this layer's SWA ring rows."""
         # Both side streams are joined before returning, and nothing they read is
         # released before the join.
         assert self.alt_streams is not None
+        unified_fp8 = q_rope_out is not None
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
         stream_sources = self.alt_streams[-1]
@@ -1584,7 +1588,21 @@ class MQALayer(MqaAttentionBase):
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        if unified_fp8:
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
+                pack_q_fp8_2buff,
+            )
+
+            # V4.1 has no query head norm: wq_b's bf16 Q, RoPE'd and packed at once
+            q = pack_q_fp8_2buff(
+                _hip.wq_b_unroped(self, q_for_wqb),
+                q_out,
+                q_rope_out,
+                self.freqs_cis,
+                positions,
+            )
+        else:
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
             with torch.cuda.stream(stream_sources):
@@ -1598,9 +1616,32 @@ class MQALayer(MqaAttentionBase):
                 )
 
         with torch.cuda.stream(stream_kv):
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
+            if unified_fp8:
+                from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
+                    store_k_fp8_2buff,
+                )
+
+                kv = (
+                    qkv_a[..., self.q_lora_rank :]
+                    if qkv_a is not None
+                    else self.wkv(x_linear)[0]
+                )
+                pool = get_token_to_kv_pool()
+                store_k_fp8_2buff(
+                    kv,
+                    self.kv_norm.weight,
+                    self.eps,
+                    positions,
+                    self.cos_cache,
+                    self.sin_cache,
+                    pool.get_unified_kv(self.layer_id),
+                    pool.get_unified_kv_rope(self.layer_id),
+                    attn_backend.get_unified_swa_loc_i64(forward_batch),
+                )
+            else:
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                )
 
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
@@ -1891,8 +1932,17 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
+        # DeepSeek-V4.1 has no query head norm: its query is computed exactly as
+        # on the paged path (RoPE'd bf16) and the fp8 store only packs it.
+        unified_no_q_norm = unified and fp8_2buff and not self.q_head_norm
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            if unified_no_q_norm:
+                # the indexer reads q_for_wqb, as _hip.compute_q_b hands it back;
+                # the RoPE happens in the fp8 packer
+                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                q_lora = q_for_wqb
+                q = _hip.wq_b_unroped(self, q_for_wqb)
+            elif _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1993,6 +2043,8 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 q_rope_out=q_rope_out,
+                q_head_norm=not unified_no_q_norm,
+                q_freqs_cis=self.freqs_cis if unified_no_q_norm else None,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the
@@ -2226,10 +2278,22 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+        )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton as _is_unified_kv_triton,
+        )
+
         low_ratio_multi_stream = (
             ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
+            # its unified_kv arm is fp8 decode only (packed Q + SWA ring store)
+            and (
+                not _is_unified_kv_triton()
+                or (is_unified_kv_fp8() and forward_batch.forward_mode.is_decode())
+            )
             and (
                 forward_batch.forward_mode.is_decode()
                 or (
@@ -2392,6 +2456,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                q_rope_out=q_rope if unified else None,
             )
             kv = None
         else:
@@ -4234,10 +4299,16 @@ class DeepseekV4Model(nn.Module):
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
+                if cp_extend and get_moe_a2a_backend().is_none():
+                    # Under CP the tail rows are this rank's local rows, and the MoE
+                    # routes the rank-major all-gather of their hidden states; the ids
+                    # vision / hash routing read must be gathered the same way.
+                    input_ids_global = attn_cp_interleave_gather(input_ids)
+                elif cp_extend:
+                    input_ids_global = input_ids  # a2a: the MoE sees local rows
+                else:
+                    input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4577,7 +4648,10 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
+        # HIP prefill CP: the runner gathers every output, DSpark captures included,
+        # by this rank's full shard layout, so the tail rows go back into it.
+        hip_cp_tail = _is_hip and tail is not None and is_cp_active(forward_batch)
+        if tail is not None and (not capture_dspark or hip_cp_tail):
             # The logits processor indexes rows by the full extend layout.
             num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
@@ -4586,6 +4660,11 @@ class DeepseekV4Model(nn.Module):
             pre_hc_head = _scatter_tail_rows(
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
+        if hip_cp_tail and capture_dspark:
+            dspark_aux_hidden_states = [
+                _scatter_tail_rows(tail=tail, rows=aux, num_tokens=input_ids.shape[0])
+                for aux in dspark_aux_hidden_states
+            ]
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
@@ -4643,17 +4722,22 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
+            # Prefill CP runs the tower on the whole sequence before sharding
+            # (prepare_cp_inputs); only the a2a-free MoE routes vision under CP.
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
+                or (
+                    get_parallel().attn_cp_size != 1
+                    and not get_moe_a2a_backend().is_none()
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP, and prefill CP without MoE A2A, "
+                    "but not PP; MoE A2A requires CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4811,6 +4895,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
+
+    def prepare_cp_inputs(self, forward_batch: ForwardBatch, **kwargs):
+        """Whole-sequence inputs for the prefill-CP runner, which shards them and
+        drives ``self.model`` without reaching ``forward``: image spans in the
+        embeddings and image pad hashes mapped to image_token_id, as in ``forward``.
+        The mapped ids ride back in the kwargs so the runner shards those (Engram,
+        hash and vision routing read them) and hands them to the logits step."""
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            forward_batch.input_ids, forward_batch, kwargs.get("input_embeds")
+        )
+        if input_embeds is None:
+            input_embeds = self.get_input_embeddings()(input_ids)
+        model_kwargs = {"input_ids": input_ids}
+        if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        return input_embeds, forward_batch.positions, model_kwargs
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()

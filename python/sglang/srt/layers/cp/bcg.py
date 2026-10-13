@@ -27,7 +27,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.interleave import (
+    InterleaveCPStrategy,
+    interleave_cp_min_tokens,
+)
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
@@ -71,9 +74,11 @@ def filter_prefill_cp_bcg_capture_num_tokens(
     capture_num_tokens: list[int], server_args: ServerArgs
 ) -> list[int]:
     """Keep only token buckets where the selected CP strategy can run."""
-    min_num_tokens = resolved_view(server_args).attn_cp_size
+    attn_cp_size = resolved_view(server_args).attn_cp_size
     if resolving_view(server_args).cp_strategy == "zigzag":
-        min_num_tokens *= 2
+        min_num_tokens = attn_cp_size * 2
+    else:
+        min_num_tokens = interleave_cp_min_tokens(attn_cp_size)
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(

@@ -59,12 +59,17 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     late_layer_tail_layout,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
+    _as_int_list,
     _prefill_graph_max_seq_len,
     _tail_rows,
 )
@@ -100,7 +105,15 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.interleave import (
+    InterleaveContextParallelMetadata,
+    interleave_rows_per_request,
+)
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order, is_cp_active
+from sglang.srt.layers.dp_attention import (
+    get_local_dp_buffer_len,
+    set_local_dp_buffer_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -142,6 +155,18 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+
+
+def _first_rows(act, n: int):
+    """The first n rows of a q_lora operand: a tensor, or the gfx950 fp8-grid form the
+    indexer's wq_b takes (row-major, scales included), which refuses plain slicing."""
+    if isinstance(act, torch.Tensor):
+        return act[:n]
+    if isinstance(act, Fp8GridActivation):
+        return Fp8GridActivation(act.x[:n])
+    if isinstance(act, Mxfp8Activation):
+        return Mxfp8Activation(act.q[:n], act.scale[:n])
+    raise TypeError(f"cannot take rows of {type(act).__name__}")
 
 
 # OPUS prefill applies from this many query rows; below it the decode kernel splits KV
@@ -249,6 +274,25 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
 
+def _low_ratio_topk_readers(cfg) -> Dict[int, Tuple[int, ...]]:
+    """DeepSeek-V4.1: first layer of each run of ratio-1/2 layers that read one
+    index source's top-k -> the whole run (the index source and the same-ratio
+    layers after it, up to the next source)."""
+    ratios = list(getattr(cfg, "compress_ratios", None) or [])
+    sources = set(getattr(cfg, "index_source_layer_ids", None) or [])
+    runs: Dict[int, List[int]] = {}
+    lead = None
+    for layer_id, ratio in enumerate(ratios):
+        if ratio not in (1, 2):
+            lead = None
+        elif layer_id in sources or lead is None or ratios[lead] != ratio:
+            lead = layer_id
+            runs[lead] = [layer_id]
+        else:
+            runs[lead].append(layer_id)
+    return {lead: tuple(run) for lead, run in runs.items()}
+
+
 @dataclass
 class UnifiedKvMetadata:
     # SWA ring write target (req_slot*ring + pos%ring)
@@ -275,6 +319,9 @@ class UnifiedKvMetadata:
     pf_chunk_start: Optional[torch.Tensor] = None
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
+    # decoder SWA bounded replay: per-token floor of the SWA window (the paged
+    # layout's swa_replay_start); None outside the late-layer tail
+    pf_swa_floor: Optional[torch.Tensor] = None
 
     # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
     # tokens); unused by plain decode, whose store reads req_pool_indices live.
@@ -284,6 +331,35 @@ class UnifiedKvMetadata:
     # precomputed once per step to drop the per-layer int add in the store path.
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
+
+    # DeepSeek-V4.1 ratio-1/2 decode streams: SWA-ring prefix built once per step,
+    # compressed tail filled per layer at that layer's compressed-row base.
+    c1_indices: Optional[torch.Tensor] = None
+    c1_indptr: Optional[torch.Tensor] = None
+    c1_len: Optional[torch.Tensor] = None
+    c2_indices: Optional[torch.Tensor] = None
+    c2_indptr: Optional[torch.Tensor] = None
+    c2_len: Optional[torch.Tensor] = None
+
+    # swa_loc in int64, for aiter's K-only store (its slot map is int64)
+    swa_loc_i64: Optional[torch.Tensor] = None
+
+    # layer id -> that layer's ratio-1/2 decode stream (c{R}_indptr layout); the
+    # first layer to read a top-k builds the streams of all its readers at once.
+    # A per-step cache rather than graph storage, so deliberately not a dataclass
+    # field: graph copy and breakable-graph refresh leave it alone.
+    low_ratio_streams = None
+
+    _LOW_RATIO_FIELDS = (
+        "swa_loc_i64",
+        "c1_indices",
+        "c1_indptr",
+        "c1_len",
+        "c2_indices",
+        "c2_indptr",
+        "c2_len",
+    )
+    _OPTIONAL_FIELDS = (*_LOW_RATIO_FIELDS, "pf_swa_floor")
 
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
@@ -310,7 +386,8 @@ class UnifiedKvMetadata:
                 # Captured store_cache reads swa_loc by address, and the eager
                 # target-verify path builds it outside the graph.
                 "swa_loc",
-            ],
+            ]
+            + [f for f in self._OPTIONAL_FIELDS if getattr(other, f) is not None],
             assign_fields=[],
         )
 
@@ -339,7 +416,8 @@ class UnifiedKvMetadata:
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
-            ],
+            ]
+            + [f for f in self._OPTIONAL_FIELDS if getattr(other, f) is not None],
         )
 
 
@@ -852,7 +930,7 @@ class DeepseekV4HipRadixBackend(
     # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
-    _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    _late_layer_tail_cp_layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
@@ -931,16 +1009,6 @@ class DeepseekV4HipRadixBackend(
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
         )
-        if self.enable_decoder_swa_bounded_replay:
-            # both read the store target off the full batch, not the tail metadata
-            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-                is_unified_kv_triton,
-            )
-
-            if is_unified_kv_triton():
-                raise NotImplementedError(
-                    "decoder SWA bounded replay is not wired for unified_kv_triton"
-                )
         # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.encoder_replay = False
@@ -956,6 +1024,9 @@ class DeepseekV4HipRadixBackend(
         self.is_dsv41 = (
             getattr(model_runner.model_config.hf_text_config, "model_type", None)
             == "deepseek_v41"
+        )
+        self._low_ratio_topk_readers = _low_ratio_topk_readers(
+            model_runner.model_config.hf_text_config
         )
         # Decode and speculative metadata can be rebuilt from device lengths.
         # The online c128 planner still consumes CPU lengths.
@@ -1093,13 +1164,23 @@ class DeepseekV4HipRadixBackend(
         # token map skip an implicit D2H.
         exact_num_tokens: bool = True,
         forward_batch: Optional[ForwardBatch] = None,
+        # the late-layer tail passes its own layout; the full extend reads the batch's
+        cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
         if cp_active:
-            cp_metadata = forward_batch.attn_cp_metadata
+            if cp_metadata is None:
+                cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            if (
+                swa_replay_start is not None
+                and swa_replay_start.shape[0] < padded_num_tokens
+            ):
+                swa_replay_start = F.pad(
+                    swa_replay_start, (0, padded_num_tokens - swa_replay_start.shape[0])
+                )
 
         from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
             ExpandPrefillCausally,
@@ -1149,9 +1230,12 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens,
             num_tokens,
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
+            swa_replay_start=swa_replay_start,
         )
         if cp_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            core_attn_metadata.apply_cp_reindex(
+                num_tokens=num_tokens, local_index=cp_metadata.local_index
+            )
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
@@ -2107,6 +2191,13 @@ class DeepseekV4HipRadixBackend(
         )
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         num_tokens = sum(tail_lens_cpu)
+        # prefill CP: every rank runs the tail rows it already holds, padded to the
+        # largest share; the tail's compact metadata is sliced by its own local_index
+        cp_tail = (
+            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            if is_cp_active(forward_batch)
+            else None
+        )
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
             req_pool_indices=forward_batch.req_pool_indices,
@@ -2118,6 +2209,8 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=tail_lens_cpu,
             extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
             swa_replay_start=swa_replay_start,
+            forward_batch=forward_batch if cp_tail is not None else None,
+            cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
         request_layout = metadata.core_attn_metadata.request_window_layout
         swa_out_cache_loc = (
@@ -2139,14 +2232,30 @@ class DeepseekV4HipRadixBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-        metadata.late_layer_tail = LateLayerTail(
-            token_indices=token_indices,
-            positions=positions,
-            extend_seq_lens=tail_lens,
-            extend_seq_lens_cpu=tail_lens_cpu,
-            swa_out_cache_loc=swa_out_cache_loc,
-            contiguous_start=contiguous_start,
-        )
+        if cp_tail is None:
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=token_indices,
+                positions=positions,
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                contiguous_start=contiguous_start,
+            )
+        else:
+            # rows index this rank's shard; the SWA store and the compressor read
+            # the gathered tail, so they keep the global rows
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=cp_tail["local_token_indices"],
+                positions=cp_tail["local_positions"],
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                pad_rows=cp_tail["pad_rows"],
+                cp_metadata=cp_tail["cp_metadata"],
+                local_lens_cpu=cp_tail["local_lens_cpu"],
+                req_global=metadata.low_ratio_req_indices,
+                pos_global=metadata.low_ratio_pos_i64,
+            )
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
 
@@ -2155,9 +2264,20 @@ class DeepseekV4HipRadixBackend(
         return value. Each request's candidate mask is cut to its tail rows."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
-        saved = (self.forward_metadata, self.candidate_masks)
+        saved = (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            get_local_dp_buffer_len(),
+        )
         tail = tail_metadata.late_layer_tail
-        tail_lens_cpu = tail.extend_seq_lens_cpu
+        # A request's tail is a suffix of its extend, so under CP the tail rows a
+        # rank holds are the suffix of that request's local rows.
+        tail_lens_cpu = (
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
+        )
         if isinstance(self.candidate_masks, list) and self.candidate_masks:
             # the last tail_len rows of each request's candidate publication
             self.candidate_masks = [
@@ -2202,10 +2322,19 @@ class DeepseekV4HipRadixBackend(
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(tail_core.request_window_layout)
+        if tail.cp_metadata is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+            set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
-        self.forward_metadata, self.candidate_masks = saved
+        (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            local_dp_buffer_len,
+        ) = saved
+        set_local_dp_buffer_len(local_dp_buffer_len)
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(
@@ -2432,6 +2561,31 @@ class DeepseekV4HipRadixBackend(
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
         swa_len = core.swa_topk_lengths
+        if core.low_ratios and not (self.has_c4 or self.has_c128) and num_draft == 0:
+            # DeepSeek-V4.1 (compressed layers all ratio 1 / 2): no c4 / c128
+            # streams to build, and the rest fits in two launches
+            u = core.unified
+            meta = runtime.build_v41_decode_meta(
+                state_slot=state_slot,
+                positions=core.positions_casual[:N],
+                seq_lens=core.seq_lens_casual[:N],
+                swa_len=swa_len[:N],
+                ratios=core.low_ratios,
+                topk=core.index_topk,
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+            )
+            u.swa_indices, u.swa_indptr = meta["swa_indices"], meta["swa_indptr"]
+            u.hca_indices = u.hca_indptr = u.csa_indices = u.csa_indptr = None
+            u.gasm_indices = u.gasm_kv_indptr = u.gasm_qo_indptr = None
+            u.low_ratio_streams = {}
+            for ratio in core.low_ratios:
+                setattr(u, f"c{ratio}_indices", None)
+                setattr(u, f"c{ratio}_indptr", meta[f"c{ratio}_indptr"])
+                setattr(u, f"c{ratio}_len", meta[f"c{ratio}_len"])
+            u.swa_loc, u.swa_loc_i64 = meta["swa_loc"], meta["swa_loc_i64"]
+            u.verify_store_state_slot = state_slot
+            return
         hca_len = core.c128_topk_lengths_raw
         csa_len = core.c4_sparse_topk_lengths_raw
         hca_page_indices = core.c128_page_indices
@@ -2494,12 +2648,34 @@ class DeepseekV4HipRadixBackend(
                 block_q=_GROUPED_ASM_BLOCK_Q,
             )
 
+        # The streams themselves are per layer (each has its own compressed-row
+        # base) and depend on the top-k, so _unified_low_ratio_stream builds them
+        # per index source; only the layer-independent indptr is built here.
+        core.unified.low_ratio_streams = {}
+        for ratio in core.low_ratios:
+            # Unclamped, unlike c{R}_sparse_topk_lengths (>= 1 for the flashmla
+            # length fold): a request with no compressed row yet has a -1 there,
+            # and the asm reader would load row -1.
+            low_len = torch.clamp(
+                core.seq_lens_casual[:N].to(torch.int32) // ratio, max=core.index_topk
+            )
+            setattr(core.unified, f"c{ratio}_indices", None)
+            setattr(
+                core.unified,
+                f"c{ratio}_indptr",
+                runtime.low_ratio_decode_indptr(swa_len, low_len),
+            )
+            setattr(core.unified, f"c{ratio}_len", low_len)
+
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
-        core.unified.swa_loc = (
+        swa_loc_i64 = (
             req_slot * pool.unified_swa_ring_size
             + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
-        ).to(torch.int32)
+        )
+        core.unified.swa_loc = swa_loc_i64.to(torch.int32)
+        if core.low_ratios:
+            core.unified.swa_loc_i64 = swa_loc_i64
         # Per-token req-slot map for the target-verify SWA ring store; plain
         # decode's store reads req_pool_indices instead.
         core.unified.verify_store_state_slot = state_slot
@@ -2513,6 +2689,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         exact_num_tokens: bool = True,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -2561,6 +2738,55 @@ class DeepseekV4HipRadixBackend(
         core.unified.pf_chunk_start = chunk_start
         core.unified.pf_cu_q = cu_q
         core.unified.pf_final_pos = final_pos
+        # padded rows floor at 0, which leaves their (inert) window as it was
+        core.unified.pf_swa_floor = (
+            None
+            if swa_replay_start is None
+            else F.pad(
+                swa_replay_start.to(torch.int32),
+                (0, max(0, padded_num_tokens - swa_replay_start.shape[0])),
+            )
+        )
+
+    def _unified_low_ratio_stream(
+        self,
+        layer_id: int,
+        compress_ratio: int,
+        core: DSV4AttnMetadata,
+        low_pi: torch.Tensor,
+        T: int,
+    ) -> torch.Tensor:
+        """This ratio-1/2 layer's decode stream: the SWA-ring prefix, then the top-k
+        at the layer's compressed-row base. The first reader of a top-k builds the
+        streams of all of its readers in one launch (they differ only in that
+        base), so the later ones are a lookup instead of a launch each."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        unified = core.unified
+        streams = unified.low_ratio_streams
+        if layer_id not in streams:
+            pool = self.token_to_kv_pool
+            readers = self._low_ratio_topk_readers.get(layer_id, (layer_id,))
+            bases = [pool.get_unified_compress_row_base(r) for r in readers]
+            step = bases[1] - bases[0] if len(bases) > 1 else 0
+            if any(b != bases[0] + i * step for i, b in enumerate(bases)):
+                readers, bases, step = (layer_id,), bases[:1], 0
+            built = runtime.build_low_ratio_group_streams(
+                state_slot=unified.verify_store_state_slot[:T],
+                positions=core.positions_casual[:T],
+                indptr=getattr(unified, f"c{compress_ratio}_indptr"),
+                prefix_len=core.swa_topk_lengths[:T],
+                page_indices=low_pi[:T],
+                valid_len=getattr(unified, f"c{compress_ratio}_len")[:T],
+                num_layers=len(readers),
+                base0=bases[0],
+                base_step=step,
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+            )
+            for reader, stream in zip(readers, built.unbind(0)):
+                streams[reader] = stream
+        return streams[layer_id]
 
     def _forward_unified_kv(
         self,
@@ -2569,15 +2795,18 @@ class DeepseekV4HipRadixBackend(
         kv: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         attn_sink: torch.Tensor,
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """q_rope present: packed fp8 q over the two-pool fp8 layout (asm decode;
-        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton)."""
+        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton).
+        inv_rope (DeepSeek-V4.1): the model's inverse RoPE, folded into the decode
+        split merge where it can be, else applied to the output here."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -2596,6 +2825,13 @@ class DeepseekV4HipRadixBackend(
 
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
+        low_pi = None
+        compress_base = swa_pages
+        if compress_ratio in (1, 2):
+            # kv_source groups: this layer's compressed rows start past the rings
+            # of the group members that follow it (see DeepSeekV4UnifiedKVPool)
+            low_pi = core_attn_metadata.sparse_page_indices(compress_ratio)
+            compress_base = pool.get_unified_compress_row_base(layer_id)
 
         # Target-verify runs through the unified_kv DECODE kernel, same path as
         # decode; its per-token decode streams were built in metadata.
@@ -2642,6 +2878,11 @@ class DeepseekV4HipRadixBackend(
                     valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
                     swa_pages=swa_pages,
                 )
+            elif compress_ratio in (1, 2):
+                kv_indptr = getattr(unified_metadata, f"c{compress_ratio}_indptr")
+                kv_indices = self._unified_low_ratio_stream(
+                    layer_id, compress_ratio, core_attn_metadata, low_pi, T
+                )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
             if q_rope is not None:
@@ -2680,6 +2921,8 @@ class DeepseekV4HipRadixBackend(
                     attn_sink=attn_sink,
                     v_head_dim=layer.v_head_dim,
                     compress_ratio=compress_ratio,
+                    low_ratio_model=bool(core_attn_metadata.low_ratios),
+                    inv_rope=inv_rope,
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
                 _kv_splits_for_stream,
@@ -2703,6 +2946,13 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified.pf_cu_q
         final_pos = core_attn_metadata.unified.pf_final_pos
 
+        swa_floor = core_attn_metadata.unified.pf_swa_floor
+        # Decoder SWA bounded replay: the late layers run the extend's tail rows,
+        # so the positions are the tail's, not forward_batch's.
+        tail = getattr(self.forward_metadata, "late_layer_tail", None)
+        if tail is not None:
+            positions = tail.positions.to(torch.int64)[:T]
+
         # Slice CP query metadata while keeping cache-write metadata global.
         _cp_active = is_cp_active(forward_batch)
         state_slot_full = state_slot
@@ -2712,14 +2962,29 @@ class DeepseekV4HipRadixBackend(
             _cp_size = get_parallel().attn_cp_size
             # pf_* were built on the padded global layout before the reindex.
             assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
-            _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
+            # This rank's rows, picked the way apply_cp_reindex picked the core fields:
+            # by the CP layout's local_index when it has one (the late-layer tail
+            # gives each row to the rank that owns it in the full extend, which is
+            # not every cp_size-th tail row), else by stride (plain interleave).
+            _local_index = getattr(forward_batch.attn_cp_metadata, "local_index", None)
+            _sl = (
+                _local_index
+                if _local_index is not None
+                else slice(get_parallel().attn_cp_rank, None, _cp_size)
+            )
             state_slot, chunk_start, cu_q, final_pos = (
                 v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q, final_pos)
             )
+            if swa_floor is not None:
+                swa_floor = swa_floor[_sl].contiguous()
             # Already CP-reindexed; padding rows carry the inert expansion position.
             positions = core_attn_metadata.positions_casual.to(torch.int64)
             assert positions.shape[0] == T
-            positions_full = forward_batch.positions.to(torch.int64)
+            positions_full = (
+                tail.pos_global
+                if tail is not None
+                else forward_batch.positions.to(torch.int64)
+            )
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -2729,9 +2994,11 @@ class DeepseekV4HipRadixBackend(
             cu_q=cu_q,
             win=win,
             ring_stride=ring_stride,
-            swa_pages=swa_pages,
+            swa_pages=compress_base,
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
+            low_ratio_page_indices=low_pi,
+            swa_floor=swa_floor,
         )
 
         if kpre_p.shape[0] < T + 1:
@@ -2772,6 +3039,9 @@ class DeepseekV4HipRadixBackend(
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
             )
+
+        if inv_rope is not None:
+            runtime.apply_inverse_rope(o, inv_rope)
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
@@ -2818,6 +3088,24 @@ class DeepseekV4HipRadixBackend(
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
         )
+
+    def get_unified_swa_loc_i64(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """get_unified_swa_loc as int64, cast once per step where it can be."""
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        unified = getattr(core, "unified", None) if core is not None else None
+        cached = unified.swa_loc_i64 if unified is not None else None
+        positions = forward_batch.positions
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == positions.shape[0]
+            and not (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.speculative_num_steps > 1
+            )
+        ):
+            return cached
+        return self.get_unified_swa_loc(forward_batch).to(torch.int64)
 
     def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         # Cached slots use committed positions; draft steps need live positions.
@@ -3067,9 +3355,7 @@ class DeepseekV4HipRadixBackend(
                 save_kv_cache=save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
-            )
-            assert inv_rope is None, (
-                "the unified_kv model path applies its inverse RoPE"
+                inv_rope=inv_rope,
             )
             return o
 
@@ -3254,16 +3540,66 @@ class DeepseekV4HipRadixBackend(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"
                 )
-            # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
-            assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            low_ratio_index_topk_hip_extend(
+                self,
+                layer,
+                x,
+                q_lora,
+                pos,
+                forward_batch,
+                rows_per_request=rows_per_request,
+            )
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
+            )
+
+    def _forward_low_ratio_sources_cp(
+        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+    ) -> None:
+        """Every rank writes the whole prompt's compressed state and scores only its own
+        rows, which are request-major like the extend's (interleave keeps the order)."""
+        cp_meta = forward_batch.attn_cp_metadata
+        total = int(cp_meta.total_seq_lens)
+        tail = self.forward_metadata.late_layer_tail
+        if tail is not None:
+            q_lens_cpu = tail.local_lens_cpu
+            req_global, pos_global = tail.req_global, tail.pos_global
+        else:
+            q_lens_cpu = interleave_rows_per_request(
+                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            req_global = token_req_indices(forward_batch, num_tokens=total)
+            pos_global = forward_batch.positions[:total].to(torch.int64)
+        num_local = sum(q_lens_cpu)
+        q_lora = _first_rows(q_lora, num_local)
+        if run_compressor and layer.compressor is not None:
+            x_global = cp_materialize_global_token_order(
+                x.contiguous(), forward_batch, torch.cuda.current_stream()
+            )[:total]
+            if tail is None:
+                # x_global is the extend itself, so the fused prefill store of the
+                # non-CP path applies with the batch's own extend offsets
+                self._low_ratio_compress(
+                    layer, x_global, req_global, pos_global, forward_batch
+                )
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+        if run_indexer and layer.indexer is not None:
+            self._low_ratio_index_topk(
+                layer,
+                x[:num_local],
+                q_lora,
+                None,
+                positions[:num_local].to(torch.int64),
+                forward_batch,
+                rows_per_request=q_lens_cpu,
             )
 
     def expand_extend_with_same_length(
@@ -3340,14 +3676,32 @@ class DeepseekV4HipRadixBackend(
                 block_size=dspark_block_size,
             )
         elif swa_replay_start is None:
-            swa_page_indices = self.get_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-            )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
+            if getattr(self.token_to_kv_pool, "_unified_kv", False):
+                # Only the paged readers take these; unified_kv addresses its own
+                # SWA ring (decode streams / prefill indices), so a shape-only
+                # stand-in saves the gather + translate launches every step.
+                swa_page_indices = seq_lens_casual.new_zeros(
+                    (seq_lens_casual.shape[0], SWA_WINDOW)
+                )
+            else:
+                swa_page_indices = self.get_swa_page_indices(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                )
+                swa_page_indices = _pad_last_dim(
+                    swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
+                )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        elif getattr(self.token_to_kv_pool, "_unified_kv", False):
+            # decoder SWA bounded replay under unified_kv: the floor reaches the
+            # ring through pf_swa_floor; only the (floored) lengths matter here
+            swa_page_indices = seq_lens_casual.new_zeros(
+                (seq_lens_casual.shape[0], SWA_WINDOW)
+            )
+            floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
+            swa_topk_lengths = torch.minimum(
+                torch.clamp(seq_lens_casual, max=SWA_WINDOW), floored.clamp_min(0)
+            )
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
