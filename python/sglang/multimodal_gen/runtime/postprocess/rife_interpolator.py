@@ -350,7 +350,6 @@ class FrameInterpolator:
 
     def __init__(self, model_path: Optional[str] = None):
         self._model_path = model_path
-        self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
         """Load RIFE model weights.
@@ -367,8 +366,6 @@ class FrameInterpolator:
 
         # Resolve: local path pass-through, HF repo ID → download & cache
         model_path = maybe_download_model(model_path)
-
-        self._resolved_path = model_path
 
         if model_path in _MODEL_CACHE:
             return _MODEL_CACHE[model_path]
