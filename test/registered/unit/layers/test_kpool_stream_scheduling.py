@@ -380,6 +380,22 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
             [call.kwargs["device_index"] for call in budget.call_args_list], [0, 1]
         )
 
+    def test_alternating_live_batches_reuse_each_budget(self):
+        """Overlapped prefill must reuse readings after switching child batches."""
+        first, second = _Batch(), _Batch()
+        with _budget_planner(budgets=[6 << 30, 2 << 30, 6 << 30, 2 << 30]) as (
+            plan,
+            budget,
+        ):
+            first_plan = plan(forward_batch=first)
+            second_plan = plan(forward_batch=second)
+            first_revisit = plan(forward_batch=first)
+            second_revisit = plan(forward_batch=second)
+
+        self.assertEqual(budget.call_count, 2)
+        self.assertEqual(first_revisit, first_plan)
+        self.assertEqual(second_revisit, second_plan)
+
     def test_the_next_forward_batch_reads_the_budget_again(self):
         """Free memory can fall between forwards (#40854), so a reading must
         not serve a later batch."""

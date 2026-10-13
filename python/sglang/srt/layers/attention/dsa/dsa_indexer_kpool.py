@@ -82,18 +82,24 @@ def _slice_rows(
     return None if tensor is None else tensor[rows]
 
 
-# Keep one free-memory reading per forward batch and device, because every
-# sparse-attention layer of a forward asks for the budget. The next forward reads
-# again, so the budget follows free memory.
-_MQA_LOGITS_BUDGET_BYTES: Dict[int, Tuple[weakref.ref[ForwardBatch], int]] = {}
+# Keep one free-memory reading per live forward batch and device. Two-batch
+# overlap alternates between its child batches at each sparse-attention layer.
+_MQA_LOGITS_BUDGET_BYTES: Dict[int, List[Tuple[weakref.ref[ForwardBatch], int]]] = {}
 
 
 def _get_mqa_logits_budget_bytes(device_index: int, forward_batch: ForwardBatch) -> int:
-    cached = _MQA_LOGITS_BUDGET_BYTES.get(device_index)
-    if cached is not None and cached[0]() is forward_batch:
-        return cached[1]
+    cached = [
+        (batch_ref, budget_bytes)
+        for batch_ref, budget_bytes in _MQA_LOGITS_BUDGET_BYTES.get(device_index, ())
+        if batch_ref() is not None
+    ]
+    for batch_ref, budget_bytes in cached:
+        if batch_ref() is forward_batch:
+            _MQA_LOGITS_BUDGET_BYTES[device_index] = cached
+            return budget_bytes
     budget_bytes = mqa_logits_budget_bytes(device_index=device_index, allow_sync=True)
-    _MQA_LOGITS_BUDGET_BYTES[device_index] = (weakref.ref(forward_batch), budget_bytes)
+    cached.append((weakref.ref(forward_batch), budget_bytes))
+    _MQA_LOGITS_BUDGET_BYTES[device_index] = cached
     return budget_bytes
 
 
