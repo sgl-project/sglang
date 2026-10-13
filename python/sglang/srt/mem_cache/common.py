@@ -432,11 +432,17 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        # A stop landing before the last committed token does the same, via
+        # The one token a pending decode step allocated is not committed yet. A
+        # stop landing before the last committed token frees more, via
         # effective_kv_committed_len().
-        assert start_p == end_p or (
-            req.finished_len is not None
-            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        assert (
+            start_p == end_p
+            or (start_p == req.kv.kv_committed_len and end_p - start_p == 1)
+            or (
+                req.finished_len is not None
+                and len(req.origin_input_ids) + req.finished_len
+                < req.kv.kv_committed_len
+            )
         ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )

@@ -28,15 +28,13 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
-from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
-    ScheduleBatchDisaggregationDecodeMixin,
-)
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVSender,
     TransferInfo,
 )
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -663,40 +661,6 @@ class TestDisaggregationWire(unittest.TestCase):
         packed = pack_int_lists([[]], "I")
         self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
-    def test_prebuilt_skips_unused_prompt_tensor(self):
-        req = SimpleNamespace(
-            kv=ReqKvInfo(req_pool_idx=0),
-            prefix_len=2,
-            extend_len=3,
-            origin_input_ids=[0, 1, 2, 3, 4],
-            output_ids=[],
-            retracted_stain=True,
-            is_retracted=True,
-            multimodal_inputs=None,
-            get_fill_ids=Mock(side_effect=AssertionError("prompt should not be read")),
-        )
-        batch = SimpleNamespace(
-            reqs=[req],
-            device="cpu",
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.arange(5, dtype=torch.int64).reshape(1, 5)
-            ),
-            return_logprob=False,
-            model_config=SimpleNamespace(vocab_size=32),
-        )
-
-        with patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-            "SamplingBatchInfo.from_schedule_batch",
-            return_value=Mock(),
-        ):
-            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
-
-        self.assertIsNone(batch.input_ids)
-        self.assertEqual(batch.extend_num_tokens, 3)
-        self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
-        req.get_fill_ids.assert_not_called()
-
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
@@ -1270,6 +1234,15 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
+    def setUp(self):
+        # The draft input itself, not its FutureMap seeding.
+        seeding = patch(
+            "sglang.srt.speculative.eagle_disaggregation.draft_state_in_future_map",
+            return_value=False,
+        )
+        seeding.start()
+        self.addCleanup(seeding.stop)
+
     @staticmethod
     def _make_req(
         seed,
@@ -1286,7 +1259,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 np.array(sampling_logprobs, np.float32),
             )
         return SimpleNamespace(
-            metadata_buffer_index=metadata_buffer_index,
+            disagg=DisaggReqState(metadata_buffer_index=metadata_buffer_index),
             output_ids=[101],
             cached_tokens=0,
             cached_tokens_device=0,
@@ -1414,12 +1387,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     )
                 )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-                queue.scheduler = SimpleNamespace(
-                    kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
-                )
+                queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
+                queue.update_reasoning_tokens = lambda req, token_id: None
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
                 req = SimpleNamespace(
@@ -1468,12 +1437,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             )
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-            queue.scheduler = SimpleNamespace(
-                kv_checksum_computer=None,
-                batch_result_processor=SimpleNamespace(
-                    _maybe_update_reasoning_tokens=lambda req, token_id: None
-                ),
-            )
+            queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
+            queue.update_reasoning_tokens = lambda req, token_id: None
             queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
             queue.metadata_buffers = buffers
             # Retracting popped token 6 from output_ids; its row is still queued.
@@ -1489,7 +1454,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
                 output_ids=[5],
-                pd_rebootstrap_forced_output_id=6,
+                disagg=DisaggReqState(rebootstrap_forced_output_id=6),
                 return_logprob=False,
                 return_sampling_mask=True,
                 sampling_logprobs_mode="support",

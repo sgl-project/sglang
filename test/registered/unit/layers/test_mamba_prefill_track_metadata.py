@@ -16,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -266,41 +265,6 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         ):
             self.assertEqual(getattr(forward, host), expected)
             self.assertEqual(getattr(forward, device).tolist(), expected)
-
-    def test_decode_and_verify_clear_prefill_lists_without_losing_snapshot(self):
-        for verify in (False, True):
-            with self.subTest(verify=verify):
-                batch = ScheduleBatch(
-                    reqs=[],
-                    spec_algorithm=SimpleNamespace(is_none=lambda: False),
-                    mamba_track_mask=torch.tensor([True]),
-                    mamba_track_seqlens=torch.tensor([65]),
-                    mamba_prefill_track_mask_cpu=[True],
-                    mamba_track_seqlens_cpu=[65],
-                )
-                snapshot = batch.copy()
-                if verify:
-                    settings = SimpleNamespace(
-                        mamba=SimpleNamespace(
-                            enable_mamba_extra_buffer=True,
-                            enable_mamba_extra_buffer_lazy=False,
-                        )
-                    )
-                    with (
-                        patch.object(spec_utils, "get_exec", return_value=settings),
-                        patch.object(spec_utils, "set_mamba_track_indices_from_reqs"),
-                    ):
-                        spec_utils.prepare_mamba_track_for_verify(batch)
-                    self.assertIsNone(batch.mamba_track_mask)
-                    self.assertIsNone(batch.mamba_track_seqlens)
-                else:
-                    with patch.object(spec_utils, "spec_prepare_for_decode"):
-                        batch.prepare_for_decode()
-                self.assertIsNone(batch.mamba_prefill_track_mask_cpu)
-                self.assertIsNone(batch.mamba_track_seqlens_cpu)
-                self.assertEqual(snapshot.mamba_prefill_track_mask_cpu, [True])
-                self.assertEqual(snapshot.mamba_track_seqlens_cpu, [65])
-                self.assertIsNone(snapshot.mamba_track_mask_cpu)
 
 
 if __name__ == "__main__":

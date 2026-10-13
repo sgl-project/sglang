@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import get_decode_retraction_order
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,7 +31,7 @@ def _args(policy: str = "length", low_first: bool = False):
 def _order(reqs, args):
     publish(args, role="test")
     try:
-        return ScheduleBatch._get_decode_retraction_order(reqs)
+        return get_decode_retraction_order(reqs)
     finally:
         reset_context()
 

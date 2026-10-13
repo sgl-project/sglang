@@ -75,7 +75,7 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        if self.enable_decode_hicache:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
@@ -154,7 +154,7 @@ class DecodeHiCachePreallocMixin:
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
-        if not self.scheduler.enable_decode_hicache:
+        if not self.enable_decode_hicache:
             return 0
         return sum(
             dr.prefix_match.restore_token_count

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -169,31 +169,37 @@ class NgramEmbeddingManager:
                 )
         return batch
 
+    def write_decode_history(self, reqs: List[Req]) -> None:
+        """Write the engram history rows of PD decode requests at admission.
+
+        PD decode runs no EXTEND for these requests, so the row their first
+        DECODE reads is written here: the n - 1 tokens before the one prefill
+        sampled, which is the token decode feeds next.
+        """
+        if self.engram_hasher is None:
+            return
+        n1 = self.engram_hasher.max_ngram_size - 1
+        history = self.engram_hasher.history
+        rows = []
+        for req in reqs:
+            # full_untruncated_fill_ids is only refreshed on the extend and
+            # decode paths, which a PD decode request has not run yet.
+            fill_ids = req.origin_input_ids + req.output_ids
+            end = len(fill_ids) - 1
+            ids = fill_ids[max(0, end - n1) : end]
+            rows.append([0] * (n1 - len(ids)) + list(ids))
+        slots = torch.tensor(
+            [req.kv.req_pool_idx for req in reqs],
+            dtype=torch.int64,
+            device=history.device,
+        )
+        history[slots] = torch.tensor(
+            rows, dtype=history.dtype, device=history.device
+        ).view(len(rows), n1)
+
     def _prepare_engram_history(self, batch: ScheduleBatch) -> None:
         """Refresh extend predecessors after prefix hits, retraction, or slot reuse."""
         n1 = self.engram_hasher.max_ngram_size - 1
-        if batch.forward_mode.is_prebuilt():
-            # PD decode runs no EXTEND for this request, so the row its first
-            # DECODE reads is written here: the n - 1 tokens before the one
-            # prefill sampled, which is the token decode feeds next.
-            history = self.engram_hasher.history
-            rows = []
-            for req in batch.reqs:
-                # full_untruncated_fill_ids is only refreshed on the extend and
-                # decode paths, which a PD decode request has not run yet.
-                fill_ids = req.origin_input_ids + req.output_ids
-                end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
-                rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
-                [req.kv.req_pool_idx for req in batch.reqs],
-                dtype=torch.int64,
-                device=history.device,
-            )
-            history[slots] = torch.tensor(
-                rows, dtype=history.dtype, device=history.device
-            ).view(len(rows), n1)
-            return
         if not batch.forward_mode.is_extend_without_speculative():
             return
         rows = []

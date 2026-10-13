@@ -92,7 +92,7 @@ def compute_split_seq_index(
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
-    elif forward_mode.is_idle() or forward_mode.is_prebuilt():
+    elif forward_mode.is_idle():
         assert num_tokens == 0
         return 0
     else:
@@ -425,8 +425,6 @@ class TboDPAttentionPreparer:
                 or local_batch.forward_mode.is_decode()
             ):
                 num_tokens = local_batch.batch_size() * token_num_per_seq
-            elif local_batch.forward_mode.is_prebuilt():
-                num_tokens = 0
             else:
                 num_tokens = local_batch.extend_num_tokens
             self.local_tbo_split_seq_index = compute_split_seq_index(
@@ -478,23 +476,19 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        forward_modes_excluding_idle_and_prebuilt = [
-            x
-            for x in forward_modes
-            if x != ForwardMode.IDLE.value and x != ForwardMode.PREBUILT.value
+        forward_modes_excluding_idle = [
+            x for x in forward_modes if x != ForwardMode.IDLE.value
         ]
 
-        if not forward_modes_excluding_idle_and_prebuilt:
+        if not forward_modes_excluding_idle:
             return ForwardMode.IDLE, False
 
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            forward_modes_excluding_idle_and_prebuilt
+            forward_modes_excluding_idle
         )
 
         global_forward_mode = (
-            ForwardMode(forward_modes_excluding_idle_and_prebuilt[0])
-            if forward_mode_agree
-            else None
+            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
         )
         return global_forward_mode, forward_mode_agree
 

@@ -2713,11 +2713,16 @@ class TestTheParallelPhase(CustomTestCase):
 
     def test_every_publisher_that_builds_a_runner_runs_the_phase(self):
         import ast as _ast
+        import re as _re
 
         offenders = []
         for path in _sources():
             text = path.read_text(encoding="utf-8-sig")
-            if "ModelRunner(" not in text or "publish(" not in text:
+            # The context's publish, not a method of that name
+            # (FutureMap.publish).
+            if "ModelRunner(" not in text or not _re.search(
+                r"(?<![\w.])publish\(", text
+            ):
                 continue
             tree = _ast.parse(text)
             builds = any(

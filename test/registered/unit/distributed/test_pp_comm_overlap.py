@@ -6,7 +6,7 @@ from unittest.mock import Mock, call
 
 import torch
 
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,7 +27,7 @@ class FakeEvent:
 
 
 def _make_scheduler(**attrs):
-    scheduler = object.__new__(SchedulerPPMixin)
+    scheduler = object.__new__(PPChannel)
     scheduler.__dict__.update(attrs)
     return scheduler
 
@@ -44,7 +44,7 @@ class TestPPCommOverlap(CustomTestCase):
             device_module=SimpleNamespace(Event=FakeEvent),
         )
 
-        scheduler._pp_commit_comm_work(works, fence_next_forward=True)
+        scheduler.commit(works, fence_next_forward=True)
 
         work.wait.assert_called_once_with()
         self.assertEqual(works, [])
@@ -57,7 +57,7 @@ class TestPPCommOverlap(CustomTestCase):
             pp_send_done_event=None,
         )
 
-        scheduler._pp_commit_comm_work([SimpleNamespace(work=Mock())], True)
+        scheduler.commit([SimpleNamespace(work=Mock())], True)
 
         self.assertIsNone(scheduler.pp_send_done_event)
 
@@ -73,7 +73,7 @@ class TestPPCommOverlap(CustomTestCase):
             pp_proxy_recv_event=recv_event,
         )
 
-        scheduler._pp_wait_forward_dependencies()
+        scheduler.wait_forward_dependencies()
 
         forward_stream.wait_stream.assert_called_once_with(schedule_stream)
         self.assertEqual(
@@ -92,7 +92,7 @@ class TestPPCommOverlap(CustomTestCase):
             ),
         )
 
-        received, event = scheduler._pp_recv_typed_dict("output")
+        received, event = scheduler._recv_typed_dict("output")
 
         self.assertIs(received, tensor_dict)
         self.assertIs(event, recv_event)

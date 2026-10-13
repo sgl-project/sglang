@@ -123,113 +123,50 @@ def _assert_snapshot_not_mutated(test_case, snapshot):
             )
 
 
-class _FakeReq:
-    def __init__(self, rid, origin_len, output_len):
-        self.rid = rid
-        self.origin_input_ids = list(range(origin_len))
-        self.output_ids = list(range(output_len))
-        self.full_untruncated_fill_ids = list(range(origin_len + output_len))
-        self.extend_end = None
-
-    def refresh_fill_ids(self):
-        self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
-
-    @property
-    def seqlen(self):
-        return len(self.origin_input_ids) + len(self.output_ids)
-
-
-class TestMergeBatchOutOfPlace(unittest.TestCase):
-    def test_merge_batch_rebinds_lists_without_mutating_either_side(self):
-        """merge_batch must build new list objects; no field of either side may be mutated in place."""
-        self_batch = make_schedule_batch(
-            2,
-            reqs=[types.SimpleNamespace(rid="a"), types.SimpleNamespace(rid="b")],
-            model_config=types.SimpleNamespace(is_encoder_decoder=False),
-            sampling_info=MagicMock(),
-            return_logprob=True,
-            top_logprobs_nums=[1, 2],
-            token_ids_logprobs=[[10], [20]],
-        )
-        other_batch = make_schedule_batch(
-            1,
-            reqs=[types.SimpleNamespace(rid="c")],
-            model_config=types.SimpleNamespace(is_encoder_decoder=False),
-            sampling_info=MagicMock(),
-            return_logprob=True,
-            top_logprobs_nums=[3],
-            token_ids_logprobs=[[30]],
-        )
-
-        self_reqs_before = self_batch.reqs
-        self_top_before = self_batch.top_logprobs_nums
-        self_snapshot = _snapshot_mutable_fields(self_batch)
-        other_snapshot = _snapshot_mutable_fields(other_batch)
-
-        self_batch.merge_batch(other_batch)
-
-        self.assertEqual([r.rid for r in self_batch.reqs], ["a", "b", "c"])
-        self.assertEqual(self_batch.top_logprobs_nums, [1, 2, 3])
-        self.assertEqual(self_batch.token_ids_logprobs, [[10], [20], [30]])
-        self.assertIsNot(self_batch.reqs, self_reqs_before)
-        self.assertIsNot(self_batch.top_logprobs_nums, self_top_before)
-        _assert_snapshot_not_mutated(self, self_snapshot)
-        _assert_snapshot_not_mutated(self, other_snapshot)
-
-
-class TestMixWithRunningOutOfPlace(unittest.TestCase):
-    def test_mix_with_running_rebinds_extend_fields_without_mutating_either_side(self):
-        """mix_with_running must append via rebound lists; no field of either side may be mutated in place."""
-        extend_batch = make_schedule_batch(
+class TestMixDecodeRows(unittest.TestCase):
+    def test_decode_rows_follow_the_prefill_rows(self):
+        """A mixed step lists its prefill rows, then each decoding request as a
+        one-token extend whose prefix is its row length before this token."""
+        extend_step = make_schedule_batch(
             2,
             reqs=[types.SimpleNamespace(rid="e1"), types.SimpleNamespace(rid="e2")],
-            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            model_config=types.SimpleNamespace(is_encoder_decoder=False, vocab_size=8),
             sampling_info=MagicMock(),
             return_logprob=False,
             forward_mode=ForwardMode.EXTEND,
             enable_overlap=False,
             is_prefill_only=True,
+            multimodal_inputs=None,
             out_cache_loc=torch.arange(6, dtype=torch.int64),
             prefix_lens=[0, 0],
             extend_lens=[3, 3],
             extend_num_tokens=6,
             extend_logprob_start_lens=[0, 0],
         )
-        running_batch = make_schedule_batch(
+        decode_step = make_schedule_batch(
             1,
-            reqs=[_FakeReq("r1", origin_len=4, output_len=2)],
-            model_config=types.SimpleNamespace(is_encoder_decoder=False),
-            sampling_info=MagicMock(),
-            return_logprob=False,
+            reqs=[types.SimpleNamespace(rid="r1")],
             forward_mode=ForwardMode.DECODE,
             out_cache_loc=torch.arange(6, 7, dtype=torch.int64),
-            # prepare_for_decode ran: the row already counts this step's token.
+            # The decode build counts this step's token in the row length.
             seq_lens_cpu=torch.tensor([6], dtype=torch.int64),
         )
 
-        extend_prefix_before = extend_batch.prefix_lens
-        extend_lens_before = extend_batch.extend_lens
-        extend_snapshot = _snapshot_mutable_fields(extend_batch)
-        running_snapshot = _snapshot_mutable_fields(running_batch)
+        extend_step.mix_decode_rows(decode_step)
 
-        extend_batch.mix_with_running(running_batch)
-
-        self.assertEqual(extend_batch.forward_mode, ForwardMode.MIXED)
-        self.assertIs(extend_batch.mix_running_indices, running_batch.req_pool_indices)
-        self.assertEqual([r.rid for r in extend_batch.reqs], ["e1", "e2", "r1"])
+        self.assertEqual(extend_step.forward_mode, ForwardMode.MIXED)
+        self.assertIs(extend_step.mix_running_indices, decode_step.req_pool_indices)
+        self.assertEqual([r.rid for r in extend_step.reqs], ["e1", "e2", "r1"])
+        self.assertEqual(extend_step.num_decode_rows, 1)
+        self.assertEqual([r.rid for r in extend_step.prefill_reqs()], ["e1", "e2"])
         self.assertTrue(
-            torch.equal(extend_batch.out_cache_loc, torch.arange(7, dtype=torch.int64))
+            torch.equal(extend_step.out_cache_loc, torch.arange(7, dtype=torch.int64))
         )
-        # The decode tail's prefix is its row length minus this step's token.
-        self.assertEqual(extend_batch.prefix_lens, [0, 0, 5])
-        self.assertEqual(extend_batch.extend_lens, [3, 3, 1])
-        self.assertEqual(extend_batch.extend_num_tokens, 7)
-        self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 0])
-        self.assertFalse(extend_batch.is_prefill_only)
-        self.assertIsNot(extend_batch.prefix_lens, extend_prefix_before)
-        self.assertIsNot(extend_batch.extend_lens, extend_lens_before)
-        _assert_snapshot_not_mutated(self, extend_snapshot)
-        _assert_snapshot_not_mutated(self, running_snapshot)
+        self.assertEqual(extend_step.prefix_lens, [0, 0, 5])
+        self.assertEqual(extend_step.extend_lens, [3, 3, 1])
+        self.assertEqual(extend_step.extend_num_tokens, 7)
+        self.assertEqual(extend_step.extend_logprob_start_lens, [0, 0, 0])
+        self.assertFalse(extend_step.is_prefill_only)
 
 
 class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):

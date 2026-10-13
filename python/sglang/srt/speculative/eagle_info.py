@@ -150,9 +150,8 @@ class EagleVerifyInput(SpecInput):
 
 @dataclass
 class EagleDraftInput(SpecInput):
-    # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
-    # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
-    # `bonus_tokens` unconditionally.
+    # For idle stubs use `create_idle_input`, not the bare ctor: it gives
+    # `topk_p` / `topk_index` / `hidden_states` / `bonus_tokens` zero rows.
 
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -226,83 +225,6 @@ class EagleDraftInput(SpecInput):
             ),
             capture_hidden_mode=capture_hidden_mode,
         )
-
-    def filter_batch(
-        self,
-        new_indices: torch.Tensor,
-        new_indices_cpu: Optional[List[int]] = None,
-    ):
-        if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
-            return
-
-        self.topk_p = self.topk_p[new_indices]
-        self.topk_index = self.topk_index[new_indices]
-        if self.draft_probs is not None:
-            self.draft_probs = self.draft_probs[new_indices]
-        if self.hidden_states is not None:
-            self.hidden_states = self.hidden_states[new_indices]
-        self.bonus_tokens = self.bonus_tokens[new_indices]
-        if self.dsa_topk_indices is not None:
-            self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
-
-    def merge_batch(self, spec_info: "EagleDraftInput"):
-        if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self_was_empty = len(self.future_indices) == 0
-            spec_info_is_empty = len(spec_info.future_indices) == 0
-            if self_was_empty:
-                self.cuda_graph_compatible = spec_info.cuda_graph_compatible
-                self.future_dsa_topk_indices_available = (
-                    spec_info.future_dsa_topk_indices_available
-                )
-            elif not spec_info_is_empty:
-                self.cuda_graph_compatible = (
-                    self.cuda_graph_compatible and spec_info.cuda_graph_compatible
-                )
-                self.future_dsa_topk_indices_available = (
-                    self.future_dsa_topk_indices_available
-                    and spec_info.future_dsa_topk_indices_available
-                )
-            self.future_indices = torch.cat(
-                [self.future_indices, spec_info.future_indices]
-            )
-            return
-
-        # Detect idle stub by `topk_index` length (idle inputs have
-        # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
-        # for STANDALONE all non-idle inputs also have None hidden_states.
-        if len(self.topk_index) == 0:
-            self.cuda_graph_compatible = spec_info.cuda_graph_compatible
-            self.hidden_states = spec_info.hidden_states
-            self.bonus_tokens = spec_info.bonus_tokens
-            self.topk_p = spec_info.topk_p
-            self.topk_index = spec_info.topk_index
-            self.draft_probs = spec_info.draft_probs
-            self.dsa_topk_indices = spec_info.dsa_topk_indices
-            return
-        if len(spec_info.topk_index) == 0:
-            return
-        self.cuda_graph_compatible = (
-            self.cuda_graph_compatible and spec_info.cuda_graph_compatible
-        )
-        if self.hidden_states is not None and spec_info.hidden_states is not None:
-            self.hidden_states = torch.cat(
-                [self.hidden_states, spec_info.hidden_states], axis=0
-            )
-        self.bonus_tokens = torch.cat(
-            [self.bonus_tokens, spec_info.bonus_tokens], axis=0
-        )
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
-            self.dsa_topk_indices = torch.cat(
-                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
-            )
-        else:
-            self.dsa_topk_indices = None
-        if self.draft_probs is not None and spec_info.draft_probs is not None:
-            self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
 
 @dataclass

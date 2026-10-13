@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional
@@ -103,6 +104,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -612,6 +614,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
+        # The draft batch is this phase's own: prepare_for_draft fills it.
+        batch = derive_batch(batch)
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
@@ -1347,13 +1351,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
-    def forward_batch_generation(
+    def _forward(
         self,
         batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
+        on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        pending_grammar,
+    ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
@@ -1373,7 +1377,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                 else:
                     return self._forward_dp_spec_prefill_coordination(
-                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                        batch, plan, on_publish, pp_proxy_tensors, pending_grammar
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
@@ -1387,13 +1391,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                     self.draft_worker.draft_runner
                 )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                batch = derive_batch(
+                    batch,
+                    spec_info=EagleDraftInput.create_idle_input(
+                        device=self.device,
+                        hidden_size=hidden_size,
+                        dtype=hidden_dtype,
+                        topk=self.topk,
+                        capture_hidden_mode=capture_mode,
+                        vocab_size=self.target_worker.model_config.vocab_size,
+                    ),
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input
@@ -1413,11 +1420,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
+            batch = derive_batch(batch, spec_info=verify_input)
             batch_output = self.verify(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
-                grammar_barrier=grammar_barrier,
+                pending_grammar=pending_grammar,
             )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1434,6 +1441,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
+                    batch = derive_batch(batch)
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
@@ -1446,20 +1454,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # PP tail-draft: draft the NEXT round's chain now — earlier
                 # stages must have the tokens before running their half of the
                 # next verify forward, so drafting cannot wait for the next
-                # iteration. Mimic the head-of-iteration state draft() expects;
-                # the scheduler's forward isolation reverts these SB edits, and
-                # the chain rides out on batch_output.
-                batch.spec_info = batch_output.next_draft_input
-                batch.seq_lens = batch_output.new_seq_lens
-                batch.forward_mode = ForwardMode.DECODE
-                # eagle_prepare_for_verify left the verify tokens here; the
-                # head-of-iteration draft always sees None (the scheduler
-                # clears it), so mirror that state.
-                batch.input_ids = None
+                # iteration. Build the head-of-iteration state draft() expects
+                # on a batch of its own; the chain rides out on batch_output.
                 # Attention metadata planning reads the CPU copies; one D2H
                 # per round (TODO: async or upper-bound estimate).
-                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                tail_seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                batch = derive_batch(
+                    batch,
+                    # The draft fills its input; the result's stays as it is.
+                    spec_info=copy.copy(batch_output.next_draft_input),
+                    seq_lens=batch_output.new_seq_lens,
+                    forward_mode=ForwardMode.DECODE,
+                    # eagle_prepare_for_verify left the verify tokens here; the
+                    # head-of-iteration draft always sees None.
+                    input_ids=None,
+                    seq_lens_cpu=tail_seq_lens_cpu,
+                    seq_lens_sum=int(tail_seq_lens_cpu.sum()),
+                )
                 with (
                     draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
@@ -1488,7 +1499,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        batch_output = self.target_worker.forward_batch_generation(
+        batch_output = self.target_worker.forward_model(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
@@ -1508,6 +1519,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self._draft_worker is None:
             return batch_output
 
+        batch = derive_batch(batch)
         if coordination_plan is not None:
             coordination_plan.apply(
                 batch,
@@ -1536,7 +1548,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def _forward_dp_spec_prefill_coordination(
-        self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+        self, batch, plan, on_publish, pp_proxy_tensors, pending_grammar
     ):
         """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
@@ -1548,7 +1560,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             else len(batch.draft_global_num_tokens) == 1
         ) or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
-        draft_batch = batch
+        draft_batch = derive_batch(batch)
         if is_prefill:
             draft_batch = ScheduleBatch.init_new(
                 [],
@@ -1568,12 +1580,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                 self.draft_worker.draft_runner
             )
-            draft_batch.spec_info = EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=hidden_size,
-                dtype=hidden_dtype,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
+            draft_batch = derive_batch(
+                draft_batch,
+                spec_info=EagleDraftInput.create_idle_input(
+                    device=self.device,
+                    hidden_size=hidden_size,
+                    dtype=hidden_dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
             )
         plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
         with (
@@ -1584,6 +1599,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             verify_input = self.draft_worker.draft(draft_batch)
 
+        batch = derive_batch(batch)
         plan.apply(batch, "target", rank, local_only=target_local_only)
         if is_prefill:
             result = self._forward_prefill_batch(
@@ -1595,10 +1611,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ]
             return result
 
-        batch.spec_info = verify_input
-        result = self.verify(batch, grammar_barrier=grammar_barrier)
+        batch = derive_batch(batch, spec_info=verify_input)
+        result = self.verify(batch, pending_grammar=pending_grammar)
         if on_publish is not None:
             on_publish(result.new_seq_lens)
+        batch = derive_batch(batch)
         plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
         with (
             draft_tp_context(self.draft_worker.draft_owns_attention),
@@ -1904,7 +1921,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, pending_grammar=None):
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -1918,5 +1935,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
-            grammar_barrier=grammar_barrier,
+            pending_grammar=pending_grammar,
         )

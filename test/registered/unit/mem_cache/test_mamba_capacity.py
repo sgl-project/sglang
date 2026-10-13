@@ -234,12 +234,9 @@ class TestMambaCapacity(unittest.TestCase):
             available_size=lambda: 1
         )
         queue.tree_cache = cache
-        queue.scheduler = SimpleNamespace(
-            running_batch=SimpleNamespace(reqs=[]),
-            enable_priority_scheduling=False,
-            enable_hisparse=False,
-            enable_lora=False,
-        )
+        queue.enable_priority_scheduling = False
+        queue.enable_hisparse = False
+        queue.enable_lora = False
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
@@ -255,7 +252,7 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_host_receive_threshold=1
             ),
         ):
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(queue.pop_preallocated([]), ([], []))
         self.assertEqual(queue.queue, [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()
@@ -272,7 +269,7 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_retraction_backup="cpu_tensor"
             ),
         ):
-            self.assertEqual(queue.resume_retracted_reqs(), [])
+            self.assertEqual(queue.resume_retracted_reqs([]), [])
         self.assertEqual(queue.retracted_queue, [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()

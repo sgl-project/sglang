@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -19,7 +19,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
+from sglang.srt.managers.scheduler_components.pp_ring import PPRing
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -28,6 +28,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import (
+    prefill_owner_shell,
+    result_processor_shell,
+)
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
@@ -172,10 +176,10 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         ),
         next_token_ids=torch.tensor([3]),
     )
-    payload = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, SimpleNamespace(return_logprob=False)
+    payload = PPRing._prepare_tensor_dict(
+        object.__new__(PPRing), result, SimpleNamespace(return_logprob=False)
     )
-    output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
+    output = get_logprob_from_pp_outputs(PPProxyTensors(payload))
     for name in (
         "token_ids",
         "lengths",
@@ -503,65 +507,6 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
-    device_output = DeviceOutput(torch.tensor([1.0]))
-    result = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=None,
-            auxiliary_device_output=device_output,
-        ),
-        next_token_ids=torch.tensor([7]),
-    )
-    copy_done = CopyDone()
-    scheduler = object.__new__(Scheduler)
-    scheduler.scheduler_stage_metrics = None
-    scheduler.metrics_reporter = Mock()
-    scheduler.forward_ct = 0
-    scheduler.processed_tokens_counter = 0
-    scheduler._sched_idled = False
-    scheduler.scripted_scheduler_hook = None
-    scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
-    scheduler.forward_sleep_time = None
-    scheduler.disaggregation_mode = None
-    scheduler.is_generation = True
-    scheduler.enable_overlap = False
-    scheduler.enable_pdmux = True
-    scheduler.enable_unified_cache_external_linker = False
-    scheduler.tp_worker = SimpleNamespace(
-        forward_batch_split_prefill=Mock(return_value=result)
-    )
-    scheduler.future_map = object()
-    scheduler._relay_forward_payload = Mock()
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
-    scheduler.attn_dp_enabled = False
-    batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(
-            is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
-        ),
-        split_index=0,
-        reqs=[],
-        req_pool_indices=torch.tensor([3]),
-        input_ids=torch.tensor([5]),
-        extend_num_tokens=1,
-        return_logprob=False,
-        return_hidden_states=False,
-    )
-
-    with (
-        published_topology(),
-        patch(
-            "sglang.srt.managers.scheduler.resolve_forward_inputs"
-        ) as resolve_forward_inputs,
-    ):
-        output_result = Scheduler.run_batch(scheduler, batch)
-
-    resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
-    assert output_result is result
-    assert result.auxiliary_host_output.values.tolist() == [1.0]
-    assert copy_done.record_count == 1
-
-
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())
@@ -578,8 +523,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         to_finish=None,
         finished_reason=None,
         discard_output_reason=None,
-        inflight_middle_chunks=0,
-        pending_bootstrap=False,
+        disagg=DisaggReqState(pending_bootstrap=False),
         return_logprob=False,
         return_sampling_mask=False,
         grammar=None,
@@ -590,37 +534,34 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
+        extend_lens=None,
+        extend_logprob_start_lens=None,
     )
     snapshot_auxiliary_output_starts = Mock(
         side_effect=SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts
     )
-    processor = SimpleNamespace(
-        move_logprobs_to_cpu=Mock(),
-        consume_auxiliary_output=Mock(),
-        snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
+    processor = result_processor_shell(
+        snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts
     )
-    scheduler = SimpleNamespace(
+    owner = prefill_owner_shell(
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_inflight_queue=[],
-        checkpoint_disagg_prefill=Mock(),
+        prefilling=[req],
+        checkpoint=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
-    SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
-        scheduler,
-        batch,
-        result,
-    )
+    owner.commit_extend(batch, result, [], None)
 
     assert req.output_ids == [7]
-    scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
+    owner.checkpoint.assert_called_once_with(req)
     copy_done.synchronize.assert_called_once_with()
     snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
@@ -628,7 +569,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
-    scheduler.maybe_send_health_check_signal.assert_called_once_with()
+    owner.maybe_send_health_check_signal.assert_called_once_with()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():
@@ -680,21 +621,19 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
         input_ids=torch.tensor([5]),
     )
 
-    tensors = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, batch
-    )
+    tensors = PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
     observer = Observer()
-    receiver = object.__new__(Scheduler)
+    receiver = object.__new__(PPRing)
     receiver.pp_group = SimpleNamespace(is_first_rank=True)
     receiver.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(sampling_observer=observer)
     )
     receiver.future_map = SimpleNamespace(stash=Mock())
 
-    output_result = Scheduler._pp_prep_batch_result(
+    output_result = PPRing._prep_batch_result(
         receiver,
         batch,
-        PPBatchMetadata(can_run_cuda_graph=True),
+        GenerationBatchResult(can_run_cuda_graph=True),
         PPProxyTensors(tensors),
     )
 
@@ -724,31 +663,29 @@ def test_pipeline_parallel_dsa_seed_round_trip(dsa_topk_indices):
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
-        spec_info=None,
     )
 
-    tensors = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, batch
-    )
+    tensors = PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
     if dsa_topk_indices is None:
         assert "draft_dsa_topk_indices" not in tensors
     else:
         assert torch.equal(tensors["draft_dsa_topk_indices"], dsa_topk_indices)
 
-    receiver = object.__new__(Scheduler)
+    receiver = object.__new__(PPRing)
     receiver.pp_group = SimpleNamespace(is_first_rank=False)
     receiver.future_map = SimpleNamespace(stash=Mock())
-    Scheduler._pp_prep_batch_result(
+    output_result = PPRing._prep_batch_result(
         receiver,
         batch,
-        PPBatchMetadata(can_run_cuda_graph=True),
+        GenerationBatchResult(can_run_cuda_graph=True),
         PPProxyTensors(tensors),
     )
 
+    relayed = output_result.next_draft_input
     if dsa_topk_indices is None:
-        assert batch.spec_info.dsa_topk_indices is None
+        assert relayed.dsa_topk_indices is None
     else:
-        assert torch.equal(batch.spec_info.dsa_topk_indices, dsa_topk_indices)
+        assert torch.equal(relayed.dsa_topk_indices, dsa_topk_indices)
 
 
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
@@ -766,17 +703,15 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
     )
-    tensors = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, batch
-    )
-    receiver = object.__new__(Scheduler)
+    tensors = PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
+    receiver = object.__new__(PPRing)
     receiver.pp_group = SimpleNamespace(is_first_rank=False)
     receiver.future_map = SimpleNamespace(stash=Mock())
 
-    output_result = Scheduler._pp_prep_batch_result(
+    output_result = PPRing._prep_batch_result(
         receiver,
         batch,
-        PPBatchMetadata(can_run_cuda_graph=False),
+        GenerationBatchResult(can_run_cuda_graph=False),
         PPProxyTensors(tensors),
     )
 
@@ -794,20 +729,18 @@ def test_pipeline_parallel_auxiliary_output_requires_receiver_observer():
         next_token_ids=torch.tensor([7]),
     )
     batch = SimpleNamespace(return_logprob=False)
-    tensors = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, batch
-    )
-    receiver = object.__new__(Scheduler)
+    tensors = PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
+    receiver = object.__new__(PPRing)
     receiver.pp_group = SimpleNamespace(is_first_rank=True)
     receiver.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(sampling_observer=None)
     )
 
     with pytest.raises(RuntimeError, match="without a sampling observer"):
-        Scheduler._pp_prep_batch_result(
+        PPRing._prep_batch_result(
             receiver,
             batch,
-            PPBatchMetadata(can_run_cuda_graph=False),
+            GenerationBatchResult(can_run_cuda_graph=False),
             PPProxyTensors(tensors),
         )
 
@@ -823,7 +756,7 @@ def test_pipeline_parallel_auxiliary_output_requires_transport_support():
     batch = SimpleNamespace(return_logprob=False)
 
     with pytest.raises(RuntimeError, match="does not support pipeline-parallel"):
-        Scheduler._pp_prepare_tensor_dict(object.__new__(Scheduler), result, batch)
+        PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
 
 
 def test_pipeline_parallel_auxiliary_output_requires_transport_observer():
@@ -835,20 +768,18 @@ def test_pipeline_parallel_auxiliary_output_requires_transport_observer():
         next_token_ids=torch.tensor([7]),
     )
     batch = SimpleNamespace(return_logprob=False)
-    tensors = Scheduler._pp_prepare_tensor_dict(
-        object.__new__(Scheduler), result, batch
-    )
-    receiver = object.__new__(Scheduler)
+    tensors = PPRing._prepare_tensor_dict(object.__new__(PPRing), result, batch)
+    receiver = object.__new__(PPRing)
     receiver.pp_group = SimpleNamespace(is_first_rank=True)
     receiver.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(sampling_observer=SimpleNamespace())
     )
 
     with pytest.raises(RuntimeError, match="does not support pipeline-parallel"):
-        Scheduler._pp_prep_batch_result(
+        PPRing._prep_batch_result(
             receiver,
             batch,
-            PPBatchMetadata(can_run_cuda_graph=False),
+            GenerationBatchResult(can_run_cuda_graph=False),
             PPProxyTensors(tensors),
         )
 

@@ -3,11 +3,11 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.dllm.manager import DllmManager
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -70,7 +70,9 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         rid=rid,
         tree_prefix=torch.tensor(prefix, dtype=torch.int32),
         prefix_len=len(prefix),
-        dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
+        dllm=SimpleNamespace(
+            incomplete_ids=array("q", range(block_size)) if reuse else array("q")
+        ),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
@@ -105,7 +107,9 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         seq_lens_cpu=seq_lens_cpu,
         extend_num_tokens=sum(extend_lens),
         maybe_evict_swa=lambda: None,
-        is_dllm=lambda: True,
+        kv_reuse_lens=[
+            len(req.dllm.incomplete_ids) if req.kv.holds_kv else 0 for req in reqs
+        ],
     )
 
 
@@ -209,22 +213,6 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
 
-    def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
-        manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        waiting = _make_req("abort-waiting", [1], self.block_size)
-        staging = _make_req("abort-staging", [2], self.block_size)
-        keep = _make_req("keep", [3], self.block_size)
-        manager.waiting_queue = [waiting, keep]
-        manager.staging_queue = [staging, waiting]
-
-        aborted = manager.pop_aborted_reqs(False, "abort")
-
-        self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
-        )
-        self.assertEqual(manager.waiting_queue, [keep])
-        self.assertEqual(manager.staging_queue, [])
-
 
 class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
     def test_resolved_block_keeps_row_until_next_block(self):
@@ -236,24 +224,23 @@ class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
             size=4, max_context_len=16, device="cpu", enable_memory_saver=False
         )
         req = SimpleNamespace(
-            dllm_incomplete_ids=array("q"),
-            is_dllm_prefill=lambda: False,
+            dllm=SimpleNamespace(incomplete_ids=array("q"), is_prefill=lambda: False),
             kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
         )
         pool.alloc([req])
         row = req.kv.req_pool_idx
-        scheduler = SimpleNamespace(
+        manager = SimpleNamespace(
             dllm_config=SimpleNamespace(
                 first_done_first_out_mode=True,
                 requires_separate_context_encoding=False,
             ),
-            req_to_token_pool=pool,
-            stash_chunked_request=Mock(),
+            tree_cache=object(),
         )
 
-        SchedulerDllmMixin.finish_dllm_forward(scheduler, req)
+        with patch("sglang.srt.dllm.manager.checkpoint_kv_cache") as checkpoint:
+            DllmManager.finish_dllm_forward(manager, req)
 
-        scheduler.stash_chunked_request.assert_called_once_with(req)
+        checkpoint.assert_called_once_with(req, manager.tree_cache)
         self.assertTrue(req.kv.holds_kv)
         self.assertEqual(req.kv.req_pool_idx, row)
         self.assertNotIn(row, pool.free_slots)

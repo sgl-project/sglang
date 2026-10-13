@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import torch
 
@@ -54,6 +54,7 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
@@ -576,8 +577,8 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    pending_grammar: Optional[Iterable[PendingStep]] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -669,7 +670,7 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
+    forward_batch_output = target_worker.forward_model(
         batch=None,
         forward_batch=verify_forward_batch,
         is_verify=True,
@@ -685,7 +686,7 @@ def run_eagle_verify(
             tree=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
-            barrier=grammar_barrier,
+            pending_grammar=pending_grammar,
         )
 
     # Sample

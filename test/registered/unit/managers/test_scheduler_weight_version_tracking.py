@@ -6,6 +6,7 @@ from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
 )
+from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -43,20 +44,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return serving
 
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
+    def _scheduler(self, **lists) -> SimpleNamespace:
         return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
-            ),
+            request_lists=lambda: {
+                name: RequestList(name=name, reqs=list(reqs))
+                for name, reqs in lists.items()
+            }
         )
 
     def test_a_new_version_is_adopted(self):
@@ -83,12 +76,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
         self.assertEqual(serving.weight_version, "v1")
 
-    def test_every_source_of_live_requests_is_stamped(self):
+    def test_every_request_list_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
         self._serving("v1")
         inflight, queued, chunked, staged = (object() for _ in range(4))
         scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
+            decoding=[inflight], waiting=[queued], chunked=[chunked], held=[staged]
         )
 
         with patch(
@@ -156,11 +149,11 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
-            scheduler=SimpleNamespace(
-                record_weight_version_change=lambda new_version: self.recorded.append(
-                    new_version
-                )
+            is_engine_paused=lambda: False,
+            record_weight_version_change=lambda new_version: self.recorded.append(
+                new_version
             ),
+            get_disagg_owners=lambda: (),
         )
 
     def _manager(self, target, draft=None, *, session=True):

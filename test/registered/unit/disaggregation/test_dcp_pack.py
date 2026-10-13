@@ -16,9 +16,10 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -251,12 +252,11 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     kv=SimpleNamespace(req_pool_idx=0),
                     origin_input_ids=[0] * total,
                     extend_end=total,
-                    start_send_idx=prefix,
-                    disagg_decode_prefix_len=prefix,
-                    disagg_kv_sender=sender,
+                    disagg=DisaggReqState(
+                        start_send_idx=prefix, decode_prefix_len=prefix
+                    ),
                 )
-                scheduler = SimpleNamespace(
-                    enable_staging=False,
+                owner = prefill_owner_shell(
                     token_to_kv_pool_allocator=SimpleNamespace(
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
@@ -266,13 +266,12 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                         req_index_to_mamba_index_mapping=torch.tensor([17]),
                         translate_mamba_indices=lambda x: x,
                     ),
-                    disagg_metadata_buffers=Mock(),
-                    disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),
-                    disagg_prefill_pending_chunk_rids=set(),
+                    enable_staging=False,
+                    metadata_buffers=Mock(),
+                    bootstrap_queue=SimpleNamespace(kv_manager=mgr),
+                    kv_senders={req.rid: sender},
                 )
-                SchedulerDisaggregationPrefillMixin._send_kv_chunk(
-                    scheduler, req, last_chunk=True
-                )
+                owner._send_kv_chunk(req, last_chunk=True)
                 calls = mgr.add_transfer_request.call_args_list
                 token_counts = [c.args[7] for c in calls]
                 if peer == "dcp":

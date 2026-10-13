@@ -743,13 +743,16 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
         )
+        scheduler.maybe_init_dllm_worker = lambda: setattr(
+            scheduler, "dllm_worker", None
+        )
         scheduler.init_memory_pools = lambda: trace.append("memory_pool")
         scheduler.init_all_attention_backends = lambda: trace.append("attention")
         scheduler.init_all_cuda_graphs = lambda: trace.append("capture")
         return scheduler
 
     def _run_startup(
-        self, mode, *, use_draft_worker=False, enable_overlap=True, pp_size=1, mlx=False
+        self, mode, *, use_draft_worker=False, enable_overlap=True, pp_size=1
     ):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
@@ -773,7 +776,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         schedule_stream = object()
         expected_stream = (
             worker.model_runner.forward_stream
-            if enable_overlap or pp_size > 1 or mlx
+            if enable_overlap or pp_size > 1
             else schedule_stream
         )
 
@@ -794,7 +797,6 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         scheduler.spec_algorithm = SimpleNamespace(is_none=stop_after_startup)
 
         with (
-            patch("sglang.srt.managers.scheduler.use_mlx", return_value=mlx),
             patch(
                 "sglang.srt.managers.scheduler.get_exec",
                 return_value=SimpleNamespace(
@@ -818,7 +820,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         ):
             scheduler.init_model_worker()
 
-        self.assertIs(scheduler.schedule_stream, None if mlx else schedule_stream)
+        self.assertIs(scheduler.schedule_stream, schedule_stream)
         worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
@@ -840,15 +842,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
 
     def test_sampling_warmup_uses_the_serving_stream(self):
-        for enable_overlap, pp_size, mlx in (
-            (False, 1, False),
-            (False, 2, False),
-            (True, 1, False),
-            (False, 1, True),
-        ):
-            with self.subTest(enable_overlap=enable_overlap, pp_size=pp_size, mlx=mlx):
+        for enable_overlap, pp_size in ((False, 1), (False, 2), (True, 1)):
+            with self.subTest(enable_overlap=enable_overlap, pp_size=pp_size):
                 self._run_startup(
-                    "serial", enable_overlap=enable_overlap, pp_size=pp_size, mlx=mlx
+                    "serial", enable_overlap=enable_overlap, pp_size=pp_size
                 )
 
     def test_overlap_starts_before_capture_and_finalizes_after(self):

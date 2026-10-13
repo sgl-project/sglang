@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -57,6 +58,10 @@ class TestPrefillAdder(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
+        # Preemption releases a running request through this function.
+        release_patch = patch("sglang.srt.managers.schedule_policy.release_req")
+        self.release_req = release_patch.start()
+        self.addCleanup(release_patch.stop)
 
     def create_tree_cache(
         self,
@@ -101,12 +106,8 @@ class TestPrefillAdder(CustomTestCase):
         )
         return allocator
 
-    def create_running_batch(self, reqs=None) -> MagicMock:
-        batch = MagicMock()
-        batch.reqs = list(reqs or [])
-        batch.release_req.return_value = None
-        batch.filter_batch.return_value = None
-        return batch
+    def create_running_reqs(self, reqs=None) -> list:
+        return list(reqs or [])
 
     def scheduling_order(self, *, schedule_low_priority_values_first: bool):
         """State the policy on the context, which is where the scheduler reads
@@ -146,12 +147,12 @@ class TestPrefillAdder(CustomTestCase):
         req.needs_host_load_back.return_value = False
         return req
 
-    def create_adder(self, running_batch, **kwargs):
+    def create_adder(self, running_reqs, **kwargs):
         defaults = dict(
             page_size=1,
             tree_cache=self.mock_tree_cache,
             token_to_kv_pool_allocator=self.mock_token_allocator,
-            running_batch=running_batch,
+            running_reqs=running_reqs,
             new_token_ratio=1.0,
             rem_input_tokens=10000,
             rem_chunk_tokens=None,
@@ -160,6 +161,9 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
+        dllm_config = defaults.pop("dllm_config", None)
+        if dllm_config is not None:
+            return DllmPrefillAdder(dllm_config=dllm_config, **defaults)
         return PrefillAdder(**defaults)
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
@@ -186,7 +190,7 @@ class TestPrefillAdder(CustomTestCase):
             lazy_compaction=True,
         ).token_to_kv_pool_allocator
         return self.create_adder(
-            self.create_running_batch(),
+            self.create_running_reqs(),
             page_size=4,
             rem_chunk_tokens=16,
             num_mixed_decode_tokens=num_mixed_decode_tokens,
@@ -211,7 +215,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
         return self.create_adder(
-            self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
+            self.create_running_reqs(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
@@ -311,7 +315,7 @@ class TestPrefillAdder(CustomTestCase):
                     supports_prefix_sharing
                 )
                 adder = self.create_adder(
-                    self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+                    self.create_running_reqs(), page_size=64, rem_chunk_tokens=100
                 )
                 req = self.create_shared_req("chunked")
                 req.full_untruncated_fill_ids = list(range(300))
@@ -383,7 +387,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.memory_budget.swa_offset, 12)
 
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
-        adder = self.create_adder(self.create_running_batch())
+        adder = self.create_adder(self.create_running_reqs())
         req = self.create_mock_req("storage-hit", priority=0, max_new_tokens=1)
         req.host_hit_length = 12
         req.host_loaded_length = 4
@@ -432,7 +436,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_storage_hit_tokens, 12)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
-        adder = self.create_adder(self.create_running_batch())
+        adder = self.create_adder(self.create_running_reqs())
         req = self.create_mock_req(
             "retracted-storage-hit", priority=0, max_new_tokens=1
         )
@@ -456,8 +460,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=False)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 225)
 
@@ -475,7 +479,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 175
         )  # 50 + 75 + 100 - 50 = 175
-        running_batch.release_req.assert_called_once()
+        self.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -488,8 +492,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=True)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 225)
 
@@ -507,7 +511,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 125
         )  # 50 + 75 + 100 - 100 = 125
-        running_batch.release_req.assert_called_once()
+        self.release_req.assert_called_once()
 
     def test_preempt_fail_low_priority_values_first(self):
         params = [
@@ -520,8 +524,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=True)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 225)
 
@@ -558,8 +562,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=False)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 225)
 
@@ -596,8 +600,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=False)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 225)
 
@@ -612,7 +616,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.memory_budget.total_offset, 175)
-        running_batch.release_req.assert_called_once()
+        self.release_req.assert_called_once()
 
         # Second call needs more tokens than currently free, so it would need to
         # preempt req_prio_0 again if already-preempted requests were not filtered out.
@@ -624,7 +628,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertFalse(second_success)
         self.assertEqual(adder.memory_budget.total_offset, 175)
         self.assertEqual(adder.preempt_list.count(running_reqs[0]), 1)
-        running_batch.release_req.assert_called_once()
+        self.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_once(self):
         params = [
@@ -639,8 +643,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=True)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 475)
 
@@ -657,7 +661,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
-        running_batch.release_req.assert_called_once()
+        self.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_twice(self):
         params = [
@@ -672,8 +676,8 @@ class TestPrefillAdder(CustomTestCase):
             for rid, priority, max_new_tokens in params
         ]
         self.scheduling_order(schedule_low_priority_values_first=True)
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        running = self.create_running_reqs(running_reqs)
+        adder = self.create_adder(running)
 
         self.assertEqual(adder.memory_budget.total_offset, 475)
 
@@ -691,7 +695,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 250
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
-        self.assertEqual(running_batch.release_req.call_count, 2)
+        self.assertEqual(self.release_req.call_count, 2)
 
     def test_mixed_chunk_prefill_budgets(self):
         self.mock_token_allocator.available_size.return_value = 1000
@@ -700,10 +704,10 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(f"decode_{i}", priority=0, max_new_tokens=50)
             for i in range(8)
         ]
-        running_batch = self.create_running_batch(decode_reqs)
+        running = self.create_running_reqs(decode_reqs)
 
         adder = self.create_adder(
-            running_batch,
+            running,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             num_mixed_decode_tokens=len(decode_reqs),
@@ -729,10 +733,10 @@ class TestPrefillAdder(CustomTestCase):
 
         # 3 decode requests finished
         remaining_decode_reqs = decode_reqs[3:]
-        running_batch2 = self.create_running_batch(remaining_decode_reqs)
+        running_reqs2 = self.create_running_reqs(remaining_decode_reqs)
 
         adder2 = self.create_adder(
-            running_batch2,
+            running_reqs2,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             num_mixed_decode_tokens=len(remaining_decode_reqs),
@@ -777,7 +781,7 @@ class TestPrefillAdder(CustomTestCase):
             max_prefix_tokens=1024, chunk_tokens=1024
         )
         self.mock_token_allocator.available_size.return_value = 64
-        adder = self.create_adder(self.create_running_batch(), page_size=16)
+        adder = self.create_adder(self.create_running_reqs(), page_size=16)
 
         req = self.create_mock_req("ignore_eos", priority=0, max_new_tokens=1)
         req.sampling_params.ignore_eos = True
@@ -823,7 +827,7 @@ class TestPrefillAdder(CustomTestCase):
             shard_spec=shard_spec,
         )
         return self.create_adder(
-            self.create_running_batch(),
+            self.create_running_reqs(),
             page_size=shard_spec.page_size,
             rem_chunk_tokens=shard_spec.chunk_tokens,
             token_to_kv_pool_allocator=allocator,
@@ -1020,7 +1024,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = full_available
         self.mock_tree_cache.sliding_window_size = 128
         adder = self.create_adder(
-            self.create_running_batch(),
+            self.create_running_reqs(),
             page_size=page_size,
             rem_chunk_tokens=rem_chunk,
         )
@@ -1093,7 +1097,7 @@ class TestPrefillAdder(CustomTestCase):
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
-                    self.create_running_batch(),
+                    self.create_running_reqs(),
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
@@ -1124,7 +1128,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
-        adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+        adder = self.create_adder(self.create_running_reqs(), page_size=PAGE)
         adder.is_hybrid_swa = True
         adder.memory_budget = SWAPrefillBudget(
             self.mock_token_allocator, self.mock_tree_cache
@@ -1172,7 +1176,7 @@ class TestPrefillAdder(CustomTestCase):
         def run(delivered: int, remaining_after_load: int = 100_000):
             self.mock_token_allocator.full_available_size.return_value = 100_000
             self.mock_token_allocator.swa_available_size.return_value = 400
-            adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+            adder = self.create_adder(self.create_running_reqs(), page_size=PAGE)
             adder.is_hybrid_swa = True
             adder.memory_budget = SWAPrefillBudget(
                 self.mock_token_allocator, self.mock_tree_cache
@@ -1250,7 +1254,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.sliding_window_size = 1024
         self.mock_tree_cache.supports_mamba.return_value = False
         adder = self.create_adder(
-            self.create_running_batch(), page_size=128, rem_chunk_tokens=chunk_tokens
+            self.create_running_reqs(), page_size=128, rem_chunk_tokens=chunk_tokens
         )
         req = self._create_host_hit_req(host_hit=6144, tail=2048)
         req.sampling_params.max_new_tokens = 1024
@@ -1420,7 +1424,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
-        adder = self.create_adder(self.create_running_batch())
+        adder = self.create_adder(self.create_running_reqs())
         adder._mamba_slot_cost = 64
         adder.rem_mamba_slots = available_slots
         req = self._create_host_hit_req(host_hit=32, tail=8)
@@ -1474,7 +1478,7 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_len = req.extend_end
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
-        next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
+        next_adder = self.create_adder(self.create_running_reqs(), rem_chunk_tokens=4)
         next_adder._mamba_slot_cost = 64
         next_adder.rem_mamba_slots = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
@@ -1583,7 +1587,7 @@ class TestPrefillAdder(CustomTestCase):
         # of a long-generation request.
         from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
 
-        adder = self.create_adder(self.create_running_batch())
+        adder = self.create_adder(self.create_running_reqs())
         cases = [
             # (max_new, generated, expected, label)
             (100, 10, 90, "below_clip_normal"),
@@ -1707,7 +1711,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = available_tokens
         self.mock_token_allocator.full_available_size.return_value = available_tokens
         return self.create_adder(
-            self.create_running_batch(),
+            self.create_running_reqs(),
             prefill_delayer_single_pass=delayer,
             **kwargs,
         )
@@ -1817,7 +1821,7 @@ class TestPrefillAdder(CustomTestCase):
             )
         )
         return self.create_adder(
-            self.create_running_batch(),
+            self.create_running_reqs(),
             page_size=page_size,
             rem_chunk_tokens=512,
         )

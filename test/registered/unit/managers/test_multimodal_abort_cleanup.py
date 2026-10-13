@@ -92,13 +92,16 @@ def _rank(rank):
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
     scheduler.waiting_queue = [req]
-    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm_config = None
+    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.disagg_prefill = None
+    scheduler.disagg_decode = None
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
     scheduler.grammar_manager = MagicMock()
-    scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.decoding = []
+    scheduler.hisparse_coordinator = None
     return scheduler
 
 

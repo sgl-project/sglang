@@ -3,23 +3,32 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from functools import partial
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 import torch
 
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+from sglang.srt.speculative.forward_batch_view import worker_forward_batch
+from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import FutureMap, StepPublish
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 
 class HiCacheDraftMode(str, Enum):
@@ -149,6 +158,17 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     _hicache_draft_plan = HiCacheDraftPlan()
+
+    # The relay each forward writes its draft state into and the next step's
+    # forward gathers it from; None under the pipeline-parallel relay.
+    future_map: Optional[FutureMap] = None
+    # The current forward's publish, between its new lengths and its commit.
+    _step_publish: Optional[StepPublish] = None
+    # DSpark's verify budget, prepared from the relayed confidence on the
+    # forward's view before its inputs resolve; None for other workers.
+    _confidence_budget_prepare: Optional[Callable[[ScheduleBatch, FutureMap], None]] = (
+        None
+    )
 
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
@@ -364,3 +384,153 @@ class BaseSpecWorker(ABC):
         the runtime state before each draft round.
         """
         pass
+
+    def attach_future_map(self, future_map: FutureMap, *, enable_overlap: bool) -> None:
+        """Hand the worker the FutureMap its forwards commit their draft state
+        to, when draft state travels through it (draft_state_in_future_map)."""
+        from sglang.srt.managers.overlap_utils import draft_state_in_future_map
+
+        if draft_state_in_future_map(enable_overlap):
+            self.future_map = future_map
+
+    def prepare_decode_step(self, step: ScheduleBatch) -> None:
+        """The worker's part of building a decode step: key its draft input to
+        its rows' slots when the draft state travels through FutureMap (under
+        the pipeline-parallel relay the launch builds the verify input), then
+        the algorithm's decode preparation."""
+        if self.future_map is not None:
+            # The rows' draft state is in their FutureMap slots; the worker
+            # gathers it at forward entry.
+            step.spec_info = self.keyed_draft_input(
+                step.req_pool_indices, step.req_pool_indices_cpu
+            )
+        spec_prepare_for_decode(step)
+        self._prepare_decode(step)
+
+    def _prepare_decode(self, step: ScheduleBatch) -> None:
+        """The algorithm's decode preparation: EAGLE's allocation of the
+        verify and draft KV; a worker whose draft input prepares itself
+        overrides it."""
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(step)
+
+    def keyed_draft_input(
+        self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> SpecInput:
+        """The draft input of a decode step over these rows, built from their
+        slots instead of carried from the previous result: it keys the slots
+        the worker gathers the rows' draft state from, and says whether that
+        state lets the draft replay its graphs."""
+        draft_input = self._new_draft_input(req_pool_indices)
+        draft_input.future_indices = req_pool_indices
+        draft_input.cuda_graph_compatible = self.future_map.cuda_graph_compatible(
+            req_pool_indices_cpu
+        )
+        return draft_input
+
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> SpecInput:
+        """An empty draft input of the type this worker's forwards produce;
+        workers carrying another type override it."""
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        return EagleDraftInput()
+
+    def forward_batch_generation(
+        self,
+        step: ScheduleBatch,
+        *,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pending_grammar: Optional[Iterable[PendingStep]] = None,
+    ) -> GenerationBatchResult:
+        """Run one step. `step` is read only: the forward runs on the worker's
+        own batches, and its draft state goes to FutureMap at commit. A verify
+        runs the grammar commit of the `pending_grammar` steps right before it
+        builds its vocab mask."""
+        batch = self.forward_input(step)
+        on_publish = partial(self.publish_new_seq_lens, batch)
+        result = self._forward(batch, on_publish, pp_proxy_tensors, pending_grammar)
+        return self.commit_forward(batch, result)
+
+    @abstractmethod
+    def _forward(
+        self,
+        batch: ScheduleBatch,
+        on_publish: Callable[[torch.Tensor], None],
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        pending_grammar: Optional[Iterable[PendingStep]],
+    ) -> GenerationBatchResult:
+        """The forward of one step on the worker's batch. It calls
+        `on_publish` with the step's new lengths as soon as they are known."""
+
+    def forward_input(self, step: ScheduleBatch) -> ScheduleBatch:
+        """The batch this worker forwards for `step`, which it never writes.
+
+        Its input ids are resolved from FutureMap on a view of the step; under
+        the pipeline-parallel relay the ring hands over a view it resolved. A
+        step that keys its draft input into FutureMap gets the draft state and
+        the committed lengths of its rows gathered from their slots, after the
+        steps that last wrote them published.
+        """
+        if self.future_map is None:
+            return worker_forward_batch(step)
+        view = worker_forward_batch(step)
+        if self._confidence_budget_prepare is not None:
+            self._confidence_budget_prepare(view, self.future_map)
+        resolve_forward_inputs(view, self.future_map)
+        carried = view.spec_info
+        if carried is None or carried.future_indices is None:
+            return worker_forward_batch(view)
+        indices_cpu = view.req_pool_indices_cpu
+        seq_lens, seq_lens_cpu, seq_lens_sum = self.future_map.gather_seq_lens(
+            carried.future_indices, indices_cpu
+        )
+        return worker_forward_batch(
+            view,
+            spec_info=self.future_map.gather_draft_input(carried, indices_cpu),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=seq_lens_sum,
+        )
+
+    def publish_new_seq_lens(
+        self,
+        batch: ScheduleBatch,
+        new_seq_lens: torch.Tensor,
+        confidence: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write the forward's new lengths into its slots as soon as they are
+        known (verify end), so the next step's host read of them overlaps the
+        rest of this forward."""
+        if self.future_map is None:
+            return
+        self._step_publish = self.future_map.publish(
+            batch.req_pool_indices,
+            new_seq_lens,
+            confidence,
+            indices_cpu=batch.req_pool_indices_cpu,
+        )
+
+    def commit_forward(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        """The device commit of a forward: write its next draft input into the
+        slots of its rows and seal its publish. Leaves `result` complete: the
+        next draft input keys its rows, and the result carries the publish."""
+        publish, self._step_publish = self._step_publish, None
+        if self.future_map is None:
+            return result
+        next_draft_input = result.next_draft_input
+        if next_draft_input is not None:
+            self.future_map.stash(
+                batch.req_pool_indices,
+                next_draft_input.relay_payload(),
+                indices_cpu=batch.req_pool_indices_cpu,
+            )
+            next_draft_input.future_dsa_topk_indices_available = (
+                next_draft_input.dsa_topk_indices is not None
+            )
+            next_draft_input.future_indices = batch.req_pool_indices
+        self.future_map.seal(publish)
+        result.step_publish = publish
+        return result

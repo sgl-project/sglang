@@ -64,7 +64,6 @@ class TestMlxRunnerPoolContract(CustomTestCase):
         worker._model_runner = runner
         worker.model_runner_list = [runner]
         worker.model_config = SimpleNamespace(context_len=128)
-        worker.dllm_algorithm = None
         worker.random_seed = 0
         worker.device = "cpu"
 

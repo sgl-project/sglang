@@ -65,6 +65,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -101,7 +102,6 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
 class BeamCoordinator(msgspec.Struct, kw_only=True):
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm
-    dllm_enabled: bool
     max_req_len: int
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
@@ -128,7 +128,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with PD disaggregation."
         if get_schedule().page_size > 1:
             return "Beam search currently requires --page-size 1."
-        if self.dllm_enabled:
+        if get_exec().dllm.dllm_algorithm is not None:
             return "Beam search is not supported with diffusion LLM."
         if get_memory().enable_hisparse:
             return "Beam search is not supported with hisparse."
@@ -222,14 +222,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._num_live_groups += 1
         return None
 
-    def pending_member_rows(self, batch: ScheduleBatch) -> int:
+    def pending_member_rows(self, reqs: List[Req]) -> int:
         """Rows admitted-but-not-yet-spawned groups will claim; the admission
         gate subtracts this so it never over-commits the req slot pool."""
         if self._num_live_groups == 0:
             return 0
         return sum(
             r.beam_group.beam_width - 1
-            for r in batch.reqs
+            for r in reqs
             if r.beam_group is not None
             and r.beam_group.member_rows is None
             and not r.beam_group.retired
@@ -440,9 +440,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 rows=rows,
                 parent_idx=parent_idx,
                 prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's committed length
+                # All rows are synchronized; the leader's allocated length
                 # covers the KV computed through this step.
-                seq_len=group.leader.kv.kv_committed_len,
+                seq_len=group.leader.kv.kv_allocated_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows

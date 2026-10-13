@@ -516,7 +516,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
-        # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
+        # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_step
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.

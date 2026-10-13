@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import RelayPayload
 
 
 class NgramVerifyInput(SpecInput):
@@ -44,6 +47,11 @@ class NgramVerifyInput(SpecInput):
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
         )
+
+    def relay_payload(self) -> RelayPayload:
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
+        return RelayPayload.from_ngram(self)
 
     @property
     def max_tree_depth(self) -> int:
@@ -115,38 +123,3 @@ class NgramVerifyInput(SpecInput):
             )
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
-
-    def filter_batch(
-        self,
-        new_indices: torch.Tensor,
-        new_indices_cpu: Optional[List[int]] = None,
-    ):
-        if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
-            return
-
-        if self.new_seq_lens is not None:
-            self.new_seq_lens = self.new_seq_lens[new_indices]
-        self.accept_tokens = self.accept_tokens.reshape(-1, self.draft_token_num)[
-            new_indices, :
-        ]
-        self.accept_tokens = self.accept_tokens.flatten()
-        self.accept_lens = self.accept_lens[new_indices]
-
-    def merge_batch(self, spec_info: NgramVerifyInput):
-        if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self.future_indices = torch.cat(
-                (self.future_indices, spec_info.future_indices), dim=0
-            )
-            return
-
-        if self.new_seq_lens is not None:
-            assert spec_info.new_seq_lens is not None
-            self.new_seq_lens = torch.cat(
-                (self.new_seq_lens, spec_info.new_seq_lens), dim=0
-            )
-        self.accept_tokens = torch.cat(
-            (self.accept_tokens, spec_info.accept_tokens), dim=0
-        )
-        self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)

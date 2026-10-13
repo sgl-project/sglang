@@ -1245,8 +1245,6 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         _attrs["forward_mode"] = "decode"
     elif batch.forward_mode.is_prefill():
         _attrs["forward_mode"] = "prefill"
-    elif batch.forward_mode.is_prebuilt():
-        _attrs["forward_mode"] = "prebuilt"
 
     for req in batch.reqs:
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)

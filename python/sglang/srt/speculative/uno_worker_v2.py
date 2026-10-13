@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import logging
 import time
 from typing import TYPE_CHECKING, Optional
@@ -26,6 +25,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
     run_eagle_verify,
 )
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import get_plan_stream
 from sglang.srt.speculative.uno_cuda_graph_runner import (
@@ -257,13 +257,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if batch.return_hidden_states:
             raise NotImplementedError("UNO does not support returned hidden states.")
 
-        penalizer = sampling_info.penalizer_orchestrator
-        penalties_active = (
-            (penalizer is not None and penalizer.is_required)
-            or sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-        )
-        if penalties_active:
+        if sampling_info.penalties is not None:
             raise NotImplementedError("UNO does not support sampling penalties.")
 
         if sampling_info.logit_bias is not None:
@@ -321,7 +315,7 @@ class UnoWorkerV2(BaseSpecWorker):
         *,
         need_top1: bool = True,
     ) -> tuple:
-        result = self.target_worker.forward_batch_generation(
+        result = self.target_worker.forward_model(
             batch=None,
             forward_batch=forward_batch,
             is_verify=True,
@@ -414,7 +408,7 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish,
     ) -> GenerationBatchResult:
-        result = self.target_worker.forward_batch_generation(batch)
+        result = self.target_worker.forward_model(batch)
         if not isinstance(result.next_token_ids, torch.Tensor):
             raise RuntimeError("UNO target prefill returned no sampled seed tensor.")
 
@@ -537,14 +531,17 @@ class UnoWorkerV2(BaseSpecWorker):
         # The first pass wrote the carried seed at C.  Give EAGLE a shallow
         # batch whose KV-ready prefix is therefore C+1; its existing allocator
         # assigns all Q tree slots at C+1 and its compactor can stay unchanged.
-        verify_batch = copy.copy(batch)
-        verify_batch.seq_lens = committed_seq_lens + 1
-        if committed_seq_lens_cpu is None:
-            verify_batch.seq_lens_cpu = None
-            verify_batch.seq_lens_sum = None
-        else:
-            verify_batch.seq_lens_cpu = committed_seq_lens_cpu + 1
-            verify_batch.seq_lens_sum = int(verify_batch.seq_lens_cpu.sum())
+        verify_seq_lens_cpu = (
+            None if committed_seq_lens_cpu is None else committed_seq_lens_cpu + 1
+        )
+        verify_batch = derive_batch(
+            batch,
+            seq_lens=committed_seq_lens + 1,
+            seq_lens_cpu=verify_seq_lens_cpu,
+            seq_lens_sum=(
+                None if verify_seq_lens_cpu is None else int(verify_seq_lens_cpu.sum())
+            ),
+        )
 
         verify_input = build_eagle_verify_input(
             verify_batch,
@@ -560,7 +557,7 @@ class UnoWorkerV2(BaseSpecWorker):
             tree_mask_mode=default_tree_mask_mode(),
             device=self.device,
         )
-        verify_batch.spec_info = verify_input
+        verify_batch = derive_batch(verify_batch, spec_info=verify_input)
         if self.plan_stream is not None:
             # C+1 was produced on the forward stream immediately above.  The
             # generic EAGLE path receives an older, already-visible frontier;
@@ -769,13 +766,20 @@ class UnoWorkerV2(BaseSpecWorker):
             indexer_topk_output=verify_result.indexer_topk_output,
         )
 
-    def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> UnoDraftInput:
+        unset = torch.empty_like(req_pool_indices, dtype=torch.int64)
+        return UnoDraftInput(
+            bonus_tokens=unset, new_seq_lens=unset, forward_width=self.forward_width
+        )
+
+    def _prepare_decode(self, step: ScheduleBatch) -> None:
+        if not isinstance(step.spec_info, UnoDraftInput):
+            raise RuntimeError("UNO decode preparation requires UnoDraftInput")
+        step.spec_info.prepare_for_decode(step)
+
+    def _forward(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors, pending_grammar
     ) -> GenerationBatchResult:
-        del grammar_barrier
         self._validate_batch(batch)
 
         if batch.forward_mode == ForwardMode.EXTEND:

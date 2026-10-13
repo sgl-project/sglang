@@ -133,7 +133,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
-        # XGrammarGrammar.accept_token). Disaggregation's process_prebuilt uses
+        # XGrammarGrammar.accept_token). PD decode's commit_prefill_handoff uses
         # `grammar.current_token is None` to detect a retracted request whose
         # token was already accepted and must not be re-accepted. Without this,
         # a ReasonerGrammarObject's current_token stays None forever (the inner

@@ -146,7 +146,7 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                         torch.tensor(prefills),
                     ),
                 )
-                self.assertEqual(worker.forward_batch_generation(batch), expected)
+                self.assertEqual(worker._forward(batch, None, None, None), expected)
                 if expected == "coordinate":
                     plan = worker._forward_dp_spec_prefill_coordination.call_args.args[
                         1

@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import get_device_module
@@ -220,6 +221,9 @@ class DynamicChunkSizer:
 
             start = time.perf_counter()
             batch.prepare_for_extend()
+            batch.sampling_info = SamplingBatchInfo.build(
+                batch.reqs, self.model_config.vocab_size, self.device
+            )
 
             # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
             if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:

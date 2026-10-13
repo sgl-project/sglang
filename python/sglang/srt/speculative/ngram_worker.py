@@ -22,6 +22,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -307,12 +308,14 @@ class NGRAMWorker(BaseSpecWorker):
         )
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch) -> ScheduleBatch:
+        """The verify batch of a decode step, built from `batch`; any other
+        batch is returned as it is."""
         # Decode-only: extend goes through the plain target forward, and an
         # IDLE batch must keep its forward_mode instead of being rewritten to
         # TARGET_VERIFY below (relevant once DP attention support lands).
         if not batch.forward_mode.is_decode():
-            return
+            return batch
 
         bs = len(batch.reqs)
 
@@ -372,29 +375,32 @@ class NGRAMWorker(BaseSpecWorker):
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.input_ids = draft_tokens
-        batch.out_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=batch.req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + self.draft_token_num,
-            batch_size=bs,
-            draft_token_num=self.draft_token_num,
-            device=self.device,
+        batch = derive_batch(
+            batch,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            # The worker's draft buffer: the verify input, never a result.
+            input_ids=draft_tokens,
+            out_cache_loc=assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                draft_token_num=self.draft_token_num,
+                device=self.device,
+            ),
+            spec_info=NgramVerifyInput(
+                draft_token=draft_tokens,
+                custom_mask=tree_mask,
+                positions=positions,
+                retrieve_index=retrieve_index,
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                draft_token_num=self.draft_token_num,
+            ),
         )
-
         prepare_mamba_track_for_verify(batch)
-
-        batch.spec_info = NgramVerifyInput(
-            draft_token=draft_tokens,
-            custom_mask=tree_mask,
-            positions=positions,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            draft_token_num=self.draft_token_num,
-        )
+        return batch
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
@@ -422,22 +428,28 @@ class NGRAMWorker(BaseSpecWorker):
             i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
-    def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> NgramVerifyInput:
+        return NgramVerifyInput(
+            draft_token_num=self.draft_token_num,
+            new_seq_lens=torch.empty_like(req_pool_indices, dtype=torch.int64),
+        )
+
+    def _forward(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors, pending_grammar
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
-        self._prepare_for_speculative_decoding(batch)
+        batch = self._prepare_for_speculative_decoding(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
         verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
-            batch_result = self.target_worker.forward_batch_generation(
+            batch_result = self.target_worker.forward_model(
                 batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
 
@@ -464,8 +476,9 @@ class NGRAMWorker(BaseSpecWorker):
                     ),
                     sampling_info=batch.sampling_info,
                     device=verify_input.retrieve_next_token.device,
-                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
-                    barrier=None,
+                    # NGRAM stays synchronous: the scheduler commits the pending
+                    # step before launching a grammar step.
+                    pending_grammar=None,
                 )
 
             # Sample
@@ -508,8 +521,7 @@ class NGRAMWorker(BaseSpecWorker):
                     accept_index=accept_index,
                 )
 
-            if on_publish is not None:
-                on_publish(new_seq_lens)
+            on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
             # Erase match state of requests that left the decode batch.
@@ -521,10 +533,9 @@ class NGRAMWorker(BaseSpecWorker):
             if departed_rids:
                 self.ngram_corpus.erase_match_state(list(departed_rids))
             self._prev_decode_rids = cur_rids
-            batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(
+            batch_result = self.target_worker.forward_model(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
             logits_output, predict, can_run_cuda_graph = (
@@ -541,8 +552,7 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
 
-            if on_publish is not None:
-                on_publish(new_seq_lens)
+            on_publish(new_seq_lens)
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
@@ -556,9 +566,6 @@ class NGRAMWorker(BaseSpecWorker):
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
-            # Consumed by the non-overlap V2 scheduler branch to advance
-            # batch.seq_lens after the isolation restore; overlap mode relays
-            # it via on_publish instead.
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -20,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
@@ -49,6 +52,16 @@ def decide_needs_cpu_seq_lens(
     return any(
         getattr(b, "needs_cpu_seq_lens", True) for b in attn_backends if b is not None
     )
+
+
+def draft_state_in_future_map(enable_overlap: bool) -> bool:
+    """Whether the draft state one speculative forward hands to the next
+    (bonus tokens, draft extras and new lengths, per row) travels through
+    FutureMap, keyed by req_pool_idx: the producing worker writes it and the
+    next step's worker gathers it. Every path but non-overlap pipeline
+    parallelism, whose relay keeps it in slots of its own
+    (speculative/pp_spec_relay.py)."""
+    return enable_overlap or get_parallel().pp_size == 1
 
 
 def decide_needs_confidence_relay() -> bool:
@@ -93,8 +106,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
-            # Keep mix_running_indices (= the mixed-in running batch's req_pool_indices, freed
-            # after merge_batch) alive on the forward stream until this gather completes.
+            # Keep mix_running_indices (= the decode rows' req_pool_indices) alive on
+            # the forward stream until this gather completes.
             # CPU has no cross-stream reuse hazard (and record_stream rejects CPU tensors).
             if batch.mix_running_indices.device.type != "cpu":
                 batch.mix_running_indices.record_stream(
@@ -121,10 +134,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
-    # Only the overlap path relays spec extras through the future_map; the
-    # synchronous (non-overlap) V2 path installs next_draft_input directly.
-    if batch.enable_overlap and not batch.spec_algorithm.is_none():
-        future_map._resolve_spec_extras(batch)
+    # Speculative draft state is not resolved here: the worker gathers it from
+    # FutureMap into its own draft input (FutureMap.gather_draft_input).
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2
@@ -151,6 +162,8 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+    # Whether the rows' draft state lets the draft replay its graphs.
+    cuda_graph_compatible: bool = True
 
     @classmethod
     def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
@@ -171,6 +184,7 @@ class RelayPayload:
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
+            cuda_graph_compatible=draft_input.cuda_graph_compatible,
         )
 
 
@@ -191,17 +205,16 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
-        if _is_cuda:
-            depth = CONFIDENCE_RELAY_RING_DEPTH
-            self.conf_ring = torch.empty(
-                (depth, self.req_pool_size, gamma),
-                dtype=torch.float32,
-                pin_memory=True,
-            )
-            self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
-            self.copy_done = [
-                torch.get_device_module(self.device).Event() for _ in range(depth)
-            ]
+        depth = CONFIDENCE_RELAY_RING_DEPTH
+        self.conf_ring = torch.empty(
+            (depth, self.req_pool_size, gamma),
+            dtype=torch.float32,
+            pin_memory=self.device.type != "cpu",
+        )
+        self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
+        self.copy_done = [
+            torch.get_device_module(self.device).Event() for _ in range(depth)
+        ]
 
     def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
         if not self.initialized:
@@ -219,9 +232,7 @@ class ConfidenceRelay(msgspec.Struct):
         self.gen_ring[slot].copy_(self.pool.req_generation)
         self.ring_pos += 1
 
-    def resolve(
-        self, batch: ScheduleBatch, *, stream, publish_ready
-    ) -> Optional[ResolvedConfidence]:
+    def resolve(self, batch: ScheduleBatch) -> Optional[ResolvedConfidence]:
         if not self.initialized:
             return None
         draft_input = batch.spec_info
@@ -231,14 +242,8 @@ class ConfidenceRelay(msgspec.Struct):
         if fi is None or fi.shape[0] == 0:
             return None
 
-        if stream is None or publish_ready is None:
-            idx = batch.req_pool_indices
-            idx_cpu = batch.req_pool_indices_cpu
-            return ResolvedConfidence(
-                confidence=self.confidence_buf[idx].cpu(),
-                generation=self.pool.req_generation[idx_cpu].clone(),
-            )
-
+        # Only a ring copy an earlier event covers is read: the host never
+        # waits on the forward stream, on any device.
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
@@ -252,9 +257,36 @@ class ConfidenceRelay(msgspec.Struct):
         )
 
 
+# Live publishes kept before dropping the ones no slot names anymore.
+_MAX_LIVE_PUBLISHES = 64
+
+
+class StepPublish:
+    """The device commit of one forward's FutureMap writes.
+
+    `seq_lens_ready` is recorded on the forward stream once the step's new
+    lengths are in FutureMap, `ready` once all of its slot writes (lengths and
+    draft state) are. A gather waits on the publishes of the steps that last
+    wrote its slots; the pending record of a step carries its publish.
+    """
+
+    __slots__ = ("step_id", "stream", "seq_lens_ready", "ready")
+
+    def __init__(self, step_id: int, stream: Any, seq_lens_ready: Any):
+        self.step_id = step_id
+        self.stream = stream
+        self.seq_lens_ready = seq_lens_ready
+        self.ready = None
+
+
 class FutureMap:
-    """Always-on pool-indexed relay for cross-iter values. Forward writes via
-    publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
+    """Pool-indexed relay for cross-step values, keyed by req_pool_idx.
+
+    The producing forward writes its slots (publish / stash, the device half
+    of commit); the next step's worker gathers them (gather_seq_lens /
+    gather_draft_input) after waiting on the publishes of the steps that last
+    wrote those slots. A slot is released (release_slots) only after the host
+    commit of the last pending step that references it.
     """
 
     def __init__(
@@ -276,6 +308,7 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
+        self.device_module = torch.get_device_module(device)
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -300,10 +333,14 @@ class FutureMap:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+            self.fwd_prepare_d2h_stream = self.device_module.Stream()
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
+        # The confidence relay's ring copies run on every device.
+        self.confidence_d2h_stream = self.fwd_prepare_d2h_stream
+        if needs_confidence_relay and self.confidence_d2h_stream is None:
+            self.confidence_d2h_stream = self.device_module.Stream()
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -311,15 +348,25 @@ class FutureMap:
         self.hidden_states_buf = None
         self.draft_probs_buf = None
         self.dsa_topk_indices_buf = None
+        # Host side: whether a slot's dsa_topk_indices_buf row holds a seed,
+        # and whether its draft state lets the draft replay its graphs.
+        self.dsa_topk_valid = np.zeros((self.req_pool_size,), dtype=bool)
+        self.slot_graph_compatible = np.ones((self.req_pool_size,), dtype=bool)
 
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
-        self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
-        # Debug consume-once state: armed by a recording publish, consumed by
-        # resolve; arm/consume strictly alternate across all batch interleavings.
-        self._publish_fresh = False
+        # Host side: the step that last published each slot (-1: none), and
+        # the publishes some slot still names, by step id. Only speculative
+        # steps publish; a non-speculative step's next reader is ordered
+        # behind it on the forward stream.
+        self.slot_writer = np.full((self.req_pool_size,), -1, dtype=np.int64)
+        self.publishes: dict[int, StepPublish] = {}
+        self.next_step_id = 0
+        # The latest publish's seq_lens_ready; the confidence relay's ring
+        # copies follow the publish order, not the slots.
+        self.last_seq_lens_ready = None
 
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
@@ -399,72 +446,145 @@ class FutureMap:
             device=self.device,
         )
 
-    def resolve_confidence_cpu(
-        self, batch: ScheduleBatch
-    ) -> Optional[ResolvedConfidence]:
-        if not self.needs_confidence_relay:
-            return None
-        return self.confidence_relay.resolve(
-            batch,
-            stream=self.fwd_prepare_d2h_stream,
-            publish_ready=self.publish_ready,
-        )
+    def _host_indices(
+        self, indices: torch.Tensor, indices_cpu: Optional[torch.Tensor]
+    ) -> np.ndarray:
+        if indices_cpu is None:
+            # Syncs on a device tensor; callers that hold the host copy pass it.
+            indices_cpu = indices.cpu()
+        if isinstance(indices_cpu, torch.Tensor):
+            return indices_cpu.numpy()
+        return np.asarray(indices_cpu, dtype=np.int64)
 
-    def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+    def writer_publishes(self, indices_cpu: np.ndarray) -> list[StepPublish]:
+        """The publishes of the steps that last wrote these slots."""
+        step_ids = np.unique(self.slot_writer[indices_cpu])
+        return [self.publishes[int(i)] for i in step_ids if i >= 0]
+
+    def _wait_writers(self, indices_cpu: np.ndarray, *, draft_state: bool) -> None:
+        """Order the current stream after the last writers of these slots:
+        their lengths, and with `draft_state` all of their slot writes."""
+        stream = self.device_module.current_stream()
+        for publish in self.writer_publishes(indices_cpu):
+            if publish.stream == stream:
+                continue  # stream-ordered already
+            event = publish.seq_lens_ready
+            if draft_state and publish.ready is not None:
+                event = publish.ready
+            if _is_hip:
+                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                event.synchronize()
+            else:
+                stream.wait_event(event)
+
+    def _host_seq_lens(
+        self, seq_lens: torch.Tensor, indices_cpu: np.ndarray
+    ) -> torch.Tensor:
+        if self.fwd_prepare_d2h_stream is None:
+            return seq_lens.cpu()  # bootstrap / non-CUDA
+        # Don't sync the forward stream: gate a private stream on the writers'
+        # publishes and copy into the static pinned buffer.
+        for publish in self.writer_publishes(indices_cpu):
+            self.fwd_prepare_d2h_stream.wait_event(publish.seq_lens_ready)
+        with self.device_module.stream(self.fwd_prepare_d2h_stream):
+            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
+        self.fwd_prepare_d2h_stream.synchronize()
+        return self.new_seq_lens_cpu_pinned[torch.from_numpy(indices_cpu)]
+
+    def gather_seq_lens(
+        self,
+        indices: torch.Tensor,
+        indices_cpu: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[int]]:
+        """The committed lengths of these slots: on device, and on host with
+        their sum when needs_cpu_seq_lens (else None, None: the backends take
+        the GPU-only path)."""
+        host_indices = self._host_indices(indices, indices_cpu)
+        self._wait_writers(host_indices, draft_state=False)
+        seq_lens = self.new_seq_lens_buf[indices]
+        if not self.needs_cpu_seq_lens:
+            return seq_lens, None, None
+        seq_lens_cpu = self._host_seq_lens(seq_lens, host_indices)
+        return seq_lens, seq_lens_cpu, int(seq_lens_cpu.sum())
+
+    def gather_draft_input(
+        self,
+        carried: Optional[SpecInput],
+        indices_cpu: Optional[torch.Tensor] = None,
+    ) -> Optional[SpecInput]:
+        """The draft input of a step's next forward: a copy of the step's
+        `carried` draft input with the per-row state gathered from the slots
+        of its `future_indices`. `carried` is left as it is; one without keys
+        (prefill, the pipeline-parallel relay) is copied as it is."""
+        if carried is None:
+            return None
+        draft_input = copy.copy(carried)
+        indices = carried.future_indices
+        if indices is None or indices.shape[0] == 0:
+            return draft_input
+        host_indices = self._host_indices(indices, indices_cpu)
+        self._wait_writers(host_indices, draft_state=True)
+
         if self.spec_algo.is_ngram():
-            draft_input = batch.spec_info
-            if draft_input is None or draft_input.future_indices is None:
-                return
-            indices = draft_input.future_indices
-            if indices.shape[0] == 0:
-                return
             draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
             draft_input.accept_lens = self.accept_lens_buf[indices]
-            return
-        draft_input: EagleDraftInput = batch.spec_info
-        if draft_input is None:
-            # FIXME(lsyin): only prefill; not compatible with mixed mode
-            return
-        indices = draft_input.future_indices
-        if indices.shape[0] == 0:
-            return
-        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
-        # record_batch_in_overlap; record_stream here is redundant.
-        indices.record_stream(torch.get_device_module(self.device).current_stream())
+            return draft_input
+
+        # CPU has no Triton gather.
+        on_cpu = indices.device.type == "cpu"
+        if not on_cpu:
+            # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
+            # record_batch_in_overlap; record_stream here is redundant.
+            indices.record_stream(self.device_module.current_stream())
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
-            (
-                draft_input.topk_p,
-                draft_input.topk_index,
-                bonus_tokens,
-                hidden_states,
-            ) = gather_spec_extras(
-                indices,
-                self.topk_p_buf,
-                self.topk_index_buf,
-                self.output_tokens_buf,
-                hidden_states_buf,
-            )
+            if on_cpu:
+                topk_p = self.topk_p_buf[indices]
+                topk_index = self.topk_index_buf[indices]
+                bonus_tokens = self.output_tokens_buf[indices]
+                hidden_states = (
+                    None if hidden_states_buf is None else hidden_states_buf[indices]
+                )
+            else:
+                topk_p, topk_index, bonus_tokens, hidden_states = gather_spec_extras(
+                    indices,
+                    self.topk_p_buf,
+                    self.topk_index_buf,
+                    self.output_tokens_buf,
+                    hidden_states_buf,
+                )
+            draft_input.topk_p = topk_p
+            draft_input.topk_index = topk_index
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
-            if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+            if self.draft_probs_buf is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
-        if draft_input.future_dsa_topk_indices_available:
-            assert self.dsa_topk_indices_buf is not None
-            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
-        else:
-            draft_input.dsa_topk_indices = None
+        dsa_topk_available = self.dsa_topk_indices_buf is not None and bool(
+            self.dsa_topk_valid[host_indices].all()
+        )
+        draft_input.future_dsa_topk_indices_available = dsa_topk_available
+        draft_input.dsa_topk_indices = (
+            self.dsa_topk_indices_buf[indices] if dsa_topk_available else None
+        )
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
+        return draft_input
+
+    def resolve_confidence_cpu(
+        self, batch: ScheduleBatch
+    ) -> Optional[ResolvedConfidence]:
+        if not self.needs_confidence_relay:
+            return None
+        return self.confidence_relay.resolve(batch)
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
@@ -476,16 +596,13 @@ class FutureMap:
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
         lengths lag the in-flight step's accept count, so rebuild the tail rows
-        from the published committed lengths behind the publish fence."""
+        from the published committed lengths behind their writers' publishes."""
         idx = batch.mix_running_indices
         n = int(idx.shape[0])
         if n == 0:
             return
-        if self.publish_ready is not None:
-            if _is_hip:
-                self.publish_ready.synchronize()
-            else:
-                self.publish_ready.wait()
+        host_indices = self._host_indices(idx, batch.mix_running_indices_cpu)
+        self._wait_writers(host_indices, draft_state=False)
         fresh = self.new_seq_lens_buf[idx]
         seq_lens = batch.seq_lens.clone()
         seq_lens[-n:] = fresh + 1
@@ -496,18 +613,7 @@ class FutureMap:
         )
         batch.out_cache_loc = out_cache_loc
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
-            fresh_cpu = fresh.cpu()  # bootstrap / non-CUDA
-        else:
-            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-            with torch.get_device_module(self.device).stream(
-                self.fwd_prepare_d2h_stream
-            ):
-                self.new_seq_lens_cpu_pinned.copy_(
-                    self.new_seq_lens_buf, non_blocking=True
-                )
-            self.fwd_prepare_d2h_stream.synchronize()
-            fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+        fresh_cpu = self._host_seq_lens(fresh, host_indices)
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu = batch.seq_lens_cpu.clone()
             seq_lens_cpu[-n:] = fresh_cpu + 1
@@ -517,90 +623,89 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
-        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
-        draft_input = batch.spec_info
-        if draft_input is None:
-            return
-
-        fi = draft_input.future_indices
-        if fi is None:
-            return
-        if self.publish_ready is not None:
-            if _DEBUG_ASSERT:
-                # Consume-once: every event wait must be re-armed by a fresh
-                # forward publish; a stale consume means a publish went missing.
-                assert self._publish_fresh, "resolve without a fresh forward publish"
-                self._publish_fresh = False
-            if _is_hip:
-                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                self.publish_ready.synchronize()
-            else:
-                self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
-
-        if not self.needs_cpu_seq_lens:
-            # GPU gather above is kept (SB.seq_lens must advance each verify);
-            # skip the .cpu() D2H. Downstream takes the GPU-only path.
-            batch.seq_lens_cpu = None
-            batch.seq_lens_sum = None
-            if _DEBUG_ASSERT:
-                # Poison consumed rows: each row must be re-published/seeded
-                # before the next resolve gathers it (safe here: the forward's
-                # re-publish is fenced behind this stream via wait_stream).
-                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
-
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
-            batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
-
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
-
-        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
-        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        if _DEBUG_ASSERT:
-            # After the D2H copy completed (synchronize above), so the pinned
-            # mirror is not poisoned.
-            _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-
     def publish(
         self,
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
-    ) -> None:
+        *,
+        indices_cpu: Optional[torch.Tensor] = None,
+    ) -> Optional[StepPublish]:
+        """Write the new lengths of these slots and, for a speculative step,
+        record its publish: the event a gather of these slots waits on."""
         indices = future_indices
         if indices.shape[0] == 0:
-            return  # DP idle
+            return None  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
-        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
-        if self.spec_algo.is_some():
-            if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
-            self.publish_ready.record()
-            self._publish_fresh = True
+        if not self.spec_algo.is_some():
+            return None
+        stream = self.device_module.current_stream()
+        publish = StepPublish(self.next_step_id, stream, self.device_module.Event())
+        self.next_step_id += 1
+        publish.seq_lens_ready.record(stream)
+        self.slot_writer[self._host_indices(indices, indices_cpu)] = publish.step_id
+        self.publishes[publish.step_id] = publish
+        if len(self.publishes) > _MAX_LIVE_PUBLISHES:
+            live = set(np.unique(self.slot_writer).tolist())
+            self.publishes = {i: p for i, p in self.publishes.items() if i in live}
+        self.last_seq_lens_ready = publish.seq_lens_ready
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
-                stream=self.fwd_prepare_d2h_stream,
-                publish_ready=self.publish_ready,
+                stream=self.confidence_d2h_stream,
+                publish_ready=publish.seq_lens_ready,
             )
+        return publish
 
-    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+    def seal(self, publish: Optional[StepPublish]) -> None:
+        """Record that every slot write of the publish's step is enqueued."""
+        if publish is None:
+            return
+        publish.ready = self.device_module.Event()
+        publish.ready.record(self.device_module.current_stream())
+
+    def seed(
+        self,
+        future_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        payload: RelayPayload,
+        *,
+        indices_cpu: torch.Tensor,
+    ) -> None:
+        """Write the committed lengths and draft state of slots whose producing
+        forward ran elsewhere (the prefill node of a PD pair), as that
+        forward's device commit would have."""
+        publish = self.publish(future_indices, seq_lens, indices_cpu=indices_cpu)
+        self.stash(future_indices, payload, indices_cpu=indices_cpu)
+        self.seal(publish)
+
+    def cuda_graph_compatible(self, indices_cpu: torch.Tensor) -> bool:
+        """Whether the draft state of all these slots lets the draft replay
+        its graphs (the DP vote reduces it across ranks)."""
+        host_indices = self._host_indices(indices_cpu, indices_cpu)
+        return bool(self.slot_graph_compatible[host_indices].all())
+
+    def release_slots(self, indices_cpu: torch.Tensor) -> None:
+        """Forget the writers of slots being freed. Call it only once no
+        pending step references the slots: at the host commit of the last
+        one, so no in-flight forward still writes them."""
+        host_indices = self._host_indices(indices_cpu, indices_cpu)
+        self.slot_writer[host_indices] = -1
+        self.dsa_topk_valid[host_indices] = False
+        self.slot_graph_compatible[host_indices] = True
+
+    def stash(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        *,
+        indices_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write a step's draft state into its slots. With `indices_cpu`, also
+        record which slots now hold a DSA top-k seed and whether their state
+        lets the draft replay its graphs."""
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
@@ -626,10 +731,15 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
-        if (
+        has_dsa_topk = (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None
-        ):
+        )
+        if has_dsa_topk:
             self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
                 self.dsa_topk_indices_buf.dtype
             )
+        if indices_cpu is not None:
+            host_indices = self._host_indices(indices, indices_cpu)
+            self.dsa_topk_valid[host_indices] = has_dsa_topk
+            self.slot_graph_compatible[host_indices] = payload.cuda_graph_compatible

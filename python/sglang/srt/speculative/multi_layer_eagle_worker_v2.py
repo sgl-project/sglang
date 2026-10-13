@@ -67,6 +67,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
     OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -1092,13 +1093,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ),
         )
 
-    def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        pp_proxy_tensors=None,
-    ):
+    def _forward(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors, pending_grammar
+    ) -> GenerationBatchResult:
         self.draft_worker.last_draft_extend_staged = False
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1107,7 +1104,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch_output = self.target_worker.forward_batch_generation(
+            batch_output = self.target_worker.forward_model(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
@@ -1119,13 +1116,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+            on_publish(batch_output.new_seq_lens)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                batch,
+                derive_batch(batch),
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
                 kv_loc_plan=kv_loc_plan,
@@ -1141,30 +1137,34 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                     self.draft_worker.draft_runner
                 )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=capture_mode,
+                batch = derive_batch(
+                    batch,
+                    spec_info=EagleDraftInput.create_idle_input(
+                        device=self.device,
+                        hidden_size=hidden_size,
+                        dtype=hidden_dtype,
+                        topk=self.topk * self.speculative_num_steps,
+                        capture_hidden_mode=capture_mode,
+                    ),
                 )
-            verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            verify_input: EagleVerifyInput = self.draft_worker.draft(
+                derive_batch(batch)
+            )
             assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
+            batch = derive_batch(batch, spec_info=verify_input)
             staged = self.draft_worker._draft_extend_plan_for_decode(batch)
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            batch_output = self.verify(batch, pending_grammar)
             # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+            on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(
-                batch,
+                derive_batch(batch),
                 batch_output,
                 staged=staged,
                 kv_loc_plan=verify_input.kv_loc_plan,
             )
             return batch_output
 
-    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+    def verify(self, batch: ScheduleBatch, pending_grammar):
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1177,5 +1177,5 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=False,
-            grammar_barrier=grammar_barrier,
+            pending_grammar=pending_grammar,
         )

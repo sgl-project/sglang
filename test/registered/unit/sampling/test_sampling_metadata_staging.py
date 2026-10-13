@@ -7,10 +7,7 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.penaltylib import (
-    BatchedMinNewTokensPenalizer,
-    BatchedPenalizerOrchestrator,
-)
+from sglang.srt.sampling.penaltylib import PenaltyStore, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -22,14 +19,12 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 VOCAB_SIZE = 32
 
 
-class _Batch:
-    def __init__(self, reqs, device):
-        self.reqs = reqs
-        self.device = device
-
-
 def _req(**sampling_params):
     return SimpleNamespace(
+        rid="r",
+        kv=SimpleNamespace(req_pool_idx=None),
+        output_ids=[],
+        grammar=None,
         sampling_params=SamplingParams(**sampling_params),
         eos_token_ids=None,
         tokenizer=SimpleNamespace(eos_token_id=None, additional_stop_token_ids=None),
@@ -53,6 +48,14 @@ class _H2DCopies(TorchDispatchMode):
             if source.device.type == "cpu" and target and target.type == "cuda":
                 self.numels.append(source.numel())
         return func(*args, **kwargs)
+
+
+def _step_penalties(reqs, device):
+    store = PenaltyStore(VOCAB_SIZE, device)
+    for slot, req in enumerate(reqs, start=1):
+        req.kv.req_pool_idx = slot
+        store.alloc(req)
+    return StepPenalties.build(reqs, store, device)
 
 
 class _SamplingMetadataTestBase(CustomTestCase):
@@ -90,34 +93,27 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].eos_token_ids = {2}
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
-        orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE, _Batch(reqs, self.device), {BatchedMinNewTokensPenalizer}
-        )
+        penalties = _step_penalties(reqs, self.device)
+        # Row 1 uses no penalty, so it holds no history row.
+        self.assertEqual(penalties.positions.tolist(), [0, 2])
         self.assert_device_tensor(
-            orch.penalizers[BatchedMinNewTokensPenalizer].min_new_tokens,
-            torch.tensor([[2], [0], [1]], dtype=torch.int32),
+            penalties.min_new_tokens,
+            torch.tensor([[2], [1]], dtype=torch.int32),
             torch.int32,
         )
         for step in range(3):
-            logits = torch.zeros(3, VOCAB_SIZE, device=self.device)
-            orch.apply(logits)
+            additive, scaling = penalties.logit_penalties()
+            self.assertIsNone(scaling)
             expected = torch.zeros(3, VOCAB_SIZE)
             if step < 2:
                 expected[0, [1, 2, 3, 4]] = -torch.inf
-            self.assert_device_tensor(logits, expected)
-            orch.cumulate_output_tokens(
-                torch.ones(3, dtype=torch.long, device=self.device)
-            )
+            self.assert_device_tensor(additive, expected)
+            penalties.commit(torch.ones(3, dtype=torch.long, device=self.device))
 
     def test_min_tokens_without_any_stop_tokens(self):
-        orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE,
-            _Batch([_req(min_new_tokens=1)], self.device),
-            {BatchedMinNewTokensPenalizer},
-        )
-        logits = torch.zeros(1, VOCAB_SIZE, device=self.device)
-        orch.apply(logits)
-        self.assert_device_tensor(logits, torch.zeros(1, VOCAB_SIZE))
+        penalties = _step_penalties([_req(min_new_tokens=1)], self.device)
+        additive, _ = penalties.logit_penalties()
+        self.assert_device_tensor(additive, torch.zeros(1, VOCAB_SIZE))
 
     def test_sparse_logit_bias_keeps_last_value_for_colliding_keys(self):
         reqs = [
@@ -126,18 +122,14 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
             _req(logit_bias={}),
             _req(logit_bias={"0": 0, "2": -1.25}),
         ]
-        info = SamplingBatchInfo.from_schedule_batch(
-            _Batch(reqs, self.device), VOCAB_SIZE
-        )
+        info = SamplingBatchInfo.build(reqs, VOCAB_SIZE, self.device)
         expected = torch.zeros(len(reqs), VOCAB_SIZE)
         expected[0, 0], expected[0, 31], expected[0, 1] = -100, 100, 3
         expected[3, 2] = -1.25
         self.assert_device_tensor(info.logit_bias, expected, torch.float32)
 
     def test_logit_bias_is_none_without_any_bias(self):
-        info = SamplingBatchInfo.from_schedule_batch(
-            _Batch([_req(), _req()], self.device), VOCAB_SIZE
-        )
+        info = SamplingBatchInfo.build([_req(), _req()], VOCAB_SIZE, self.device)
         self.assertIsNone(info.logit_bias)
 
 
@@ -152,24 +144,16 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
                 _req(min_new_tokens=2, stop_token_ids=[2, 3]) for _ in range(batch_size)
             ]
             with _H2DCopies() as copies:
-                orch = BatchedPenalizerOrchestrator(
-                    VOCAB_SIZE,
-                    _Batch(reqs, self.device),
-                    {BatchedMinNewTokensPenalizer},
-                )
-                logits = torch.zeros(batch_size, VOCAB_SIZE, device=self.device)
-                orch.apply(logits)
+                additive, _ = _step_penalties(reqs, self.device).logit_penalties()
             torch.cuda.synchronize()
             copy_counts[batch_size] = len(copies.numels)
-            self.assertTrue(torch.isneginf(logits[:, 2:4]).all().item())
+            self.assertTrue(torch.isneginf(additive[:, 2:4]).all().item())
         self.assertEqual(copy_counts[16], copy_counts[1])
 
     def test_logit_bias_never_copies_a_dense_row(self):
         reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]
         with _H2DCopies() as copies:
-            info = SamplingBatchInfo.from_schedule_batch(
-                _Batch(reqs, self.device), VOCAB_SIZE
-            )
+            info = SamplingBatchInfo.build(reqs, VOCAB_SIZE, self.device)
         torch.cuda.synchronize()
         self.assertLess(max(copies.numels), VOCAB_SIZE)
         expected = torch.zeros(len(reqs), VOCAB_SIZE)

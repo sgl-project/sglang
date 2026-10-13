@@ -14,7 +14,6 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
@@ -54,7 +53,6 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 class SchedulerInvariantChecker:
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
-    disaggregation_mode: DisaggregationMode
     page_size: int
     full_tokens_per_layer: Optional[int]
     swa_tokens_per_layer: Optional[int]
@@ -63,11 +61,11 @@ class SchedulerInvariantChecker:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
-    get_last_batch: Callable
-    get_running_batch: Callable
+    # The step this iteration launched; None when it launched nothing.
+    get_launched_step: Callable
+    get_decoding: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # it still owns its KV row.
+    # The chunked-prefill request parked between chunks; it owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -272,13 +270,7 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
+        reqs = list(self.get_decoding())
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
@@ -311,7 +303,7 @@ class SchedulerInvariantChecker:
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
     def self_check_during_busy(self):
-        if self.get_last_batch() is None:
+        if self.get_launched_step() is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()

@@ -56,10 +56,10 @@ class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
-        self.disagg_prefill_inflight_queue: List[object] = []
-        self.disagg_prefill_pending_chunk_rids: Set[str] = set()
-        self.disagg_decode_transfer_queue = _FakeTransferQueue()
-        self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.disagg_prefill = SimpleNamespace(transfer=[], pending_chunk_rids=set())
+        self.disagg_decode = SimpleNamespace(
+            transfer_queue=_FakeTransferQueue(), prealloc_queue=_FakePreallocQueue()
+        )
         self.decode_offload_manager = None
 
 
@@ -76,16 +76,16 @@ class TestDecodeMoveGate(CustomTestCase):
         self.assertTrue(gate(), "idle decode node should allow compaction")
 
         # A's destination is now visible to prefill; transfer queue still empty.
-        scheduler.disagg_decode_prealloc_queue.note_destinations_published()
-        self.assertFalse(scheduler.disagg_decode_transfer_queue.queue)
+        scheduler.disagg_decode.prealloc_queue.note_destinations_published()
+        self.assertFalse(scheduler.disagg_decode.transfer_queue.queue)
         self.assertFalse(gate())
 
         # Handing the batch to the transfer queue transfers responsibility.
-        scheduler.disagg_decode_transfer_queue.queue.append(object())
-        scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
+        scheduler.disagg_decode.transfer_queue.queue.append(object())
+        scheduler.disagg_decode.prealloc_queue.note_destinations_queued(1)
         self.assertFalse(gate(), "transfer queue still holds it")
 
-        scheduler.disagg_decode_transfer_queue.queue.clear()
+        scheduler.disagg_decode.transfer_queue.queue.clear()
         self.assertTrue(gate())
 
 
@@ -102,20 +102,20 @@ class TestPrefillMoveGate(CustomTestCase):
 
         # A middle chunk went out for rid "r0".
         scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
+        scheduler.disagg_prefill.pending_chunk_rids.add("r0")
         self.assertFalse(gate())
 
         # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
         scheduler.chunked_req = None
-        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
+        self.assertFalse(scheduler.disagg_prefill.transfer)
         self.assertFalse(gate())
 
         # Last chunk sent: the request is on the inflight queue, which covers it.
-        scheduler.disagg_prefill_inflight_queue.append(object())
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        scheduler.disagg_prefill.transfer.append(object())
+        scheduler.disagg_prefill.pending_chunk_rids.discard("r0")
         self.assertFalse(gate())
 
-        scheduler.disagg_prefill_inflight_queue.clear()
+        scheduler.disagg_prefill.transfer.clear()
         self.assertTrue(gate())
 
     def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
@@ -129,12 +129,12 @@ class TestPrefillMoveGate(CustomTestCase):
         gate = unified_memory_disagg_move_gate(scheduler)
 
         scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
+        scheduler.disagg_prefill.pending_chunk_rids.add("r0")
         self.assertFalse(gate())
 
         # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
         scheduler.chunked_req = None
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        scheduler.disagg_prefill.pending_chunk_rids.discard("r0")
         self.assertTrue(gate(), "abort cleanup must let compaction resume")
 
 

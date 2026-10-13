@@ -1,7 +1,6 @@
 """Unit tests for the DFlash spec-v2 host-sync removal: compact-rebuild
 kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
-upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
-keep-list."""
+upper bound, hybrid needs_cpu_seq_lens delegation."""
 
 import unittest
 from types import SimpleNamespace
@@ -270,29 +269,6 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         self.assertFalse(
             self._make(False, False, spec_mode="prefill").needs_cpu_seq_lens
         )
-
-
-class TestFilterBatchHostIndices(CustomTestCase):
-    def test_host_keep_list_matches_gpu_indices(self):
-        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-
-        def make():
-            info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
-            info.nxt_kv_lens_cpu = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
-            info.nxt_kv_lens_sum = 100
-            info.future_indices = torch.tensor([5, 6, 7, 8])
-            return info
-
-        keep = [0, 2]
-        a, b = make(), make()
-        a.filter_batch(new_indices=torch.tensor(keep))
-        b.filter_batch(
-            new_indices=torch.tensor(keep),
-            new_indices_cpu=keep,
-        )
-        torch.testing.assert_close(a.nxt_kv_lens_cpu, b.nxt_kv_lens_cpu)
-        self.assertEqual(a.nxt_kv_lens_sum, b.nxt_kv_lens_sum)
-        torch.testing.assert_close(a.future_indices, b.future_indices)
 
 
 if __name__ == "__main__":

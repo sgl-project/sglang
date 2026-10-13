@@ -209,10 +209,6 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND_V2 = auto()
 
-    # Used in disaggregated decode worker
-    # Represent a batch of requests having their KV cache ready to start decoding
-    PREBUILT = auto()
-
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -289,9 +285,6 @@ class ForwardMode(IntEnum):
 
     def is_extend_without_speculative(self):
         return self.is_extend() and not self.is_target_verify()
-
-    def is_prebuilt(self):
-        return self == ForwardMode.PREBUILT
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
@@ -973,17 +966,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
 
-        # Mirror the grammars-population behavior previously done in
-        # ScheduleBatch.get_model_worker_batch.
-        if batch.sampling_info is not None:
-            if batch.has_grammar:
-                batch.sampling_info.grammars = [req.grammar for req in batch.reqs]
-            else:
-                batch.sampling_info.grammars = None
-
-        # ScheduleBatch.sampling_info is already swapped to the forward-only
-        # copy by Scheduler.run_batch under overlap mode (see save/restore
-        # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
@@ -1126,17 +1108,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
-        # A dLLM denoise pass rewrites a fixed-size block in place. Context
-        # encoding uses the ordinary EXTEND position path below.
-        if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
-            block_size = batch.dllm_config.block_size
+        # A dLLM denoise pass rewrites a fixed-size block in place, at the
+        # positions its build fixed. Context encoding uses the ordinary EXTEND
+        # position path below.
+        if batch.extend_positions is not None:
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
+                batch.extend_positions,
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
         elif (

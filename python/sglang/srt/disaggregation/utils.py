@@ -19,7 +19,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    get_dsa_mtp_topk_width,
+    is_deepseek_dsa,
+)
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -39,6 +43,8 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -181,8 +187,8 @@ def unified_memory_disagg_move_gate(scheduler):
 
         def prefill_gate() -> bool:
             return not (
-                scheduler.disagg_prefill_inflight_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
+                scheduler.disagg_prefill.transfer
+                or scheduler.disagg_prefill.pending_chunk_rids
             )
 
         return prefill_gate
@@ -192,8 +198,8 @@ def unified_memory_disagg_move_gate(scheduler):
         def decode_gate() -> bool:
             decode_offload_manager = scheduler.decode_offload_manager
             return not (
-                scheduler.disagg_decode_transfer_queue.queue
-                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                scheduler.disagg_decode.transfer_queue.queue
+                or scheduler.disagg_decode.prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
                     and decode_offload_manager.has_inflight_device_transfer()
@@ -469,7 +475,7 @@ class MetadataBuffers:
                 )
 
     def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+        self.kv_checksum[req.disagg.metadata_buffer_index, 0] = value
 
     def get_kv_checksum(self, idx: int) -> int:
         return int(self.kv_checksum[idx, 0].item())
@@ -536,15 +542,19 @@ class MetadataBuffers:
 
     def set_buf(self, req: Req):
 
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.output_ids[req.disagg.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
         # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
-        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
-        self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
-        self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
-        self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+        self.cached_tokens[req.disagg.metadata_buffer_index][0] = req.cached_tokens
+        self.cached_tokens[req.disagg.metadata_buffer_index][1] = (
+            req.cached_tokens_device
+        )
+        self.cached_tokens[req.disagg.metadata_buffer_index][2] = req.cached_tokens_host
+        self.cached_tokens[req.disagg.metadata_buffer_index][3] = (
+            req.cached_tokens_storage
+        )
 
         # Compute multimodal prompt token counts on the prefill node so decode
         # can report them in usage.
@@ -552,16 +562,16 @@ class MetadataBuffers:
             image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
         else:
             image_t = audio_t = video_t = 0
-        self.cached_tokens[req.metadata_buffer_index][4] = image_t
-        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
-        self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.cached_tokens[req.disagg.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.disagg.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.disagg.metadata_buffer_index][6] = video_t
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
-                self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
+                self.output_token_logprobs_val[req.disagg.metadata_buffer_index][0] = (
                     req.logprob.output_token_logprobs_val[0]
                 )
             if req.logprob.output_token_logprobs_idx:  # not none or empty list
-                self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
+                self.output_token_logprobs_idx[req.disagg.metadata_buffer_index][0] = (
                     req.logprob.output_token_logprobs_idx[0]
                 )
 
@@ -574,7 +584,7 @@ class MetadataBuffers:
                         f"disaggregation metadata capacity {max_top_logprobs_len}. "
                         "Lower top_logprobs_num or increase the metadata buffer."
                     )
-                self.output_top_logprobs_val[req.metadata_buffer_index][
+                self.output_top_logprobs_val[req.disagg.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
                     req.logprob.output_top_logprobs_val[0],
@@ -582,7 +592,7 @@ class MetadataBuffers:
                     device="cpu",
                 )
             if req.logprob.output_top_logprobs_idx:  # not none or empty list
-                self.output_top_logprobs_idx[req.metadata_buffer_index][
+                self.output_top_logprobs_idx[req.disagg.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
                     req.logprob.output_top_logprobs_idx[0],
@@ -594,37 +604,41 @@ class MetadataBuffers:
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()
             mask_len = len(chunk.token_ids)
-            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
+            self.output_token_sampling_mask_len[req.disagg.metadata_buffer_index][0] = (
+                mask_len
+            )
             self.output_token_sampling_mask_idx[
-                req.metadata_buffer_index, :mask_len
+                req.disagg.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.token_ids))
             self.output_token_sampling_logprobs[
-                req.metadata_buffer_index, : len(chunk.logprobs)
+                req.disagg.metadata_buffer_index, : len(chunk.logprobs)
             ].copy_(torch.from_numpy(chunk.logprobs))
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
             topk = req.output_topk_p.size(0)
 
-            self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
+            self.output_topk_p[req.disagg.metadata_buffer_index, :topk].copy_(
                 req.output_topk_p
             )
-            self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
+            self.output_topk_index[req.disagg.metadata_buffer_index, :topk].copy_(
                 req.output_topk_index
             )
-            self.output_hidden_states[req.metadata_buffer_index].copy_(
+            self.output_hidden_states[req.disagg.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
             if self.output_dsa_topk_indices is not None:
                 dsa_topk_indices = req.output_dsa_topk_indices
                 if dsa_topk_indices is not None:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
-                        dsa_topk_indices
-                    )
+                    self.output_dsa_topk_indices[
+                        req.disagg.metadata_buffer_index
+                    ].copy_(dsa_topk_indices)
                 else:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
+                    self.output_dsa_topk_indices[
+                        req.disagg.metadata_buffer_index
+                    ].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
+        self.bootstrap_room[req.disagg.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
 
@@ -632,6 +646,53 @@ class MetadataBuffers:
 #########################
 # Transfer Backend
 #########################
+
+
+def build_metadata_buffers(
+    buffer_size: int,
+    *,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    custom_mem_pool: Optional[torch.cuda.MemPool],
+) -> MetadataBuffers:
+    """The PD metadata buffers, in the wire schema both nodes agree on."""
+    # eagle_utils imports this module through the memory cache.
+    from sglang.srt.speculative.eagle_utils import (
+        get_draft_recurrent_hidden_state_spec_from_config,
+    )
+
+    if spec_algorithm.carries_draft_hidden_states():
+        # Derive the rank-uniform PD wire schema from config because only the
+        # last prefill PP stage owns a draft runner.
+        draft_model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=get_spec().speculative_draft_model_path,
+            model_revision=get_spec().speculative_draft_model_revision,
+            is_draft_model=True,
+        )
+        disagg_hidden_size, disagg_hidden_states_dtype = (
+            get_draft_recurrent_hidden_state_spec_from_config(
+                draft_model_config, spec_algorithm
+            )
+        )
+    else:
+        disagg_hidden_size = 16  # minimal padding size for RDMA
+        disagg_hidden_states_dtype = torch.float32
+
+    # The PD metadata wire schema must match on P and D even when only D
+    # enables spec decoding; a seedless prefill writes the invalid sentinel.
+    output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(model_config.hf_config)
+
+    return MetadataBuffers(
+        buffer_size,
+        hidden_size=disagg_hidden_size,
+        hidden_states_dtype=disagg_hidden_states_dtype,
+        max_sampling_mask_tokens=server_args.sampling_mask_max_tokens,
+        custom_mem_pool=custom_mem_pool,
+        output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+        kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+    )
 
 
 class TransferBackend(Enum):
@@ -1824,8 +1885,8 @@ def is_unadmitted_reject(req: Req) -> bool:
     """A request rejected at intake, before it acquired anything.
 
     A preempted or resumed request can also carry a pending abort -- "Abort
-    method 3" marks a *running* request and `filter_batch` does not drop it,
-    since `finished()` is still False -- and its queue owns the release of
+    method 3" marks a *running* request that stays in its list, since
+    `finished()` is still False -- and its queue owns the release of
     whatever it still holds.
 
     `req.is_retracted` catches the two re-entries that declare nothing:
@@ -1844,7 +1905,7 @@ def is_unadmitted_reject(req: Req) -> bool:
         req.is_retracted
         or req.kv.holds_kv
         or req.kv.holds_mamba
-        or req.metadata_buffer_index >= 0
+        or req.disagg.metadata_buffer_index >= 0
         or req.kv.retraction_backup is not None
     )
 

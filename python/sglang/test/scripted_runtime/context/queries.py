@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
-from sglang.srt.runtime_context import get_parallel
-
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.test.scripted_runtime.context.api import ScriptedContext
+
+
+def _last_step(ctx: ScriptedContext) -> Optional[ScheduleBatch]:
+    """The step the last scheduler iteration launched; None when it launched
+    nothing."""
+    return ctx.scheduler.cur_batch_for_debug
 
 
 def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
@@ -14,15 +18,11 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     if s.chunked_req is not None:
         yield s.chunked_req
     yield from s.waiting_queue
-    if get_parallel().pp_size > 1:
-        for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
-            if mb is not None:
-                yield from mb.reqs
-    else:
-        if s.running_batch is not None:
-            yield from s.running_batch.reqs
-        if s.last_batch is not None:
-            yield from s.last_batch.reqs
+    yield from s.decoding
+    # A request the last step finished has left the lists already.
+    last_step = _last_step(ctx)
+    if last_step is not None:
+        yield from last_step.reqs
 
 
 def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
@@ -33,13 +33,11 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
     s = ctx.scheduler
     chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
     chunked = [chunked_rid] if chunked_rid is not None else []
-    running = (
-        [r.rid for r in s.running_batch.reqs] if s.running_batch is not None else []
-    )
+    running = [r.rid for r in s.decoding]
 
     prefill: List[str] = []
     decode: List[str] = []
-    batch = s.last_batch
+    batch = _last_step(ctx)
     if batch is not None and not batch.is_empty() and batch.forward_mode is not None:
         bucket = prefill if batch.forward_mode.is_extend() else decode
         bucket.extend(r.rid for r in batch.reqs if r.rid != chunked_rid)
@@ -54,22 +52,17 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
 
 def is_idle(ctx: ScriptedContext) -> bool:
     s = ctx.scheduler
-    return (
-        s.chunked_req is None
-        and len(s.waiting_queue) == 0
-        and (s.running_batch is None or s.running_batch.is_empty())
-    )
+    return s.chunked_req is None and len(s.waiting_queue) == 0 and not s.decoding
 
 
 def is_fully_idle(ctx: ScriptedContext) -> bool:
-    s = ctx.scheduler
-    return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
+    return is_idle(ctx) and len(ctx.scheduler.pending) == 0
 
 
 def last_batch_forward_mode(ctx: ScriptedContext) -> Optional[str]:
-    s = ctx.scheduler
-    if s.last_batch is not None and s.last_batch.forward_mode is not None:
-        return s.last_batch.forward_mode.name
+    batch = _last_step(ctx)
+    if batch is not None and batch.forward_mode is not None:
+        return batch.forward_mode.name
     return None
 
 

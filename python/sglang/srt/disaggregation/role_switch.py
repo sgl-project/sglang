@@ -120,7 +120,9 @@ def handle_pd_role_switch(
             teardown_disaggregation(scheduler)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
-            scheduler._sync_disaggregation_mode_to_subcomponents()
+            scheduler.maybe_init_disagg_prefill()
+            scheduler.maybe_init_disagg_decode()
+            scheduler.init_mode_stages()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(
@@ -216,40 +218,22 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
 
 def _current_kv_manager(scheduler: Scheduler):
-    """The KV manager of the current role's disaggregation queue, or None."""
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-        q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-    elif scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-        q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
-    else:
-        q = None
-    return getattr(q, "kv_manager", None) if q is not None else None
+    """The KV manager of the current role's owner, or None."""
+    owner = scheduler.disagg_prefill or scheduler.disagg_decode
+    return owner.kv_manager if owner is not None else None
 
 
 def teardown_disaggregation(scheduler: Scheduler) -> None:
-    """Release the current role's disaggregation structures (queues, metadata
-    buffers, KV transfer manager) so the other role can be rebuilt."""
-    mode = scheduler.disaggregation_mode
-    if mode == DisaggregationMode.PREFILL:
-        q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-        if q is not None:
-            km = getattr(q, "kv_manager", None)
-            if km is not None:
-                km.teardown()
-            scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_inflight_queue = []
-    elif mode == DisaggregationMode.DECODE:
-        q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
-        if q is not None:
-            km = getattr(q, "kv_manager", None)
-            if km is not None:
-                km.teardown()
-            scheduler.disagg_decode_prealloc_queue = None
-        scheduler.disagg_decode_transfer_queue = None
+    """Release the current role's owner (its queues, metadata buffers and KV
+    transfer manager) so the other role can be rebuilt."""
+    if scheduler.disagg_prefill is not None:
+        scheduler.disagg_prefill.kv_manager.teardown()
+        scheduler.disagg_prefill = None
+    elif scheduler.disagg_decode is not None:
+        scheduler.disagg_decode.kv_manager.teardown()
+        scheduler.disagg_decode = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
-    scheduler.disagg_metadata_buffers = None
-    scheduler.req_to_metadata_buffer_idx_allocator = None
     _release_prefix_cache_for_role_switch(scheduler)
 
 

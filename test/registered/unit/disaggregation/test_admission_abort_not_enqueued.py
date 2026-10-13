@@ -12,7 +12,7 @@ pass and the batch boundary returns the 400, so that path is deliberately left
 alone -- `test_null_mode_is_deliberately_untouched` pins that.
 
 The door must also not retire a *re-entering* request. "Abort method 3" sets
-`to_finish` on a running request and `filter_batch` does not drop it, so a
+`to_finish` on a running request that stays in its list, so a
 retracted, preempted or resumed request can arrive carrying one while its queue
 still owes a release. The prefill door detects that from the resources the
 request still holds; the decode door cannot -- a retracted request holds none of
@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -76,7 +77,7 @@ def _make_scheduler():
 
 def _prefill_queue(sched):
     q = SimpleNamespace(
-        scheduler=sched,
+        retire_unadmitted_request=sched.retire_unadmitted_request,
         queue=[],
         create_sender=MagicMock(return_value=True),
     )
@@ -85,7 +86,7 @@ def _prefill_queue(sched):
 
 def _decode_queue(sched):
     q = SimpleNamespace(
-        scheduler=sched,
+        retire_unadmitted_request=sched.retire_unadmitted_request,
         token_to_kv_pool_allocator=MagicMock(),
         retracted_queue=[],
         pending_reqs=[],
@@ -101,10 +102,15 @@ def _decode_queue(sched):
 
 
 def _admit_prefill(q, req):
+    # The owner attaches the PD state before the door.
+    if req.disagg is None:
+        req.disagg = DisaggReqState()
     PrefillBootstrapQueue.add(q, req, 8)
 
 
 def _admit_decode(q, req, **kw):
+    if req.disagg is None:
+        req.disagg = DisaggReqState()
     with patch(
         "sglang.srt.disaggregation.decode._is_fake_transfer", return_value=False
     ):
@@ -159,13 +165,15 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         for marker in ("metadata_buffer_index", "retraction_backup"):
             with self.subTest(marker=marker):
                 req = _make_req(prompt_len=16)
+                # Its first pass through the queue attached the PD state.
+                req.disagg = DisaggReqState()
                 req.to_finish = FINISH_ABORT(
                     "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
                 # release_req already freed the KV row.
                 self.assertFalse(req.kv.holds_kv)
                 if marker == "metadata_buffer_index":
-                    req.metadata_buffer_index = 7
+                    req.disagg.metadata_buffer_index = 7
                 else:
                     req.kv.retraction_backup = object()
                 self.assertFalse(is_unadmitted_reject(req))
@@ -196,13 +204,14 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
             for backup in (object(), None):
                 with self.subTest(flag=flag, has_backup=backup is not None):
                     req = _make_req(prompt_len=16)
+                    req.disagg = DisaggReqState()
                     req.to_finish = FINISH_ABORT(
                         "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                     )
                     # Exactly what retract_decode leaves behind.
                     self.assertFalse(req.kv.holds_kv)
                     self.assertFalse(req.kv.holds_mamba)
-                    self.assertEqual(req.metadata_buffer_index, -1)
+                    self.assertEqual(req.disagg.metadata_buffer_index, -1)
                     req.kv.retraction_backup = backup
 
                     sched = _make_scheduler()
@@ -230,6 +239,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         for door in ("prefill", "decode"):
             with self.subTest(door=door):
                 req = _make_req(prompt_len=16)
+                req.disagg = DisaggReqState()
                 req.to_finish = FINISH_ABORT(
                     "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -237,7 +247,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 # Exactly what a short preemption leaves behind.
                 self.assertFalse(req.kv.holds_kv)
                 self.assertIsNone(req.kv.retraction_backup)
-                self.assertEqual(req.metadata_buffer_index, -1)
+                self.assertEqual(req.disagg.metadata_buffer_index, -1)
                 self.assertFalse(is_unadmitted_reject(req))
 
                 sched = _make_scheduler()
@@ -282,6 +292,8 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
+            disagg_prefill=None,
+            disagg_decode=None,
             waiting_queue=[],
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),

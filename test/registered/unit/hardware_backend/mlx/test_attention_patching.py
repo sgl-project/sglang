@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -42,18 +41,6 @@ if _HAS_MLX:
         MlxModelRunner,
         MlxPendingDecode,
     )
-    from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
-        MlxPendingJob,
-        SchedulerMlxOverlapMixin,
-    )
-    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
-    from sglang.srt.managers.scheduler_components import (
-        batch_result_processor as batch_result_processor_module,
-    )
-    from sglang.srt.managers.scheduler_components.batch_result_processor import (
-        SchedulerBatchResultProcessor,
-    )
-    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
@@ -406,47 +393,6 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(calls, [(1, [[7]], ["r0"])])
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
-
-    def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
-        from sglang.srt.managers import scheduler as scheduler_module
-        from sglang.srt.managers.overlap_utils import RelayPayload
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        scheduler = object.__new__(Scheduler)
-        scheduler.device = "cpu"
-        scheduler.draft_worker = None
-        scheduler.tp_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(attn_backend=None)
-        )
-        scheduler.server_args = SimpleNamespace(
-            enable_two_batch_overlap=False,
-            cuda_graph_config=None,
-            speculative_algorithm=None,
-        )
-        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.req_to_token_pool = ReqToTokenPool(
-            size=4,
-            max_context_len=8,
-            device="cpu",
-            enable_memory_saver=False,
-        )
-        scheduler.enable_overlap = False
-
-        original_use_mlx = scheduler_module.use_mlx
-        scheduler_module.use_mlx = lambda: True
-        try:
-            Scheduler.init_overlap(scheduler)
-        finally:
-            scheduler_module.use_mlx = original_use_mlx
-
-        self.assertIsNotNone(scheduler.future_map)
-        indices = torch.tensor([1], dtype=torch.int64)
-        scheduler.future_map.stash(
-            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
-        )
-        self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
         runner = object.__new__(MlxModelRunner)
@@ -1106,190 +1052,6 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
 
-@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
-class TestMlxOverlapScheduler(unittest.TestCase):
-    def test_finalize_pending_job_updates_scheduler_last_batch(self):
-        token_ids = torch.tensor([7], dtype=torch.long)
-        scheduler = FakeOverlapScheduler(token_ids)
-        stale_batch = SimpleNamespace(input_ids=None)
-        batch_copy = SimpleNamespace(input_ids=None)
-        schedule_batch = SimpleNamespace(input_ids=None)
-        scheduler.last_batch = stale_batch
-
-        pending = MlxPendingJob(
-            launch=MlxLaunch(
-                lazy_tokens=None,
-                prefills=["prefill"],
-                extends=[],
-                decode=None,
-                mode="extend",
-            ),
-            batch_copy=batch_copy,
-            schedule_batch=schedule_batch,
-            reqs=[SimpleNamespace(rid="r0")],
-        )
-
-        scheduler._finalize_mlx_pending_job(pending)
-
-        self.assertIs(scheduler.last_batch, schedule_batch)
-        self.assertTrue(torch.equal(batch_copy.input_ids, token_ids))
-        self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
-        self.assertIs(scheduler.processed_batch, batch_copy)
-        self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
-
-    def test_overlap_loop_materializes_prefill_input_ids(self):
-        # Regression: the MLX overlap loop must materialize batch.input_ids
-        # (deferred input materialization) before launching the forward.
-        # Without resolve_forward_inputs in _launch_fresh, input_ids stays
-        # None and async_forward_batch_generation_mlx dereferences a None.
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        class _StopLoop(Exception):
-            pass
-
-        captured = {}
-
-        def fake_forward(batch):
-            captured["input_ids"] = batch.input_ids
-            raise _StopLoop
-
-        scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
-        scheduler.ingest_requests = lambda: []
-        scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
-        scheduler.forward_ct = 0
-        scheduler._sched_idled = False
-        scheduler.profiler_manager = SimpleNamespace(
-            _profile_batch_predicate=lambda batch: None
-        )
-        scheduler.waiting_queue = []
-        scheduler.result_queue = deque()
-        scheduler.future_map = SimpleNamespace()
-        scheduler.cur_batch_for_debug = None
-        scheduler.last_batch = None
-        scheduler.running_batch = None
-        scheduler.tp_worker = SimpleNamespace(
-            async_forward_batch_generation_mlx=fake_forward
-        )
-
-        batch = SimpleNamespace(
-            prefill_input_ids_cpu=torch.tensor([1, 2, 3], dtype=torch.int64),
-            input_ids=None,
-            mix_running_indices=None,
-            enable_overlap=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            device="cpu",
-        )
-        scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
-            SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
-        )
-
-        with self.assertRaises(_StopLoop):
-            scheduler.event_loop_overlap_mlx()
-
-        self.assertIsNotNone(captured["input_ids"])
-        self.assertTrue(torch.equal(captured["input_ids"], torch.tensor([1, 2, 3])))
-
-    def test_finished_request_snapshots_before_release(self):
-        events = []
-        tree_cache = object()
-        processor = SchedulerBatchResultProcessor(
-            is_generation=True,
-            disaggregation_mode=None,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
-            model_config=None,
-            token_to_kv_pool_allocator=None,
-            tree_cache=tree_cache,
-            hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
-            req_to_token_pool=None,
-            decode_offload_manager=None,
-            metrics_collector=None,
-            metrics_reporter=None,
-            draft_worker=None,
-            model_worker=SimpleNamespace(
-                prepare_for_kv_cache_release=lambda req: events.append(
-                    ("prepare", req.rid)
-                )
-            ),
-            logprob_result_processor=None,
-            output_streamer=None,
-            beam_coordinator=None,
-            abort_request=lambda req: None,
-        )
-        # Stub out the methods _handle_finish_state_updated_req calls that
-        # are not relevant to this test.  SchedulerBatchResultProcessor is
-        # @dataclass(slots=True, frozen=True), so patches go on the class.
-        noop_stubs = {
-            "_mamba_prefix_cache_update": lambda *a, **k: None,
-            "_maybe_collect_routed_experts": lambda *a, **k: None,
-            "_maybe_collect_indexer_topk": lambda *a, **k: None,
-            "_maybe_collect_customized_info": lambda *a, **k: None,
-        }
-        saved = {
-            name: getattr(SchedulerBatchResultProcessor, name) for name in noop_stubs
-        }
-        for name, value in noop_stubs.items():
-            setattr(SchedulerBatchResultProcessor, name, value)
-        req = SimpleNamespace(
-            rid="r0",
-            finished=lambda: True,
-            multimodal_inputs=None,
-            session=None,
-            return_routed_experts=False,
-            mamba_lazy_checkpoint=True,
-            time_stats=SimpleNamespace(
-                set_completion_time=lambda: events.append(("completion", "r0"))
-            ),
-        )
-        batch = SimpleNamespace(
-            mamba_track_mask_cpu=None,
-            mamba_track_mask_next_cpu=None,
-            mamba_decode_batch_idx_cpu=None,
-        )
-        result = SimpleNamespace()
-        i = 0
-        logits_output = SimpleNamespace(customized_info=None)
-        original_release = batch_result_processor_module.release_kv_cache
-        original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-
-        def fake_release_kv_cache(release_req, tree_cache, checkpoint=False):
-            events.append(("release", release_req.rid))
-            self.assertIs(tree_cache, processor.tree_cache)
-
-        batch_result_processor_module.release_kv_cache = fake_release_kv_cache
-        batch_result_processor_module.get_global_indexer_capturer = lambda: None
-        # The lazy predicate reads the published bags; publish the non-lazy
-        # strategy instead of stubbing the accessor.
-        from sglang.srt.runtime_context import get_context
-
-        override = get_context().override_server_args(
-            mamba_radix_cache_strategy="extra_buffer"
-        )
-        override.install()
-        try:
-            SchedulerBatchResultProcessor._handle_finish_state_updated_req(
-                processor, req, batch, result, i, logits_output
-            )
-        finally:
-            override.restore()
-            for name, original in saved.items():
-                setattr(SchedulerBatchResultProcessor, name, original)
-            batch_result_processor_module.release_kv_cache = original_release
-            batch_result_processor_module.get_global_indexer_capturer = (
-                original_get_indexer
-            )
-
-        self.assertEqual(
-            events,
-            [
-                ("prepare", "r0"),
-                ("release", "r0"),
-                ("completion", "r0"),
-            ],
-        )
-
-
 if _HAS_MLX:
 
     class FakeProjection(nn.Module):
@@ -1520,31 +1282,6 @@ if _HAS_MLX:
             self.mamba_branching_seqlen = None
             self.inflight_middle_chunks = 0
             self.mamba_branching_seqlen = None
-
-    class FakeTpWorker:
-        def __init__(self, next_token_ids):
-            self.result = GenerationBatchResult(next_token_ids=next_token_ids)
-            self.calls = []
-
-        def finalize_mlx_result(self, *args):
-            self.calls.append(args)
-            return self.result
-
-    class FakeOverlapScheduler(SchedulerMlxOverlapMixin):
-        def __init__(self, next_token_ids):
-            self.tp_worker = FakeTpWorker(next_token_ids)
-            self.last_batch = None
-            self.processed_batch = None
-            self.processed_result = None
-            # Launch bookkeeping mirrors run_batch before each MLX forward.
-            self.forward_ct = 0
-            self.profiler_manager = SimpleNamespace(
-                _profile_batch_predicate=lambda batch: None
-            )
-
-        def process_batch_result(self, batch, result):
-            self.processed_batch = batch
-            self.processed_result = result
 
 
 if __name__ == "__main__":

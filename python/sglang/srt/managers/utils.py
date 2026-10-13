@@ -54,10 +54,6 @@ class GenerationBatchResult:
     next_token_ids: Optional[
         Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
     ] = None
-    num_correct_drafts: int = 0  # no bonus included
-    num_correct_drafts_per_req_cpu: Optional[List[int]] = None
-    num_block_accept_tokens: int = 0
-    num_cap_tokens: int = 0
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
@@ -68,14 +64,9 @@ class GenerationBatchResult:
     # to validate that skipped output is never consumed.
     skipped_output_comm: bool = False
 
-    # For output processing
-    extend_input_len_per_req: Optional[List[int]] = None
-    extend_logprob_start_len_per_req: Optional[List[int]] = None
-
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
-    future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
@@ -84,10 +75,9 @@ class GenerationBatchResult:
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1
 
-    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
-    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
-    # lazily in _resolve_spec_v2_tokens — and the latter consumes
-    # grammar_retained_tokens instead of re-advancing the FSM.
+    # The step's grammar commit (advance_grammar_fsm) runs once: inside the
+    # next step's verify under overlap, else in this step's host commit. The
+    # flag marks it done; a spec decode step keeps its grammar-legal runs.
     grammar_advanced: bool = False
     grammar_retained_tokens: Optional[list] = None
 
@@ -99,11 +89,14 @@ class GenerationBatchResult:
 
     cap_lens: Optional[torch.Tensor] = None
 
-    # Next-iter seq_lens; published via on_publish.
+    # Next-iter seq_lens; the worker publishes them into FutureMap.
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
+    # The FutureMap publish of this step's slot writes (speculative steps); a
+    # pending record carries it, and a gather of the slots waits on it.
+    step_publish: Optional[Any] = None
 
     # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
     # bonus) for the NEXT verify round, relayed last stage -> all stages,
@@ -114,9 +107,9 @@ class GenerationBatchResult:
     next_verify_top_scores_index: Optional[torch.Tensor] = None
 
     # PP+spec: the verify forward's KV slots on a non-last stage. That stage
-    # prepares verify inside forward isolation, which restores
-    # batch.out_cache_loc, so the slots have to travel on the result to survive
-    # until the accepted path comes back over the relay.
+    # prepares verify on its worker's forward batch, not the step, so the
+    # slots have to travel on the result to survive until the accepted path
+    # comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
     # The plan the forward wrote its KV through, when the caller asked for it
@@ -132,9 +125,9 @@ class GenerationBatchResult:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None
 
-    # Refs the worker wants scheduler to keep alive for the same 2-iter window
-    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
-    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    # Refs the worker wants kept alive until the step's host commit (its
+    # pending record holds this result). Used for cross-stream tensor lifetime
+    # (e.g. a spec V2 verify ForwardBatch whose tensors the forward reads).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
@@ -156,8 +149,19 @@ class GenerationBatchResult:
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
+    def num_correct_drafts_per_req(self) -> Optional[List[int]]:
+        """Each row's accepted draft tokens (no non-draft token), from the
+        host accept_lens; None for a step without speculation."""
+        if self.accept_lens is None:
+            return None
+        return [
+            length - self.num_non_draft_tokens_per_req
+            for length in self.accept_lens.tolist()
+        ]
+
     def get_num_generated_tokens(self, batch_size: int) -> int:
-        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
+        num_correct_drafts = sum(self.num_correct_drafts_per_req() or [])
+        return num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -233,23 +237,6 @@ class GenerationBatchResult:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
             self.logits_output.auxiliary_device_output = None
 
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
 
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
@@ -295,8 +282,6 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     sampling_mask_output = logits_output.sampling_mask_output
 
     return {
-        "extend_input_len_per_req": result.extend_input_len_per_req,
-        "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
         "next_token_logprobs": result.logits_output.next_token_logprobs,
         "next_token_top_logprobs_val": result.logits_output.next_token_top_logprobs_val,
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
@@ -336,7 +321,7 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
-) -> tuple[LogitsProcessorOutput, list[int], list[int]]:
+) -> LogitsProcessorOutput:
     """Reconstruct output processing state received from the last PP stage."""
     sampling_mask_output = None
     if next_pp_outputs["sampling_mask_token_ids"] is not None:
@@ -348,7 +333,7 @@ def get_logprob_from_pp_outputs(
             statuses=next_pp_outputs["sampling_mask_statuses"],
             num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
-    logits_output = LogitsProcessorOutput(
+    return LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
         next_token_logits=None,
         hidden_states=None,
@@ -368,12 +353,6 @@ def get_logprob_from_pp_outputs(
         input_token_ids_logprobs_val=next_pp_outputs["input_token_ids_logprobs_val"],
         input_token_ids_logprobs_idx=next_pp_outputs["input_token_ids_logprobs_idx"],
     )
-    extend_input_len_per_req = next_pp_outputs["extend_input_len_per_req"]
-    extend_logprob_start_len_per_req = next_pp_outputs[
-        "extend_logprob_start_len_per_req"
-    ]
-
-    return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
 
 
 @dataclass

@@ -1,0 +1,150 @@
+"""The PD consensus around each PP ring slot: a rank past the first agrees
+with the ids the previous rank sent, and the owner applies the agreed ids."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from sglang.srt.disaggregation.pp_ring_consensus import (
+    _DisaggDecodeRing,
+    _DisaggPrefillRing,
+)
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+PP_MODULE = "sglang.srt.disaggregation.pp_ring_consensus"
+
+
+class _Channel:
+    """A middle PP rank: it receives what the previous rank sent, in order."""
+
+    is_first_rank = False
+    is_last_rank = False
+
+    def __init__(self, *received):
+        self.received = list(received)
+        self.sent = []
+
+    def recv_prev(self):
+        return self.received.pop(0)
+
+    def send_next(self, data):
+        self.sent.append(data)
+        return []
+
+    def commit(self, work):
+        pass
+
+
+def _decode_ring(owner, channel):
+    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock())
+
+
+class TestDisaggDecodeRing(CustomTestCase):
+    def test_take_ids_agrees_with_the_previous_rank(self):
+        owner = decode_owner_shell(
+            retracted_rids=lambda mb_id: ["a", "b"],
+            poll_prealloc_rids=lambda: (["x", "y"], ["z"]),
+            aborted_prealloc_rids=lambda: {"y"},
+            poll_transfer_rids=lambda: ["t1", "t2"],
+        )
+        channel = _Channel(["b", "c"], (["x", "y", "w"], ["v"]), ["t2", "t3"])
+        ring = _decode_ring(owner, channel)
+
+        ring.take_ids(0)
+
+        self.assertEqual(ring.retract_rids, ["b"])
+        good, bad = ring.prealloc_rids
+        # Good ids need both ranks; failed or aborted ids need one.
+        self.assertEqual(good, ["x"])
+        self.assertEqual(set(bad), {"v", "y", "z"})
+        self.assertEqual(ring.transferred_rids, ["t2"])
+        self.assertEqual(ring.rmbs[0], ["b"])
+        self.assertIsNone(ring.rmbs[1])
+
+    @patch(f"{PP_MODULE}.get_disagg")
+    def test_exchange_ids_applies_the_consensus_of_the_next_slot(self, get_disagg):
+        get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        owner = decode_owner_shell(
+            apply_retract_consensus=Mock(return_value=["r"]),
+            apply_prealloc_consensus=Mock(return_value=[["p"], []]),
+            apply_transfer_consensus=Mock(return_value=["t"]),
+        )
+        channel = _Channel(["r", "q"], [["p"], []], ["t"])
+        ring = _decode_ring(owner, channel)
+        ring.rmbs[1] = ring.pmbs[1] = ring.tmbs[1] = []
+        # The previous consensus passes on to the next rank.
+        ring.consensus_retract_rids = ["old"]
+
+        next_slot = ScheduleSlot(index=1)
+        ring.exchange_ids(next_slot, next_first_rank_mb_id=0)
+
+        owner.apply_retract_consensus.assert_called_once_with(["r", "q"], next_slot)
+        owner.apply_prealloc_consensus.assert_called_once_with([["p"], []], next_slot)
+        owner.apply_transfer_consensus.assert_called_once_with(["t"], next_slot)
+        self.assertEqual(channel.sent, [["old"]])
+        self.assertEqual(ring.consensus_retract_rids, ["r"])
+        self.assertEqual(ring.consensus_prealloc_rids, [["p"], []])
+        self.assertEqual(ring.release_rids, ["t"])
+
+    @patch(f"{PP_MODULE}.get_disagg")
+    def test_exchange_ids_skips_a_slot_that_put_nothing(self, get_disagg):
+        get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        owner = decode_owner_shell(apply_transfer_consensus=Mock())
+        channel = _Channel()
+        ring = _decode_ring(owner, channel)
+
+        ring.exchange_ids(ScheduleSlot(index=1), next_first_rank_mb_id=0)
+
+        owner.apply_transfer_consensus.assert_not_called()
+        self.assertIsNone(ring.release_rids)
+
+    def test_drained_counts_the_owner_lists(self):
+        owner = decode_owner_shell()
+        ring = _decode_ring(owner, _Channel())
+        with patch(f"{PP_MODULE}.get_disagg") as get_disagg:
+            get_disagg.return_value = SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False
+            )
+            self.assertTrue(ring.is_drained())
+            owner.ready.append(object())
+            self.assertFalse(ring.is_drained())
+
+
+class TestDisaggPrefillRing(CustomTestCase):
+    def test_release_waits_for_the_slot_consensus(self):
+        owner = prefill_owner_shell(poll_transfer_rids=lambda: ["a", "b"])
+        intake, release = Mock(), Mock()
+        channel = _Channel(["b", "c"], ["b"])
+        ring = _DisaggPrefillRing(
+            owner, channel, 2, intake=intake, schedule=Mock(), release=release
+        )
+
+        ring.take_ids(0)
+        intake.assert_called_once_with()
+        self.assertEqual(ring.transferred_rids, ["b"])
+
+        # Slot 1 put nothing to the consensus: nothing is received or released.
+        ring.exchange_ids(ScheduleSlot(index=1), next_first_rank_mb_id=0)
+        ring.after_commit(next_mb_id=1)
+        release.assert_not_called()
+
+        ring.exchange_ids(ScheduleSlot(index=0), next_first_rank_mb_id=1)
+        ring.after_commit(next_mb_id=0)
+        release.assert_called_once_with(["b"])
+
+        ring.send_ids()
+        self.assertEqual(channel.sent, [["b"]])
+        self.assertTrue(ring.is_drained())
+
+
+if __name__ == "__main__":
+    unittest.main()

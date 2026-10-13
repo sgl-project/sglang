@@ -182,7 +182,6 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         return BeamCoordinator(
             model_config=None,
             spec_algorithm=None,
-            dllm_enabled=False,
             max_req_len=0,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=allocator,

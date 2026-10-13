@@ -20,7 +20,7 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
@@ -163,11 +163,12 @@ class SpeculativeAlgorithm(Enum):
         return self.is_dspark()
 
     def supports_grammar_overlap(self) -> bool:
-        # Whether the worker advances the grammar FSM inside verify() (via the
-        # scheduler's grammar barrier), letting spec + grammar decode overlap.
-        # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
-        # from a host corpus lookup, so it stays synchronous by design.
-        # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
+        # Whether the worker runs the previous step's grammar commit inside
+        # verify() (the forward's pending_grammar), letting spec + grammar
+        # decode overlap. Needs a GPU draft phase to hide the grammar CPU work
+        # under: NGRAM drafts from a host corpus lookup, so it stays
+        # synchronous by design. STANDALONE inherits the EAGLE V2 worker's
+        # verify path, grammar commit included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
@@ -375,10 +376,6 @@ class SpecInputType(IntEnum):
     UNO_STATE = auto()
     UNO_DRAFT = auto()
     UNO_VERIFY = auto()
-    # Carried between rounds under PP: the tree the last stage drafted, which
-    # every stage rebuilds its verify input from. Neither a draft nor a verify
-    # input -- no forward ever runs on it.
-    PP_SPEC_RELAY = auto()
 
 
 class SpecInput(ABC):
@@ -442,6 +439,13 @@ class SpecInput(ABC):
         batch_size: int,
     ) -> None:
         return None
+
+    def relay_payload(self) -> RelayPayload:
+        """The slot state this draft input relays through FutureMap to the
+        next step's forward."""
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
+        return RelayPayload.from_draft_input(self)
 
 
 def spec_scale_global_num_tokens(

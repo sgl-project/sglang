@@ -31,6 +31,7 @@ class ScriptedContextReqStarter:
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
     ) -> ScriptedReqHandle:
@@ -43,6 +44,8 @@ class ScriptedContextReqStarter:
         sampling_params = {"max_new_tokens": max_new_tokens, "ignore_eos": ignore_eos}
         if stop_token_ids is not None:
             sampling_params["stop_token_ids"] = stop_token_ids
+        if stop is not None:
+            sampling_params["stop"] = stop
         if temperature is not None:
             sampling_params["temperature"] = temperature
         payload = {

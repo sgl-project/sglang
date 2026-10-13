@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -157,6 +157,14 @@ class DecodeKVCacheOffloadManager:
     def _prefill_offloaded_len(self, req: Req) -> int:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
+
+    def releasing_reqs(self) -> List[Req]:
+        """Finished requests whose KV release waits on an offload copy."""
+        reqs = {}
+        for req, *_ in self.ongoing_offload.values():
+            if req.finished():
+                reqs[id(req)] = req
+        return list(reqs.values())
 
     def has_inflight_device_transfer(self) -> bool:
         """Whether a device-to-host copy may still read unified KV pages."""

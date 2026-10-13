@@ -300,6 +300,7 @@ class Sampler(nn.Module):
         _trace_e2e_sampler("token_sync_enter")
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         _trace_e2e_sampler("token_sync_returned")
+        sampling_info.commit_sampled_tokens(batch_next_token_ids)
 
         if return_sampling_mask:
             assert sampling_mask_batch_indices is not None

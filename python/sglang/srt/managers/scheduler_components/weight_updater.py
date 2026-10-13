@@ -16,7 +16,6 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -91,7 +90,10 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
-    scheduler: Optional[Any] = None
+    is_engine_paused: Callable[[], bool]
+    record_weight_version_change: Callable[[Optional[str]], None]
+    # The PD owners, read at call time: a role switch rebuilds them.
+    get_disagg_owners: Callable[[], Tuple[Any, ...]]
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -133,7 +135,7 @@ class SchedulerWeightUpdaterManager:
         return success, message
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
-        self.scheduler.record_weight_version_change(new_version=weight_version)
+        self.record_weight_version_change(new_version=weight_version)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -335,9 +337,11 @@ class SchedulerWeightUpdaterManager:
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        scheduler = self.scheduler
+        # Held releases are dropped with the pool below (the PD decode
+        # transfer queue's release_memory_occupation).
         assert self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
+            ignore_waiting=self.is_engine_paused(),
+            ignore_releasing=True,
         ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
@@ -349,19 +353,9 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            if scheduler is not None:
-                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.release_memory_occupation()
-                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-                    if queue is not None:
-                        queue.release_memory_occupation()
+            for owner in self.get_disagg_owners():
+                if owner is not None:
+                    owner.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
 
@@ -404,20 +398,9 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-            scheduler = self.scheduler
-            if scheduler is not None:
-                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
-                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-                    if queue is not None:
-                        queue.resume_memory_occupation()
+            for owner in self.get_disagg_owners():
+                if owner is not None:
+                    owner.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 

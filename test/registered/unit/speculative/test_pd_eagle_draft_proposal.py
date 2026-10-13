@@ -57,7 +57,13 @@ def _batch(tokens):
 
 class TestPdEagleDraftProposal(CustomTestCase):
     def build(self, spec, tokens=(3, 7)):
-        with patch.object(eagle_disaggregation, "get_spec", return_value=spec):
+        # The draft input itself, not its FutureMap seeding.
+        with (
+            patch.object(eagle_disaggregation, "get_spec", return_value=spec),
+            patch.object(
+                eagle_disaggregation, "draft_state_in_future_map", return_value=False
+            ),
+        ):
             return build_eagle_disagg_draft_input(
                 _batch(tokens), torch.tensor([1, 2]), future_map=None
             )

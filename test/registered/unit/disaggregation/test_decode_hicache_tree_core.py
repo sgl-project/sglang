@@ -38,7 +38,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             prefix_device_indices=Mock(return_value=torch.tensor([10, 11])),
         )
         harness = SimpleNamespace(
-            scheduler=SimpleNamespace(enable_decode_hicache=True),
+            enable_decode_hicache=True,
             tree_cache=tree_cache,
         )
         req = SimpleNamespace(

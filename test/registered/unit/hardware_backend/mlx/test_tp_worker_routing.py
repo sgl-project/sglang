@@ -220,7 +220,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker._mlx_active_rids = set()
         worker._req_retraction_count = {}
         # The sync entry point delegates to the async launch, which guards
-        # pool creation behind this flag; forward_batch_generation has
+        # pool creation behind this flag; forward_model has
         # already run it for real by the time either path is reached.
         worker._mlx_pool_initialized = True
         return worker

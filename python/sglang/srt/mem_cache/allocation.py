@@ -379,10 +379,6 @@ def alloc_for_extend(
 
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
 
-    reuse_kv = None
-    if batch.is_dllm():
-        reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
-
     # Create tensors for allocation
     pin_memory = is_pin_memory_available(batch.device)
     prefix_lens_cpu = torch.tensor(
@@ -405,10 +401,10 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
+    if batch.kv_reuse_lens is not None and any(batch.kv_reuse_lens):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
-            reuse_kv,
+            batch.kv_reuse_lens,
             prefix_tensors,
             req_pool_indices_cpu,
             prefix_lens_cpu,
@@ -478,7 +474,7 @@ def alloc_for_extend(
 
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
-    reuse_kv: list[bool],
+    kv_reuse_lens: list[int],
     prefix_tensors: list[torch.Tensor],
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
@@ -488,13 +484,14 @@ def _alloc_extend_loc_with_kv_reuse(
 ) -> torch.Tensor:
     device = batch.device
     req_to_token = batch.req_to_token_pool.req_to_token
+    reuse_kv = [retained_len > 0 for retained_len in kv_reuse_lens]
 
     for i, req in enumerate(batch.reqs):
         if not reuse_kv[i]:
             continue
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
-        retained_len = len(req.dllm_incomplete_ids)
+        retained_len = kv_reuse_lens[i]
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
         if prefix_len + extend_len > req.kv.kv_allocated_len:
@@ -669,9 +666,9 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
         raise
 
+    # kv_committed_len follows at the step's host commit (commit_step_counters).
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
-        req.kv.kv_committed_len += token_per_req
 
     return out_cache_loc
 

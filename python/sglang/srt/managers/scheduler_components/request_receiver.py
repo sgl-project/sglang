@@ -67,7 +67,6 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
@@ -90,7 +89,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_batch()):
+            if not self.recv_skipper.handle():
                 return []
 
         recv_reqs = self._pull_raw_reqs()

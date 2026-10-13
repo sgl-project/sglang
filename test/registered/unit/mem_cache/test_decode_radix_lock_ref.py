@@ -8,7 +8,7 @@ transfer scenarios identified in PR #19746:
    inc_lock_ref(pop_preallocated) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 2. Full transfer & success (prefix match == 0, full KV transferred)
-   inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint) -> dec(release_kv_cache)
+   inc_lock_ref(admission into decoding) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
    lock(pop_preallocated) -> unlock(release_kv_cache checkpoint=False)
@@ -20,9 +20,12 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
+from sglang.srt.disaggregation.req_state import DisaggReqState
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import decode_owner_shell
 from sglang.test.test_utils import enter_override
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -30,14 +33,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.disaggregation.decode import (
-    DecodePreallocQueue,
-    SchedulerDisaggregationDecodeMixin,
-)
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
@@ -150,10 +150,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue.scheduler = SimpleNamespace(
-            sliding_window_size=127,
-            server_args=SimpleNamespace(),
-        )
+        queue.sliding_window_size = 127
+        queue.server_args = SimpleNamespace()
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
 
@@ -166,10 +164,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.scheduler = MagicMock()
-        queue.scheduler.running_batch.reqs = []
-        queue.scheduler.sliding_window_size = 128
-        queue.scheduler.last_batch = None
+        queue.sliding_window_size = 128
+        queue.enable_hisparse = False
         queue.retracted_queue = []
         queue._need_space_for_single_req = MagicMock(return_value=0)
         queue._active_req_count = MagicMock(return_value=1)
@@ -181,6 +177,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue.tree_cache.swa_evictable_size.return_value = 192
 
         budget = queue._swa_tail_allocatable_token_budget(
+            [],
             count_retracted=False,
             reserved_tokens=64,
         )
@@ -279,7 +276,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
     def test_full_transfer_success(self):
         """Scenario 2: no prefix match, full KV transferred, succeeds.
 
-        Flow: inc_lock_ref(root, via init_next_round_input/get_new_prebuilt_batch)
+        Flow: inc_lock_ref(root, via init_next_round_input at admission)
               -> dec_lock_ref + inc_lock_ref(checkpoint)
               -> dec_lock_ref(cache_finished_req)
         """
@@ -295,7 +292,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # matched_node is root
 
         root_lock_before = cache.root_node.lock_ref
-        # Step 1: lock root (simulates get_new_prebuilt_batch)
+        # Step 1: lock root (simulates admission into decoding)
         # Note: inc/dec_lock_ref skip the root node (while node != root_node),
         # so this is a no-op. Root always keeps lock_ref=1.
         lock = cache.lock(matched_node)
@@ -487,7 +484,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
         )
         req.lock = lock
-        req.pd_rebootstrap_in_progress = False
+        req.disagg = DisaggReqState()
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -544,22 +541,20 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 disaggregation_decode_enable_radix_cache=True
             ),
         )
-        scheduler = MagicMock()
-        scheduler.running_batch = running_batch
-        scheduler.server_args = server_args
-        scheduler.enable_hisparse = False
-        scheduler.enable_decode_hicache = False
-        scheduler.enable_priority_scheduling = False
-        scheduler.waiting_queue = []
-        scheduler.last_batch = None
-        scheduler.output_streamer = MagicMock()
-        queue.scheduler = scheduler
+        queue.server_args = server_args
+        queue.enable_hisparse = False
+        queue.enable_decode_hicache = False
+        queue.enable_priority_scheduling = False
+        queue.enable_lora = False
+        queue.get_ready = lambda: []
+        queue.output_streamer = MagicMock()
+        queue.pool_stats_observer = MagicMock()
 
         # Admission rejection must release the matched-node lock, including
         # when the SWA lock was already released for fresh tail allocation.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
-        preallocated, failed = queue.pop_preallocated()
+        preallocated, failed = queue.pop_preallocated(running_batch.reqs)
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
@@ -615,7 +610,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertIsNone(decode_req.hicache_restore_lock)
 
     def test_resumed_retracted_req_keeps_other_holders_lock(self):
-        """A retracted request resumed through the prebuilt batch must not release
+        """A retracted request resumed through admission must not release
         a prefix lock it never took, and must hand its own prefix copy back."""
         enter_override(
             self,
@@ -644,22 +639,15 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.kv_committed_len = 4
         req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
 
-        scheduler = SimpleNamespace(
-            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            waiting_queue=[req],
+        owner = decode_owner_shell(
+            ready=[req],
+            get_decoding=lambda: [],
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,
-            token_to_kv_pool_allocator=None,
             tree_cache=cache,
-            model_config=None,
-            enable_overlap=False,
-            spec_algorithm=None,
         )
-        with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
-            SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
-                scheduler, SimpleNamespace(batch_size=lambda: 0)
-            )
+        owner.pop_reqs_to_admit(ScheduleSlot())
         cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(shared.lock_ref, 2)

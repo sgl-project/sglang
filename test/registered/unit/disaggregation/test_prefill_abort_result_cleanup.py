@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -17,24 +17,28 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import (
+    prefill_owner_shell,
+    result_processor_shell,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _Req:
-    def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
+    def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
-        self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
             kv_allocated_len=1 if allocated else 0,
             mamba_pool_idx=object() if allocated else None,
         )
-        self.metadata_buffer_index = 7 if allocated else -1
-        self.pending_bootstrap = allocated
-        self.disagg_kv_sender = Mock()
+        self.disagg = DisaggReqState(
+            metadata_buffer_index=7 if allocated else -1, pending_bootstrap=allocated
+        )
+        self.sender = Mock()
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
@@ -58,32 +62,29 @@ class _Req:
         self.to_finish = None
 
 
-class _Scheduler(SchedulerDisaggregationPrefillMixin):
-    def __init__(self):
-        self.batch_result_processor = SimpleNamespace(
-            snapshot_auxiliary_output_starts=Mock(return_value=[]),
-            move_logprobs_to_cpu=Mock(),
-            consume_auxiliary_output=Mock(),
-        )
-        self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
-        self.tree_cache = Mock()
-        self.disagg_prefill_inflight_queue = []
-        self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
-        self.send_kv_chunk = Mock()
-        self.output_streamer = Mock()
-        self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
-        self.maybe_send_health_check_signal = Mock()
-        self.req_to_metadata_buffer_idx_allocator = Mock()
-        self.enable_hicache_storage = True
-        self.chunked_req = None
+def _owner():
+    return prefill_owner_shell(
+        batch_result_processor=result_processor_shell(),
+        spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+        tree_cache=Mock(),
+        pending_chunk_rids={"aborted-prefill"},
+        req_to_metadata_buffer_idx_allocator=Mock(),
+        send_kv_chunk=Mock(),
+        output_streamer=Mock(),
+        metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+        maybe_send_health_check_signal=Mock(),
+    )
 
 
-def _batch(req):
+def _batch(req, *, middle_chunk=False):
     return SimpleNamespace(
         reqs=[req],
+        chunked_req=req if middle_chunk else None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
+        extend_lens=None,
+        extend_logprob_start_lens=None,
     )
 
 
@@ -103,87 +104,91 @@ def _free_req(req, _tree_cache, *, checkpoint):
 def test_aborted_final_result_releases_hybrid_cache(
     checkpoint_kv_cache, release_kv_cache
 ):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
+    owner.prefilling = [req]
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
+    assert owner.prefilling == []
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
     checkpoint_kv_cache.assert_not_called()
-    req.disagg_kv_sender.abort.assert_called_once_with()
-    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
-    scheduler.tree_cache.finish.assert_called_once_with(
+    req.sender.abort.assert_called_once_with()
+    owner.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    owner.tree_cache.finish.assert_called_once_with(
         req.cache_request_handle, CacheRequestOutcome.ABORT
     )
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-    scheduler.send_kv_chunk.assert_not_called()
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
+    owner.send_kv_chunk.assert_not_called()
     assert req.output_ids == []
     assert req.finished()
-    assert req.metadata_buffer_index == -1
-    assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+    assert req.disagg.metadata_buffer_index == -1
+    assert req.rid not in owner.pending_chunk_rids
+    assert req.rid not in owner.kv_senders
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=1)
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
     req.extend_end = 50
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req, middle_chunk=True), _result(), [], None)
 
-    assert req.inflight_middle_chunks == 0
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=1)
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
     req.extend_end = len(req.origin_input_ids)
+    # Its final chunk launched while the middle chunk was still in flight.
+    owner.prefilling = [req]
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req, middle_chunk=True), _result(), [], None)
 
     release_kv_cache.assert_not_called()
-    scheduler.output_streamer.stream_output.assert_not_called()
+    owner.output_streamer.stream_output.assert_not_called()
+    assert owner.prefilling == [req]
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    assert owner.prefilling == []
+
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")
 def test_delayed_result_ignores_already_retired_request(release_kv_cache):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0, allocated=False)
+    owner = _owner()
+    req = _Req(allocated=False)
+    owner.kv_senders[req.rid] = req.sender
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
     release_kv_cache.assert_not_called()
-    req.disagg_kv_sender.abort.assert_not_called()
-    scheduler.output_streamer.stream_output.assert_not_called()
+    req.sender.abort.assert_not_called()
+    owner.output_streamer.stream_output.assert_not_called()
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
-    req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
+    req.sender.abort.side_effect = RuntimeError("transport is down")
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
+    owner.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
     assert req.finished()
 
 
@@ -192,47 +197,48 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
 def test_grammar_rejection_retires_prefill_before_transfer(
     checkpoint_kv_cache, release_kv_cache
 ):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
     req.to_finish = None
     req.grammar = Mock()
     req.grammar.accept_token.side_effect = ValueError("invalid token")
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
     req.grammar.accept_token.assert_called_once_with(11)
     assert req.grammar.finished
     assert req.finished()
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
     checkpoint_kv_cache.assert_not_called()
-    scheduler.send_kv_chunk.assert_not_called()
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-    assert scheduler.disagg_prefill_inflight_queue == []
+    owner.send_kv_chunk.assert_not_called()
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
+    assert owner.transfer == []
 
 
 def test_aborted_result_releases_mamba_allocated_before_kv():
-    scheduler = _Scheduler()
-    scheduler.enable_hicache_storage = False
-    scheduler.tree_cache.supports_mamba.return_value = True
-    scheduler.tree_cache.req_to_token_pool.mamba_allocator.free = Mock()
-    req = _Req(inflight_middle_chunks=0, allocated=False)
+    owner = _owner()
+    owner.enable_hicache_storage = False
+    owner.tree_cache.supports_mamba.return_value = True
+    owner.tree_cache.req_to_token_pool.mamba_allocator.free = Mock()
+    req = _Req(allocated=False)
+    owner.kv_senders[req.rid] = req.sender
     req.kv.mamba_pool_idx = torch.tensor([3])
     req.to_finish = FINISH_ABORT()
     req.finished_reason = None
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+    owner.commit_extend(_batch(req), _result(), [], None)
 
-    scheduler.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
+    owner.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
     assert req.kv.mamba_pool_idx is None
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
+    owner = _owner()
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
     req.to_finish = None
     req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
     result = GenerationBatchResult(
@@ -240,15 +246,13 @@ def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
         logits_output=LogitsProcessorOutput(next_token_logits=None),
     )
 
-    scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+    owner.commit_extend(_batch(req), result, [], None)
 
     assert req.finished_reason.status_code == 503
     assert req.output_ids == []
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    req.disagg_kv_sender.abort.assert_called_once_with()
-    scheduler.send_kv_chunk.assert_not_called()
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
+    req.sender.abort.assert_called_once_with()
+    owner.send_kv_chunk.assert_not_called()
 
 
 @pytest.mark.parametrize("transport_error", [False, True])
@@ -264,16 +268,17 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     release_kv_cache, status, http_status, err_type, transport_error
 ):
     """A failed sender notification must not leak ownership or lose the API error."""
-    scheduler = _Scheduler()
-    scheduler.batch_result_processor.get_sampling_mask_finish_reason = lambda **kwargs: (
+    owner = _owner()
+    owner.batch_result_processor.get_sampling_mask_finish_reason = lambda **kwargs: (
         SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(None, **kwargs)
     )
-    req = _Req(inflight_middle_chunks=0)
+    req = _Req()
+    owner.kv_senders[req.rid] = req.sender
     req.to_finish = None
     req.return_sampling_mask = True
     req.time_stats.trace_ctx = Mock()
     if transport_error:
-        req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
+        req.sender.abort.side_effect = RuntimeError("transport is down")
     result = GenerationBatchResult(
         next_token_ids=torch.tensor([11]),
         logits_output=LogitsProcessorOutput(
@@ -282,26 +287,24 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     )
 
     with get_context().override_server_args(sampling_mask_max_tokens=64):
-        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
-        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+        owner.commit_extend(_batch(req), result, [], None)
+        owner.commit_extend(_batch(req), result, [], None)
 
     assert req.finished_reason.status_code == http_status
     assert req.finished_reason.err_type == err_type
     assert req.output_ids == []
     assert not req.kv.holds_kv and not req.kv.holds_mamba
-    assert req.metadata_buffer_index == -1
-    assert not req.pending_bootstrap
-    assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    req.disagg_kv_sender.abort.assert_called_once_with()
-    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
-    scheduler.tree_cache.finish.assert_called_once_with(
+    assert req.disagg.metadata_buffer_index == -1
+    assert not req.disagg.pending_bootstrap
+    assert req.rid not in owner.pending_chunk_rids
+    release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
+    req.sender.abort.assert_called_once_with()
+    owner.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    owner.tree_cache.finish.assert_called_once_with(
         req.cache_request_handle, CacheRequestOutcome.ABORT
     )
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-    scheduler.send_kv_chunk.assert_not_called()
+    owner.output_streamer.stream_output.assert_called_once_with([req], False)
+    owner.send_kv_chunk.assert_not_called()
 
 
 class TestPrefillCompleteResult(CustomTestCase):
@@ -315,9 +318,10 @@ class TestPrefillCompleteResult(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
-        scheduler = _Scheduler()
-        scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
-        req = _Req(inflight_middle_chunks=0)
+        owner = _owner()
+        owner.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
+        req = _Req()
+        owner.kv_senders[req.rid] = req.sender
         req.to_finish = None
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
         draft = SimpleNamespace(
@@ -326,8 +330,8 @@ class TestPrefillCompleteResult(CustomTestCase):
             topk_index=torch.tensor([[3, 4]]),
             dsa_topk_indices=torch.tensor([[5, 6]]),
         )
+        # The launched step keeps no draft input; the result carries it.
         batch = _batch(req)
-        batch.spec_info = draft
         result = GenerationBatchResult(
             next_token_ids=torch.tensor([11]), next_draft_input=draft
         )
@@ -339,38 +343,42 @@ class TestPrefillCompleteResult(CustomTestCase):
                     list(req.output_ids),
                     req.hidden_states_tensor.tolist(),
                     req.output_dsa_topk_indices.tolist(),
-                    req in scheduler.disagg_prefill_inflight_queue,
+                    req in owner.transfer,
                 )
             )
 
-        req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
-        scheduler.process_batch_result_disagg_prefill(batch, result)
+        req.sender.mark_prefill_complete.side_effect = ready
+        owner.commit_extend(batch, result, [], None)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
-        self.assertTrue(req.pending_bootstrap)
-        scheduler.send_kv_chunk.assert_not_called()
+        self.assertTrue(req.disagg.pending_bootstrap)
+        owner.send_kv_chunk.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_aborted_final_result_never_publishes_ready(self, release):
-        scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
-        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        owner = _owner()
+        req = _Req()
+        owner.kv_senders[req.rid] = req.sender
+        owner.commit_extend(_batch(req), _result(), [], None)
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
-        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        self.assertEqual(owner.transfer, [])
+        req.sender.mark_prefill_complete.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
     def test_discarded_attempt_never_publishes_ready(self, force_retry):
-        scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
+        owner = _owner()
+        req = _Req()
+        owner.kv_senders[req.rid] = req.sender
         req.to_finish = None
         retried = []
-        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
-        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        owner.optimistic_release_and_requeue = lambda r, waiting: (
+            retried.append(r) or waiting
+        )
+        owner.commit_extend(_batch(req), _result(), [], None)
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
-        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        self.assertEqual(owner.transfer, [])
+        req.sender.mark_prefill_complete.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -176,7 +176,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
 
@@ -208,7 +208,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
         quiet = _FakeReq("quiet", [10, 11])
@@ -245,7 +245,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
         terminal = _FakeReq("terminal", [20], finished=True)
@@ -285,7 +285,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
         first = _FakeReq("duplicate", [10], finished=True)
@@ -309,7 +309,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
 
@@ -334,7 +334,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
 
@@ -355,7 +355,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
-                disaggregation_mode=DisaggregationMode.NULL,
+                get_disaggregation_mode=lambda: DisaggregationMode.NULL,
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )

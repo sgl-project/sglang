@@ -750,9 +750,7 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
+    from sglang.srt.sampling.penaltylib import apply_scaling_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -774,20 +772,22 @@ def eagle_sample(
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
+    # This is a relaxed version of penalties for speculative decoding: every
+    # draft position of a request sees the history before this step.
+    additive_penalties, scaling_penalties = sampling_info.logit_penalties()
+    if additive_penalties is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
+                additive_penalties,
                 verify_input.draft_token_num,
                 dim=0,
             )
         )
-    if sampling_info.acc_scaling_penalties is not None:
+    if scaling_penalties is not None:
         apply_scaling_penalties(
             next_token_logits,
             torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
+                scaling_penalties, verify_input.draft_token_num, dim=0
             ),
         )
     if sampling_info.logit_bias is not None:
@@ -1048,6 +1048,12 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    if sampling_info.penalties is not None:
+        # Guarded here: building the arguments launches device work.
+        sampling_info.commit_sampled_tokens(
+            predict[accept_index.clamp(min=0)], accept_mask=accept_index >= 0
+        )
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
@@ -1057,11 +1063,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
-
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
@@ -1070,9 +1071,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         reserve=double_alloc,
         page_size=page_size,
     )
-    for r in batch.reqs:
-        r.decode_batch_idx += 1
-
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 

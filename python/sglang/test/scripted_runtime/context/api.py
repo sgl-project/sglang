@@ -64,6 +64,7 @@ class ScriptedContext:
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
     ) -> ScriptedReqHandle:
@@ -79,6 +80,7 @@ class ScriptedContext:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             stop_token_ids=stop_token_ids,
+            stop=stop,
             temperature=temperature,
             lora_path=lora_path,
         )

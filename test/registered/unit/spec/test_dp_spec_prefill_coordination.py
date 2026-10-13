@@ -297,14 +297,14 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
 
                 def draft(current):
                     record("draft", current)
-                    self.assertIs(current, idle if is_prefill else batch)
+                    self.assertIsNot(current, batch)
                     return verify_input
 
                 def target(current, **kwargs):
                     record("target", current)
+                    self.assertIsNot(current, batch)
                     if not is_prefill:
                         self.assertIs(current.spec_info, verify_input)
-                        self.assertEqual(kwargs["grammar_barrier"], "grammar")
                     return result
 
                 def extend(current, *args, **kwargs):
@@ -319,7 +319,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 worker.device = "cpu"
                 worker.topk = 1
                 worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
-                worker._target_worker = SimpleNamespace(forward_batch_generation=target)
+                worker._target_worker = SimpleNamespace(forward_model=target)
                 worker._draft_worker = SimpleNamespace(
                     draft_runner=SimpleNamespace(),
                     draft_owns_attention=bool(rank % 2),
@@ -373,13 +373,17 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         batch,
                         plan,
                         lambda value: events.append("publish"),
-                        "grammar",
+                        None,
                         None,
                     )
                 self.assertIs(actual, result)
+                # Each phase ran on a batch of its own; the step is untouched.
+                self.assertFalse(batch.dp_spec_prefill_coordination_applied)
+                self.assertEqual(batch.global_num_tokens, list(plan.counts))
                 self.assertEqual(events, ["draft", "target", "publish", "draft_extend"])
                 if is_prefill:
-                    self.assertIn(idle, result.extra_keep_alive_refs)
+                    # The draft pass's idle batch is kept alive.
+                    self.assertEqual(len(result.extra_keep_alive_refs), 1)
                     idle.prepare_for_idle.assert_called_once()
 
     def test_disabled_feature_retains_existing_dispatch_without_phase_metadata(self):
@@ -391,7 +395,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
             is_extend_in_batch=True,
             forward_mode=ForwardMode.DECODE,
         )
-        result = worker.forward_batch_generation(batch)
+        result = worker._forward(batch, None, None, None)
         self.assertIs(result, worker._forward_prefill_batch.return_value)
         worker._forward_dp_spec_prefill_coordination.assert_not_called()
 
@@ -411,7 +415,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 torch.tensor([1, 0]),
             ),
         )
-        result = worker.forward_batch_generation(batch)
+        result = worker._forward(batch, None, None, None)
         self.assertIs(result, worker._forward_prefill_batch.return_value)
         worker._forward_dp_spec_prefill_coordination.assert_not_called()
 

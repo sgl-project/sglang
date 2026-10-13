@@ -1,11 +1,17 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from collections import deque
+from typing import Deque, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import (
+    get_device_module,
+    is_hip,
+    is_pin_memory_available,
+    is_xpu,
+)
 
 if is_xpu():
     from sgl_kernel import (
@@ -35,6 +41,7 @@ else:
 
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -55,12 +62,6 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
-
-
-class HiSparseAct(NamedTuple):
-    start_event: device_module.Event
-    finish_event: device_module.Event
-    req: Req
 
 
 class HiSparseTokenStats(NamedTuple):
@@ -133,6 +134,27 @@ def _build_prefetch_groups(
 
 
 class HiSparseCoordinator:
+    """HiSparse as an add-on: its requests' KV lives in host rows plus a small
+    device buffer per request. Each hook names its side: a core stage moves
+    requests between lists and reads host state only; an executor action does
+    device work.
+
+    - launch, core stage: `on_launch` (the launched last prefill chunks join
+      staging);
+    - prefill commit, executor action: `admit_request_into_staging` (the host
+      copy);
+    - schedule, core stage: `collect_ready_reqs` (ready -> decoding);
+    - decode forward entry, executor action: `map_last_loc_to_buffer` (the
+      slot maps);
+    - decode commit, executor action: `free_remapped_decode_slots` (the stale
+      slots);
+    - commit, core stage: `leave_finished` (finished requests leave staging);
+    - PD decode: `alloc_transfer_rows` at preallocation; executor action
+      `admit_request_direct` when a transferred request becomes ready;
+    - release: `request_finished` when `holds_rows`, through the result
+      processor's `release_finished_req`; retraction: `retract_req`.
+    """
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -251,7 +273,17 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        # Requests from the launch of their last prefill chunk until their
+        # staging copy lands, in launch order. The copy starts at the prefill's
+        # host commit; its done event is keyed by the request's slot.
+        self.staging: List[Req] = []
+        self._staging_copy_done: Dict[int, device_module.Event] = {}
+        # Per launched decode step, in launch order: a host copy of the
+        # temporary slots its forward entry remapped away from (0 = none) and
+        # the copy's event; its host commit frees them.
+        self._remapped_decode_slots: Deque[Tuple[torch.Tensor, device_module.Event]] = (
+            deque()
+        )
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -307,6 +339,10 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+        # Per request slot, whether this coordinator holds host rows or a
+        # device buffer for it: set when it takes them, cleared when it frees
+        # them. A host fact, so release asks it without reading the device.
+        self._holds_rows = [False] * max_num_req_slots
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -404,7 +440,11 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        """Executor action at the host commit of a staging request's last
+        prefill chunk: take its host rows and start the host copy of its
+        prefill KV."""
         req.hisparse_staging = True
+        self._holds_rows[req.kv.req_pool_idx] = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_end
@@ -441,10 +481,12 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+        self._staging_copy_done[req.kv.req_pool_idx] = finish_event
 
     def admit_request_direct(self, req: Req) -> None:
-        """Direct-to-host path: KV data already resides in host pool via RDMA.
+        """Executor action when PD decode moves a transferred request to its
+        ready list (direct-to-host path): KV data already resides in host pool
+        via RDMA.
 
         Skips staging DMA entirely. Only allocates a small device buffer
         (4KB) for decode-time swap-in, then marks the request as ready.
@@ -457,6 +499,7 @@ class HiSparseCoordinator:
           but here the buffer is empty.
         """
         self.alloc_device_buffer(req)
+        self._holds_rows[req.kv.req_pool_idx] = True
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
@@ -475,6 +518,23 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._skip_first_backup[req.kv.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def alloc_transfer_rows(self, req: Req, fill_len: int) -> torch.Tensor:
+        """At PD decode preallocation, take the host rows the transfer writes
+        into directly; return their indices."""
+        self._holds_rows[req.kv.req_pool_idx] = True
+        return self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req.kv.req_pool_idx,
+            0,
+            self.host_token_len(fill_len),
+        )
+
+    def holds_rows(self, req: Req) -> bool:
+        """Whether this coordinator holds host rows or a device buffer for
+        req, so its release must free them."""
+        return self._holds_rows[req.kv.req_pool_idx]
 
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
@@ -621,17 +681,34 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
+    def lists(self) -> List[RequestList]:
+        """Requests from the launch of their last prefill chunk until their
+        host copy lands; abort marks them `to_finish`."""
+        return [RequestList(name="hisparse_staging", reqs=self.staging, inflight=True)]
+
+    def on_launch(self, reqs: List[Req]) -> None:
+        """Core stage at launch: the requests whose last prefill chunk
+        launched stage until their host copy lands."""
+        self.staging.extend(reqs)
+
+    def leave_finished(self) -> None:
+        """Core stage at commit: the staging requests their prefill commit
+        finished leave staging; they never took rows."""
+        self.staging = [req for req in self.staging if not req.finished()]
 
     def collect_ready_reqs(self) -> List[Req]:
-        ready_reqs: List[Req] = []
-        if len(self.ack_staging_queue) == 0:
-            return ready_reqs
+        """Core stage at schedule: pop the staging prefix whose host copy
+        landed on every TP rank; they join decoding. Whether a copy landed is
+        its done event, a status the executor answers. The ready requests'
+        device buffers are allocated here, where allocation runs."""
+        if len(self.staging) == 0:
+            return []
 
         finish_count = 0
-        for _, finish_event, _ in self.ack_staging_queue:
-            if not finish_event.query():
+        for req in self.staging:
+            # No event yet: the prefill launched but has not committed.
+            finish_event = self._staging_copy_done.get(req.kv.req_pool_idx)
+            if finish_event is None or not finish_event.query():
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -643,14 +720,14 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
-            self.alloc_device_buffer(req)
+        ready_reqs = self.staging[:finish_count]
+        del self.staging[:finish_count]
+        for req in ready_reqs:
+            del self._staging_copy_done[req.kv.req_pool_idx]
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
-            finish_count -= 1
-            ready_reqs.append(req)
+        for req in ready_reqs:
+            self.alloc_device_buffer(req)
         return ready_reqs
 
     def map_last_loc_to_buffer(
@@ -661,6 +738,10 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        """Executor action at a decode forward's entry, on its stream: map each
+        decode row's new token into its device buffer, after the previous
+        forward that reads these maps; a device-side test here would block the
+        host on that forward, so row selection reads the host copies."""
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -678,29 +759,41 @@ class HiSparseCoordinator:
                 out_cache_loc
             )
             # Page-size-one allocation creates a temporary slot before remapping
-            # the new token into the request's reserved device-buffer slot.
+            # the new token into the request's reserved device-buffer slot. Its
+            # free waits for this step's host commit, which reads a host copy:
+            # selecting the slots here would block the host on the previous
+            # forward.
             if _is_hip or self.mem_pool_device.page_size == 1:
                 previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
                     compressed_locs
                 )
-                stale_locs = previous_locs[
-                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
-                ]
-                if stale_locs.numel() > 0:
-                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+                is_stale = (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
+                stale_locs = torch.where(is_stale, previous_locs, 0)
+                stale_locs_host = torch.empty(
+                    stale_locs.shape,
+                    dtype=stale_locs.dtype,
+                    pin_memory=is_pin_memory_available(self.device),
+                )
+                stale_locs_host.copy_(stale_locs, non_blocking=True)
+                copied = device_module.Event()
+                copied.record()
+                self._remapped_decode_slots.append((stale_locs_host, copied))
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = reserved_buffer_loc
             return
 
-        active_reqs = seq_lens % self.compress_ratio == 0
-        if not torch.any(active_reqs):
+        active_rows_cpu = torch.nonzero(seq_lens_cpu % self.compress_ratio == 0)
+        if active_rows_cpu.numel() == 0:
             return
+        active_rows = (
+            active_rows_cpu.view(-1).pin_memory().to(self.device, non_blocking=True)
+        )
 
-        active_seq_lens = seq_lens[active_reqs]
-        active_out_cache_loc = out_cache_loc[active_reqs]
-        active_req_pool_indices = req_pool_indices[active_reqs]
+        active_seq_lens = seq_lens[active_rows]
+        active_out_cache_loc = out_cache_loc[active_rows]
+        active_req_pool_indices = req_pool_indices[active_rows]
 
         compressed_seq_lens = active_seq_lens // self.compress_ratio
         reserved_positions = (compressed_seq_lens - 1).clamp(
@@ -720,6 +813,24 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
+
+    def free_remapped_decode_slots(self) -> None:
+        """Executor action at the host commit of the oldest launched decode
+        step: free the temporary slots its forward entry remapped away from.
+        Selected on the host and freed as page ids, so nothing waits on the
+        device."""
+        if not self._remapped_decode_slots:
+            return
+        stale_locs, copied = self._remapped_decode_slots.popleft()
+        # The copy precedes the step's forward, whose results the commit has.
+        copied.synchronize()
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        page_ids = torch.unique(stale_locs[stale_locs > 0] // allocator.page_size)
+        if page_ids.numel() == 0:
+            return
+        if is_pin_memory_available(self.device):
+            page_ids = page_ids.pin_memory()
+        allocator.free_page_ids(page_ids.to(self.device, non_blocking=True))
 
     def _eager_backup_previous_token(
         self,
@@ -756,7 +867,7 @@ class HiSparseCoordinator:
             return
 
         # Use a pinned, non-blocking H2D copy to avoid synchronizing the host
-        # with pending work on the schedule stream.
+        # with pending work on the current stream.
         backup_indices_gpu = torch.tensor(
             backup_indices, dtype=torch.int64, device="cpu", pin_memory=True
         ).to(self.device, non_blocking=True)
@@ -789,9 +900,9 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
-        schedule_stream = device_module.current_stream()
+        current_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
-            self.decode_backup_stream.wait_stream(schedule_stream)
+            self.decode_backup_stream.wait_stream(current_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -916,9 +1027,8 @@ class HiSparseCoordinator:
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
         # Remove from staging queue
-        self.ack_staging_queue = [
-            act for act in self.ack_staging_queue if act.req is not req
-        ]
+        self.staging = [r for r in self.staging if r is not req]
+        self._staging_copy_done.pop(req.kv.req_pool_idx, None)
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -939,6 +1049,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         self._skip_first_backup[req.kv.req_pool_idx] = False
+        self._holds_rows[req.kv.req_pool_idx] = False
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -948,6 +1059,8 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        """Free the rows of a request that leaves; release_finished_req calls
+        it only while holds_rows(req)."""
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -994,6 +1107,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.kv.req_pool_idx] = False
+        self._holds_rows[req.kv.req_pool_idx] = False
 
     def _run_swap_in_kernel(
         self,

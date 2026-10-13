@@ -21,10 +21,7 @@ class SchedulerRecvSkipper:
     def derive_forward_mode(gathered_modes: List[int]) -> Optional[ForwardMode]:
         """Collapse the gathered per-DP-rank forward modes into one weight-table
         bucket; the input is rank-identical, so the recv decision is too."""
-        active = set(gathered_modes) - {
-            ForwardMode.IDLE.value,
-            ForwardMode.PREBUILT.value,
-        }
+        active = set(gathered_modes) - {ForwardMode.IDLE.value}
         if not active:
             return None  # globally idle: same bucket as "no last batch"
         if active - {ForwardMode.DECODE.value, ForwardMode.TARGET_VERIFY.value}:
@@ -36,6 +33,8 @@ class SchedulerRecvSkipper:
     def __init__(self):
         self._use_synced_mode = get_parallel().attn_dp_enabled
         self._counter = 0
+        # The mode of the last iteration's step; None when it launched nothing.
+        self._last_mode: Optional[ForwardMode] = None
         self._threshold = get_schedule().scheduler_recv_interval
         # All can be tuned if needed
         self._default_weight = envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT.get()
@@ -45,21 +44,23 @@ class SchedulerRecvSkipper:
             None: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE.get(),
         }
 
-    def _pick_mode(self, last_batch: Optional[ScheduleBatch]) -> Optional[ForwardMode]:
+    def on_launch(self, step: Optional[ScheduleBatch]) -> None:
+        """Record the mode of this iteration's step; None when nothing launched."""
         # The recv decision must be identical on every rank in the request
         # broadcast. Local modes differ across DP ranks (IDLE vs DECODE), so
         # use the rank-consistent mode derived from the MLP sync all-gather.
-        if last_batch is None:
-            return None
-        if self._use_synced_mode:
-            return last_batch.recv_skipper_forward_mode
-        return last_batch.forward_mode
+        if step is None:
+            self._last_mode = None
+        elif self._use_synced_mode:
+            self._last_mode = step.recv_skipper_forward_mode
+        else:
+            self._last_mode = step.forward_mode
 
-    def handle(self, last_batch: Optional[ScheduleBatch]) -> bool:
+    def handle(self) -> bool:
         should_recv = False
 
         last_weight = self._weight_of_forward_mode.get(
-            self._pick_mode(last_batch), self._default_weight
+            self._last_mode, self._default_weight
         )
         self._counter += last_weight
 

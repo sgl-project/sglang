@@ -1,177 +1,80 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Tuple
 
 import torch
 
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.runtime_context import get_spec
 
 
-class PPSpecRelayInput(SpecInput):
-    """The draft tree the last PP stage produced, carried by the requests it
-    belongs to so every stage can rebuild the same verify input.
+class PPSpecRelay:
+    """Per request slot (req_pool_idx): the draft tree the request's next
+    verify round runs, as the last PP stage drafted it.
 
-    Under PP the draft model lives on the last stage only, so the other stages
-    receive the tree over the output relay instead of drafting it. It has to
-    survive between rounds and across microbatch recomposition, which is why
-    it rides on ``ScheduleBatch.spec_info`` and implements the filter / merge
-    hooks rather than living in a side table: a request that finishes, gets
-    retracted, or is merged in from a just-finished prefill carries its own
-    row along with it.
-
-    Rows are per request and aligned with ``batch.reqs``. ``rids`` is kept
-    alongside them because the relayed tensors are sized by the composition
-    that ran the forward, which can differ from the live batch by the time
-    the result comes back around the ring.
-
-    This is the algorithm-agnostic half of the PP relay: the tokens plus the
-    topology they were arranged by. A speculative algorithm whose proposal is
-    not an EAGLE-style tree can subclass it (or mirror it) and only has to
-    supply its own rebuild.
+    Under PP the draft model lives on the last stage only, so every stage takes
+    the tree from the output relay instead of drafting it. When the relay
+    brings a step's outputs back, the ring writes their trees into the slots of
+    the step's rows; the next round's launch gathers its rows' trees and builds
+    the verify input every stage runs. The ring commits a slot's step before it
+    schedules the slot again, so a row's tree is written before it is read.
     """
 
-    def __init__(
-        self,
-        rids: List[str],
-        tokens: torch.Tensor,
-        parents: Optional[torch.Tensor] = None,
-        top_scores: Optional[torch.Tensor] = None,
-    ):
-        super().__init__(SpecInputType.PP_SPEC_RELAY)
-        # [bs, num_draft_tokens], column 0 is the bonus token
-        self.rids = rids
-        self.tokens = tokens
-        # parent_list / top_scores_index, [bs, *]. None until the request has
-        # been drafted for: its first decode after prefill carries zero drafts,
-        # which are rejected whatever tree shape they hang on.
-        self.parents = parents
-        self.top_scores = top_scores
-
-    def __repr__(self) -> str:
-        return (
-            f"PPSpecRelayInput(bs={len(self.rids)}, drafted={self.parents is not None})"
+    def __init__(self, req_pool_size: int, device: str):
+        spec = get_spec()
+        self.num_draft_tokens = spec.speculative_num_draft_tokens
+        num_steps = spec.speculative_num_steps
+        parent_width = (
+            spec.speculative_eagle_topk * (num_steps - 1) + 1 if num_steps > 1 else 0
+        )
+        # Column 0 of a tree is its root, the bonus token.
+        self.tokens = torch.zeros(
+            (req_pool_size, self.num_draft_tokens), dtype=torch.int64, device=device
+        )
+        self.parents = torch.zeros(
+            (req_pool_size, parent_width), dtype=torch.long, device=device
+        )
+        self.top_scores = torch.zeros(
+            (req_pool_size, self.num_draft_tokens - 1), dtype=torch.long, device=device
+        )
+        # The topology of a tree that proposes nothing, in the tree kernel's
+        # row strides: consecutive selected indices and earlier parents give an
+        # acyclic tree; topk = 1 reduces to a chain.
+        self.chain_parents = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=device
+        )
+        self.chain_top_scores = torch.arange(
+            self.num_draft_tokens - 1, dtype=torch.long, device=device
         )
 
-    @classmethod
-    def degenerate(
-        cls, rids: List[str], bonus_tokens: torch.Tensor, num_draft_tokens: int
-    ) -> PPSpecRelayInput:
-        """A tree that proposes nothing: just the sampled token, padded with
-        zeros. What a request carries out of prefill, before the last stage
-        has drafted for it."""
-        tokens = torch.zeros(
-            (len(rids), num_draft_tokens),
+    def write_roots(self, indices: torch.Tensor, bonus_tokens: torch.Tensor) -> None:
+        """Trees that propose nothing: the sampled token, then zero drafts that
+        the verify rejects. What a request carries out of prefill, before the
+        last stage has drafted for it."""
+        rows = torch.zeros(
+            (indices.shape[0], self.num_draft_tokens),
             dtype=torch.int64,
-            device=bonus_tokens.device,
+            device=self.tokens.device,
         )
-        tokens[:, 0] = bonus_tokens.to(torch.int64)
-        return cls(rids=list(rids), tokens=tokens)
+        rows[:, 0] = bonus_tokens
+        self.tokens[indices] = rows
+        self.parents[indices] = self.chain_parents
+        self.top_scores[indices] = self.chain_top_scores
 
-    def filter_batch(
-        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
+    def write_trees(
+        self,
+        indices: torch.Tensor,
+        tokens: torch.Tensor,
+        parents: torch.Tensor,
+        top_scores: torch.Tensor,
     ) -> None:
-        keep = new_indices_cpu if new_indices_cpu is not None else new_indices.tolist()
-        self.rids = [self.rids[i] for i in keep]
-        self.tokens = self.tokens[new_indices]
-        if self.parents is not None:
-            self.parents = self.parents[new_indices]
-            self.top_scores = self.top_scores[new_indices]
+        """The trees the last stage drafted, with the topology their tokens
+        were arranged by (data-dependent once topk > 1)."""
+        self.tokens[indices] = tokens.to(torch.int64).reshape(-1, self.num_draft_tokens)
+        self.parents[indices] = parents.to(torch.long)
+        self.top_scores[indices] = top_scores.to(torch.long)
 
-    def merge_batch(self, other: PPSpecRelayInput) -> None:
-        if not other.rids:
-            return
-        if not self.rids:
-            self.rids, self.tokens = list(other.rids), other.tokens
-            self.parents, self.top_scores = other.parents, other.top_scores
-            return
-        self.rids = self.rids + list(other.rids)
-        self.tokens = torch.cat([self.tokens, other.tokens])
-        # A batch merging in from prefill has no topology yet; give it the
-        # other side's widths so the rows stay stackable.
-        left, right = self._widths(), other._widths()
-        widths = left if left is not None else right
-        if widths is None:
-            self.parents = self.top_scores = None
-            return
-        self.parents = torch.cat(
-            [self._parents_or_chain(widths), other._parents_or_chain(widths)]
-        )
-        self.top_scores = torch.cat(
-            [self._top_scores_or_chain(widths), other._top_scores_or_chain(widths)]
-        )
-
-    def adopt(self, relayed: PPSpecRelayInput) -> None:
-        """Take the relayed rows for the requests they cover, in this input's
-        order, keeping the current row for any request the relay does not
-        mention (one merged in after the forward was launched)."""
-        by_rid = {rid: i for i, rid in enumerate(relayed.rids)}
-        rows = [by_rid.get(rid) for rid in self.rids]
-        if all(r is None for r in rows):
-            return
-        take = torch.tensor(
-            [r if r is not None else 0 for r in rows],
-            dtype=torch.long,
-            device=relayed.tokens.device,
-        )
-        keep = torch.tensor(
-            [r is None for r in rows], dtype=torch.bool, device=self.tokens.device
-        )
-        relayed_tokens = relayed.tokens.to(self.tokens.device)[take]
-        self.tokens = torch.where(keep.unsqueeze(1), self.tokens, relayed_tokens)
-        if relayed.parents is None:
-            return
-        widths = relayed._widths()
-        self.parents = torch.where(
-            keep.unsqueeze(1),
-            self._parents_or_chain(widths),
-            relayed.parents.to(self.tokens.device)[take],
-        )
-        self.top_scores = torch.where(
-            keep.unsqueeze(1),
-            self._top_scores_or_chain(widths),
-            relayed.top_scores.to(self.tokens.device)[take],
-        )
-
-    def reindex(self, rids: List[str]) -> PPSpecRelayInput:
-        """This input's rows in another composition's order. Every rid must be
-        covered -- the caller is relabelling the same requests, not adding."""
-        by_rid = {rid: i for i, rid in enumerate(self.rids)}
-        take = torch.tensor(
-            [by_rid[rid] for rid in rids], dtype=torch.long, device=self.tokens.device
-        )
-        return PPSpecRelayInput(
-            rids=list(rids),
-            tokens=self.tokens[take],
-            parents=None if self.parents is None else self.parents[take],
-            top_scores=None if self.top_scores is None else self.top_scores[take],
-        )
-
-    def topology(self, *, fallback):
-        """The rows' tree shape, as a rectangular pair. ``fallback`` supplies
-        chain constants for the case where no request has been drafted for
-        yet, since their width comes from the spec config, not from a row."""
-        widths = self._widths()
-        if widths is None:
-            return fallback()
-        return self._parents_or_chain(widths), self._top_scores_or_chain(widths)
-
-    def _widths(self):
-        if self.parents is None:
-            return None
-        return self.parents.shape[1], self.top_scores.shape[1]
-
-    def _parents_or_chain(self, widths) -> torch.Tensor:
-        if self.parents is not None:
-            return self.parents
-        width = widths[0]
-        return torch.arange(
-            -1, width - 1, dtype=torch.long, device=self.tokens.device
-        ).repeat(len(self.rids), 1)
-
-    def _top_scores_or_chain(self, widths) -> torch.Tensor:
-        if self.top_scores is not None:
-            return self.top_scores
-        width = widths[1]
-        return torch.arange(width, dtype=torch.long, device=self.tokens.device).repeat(
-            len(self.rids), 1
-        )
+    def gather(
+        self, indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The trees of these slots: tokens, parents, top scores."""
+        return self.tokens[indices], self.parents[indices], self.top_scores[indices]

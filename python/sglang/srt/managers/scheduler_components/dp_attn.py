@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _decode_total_seq_lens,
     _prefill_attention_pairs,
@@ -22,10 +21,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
 from sglang.srt.managers.utils import is_health_check_generate_req
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -60,15 +56,11 @@ def _spec_input_cuda_graph_compatible(
 ) -> bool:
     """Return the local speculative-draft graph admission bit.
 
-    None/idle/prebuilt inputs stay permissive so an active rank with complete
+    None/idle inputs stay permissive so an active rank with complete
     runtime state can still use graphs. Any active incompatible input is
     min-reduced by ``MLPSyncBatchInfo`` and forces every DP rank eager.
     """
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     spec_info = local_batch.spec_info
     return spec_info is None or spec_info.cuda_graph_compatible
@@ -344,11 +336,7 @@ def _local_decode_cuda_graph_vote(
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
         return False
-    return (
-        local_batch is None
-        or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    )
+    return local_batch is None or local_batch.forward_mode.is_decode_or_idle()
 
 
 def _local_prefill_cuda_graph_vote(
@@ -444,11 +432,7 @@ def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
     attention: one query per decode row over its committed length (spec
     batches have no CPU seq_lens at schedule time), the chunk formula for
     prefill."""
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_prebuilt()
-        or local_batch.forward_mode.is_idle()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         return 0
     if local_batch.forward_mode.is_decode():
         return _decode_total_seq_lens(local_batch)
@@ -463,7 +447,7 @@ class DPSyncWaitCarry:
     then for the running batch); the first gather absorbs the cross-rank
     arrival skew but yields no batch to record on. Only batch-less gathers carry: an iteration
     that ends with no batch drops the carry in Scheduler.on_idle, and a step
-    that runs a batch without recording (prebuilt, health check) drops it too,
+    that runs a batch without recording (health check) drops it too,
     so an idle engine's gathers never pile onto the first busy step.
     """
 
@@ -490,11 +474,7 @@ def prepare_mlp_sync_batch_raw(
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
-    if (
-        local_batch is None
-        or local_batch.forward_mode.is_prebuilt()
-        or local_batch.forward_mode.is_idle()
-    ):
+    if local_batch is None or local_batch.forward_mode.is_idle():
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
@@ -618,25 +598,18 @@ def prepare_mlp_sync_batch_raw(
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 
-    batch_to_gather = local_batch
-    if need_idle_batch:
-        if local_batch is None:
-            batch_to_gather = local_batch = get_idle_batch()
-        elif local_batch.forward_mode.is_prebuilt():
-            # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
-            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+    if need_idle_batch and local_batch is None:
+        local_batch = get_idle_batch()
 
-    if batch_to_gather is not None:
+    if local_batch is not None:
         _update_gather_batch(
-            batch_to_gather,
+            local_batch,
             mlp_sync_info,
             require_mlp_tp_gather,
             draft_require_mlp_tp_gather,
             skip_global_metadata=not metadata_ready,
         )
 
-    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
-    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
@@ -672,13 +645,10 @@ def prepare_mlp_sync_batch_raw(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
-    req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    tree_cache: BasePrefixCache
     offload_tags: set[str]
-    model_config: ModelConfig
-    enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
+    # The scheduler's step factory: an empty step of the given requests.
+    new_step: Callable[[List[Req]], ScheduleBatch]
     get_require_mlp_sync: Callable[[], bool]
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
 
@@ -726,26 +696,24 @@ class SchedulerDPAttnAdapter:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
-    def maybe_convert_decode_to_extend(
-        self, batch: Optional[ScheduleBatch]
-    ) -> Optional[ScheduleBatch]:
-        """After the mlp-sync gather: convert an eligible decode batch to the
-        extend view when a peer rank runs extend this step, so the step stays
+    def maybe_set_extend_view(self, batch: Optional[ScheduleBatch]) -> None:
+        """After the mlp-sync gather: give an eligible decode step the extend
+        view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
         if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
             # Keep verification rows in their native mode on heterogeneous steps.
-            return batch
+            return
         if batch is None or not batch.forward_mode.is_decode():
-            return batch
+            return
         # Global triggers from the gather. This rank's own eligibility (spec/
         # TBO/CP/logprob/replayability) is folded into the min-reduced vote:
         # if it failed, can_run_dp_prefill_cuda_graph is already False.
         if not batch.is_extend_in_batch:
-            return batch
+            return
         if not batch.can_run_dp_prefill_cuda_graph:
             # The step is eager everywhere; eager decode beats eager mixed.
-            return batch
+            return
         global_tokens = batch.global_num_tokens
         if (
             global_tokens is not None
@@ -753,21 +721,12 @@ class SchedulerDPAttnAdapter:
             and min(global_tokens) == 0
         ):
             # An idle rank makes the prefill runner reject replay for every
-            # rank (_has_inactive_dp_rank); converting would only trade eager
-            # decode for eager mixed.
-            return batch
-        batch.convert_decode_to_extend()
-        return batch
+            # rank (_has_inactive_dp_rank); the extend view would only trade
+            # eager decode for eager mixed.
+            return
+        batch.set_extend_view()
 
     def get_idle_batch(self) -> ScheduleBatch:
-        idle_batch = ScheduleBatch.init_new(
-            [],
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-        )
+        idle_batch = self.new_step([])
         idle_batch.prepare_for_idle()
         return idle_batch

@@ -1,15 +1,11 @@
-"""Readback and runtime updates for the scheduler's internal state.
-
-Holds the live ``Scheduler`` because both sides answer about the state at call
-time; it only reads it.
-"""
+"""Readback and runtime updates for the scheduler's internal state."""
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -23,7 +19,14 @@ from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.request_lists import RequestList
+    from sglang.srt.managers.scheduler_components.metrics_reporter import (
+        SchedulerMetricsReporter,
+    )
+    from sglang.srt.managers.tp_worker import BaseTpWorker
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,23 @@ class UpdateRejected(Exception):
     """A requested update is not applicable to this scheduler."""
 
 
+@dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerInternalStateController:
-    def __init__(self, scheduler: Scheduler, record_step_time: bool) -> None:
-        self.scheduler = scheduler
-        self.record_step_time = record_step_time
+    tp_worker: BaseTpWorker
+    draft_worker: Any
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    spec_algorithm: SpeculativeAlgorithm
+    max_running_requests: int
+    max_total_num_tokens: int
+    swa_tokens_per_layer: Optional[int]
+    startup_available_gpu_memory_gb: float
+    metrics_reporter: SchedulerMetricsReporter
+    rust_server: Any
+    get_disaggregation_mode: Callable[[], DisaggregationMode]
+    get_request_lists: Callable[[], Dict[str, RequestList]]
+    # Set once the scheduler finishes starting, after this is built.
+    get_startup_time: Callable[[], Any]
+    record_step_time: bool
 
     # ---------------------------------------------------------------- readback
 
@@ -63,26 +79,24 @@ class SchedulerInternalStateController:
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
 
     def _add_topology(self, state: Dict[str, Any]) -> None:
-        scheduler = self.scheduler
         state["world_size"] = compute_world_size(
             dp_size=get_parallel().dp_size,
             tp_size=get_parallel().tp_size,
             pp_size=get_parallel().pp_size,
         )
-        state["startup_time"] = scheduler.startup_time
-        state["effective_max_running_requests_per_dp"] = scheduler.max_running_requests
-        state["last_gen_throughput"] = scheduler.metrics_reporter.last_gen_throughput
+        state["startup_time"] = self.get_startup_time()
+        state["effective_max_running_requests_per_dp"] = self.max_running_requests
+        state["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
-        scheduler = self.scheduler
-        draft_worker = scheduler.draft_worker
+        draft_worker = self.draft_worker
         state["memory_usage"] = build_memory_usage(
-            weight_gb=scheduler.tp_worker.model_runner.weight_load_mem_usage,
-            kv_cache_gb=scheduler.token_to_kv_pool_allocator.get_kvcache().mem_usage,
-            startup_available_gb=scheduler.startup_available_gpu_memory_gb,
-            token_capacity=scheduler.max_total_num_tokens,
-            token_capacity_swa=scheduler.swa_tokens_per_layer,
-            target_graph_memory_usage=scheduler.tp_worker.graph_memory_usage,
+            weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
+            startup_available_gb=self.startup_available_gpu_memory_gb,
+            token_capacity=self.max_total_num_tokens,
+            token_capacity_swa=self.swa_tokens_per_layer,
+            target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=(
                 None if draft_worker is None else draft_worker.graph_memory_usage
             ),
@@ -91,16 +105,11 @@ class SchedulerInternalStateController:
     def _add_disaggregation(self, state: Dict[str, Any]) -> None:
         # PD role switch: report this instance's role and the decode CUDA graph
         # batch sizes it captured, which a router feeds back as
-        # PdRoleSwitchReqInput.decode_cuda_graph_bs. Unset until
-        # init_disaggregation runs, which also re-derives it on every flip.
-        mode = getattr(self.scheduler, "disaggregation_mode", None)
-        if mode is None:
-            return
+        # PdRoleSwitchReqInput.decode_cuda_graph_bs.
+        mode = self.get_disaggregation_mode()
         graph_memory = state["memory_usage"]["graph"]
         state["disaggregation_mode"] = mode.value
-        state["decode_cuda_graph_bs"] = (
-            self.scheduler.tp_worker.get_decode_cuda_graph_bs()
-        )
+        state["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
         state["decode_cuda_graph_memory_gb"] = round(
             sum(graph_memory[phase] for phase in _DECODE_GRAPH_PHASES), 3
         )
@@ -117,24 +126,23 @@ class SchedulerInternalStateController:
         state["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
 
     def _add_speculative(self, state: Dict[str, Any]) -> None:
-        scheduler = self.scheduler
-        if scheduler.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none():
             return
         accept_length = self._average_accept_length()
         if accept_length is not None:
             state["avg_spec_accept_length"] = accept_length
-        if scheduler.spec_algorithm.is_dspark() and scheduler.draft_worker is not None:
-            info_record = scheduler.draft_worker.dump_info_records()
+        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+            info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:
-            state["step_time_dict"] = self.scheduler.metrics_reporter.step_time_dict
+            state["step_time_dict"] = self.metrics_reporter.step_time_dict
 
     def _add_rust_server(self, state: Dict[str, Any]) -> None:
-        if self.scheduler.rust_server is not None:
-            state["rust_mm_transport"] = self.scheduler.rust_server.mm_transport_stats()
+        if self.rust_server is not None:
+            state["rust_mm_transport"] = self.rust_server.mm_transport_stats()
 
     def _add_env_vars(self, state: Dict[str, Any]) -> None:
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
@@ -184,7 +192,7 @@ class SchedulerInternalStateController:
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
-        upper = self.scheduler.max_running_requests // get_parallel().pp_size
+        upper = self.max_running_requests // get_parallel().pp_size
         if value < 1 or value > upper:
             raise UpdateRejected(
                 f"Updating {key} to {value} is rejected because it is out of "
@@ -194,7 +202,7 @@ class SchedulerInternalStateController:
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
         # target policy, which is what a captured sampling mask describes.
-        if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
+        if not self.spec_algorithm.is_dflash() or float(value) == 1.0:
             return
         if self._has_active_sampling_mask_request():
             raise UpdateRejected(
@@ -207,7 +215,7 @@ class SchedulerInternalStateController:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             logger.info(f"avg_spec_accept_length={accept_length}")
-        metrics_reporter = self.scheduler.metrics_reporter
+        metrics_reporter = self.metrics_reporter
         metrics_reporter.spec_total_num_accept_tokens = (
             metrics_reporter.spec_total_num_forward_ct
         ) = 0
@@ -220,7 +228,7 @@ class SchedulerInternalStateController:
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
         # A worker command, not a server arg: keep it out of the override.
-        self.scheduler.draft_worker.set_dspark_forced_budget_frac(
+        self.draft_worker.set_dspark_forced_budget_frac(
             None if value is None else float(value)
         )
 
@@ -229,20 +237,20 @@ class SchedulerInternalStateController:
 
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
-            self.scheduler.draft_worker.clear_info_records()
+            self.draft_worker.clear_info_records()
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
-        if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(
-            self.scheduler.draft_worker, command
+        if not self.spec_algorithm.is_dspark() or not hasattr(
+            self.draft_worker, command
         ):
             raise UpdateRejected(f"{key} requires a DSpark draft worker.")
 
     # ------------------------------------------------------------------ shared
 
     def _average_accept_length(self) -> Optional[float]:
-        metrics_reporter = self.scheduler.metrics_reporter
+        metrics_reporter = self.metrics_reporter
         if (
-            self.scheduler.spec_algorithm.is_none()
+            self.spec_algorithm.is_none()
             or metrics_reporter.spec_total_num_forward_ct <= 0
         ):
             return None
@@ -252,33 +260,13 @@ class SchedulerInternalStateController:
         )
 
     def _has_active_sampling_mask_request(self) -> bool:
-        """Whether any unfinished request holding a sampling mask is queued or
-        running, including PP micro-batches and PD decode queues."""
-        scheduler = self.scheduler
-        batches = [scheduler.running_batch, scheduler.last_batch]
-        batches.extend(getattr(scheduler, "running_mbs", ()))
-        batches.extend(getattr(scheduler, "mbs", ()))
-        batches.extend(getattr(scheduler, "last_mbs", ()))
-        queued = [
-            *(req for batch in batches if batch is not None for req in batch.reqs),
-            *scheduler.waiting_queue,
-            *scheduler.grammar_manager.grammar_queue,
-        ]
-        if scheduler.chunked_req is not None:
-            queued.append(scheduler.chunked_req)
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            prealloc_queue = scheduler.disagg_decode_prealloc_queue
-            queued.extend(
-                decode_req.req
-                for decode_req in (
-                    *prealloc_queue.queue,
-                    *prealloc_queue.pending_reqs,
-                    *scheduler.disagg_decode_transfer_queue.queue,
-                )
-            )
-            queued.extend(prealloc_queue.retracted_queue)
-            queued.extend(prealloc_queue.held_rebootstrap_reqs)
-        return any(req.return_sampling_mask and not req.finished() for req in queued)
+        """Whether any unfinished request holding a sampling mask is in a
+        request list."""
+        return any(
+            req.return_sampling_mask and not req.finished()
+            for entry in self.get_request_lists().values()
+            for req in entry.reqs
+        )
 
 
 class _UpdateHandler:

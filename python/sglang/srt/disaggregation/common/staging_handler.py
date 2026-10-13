@@ -78,7 +78,7 @@ class DecodeStagingHandler:
         decode_tp: int,
         total_kv_heads: int,
         tp_rank: int,
-        scheduler,
+        req_to_token_pool,
     ):
         self.kv_manager = kv_manager
         self.staging_allocator = staging_allocator
@@ -86,7 +86,7 @@ class DecodeStagingHandler:
         self.decode_tp = decode_tp
         self.total_kv_heads = total_kv_heads
         self.tp_rank = tp_rank
-        self.scheduler = scheduler
+        self.req_to_token_pool = req_to_token_pool
         # Same stall->Failed semantics (and knob) as _check_waiting_timeout,
         # which is unreachable once the receiver has concluded Success.
         from sglang.srt.environ import envs
@@ -132,7 +132,9 @@ class DecodeStagingHandler:
         return tp_writers * pp_writers
 
     @classmethod
-    def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
+    def create(
+        cls, kv_manager, req_to_token_pool, tp_rank: int
+    ) -> DecodeStagingHandler:
         """Factory: create handler. Raises if staging infra is missing."""
         staging_allocator = kv_manager._staging_ctx.allocator
         if staging_allocator is None:
@@ -160,7 +162,7 @@ class DecodeStagingHandler:
             decode_tp=decode_tp,
             total_kv_heads=total_kv_heads,
             tp_rank=tp_rank,
-            scheduler=scheduler,
+            req_to_token_pool=req_to_token_pool,
         )
 
     # ------------------------------------------------------------------
@@ -429,7 +431,7 @@ class DecodeStagingHandler:
         prefill_tp = receiver.prefill_info.attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
-            kv_indices = self.scheduler.req_to_token_pool.req_to_token[
+            kv_indices = self.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
             if page_size > 1:

@@ -1,0 +1,336 @@
+"""Penalty history in per-request rows, keyed by req_pool_idx.
+
+API:
+- `PenaltyStore(vocab_size, device)`: one per `ReqToTokenPool`, as its
+  `penalty_store`; `ReqToTokenPool.free` calls `free` for the slot.
+- `PenaltyStore.alloc(req) -> None`: whenever `req` enters an extend step (each
+  prefill chunk, readmission after retract, PD decode admission), after its
+  slot is assigned; (re)sets its row to the history of `req.output_ids`.
+- `PenaltyStore.free(req_pool_idx: int) -> None`: when the slot is released.
+- `StepPenalties.build(reqs, store, device) -> Optional[StepPenalties]`: called
+  by `SamplingBatchInfo.build`.
+- `StepPenalties.logit_penalties()` before sampling and
+  `StepPenalties.commit(token_ids, accept_mask=None)` after it: called by the
+  sampling path through `SamplingBatchInfo`.
+
+Invariants:
+- Only a request whose params use a penalty (frequency, presence, repetition,
+  min_new_tokens) holds a row. A step without one has no `StepPenalties`, and
+  a store that never saw one holds no rows.
+- A row holds history only: per-token output counts and the output length.
+  Penalty values come from the request's params at build.
+- Host calls (`alloc`, `free`, `build`) never touch rows. Rows are grown,
+  reset, read, and written only by the sampling path, on the stream that
+  samples, so a step sees exactly the tokens of the steps sampled before it.
+- A slot is not reallocated between the build of a step holding it and that
+  step's sampling; a row freed in between may still take the step's commit,
+  and its next `alloc` resets it.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from sglang.srt.utils import get_compiler_backend, is_npu
+from sglang.srt.utils.common import is_pin_memory_available
+
+_is_npu = is_npu()
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def apply_scaling_penalties(logits, scaling_penalties):
+    logits[:] = torch.where(
+        logits < 0,
+        logits * scaling_penalties,
+        logits / scaling_penalties,
+    )
+
+
+def uses_penalty(sampling_params) -> bool:
+    return (
+        sampling_params.frequency_penalty != 0.0
+        or sampling_params.presence_penalty != 0.0
+        or sampling_params.repetition_penalty != 1.0
+        or sampling_params.min_new_tokens > 0
+    )
+
+
+def _to_device(data, dtype: torch.dtype, device, pin: bool) -> torch.Tensor:
+    return torch.tensor(data, dtype=dtype, pin_memory=pin).to(device, non_blocking=True)
+
+
+class PenaltyStore:
+    def __init__(self, vocab_size: int, device):
+        self.vocab_size = vocab_size
+        self.device = device
+        self.pin = is_pin_memory_available(device)
+        self.row_of_slot: Dict[int, int] = {}
+        self.free_rows: List[int] = []
+        # Rows to reset before their next device use, with the tokens to replay.
+        self.pending_init: Dict[int, List[int]] = {}
+        self.counts = torch.zeros((0, vocab_size), dtype=torch.int32, device=device)
+        self.lens = torch.zeros((0,), dtype=torch.int32, device=device)
+
+    def alloc(self, req) -> None:
+        if not uses_penalty(req.sampling_params):
+            return
+        slot = req.kv.req_pool_idx
+        row = self.row_of_slot.get(slot)
+        if row is None:
+            row = self.free_rows.pop() if self.free_rows else len(self.row_of_slot)
+            self.row_of_slot[slot] = row
+        self.pending_init[row] = list(req.output_ids)
+
+    def free(self, req_pool_idx: int) -> None:
+        row = self.row_of_slot.pop(req_pool_idx, None)
+        if row is None:
+            return
+        self.pending_init.pop(row, None)
+        self.free_rows.append(row)
+
+    def _flush(self) -> None:
+        num_rows = len(self.row_of_slot) + len(self.free_rows)
+        capacity = self.counts.shape[0]
+        if capacity < num_rows:
+            new_capacity = max(num_rows, 2 * capacity)
+            counts = torch.zeros(
+                (new_capacity, self.vocab_size), dtype=torch.int32, device=self.device
+            )
+            counts[:capacity] = self.counts
+            lens = torch.zeros((new_capacity,), dtype=torch.int32, device=self.device)
+            lens[:capacity] = self.lens
+            self.counts, self.lens = counts, lens
+
+        if not self.pending_init:
+            return
+        rows = list(self.pending_init)
+        histories = list(self.pending_init.values())
+        self.pending_init.clear()
+        rows_device = _to_device(rows, torch.int64, self.device, self.pin)
+        self.counts[rows_device] = 0
+        self.lens[rows_device] = _to_device(
+            [len(h) for h in histories], torch.int32, self.device, self.pin
+        )
+        replay_rows = [row for row, h in zip(rows, histories) for _ in h]
+        if replay_rows:
+            replay_tokens = [token for h in histories for token in h]
+            self.counts.index_put_(
+                (
+                    _to_device(replay_rows, torch.int64, self.device, self.pin),
+                    _to_device(replay_tokens, torch.int64, self.device, self.pin),
+                ),
+                torch.ones(len(replay_rows), dtype=torch.int32, device=self.device),
+                accumulate=True,
+            )
+
+    def gather(self, rows: torch.Tensor) -> torch.Tensor:
+        """The rows' token counts."""
+        self._flush()
+        return self.counts[rows]
+
+    def gather_lens(self, rows: torch.Tensor) -> torch.Tensor:
+        """The rows' output lengths."""
+        self._flush()
+        return self.lens[rows]
+
+    def accumulate(
+        self,
+        rows: torch.Tensor,
+        token_ids: torch.Tensor,
+        accept_mask: Optional[torch.Tensor],
+    ) -> None:
+        """Count token_ids[i, j] into rows[i] where accept_mask[i, j] (all if None)."""
+        self._flush()
+        token_ids = token_ids.view(rows.shape[0], -1).long()
+        if accept_mask is None and token_ids.shape[1] == 1:
+            # One token per row over distinct rows: no (row, token) pair
+            # repeats, so a plain add counts them without a sorted accumulate.
+            self.counts[rows, token_ids.view(-1)] += 1
+            self.lens.index_add_(0, rows, torch.ones_like(rows, dtype=torch.int32))
+            return
+        if accept_mask is None:
+            weights = torch.ones_like(token_ids, dtype=torch.int32)
+        else:
+            weights = accept_mask.view(token_ids.shape).to(torch.int32)
+        self.counts.index_put_(
+            (rows.unsqueeze(1).expand_as(token_ids).reshape(-1), token_ids.reshape(-1)),
+            weights.reshape(-1),
+            accumulate=True,
+        )
+        self.lens.index_add_(0, rows, weights.sum(dim=1, dtype=torch.int32))
+
+
+@dataclasses.dataclass(frozen=True)
+class StepPenalties:
+    """The penalized requests of one step: their rows and penalty params."""
+
+    store: PenaltyStore
+    batch_size: int
+    # [n] step positions of the penalized requests, and their rows in the store.
+    positions: torch.Tensor
+    rows: torch.Tensor
+    # [n, 1] per penalized request, None when none of them uses that penalty.
+    frequency: Optional[torch.Tensor]
+    presence: Optional[torch.Tensor]
+    repetition: Optional[torch.Tensor]
+    min_new_tokens: Optional[torch.Tensor]
+    # [n, k] stop token ids, padded with vocab_size; set with min_new_tokens.
+    stop_token_ids: Optional[torch.Tensor]
+
+    @classmethod
+    def build(
+        cls,
+        reqs: Sequence,
+        store: Optional[PenaltyStore],
+        device,
+    ) -> Optional[StepPenalties]:
+        positions = [i for i, r in enumerate(reqs) if uses_penalty(r.sampling_params)]
+        if not positions:
+            return None
+        if store is None:
+            raise RuntimeError("requests use sampling penalties but no PenaltyStore")
+        rows = []
+        for i in positions:
+            row = store.row_of_slot.get(reqs[i].kv.req_pool_idx)
+            if row is None:
+                raise RuntimeError(
+                    f"request {reqs[i].rid} uses sampling penalties but its slot "
+                    "holds no penalty row; PenaltyStore.alloc was not called"
+                )
+            rows.append(row)
+
+        pin = is_pin_memory_available(device)
+        params = [reqs[i].sampling_params for i in positions]
+
+        def per_row(values, dtype, needed):
+            if not needed:
+                return None
+            return _to_device(values, dtype, device, pin).unsqueeze_(1)
+
+        frequency = per_row(
+            [p.frequency_penalty for p in params],
+            torch.float32,
+            any(p.frequency_penalty != 0.0 for p in params),
+        )
+        presence = per_row(
+            [p.presence_penalty for p in params],
+            torch.float32,
+            any(p.presence_penalty != 0.0 for p in params),
+        )
+        repetition = per_row(
+            [p.repetition_penalty for p in params],
+            torch.float32,
+            any(p.repetition_penalty != 1.0 for p in params),
+        )
+        needs_min_new_tokens = any(p.min_new_tokens > 0 for p in params)
+        min_new_tokens = per_row(
+            [p.min_new_tokens for p in params], torch.int32, needs_min_new_tokens
+        )
+        stop_token_ids = None
+        if needs_min_new_tokens:
+            stop_sets = [_stop_token_ids(reqs[i]) for i in positions]
+            width = max(1, max(len(s) for s in stop_sets))
+            padded = [s + [store.vocab_size] * (width - len(s)) for s in stop_sets]
+            stop_token_ids = _to_device(padded, torch.int64, device, pin)
+
+        return cls(
+            store=store,
+            batch_size=len(reqs),
+            positions=_to_device(positions, torch.int64, device, pin),
+            rows=_to_device(rows, torch.int64, device, pin),
+            frequency=frequency,
+            presence=presence,
+            repetition=repetition,
+            min_new_tokens=min_new_tokens,
+            stop_token_ids=stop_token_ids,
+        )
+
+    def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return (additive, scaling) [batch_size, vocab] penalties, each None if unused."""
+        counts = self.store.gather(self.rows)
+        vocab_size = self.store.vocab_size
+        device = counts.device
+        # The tokens each row has output, for presence and repetition.
+        present = (
+            counts > 0
+            if self.presence is not None or self.repetition is not None
+            else None
+        )
+
+        additive = None
+        if (
+            self.frequency is not None
+            or self.presence is not None
+            or self.min_new_tokens is not None
+        ):
+            additive = torch.zeros(counts.shape, dtype=torch.float32, device=device)
+            # addcmul_ with value=-1 subtracts a product in one kernel; on these
+            # operands it rounds as the product and the subtraction would.
+            if self.frequency is not None:
+                additive.addcmul_(counts, self.frequency, value=-1)
+            if self.presence is not None:
+                additive.addcmul_(present, self.presence, value=-1)
+            if self.min_new_tokens is not None:
+                lens = self.store.gather_lens(self.rows)
+                stop_penalties = torch.zeros(
+                    (counts.shape[0], vocab_size + 1),
+                    dtype=torch.float32,
+                    device=device,
+                ).scatter_(1, self.stop_token_ids, float("-inf"))[:, :vocab_size]
+                # torch.where, not a boolean index: no host sync, no -inf * 0.
+                additive.add_(
+                    torch.where(
+                        lens.unsqueeze(1) < self.min_new_tokens, stop_penalties, 0.0
+                    )
+                )
+            additive = self._to_batch(additive, 0.0)
+
+        scaling = None
+        if self.repetition is not None:
+            scaling = torch.where(present, self.repetition, 1.0)
+            scaling = self._to_batch(scaling, 1.0)
+        return additive, scaling
+
+    def _to_batch(self, rows: torch.Tensor, fill: float) -> torch.Tensor:
+        if self.positions.numel() == self.batch_size:
+            return rows
+        out = torch.full(
+            (self.batch_size, rows.shape[1]), fill, dtype=rows.dtype, device=rows.device
+        )
+        out[self.positions] = rows
+        return out
+
+    def commit(
+        self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
+    ) -> None:
+        """Count this step's output tokens into the rows of its requests.
+
+        token_ids: [batch_size] sampled ids, or [batch_size, k] with `accept_mask`
+        marking the ids that count (speculative verify).
+        """
+        token_ids = token_ids.view(self.batch_size, -1)
+        if accept_mask is not None:
+            accept_mask = accept_mask.view(self.batch_size, -1)
+        if self.positions.numel() != self.batch_size:
+            # Only some requests are penalized: take their rows of the step.
+            token_ids = token_ids[self.positions]
+            if accept_mask is not None:
+                accept_mask = accept_mask[self.positions]
+        self.store.accumulate(self.rows, token_ids, accept_mask)
+
+
+def _stop_token_ids(req) -> List[int]:
+    stop_ids = (
+        (req.sampling_params.stop_token_ids or set())
+        | (req.eos_token_ids or set())
+        | (req.tokenizer.additional_stop_token_ids or set())
+        | (
+            {req.tokenizer.eos_token_id}
+            if req.tokenizer.eos_token_id is not None
+            else set()
+        )
+    )
+    return [token_id for token_id in stop_ids if token_id is not None]

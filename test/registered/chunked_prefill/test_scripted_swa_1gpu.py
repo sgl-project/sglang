@@ -31,6 +31,12 @@ _MIXED_N_CANDIDATES = 4
 _MIXED_MAX_STEPS = 4000
 
 
+def _num_decoding(handles) -> int:
+    """Requests that committed their first output token: the same commit on any
+    scheduler, unlike membership in its decoding list."""
+    return sum(1 for h in handles if h.req is not None and h.req.output_ids)
+
+
 class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_SWA_MODEL,
@@ -50,15 +56,17 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedContext):
         s = t.scheduler
 
-        for i in range(_N_DECODERS):
+        decoders = [
             t.start_req(
                 prompt_len=_DECODER_PROMPT,
                 max_new_tokens=_DECODER_MAX_NEW,
                 ignore_eos=True,
                 prompt_token=10 + i,
             )
+            for i in range(_N_DECODERS)
+        ]
         for _ in range(_DECODER_WARMUP_STEPS):
-            if len(s.running_batch.reqs) >= _DECODER_WARMUP_RUNNING:
+            if _num_decoding(decoders) >= _DECODER_WARMUP_RUNNING:
                 break
             yield
 
@@ -90,11 +98,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
 
         t.abort_all()
         for _ in range(_DRAIN_STEPS):
-            if (
-                s.chunked_req is None
-                and len(s.waiting_queue) == 0
-                and s.running_batch.is_empty()
-            ):
+            if s.chunked_req is None and len(s.waiting_queue) == 0 and not s.decoding:
                 break
             yield
         for _ in range(20):
@@ -142,7 +146,7 @@ class TestScriptedSwaMixedChunkDecodeFit(ScriptedTestCase):
             for i in range(_N_DECODERS)
         ]
         for _ in range(_DECODER_WARMUP_STEPS):
-            if len(s.running_batch.reqs) >= _DECODER_WARMUP_RUNNING:
+            if _num_decoding(decoders) >= _DECODER_WARMUP_RUNNING:
                 break
             yield
 
@@ -160,16 +164,14 @@ class TestScriptedSwaMixedChunkDecodeFit(ScriptedTestCase):
         decode_held_back = False
         decoder_rids = {h.rid for h in decoders}
         for _ in range(_MIXED_MAX_STEPS):
-            batch = s.last_batch
+            # The step the last iteration launched.
+            batch = s.cur_batch_for_debug
             if (
                 batch is not None
                 and batch.forward_mode is not None
                 and batch.forward_mode.is_extend()
                 and not batch.forward_mode.is_mixed()
-                and any(
-                    r.rid in decoder_rids and not r.finished()
-                    for r in s.running_batch.reqs
-                )
+                and any(r.rid in decoder_rids and not r.finished() for r in s.decoding)
             ):
                 decode_held_back = True
             if all(h.finished for h in handles):

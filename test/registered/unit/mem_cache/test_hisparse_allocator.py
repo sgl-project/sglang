@@ -1,11 +1,13 @@
 import unittest
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -19,9 +21,50 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class _DeviceTensor(torch.Tensor):
+    """A CPU tensor standing for device memory: reading its values on the host
+    (a scalar, a list, a boolean-mask index, nonzero, unique, a blocking copy
+    to host) fails, as that would wait for the stream that produces it."""
+
+    _HOST_READS = {
+        torch.Tensor.item,
+        torch.Tensor.tolist,
+        torch.Tensor.numpy,
+        torch.Tensor.__bool__,
+        torch.Tensor.__int__,
+        torch.Tensor.__index__,
+        torch.Tensor.nonzero,
+        torch.nonzero,
+        torch.Tensor.unique,
+        torch.unique,
+        torch.Tensor.masked_select,
+        torch.masked_select,
+        torch.Tensor.cpu,
+    }
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        mask_index = func in (torch.Tensor.__getitem__, torch.Tensor.__setitem__) and (
+            _has_bool_tensor(args[1])
+        )
+        blocking_copy_to_host = (
+            func is torch.Tensor.copy_
+            and not isinstance(args[0], _DeviceTensor)
+            and not kwargs.get("non_blocking", args[2] if len(args) > 2 else False)
+        )
+        if func in cls._HOST_READS or mask_index or blocking_copy_to_host:
+            raise AssertionError(f"host read of a device tensor: {func.__name__}")
+        return super().__torch_function__(func, types, args, kwargs)
+
+
+def _has_bool_tensor(index) -> bool:
+    indices = index if isinstance(index, tuple) else (index,)
+    return any(isinstance(i, torch.Tensor) and i.dtype == torch.bool for i in indices)
+
+
 class TestHiSparseDecodeRemap(CustomTestCase):
-    def test_page_size_one_reclaims_temporary_device_slot(self):
-        """Decode remapping must reclaim its temporary slot without freeing the live slot."""
+    def _page_size_one_coordinator(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
         from sglang.srt.mem_cache.allocator.hisparse import (
             HiSparseTokenToKVPoolAllocator,
@@ -52,6 +95,7 @@ class TestHiSparseDecodeRemap(CustomTestCase):
             need_sort=False,
         )
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = "cpu"
         coordinator.is_dsv4_hisparse = False
         coordinator.mem_pool_device = pool.main_pool
         coordinator.token_to_kv_pool_allocator = allocator
@@ -64,17 +108,33 @@ class TestHiSparseDecodeRemap(CustomTestCase):
             (1, 1, 3), dtype=torch.int32
         )
         coordinator._skip_first_backup = [True]
+        coordinator._remapped_decode_slots = deque()
+        return pool, allocator, coordinator
+
+    def _map_one_decode_token(self, coordinator, out_loc, device_tensor=torch.Tensor):
+        coordinator._skip_first_backup[0] = True
+        coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([3]).as_subclass(device_tensor),
+            out_cache_loc=out_loc.as_subclass(device_tensor),
+            req_pool_indices=torch.tensor([0]).as_subclass(device_tensor),
+            seq_lens_cpu=torch.tensor([3]),
+            req_pool_indices_cpu=torch.tensor([0]),
+        )
+
+    def test_page_size_one_reclaims_temporary_device_slot(self):
+        """Decode remapping must reclaim its temporary slot without freeing the
+        live slot, and only at the step's host commit: until then the slot
+        stays allocated."""
+        pool, allocator, coordinator = self._page_size_one_coordinator()
         out_loc = allocator.alloc(1)
         with patch("sglang.srt.managers.hisparse_coordinator._is_hip", False):
-            for _ in range(2):
-                coordinator._skip_first_backup[0] = True
-                coordinator.map_last_loc_to_buffer(
-                    seq_lens=torch.tensor([3]),
-                    out_cache_loc=out_loc,
-                    req_pool_indices=torch.tensor([0]),
-                    seq_lens_cpu=torch.tensor([3]),
-                    req_pool_indices_cpu=torch.tensor([0]),
+            for held in (1, 0):
+                self._map_one_decode_token(coordinator, out_loc)
+                self.assertEqual(
+                    allocator.hisparse_attn_allocator.available_size(),
+                    pool.size - 3 - held,
                 )
+                coordinator.free_remapped_decode_slots()
                 self.assertEqual(
                     allocator.hisparse_attn_allocator.available_size(), pool.size - 3
                 )
@@ -82,6 +142,21 @@ class TestHiSparseDecodeRemap(CustomTestCase):
                     allocator.full_to_hisparse_device_index_mapping[out_loc],
                     coordinator.req_to_device_buffer[:, 2],
                 )
+
+    def test_forward_entry_remap_reads_no_device_value(self):
+        """The remap runs at the decode forward's entry: a host read of a device
+        value there would block the host on the previous forward."""
+        pool, allocator, coordinator = self._page_size_one_coordinator()
+        coordinator.req_to_device_buffer = coordinator.req_to_device_buffer.as_subclass(
+            _DeviceTensor
+        )
+        out_loc = allocator.alloc(1)
+        with patch("sglang.srt.managers.hisparse_coordinator._is_hip", False):
+            self._map_one_decode_token(coordinator, out_loc, _DeviceTensor)
+        coordinator.free_remapped_decode_slots()
+        self.assertEqual(
+            allocator.hisparse_attn_allocator.available_size(), pool.size - 3
+        )
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
@@ -211,14 +286,14 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             logical_attn_allocator=logical_allocator
         )
-        queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
+        queue.enable_hisparse = True
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._need_space_for_single_req = MagicMock(return_value=0)
         queue._active_reserved_tokens = MagicMock(return_value=0)
 
-        budget = queue._allocatable_token_budgets()
+        budget = queue._allocatable_token_budgets([])
 
         self.assertEqual(budget, 512)
         logical_allocator.full_available_size.assert_called_once_with()
@@ -226,6 +301,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
     def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         fill_len = 512
         sliding_window_size = 200
@@ -240,6 +316,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
             kv=ReqKvInfo(),
+            disagg=DisaggReqState(),
         )
 
         class ReqToTokenPool:
@@ -269,6 +346,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             req_to_host_pool=object(),
             req_to_host_pool_allocated_len=object(),
             host_token_len=MagicMock(side_effect=lambda token_len: token_len // 4),
+            _holds_rows=[False],
+        )
+        coordinator.alloc_transfer_rows = MethodType(
+            HiSparseCoordinator.alloc_transfer_rows, coordinator
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = req_to_token_pool
@@ -278,12 +359,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             protected_size=MagicMock(return_value=0),
             maybe_hand_to_session=lambda req: None,
         )
-        queue.scheduler = SimpleNamespace(
-            enable_hisparse=True,
-            hisparse_coordinator=coordinator,
-            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
-            sliding_window_size=sliding_window_size,
+        queue.enable_hisparse = True
+        queue.hisparse_coordinator = coordinator
+        queue.server_args = SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=False
         )
+        queue.sliding_window_size = sliding_window_size
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
 
         result = queue._pre_alloc(req)
@@ -310,6 +391,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             len(host_indices),
         )
         self.assertTrue(torch.equal(req_to_token_pool.writes[0][1], kv_loc))
+        self.assertTrue(coordinator._holds_rows[0])
 
         # C4 indexer/C128 use the logical allocator's full-page IDs. They do not
         # use either the independently allocated host pages or C4 sparse slots.

@@ -274,12 +274,27 @@ class LogitsProcessorOutput:
 
     ## Part 6: Temporary variables
     # FIXME: These fields are not logits-related but are passed through here as a
-    # workaround since ForwardBatch is local to forward_batch_generation().
+    # workaround since ForwardBatch is local to forward_model().
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def host_copy(self) -> "LogitsProcessorOutput":
+        """A copy for one host commit to turn into host values in place; this
+        output keeps what the forward produced."""
+        copy = dataclasses.replace(self)
+        for name in (
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "input_token_ids_logprobs_val",
+        ):
+            sequences = getattr(copy, name)
+            if sequences is not None:
+                # finalize_input_logprobs rewrites these lists' rows.
+                setattr(copy, name, list(sequences))
+        return copy
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:

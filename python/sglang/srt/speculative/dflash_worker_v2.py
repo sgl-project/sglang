@@ -77,6 +77,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
@@ -587,13 +588,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # gather's implicit nonzero D2H + lengths.max().item()); keep it only
         # for platforms without GPU triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
-        self._accept_bonus_buffer_cap: int = 0
-        self._accept_bonus_buffer_slot: int = 0
-        self._accept_len_buf: Optional[torch.Tensor] = None
-        self._commit_lens_bufs: List[torch.Tensor] = []
-        self._bonus_id_bufs: List[torch.Tensor] = []
-        self._out_tokens_bufs: List[torch.Tensor] = []
-        self._new_seq_lens_bufs: List[torch.Tensor] = []
 
     @property
     def draft_worker(self):
@@ -2083,38 +2077,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
-    def _ensure_accept_bonus_buffers(self, bs: int) -> None:
-        if self._accept_bonus_buffer_cap >= int(bs):
-            return
-
-        new_cap = max(
-            int(bs),
-            (
-                self._accept_bonus_buffer_cap * 2
-                if self._accept_bonus_buffer_cap > 0
-                else int(bs)
-            ),
-        )
-        device = self.device
-        block_size = int(self.block_size)
-        self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
-        self._commit_lens_bufs = [
-            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
-        ]
-        # int64 keeps the downstream .to(torch.int64) a no-op.
-        self._bonus_id_bufs = [
-            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self._out_tokens_bufs = [
-            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
-            for _ in range(2)
-        ]
-        self._new_seq_lens_bufs = [
-            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self._accept_bonus_buffer_cap = new_cap
-
-    def _next_accept_bonus_buffers(
+    def _alloc_accept_bonus_outputs(
         self, bs: int
     ) -> tuple[
         torch.Tensor,
@@ -2123,16 +2086,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         torch.Tensor,
         torch.Tensor,
     ]:
-        self._ensure_accept_bonus_buffers(bs)
-        assert self._accept_len_buf is not None
-        slot = self._accept_bonus_buffer_slot
-        self._accept_bonus_buffer_slot = (slot + 1) % 2
+        """Fresh accept outputs: they back the step's result (accept lens,
+        output tokens, new lengths), which outlives any number of later steps,
+        so they are never a worker buffer the next step writes again."""
+        device = self.device
         return (
-            self._accept_len_buf[:bs],
-            self._commit_lens_bufs[slot][:bs],
-            self._bonus_id_bufs[slot][:bs],
-            self._out_tokens_bufs[slot][:bs],
-            self._new_seq_lens_bufs[slot][:bs],
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            # int64 keeps the downstream .to(torch.int64) a no-op.
+            torch.empty((bs,), dtype=torch.int64, device=device),
+            torch.empty((bs, int(self.block_size)), dtype=torch.int64, device=device),
+            torch.empty((bs,), dtype=torch.int64, device=device),
         )
 
     def _accept_block(
@@ -2186,7 +2150,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         bonus,
                         out_tokens,
                         new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
+                    ) = self._alloc_accept_bonus_outputs(bs)
                     _compute_dflash_accept_bonus_triton_unchecked(
                         candidates=candidates,
                         target_top1=target_predict,
@@ -2284,18 +2248,21 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
-    def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        pp_proxy_tensors=None,
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> DFlashDraftInputV2:
+        unset = torch.empty_like(req_pool_indices, dtype=torch.int64)
+        return make_draft_input_v2(bonus_tokens=unset, new_seq_lens=unset)
+
+    def _prepare_decode(self, step: ScheduleBatch) -> None:
+        step.spec_info.prepare_for_decode(step)
+
+    def _forward(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors, pending_grammar
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch_output = self.target_worker.forward_batch_generation(
+            batch_output = self.target_worker.forward_model(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -2371,7 +2338,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Decode / target-verify stage.
         if batch.spec_info is None:
-            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+            batch = derive_batch(
+                batch,
+                spec_info=DFlashDraftInputV2.create_idle_input(device=self.device),
+            )
 
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
@@ -2393,14 +2363,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                    derive_batch(batch), self._target_worker
                 )
                 # Force eager: the active ranks run eager verify when any DP
                 # rank is idle (see the idle-guard below); a graph-replaying
                 # idle rank would disagree with them on DP-gather segment
                 # offsets (padded bucket vs raw counts).
                 idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                self._target_worker.forward_batch_generation(
+                self._target_worker.forward_model(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
@@ -2777,28 +2747,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             kv_loc_plan=kv_loc_plan,
         )
 
-        batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
+        # The verify batch plans attention over the host bound; the rest of
+        # the step reads the committed host lengths.
+        verify_batch = derive_batch(batch, out_cache_loc=verify_out_cache_loc)
+        if batch.seq_lens_cpu is not None:
             # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            verify_host_seq_lens = batch.seq_lens_cpu + block_size
+            verify_batch = derive_batch(
+                verify_batch,
+                seq_lens_cpu=verify_host_seq_lens,
+                seq_lens_sum=int(verify_host_seq_lens.sum()),
+            )
         elif draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+            verify_batch = derive_batch(
+                verify_batch,
+                seq_lens_cpu=draft_input.nxt_kv_lens_cpu,
+                seq_lens_sum=int(draft_input.nxt_kv_lens_sum),
+            )
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            verify_batch, self.target_worker
         )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
+        batch = derive_batch(
+            verify_batch,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens_sum=batch.seq_lens_sum,
+        )
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -2817,7 +2796,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
-        target_out = self.target_worker.forward_batch_generation(
+        target_out = self.target_worker.forward_model(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
@@ -2833,7 +2812,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tree=grammar_tree,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
+                pending_grammar=pending_grammar,
             )
 
         if sampling_info is not None:

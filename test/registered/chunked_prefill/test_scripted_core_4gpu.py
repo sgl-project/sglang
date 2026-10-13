@@ -65,23 +65,14 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
         scheduler = t.scheduler
         r = t.start_req(prompt_len=2 * _CHUNK_SIZE - 3, max_new_tokens=2)
 
-        # Wait for the window where the queues and the current microbatch slot
-        # bindings are all clear, yet dispatched chunk batch results are still
-        # in flight in the PP pipeline, then post flush_cache into that window.
+        # Wait for the window where the last chunk is dispatched (no chunked or
+        # waiting request left) yet its result is still in flight in the PP
+        # ring, then post flush_cache into that window.
         flushed = False
         for _ in range(DEFAULT_MAX_STEPS):
-            in_flight = any(
-                mb is not None and not mb.is_empty() for mb in scheduler.mbs
-            )
+            in_flight = len(scheduler.pending) > 0
             queues_clear = (
-                scheduler.chunked_req is None
-                and len(scheduler.waiting_queue) == 0
-                and all(x.is_empty() for x in scheduler.running_mbs)
-                and (
-                    scheduler.cur_batch_for_debug is None
-                    or scheduler.cur_batch_for_debug.is_empty()
-                )
-                and (scheduler.last_batch is None or scheduler.last_batch.is_empty())
+                scheduler.chunked_req is None and len(scheduler.waiting_queue) == 0
             )
             if in_flight and queues_clear:
                 t.flush_cache()

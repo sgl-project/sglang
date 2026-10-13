@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.test.scheduler_request_lists import assert_one_list_per_request
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.io_struct import (
@@ -25,14 +26,18 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
+from sglang.test.scripted_runtime.scheduling_trace import SchedulingTraceWriter
 from sglang.test.scripted_runtime.utils import (
     close_zmq_socket,
     ensure_script_importable,
     resolve_fn,
 )
+from sglang.test.step_freeze import freeze_step, release_step
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
@@ -131,6 +136,7 @@ class ScriptedSchedulerHook:
             and get_parallel().attn_cp_rank == 0
         )
         self._batch_log: List[ScriptedBatchRecord] = []
+        self._trace: Optional[SchedulingTraceWriter] = None
 
         if self._is_driver:
             ensure_script_importable(
@@ -165,6 +171,9 @@ class ScriptedSchedulerHook:
                         ctx = self._context
                         yield from _reset_engine_state(ctx)
                         self._batch_log.clear()
+                        self._trace = SchedulingTraceWriter.maybe_open(
+                            self.scheduler, fn_path, args
+                        )
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
@@ -177,6 +186,10 @@ class ScriptedSchedulerHook:
                             )
                         else:
                             sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
+                        finally:
+                            if self._trace is not None:
+                                self._trace.close()
+                                self._trace = None
                     case _:
                         raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:
@@ -186,7 +199,10 @@ class ScriptedSchedulerHook:
     def on_run_batch(self, batch) -> None:
         if not self._is_driver:
             return
-        chunked = self.scheduler.chunked_req
+        # The chunked request once this step launches.
+        chunked = (
+            batch.chunked_req if batch.prefill_reqs() else self.scheduler.chunked_req
+        )
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,
@@ -205,12 +221,28 @@ class ScriptedSchedulerHook:
             )
         )
 
+    def on_schedule(self, step: Optional[ScheduleBatch], slot: ScheduleSlot) -> None:
+        # The step is finalized: nothing writes it until its commit.
+        if step is not None:
+            freeze_step(step)
+        if self._trace is not None:
+            self._trace.record_schedule(self.scheduler, step, slot)
+
+    def on_process_result(self, batch: ScheduleBatch) -> None:
+        release_step(batch)
+        if self._trace is not None:
+            self._trace.record_process_result(batch)
+
     def step(self) -> None:
+        # An iteration boundary: the scheduler loop calls this at intake.
+        assert_one_list_per_request(self.scheduler)
         if not self._is_driver:
             return
 
         done, exc_tb = _advance_generator(self._script_fn_generator)
         if not done:
+            if self._trace is not None:
+                self._trace.observe_readers(self.scheduler)
             return
 
         if exc_tb is not None:

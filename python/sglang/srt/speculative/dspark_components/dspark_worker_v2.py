@@ -73,6 +73,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
@@ -93,6 +94,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -575,16 +577,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
-    def forward_batch_generation(
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> DFlashDraftInputV2:
+        unset = torch.empty_like(req_pool_indices, dtype=torch.int64)
+        return make_next_draft_input(bonus_tokens=unset, new_seq_lens=unset)
+
+    def _prepare_decode(self, step: ScheduleBatch) -> None:
+        step.spec_info.prepare_for_decode(step)
+
+    def _forward(
         self,
         batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        *,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        pending_grammar,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
-            batch_output = self.target_worker.forward_batch_generation(
+            batch_output = self.target_worker.forward_model(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -602,21 +610,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 if plan.heterogeneous:
                     return self._forward_dp_spec_prefill_coordination(
-                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                        batch, plan, on_publish, pp_proxy_tensors, pending_grammar
                     )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(batch, on_publish, pending_grammar)
 
     def _forward_dp_spec_prefill_coordination(
-        self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+        self, batch, plan, on_publish, pp_proxy_tensors, pending_grammar
     ):
         """Pair local prefill with peer verification after the shared draft pass."""
         if not batch.forward_mode.is_extend():
             return self._forward_decode(
-                batch, on_publish, grammar_barrier, coordination_plan=plan
+                batch, on_publish, pending_grammar, coordination_plan=plan
             )
 
         rank = get_parallel().attn_dp_rank
@@ -642,12 +650,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().attn_dp_enabled:
-                self.target_worker.forward_batch_generation(
+                self.target_worker.forward_model(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch_output = self.target_worker.forward_batch_generation(
+        batch_output = self.target_worker.forward_model(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -795,11 +803,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
-        grammar_barrier=None,
+        pending_grammar,
         coordination_plan=None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
-            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+            batch = derive_batch(
+                batch,
+                spec_info=DFlashDraftInputV2.create_idle_input(device=self.device),
+            )
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
@@ -975,7 +986,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tree=grammar_tree,
                 sampling_info=sampling_info,
                 device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
+                pending_grammar=pending_grammar,
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
@@ -1166,6 +1177,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             model=self.target_worker.model_runner.model,
             req_pool_indices=batch.req_pool_indices,
         )
+
+    def attach_future_map(
+        self, future_map: "FutureMap", *, enable_overlap: bool
+    ) -> None:
+        super().attach_future_map(future_map, enable_overlap=enable_overlap)
+        if future_map.needs_confidence_relay and enable_overlap:
+            self._confidence_budget_prepare = self.get_confidence_budget_prepare()
 
     def get_confidence_budget_prepare(self):
         if not self._hosts_draft:

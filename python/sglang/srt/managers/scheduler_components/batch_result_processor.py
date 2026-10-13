@@ -6,6 +6,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Iterable,
     List,
     Optional,
     Tuple,
@@ -15,7 +16,6 @@ from typing import (
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -27,7 +27,6 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
-    mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -44,7 +43,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     mamba_track_grid,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -70,6 +68,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.pending_steps import (
+        PendingStep,
+        PendingSteps,
+    )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
@@ -83,6 +85,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _host_sum(lengths: Optional[torch.Tensor]) -> int:
+    return int(lengths.sum()) if lengths is not None else 0
+
+
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
     stride = result.speculative_output_stride
@@ -93,12 +99,104 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     return stride
 
 
+def _accept_grammar_tokens(req: Req, tokens: Union[int, List[int]]) -> List[int]:
+    """Advance the grammar over the accepted token(s), stopping at the token
+    that terminates it.
+
+    ``tokens`` is a single sampled token (normal decode) or the whole
+    verified run (spec decode). Returns the retained prefix; for spec the
+    suffix past grammar completion is dropped so it is never committed to KV
+    nor emitted. Advances the grammar FSM only -- ``grammar.finished`` is
+    synced by the caller once the finish state is updated.
+    """
+    if isinstance(tokens, int):
+        tokens = [tokens]
+    retained = []
+    try:
+        for token_id in tokens:
+            req.grammar.accept_token(token_id)
+            retained.append(token_id)
+            if req.grammar.is_terminated():
+                break
+    except ValueError as e:
+        # accept_token raises ValueError if the token is not in the grammar
+        # (misconfigured grammar or invalid token); abort the request.
+        logger.error(
+            f"Grammar accept_token failed for req {req.rid} with token {tokens}: {e}"
+        )
+        req.to_finish = FINISH_ABORT()
+    return retained
+
+
+def advance_grammar_fsm(result: GenerationBatchResult, batch: ScheduleBatch) -> None:
+    """The grammar commit of one step: advance each req's grammar FSM over
+    the tokens the step produced, and (for a spec decode step) keep the
+    grammar-truncated runs on ``result``.
+
+    It runs once (``result.grammar_advanced``): inside the next step's verify
+    (commit_pending_grammar, so the advance overlaps that forward),
+    or in the step's own host commit. It handles both decode (the accepted
+    spec run) and extend (the single prefilled token) steps, so the next
+    step's verify can commit whatever step precedes it, e.g. at the
+    extend->decode boundary.
+    """
+    if result.grammar_advanced or not batch.has_grammar:
+        return
+    is_decode = batch.forward_mode.is_decode()
+    if not (is_decode or batch.forward_mode.is_extend()):
+        return
+    if result.copy_done is not None:
+        result.copy_done.synchronize()
+    next_token_ids = result.next_token_ids.tolist()
+
+    if not is_decode:
+        # Extend: advance over the single token each completed-prefill req emitted
+        # (mirrors process_batch_result_prefill's per-req token indexing).
+        for i, req in enumerate(batch.reqs):
+            if (
+                req.grammar is None
+                or req.is_retracted
+                or req.finished()
+                or req is batch.chunked_req
+            ):
+                continue
+            _accept_grammar_tokens(req, next_token_ids[i])
+        result.grammar_advanced = True
+        return
+
+    # Decode: only the spec-v2 path reaches here (the next step's verify and
+    # _resolve_spec_v2_tokens). Non-spec grammar decode
+    # advances its FSM in process_batch_result_decode and has no accept_lens, so
+    # bail out defensively.
+    if result.accept_lens is None:
+        return
+    accept_lens = result.accept_lens.tolist()
+    stride = _get_speculative_output_stride(result)
+    retained = [None] * len(batch.reqs)
+    for i, req in enumerate(batch.reqs):
+        if req.grammar is None or req.is_retracted or req.finished():
+            continue
+        accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+        # Stop accepting once the grammar terminates so the over-drafted suffix
+        # is never committed to KV nor emitted; this advances the FSM.
+        retained[i] = _accept_grammar_tokens(req, accept_tokens)
+    result.grammar_retained_tokens = retained
+    result.grammar_advanced = True
+
+
+def commit_pending_grammar(pending: Iterable[PendingStep]) -> None:
+    """The grammar commit of each pending step: its tokens advance its
+    requests' grammar FSMs, once (the step's host commit then skips it). A
+    speculative verify runs it right before building the next step's vocab
+    mask, so it overlaps the verify forward."""
+    for record in pending:
+        advance_grammar_fsm(record.result, record.step)
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    disaggregation_mode: DisaggregationMode
     enable_overlap: bool
-    enable_overlap_mlx: bool
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -113,25 +211,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
-
-    def process_batch_result_prebuilt(self, batch: ScheduleBatch):
-        assert self.disaggregation_mode == DisaggregationMode.DECODE
-        use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
-        if use_free_group:
-            self.token_to_kv_pool_allocator.free_group_begin()
-        for req in batch.reqs:
-            req.time_stats.set_decode_prebuilt_finish_time()
-            req.update_finish_state()
-            if req.finished():
-                req.time_stats.set_quick_finish_time()
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-
-        # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-        if use_free_group:
-            self.token_to_kv_pool_allocator.free_group_end()
+    pending: PendingSteps
 
     def _maybe_collect_routed_experts(self, req: Req):
         """Collect routed experts for a finished request.
@@ -255,6 +335,31 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
 
+    def host_prefill_result(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> Tuple[Optional[LogitsProcessorOutput], List[int], Optional[List[int]]]:
+        """Wait for a prefill step's host copies and turn its result into host
+        values: the logits output's host copy, the next token ids, and the
+        auxiliary output starts."""
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+        logits_output = (
+            result.logits_output.host_copy()
+            if result.logits_output is not None
+            else None
+        )
+        next_token_ids = result.next_token_ids.tolist()
+        self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+        self.materialize_sampling_mask_output(batch.reqs, logits_output)
+        return logits_output, next_token_ids, auxiliary_output_starts
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -264,35 +369,12 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
-            auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
-                batch, result
+            logits_output, next_token_ids, auxiliary_output_starts = (
+                self.host_prefill_result(batch, result)
             )
             auxiliary_output = result.auxiliary_host_output
-            if result.routed_experts_output is not None:
-                result.routed_experts_output.finalize()
-                result.routed_experts_output = None
-            if result.indexer_topk_output is not None:
-                result.indexer_topk_output.finalize()
-                result.indexer_topk_output = None
-
-            (
-                logits_output,
-                next_token_ids,
-                extend_input_len_per_req,
-                extend_logprob_start_len_per_req,
-            ) = (
-                result.logits_output,
-                result.next_token_ids,
-                result.extend_input_len_per_req,
-                result.extend_logprob_start_len_per_req,
-            )
-
-            # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
-            self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
-            self.materialize_sampling_mask_output(batch.reqs, logits_output)
+            extend_input_len_per_req = batch.extend_lens
+            extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -303,12 +385,14 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            first_decode_row = len(batch.reqs) - batch.num_decode_rows
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                is_decode_row = i >= first_decode_row
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
-                    and req.inflight_middle_chunks <= 0
+                    and req is not batch.chunked_req
                 )
                 # A reason here finishes the request without committing this
                 # forward's output: a failed KV load or an unusable sampling mask.
@@ -341,14 +425,14 @@ class SchedulerBatchResultProcessor:
                     )
 
                 if (
-                    req.finished() and req.inflight_middle_chunks <= 0
+                    req.finished() and req is not batch.chunked_req
                 ) or req.is_retracted:
                     # Decode req in a mixed batch, or a retracted req. Keep an
                     # aborted middle chunk in the chunked branch long enough to
                     # drain its accounting without streaming it.
                     continue
 
-                if req.inflight_middle_chunks <= 0:
+                if req is not batch.chunked_req:
                     req.time_stats.set_prefill_finished_time()
 
                     if discard_finish_reason is not None:
@@ -371,8 +455,7 @@ class SchedulerBatchResultProcessor:
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and is_decode_row
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
@@ -380,15 +463,11 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
-                            self._prepare_kv_cache_release(req)
-                        release_kv_cache(
-                            req,
-                            self.tree_cache,
-                            checkpoint=discard_finish_reason is None,
+                        self.release_finished_req(
+                            req, checkpoint=discard_finish_reason is None
                         )
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not is_decode_row:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -423,7 +502,6 @@ class SchedulerBatchResultProcessor:
 
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -469,7 +547,7 @@ class SchedulerBatchResultProcessor:
 
                 if (
                     req.discard_output_reason is not None
-                    and req.inflight_middle_chunks <= 0
+                    and req is not batch.chunked_req
                 ):
                     req.to_finish = req.discard_output_reason
                     req.update_finish_state(0)
@@ -480,7 +558,7 @@ class SchedulerBatchResultProcessor:
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.inflight_middle_chunks <= 0:
+                if req is not batch.chunked_req:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -493,7 +571,6 @@ class SchedulerBatchResultProcessor:
                         checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.token_to_kv_pool_allocator.free_group_end()
@@ -537,6 +614,8 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
     ) -> None:
+        """Turn the logprobs of a commit's host copy of the logits output
+        (`LogitsProcessorOutput.host_copy`) into host values in place."""
         if batch.return_logprob:
             logits_output.finalize_input_logprobs()
             if logits_output.next_token_logprobs is not None:
@@ -602,35 +681,34 @@ class SchedulerBatchResultProcessor:
     ):
         """Validate PP skip output comm correctness.
 
-        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
+        - When skip=True: all reqs must be middle chunks (batch.chunked_req)
           so placeholder zeros are never consumed via req.output_ids.append().
         - When skip=False: at least one req should consume next_token_ids
-          (inflight_middle_chunks <= 0), otherwise warn.
+          (not a middle chunk), otherwise warn.
         """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
 
         if not getattr(result, "skipped_output_comm", False):
-            if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
+            if batch.forward_mode.is_extend():
                 has_consumed_output = any(
-                    req.inflight_middle_chunks <= 0
+                    req is not batch.chunked_req
                     for req in batch.reqs
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                        f"num_reqs={len(batch.reqs)}, all of them middle chunks"
                     )
             return
 
         for req in batch.reqs:
             if not req.finished() and not req.is_retracted:
-                assert req.inflight_middle_chunks > 0, (
+                assert req is batch.chunked_req, (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
+                    f"is not a middle chunk "
                     f"but output was skipped (contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
@@ -711,9 +789,9 @@ class SchedulerBatchResultProcessor:
     def _apply_prefill_grammar(
         self, *, req: Req, next_token_id: int, already_advanced: bool = False
     ) -> None:
-        # The grammar barrier may have already advanced the FSM over this prefilled
-        # token (spec overlap path); only advance if not, but always sync
-        # grammar.finished.
+        # The step's grammar commit may have advanced the FSM over this
+        # prefilled token already (inside the next spec step's verify); only
+        # advance if not, but always sync grammar.finished.
         if not already_advanced:
             # FIXME: this try-except block is for handling unexpected xgrammar issue.
             try:
@@ -773,36 +851,26 @@ class SchedulerBatchResultProcessor:
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         stride = _get_speculative_output_stride(result)
-        num_non_draft = result.num_non_draft_tokens_per_req
-        result.num_correct_drafts_per_req_cpu = [
-            length - num_non_draft for length in accept_lens
-        ]
-        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+        num_correct_drafts_per_req = result.num_correct_drafts_per_req()
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
             if result.block_accept_lens is not None
             else None
         )
-        result.num_block_accept_tokens = (
-            sum(block_accept_lens) if block_accept_lens else 0
-        )
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
-        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            num_correct_drafts_per_req, batch_size=len(batch.reqs)
         )
 
-        # Advance the grammar FSM over this batch's committed tokens (idempotent):
-        # the EAGLE overlap path already did this inside verify() via the grammar
-        # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
-        # grammar (the queued batch.copy() does not carry has_grammar) and consumes
-        # result.grammar_retained_tokens below instead of re-advancing.
-        self.advance_grammar_fsm(result, batch)
+        # The step's grammar commit (idempotent): under overlap the next step's
+        # verify may have run it already; otherwise it runs now. The retained
+        # runs it left in result.grammar_retained_tokens are used below.
+        advance_grammar_fsm(result, batch)
 
         predict_tokens = []
         for i, req in enumerate(batch.reqs):
@@ -821,109 +889,21 @@ class SchedulerBatchResultProcessor:
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
                 req.kv.kv_committed_len += num_accept_tokens
-                req.spec_verify_ct += 1
+                req.spec_stats.verify_ct += 1
 
-                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-                req.spec_num_correct_drafts += num_correct_drafts
-                req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                num_correct_drafts = num_correct_drafts_per_req[i]
+                req.spec_stats.num_correct_drafts += num_correct_drafts
+                req.spec_stats.update_correct_drafts_histogram(num_correct_drafts)
 
                 if block_accept_lens is not None:
-                    req.spec_num_block_accept_tokens += block_accept_lens[i]
+                    req.spec_stats.num_block_accept_tokens += block_accept_lens[i]
                 if cap_lens is not None:
-                    req.spec_num_cap_tokens += cap_lens[i]
-                    req.update_spec_cap_lens_histogram(cap_lens[i])
+                    req.spec_stats.num_cap_tokens += cap_lens[i]
+                    req.spec_stats.update_cap_lens_histogram(cap_lens[i])
 
             predict_tokens.append(accept_tokens)
 
         return predict_tokens
-
-    def _accept_grammar_tokens(
-        self, req: Req, tokens: Union[int, List[int]]
-    ) -> List[int]:
-        """Advance the grammar over the accepted token(s), stopping at the token
-        that terminates it.
-
-        ``tokens`` is a single sampled token (normal decode) or the whole
-        verified run (spec decode). Returns the retained prefix; for spec the
-        suffix past grammar completion is dropped so it is never committed to KV
-        nor emitted. Advances the grammar FSM only -- ``grammar.finished`` is
-        synced by the caller once the finish state is updated.
-        """
-        if isinstance(tokens, int):
-            tokens = [tokens]
-        retained = []
-        try:
-            for token_id in tokens:
-                req.grammar.accept_token(token_id)
-                retained.append(token_id)
-                if req.grammar.is_terminated():
-                    break
-        except ValueError as e:
-            # accept_token raises ValueError if the token is not in the grammar
-            # (misconfigured grammar or invalid token); abort the request.
-            logger.error(
-                f"Grammar accept_token failed for req {req.rid} with token "
-                f"{tokens}: {e}"
-            )
-            req.to_finish = FINISH_ABORT()
-        return retained
-
-    def advance_grammar_fsm(
-        self, result: GenerationBatchResult, batch: ScheduleBatch
-    ) -> None:
-        """Advance each req's grammar FSM over the tokens THIS batch committed, and
-        (for decode) memoize the grammar-truncated run on ``result``.
-
-        This is the single place the spec-v2 FSM advances. It is idempotent
-        (``result.grammar_advanced``) so it runs either eagerly — inside ``verify(N)``
-        via the scheduler's grammar barrier, so the advance overlaps the target-verify
-        forward — or lazily from the result processors on the non-overlap / non-EAGLE
-        paths. It handles both decode (the accepted spec run) and extend (the single
-        prefilled token) results, so the barrier can resolve whatever the previous
-        batch was — e.g. the extend->decode boundary.
-        """
-        if result.grammar_advanced or not batch.has_grammar:
-            return
-        is_decode = batch.forward_mode.is_decode()
-        if not (is_decode or batch.forward_mode.is_extend()):
-            return
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-        next_token_ids = result.next_token_ids.tolist()
-
-        if not is_decode:
-            # Extend: advance over the single token each completed-prefill req emitted
-            # (mirrors process_batch_result_prefill's per-req token indexing).
-            for i, req in enumerate(batch.reqs):
-                if (
-                    req.grammar is None
-                    or req.is_retracted
-                    or req.finished()
-                    or req.inflight_middle_chunks > 0
-                ):
-                    continue
-                self._accept_grammar_tokens(req, next_token_ids[i])
-            result.grammar_advanced = True
-            return
-
-        # Decode: only the spec-v2 path reaches here (the grammar barrier for
-        # spec-overlap workers and _resolve_spec_v2_tokens). Non-spec grammar decode
-        # advances its FSM in process_batch_result_decode and has no accept_lens, so
-        # bail out defensively.
-        if result.accept_lens is None:
-            return
-        accept_lens = result.accept_lens.tolist()
-        stride = _get_speculative_output_stride(result)
-        retained = [None] * len(batch.reqs)
-        for i, req in enumerate(batch.reqs):
-            if req.grammar is None or req.is_retracted or req.finished():
-                continue
-            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
-            # Stop accepting once the grammar terminates so the over-drafted suffix
-            # is never committed to KV nor emitted; this advances the FSM.
-            retained[i] = self._accept_grammar_tokens(req, accept_tokens)
-        result.grammar_retained_tokens = retained
-        result.grammar_advanced = True
 
     def process_batch_result_idle(
         self,
@@ -948,13 +928,15 @@ class SchedulerBatchResultProcessor:
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
-            result.routed_experts_output = None
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
-            result.indexer_topk_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
-            result.logits_output,
+            (
+                result.logits_output.host_copy()
+                if result.logits_output is not None
+                else None
+            ),
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
@@ -973,10 +955,10 @@ class SchedulerBatchResultProcessor:
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
                 batch_size,
-                result.num_correct_drafts,
+                num_generated_tokens - batch_size * result.num_non_draft_tokens_per_req,
                 num_accept_tokens=num_generated_tokens,
-                num_block_accept_tokens=result.num_block_accept_tokens,
-                num_cap_tokens=result.num_cap_tokens,
+                num_block_accept_tokens=_host_sum(result.block_accept_lens),
+                num_cap_tokens=_host_sum(result.cap_lens),
             )
         if get_observability().enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -1007,9 +989,7 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
@@ -1074,7 +1054,7 @@ class SchedulerBatchResultProcessor:
                 if not is_spec:
                     # Normal decode advances the grammar for its single token
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
-                    self._accept_grammar_tokens(req, next_token_id)
+                    _accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
         if auxiliary_output is not None:
@@ -1092,7 +1072,7 @@ class SchedulerBatchResultProcessor:
         ) % (1 << 30)
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
-            running_batch=batch,
+            batch=batch,
             num_generated_tokens=num_generated_tokens,
         )
 
@@ -1110,7 +1090,6 @@ class SchedulerBatchResultProcessor:
         if not batch.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_v2_tokens(result, batch)
         else:
-            # CUDA workers return a device tensor, MLX a host list[int]; both -> list.
             ids = (
                 next_token_ids.tolist()
                 if torch.is_tensor(next_token_ids)
@@ -1341,13 +1320,14 @@ class SchedulerBatchResultProcessor:
             "InternalServerError",
         )
 
-    def _prepare_kv_cache_release(self, req: Req) -> None:
-        # Only workers that keep KV outside the pool (MLX) define the hook.
-        prepare_release = getattr(
-            self.model_worker, "prepare_for_kv_cache_release", None
-        )
-        if callable(prepare_release):
-            prepare_release(req)
+    def release_finished_req(self, req: Req, *, checkpoint: bool) -> None:
+        """Give a leaving request's KV back: HiSparse frees the rows it holds
+        for it first, then the row goes back to the tree (with ``checkpoint``,
+        the tree first keeps what it can key)."""
+        hisparse = self.hisparse_coordinator
+        if hisparse is not None and hisparse.holds_rows(req):
+            hisparse.request_finished(req)
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
@@ -1356,10 +1336,7 @@ class SchedulerBatchResultProcessor:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            if get_memory().enable_hisparse:
-                self.hisparse_coordinator.request_finished(req)
-            self._prepare_kv_cache_release(req)
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self.release_finished_req(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1370,48 +1347,9 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
-        known_mamba_boundary = None
-        completed_mamba_boundary = None
-        lookahead = 0
-        if batch.mamba_track_mask_cpu is not None:
-            completed_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
-            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
-            assert lookahead in (0, 1), (
-                f"mamba result lookahead={lookahead} for req {req.rid}; "
-                "overlap advanced more than one decode batch"
-            )
-            if lookahead == 0:
-                known_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
-            else:
-                known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
-
-            if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                # The slot that stops being the latest still holds its
-                # checkpoint; name it so a short key can fall back to it.
-                req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
-            elif (
-                req.finished()
-                and lazy
-                and lookahead == 1
-                and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-            ):
-                req.mamba_lazy_checkpoint = False
-
         # Called here (after update_finish_state) so req.finished() is valid
-        # for mamba_lazy_post_decode_at_boundary inside.
-        should_update = completed_mamba_boundary if lazy else known_mamba_boundary
-        if should_update is None or should_update:
-            self._mamba_prefix_cache_update(
-                req,
-                batch,
-                result,
-                i,
-                known_boundary=not lazy and known_mamba_boundary is True,
-            )
+        # for _mamba_lazy_spec_update inside.
+        self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1439,15 +1377,10 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                self._prepare_kv_cache_release(req)
-                checkpoint = (
-                    req.mamba_lazy_checkpoint
-                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
-                    else True
+                self.release_finished_req(
+                    req,
+                    checkpoint=not self._mamba_lazy_keep_written(req, batch, result, i),
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
@@ -1482,28 +1415,20 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
         i: int,
-        known_boundary: bool = False,
     ) -> None:
-        """Update mamba track state at ping-pong boundaries.
+        """Commit the state this step tracked at a ping-pong boundary.
 
-        Non-lazy: swap the ping-pong index so the next forward writes to
-        the alternate slot.
-        Lazy: keep the same index (prealloc handles the swap) and run
-        post-decode cleanup to free the temporary second slot.
+        Non-lazy: the tracked slot becomes the latest checkpoint and the next
+        boundary tracks into the other slot.
+        Lazy: the tracked slot becomes the only one; the old one is freed.
         """
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
-        if known_boundary:
-            self._mamba_assert_committed_len_lookahead(req)
-            track_seqlen = req.kv.kv_committed_len
-            assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
-            at_boundary = True
-        else:
-            at_boundary, track_seqlen = self._mamba_check_track_boundary(
-                req, batch, result, i
-            )
+        at_boundary, track_seqlen = self._mamba_check_track_boundary(
+            req, batch, result, i
+        )
 
         if lazy and not batch.spec_algorithm.is_none():
             # For spec, at_boundary means this step actually crossed an interval.
@@ -1513,20 +1438,18 @@ class SchedulerBatchResultProcessor:
         if not at_boundary:
             return
 
-        track_idx = req.kv.mamba_next_track_idx
-        if not known_boundary and batch.mamba_track_buffer_indices is not None:
-            track_idx = batch.mamba_track_buffer_indices[i]
+        track_idx = batch.mamba_track_buffer_indices[i]
         previous_track_seqlen = req.kv.mamba_last_track_seqlen
-        if not known_boundary:
-            req.kv.mamba_last_track_seqlen = track_seqlen
+        req.kv.mamba_last_track_seqlen = track_seqlen
         if lazy:
             # Lazy frees the slot it stops tracking, so nothing names the
             # previous checkpoint there; mamba_prev_track_seqlen stays None.
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
-            if not known_boundary:
-                req.kv.mamba_last_track_idx = track_idx
-                req.kv.mamba_prev_track_seqlen = previous_track_seqlen
+            req.kv.mamba_last_track_idx = track_idx
+            # The slot that stops being the latest still holds its
+            # checkpoint; name it so a short key can fall back to it.
+            req.kv.mamba_prev_track_seqlen = previous_track_seqlen
             req.kv.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )
@@ -1538,42 +1461,12 @@ class SchedulerBatchResultProcessor:
 
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
-        the plan already pointed at the keep slot (in-place fallback, or
-        promoted by an earlier overlapped confirmation).
-        Finishing req: donate the keep slot only if no scatter wrote it
-        (this step) or may still write it (the in-flight next step).
+        the plan already pointed at the keep slot (an in-place crossing). A
+        finishing req keeps its slots for the donation
+        (_mamba_lazy_keep_written).
         """
-        positions = batch.mamba_lazy_spec_track_positions_cpu
-        planned_pos = (
-            positions[i]
-            if positions is not None and i < len(positions)
-            else None  # filtered/merged snapshot without a plan: be conservative
-        )
-
-        if req.finished():
-            # Skip the donation if a scatter wrote or may still write the keep slot.
-            keep_written_by_this_step = (
-                crossed and planned_pos == req.kv.mamba_next_track_idx
-            )
-            other_idx = 1 - req.kv.mamba_next_track_idx
-            # Recompute the in-flight verify's plan (kv_committed_len is
-            # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
-                other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
-                req,
-                mamba_track_grid(self.tree_cache.page_size),
-                max_speculative_num_draft_tokens(),
-            )
-            if (
-                planned_pos is None
-                or keep_written_by_this_step
-                or keep_may_be_written_in_flight
-            ):
-                req.mamba_lazy_checkpoint = False
-            return
-
-        if not crossed or planned_pos is None:
+        planned_pos = batch.mamba_lazy_spec_track_positions_cpu[i]
+        if req.finished() or not crossed:
             return
         if planned_pos != req.kv.mamba_next_track_idx:
             # Promote pending -> keep: free the old checkpoint, repoint.
@@ -1583,46 +1476,48 @@ class SchedulerBatchResultProcessor:
             pool.mamba_allocator.free(keep_val.unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
             req.kv.mamba_next_track_idx = planned_pos
-        # else: in-place fallback, or promoted by an earlier confirmation —
-        # keep holds the track_seqlen state either way.
         req.kv.mamba_last_track_idx = planned_pos
         req.kv.mamba_last_track_seqlen = track_seqlen
 
-    @staticmethod
-    def _mamba_assert_committed_len_lookahead(req: Req) -> None:
-        """Alarm if overlap advances beyond the scheduler's modeled window."""
-        assert req.output_ids, (
-            "mamba track boundary reached before a decode token was appended "
-            f"(req {req.rid}); output_ids is empty"
-        )
-        token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        assert (req.kv.kv_committed_len - token_seq_len) in (0, 1), (
-            f"mamba track boundary: kv_committed_len={req.kv.kv_committed_len} "
-            f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
-            "overlap lookahead wider than assumed"
-        )
+    def _mamba_lazy_keep_written(
+        self,
+        req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
+    ) -> bool:
+        """Whether a finishing lazy request's checkpoint slot is written in
+        place, by this step's verify (a finishing request's crossing is not
+        committed) or by a pending step; the request is then released without
+        a checkpoint."""
+        if (
+            not get_exec().mamba.enable_mamba_extra_buffer_lazy
+            or req.kv.mamba_ping_pong_track_buffer is None
+        ):
+            return False
+        keep_idx = req.kv.mamba_last_track_idx
+        if (
+            not batch.spec_algorithm.is_none()
+            and batch.mamba_track_write_position(i) == keep_idx
+            and self._mamba_check_track_boundary(req, batch, result, i)[0]
+        ):
+            return True
+        return self.pending.plans_mamba_track_write(req, keep_idx)
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  The boundary condition
-        matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Subtracting the overlap
-        lookahead from ``kv_committed_len`` reproduces that check.
-
-        For spec decode, the boundary is detected by comparing the
-        accepted seq_len range against interval boundaries.
+        Returns (at_boundary, track_seqlen). A non-spec step tracked the rows
+        its mask marks, at the step's own length. For spec decode, the boundary
+        is detected by comparing the accepted seq_len range against interval
+        boundaries.
         """
         interval = mamba_track_grid(self.tree_cache.page_size)
 
         if batch.spec_algorithm.is_none():
-            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
-            committed_len = req.kv.kv_committed_len - lookahead
-            if committed_len % interval == 0:
-                return True, committed_len
-        elif result.num_correct_drafts_per_req_cpu is not None:
+            if batch.mamba_track_mask_cpu is not None and batch.mamba_track_mask_cpu[i]:
+                return True, int(batch.seq_lens_cpu[i])
+        elif result.accept_lens is not None:
             cur = req.seqlen - 1
             num_non_draft = result.num_non_draft_tokens_per_req
             retained = result.grammar_retained_tokens
@@ -1631,7 +1526,7 @@ class SchedulerBatchResultProcessor:
                 # tokens ahead of the tracked verify window (UNO's root).
                 num_committed = max(len(retained[i]) - (num_non_draft - 1), 0)
             else:
-                num_committed = result.num_correct_drafts_per_req_cpu[i] + 1
+                num_committed = int(result.accept_lens[i]) - num_non_draft + 1
             prev = cur - num_committed
             if cur // interval != prev // interval:
                 return True, cur // interval * interval

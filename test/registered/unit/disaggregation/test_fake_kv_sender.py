@@ -71,7 +71,7 @@ class TestFakeKVSender(unittest.TestCase):
         a terminal poll state instead of accumulating in the inflight queue."""
         self.sender.init(0, 0)
         page_indices = np.array([], dtype=np.int32)
-        # Mirrors the send_kv_chunk gate in SchedulerDisaggregationPrefillMixin.
+        # Mirrors the send_kv_chunk gate in DisaggPrefill.
         if self.sender.should_send_kv_chunk(len(page_indices), True):
             self.sender.send(page_indices)
         self.assertEqual(self.sender.poll(), KVPoll.Success)

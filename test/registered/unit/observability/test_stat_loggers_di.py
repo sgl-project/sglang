@@ -27,6 +27,7 @@ import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
@@ -232,6 +233,13 @@ class TestHiCacheMetrics(unittest.TestCase):
         )
 
 
+def _empty_decode_lists():
+    return {
+        name: RequestList(name=name, reqs=[])
+        for name in ("prealloc", "retracted", "transfer")
+    }
+
+
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
         self.labels = {
@@ -283,10 +291,13 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.DECODE,
-            disagg_decode_transfer_queue=queue,
-            disagg_decode_prealloc_queue=SimpleNamespace(queue=[]),
-            running_batch=SimpleNamespace(reqs=[]),
+            disagg_decode=SimpleNamespace(
+                transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
+            ),
+            request_lists=_empty_decode_lists,
+            decoding=[],
             waiting_queue=[],
+            queued_reqs=lambda: [],
             grammar_manager=[],
             enable_priority_scheduling=False,
             pool_stats_observer=SimpleNamespace(
@@ -356,12 +367,16 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.DECODE,
-            disagg_decode_transfer_queue=queue,
-            disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+            disagg_decode=SimpleNamespace(
+                transfer_queue=queue,
+                prealloc_queue=SimpleNamespace(
+                    queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+                ),
             ),
-            running_batch=batch,
+            request_lists=_empty_decode_lists,
+            decoding=batch.reqs,
             waiting_queue=[],
+            queued_reqs=lambda: [],
             grammar_manager=[],
             enable_priority_scheduling=False,
             max_total_num_tokens=1,
@@ -428,7 +443,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 return_value=10.0,
             ),
         ):
-            reporter.report_decode_stats(can_run_cuda_graph=False, running_batch=batch)
+            reporter.report_decode_stats(can_run_cuda_graph=False, batch=batch)
 
         self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 2)
         self.assertEqual(

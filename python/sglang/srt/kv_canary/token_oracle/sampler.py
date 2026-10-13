@@ -56,4 +56,5 @@ class _OracleSampler(Sampler):
         )
 
         batch_next_token_ids = maybe_perturb_swap_next_tokens(batch_next_token_ids)
+        sampling_info.commit_sampled_tokens(batch_next_token_ids)
         return batch_next_token_ids

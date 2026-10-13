@@ -8,7 +8,10 @@ from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
-from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.overlap_utils import (
+    RelayPayload,
+    draft_state_in_future_map,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -142,14 +145,14 @@ def build_eagle_disagg_draft_input(
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
-    if batch.enable_overlap:
+    if draft_state_in_future_map(batch.enable_overlap):
         spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
-        # Seed the relay buf with the known seq_lens; publish's chained record
-        # keeps the in-flight forward's fence intact (see FutureMap.publish).
-        future_map.publish(spec_info.future_indices, batch.seq_lens)
-        future_map.stash(
-            spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
+        future_map.seed(
+            spec_info.future_indices,
+            batch.seq_lens,
+            RelayPayload.from_draft_input(spec_info),
+            indices_cpu=batch.req_pool_indices_cpu,
         )
 
     return spec_info

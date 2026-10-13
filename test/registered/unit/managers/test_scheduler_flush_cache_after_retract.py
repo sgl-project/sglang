@@ -1,5 +1,4 @@
 import unittest
-from collections import deque
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -9,6 +8,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -24,7 +24,7 @@ def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
 class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     """Regression coverage for flush_cache() no-oping while the engine is paused.
 
-    With generation paused and running_batch drained, nothing in waiting_queue
+    With generation paused and nothing decoding, nothing in waiting_queue
     holds KV/pool state: neither requests pause_generation(mode="retract") just
     moved there, nor requests that were never scheduled at all. The latter are
     always present under high concurrency (in-flight targets exceed engine
@@ -36,17 +36,17 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
-        scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.running_batch = MagicMock()
-        scheduler.running_batch.is_empty.return_value = True
-        scheduler.result_queue = deque()
+        scheduler.disagg_prefill = None
+        scheduler.disagg_decode = None
+        scheduler.decoding = []
+        scheduler.pending = PendingSteps()
         scheduler.waiting_queue = []
-        scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
-        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+        scheduler.dllm = None
+        scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False

@@ -264,7 +264,6 @@ class LLaDAImageTextEncoderRunner:
                 vocab_size=self.worker.model_config.vocab_size,
                 eos_token_ids=set(),
                 return_hidden_states=True,
-                dllm_config=None,
             )
             req.skip_radix_cache_insert = True
             reqs.append(req)
@@ -284,7 +283,6 @@ class LLaDAImageTextEncoderRunner:
             self.server_args.max_prefill_tokens,
             chunked_prefill_size,
             prefill_max_requests=len(reqs),
-            dllm_config=None,
         )
         for req in reqs:
             req.init_next_round_input(self.tree_cache)
@@ -309,7 +307,6 @@ class LLaDAImageTextEncoderRunner:
             model_config=self.worker.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            dllm_config=None,
         )
         try:
             batch.prepare_for_extend()

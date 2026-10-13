@@ -266,7 +266,6 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             disaggregation_mode=DisaggregationMode.NULL,
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             metrics_collector=None,
-            dllm_config=None,
             tokenizer=object(),
         )
         receiver = SimpleNamespace(scheduler=scheduler)

@@ -360,35 +360,26 @@ class TestDecodeRetractionBackup(CustomTestCase):
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
-            scheduler=SimpleNamespace(
-                server_args=env.server_args,
-                ps=SimpleNamespace(dp_rank=0, gpu_id=0),
-                model_config=SimpleNamespace(
-                    num_hidden_layers=env.target_pool.layer_num
-                ),
-                running_batch=SimpleNamespace(reqs=[]),
-                waiting_queue=[],
-                last_batch=None,
-                sliding_window_size=8 if hybrid_swa else None,
-                enable_hisparse=False,
-                enable_decode_hicache=False,
-                enable_lora=False,
-                enable_priority_scheduling=False,
-                metrics_reporter=SimpleNamespace(
-                    current_scheduler_metrics_enabled=False
-                ),
-                tp_worker=SimpleNamespace(
-                    is_hybrid_swa=hybrid_swa,
-                    model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16"),
-                ),
-            ),
+            server_args=env.server_args,
+            model_config=SimpleNamespace(num_hidden_layers=env.target_pool.layer_num),
+            get_decoding=lambda: [],
+            get_ready=lambda: [],
+            sliding_window_size=8 if hybrid_swa else None,
+            enable_hisparse=False,
+            hisparse_coordinator=None,
+            enable_decode_hicache=False,
+            enable_lora=False,
+            enable_priority_scheduling=False,
+            metrics_reporter=SimpleNamespace(current_scheduler_metrics_enabled=False),
+            is_hybrid_swa=hybrid_swa,
+            kv_cache_dtype_str="bfloat16",
         )
         with (
             patch.object(FakeKVManager, "supports_host_destination", True),
             get_parallel().override(dp_rank=0),
         ):
             queue.kv_manager = queue._init_kv_manager()
-        queue.scheduler.pool_stats_observer = SchedulerPoolStatsObserver(
+        queue.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=env.cache,
             token_to_kv_pool_allocator=env.allocator,
             req_to_token_pool=env.req_to_token_pool,
@@ -441,7 +432,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
         # Independent SWA pressure must delay device admission even when full KV fits.
         swa_blocker = env.allocator.swa_attn_allocator.alloc(self.pool_size)
-        self.assertFalse(queue.allocate_host_staged(decode_req))
+        self.assertFalse(queue.allocate_host_staged(decode_req, []))
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertIs(req.kv.retraction_backup, backup)
         env.allocator.swa_attn_allocator.free(swa_blocker)
@@ -468,7 +459,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 expected.append((pool_name, buffer, values[:num_tokens]))
                 buffer.fill_(-1)
 
-        self.assertTrue(queue.allocate_host_staged(decode_req))
+        self.assertTrue(queue.allocate_host_staged(decode_req, []))
         req.output_ids.append(99)
         env.cache.restore_kv_cache(req, backup)
         full_indices = env.req_to_token_pool.req_to_token[
@@ -511,10 +502,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
                 queue, _ = self._receive_queue(env)
                 host_admissions = []
-                queue.scheduler.metrics_reporter.current_scheduler_metrics_enabled = (
-                    True
-                )
-                queue.scheduler.metrics_collector = SimpleNamespace(
+                queue.metrics_reporter.current_scheduler_metrics_enabled = True
+                queue.metrics_collector = SimpleNamespace(
                     increment_decode_host_receive_reqs=lambda: host_admissions.append(1)
                 )
                 pressure = env.allocator.alloc(used_tokens)
@@ -529,7 +518,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
                 queue.queue = [decode_req]
-                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
                 self.assertEqual(decode_req.host_staged, host_staged)
                 self.assertEqual(len(host_admissions), int(host_staged))
                 self.assertEqual(req.kv.req_pool_idx is None, host_staged)
@@ -581,7 +570,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue.queue = [decode_req]
                 host_free_before = cache.host_pool_group.available_size()
                 blocker = env.allocator.alloc(self.pool_size)
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(queue.pop_preallocated([]), ([], []))
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -589,7 +578,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.allocator.free(blocker)
                 pressure = env.allocator.alloc(num_slots)
                 receiver.supports_host_destination = True
-                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
                 self.assertIsNone(req.kv.req_pool_idx)
                 self.assertEqual(
                     env.allocator.available_size(), self.pool_size - num_slots
@@ -649,7 +638,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
                 queue.queue = [pending]
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(queue.pop_preallocated([]), ([], []))
                 self.assertEqual(queue.queue, [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)
@@ -674,11 +663,11 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
                 # Device slots are assigned only after the host transfer.
                 blocker = env.allocator.alloc(num_slots)
-                self.assertFalse(queue.allocate_host_staged(decode_req))
+                self.assertFalse(queue.allocate_host_staged(decode_req, []))
                 self.assertIsNone(req.kv.req_pool_idx)
                 self.assertIs(req.kv.retraction_backup, backup)
                 env.allocator.free(blocker)
-                self.assertTrue(queue.allocate_host_staged(decode_req))
+                self.assertTrue(queue.allocate_host_staged(decode_req, []))
                 self.assertFalse(decode_req.host_staged)
                 received_indices = env.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :num_tokens
@@ -693,7 +682,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 # Abort cleanup uses the same descriptor, including sidecars.
-                self.assertEqual(queue.pop_preallocated(), ([pending], []))
+                self.assertEqual(queue.pop_preallocated([]), ([pending], []))
                 cache.discard_kv_cache_backup(pending_req.kv.retraction_backup)
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -735,7 +724,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
         queue.queue = [decode_req]
         host_free_before = cache.host_pool_group.available_size()
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertEqual(cache.protected_size(), 4)
         env.allocator.free(pressure)
@@ -743,7 +732,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         for buffer in queue.host_pool.host_kv_data_refs:
             buffer[backup.host_indices] = 7
 
-        self.assertTrue(queue.allocate_host_staged(decode_req))
+        self.assertTrue(queue.allocate_host_staged(decode_req, []))
         received_indices = env.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :8
         ].clone()

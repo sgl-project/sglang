@@ -819,10 +819,10 @@ class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
 
 
 class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
-    """`current_token` must be tracked on the wrapper so that disaggregation's
-    process_prebuilt dedup guard (`grammar.current_token is None`) works for
+    """`current_token` must be tracked on the wrapper so that the PD decode
+    admission dedup guard (`grammar.current_token is None`) works for
     reasoning requests. Without it the guard never fires and a retracted/
-    re-prebuilt request re-accepts an already-accepted token -> grammar raises
+    re-admitted request re-accepts an already-accepted token -> grammar raises
     "Tokens not accepted" -> FINISH_ABORT (the disagg tool_choice abort)."""
 
     def _make_object_with_mock_grammar(self):
@@ -869,7 +869,7 @@ class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
         obj.accept_token(4913)  # '{"' accepted into inner grammar
         inner_grammar.accept_token.reset_mock()
 
-        # Mirror disaggregation/decode_schedule_batch_mixin.py:process_prebuilt
+        # Mirror disaggregation/decode.py:_commit_prefill_handoff
         last_token = 4913
         if obj.current_token is None:  # guard
             obj.accept_token(last_token)

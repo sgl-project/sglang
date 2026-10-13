@@ -192,7 +192,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue.clear()
+        self.coordinator.staging.clear()
+        self.coordinator._staging_copy_done.clear()
+        self.coordinator._remapped_decode_slots.clear()
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -571,7 +573,8 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "page_size_one_alloc_free_cycle")
 
     def test_decode_remap_frees_stale_page_size_one_mapping(self):
-        """map_last_loc_to_buffer frees the temporary alloc() hisparse slot."""
+        """The decode step's host commit frees the temporary alloc() hisparse
+        slot its forward entry remapped away from."""
         if self.page_size != 1:
             self.skipTest("page_size=1 decode remap path is ROCm-specific")
 
@@ -613,6 +616,7 @@ class TestHiSparseUnit(unittest.TestCase):
             torch.equal(stale_loc, remapped_loc),
             "Decode loc should move from temporary mapping to device buffer",
         )
+        self.coordinator.free_remapped_decode_slots()
         self.assertEqual(
             self.allocator.hisparse_attn_allocator.available_size(),
             initial[1] - seq_len,
@@ -636,8 +640,12 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        # The launch of the last prefill chunk joins staging; its commit
+        # starts the copy.
+        self.coordinator.staging.append(req)
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
+        self.assertTrue(self.coordinator.holds_rows(req))
 
         get_device_module().synchronize()
         ready = self.coordinator.collect_ready_reqs()
@@ -657,7 +665,11 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         self._assert_matches_naive(rpi, sls, batch, locs, layer_id=0, msg="Staging: ")
 
-        self._cleanup_req(req, kv_loc)
+        # holds_rows reads the request's slot, so check it before the slot is freed.
+        self.coordinator.request_finished(req)
+        self.assertFalse(self.coordinator.holds_rows(req))
+        self.allocator.free(kv_loc)
+        self._free_req_slot(req)
         self._assert_sizes_restored(initial, "staging_path")
 
     # ==================================================================
@@ -674,6 +686,9 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        # The launch of the last prefill chunk joins staging; its commit
+        # starts the copy.
+        self.coordinator.staging.append(req)
         self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
         ready = self.coordinator.collect_ready_reqs()
@@ -761,6 +776,10 @@ class TestHiSparseUnit(unittest.TestCase):
         req = _make_req("pd-decode-prealloc", list(range(fill_len)))
 
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from sglang.srt.disaggregation.req_state import DisaggReqState
+
+        # The PD decode queue that takes a request attaches its PD state.
+        req.disagg = DisaggReqState()
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = self.req_to_token_pool
@@ -771,12 +790,11 @@ class TestHiSparseUnit(unittest.TestCase):
             protected_size=lambda: 0,
             maybe_hand_to_session=lambda req: None,
         )
-        queue.scheduler = SimpleNamespace(
-            enable_hisparse=True,
-            hisparse_coordinator=self.coordinator,
-        )
+        queue.enable_hisparse = True
+        queue.hisparse_coordinator = self.coordinator
 
         host_indices = queue._pre_alloc(req)
+        self.assertTrue(self.coordinator.holds_rows(req))
         self.assertEqual(host_indices.numel(), fill_len)
         self.assertTrue(torch.all(host_indices >= 0))
         self.assertTrue(

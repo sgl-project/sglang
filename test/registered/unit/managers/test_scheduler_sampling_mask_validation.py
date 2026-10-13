@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -27,12 +28,20 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     hf_eos_token_id={1}, vocab_size=128
                 )
                 scheduler.disaggregation_mode = mode
-                scheduler.disagg_metadata_buffers = SimpleNamespace(
-                    enable_sampling_mask=False
+                buffers = SimpleNamespace(enable_sampling_mask=False)
+                scheduler.disagg_prefill = (
+                    prefill_owner_shell(metadata_buffers=buffers)
+                    if mode == DisaggregationMode.PREFILL
+                    else None
+                )
+                scheduler.disagg_decode = (
+                    decode_owner_shell(metadata_buffers=buffers)
+                    if mode == DisaggregationMode.DECODE
+                    else None
                 )
                 scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
                 scheduler.tokenizer = None
-                scheduler.dllm_config = None
+                scheduler.dllm = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,

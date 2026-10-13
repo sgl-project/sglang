@@ -11,8 +11,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -32,7 +33,6 @@ def _make_req(
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_len = prefix_len
     req.extend_end = fill_len
-    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
@@ -58,29 +58,24 @@ def _make_tree_cache() -> BasePrefixCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
+    s.scripted_scheduler_hook = None
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.dllm_config = None
-    s.dllm_manager = None
+    s.disagg_prefill = None
+    s.dllm = None
     s.enable_hisparse = False
     s.enable_fpm = False
     # Exercise the unconditional scheduler-loop HiCache event-drain point.
     s.enable_hierarchical_cache = True
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
-    s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
     s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
-    s.running_batch = MagicMock()
-    s.running_batch.is_empty.return_value = True
-    s.running_batch.is_prefill_only = False
-    s.running_batch.batch_is_full = False
-    s.running_batch.reqs = []
+    s.decoding = []
     s.prefill_decode_interval = 0
     s._prefill_decode_interval_remaining = 0
-    s.get_new_batch_prefill = MagicMock(
-        return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
-    )
+    s.get_new_batch_prefill = MagicMock(return_value=None)
+    s.get_decode_step = MagicMock(return_value=None)
     s.dp_attn_adapter = MagicMock()
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch
@@ -89,11 +84,13 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.ngram_embedding_manager.prepare_for_forward = MagicMock(
         side_effect=lambda batch, **_: batch
     )
-    s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s.disagg_decode = None
+    s.hisparse_coordinator = None
+    s.init_mode_stages()
     return s
 
 
@@ -121,9 +118,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         # so the gate must skip stash and leave the prefix intact.
         s, req = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
-        Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, ScheduleSlot())
 
         self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
         s.tree_cache.checkpoint.assert_not_called()
@@ -133,9 +128,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         # the cached prefix, stash must run and advance prefix_len.
         s, req = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
-        Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, ScheduleSlot())
 
         self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
         s.tree_cache.checkpoint.assert_called_once_with(
@@ -148,9 +141,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         cache = _make_tree_cache()
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
-        Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, ScheduleSlot())
         self.assertIsNone(s.chunked_req)
         cache.checkpoint.assert_not_called()
 

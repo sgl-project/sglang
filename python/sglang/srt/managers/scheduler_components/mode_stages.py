@@ -1,0 +1,78 @@
+"""What the drivers run per mode, and what they hand to it.
+
+A mode's stages come from its owner and are chosen once, when the scheduler
+(or a PD role switch) builds the owner; the flat and the ring driver read the
+same set. An entry left None runs the core default inline, so a mode pays no
+call for a stage it does not have.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+@dataclass(slots=True)
+class ScheduleSlot:
+    """What one step is scheduled for: the decoding requests it may run and
+    its admission flag. The flat driver has one slot, over every decoding
+    request; the PP ring has one per microbatch slot, over the requests that
+    slot launched. A launch tags the requests joining decoding with it, and
+    the commit of the slot's step reopens its admission."""
+
+    # The ring slot; None for the flat driver.
+    index: Optional[int] = None
+    # Admission is shut until a request leaves decoding.
+    batch_is_full: bool = False
+
+    def filter_decoding(self, decoding: List[Req]) -> List[Req]:
+        """The decoding requests a step of this slot may run."""
+        if self.index is None:
+            return decoding
+        return [req for req in decoding if req.ring_slot == self.index]
+
+
+@dataclass(frozen=True, slots=True)
+class ModeStages:
+    """One mode's stages, in driver order."""
+
+    # Build the step of a slot (flat PD prefill also takes its polling args).
+    schedule: Callable[..., Optional[ScheduleBatch]]
+    # Flat driver, before intake while the engine runs: PD decode starts the
+    # prefill DP-rank lookups of its pending rooms.
+    prefetch: Optional[Callable[[], None]] = None
+    # Flat driver, after intake: the owner advances its own lists and returns
+    # the requests that join the core waiting list (PD prefill: bootstrapped;
+    # PD decode: None, its admitted requests wait in its ready list).
+    intake: Optional[Callable[[], Optional[List[Req]]]] = None
+    # Normal schedule, before admission: HiSparse requests whose host copy
+    # landed; they join decoding.
+    collect_ready: Optional[Callable[[], List[Req]]] = None
+    # Normal schedule, admission: dLLM takes its requests from waiting and
+    # builds its step (None: prefill admission, after the prefill/decode
+    # interval).
+    admit: Optional[Callable[[ScheduleSlot], Optional[ScheduleBatch]]] = None
+    # Launch, before the forward: PD prefill sends cached prefix KV early.
+    before_forward: Optional[Callable[[ScheduleBatch], None]] = None
+    # Launch: dLLM moves its whole step into its staging list.
+    on_launch: Optional[Callable[[ScheduleBatch], None]] = None
+    # Launch: where the requests whose last prefill chunk ran go (PD
+    # prefill: prefilling; HiSparse: staging; None: decoding).
+    on_prefilled: Optional[Callable[[List[Req]], None]] = None
+    # Overlap flat driver, the commit readiness gate (PD prefill with
+    # continuous input polling): whether a pending step's result is ready on
+    # every rank; until it is, the driver returns to intake.
+    is_result_ready: Optional[Callable[[Any], bool]] = None
+    # Commit, after the finished requests leave decoding: HiSparse drops
+    # those its prefill commit finished from staging.
+    leave_finished: Optional[Callable[[], None]] = None
+    # Flat driver, after the commits: PD prefill polls its KV transfers; it
+    # takes and returns the core waiting list.
+    after_commit: Optional[Callable[[List[Req]], List[Req]]] = None
+    # PP ring: builds the PD consensus messages around each slot, from the PP
+    # channel and the ring size; under PP they replace the flat intake and
+    # after_commit.
+    ring_consensus: Optional[Callable[[Any, int], Any]] = None

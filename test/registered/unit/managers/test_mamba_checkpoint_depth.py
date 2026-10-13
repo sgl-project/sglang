@@ -12,7 +12,7 @@ then frees two kv-row segments that share the page holding 576.
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -64,18 +64,17 @@ def _track_seqlen(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
-    batch.req_to_token_pool = MagicMock()
-    batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
         return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
     ):
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    # The plan is applied to the request at admission, not by the build.
+    assert req.kv.mamba_last_track_seqlen is None
     if not entry.track_mask:
-        assert req.kv.mamba_last_track_seqlen is None
         return None
-    return req.kv.mamba_last_track_seqlen
+    return entry.checkpoint_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):

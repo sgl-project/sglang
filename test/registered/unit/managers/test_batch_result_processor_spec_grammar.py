@@ -10,10 +10,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
@@ -67,9 +69,7 @@ class _FakeBatch:
 def _make_processor() -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        disaggregation_mode=None,
         enable_overlap=False,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
@@ -84,6 +84,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
+        pending=PendingSteps(),
     )
 
 
@@ -117,9 +118,8 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.scheduler = SimpleNamespace(
-        batch_result_processor=processor, kv_checksum_computer=None
-    )
+    queue.update_reasoning_tokens = processor._maybe_update_reasoning_tokens
+    queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (
@@ -142,7 +142,7 @@ def _commit_disagg_handoff(
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
     if replayed_boundary:
-        req.pd_rebootstrap_forced_output_id = token_id
+        req.disagg = DisaggReqState(rebootstrap_forced_output_id=token_id)
     decode_req = DecodeRequest(
         req=req,
         kv_receiver=SimpleNamespace(clear=lambda: None),

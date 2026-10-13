@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.overlap_utils import (
+    RelayPayload,
+    draft_state_in_future_map,
+)
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
 if TYPE_CHECKING:
@@ -22,11 +25,12 @@ def build_dflash_disagg_draft_input(
         bonus_tokens=last_tokens_tensor,
         new_seq_lens=batch.seq_lens,
     )
-    if batch.enable_overlap:
+    if draft_state_in_future_map(batch.enable_overlap):
         spec_info.future_indices = batch.req_pool_indices
-        future_map.publish(spec_info.future_indices, batch.seq_lens)
-        future_map.stash(
+        future_map.seed(
             spec_info.future_indices,
+            batch.seq_lens,
             RelayPayload(bonus_tokens=last_tokens_tensor),
+            indices_cpu=batch.req_pool_indices_cpu,
         )
     return spec_info

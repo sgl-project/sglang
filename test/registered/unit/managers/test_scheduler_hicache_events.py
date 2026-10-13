@@ -13,8 +13,9 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.test.disagg_owner_shells import prefill_owner_shell
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -24,6 +25,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
+        s.scripted_scheduler_hook = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
@@ -31,9 +33,23 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
-        s.process_prefill_chunk = Mock()
+        s.chunked_req = None
+        s.pending = []
+        s.disagg_prefill = prefill_owner_shell(
+            resolve_waiting_bootstrap=lambda waiting: waiting,
+            process_prefill_chunk=lambda chunked_req, waiting, pending: (
+                chunked_req,
+                waiting,
+            ),
+        )
+        s.disagg_decode = None
+        s.dllm = None
+        s.hisparse_coordinator = None
+        s.enable_overlap = False
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
+        s._arm_prefill_decode_interval = Mock()
+        s.enable_fpm = False
         self.running_batch = SimpleNamespace(
             batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
         )
@@ -71,23 +87,20 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler
-        s.resolve_waiting_queue_bootstrap = Mock()
         s.get_new_batch_prefill = self.calls.admit
-        s.get_new_batch_prefill.return_value = NextBatchPlan(
-            batch_to_run=None, running_batch=self.running_batch
-        )
+        s.get_new_batch_prefill.return_value = None
+        s.ngram_embedding_manager = Mock()
+        s.ngram_embedding_manager.prepare_for_forward.return_value = None
+        slot = ScheduleSlot()
         for waiting_queue in ([], [SimpleNamespace(rid="pending_l3")]):
             with self.subTest(waiting=bool(waiting_queue)):
                 s.waiting_queue = waiting_queue
                 self.calls.reset_mock()
                 for _ in range(2):
-                    plan = s.get_next_disagg_prefill_batch_to_run(
-                        running_batch=self.running_batch, last_batch=None
-                    )
-                    self.assertIsNone(plan.batch_to_run)
+                    self.assertIsNone(s.get_next_disagg_prefill_batch_to_run(slot))
                 self.assertEqual(
                     self.calls.mock_calls,
-                    [call.drain(), call.retry(), call.admit(self.running_batch)] * 2,
+                    [call.drain(), call.retry(), call.admit(slot)] * 2,
                 )
 
     def test_unified_drains_when_prefill_is_deferred(self):
@@ -95,21 +108,22 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.enable_fpm = False
         s._abort_on_waiting_timeout = Mock()
         s._abort_on_running_timeout = Mock()
-        s.dllm_config = None
+        s.disagg_prefill = None
         s.chunked_req = None
         s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer
         s._should_defer_prefill.return_value = True
         s.get_new_batch_prefill = Mock()
-        s.dp_attn_adapter.maybe_convert_decode_to_extend.return_value = None
+        s.get_decode_step = Mock(return_value=None)
         s._arm_prefill_decode_interval = Mock()
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.return_value = None
 
-        plan = s.get_next_batch_to_run(self.running_batch, None)
+        s.init_mode_stages()
+        step = s.get_next_batch_to_run(ScheduleSlot())
 
-        self.assertIsNone(plan.batch_to_run)
+        self.assertIsNone(step)
         s.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
             self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
@@ -117,27 +131,36 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
     def test_pp_prefill_drains_before_admission(self):
         s = self.scheduler
-        s.init_pp_loop_state = Mock()
-        s.pp_loop_size = 1
         enter_scope(self, published_topology(pp_size=2))
-        s.pp_group = SimpleNamespace(is_last_rank=True)
-        s.running_mbs = [self.running_batch]
-        s.last_mbs = [None]
+        s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        s.world_group = s.attn_tp_group = s.device = s.device_module = None
+        s.schedule_stream = s.forward_stream = s.copy_stream = None
+        s.copy_stream_ctx = s.forward_stream_ctx = s.spec_algorithm = None
+        s.req_to_token_pool = s.token_to_kv_pool_allocator = None
+        s.tp_worker = s.model_worker = s.future_map = None
+        s.recv_skipper = None
         s.ingest_requests = Mock(return_value=[])
         s.waiting_queue = []
-        s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
-        s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
-        s._pp_commit_comm_work = Mock()
+        s.disagg_prefill.bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
+        s.disagg_prefill.poll_transfer_rids = Mock(return_value=[])
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler.PPChannel",
+                return_value=Mock(is_first_rank=True, is_last_rank=True),
+            ),
+        )
         s.get_new_batch_prefill = self.calls.admit
         # Stop the infinite loop at admission; no PP transport or GPU is needed.
         s.get_new_batch_prefill.side_effect = StopIteration
 
+        s.init_mode_stages()
         with self.assertRaises(StopIteration):
-            s.event_loop_pp_disagg_prefill()
+            s.event_loop_pp()
 
         self.assertEqual(
             self.calls.mock_calls,
-            [call.drain(), call.retry(), call.admit(self.running_batch)],
+            [call.drain(), call.retry(), call.admit(s.pp_ring.slots[0].schedule_slot)],
         )
 
 

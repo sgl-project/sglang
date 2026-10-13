@@ -34,6 +34,12 @@ def _batch(forward_mode, recv_skipper_forward_mode=None):
     )
 
 
+def _recv(skipper, last_step):
+    """One iteration: launch last_step, then decide at the next intake."""
+    skipper.on_launch(last_step)
+    return skipper.handle()
+
+
 class TestSchedulerRecvSkipper(CustomTestCase):
     def test_disabled_at_default_interval(self):
         # interval <= 1 disables the skipper entirely.
@@ -49,35 +55,35 @@ class TestSchedulerRecvSkipper(CustomTestCase):
     def test_no_last_batch_accumulates_slowly(self):
         _publish(self, 50)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(None))
+        self.assertFalse(_recv(skipper, None))
 
     def test_decode_accumulates_until_threshold(self):
         # DECODE weight = 1: recv only every `interval` decode steps.
         _publish(self, 3)
         skipper = SchedulerRecvSkipper.maybe_create()
         decode = _batch(ForwardMode.DECODE)
-        self.assertFalse(skipper.handle(decode))  # counter 1
-        self.assertFalse(skipper.handle(decode))  # counter 2
-        self.assertTrue(skipper.handle(decode))  # counter 3 -> recv, reset
-        self.assertFalse(skipper.handle(decode))  # counter 1 again
+        self.assertFalse(_recv(skipper, decode))  # counter 1
+        self.assertFalse(_recv(skipper, decode))  # counter 2
+        self.assertTrue(_recv(skipper, decode))  # counter 3 -> recv, reset
+        self.assertFalse(_recv(skipper, decode))  # counter 1 again
 
     def test_prefill_triggers_recv_immediately(self):
         # Non-decode passes use the large default weight: recv right away.
         _publish(self, 50)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertTrue(skipper.handle(_batch(ForwardMode.EXTEND)))
+        self.assertTrue(_recv(skipper, _batch(ForwardMode.EXTEND)))
 
     def test_dp_uses_synced_mode_not_local(self):
         # Local EXTEND (weight 1000) must be ignored in favor of the synced
         # DECODE (weight 1); a recv here would mean the local mode leaked in.
         _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(_batch(ForwardMode.EXTEND, ForwardMode.DECODE)))
+        self.assertFalse(_recv(skipper, _batch(ForwardMode.EXTEND, ForwardMode.DECODE)))
 
     def test_dp_synced_extend_triggers_recv(self):
         _publish(self, 50, attn_dp_size=2)
         skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertTrue(skipper.handle(_batch(ForwardMode.IDLE, ForwardMode.EXTEND)))
+        self.assertTrue(_recv(skipper, _batch(ForwardMode.IDLE, ForwardMode.EXTEND)))
 
     def test_derive_forward_mode(self):
         derive = SchedulerRecvSkipper.derive_forward_mode
@@ -85,12 +91,10 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         extend = ForwardMode.EXTEND.value
         mixed = ForwardMode.MIXED.value
         idle = ForwardMode.IDLE.value
-        prebuilt = ForwardMode.PREBUILT.value
         verify = ForwardMode.TARGET_VERIFY.value
 
-        # All ranks idle/prebuilt: same bucket as "no last batch".
+        # All ranks idle: same bucket as "no last batch".
         self.assertIsNone(derive([idle, idle]))
-        self.assertIsNone(derive([prebuilt, idle]))
 
         # Any extend-like rank forces the immediate-recv bucket.
         self.assertEqual(derive([decode, extend, idle]), ForwardMode.EXTEND)

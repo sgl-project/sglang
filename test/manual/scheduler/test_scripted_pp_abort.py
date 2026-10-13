@@ -21,24 +21,19 @@ def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
         yield
 
 
-def _advance_until_in_running_mbs(
+def _advance_until_decoding(
     t: ScriptedContext, *handles: ScriptedReqHandle, max_steps: int = 800
 ):
     rids = {h.rid for h in handles}
     present: set[str] = set()
     for _ in range(max_steps):
-        present = {
-            req.rid
-            for mb in t.scheduler.running_mbs
-            for req in mb.reqs
-            if req.rid in rids
-        }
+        present = {req.rid for req in t.scheduler.decoding if req.rid in rids}
         if present == rids:
             return
         yield
     raise AssertionError(
-        f"reqs did not all reach a running_mbs decode slot within {max_steps} "
-        f"steps; present={present!r} wanted={rids!r}"
+        f"reqs did not all reach decoding within {max_steps} steps; "
+        f"present={present!r} wanted={rids!r}"
     )
 
 
@@ -50,7 +45,7 @@ class TestAbortPPCrossSlot(ScriptedTestCase):
     )
 
     def test_abort_all_reaches_running_reqs_in_all_microbatch_slots(self):
-        """abort_all must abort running reqs in every PP microbatch slot, not just the current one (needs >2 slots)."""
+        """abort_all must abort running reqs in every PP ring slot, not just the current one (needs >2 slots)."""
         self.server.execute_script(
             self._script_abort_all_reaches_running_reqs_in_all_microbatch_slots
         )
@@ -68,15 +63,12 @@ class TestAbortPPCrossSlot(ScriptedTestCase):
             )
             for i in range(4)
         ]
-        yield from _advance_until_in_running_mbs(t, *reqs)
+        yield from _advance_until_decoding(t, *reqs)
 
-        slot_of = {}
-        for slot_id, mb in enumerate(t.scheduler.running_mbs):
-            for req in mb.reqs:
-                slot_of[req.rid] = slot_id
+        slot_of = {req.rid: req.ring_slot for req in t.scheduler.decoding}
         slots = {slot_of[r.rid] for r in reqs}
         assert len(slots) == len(reqs), (
-            f"setup invalid: reqs must each occupy a distinct mb slot to exercise "
+            f"setup invalid: reqs must each occupy a distinct ring slot to exercise "
             f"the cross-slot abort scan; slot_of={slot_of!r}"
         )
 
@@ -85,8 +77,8 @@ class TestAbortPPCrossSlot(ScriptedTestCase):
 
         alive = {r.rid: r.kv_pages for r in reqs if r.kv_pages != 0}
         assert not alive, (
-            f"abort_all left running reqs alive in non-current mb slots (only the "
-            f"current slot + stale cur_batch were scanned): still_holding_kv={alive!r}"
+            f"abort_all left running reqs alive in non-current ring slots: "
+            f"still_holding_kv={alive!r}"
         )
 
 

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
@@ -44,12 +45,17 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
         chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
+        lists = {
+            "waiting": RequestList(name="waiting", reqs=[waiting_req]),
+            "chunked": RequestList(name="chunked", reqs=[chunked_req]),
+        }
         return SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.NULL,
-            get_waiting_queue=lambda: [waiting_req],
-            waiting_queue_prefix_matched=lambda: waiting_queue_prefix_matched,
-            get_chunked_req=lambda: chunked_req,
-            get_recent_cache_hit_rate=lambda: 0.75,
+            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
+            get_request_lists=lambda: lists,
+            policy=SimpleNamespace(
+                waiting_queue_prefix_matched=lambda reqs: waiting_queue_prefix_matched
+            ),
+            metrics_reporter=SimpleNamespace(recent_cache_hit_rate=0.75),
         )
 
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):

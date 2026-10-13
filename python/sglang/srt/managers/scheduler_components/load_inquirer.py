@@ -17,12 +17,15 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_policy import SchedulePolicy
+    from sglang.srt.managers.scheduler_components.metrics_reporter import (
+        SchedulerMetricsReporter,
+    )
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -31,91 +34,65 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    disaggregation_mode: DisaggregationMode
-    server_args: ServerArgs
+    get_disaggregation_mode: Callable[[], DisaggregationMode]
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
     tp_worker: BaseTpWorker
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
-    get_running_batch: Callable
-    get_waiting_queue: Callable
-    waiting_queue_prefix_matched: Callable
-    get_recent_cache_hit_rate: Callable
-    get_stats: Callable
-    get_chunked_req: Callable
-    get_disagg_prefill_bootstrap_queue: Callable
-    get_disagg_prefill_inflight_queue: Callable
+    policy: SchedulePolicy
+    metrics_reporter: SchedulerMetricsReporter
+    get_request_lists: Callable
     get_disagg_decode_prealloc_queue: Callable
-    get_disagg_decode_transfer_queue: Callable
-    get_spec_total_num_accept_tokens: Callable
-    get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
 
-    def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
-        """Get the total number of tokens pending prefill.
-
-        This includes tokens from waiting queue requests plus remaining tokens
-        from the currently chunked request.
-
-        Args:
-            chunk_deduct: extra tokens to subtract from the chunked request's
-                remaining count. At batch-scheduling time the current chunk
-                has been planned but ``prefix_len`` does not yet include it,
-                so callers pass ``extend_input_len`` here. At load-reporting
-                time ``prefix_len`` is already up-to-date, so the default
-                0 is correct.
-        """
-        num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - req.prefix_len - chunk_deduct
-        return num_pending_tokens
-
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.get_disaggregation_mode() == DisaggregationMode.DECODE:
             return 0
-        waiting_queue_prefix_matched = self.waiting_queue_prefix_matched()
-        cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
+        lists = self.get_request_lists()
+        waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
+            lists["waiting"].reqs
+        )
+        cache_miss_rate = 1.0 - self.metrics_reporter.recent_cache_hit_rate
         num_tokens = 0
-        for req in self.get_waiting_queue():
+        for req in lists["waiting"].reqs:
             if waiting_queue_prefix_matched:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
-        cr = self.get_chunked_req()
-        if cr is not None:
+        for cr in lists["chunked"].reqs:
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
-        stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        disaggregation_mode = self.get_disaggregation_mode()
+        stats = self.metrics_reporter.stats
+        lists = self.get_request_lists()
+        num_running_reqs = len(lists["decoding"].reqs)
 
-        waiting_queues = [self.get_waiting_queue()]
-        pending_token_queues = [self.get_waiting_queue()]
+        queued = [req for entry in lists.values() if entry.queued for req in entry.reqs]
+        waiting_queues = [queued]
+        pending_token_queues = [queued]
         awaiting_kv_tokens = 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
+        if disaggregation_mode == DisaggregationMode.PREFILL:
+            prefill_bootstrap_queue = lists["bootstrap"].reqs
             waiting_queues.append(prefill_bootstrap_queue)
             pending_token_queues.append(prefill_bootstrap_queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
-            decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
-            decode_retracted_queue = (
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+        elif disaggregation_mode == DisaggregationMode.DECODE:
+            decode_prealloc_queue = lists["prealloc"].reqs
+            decode_transfer_queue = lists["transfer"].reqs
+            decode_retracted_queue = lists["retracted"].reqs
             waiting_queues.append(decode_prealloc_queue)
             waiting_queues.append(decode_transfer_queue)
             waiting_queues.append(decode_retracted_queue)
-            # In disaggregated decode, transfer-queue requests and transferred
-            # waiting-queue requests have already pre-allocated decode-side KV
-            # slots, so they are already included in num_used_tokens.
+            # In disaggregated decode, transfer-queue requests and ready
+            # requests have already pre-allocated decode-side KV slots, so
+            # they are already included in num_used_tokens.
             pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
             # KV not yet arrived from the prefill side.
             awaiting_kv_tokens = sum(
@@ -147,14 +124,15 @@ class SchedulerLoadInquirer:
             logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
+        metrics_reporter = self.metrics_reporter
         if (
             not self.spec_algorithm.is_none()
-            and self.get_spec_total_num_forward_ct() > 0
+            and metrics_reporter.spec_total_num_forward_ct > 0
         ):
             speculative = SpeculativeMetrics(
                 accept_length=(
-                    self.get_spec_total_num_accept_tokens()
-                    / self.get_spec_total_num_forward_ct()
+                    metrics_reporter.spec_total_num_accept_tokens
+                    / metrics_reporter.spec_total_num_forward_ct
                 ),
                 accept_rate=stats.spec_accept_rate,
             )
@@ -172,17 +150,15 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
-            prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
-            prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            prefill_bootstrap = len(lists["bootstrap"].reqs)
+            prefill_inflight = len(lists["transfer"].reqs)
+        elif disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
-            decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
-            decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
-            decode_retracted = len(
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+            decode_prealloc = len(lists["prealloc"].reqs)
+            decode_transfer = len(lists["transfer"].reqs)
+            decode_retracted = len(lists["retracted"].reqs)
             ready_reqs = [
                 decode_req.req
                 for decode_req in self.get_disagg_decode_prealloc_queue().queue
@@ -202,7 +178,7 @@ class SchedulerLoadInquirer:
         )
 
         queues = QueueMetrics(
-            waiting=len(self.get_waiting_queue()),
+            waiting=len(queued),
             grammar=stats.num_grammar_queue_reqs,
             paused=stats.num_paused_reqs,
             retracted=stats.num_retracted_reqs,

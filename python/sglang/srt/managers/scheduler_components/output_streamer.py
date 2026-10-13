@@ -56,7 +56,7 @@ class SchedulerOutputStreamer:
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
-    disaggregation_mode: DisaggregationMode
+    get_disaggregation_mode: Callable[[], DisaggregationMode]
     enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
@@ -169,7 +169,7 @@ class SchedulerOutputStreamer:
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.disaggregation_mode,
+            disaggregation_mode=self.get_disaggregation_mode(),
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
@@ -532,12 +532,16 @@ class _GenerationStreamAccumulator:
         self.time_stats.append(req.time_stats)
 
         if not self.spec_algorithm.is_none():
-            self.spec_verify_ct.append(req.spec_verify_ct)
-            self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
-            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
-            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
-            self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
-            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
+            self.spec_verify_ct.append(req.spec_stats.verify_ct)
+            self.spec_num_correct_drafts.append(req.spec_stats.num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(
+                req.spec_stats.num_block_accept_tokens
+            )
+            self.spec_num_cap_tokens.append(req.spec_stats.num_cap_tokens)
+            self.spec_correct_drafts_histogram.append(
+                req.spec_stats.correct_drafts_histogram
+            )
+            self.spec_cap_lens_histogram.append(req.spec_stats.cap_lens_histogram)
 
         if self.return_logprob:
             if (

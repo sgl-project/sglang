@@ -5,18 +5,34 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
     Req,
     ScheduleBatch,
+    commit_step_counters,
     set_mamba_track_indices_from_reqs,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.managers.scheduler_components.pending_steps import (
+    PendingStep,
+    PendingSteps,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.forward_batch_view import worker_forward_batch
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import (
+    prepare_mamba_track_for_verify,
+    spec_prepare_for_decode,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -57,13 +73,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     batch = ScheduleBatch(reqs=[req])
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
     batch.device = "cpu"
-    batch.model_config = SimpleNamespace(is_encoder_decoder=False)
+    batch.model_config = SimpleNamespace(is_encoder_decoder=False, vocab_size=128)
     batch.enable_overlap = True
     batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-    batch.sampling_info = SimpleNamespace(
-        penalizer_orchestrator=SimpleNamespace(is_required=False)
-    )
-    batch.hisparse_coordinator = None
     batch.seq_lens = torch.tensor([2], dtype=torch.int64)
     batch.seq_lens_cpu = torch.tensor([2], dtype=torch.int64)
     batch.orig_seq_lens = torch.tensor([2], dtype=torch.int32)
@@ -76,9 +88,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     metrics_reporter.forward_ct_decode = 0
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        disaggregation_mode=None,
         enable_overlap=True,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
@@ -93,108 +103,426 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
+        pending=PendingSteps(),
     )
 
 
 def _make_result():
     return GenerationBatchResult(
-        logits_output=SimpleNamespace(
-            hidden_states=None, customized_info=None, sampling_mask_output=None
-        ),
+        logits_output=LogitsProcessorOutput(next_token_logits=None),
         next_token_ids=[4],
         speculative_num_draft_tokens=0,
     )
 
 
-class TestMambaBoundaryMaskReuse(unittest.TestCase):
-    def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
-        for schedule_next_decode, expected_lookahead in ((False, 0), (True, 1)):
-            with self.subTest(schedule_next_decode=schedule_next_decode):
-                req, batch = _make_batch()
-                processor = _make_processor()
-                result = _make_result()
+class TestMambaBoundaryCommit(unittest.TestCase):
+    def test_overlapped_boundary_moves_req_state_at_its_own_commit(self):
+        """Under overlap, the step after a boundary step is built before the
+        boundary commits. The build reads the Req; the boundary's checkpoint
+        reaches the Req only at its own commit, from the step it ran."""
+        req, _ = _make_batch()
+        req.origin_input_ids = array("q", [1, 2, 3])
+        req.kv.req_pool_idx = 0
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = 3
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        processor = _make_processor()
+        result = _make_result()
 
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.gracefully_exit = False
-                scheduler.ingest_requests = MagicMock(
-                    side_effect=[[], [], StopIteration]
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.disagg_prefill = None
+        scheduler.disagg_decode = None
+        scheduler.dllm = None
+        scheduler.hisparse_coordinator = None
+        scheduler.gracefully_exit = False
+        scheduler.flat_slot = ScheduleSlot()
+        scheduler.ingest_requests = MagicMock(side_effect=[[], [], [], StopIteration])
+        scheduler._engine_paused = False
+        scheduler._sched_idled = False
+        scheduler.pending = PendingSteps()
+        scheduler.recv_skipper = None
+        scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.run_batch = MagicMock(return_value=result)
+        scheduler._apply_war_barrier = MagicMock()
+        scheduler._record_step_counters = MagicMock()
+        scheduler.is_generation = False
+
+        pool = SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=torch.tensor([[10, 11]]),
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx,
+        )
+        steps = []
+
+        def get_next_batch_to_run(slot):
+            # Two decode steps of req: seq lens 4 (a boundary) and 5.
+            if len(steps) == 2:
+                return None
+            _, step = _make_batch()
+            step.reqs = [req]
+            step.req_to_token_pool = pool
+            step.prepare_for_decode()
+            steps.append(step)
+            return step
+
+        def alloc_for_decode(step, token_per_req):
+            req.kv.kv_allocated_len += token_per_req
+            return torch.tensor([3], dtype=torch.int64)
+
+        scheduler.get_next_batch_to_run = get_next_batch_to_run
+        state_at_commit = []
+
+        def process_batch_result(result_batch, batch_result, slot):
+            state_at_commit.append(
+                (req.kv.mamba_next_track_idx, req.kv.mamba_last_track_seqlen)
+            )
+            commit_step_counters(result_batch)
+            processor.process_batch_result_decode(result_batch, batch_result)
+
+        scheduler.process_batch_result = process_batch_result
+        scheduler.init_mode_stages()
+
+        with (
+            # The mamba predicates and the track interval read the published
+            # bags, so publish the configuration under test (non-lazy extra
+            # buffer, interval 4); observability and disagg reads are served
+            # by the same publish at their defaults.
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                side_effect=alloc_for_decode,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
+                side_effect=_set_mamba_track_indices_on_cpu,
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            with self.assertRaises(StopIteration):
+                scheduler.event_loop_overlap()
+
+        self.assertEqual([s.mamba_track_mask_cpu for s in steps], [[True], [False]])
+        # The second step was built before the boundary committed.
+        self.assertEqual([s.mamba_track_buffer_indices for s in steps], [[0], [0]])
+        self.assertEqual(state_at_commit, [(0, None), (1, TRACK_INTERVAL)])
+        self.assertEqual(req.kv.mamba_last_track_idx, 0)
+        self.assertEqual(req.kv.mamba_next_track_idx, 1)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+        self.assertEqual(req.decode_batch_idx, 2)
+        self.assertEqual(req.kv.kv_committed_len, req.kv.kv_allocated_len)
+
+
+class TestMambaSpecBoundaryCommit(unittest.TestCase):
+    def test_spec_step_carries_the_slot_its_verify_tracks(self):
+        """A spec decode step that crosses a track boundary: the step's plan
+        names the slot its verify tracks into, and the host commit makes that
+        slot the latest checkpoint, also for a request finishing in that step."""
+        req, step = _make_batch()
+        req.sampling_params.max_new_tokens = 3
+        req.origin_input_ids = array("q", [1, 2, 3])
+        req.kv.req_pool_idx = 0
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = 3
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        step.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        step.req_to_token_pool = SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=torch.tensor([[10, 11]]),
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx,
+        )
+        # The verify accepts one draft plus the bonus: the request goes from
+        # length 4 to 6, crossing the boundary at 4, and reaches max_new_tokens.
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=torch.tensor([5, 6, 0, 0]),
+            accept_lens=torch.tensor([2]),
+            speculative_num_draft_tokens=4,
+        )
+        processor = _make_processor()
+
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch("sglang.srt.speculative.eagle_utils.eagle_prepare_for_decode"),
+            patch(
+                "sglang.srt.speculative.spec_utils.set_mamba_track_indices_from_reqs",
+                side_effect=_set_mamba_track_indices_on_cpu,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            # Scheduler._build_decode_step, then the verify on its forward view.
+            step.prepare_for_decode()
+            spec_prepare_for_decode(step)
+            forward_batch = worker_forward_batch(step)
+            prepare_mamba_track_for_verify(forward_batch)
+            processor.process_batch_result_decode(step, result)
+
+        self.assertEqual(step.mamba_track_buffer_indices, [0])
+        self.assertEqual(forward_batch.mamba_track_indices.tolist(), [10])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.kv.mamba_last_track_idx, 0)
+        self.assertEqual(req.kv.mamba_next_track_idx, 1)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+
+# The old checkpoint at the first boundary, held in slot 10 at position 0.
+_LAZY_CHECKPOINT_SLOT = 10
+
+
+def _lazy_overrides():
+    return get_context().override_server_args(
+        mamba_radix_cache_strategy="extra_buffer_lazy",
+        mamba_track_interval=TRACK_INTERVAL,
+        _mamba_cache_chunk_size=TRACK_INTERVAL,
+    )
+
+
+def _make_lazy_step(req: Req, *, spec: bool, other_slot: int = -1) -> ScheduleBatch:
+    """A step of req, which holds one checkpoint slot (and other_slot at
+    position 1, -1 for none), over a mamba pool that has no free slot."""
+    _, step = _make_batch()
+    step.reqs = [req]
+    req.kv.req_pool_idx = 0
+    req.kv.mamba_ping_pong_track_buffer = torch.tensor(
+        [_LAZY_CHECKPOINT_SLOT, other_slot]
+    )
+    req.kv.mamba_next_track_idx = 0
+    req.kv.mamba_last_track_idx = 0
+    req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+    if spec:
+        step.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    step.req_to_token_pool = SimpleNamespace(
+        req_index_to_mamba_ping_pong_track_buffer_mapping=torch.tensor(
+            [[_LAZY_CHECKPOINT_SLOT, other_slot]]
+        ),
+        mamba_allocator=SimpleNamespace(alloc=lambda n: None, free=MagicMock()),
+        get_mamba_ping_pong_other_idx=lambda idx: 1 - idx,
+    )
+    return step
+
+
+def _make_lazy_req(seq_len: int) -> Req:
+    """A decoding request of seq_len tokens, one of them an output."""
+    req, _ = _make_batch()
+    req.origin_input_ids = array("q", range(seq_len - 1))
+    req.kv.kv_allocated_len = req.kv.kv_committed_len = seq_len
+    return req
+
+
+def _spec_result(num_accepted: int) -> GenerationBatchResult:
+    return GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(next_token_logits=None),
+        next_token_ids=torch.tensor([5] * num_accepted),
+        accept_lens=torch.tensor([num_accepted]),
+        speculative_num_draft_tokens=2,
+    )
+
+
+def _plan_spec_step(step: ScheduleBatch) -> None:
+    # Two draft tokens: a verify from length 7 can cross the boundary at 8.
+    step.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
+
+
+class TestMambaLazyInPlaceTrack(unittest.TestCase):
+    """A lazy request that cannot get a second slot at a boundary tracks in
+    place into the slot of its checkpoint. The build only plans it; the host
+    commit of a step that crossed names the new checkpoint."""
+
+    def test_spec_step_plans_the_checkpoint_slot_and_its_commit_names_a_crossing(
+        self,
+    ):
+        for num_accepted, crossed in ((2, True), (1, False)):
+            with self.subTest(crossed=crossed), _lazy_overrides():
+                req = _make_lazy_req(7)
+                step = _make_lazy_step(req, spec=True)
+                _plan_spec_step(step)
+                self.assertEqual(step.mamba_lazy_spec_track_positions_cpu, [0])
+                self.assertEqual(step.mamba_track_write_position(0), 0)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+                # The verify accepts num_accepted tokens from length 7.
+                req.output_ids.extend([5] * num_accepted)
+                _make_processor()._mamba_prefix_cache_update(
+                    req, step, _spec_result(num_accepted), 0
                 )
-                scheduler.process_input_requests = MagicMock()
-                scheduler._engine_paused = False
-                scheduler.running_batch = batch
-                scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
-                scheduler.run_batch = MagicMock(return_value=result)
-                scheduler._apply_war_barrier = MagicMock()
-                scheduler.is_generation = False
-                scheduler.last_batch = None
+                self.assertEqual(
+                    req.kv.mamba_last_track_seqlen,
+                    2 * TRACK_INTERVAL if crossed else TRACK_INTERVAL,
+                )
+                self.assertEqual(req.kv.mamba_last_track_idx, 0)
+                self.assertEqual(req.kv.mamba_next_track_idx, 0)
+                self.assertEqual(
+                    req.kv.mamba_ping_pong_track_buffer.tolist(),
+                    [_LAZY_CHECKPOINT_SLOT, -1],
+                )
+                step.req_to_token_pool.mamba_allocator.free.assert_not_called()
 
-                plan_count = 0
+    def test_decode_step_at_a_boundary_tracks_in_place(self):
+        req = _make_lazy_req(7)
+        step = _make_lazy_step(req, spec=False)
 
-                def get_next_batch_to_run(*, running_batch, last_batch):
-                    nonlocal plan_count
-                    del running_batch, last_batch
-                    plan_count += 1
-                    if plan_count == 1:
-                        batch.prepare_for_decode()
-                        return SimpleNamespace(
-                            running_batch=batch,
-                            batch_to_run=batch,
-                        )
-                    if plan_count == 2 and schedule_next_decode:
-                        batch.prepare_for_decode()
-                        return SimpleNamespace(
-                            running_batch=batch,
-                            batch_to_run=batch,
-                        )
-                    return SimpleNamespace(
-                        running_batch=batch,
-                        batch_to_run=None,
+        def alloc_for_decode(step, token_per_req):
+            req.kv.kv_allocated_len += token_per_req
+            return torch.tensor([7], dtype=torch.int64)
+
+        with (
+            _lazy_overrides(),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                side_effect=alloc_for_decode,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
+                side_effect=_set_mamba_track_indices_on_cpu,
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            step.prepare_for_decode()
+            self.assertEqual(step.mamba_track_mask_cpu, [True])
+            self.assertEqual(step.mamba_track_indices.tolist(), [_LAZY_CHECKPOINT_SLOT])
+            self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+            _make_processor()._mamba_prefix_cache_update(req, step, _make_result(), 0)
+
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 2 * TRACK_INTERVAL)
+        self.assertEqual(req.kv.mamba_last_track_idx, 0)
+        self.assertEqual(req.kv.mamba_next_track_idx, 0)
+
+
+class TestMambaLazyFinishDonation(unittest.TestCase):
+    """A finishing lazy request donates its checkpoint slot only when no
+    forward writes it in place: not this step's crossing, and not a pending
+    step's plan."""
+
+    def _checkpoint_at_finish(self, step, result, pending_step=None) -> bool:
+        req = step.reqs[0]
+        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+        processor = _make_processor()
+        if pending_step is not None:
+            processor.pending.push(
+                PendingStep(
+                    step=pending_step,
+                    result=None,
+                    slot=ScheduleSlot(),
+                    launch_ts=0.0,
+                    after_idle_gap=False,
+                )
+            )
+        with patch(
+            "sglang.srt.managers.scheduler_components."
+            "batch_result_processor.release_kv_cache"
+        ) as release:
+            processor._handle_finish_state_updated_req(
+                req, step, result, 0, LogitsProcessorOutput(next_token_logits=None)
+            )
+        release.assert_called_once()
+        return release.call_args.kwargs["checkpoint"]
+
+    def test_pending_step_that_writes_the_checkpoint_slot_blocks_the_donation(self):
+        # (spec, the pending step's second slot, whether it may track, donated)
+        cases = (
+            (False, -1, True, False),
+            (False, 11, True, True),
+            (False, -1, False, True),
+            (True, -1, True, False),
+            (True, 11, True, True),
+            (True, -1, False, True),
+        )
+        for spec, other_slot, tracks, donated in cases:
+            with (
+                self.subTest(spec=spec, other_slot=other_slot, tracks=tracks),
+                _lazy_overrides(),
+            ):
+                # The committing step crosses nothing and finishes the request
+                # at length 7.
+                req = _make_lazy_req(6)
+                step = _make_lazy_step(req, spec=spec, other_slot=other_slot)
+                step.mamba_track_mask_cpu = [False]
+                pending_step = _make_lazy_step(req, spec=spec, other_slot=other_slot)
+                if spec:
+                    # Planned from length 7: two draft tokens reach the
+                    # boundary at 8, one does not.
+                    req.kv.kv_committed_len = 7
+                    pending_step.mamba_lazy_spec_prepare(
+                        TRACK_INTERVAL, max_draft_tokens=2 if tracks else 0
                     )
-
-                scheduler.get_next_batch_to_run = get_next_batch_to_run
-                observed_lookahead = []
-
-                def process_batch_result(result_batch, batch_result):
-                    observed_lookahead.append(
-                        req.decode_batch_idx
-                        - result_batch.mamba_decode_batch_idx_cpu[0]
-                    )
-                    processor.process_batch_result_decode(result_batch, batch_result)
-
-                scheduler.process_batch_result = process_batch_result
-
-                with (
-                    # The mamba predicates and the track interval read the
-                    # published bags, so publish the configuration under test
-                    # (non-lazy extra buffer, interval 4); observability and
-                    # disagg reads are served by the same publish at their
-                    # defaults.
-                    get_context().override_server_args(
-                        mamba_radix_cache_strategy="extra_buffer",
-                        mamba_track_interval=TRACK_INTERVAL,
-                        _mamba_cache_chunk_size=TRACK_INTERVAL,
-                    ),
-                    patch(
-                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                        return_value=torch.tensor([3], dtype=torch.int64),
-                    ),
-                    patch(
-                        "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
-                    ),
-                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    patch.object(
-                        SchedulerBatchResultProcessor,
-                        "_mamba_prefix_cache_update",
-                    ) as cache_update,
-                ):
-                    with self.assertRaises(StopIteration):
-                        scheduler.event_loop_overlap()
-
-                self.assertEqual(observed_lookahead, [expected_lookahead])
-                if expected_lookahead == 0:
-                    cache_update.assert_not_called()
+                    req.kv.kv_committed_len = 6
+                    step.mamba_lazy_spec_track_positions_cpu = [0]
+                    result = _spec_result(1)
                 else:
-                    self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+                    pending_step.mamba_track_mask_cpu = [tracks]
+                    pending_step.mamba_track_buffer_indices = [
+                        0 if other_slot == -1 else 1
+                    ]
+                    step.mamba_track_buffer_indices = [0]
+                    result = _make_result()
+                req.output_ids.append(5)
+                self.assertEqual(
+                    self._checkpoint_at_finish(step, result, pending_step), donated
+                )
+                self.assertTrue(self._checkpoint_at_finish(step, result))
+
+    def test_finishing_spec_step_that_crossed_in_place_skips_the_donation(self):
+        for num_accepted, donated in ((2, False), (1, True)):
+            with self.subTest(num_accepted=num_accepted), _lazy_overrides():
+                req = _make_lazy_req(7)
+                step = _make_lazy_step(req, spec=True)
+                _plan_spec_step(step)
+                req.output_ids.extend([5] * num_accepted)
+                self.assertEqual(
+                    self._checkpoint_at_finish(step, _spec_result(num_accepted)),
+                    donated,
+                )
+                self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+
+class TestMambaExtendAdmission(unittest.TestCase):
+    def test_next_chunk_built_before_commit_tracks_into_the_other_slot(self):
+        """Under overlap the next chunk is built, and the chunked request
+        stashed, before a chunk commits; admission, not the commit, hands the
+        next chunk the other ping-pong slot."""
+        req, batch = _make_batch()
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(mamba_chunk_size=TRACK_INTERVAL)
+        )
+        batch.req_to_token_pool = SimpleNamespace(
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
+        )
+        positions = []
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer",
+            mamba_track_interval=TRACK_INTERVAL,
+            _mamba_cache_chunk_size=TRACK_INTERVAL,
+        ):
+            for prefix_len in (0, 2 * TRACK_INTERVAL):
+                req.prefix_len = prefix_len
+                req.extend_end = prefix_len + 2 * TRACK_INTERVAL
+                entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+                batch.mamba_prefill_track_mask_cpu = [entry.track_mask]
+                batch.mamba_track_buffer_indices = [entry.track_position]
+                batch.mamba_prefill_checkpoint_seqlens_cpu = [entry.checkpoint_seqlen]
+                batch.admit_mamba_track()
+                positions.append(entry.track_position)
+        self.assertEqual(positions, [0, 1])
+        self.assertEqual(req.kv.mamba_last_track_idx, 1)
+        self.assertEqual(req.kv.mamba_next_track_idx, 0)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 4 * TRACK_INTERVAL)
 
 
 class TestMambaPrevTrackSeqlen(unittest.TestCase):
@@ -204,7 +532,6 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
         req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
-        batch.mamba_track_buffer_indices = None
         batch.req_to_token_pool = SimpleNamespace(
             get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
         )
@@ -220,8 +547,10 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
                 side_effect=[(True, TRACK_INTERVAL), (True, 2 * TRACK_INTERVAL)],
             ),
         ):
+            batch.mamba_track_buffer_indices = [0]
             processor._mamba_prefix_cache_update(req, batch, _make_result(), 0)
             self.assertIsNone(req.kv.mamba_prev_track_seqlen)
+            batch.mamba_track_buffer_indices = [1]
             processor._mamba_prefix_cache_update(req, batch, _make_result(), 0)
         self.assertEqual(req.kv.mamba_last_track_seqlen, 2 * TRACK_INTERVAL)
         self.assertEqual(req.kv.mamba_prev_track_seqlen, TRACK_INTERVAL)
@@ -229,7 +558,12 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
 
 class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
     def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
-        for positions, expected in ((None, [-1, 11]), ([1, 1], [-1, 12])):
+        for positions, expected in (
+            (None, [-1, 11]),
+            ([1, 1], [-1, 12]),
+            # A None position (no lazy destination) tracks nowhere.
+            ([1, None], [-1, -1]),
+        ):
             with self.subTest(positions=positions):
                 mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
                 batch = SimpleNamespace(

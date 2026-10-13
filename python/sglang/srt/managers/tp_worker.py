@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -59,6 +60,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.forward_batch_view import (
+    derive_batch,
+    forward_sampling_info,
+    worker_forward_batch,
+)
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -70,6 +76,8 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -77,9 +85,98 @@ logger = logging.getLogger(__name__)
 
 
 class BaseTpWorker(ABC):
+    # The relay the scheduler hands its model worker: a forward resolves its
+    # input tokens from it and commits its sampled tokens to it. None for a
+    # worker another worker drives (a speculative worker's target).
+    future_map: Optional[FutureMap] = None
+    # Whether a forward also publishes its rows' new lengths (overlap).
+    publishes_new_seq_lens: bool = False
+
+    def attach_future_map(self, future_map: FutureMap, *, enable_overlap: bool) -> None:
+        """Make this worker the scheduler's model worker over `future_map`."""
+        self.future_map = future_map
+        self.publishes_new_seq_lens = enable_overlap
+
+    def forward_batch_generation(
+        self,
+        step: ScheduleBatch,
+        *,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pending_grammar: Optional[Iterable[PendingStep]] = None,
+    ) -> GenerationBatchResult:
+        """Run one scheduled step, with its device commit. `step` is read
+        only: the forward runs on a view of it. A step without speculation runs
+        its grammar in its own host commit, so `pending_grammar` is not read."""
+        forward_batch = self.forward_input(step)
+        result = self.forward_model(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        return self.commit_forward(step, result)
+
+    def forward_input(self, step: ScheduleBatch) -> ScheduleBatch:
+        """The batch this worker forwards for `step`: a view of it with its
+        input ids resolved from FutureMap."""
+        forward_batch = worker_forward_batch(step)
+        resolve_forward_inputs(forward_batch, self.future_map)
+        hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if hisparse_coordinator is not None and step.forward_mode.is_decode():
+            # Device commit of a HiSparse decode step's buffer maps, at its
+            # forward entry on the forward stream: after the previous forward
+            # read them.
+            hisparse_coordinator.map_last_loc_to_buffer(
+                step.seq_lens,
+                step.out_cache_loc,
+                step.req_pool_indices,
+                step.seq_lens_cpu,
+                step.req_pool_indices_cpu,
+            )
+        return forward_batch
+
+    def commit_forward(
+        self, step: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        """The device commit of a forward without speculation: publish the
+        rows' new lengths (under overlap) and stash the sampled tokens for the
+        next step's input; a delayed sample stashes them once it runs."""
+        if self.publishes_new_seq_lens:
+            self.future_map.publish(step.req_pool_indices, step.seq_lens + 1)
+        if result.delay_sample_func is None:
+            self._stash_sampled_tokens(step, result)
+            return result
+        sample = result.delay_sample_func
+
+        def sample_and_stash():
+            sampled = sample()
+            self._stash_sampled_tokens(step, result)
+            return sampled
+
+        result.delay_sample_func = sample_and_stash
+        return result
+
+    def _stash_sampled_tokens(
+        self, step: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Stash a step's sampled tokens for the next step's
+        resolve_forward_inputs."""
+        if not result.has_sampled_token_ids:
+            return
+        payload = RelayPayload(bonus_tokens=result.next_token_ids)
+        future_indices = step.req_pool_indices
+        if step.beam_tail is not None:
+            # The worker sliced the tail off before sampling, so sampled tokens
+            # cover only the reqs-aligned rows; the coordinator relays the rest.
+            future_indices = future_indices[: step.beam_tail.num_base_rows]
+        self.future_map.stash(future_indices, payload)
+
     @abstractmethod
-    def forward_batch_generation(self, forward_batch: ForwardBatch):
-        pass
+    def forward_model(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
+        """The model forward of a forward batch, without a device commit."""
+
+    def prepare_decode_step(self, step: ScheduleBatch) -> None:
+        """The worker's part of building a decode step; none without
+        speculation."""
 
     @property
     @abstractmethod
@@ -320,8 +417,6 @@ class TpModelWorker(BaseTpWorker):
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
 
-        self._init_dllm_algorithm()
-
         if get_serving().skip_tokenizer_init or self.is_draft_worker:
             # A draft worker's tokenizer would only duplicate the target's:
             # tokenizer_path always points at the target model.
@@ -514,14 +609,6 @@ class TpModelWorker(BaseTpWorker):
                 )
             )
 
-    def _init_dllm_algorithm(self):
-        from sglang.srt.dllm.algorithm.base import DllmAlgorithm
-
-        if get_exec().dllm.dllm_algorithm is not None:
-            self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
-        else:
-            self.dllm_algorithm = None
-
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
@@ -551,8 +638,6 @@ class TpModelWorker(BaseTpWorker):
             kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
-        if self.dllm_algorithm is not None:
-            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
@@ -568,51 +653,29 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
-    def is_dllm(self):
-        return self.dllm_algorithm is not None
-
-    def _forward_batch_generation_dllm(
-        self,
-        forward_batch: ForwardBatch,
-        batch: Optional[ScheduleBatch] = None,
-    ) -> GenerationBatchResult:
-        algo_states = None
-        if self.dllm_algorithm.fdfo and batch is not None:
-            algo_states = [req.dllm_algo_state for req in batch.reqs]
-
-        (
-            logits_output,
-            next_token_ids,
-            accept_length_per_req_cpu,
-            dllm_algo_state,
-            can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
-
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            dllm_algo_state=dllm_algo_state,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
     def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
         if self.model_runner._elastic_cuda_graph_enabled():
             self.model_runner.maybe_join_ep_ranks()
 
-    def forward_batch_generation(
+    def init_forward_batch(
         self,
         batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
-        return_kv_loc_plan: bool = False,
-    ) -> GenerationBatchResult:
+    ) -> Tuple[Optional[ScheduleBatch], ForwardBatch]:
+        """The forward batch of a step (and the step as the forward reads it),
+        or the forward batch given."""
         # Get forward batch from schedule batch
         if batch is not None:
+            if self.enable_overlap:
+                # The batch is read-only: the forward fills a sampling info of
+                # its own, with the penalties accumulated (the next step's
+                # schedule updates the batch's while this forward runs).
+                batch = derive_batch(
+                    batch, sampling_info=forward_sampling_info(batch.sampling_info)
+                )
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
@@ -640,8 +703,38 @@ class TpModelWorker(BaseTpWorker):
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
-        if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch, batch)
+        return batch, forward_batch
+
+    def prepare_decode_step(self, step: ScheduleBatch) -> None:
+        """A speculative server's stage before the last under pipeline
+        parallelism runs this worker without a draft worker: its decode step
+        still takes the EAGLE preparation; the launch builds its verify input
+        from the relay."""
+        if not self.enable_spec:
+            return
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+        from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+        spec_prepare_for_decode(step)
+        eagle_prepare_for_decode(step)
+
+    def forward_model(
+        self,
+        batch: Optional[ScheduleBatch],
+        forward_batch: Optional[ForwardBatch] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        is_verify: bool = False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
+    ) -> GenerationBatchResult:
+        batch, forward_batch = self.init_forward_batch(
+            batch,
+            forward_batch,
+            skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
+        )
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(

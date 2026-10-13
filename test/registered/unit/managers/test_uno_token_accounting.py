@@ -3,10 +3,14 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,18 +21,20 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 class TestUnoTokenAccounting(CustomTestCase):
     def setUp(self):
         self.batch_size = 2
+        # Two rows accepting 4 and 3 tokens, 2 of each not drafted: 3 drafts.
         self.result = GenerationBatchResult(
-            num_correct_drafts=3,
+            accept_lens=torch.tensor([4, 3]),
             num_non_draft_tokens_per_req=2,
         )
 
     def test_generated_token_count_includes_both_non_draft_tokens(self):
+        self.assertEqual(self.result.num_correct_drafts_per_req(), [2, 1])
         self.assertEqual(self.result.get_num_generated_tokens(self.batch_size), 7)
+        one_bonus = GenerationBatchResult(accept_lens=torch.tensor([3, 2]))
+        self.assertEqual(one_bonus.get_num_generated_tokens(self.batch_size), 5)
+        # Without speculation each row generates its one token.
         self.assertEqual(
-            GenerationBatchResult(num_correct_drafts=3).get_num_generated_tokens(
-                self.batch_size
-            ),
-            5,
+            GenerationBatchResult().get_num_generated_tokens(self.batch_size), 2
         )
 
     def test_spec_metrics_keep_generated_and_draft_counts_separate(self):
@@ -41,7 +47,7 @@ class TestUnoTokenAccounting(CustomTestCase):
 
         reporter.update_spec_metrics(
             self.batch_size,
-            self.result.num_correct_drafts,
+            sum(self.result.num_correct_drafts_per_req()),
             num_accept_tokens=self.result.get_num_generated_tokens(self.batch_size),
         )
 
@@ -61,11 +67,17 @@ class TestUnoTokenAccounting(CustomTestCase):
             ),
             reqs=[SimpleNamespace(rid="req-0"), SimpleNamespace(rid="req-1")],
             forward_iter=2,
-            launch_ts=10.001,
-            after_idle_gap=False,
         )
 
-        scheduler._record_step_counters(batch, self.result)
+        scheduler._record_step_counters(
+            PendingStep(
+                step=batch,
+                result=self.result,
+                slot=ScheduleSlot(),
+                launch_ts=10.001,
+                after_idle_gap=False,
+            )
+        )
 
         self.assertEqual(scheduler.decode_moment_totals[5], 7)
 

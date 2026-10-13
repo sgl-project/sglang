@@ -82,14 +82,13 @@ class Schedule(msgspec.Struct):
     schedule_policy: A[
         str,
         Arg(
-            help="The scheduling policy of the requests.",
+            help="The scheduling policy of the requests. Priority scheduling is enabled separately, with --enable-priority-scheduling.",
             choices=[
                 "lpm",
                 "random",
                 "fcfs",
                 "dfs-weight",
                 "lof",
-                "priority",
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",

@@ -1,0 +1,594 @@
+"""The stage order each driver runs per mode: the flat driver (normal, overlap,
+PD prefill with and without the commit readiness gate, PD decode, dLLM) and the
+PP ring (plain, PD prefill, PD decode), over a few scripted iterations on fakes.
+
+The fakes stand at the owners and at the scheduling and commit leaves, so the
+order pinned here is the drivers' and the schedule stages', not the leaves'.
+"""
+
+import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
+from sglang.srt.managers.scheduler import (  # noqa: E402
+    Scheduler,
+    _dispatch_event_loop_once,
+)
+from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
+    ScheduleSlot,
+)
+from sglang.srt.managers.scheduler_components.pending_steps import (  # noqa: E402
+    PendingSteps,
+)
+from sglang.srt.managers.scheduler_components.pp_ring import PPRing  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _Stop(Exception):
+    pass
+
+
+def _step(name, mode=ForwardMode.EXTEND):
+    req = Req(name, "", [1, 2, 3], SamplingParams())
+    step = ScheduleBatch(
+        reqs=[req], forward_mode=mode, spec_algorithm=SpeculativeAlgorithm.NONE
+    )
+    step.name = name
+    return step
+
+
+class _Result:
+    def __init__(self, name, delayed, ready_at):
+        self.name = name
+        self.delay_sample_func = (lambda: self) if delayed else None
+        self.ready_at = ready_at
+
+
+class _PrefillOwner:
+    def __init__(self, shell):
+        self.shell = shell
+        self.transfer = []
+
+    def intake(self):
+        self.shell.log("dp.intake")
+        return []
+
+    def resolve_waiting_bootstrap(self, waiting):
+        self.shell.log("dp.resolve")
+        return waiting
+
+    def process_prefill_chunk(self, chunked_req, waiting, pending):
+        self.shell.log("dp.chunk")
+        return chunked_req, waiting
+
+    def before_forward(self, step):
+        # The fake run_batch stands for the forward and what runs before it.
+        raise AssertionError("not reached")
+
+    def on_launch(self, reqs):
+        self.shell.log("dp.on_launch", *[r.rid for r in reqs])
+
+    def after_commit(self, waiting, rids_to_check=None):
+        self.shell.log("dp.after_commit")
+        return waiting
+
+    def is_result_ready(self, result, *status):
+        ready = self.shell.iteration >= result.ready_at
+        self.shell.log("dp.ready", result.name, ready)
+        return ready
+
+    def poll_transfer_rids(self):
+        self.shell.log("dp.poll_transfer")
+        return []
+
+
+class _DecodeOwner:
+    def __init__(self, shell):
+        self.shell = shell
+        self.ready = []
+        self.transfer_queue = SimpleNamespace(queue=[])
+        self.prealloc_queue = SimpleNamespace(queue=[])
+
+    def prefetch_prefill_dp_rank_queries(self):
+        self.shell.log("dd.prefetch")
+
+    def intake(self):
+        self.shell.log("dd.intake")
+
+    def pop_reqs_to_admit(self, slot):
+        self.shell.log("dd.pop", slot.index)
+        return []
+
+    def commit_prefill_handoff(self, reqs):
+        self.shell.log("dd.handoff")
+
+    def retracted_rids(self, mb_id):
+        self.shell.log("dd.retracted")
+        return []
+
+    def poll_prealloc_rids(self):
+        self.shell.log("dd.poll_prealloc")
+        return [], []
+
+    def aborted_prealloc_rids(self):
+        return []
+
+    def poll_transfer_rids(self):
+        self.shell.log("dd.poll_transfer")
+        return []
+
+    def apply_retract_consensus(self, rids, slot):
+        self.shell.log("dd.apply_retract", slot.index)
+        return rids
+
+    def apply_prealloc_consensus(self, rids, slot):
+        self.shell.log("dd.apply_prealloc", slot.index)
+        return rids
+
+    def apply_transfer_consensus(self, rids, slot):
+        self.shell.log("dd.apply_transfer", slot.index)
+        return rids
+
+
+class _DllmOwner:
+    def __init__(self, shell):
+        self.shell = shell
+
+    def schedule(self, waiting):
+        step = self.shell.script("prefill")
+        self.shell.log("dllm.schedule")
+        return step, waiting
+
+    def on_launch(self, step):
+        self.shell.log("dllm.on_launch", step.name)
+
+
+class _Hook:
+    def __init__(self, shell):
+        self.shell = shell
+
+    def on_schedule(self, step, *slot):
+        self.shell.log("hook.on_schedule")
+
+
+class _Shell:
+    """A Scheduler built with __new__ whose leaves record into one log."""
+
+    def __init__(
+        self, mode, iterations, prefill=(), decode=(), ready_at=None, shutdown_at=None
+    ):
+        self.events = []
+        self.shutdown_at = shutdown_at
+        self.iteration = -1
+        self.iterations = iterations
+        self.prefill = dict(prefill)
+        self.decode = dict(decode)
+        self.ready_at = ready_at or {}
+        self.results = {}
+        s = self.s = Scheduler.__new__(Scheduler)
+        s.gracefully_exit = False
+        s._engine_paused = False
+        s._deferred_input_requests = []
+        s.scheduler_stage_metrics = None
+        s.waiting_queue = []
+        s.decoding = []
+        s.chunked_req = None
+        s.pending = PendingSteps()
+        s.flat_slot = ScheduleSlot()
+        s.enable_skip_finishing_decode = False
+        s._sched_idled = False
+        s.cur_batch_for_debug = None
+        s.recv_skipper = None
+        s.enable_overlap = False
+        s.enable_unified_memory = False
+        s.enable_fpm = False
+        s.enable_hisparse = False
+        s.hisparse_coordinator = None
+        s.require_mlp_sync = False
+        s.is_generation = True
+        s.tp_size = 2
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s._prefill_decode_interval_remaining = 0
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.scripted_scheduler_hook = _Hook(self)
+        s.dllm = None
+        s.disagg_prefill = None
+        s.disagg_decode = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        if mode == "prefill":
+            s.disagg_prefill = _PrefillOwner(self)
+            s.disaggregation_mode = DisaggregationMode.PREFILL
+        elif mode == "decode":
+            s.disagg_decode = _DecodeOwner(self)
+            s.disaggregation_mode = DisaggregationMode.DECODE
+        elif mode == "dllm":
+            s.dllm = _DllmOwner(self)
+
+        s.ingest_requests = self.ingest_requests
+        s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
+        s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
+        s._process_hicache_events = self.hicache_events
+        s.get_new_batch_prefill = lambda *slot: self.schedule_leaf("prefill")
+        s.get_decode_step = lambda *slot: self.schedule_leaf("decode")
+        s.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=self.mlp_sync,
+            maybe_set_extend_view=lambda step: self.log("extend_view"),
+        )
+        s._arm_prefill_decode_interval = lambda step: self.log("arm_interval")
+        s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=self.ngram)
+        s.run_batch = self.run_batch
+        s._apply_war_barrier = lambda: self.log("war_barrier")
+        s.launch_batch_sample_if_needed = self.sample
+        s.process_batch_result = self.process_batch_result
+        s._record_step_counters = lambda record: None
+        s.on_idle = lambda: self.log("idle")
+
+    def log(self, *event):
+        self.events.append((self.iteration,) + event)
+
+    def script(self, kind):
+        table = self.prefill if kind == "prefill" else self.decode
+        return table.pop(self.iteration, None)
+
+    def ingest_requests(self, stop_at_pause=False):
+        self.iteration += 1
+        if self.iteration == self.iterations:
+            raise _Stop
+        self.log("ingest", stop_at_pause) if stop_at_pause else self.log("ingest")
+        if self.iteration == self.shutdown_at:
+            self.s.gracefully_exit = True
+        return []
+
+    def hicache_events(self, should_retry_storage_prefetch=True):
+        if should_retry_storage_prefetch:
+            self.log("hicache")
+        else:
+            self.log("hicache", "no_retry")
+
+    def schedule_leaf(self, kind):
+        step = self.script(kind)
+        self.log(kind, step.name if step is not None else None)
+        return step
+
+    def mlp_sync(self, step, need_sync=None):
+        self.log("mlp_sync")
+        return step
+
+    def ngram(self, step, chunked_req):
+        self.log("ngram")
+        return step
+
+    def run_batch(self, step, pp_proxy_tensors=None):
+        self.log("run_batch", step.name)
+        result = _Result(step.name, self.s.enable_overlap, self.ready_at.get(step.name))
+        self.results[step.name] = result
+        return result
+
+    def sample(self, result, step):
+        if result is None or result.delay_sample_func is None:
+            return
+        result.delay_sample_func = None
+        self.log("sample", result.name)
+
+    def process_batch_result(self, step, result, *slot):
+        self.log("commit", step.name)
+
+    def run(self, **topology):
+        with (
+            published_topology(**topology),
+            patch(
+                "sglang.srt.managers.scheduler.set_schedule_time_batch",
+                lambda step: self.log("schedule_time"),
+            ),
+        ):
+            self.s.init_mode_stages()
+            try:
+                _dispatch_event_loop_once(self.s)
+            except _Stop:
+                pass
+        return self.events
+
+
+def _decode_step(name):
+    return _step(name, ForwardMode.DECODE)
+
+
+def _at(iteration, *events):
+    """The events of one iteration; a bare name is a one-field event."""
+    return [(iteration,) + (e if isinstance(e, tuple) else (e,)) for e in events]
+
+
+# The tail every schedule runs, on a step and on no step.
+_HOOK = "hook.on_schedule"
+_FINALIZE_NONE = ("mlp_sync", "extend_view", "arm_interval", "ngram", _HOOK)
+_FINALIZE = _FINALIZE_NONE[:-1] + ("schedule_time", _HOOK)
+
+
+class TestFlatDriverStageOrder(CustomTestCase):
+    def test_normal(self):
+        shell = _Shell(
+            "normal", 3, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
+        )
+        schedule = ("ingest", "chunked_abort", "hicache")
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
+            + _at(0, ("run_batch", "p0"), ("commit", "p0"))
+            + _at(1, *schedule, ("prefill", None), ("decode", "d1"), *_FINALIZE)
+            + _at(1, ("run_batch", "d1"), ("commit", "d1"))
+            + _at(2, *schedule, ("prefill", None), ("decode", None))
+            + _at(2, *_FINALIZE_NONE, "idle"),
+        )
+
+    def test_overlap(self):
+        shell = _Shell(
+            "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
+        )
+        shell.s.enable_overlap = True
+        schedule = {"chunked_abort", "hicache", "prefill", "decode"}
+        schedule.update(_FINALIZE)
+        self.assertEqual(
+            [e for e in shell.run() if e[1] not in schedule],
+            _at(0, "ingest", ("run_batch", "p0"), "war_barrier", ("sample", "p0"))
+            + _at(1, "ingest", ("run_batch", "d1"), "war_barrier")
+            + _at(1, ("commit", "p0"), ("sample", "d1"))
+            + _at(2, "ingest", ("commit", "d1"))
+            + _at(3, "ingest", "idle"),
+        )
+        self.assertTrue(shell.s.enable_skip_finishing_decode)
+
+    def test_shutdown_stops_new_launches(self):
+        """The pass that receives the shutdown commits what is pending and
+        launches nothing; the loop then exits."""
+        shell = _Shell(
+            "normal",
+            3,
+            prefill={0: _step("p0")},
+            decode={1: _decode_step("d1")},
+            shutdown_at=1,
+        )
+        shell.s.enable_overlap = True
+        self.assertEqual(
+            [e for e in shell.run() if e[1] in ("ingest", "run_batch", "commit")],
+            _at(0, "ingest", ("run_batch", "p0")) + _at(1, "ingest", ("commit", "p0")),
+        )
+
+    def test_dllm(self):
+        shell = _Shell("dllm", 2, prefill={0: _step("b0", ForwardMode.DLLM_EXTEND)})
+        schedule = ("ingest", "chunked_abort", "hicache", "dllm.schedule")
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, *_FINALIZE)
+            + _at(0, ("run_batch", "b0"), ("dllm.on_launch", "b0"), ("commit", "b0"))
+            + _at(1, *schedule, ("decode", None), *_FINALIZE_NONE, "idle"),
+        )
+
+    def test_pd_prefill(self):
+        shell = _Shell("prefill", 2, prefill={0: _step("p0")})
+        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule += ("dp.resolve", "dp.chunk")
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
+            + _at(0, ("run_batch", "p0"), ("dp.on_launch", "p0"))
+            + _at(0, ("commit", "p0"), "dp.after_commit")
+            + _at(1, *schedule, ("prefill", None), *_FINALIZE_NONE, "idle")
+            + _at(1, "dp.after_commit"),
+        )
+
+    def test_pd_prefill_overlap(self):
+        shell = _Shell("prefill", 3, prefill={0: _step("p0"), 1: _step("p1")})
+        shell.s.enable_overlap = True
+        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule += ("dp.resolve", "dp.chunk")
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
+            + _at(0, ("run_batch", "p0"), "war_barrier")
+            + _at(0, ("dp.on_launch", "p0"), "dp.after_commit", ("sample", "p0"))
+            + _at(1, *schedule, ("prefill", "p1"), *_FINALIZE)
+            + _at(1, ("run_batch", "p1"), "war_barrier")
+            + _at(1, ("dp.on_launch", "p1"), ("commit", "p0"), "dp.after_commit")
+            + _at(1, ("sample", "p1"))
+            + _at(2, *schedule, ("prefill", None), *_FINALIZE_NONE)
+            + _at(2, ("commit", "p1"), "dp.after_commit"),
+        )
+
+    def test_pd_prefill_overlap_with_readiness_gate(self):
+        """While the oldest pending step is not ready, intake repeats (holding
+        a pause) and the commit waits; no step is built while two are pending."""
+        shell = _Shell(
+            "prefill",
+            7,
+            prefill={0: _step("p0"), 1: _step("p1"), 4: _step("p2")},
+            ready_at={"p0": 3, "p1": 3, "p2": 5},
+        )
+        shell.s.enable_overlap = True
+        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule += ("dp.resolve", "dp.chunk")
+        with envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(True):
+            events = shell.run()
+        self.assertEqual(
+            events,
+            _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
+            + _at(0, ("run_batch", "p0"), "war_barrier")
+            + _at(0, ("dp.on_launch", "p0"), "dp.after_commit", ("sample", "p0"))
+            + _at(1, *schedule, ("prefill", "p1"), *_FINALIZE)
+            + _at(1, ("run_batch", "p1"), "war_barrier")
+            + _at(1, ("dp.on_launch", "p1"), ("dp.ready", "p0", False))
+            + _at(2, ("ingest", True), "dp.intake", ("dp.ready", "p0", False))
+            + _at(3, ("ingest", True), "dp.intake", ("dp.ready", "p0", True))
+            + _at(3, ("commit", "p0"), "dp.after_commit", ("sample", "p1"))
+            + _at(4, *schedule, ("prefill", "p2"), *_FINALIZE)
+            + _at(4, ("run_batch", "p2"), "war_barrier")
+            + _at(4, ("dp.on_launch", "p2"), ("dp.ready", "p1", True))
+            + _at(4, ("commit", "p1"), "dp.after_commit", ("sample", "p2"))
+            + _at(5, *schedule, ("prefill", None), *_FINALIZE_NONE)
+            + _at(5, ("dp.ready", "p2", True), ("commit", "p2"), "dp.after_commit")
+            + _at(6, *schedule, ("prefill", None), *_FINALIZE_NONE, "idle")
+            + _at(6, "dp.after_commit"),
+        )
+
+    def test_pd_decode(self):
+        # The prefetch runs at the top of an iteration, before the ingest that
+        # numbers it, so the log stamps it with the iteration before.
+        schedule = ("ingest", "dd.intake", ("dd.pop", None))
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                shell = _Shell("decode", 2, decode={0: _decode_step("d0")})
+                shell.s.enable_overlap = overlap
+                launch = (
+                    [("run_batch", "d0"), ("commit", "d0")]
+                    if not overlap
+                    else [("run_batch", "d0"), "war_barrier", ("sample", "d0")]
+                )
+                self.assertEqual(
+                    shell.run(),
+                    _at(-1, "dd.prefetch")
+                    + _at(0, *schedule, ("decode", "d0"), *_FINALIZE)
+                    + _at(0, *launch, "dd.prefetch")
+                    + _at(1, *schedule, ("decode", None), *_FINALIZE_NONE)
+                    + _at(1, ("commit", "d0") if overlap else "idle", "dd.prefetch"),
+                )
+                self.assertFalse(shell.s.enable_skip_finishing_decode)
+
+
+class _RingShell(_Shell):
+    """The ring on PP rank 0 of 2: it relays requests, proxies and PD ids to
+    rank 1; the outputs of a slot's step come back one ring round later."""
+
+    def __init__(self, mode, iterations, **script):
+        super().__init__(mode, iterations, **script)
+        s = self.s
+        s.device = "cpu"
+        s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
+        s.world_group = s.attn_tp_group = None
+        s.schedule_stream = s.forward_stream = s.copy_stream = None
+        s.copy_stream_ctx = s.future_map = s.req_to_token_pool = None
+        s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
+        self.channel = SimpleNamespace(
+            is_first_rank=True,
+            is_last_rank=False,
+            commit=lambda work, fence_next_forward=False: None,
+            commit_proxy_send=lambda: None,
+            send_pyobj=self.send,
+            send_next=lambda data: self.send(data, async_send=True),
+            recv_prev=self.recv,
+            recv_proxy=lambda: None,
+            send_proxy=lambda result: self.log("send_proxy"),
+            wait_forward_dependencies=lambda: None,
+            launch_event=None,
+        )
+        s.forward_stream_ctx = nullcontext()
+        s.device_module = SimpleNamespace(
+            Event=lambda: SimpleNamespace(record=lambda stream: None),
+            current_stream=lambda: None,
+        )
+
+    def send(self, data, async_send=False):
+        self.log("send")
+        return []
+
+    def recv(self):
+        self.log("recv")
+        return []
+
+    def exchange(self, next_first_rank_mb_id, next_mb_id):
+        self.log("exchange", next_mb_id)
+        done = SimpleNamespace(synchronize=lambda: None)
+        return None, SimpleNamespace(relayed=next_mb_id), done
+
+    def run(self):
+        with (
+            patch("sglang.srt.managers.scheduler_components.pp_ring.set_time_batch"),
+            patch("sglang.srt.managers.scheduler.PPChannel", return_value=self.channel),
+            patch.object(
+                PPRing,
+                "_commit_send_output_work_and_preprocess_output_tensors",
+                lambda ring, *args: self.exchange(*args),
+            ),
+        ):
+            return super().run(pp_size=2)
+
+
+class TestRingDriverStageOrder(CustomTestCase):
+    def test_plain(self):
+        shell = _RingShell(
+            "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
+        )
+        schedule = {"chunked_abort", "hicache"}
+        schedule.update(_FINALIZE)
+        self.assertEqual(
+            [e for e in shell.run() if e[1] not in schedule],
+            _at(0, "ingest", "send", ("prefill", "p0"), ("run_batch", "p0"))
+            + _at(0, ("exchange", 1), "send_proxy")
+            + _at(1, "ingest", "send", ("prefill", None), ("decode", "d1"))
+            + _at(1, ("run_batch", "d1"), ("exchange", 0), ("commit", "p0"))
+            + _at(1, "send_proxy")
+            + _at(2, "ingest", "send", ("prefill", None), ("decode", None))
+            + _at(2, ("exchange", 1), ("commit", "d1"))
+            + _at(3, "ingest", "send", ("prefill", None), ("decode", None))
+            + _at(3, ("exchange", 0), "idle"),
+        )
+
+    def test_pd_prefill(self):
+        shell = _RingShell("prefill", 3, prefill={0: _step("p0")})
+        schedule = ("ingest", "dp.intake", "dp.poll_transfer", "dp.chunk", "hicache")
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
+            + _at(0, ("run_batch", "p0"))
+            + _at(0, ("dp.on_launch", "p0"), ("exchange", 1), "send", "send")
+            + _at(0, "send_proxy")
+            + _at(1, *schedule, ("prefill", None), *_FINALIZE_NONE, ("exchange", 0))
+            + _at(1, "recv", ("commit", "p0"), "dp.after_commit", "send", "send")
+            + _at(2, *schedule, ("prefill", None), *_FINALIZE_NONE, ("exchange", 1))
+            + _at(2, "send", "recv", "dp.after_commit", "send", "send"),
+        )
+
+    def test_pd_decode(self):
+        shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})
+        schedule = ("ingest", "dd.retracted", "dd.poll_prealloc", "dd.poll_transfer")
+
+        # Slot 1 applies the consensus of slot 0, the slot scheduled next,
+        # and budgets it against that slot.
+        def consensus(slot):
+            return (
+                "recv",
+                ("dd.apply_retract", slot),
+                "recv",
+                ("dd.apply_prealloc", slot),
+                "recv",
+                ("dd.apply_transfer", slot),
+            )
+
+        self.assertEqual(
+            shell.run(),
+            _at(0, *schedule, ("dd.pop", 0), ("decode", "d0"), *_FINALIZE)
+            + _at(0, ("run_batch", "d0"), ("exchange", 1))
+            + _at(0, "send", "send", "send", "send", "send_proxy")
+            + _at(1, *schedule, ("dd.pop", 1), ("decode", None), *_FINALIZE_NONE)
+            + _at(1, ("exchange", 0), *consensus(0))
+            + _at(1, ("commit", "d0"), "send", "send", "send", "send"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

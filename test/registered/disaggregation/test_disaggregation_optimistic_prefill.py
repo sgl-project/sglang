@@ -18,10 +18,8 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.disaggregation.prefill import (
-    SchedulerDisaggregationPrefillMixin,
-    should_force_retry,
-)
+from sglang.srt.disaggregation.prefill import should_force_retry
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -35,6 +33,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -54,7 +53,7 @@ def rid_that_forces_retry(prefix: str) -> str:
         req = SimpleNamespace(
             rid=rid,
             is_retracted=False,
-            prefill_attempt_count=0,
+            disagg=DisaggReqState(prefill_attempt_count=0),
         )
         if should_force_retry(req):
             return rid
@@ -462,23 +461,20 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
         req.kv.kv_allocated_len = len(self.PROMPT)
         req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN
         req.last_node = tree.root_node_handle()
+        req.disagg = DisaggReqState()
 
-        scheduler = SimpleNamespace(
+        owner = prefill_owner_shell(
             tree_cache=tree,
-            waiting_queue=[],
-            disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
-            processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
+            get_processed_tokens_counter=lambda: 0,
+            release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
-            SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
-            )
+            owner.optimistic_release_and_requeue(req, [])
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
         match = tree.match_prefix(

@@ -5,7 +5,15 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+)
 
 import torch
 from huggingface_hub import snapshot_download
@@ -81,6 +89,7 @@ _is_cpu = is_cpu()
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -699,16 +708,21 @@ def build_grammar_vocab_mask(
     tree: GrammarTree,
     sampling_info: SamplingBatchInfo,
     device,
-    barrier: Optional[Callable[[], None]],
+    pending_grammar: Optional[Iterable[PendingStep]],
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
     Call it after the target verify launch -- every step here is host work, so it all
-    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
-    committed tokens, which the traversal then reads, so it has to run first.
+    overlaps that forward. The grammar commit of the steps in ``pending_grammar``
+    (their tokens advance the FSM the traversal reads) runs first; None when no step
+    can be pending (the scheduler committed them).
     """
-    if barrier is not None:
-        barrier()
+    if pending_grammar is not None:
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            commit_pending_grammar,
+        )
+
+        commit_pending_grammar(pending_grammar)
     vocab_mask, grammar = generate_token_bitmask(
         reqs,
         *tree.resolve(),
@@ -851,28 +865,26 @@ def move_accept_tokens_to_target_kvcache(
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
-    """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
+    """Gather the mamba track indices of the step's track plan before a
+    TARGET_VERIFY forward.
 
-    Spec batches skip the refresh in prepare_for_decode, and filter/merge
-    null these fields, so they must be rebuilt right before verify. Clearing
-    the mask also keeps a stale extend-time mask from triggering in-forward
-    tracking during TARGET_VERIFY; tracking is done in
-    commit_mamba_states_after_verify instead.
-
-    Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
-    inside forward isolation, so it must not mutate req/pool state.
+    spec_prepare_for_decode plans the positions at step build (lazy: those
+    of mamba_lazy_spec_prepare); the gather runs right before verify, on the
+    worker's forward batch (the step stays as scheduled). Clearing the mask
+    keeps in-forward tracking off during TARGET_VERIFY; tracking is done in
+    commit_mamba_states_after_verify instead. Runs in the forward, so it must
+    not mutate req/pool state.
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
-    track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
-        assert track_positions is not None and len(track_positions) == len(
-            batch.reqs
-        ), (
-            "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
-            "must run in prepare_for_decode for every spec decode iteration"
-        )
+    else:
+        track_positions = batch.mamba_track_buffer_indices
+    assert track_positions is not None and len(track_positions) == len(batch.reqs), (
+        "spec verify without a track plan: spec_prepare_for_decode must plan "
+        "every spec decode step"
+    )
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
@@ -1187,27 +1199,19 @@ def commit_mamba_states_after_verify(
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """eagle/ngram share a stateless free function; dflash keeps stateful
-    prep on its draft input -- the dispatcher routes.
-    """
+    """The decode preparation every speculative algorithm shares; the worker's
+    prepare_decode_step runs its own after it."""
+    # Step build: the track plan is the step's, read by its verify and by the
+    # host commit that promotes the tracked slot.
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-        # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    if batch.spec_algorithm.is_dflash_family():
-        batch.spec_info.prepare_for_decode(batch)
-    elif batch.spec_algorithm.is_uno():
-        from sglang.srt.speculative.uno_info import UnoDraftInput
-
-        if not isinstance(batch.spec_info, UnoDraftInput):
-            raise RuntimeError("UNO decode preparation requires UnoDraftInput")
-        batch.spec_info.prepare_for_decode(batch)
-    else:
-        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
-
-        eagle_prepare_for_decode(batch)
+    elif get_exec().mamba.enable_mamba_extra_buffer:
+        batch.mamba_track_buffer_indices = [
+            req.kv.mamba_next_track_idx for req in batch.reqs
+        ]
 
 
 def get_plan_stream(

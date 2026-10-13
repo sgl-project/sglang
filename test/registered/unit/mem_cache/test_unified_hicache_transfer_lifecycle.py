@@ -427,13 +427,11 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
     """PrefillAdder load-back admission over the real cache and shared budget."""
 
     def _adder(self, num_mixed_decode_tokens: int = 0):
-        running = mock.MagicMock()
-        running.reqs = []
         return PrefillAdder(
             page_size=PAGE,
             tree_cache=self.cache,
             token_to_kv_pool_allocator=self.allocator,
-            running_batch=running,
+            running_reqs=[],
             new_token_ratio=1.0,
             rem_input_tokens=10_000,
             rem_chunk_tokens=None,

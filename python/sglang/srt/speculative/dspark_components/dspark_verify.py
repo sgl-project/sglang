@@ -63,10 +63,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    if penalizer is not None and penalizer.is_required:
+    if getattr(sampling_info, "penalties", None) is not None:
         return False
     if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
@@ -163,7 +160,12 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            return self.verify_epilogue.read_accept(bs)
+            # Copies: the outputs back the step's result, and the next replay
+            # writes the epilogue's graph buffers again.
+            outs = self.verify_epilogue.read_accept(bs)
+            return AcceptOuts(
+                **{f: getattr(outs, f).clone() for f in AcceptOuts.__struct_fields__}
+            )
 
         simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
@@ -255,7 +257,7 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        self.target_worker.forward_batch_generation(
+        self.target_worker.forward_model(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
@@ -329,7 +331,7 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
+        target_out = self.target_worker.forward_model(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,

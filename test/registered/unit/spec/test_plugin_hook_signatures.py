@@ -8,10 +8,10 @@ draft-input builder: the built-in dropped a parameter the hook kept, so every
 plugin call would have hit a TypeError.
 
 What is pinned here:
-
   * every method the dispatch may call on either type takes the same arguments
     on both -- the set is intersected out of the two types, never listed;
-  * the call the dispatch actually writes binds on both types.
+  * the calls PD decode admission writes, among them the draft-input builder,
+    bind on both types.
 """
 
 import ast
@@ -19,7 +19,7 @@ import inspect
 import unittest
 from pathlib import Path
 
-from sglang.srt.disaggregation import decode_schedule_batch_mixin
+from sglang.srt.disaggregation import decode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,9 +45,9 @@ def _dispatched_methods():
 
 
 def _dispatch_calls():
-    """Every call the decode dispatch makes on the algorithm object, read from
-    its source: `(method, positional count, keyword names)`."""
-    source = Path(decode_schedule_batch_mixin.__file__).read_text(encoding="utf-8")
+    """Every call PD decode makes on the algorithm object, read from its
+    source: `(method, positional count, keyword names)`."""
+    source = Path(decode.__file__).read_text(encoding="utf-8")
     calls = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
@@ -95,7 +95,11 @@ class TestDispatchedSignatures(CustomTestCase):
 
     def test_the_dispatch_call_binds_on_both_types(self):
         calls = _dispatch_calls()
-        self.assertNotEqual(calls, [], "no dispatch call found to bind against")
+        self.assertIn(
+            "build_disagg_draft_input",
+            [method for method, _, _ in calls],
+            "PD decode admission no longer builds the draft input here",
+        )
         for method, positional, keywords in calls:
             self.assertIn(method, _dispatched_methods())
             for owner in (CustomSpecAlgo, SpeculativeAlgorithm):

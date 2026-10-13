@@ -132,7 +132,7 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_runner.init_cache_pools(self._model_runner.req_to_token_pool)
             self._mlx_pool_initialized = True
 
-    def forward_batch_generation(
+    def forward_model(
         self,
         batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
@@ -148,7 +148,7 @@ class MlxTpModelWorker(TpModelWorker):
             return self._forward_batch_generation_mlx(batch)
 
         # Fallback to standard path for None batches
-        return super().forward_batch_generation(
+        return super().forward_model(
             batch,
             forward_batch,
             pp_proxy_tensors,

@@ -46,7 +46,11 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
-        s._sync_disaggregation_mode_to_subcomponents = MagicMock()
+        s.maybe_init_disagg_prefill = MagicMock()
+        s.maybe_init_disagg_decode = MagicMock()
+        s.init_mode_stages = MagicMock()
+        s.disagg_prefill = None
+        s.disagg_decode = None
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
@@ -165,7 +169,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # The pristine startup record is never mutated.
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
-        s._sync_disaggregation_mode_to_subcomponents.assert_called_once()
+        s.maybe_init_disagg_decode.assert_called_once()
+        # The new owner's stages replace the old one's.
+        s.init_mode_stages.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
@@ -226,7 +232,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Teardown + rebuild attempted exactly once (no rollback).
         self.assertEqual(s.teardown_disaggregation.call_count, 1)
         self.assertEqual(s.init_disaggregation.call_count, 1)
-        s._sync_disaggregation_mode_to_subcomponents.assert_not_called()
+        s.maybe_init_disagg_decode.assert_not_called()
         # A subsequent switch is rejected because the instance is unhealthy.
         out2 = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")
@@ -255,7 +261,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Teardown raised, so rebuild is never attempted.
         self.assertEqual(s.teardown_disaggregation.call_count, 1)
         s.init_disaggregation.assert_not_called()
-        s._sync_disaggregation_mode_to_subcomponents.assert_not_called()
+        s.maybe_init_disagg_decode.assert_not_called()
 
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
@@ -590,10 +596,11 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
 
     def test_teardown_invokes_release(self):
         s = _radix_scheduler(disable_radix_cache=False)
-        s.disaggregation_mode = DisaggregationMode.PREFILL
-        s.disagg_prefill_bootstrap_queue = None  # no queue -> skip km.teardown()
+        kv_manager = MagicMock()
+        s.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
         teardown_disaggregation(s)
-        self.assertIsNone(s.disagg_metadata_buffers)
+        kv_manager.teardown.assert_called_once_with()
+        self.assertIsNone(s.disagg_prefill)
         s.tree_cache.reset.assert_called_once_with()
 
 

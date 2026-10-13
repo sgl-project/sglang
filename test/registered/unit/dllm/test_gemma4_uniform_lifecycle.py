@@ -8,9 +8,11 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.dllm.manager import DllmManager
+from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
+from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -28,10 +30,13 @@ class _Req:
             "q", [0] * block_size
         )
         self.prefix_len = context_len
-        self.dllm_block_offset = context_len
-        self.dllm_incomplete_ids = array("q")
-        self.dllm_algo_state = None
-        self.dllm_phase_prefill = prefill
+        self.dllm = DllmReqState(
+            config=None,
+            phase=(
+                DllmReqPhase.STAGING_PREFILL if prefill else DllmReqPhase.STAGING_DECODE
+            ),
+            block_offset=context_len,
+        )
         self.extend_end = context_len + block_size
         self.kv = ReqKvInfo(
             req_pool_idx=1,
@@ -50,9 +55,6 @@ class _Req:
 
     extend_len = Req.extend_len
 
-    def is_dllm_prefill(self):
-        return self.dllm_phase_prefill
-
     def update_finish_state(self, new_accepted_len=1):
         if self.finish_on_update:
             self.finished_reason = object()
@@ -66,7 +68,7 @@ class _Batch:
         self.reqs = reqs
         self.forward_mode = (
             ForwardMode.EXTEND
-            if all(req.is_dllm_prefill() for req in reqs)
+            if all(req.dllm.is_prefill() for req in reqs)
             else ForwardMode.DLLM_EXTEND
         )
         self.return_logprob = False
@@ -77,9 +79,9 @@ class _Batch:
         return len(self.reqs)
 
 
-class _Scheduler(SchedulerDllmMixin):
-    def __init__(self, *, fdfo, block_size=4, context_len=128):
-        self.dllm_config = DllmConfig(
+def _manager(*, fdfo, block_size=4, context_len=128):
+    return DllmManager(
+        dllm_config=DllmConfig(
             algorithm="Gemma4Renoise",
             algorithm_config={},
             block_size=block_size,
@@ -87,18 +89,34 @@ class _Scheduler(SchedulerDllmMixin):
             max_running_requests=8,
             first_done_first_out_mode=fdfo,
             requires_separate_context_encoding=True,
-        )
-        self.metrics_reporter = SimpleNamespace(
-            num_generated_tokens=0,
-            report_prefill_stats=Mock(),
-        )
-        self.token_to_kv_pool_allocator = SimpleNamespace(
+        ),
+        tree_cache=object(),
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=SimpleNamespace(
             free_group_begin=Mock(),
             free_group_end=Mock(),
-        )
-        self.tree_cache = object()
-        self.output_streamer = SimpleNamespace(stream_output=Mock())
-        self.model_config = SimpleNamespace(context_len=context_len)
+        ),
+        policy=None,
+        new_token_ratio_tracker=None,
+        page_size=1,
+        max_prefill_tokens=0,
+        chunked_prefill_size=None,
+        priority_scheduling_preemption_threshold=0,
+        enable_priority_preemption=False,
+        enable_priority_scheduling=False,
+        truncation_align_size=None,
+        context_len=context_len,
+        get_num_allocatable_reqs=None,
+        build_extend_step=None,
+        build_sampling_info=None,
+        metrics_reporter=SimpleNamespace(
+            num_generated_tokens=0,
+            report_prefill_stats=Mock(),
+        ),
+        output_streamer=SimpleNamespace(stream_output=Mock()),
+        release_aborted_request=Mock(),
+        send_abort_output=Mock(),
+    )
 
 
 def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
@@ -113,44 +131,36 @@ def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
 
 class TestGemma4ContextLifecycle(unittest.TestCase):
     def test_scheduler_uses_standard_extend_for_context_only(self):
-        scheduler = SimpleNamespace(
+        manager = SimpleNamespace(
             dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
-            dllm_manager=SimpleNamespace(
-                get_prefill_requests=Mock(return_value=[object()]),
-                get_decode_requests=Mock(return_value=[]),
-            ),
+            get_prefill_requests=Mock(return_value=[object()]),
+            get_decode_requests=Mock(return_value=[]),
             _process_batch_by_phase=Mock(),
         )
 
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
+        mode = DllmManager._process_dllm_batches(manager, Mock())
         self.assertEqual(mode, ForwardMode.EXTEND)
 
-        scheduler.dllm_config.requires_separate_context_encoding = False
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
+        manager.dllm_config.requires_separate_context_encoding = False
+        mode = DllmManager._process_dllm_batches(manager, Mock())
         self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
 
-        scheduler.dllm_config.requires_separate_context_encoding = True
-        scheduler.dllm_manager.get_prefill_requests.return_value = []
-        scheduler.dllm_manager.get_decode_requests.return_value = [object()]
-        mode = SchedulerDllmMixin._process_dllm_batches(
-            scheduler, Mock(), running_batch=Mock()
-        )
+        manager.dllm_config.requires_separate_context_encoding = True
+        manager.get_prefill_requests.return_value = []
+        manager.get_decode_requests.return_value = [object()]
+        mode = DllmManager._process_dllm_batches(manager, Mock())
         self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
 
     def test_context_result_skips_fdfo_token_processing(self):
-        scheduler = _Scheduler(fdfo=True)
+        manager = _manager(fdfo=True)
         req = _Req(prefill=True)
         result = _result(None)
 
-        SchedulerDllmMixin.process_batch_result_dllm(scheduler, _Batch([req]), result)
+        manager._write_blocks(_Batch([req]), result)
 
-        scheduler.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
-        scheduler.output_streamer.stream_output.assert_not_called()
-        scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+        manager.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
+        manager.output_streamer.stream_output.assert_not_called()
+        manager.metrics_reporter.report_prefill_stats.assert_called_once()
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(
@@ -163,7 +173,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             swa_evictable_size=lambda: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)
-        adder = object.__new__(PrefillAdder)
+        adder = object.__new__(DllmPrefillAdder)
         adder.memory_budget = budget
         adder.page_size = 4
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
@@ -176,12 +186,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             with self.subTest(reserved=reserved):
                 budget.swa_offset = reserved
                 self.assertEqual(adder._get_dllm_remain_tokens(req), expected)
-        req.dllm_phase_prefill = False
+        req.dllm.phase = DllmReqPhase.STAGING_DECODE
         budget.swa_offset = 0
         self.assertEqual(adder._get_dllm_remain_tokens(req), 8)
 
     def test_context_prefill_is_not_capped_to_canvas_length(self):
-        adder = object.__new__(PrefillAdder)
+        adder = object.__new__(DllmPrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
@@ -207,16 +217,16 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             truncation_align_size=None,
         )
         self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
-        PrefillAdder._add_dllm_req(adder, req)
+        DllmPrefillAdder._add_dllm_req(adder, req)
         self.assertEqual((req.prefix_len, req.extend_end), (0, 300))
 
-        req.dllm_phase_prefill = False
+        req.dllm.phase = DllmReqPhase.STAGING_DECODE
         req.prefix_len = 300
-        PrefillAdder._add_dllm_req(adder, req)
+        DllmPrefillAdder._add_dllm_req(adder, req)
         self.assertEqual((req.prefix_len, req.extend_end), (300, 556))
 
     def test_chunked_context_prefill_stops_at_context_boundary(self):
-        adder = object.__new__(PrefillAdder)
+        adder = object.__new__(DllmPrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
         adder._get_dllm_remain_tokens = lambda req=None: 64
@@ -226,7 +236,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req = _Req(context_len=10, block_size=4, prefill=True)
         req.prefix_len = 7
 
-        result = PrefillAdder.add_dllm_staging_req(adder, req)
+        result = DllmPrefillAdder.add_dllm_staging_req(adder, req)
 
         self.assertEqual(result, AddReqResult.CONTINUE)
         self.assertEqual((req.prefix_len, req.extend_end), (7, 10))
@@ -238,7 +248,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             "completed-canvas", "", array("q", range(context_len)), SamplingParams()
         )
         req.full_untruncated_fill_ids.extend([0] * block_size)
-        req.dllm_block_offset = context_len
+        req.dllm = DllmReqState(config=None, block_offset=context_len)
         req.extend_end = context_len + block_size
         req.kv.req_pool_idx = 3
         req.kv.kv_allocated_len = context_len + block_size
@@ -246,12 +256,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
         req_to_token = torch.arange(4 * 600, dtype=torch.int64).view(4, 600)
         allocator = SimpleNamespace(page_size=page_size, free_segment=Mock())
-        scheduler = _Scheduler(fdfo=True, block_size=block_size)
-        scheduler.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
-        scheduler.token_to_kv_pool_allocator = allocator
-        scheduler.stash_chunked_request = Mock()
+        manager = _manager(fdfo=True, block_size=block_size)
+        manager.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        manager.token_to_kv_pool_allocator = allocator
 
-        SchedulerDllmMixin._stash_dllm_context(scheduler, req)
+        with patch("sglang.srt.dllm.manager.checkpoint_kv_cache") as checkpoint:
+            manager._stash_dllm_context(req)
 
         expected = req_to_token[3, page_size : context_len + block_size]
         freed = allocator.free_segment.call_args.args[0]
@@ -261,19 +271,18 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         self.assertEqual(req.kv.kv_committed_len, context_len)
         self.assertEqual(req.kv.kv_allocated_len, context_len)
         self.assertEqual(req.extend_end, context_len)
-        scheduler.stash_chunked_request.assert_called_once_with(req)
+        checkpoint.assert_called_once_with(req, manager.tree_cache)
 
     def test_unresolved_fdfo_preserves_state_and_reuses_exact_slots(self):
         context_len, block_size, slot = 5, 4, 2
-        scheduler = _Scheduler(fdfo=True, block_size=block_size)
+        manager = _manager(fdfo=True, block_size=block_size)
         req = _Req(context_len=context_len, block_size=block_size)
         req.kv.req_pool_idx = slot
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
-            SchedulerDllmMixin.process_batch_result_dllm(
-                scheduler,
+        with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+            manager._write_blocks(
                 _Batch([req]),
                 _result(
                     [next_canvas],
@@ -284,8 +293,8 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         release.assert_not_called()
         self.assertEqual(req.kv.req_pool_idx, slot)
         self.assertEqual(req.kv.kv_allocated_len, context_len + block_size)
-        self.assertEqual(req.dllm_incomplete_ids.tolist(), next_canvas.tolist())
-        self.assertIs(req.dllm_algo_state, state)
+        self.assertEqual(req.dllm.incomplete_ids.tolist(), next_canvas.tolist())
+        self.assertIs(req.dllm.algo_state, state)
 
         req_to_token = torch.arange(3 * 32, dtype=torch.int64).view(3, 32)
         alloc_batch = SimpleNamespace(
@@ -295,7 +304,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         reused = _alloc_extend_loc_with_kv_reuse(
             alloc_batch,
-            [True],
+            [block_size],
             [req_to_token[slot, :context_len]],
             torch.tensor([slot]),
             torch.tensor([context_len]),
@@ -308,23 +317,21 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
 
     def test_finished_context_model_never_inserts_canvas_kv(self):
-        scheduler = _Scheduler(fdfo=False)
+        manager = _manager(fdfo=False)
         req = _Req()
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
-            SchedulerDllmMixin.process_batch_result_dllm(
-                scheduler, _Batch([req]), _result([canvas])
-            )
+        with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+            manager._write_blocks(_Batch([req]), _result([canvas]))
 
-        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
+        release.assert_called_once_with(req, manager.tree_cache, checkpoint=False)
 
     def test_context_boundary_stops_sync_and_fdfo(self):
         block_size = 4
         for fdfo in (False, True):
             with self.subTest(fdfo=fdfo):
-                scheduler = _Scheduler(fdfo=fdfo, block_size=block_size, context_len=14)
+                manager = _manager(fdfo=fdfo, block_size=block_size, context_len=14)
                 req = _Req(context_len=7, block_size=block_size)
                 canvas = torch.tensor([3, 2, 1, 0])
                 result = _result(
@@ -333,16 +340,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                     algo_states=[None] if fdfo else None,
                 )
 
-                with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
-                ) as release:
-                    SchedulerDllmMixin.process_batch_result_dllm(
-                        scheduler, _Batch([req]), result
-                    )
+                with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+                    manager._write_blocks(_Batch([req]), result)
 
                 self.assertTrue(req.finished())
                 release.assert_called_once_with(
-                    req, scheduler.tree_cache, checkpoint=False
+                    req, manager.tree_cache, checkpoint=False
                 )
 
 
@@ -354,17 +357,16 @@ class TestGemma4RequestValidation(unittest.TestCase):
         algorithm="Gemma4Renoise",
         **req_kwargs,
     ):
-        scheduler = _Scheduler(fdfo=False)
-        scheduler.dllm_config.algorithm = algorithm
+        manager = _manager(fdfo=False)
+        manager.dllm_config.algorithm = algorithm
         req = Req(
             "request",
             "",
             array("q", [1]),
             sampling_params if sampling_params is not None else SamplingParams(),
-            dllm_config=scheduler.dllm_config,
             **req_kwargs,
         )
-        return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
+        return manager.validate_request(req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
         from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -378,7 +380,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
-        scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config
+        scheduler.dllm = _manager(fdfo=False)
         scheduler._maybe_namespace_elastic_radix_cache = Mock()
         scheduler._add_request_to_queue = Mock()
         scheduler.init_req_max_new_tokens = Mock()
@@ -398,7 +400,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
             SamplingParams(),
             return_logprob=True,
             top_logprobs_num=1,
-            dllm_config=scheduler.dllm_config,
         )
         with (
             get_context().override_server_args(weight_version="test"),
@@ -489,8 +490,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
         self.assertIsNone(
             self._validate(SamplingParams(top_p=0.9), algorithm="LowConfidence")
         )
-        scheduler = SimpleNamespace(dllm_config=None)
-        self.assertIsNone(SchedulerDllmMixin.validate_dllm_request(scheduler, object()))
 
     def test_greedy_temperature_is_accepted_after_normalization(self):
         params = SamplingParams(temperature=0)

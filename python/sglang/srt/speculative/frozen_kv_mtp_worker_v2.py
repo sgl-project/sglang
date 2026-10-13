@@ -55,6 +55,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
@@ -432,8 +433,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         stashed = FrozenKVMTPDraftInput()
         stashed.bonus_tokens = last_token_ids.to(torch.int64)
         stashed.hidden_states = last_hidden_states
-        # Real-shaped zeros so inherited `filter_batch`/`merge_batch` can slice
-        # them between iters; overwritten by the captured seed iter.
+        # Real-shaped zeros so the FutureMap stash has every field per row;
+        # overwritten by the captured seed iter.
         bs = last_token_ids.shape[0]
         device = last_token_ids.device
         stashed.topk_p = torch.zeros(
@@ -458,12 +459,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
-        # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
-        # decode_batch_idx tick) is done by the scheduler-driven
-        # eagle_utils.eagle_prepare_for_decode (see
-        # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
-        # Repeating evict/tick here would double-run them: the idx clock
-        # gates SWA eviction timing and the SWA prefix-lock release.
+        # NOTE: per-iter bookkeeping is the scheduler's, not here -- matching
+        # EAGLE v2: maybe_evict_swa runs in eagle_utils.eagle_prepare_for_decode
+        # (see ScheduleBatch.prepare_for_decode) and the decode_batch_idx tick
+        # at the step's host commit (commit_step_counters). Repeating them
+        # here would double-run them: the idx clock gates SWA eviction timing
+        # and the SWA prefix-lock release.
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         # Actual width of the next draft-decode forward: topk tokens per req.
@@ -747,15 +748,18 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
-    def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    def _new_draft_input(self, req_pool_indices: torch.Tensor) -> FrozenKVMTPDraftInput:
+        return FrozenKVMTPDraftInput(capture_hidden_mode=CaptureHiddenMode.LAST)
+
+    def _forward(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors, pending_grammar
     ):
-        # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
+        # Mirrors EAGLEWorkerV2._forward; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill (frozen is never standalone -> capture FULL hidden).
-            batch_output = self.target_worker.forward_batch_generation(
+            batch_output = self.target_worker.forward_model(
                 batch, capture_hidden_mode=CaptureHiddenMode.FULL
             )
 
@@ -785,7 +789,10 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
-                batch.spec_info = self.draft_worker._idle_seed()
+                batch = derive_batch(batch, spec_info=self.draft_worker._idle_seed())
+            # The draft fills its batch (lengths sum, no hidden-state return);
+            # verify builds on it.
+            batch = derive_batch(batch)
             with (
                 draft_tp_context(self.draft_worker.draft_owns_attention),
                 speculative_moe_backend_context(),
@@ -794,8 +801,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             ):
                 verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            batch = derive_batch(batch, spec_info=verify_input)
+            batch_output = self.verify(batch, pending_grammar=pending_grammar)
             # Publish before draft-extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

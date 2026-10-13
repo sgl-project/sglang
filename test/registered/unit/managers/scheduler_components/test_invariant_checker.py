@@ -12,7 +12,6 @@ maybe_stub_sgl_kernel()
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
@@ -50,7 +49,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
         return SchedulerInvariantChecker(
             is_hybrid_swa=hybrid_swa,
             is_hybrid_ssm=hybrid_ssm,
-            disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
             full_tokens_per_layer=None,
             swa_tokens_per_layer=None,
@@ -59,8 +57,8 @@ class TestCheckTreeCacheGate(CustomTestCase):
             token_to_kv_pool_allocator=MagicMock(),
             req_to_token_pool=MagicMock(),
             pool_stats_observer=MagicMock(),
-            get_last_batch=lambda: None,
-            get_running_batch=lambda: None,
+            get_launched_step=lambda: None,
+            get_decoding=lambda: [],
             scheduler_stage_metrics=None,
         )
 
@@ -171,8 +169,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     tree_components=(ComponentType.FULL,),
                 )
             )
-        self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-        self.running_batch = self.last_batch
+        self.launched_step = SimpleNamespace(reqs=[])
+        self.decoding = []
         self.chunked_req = None
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
@@ -190,7 +188,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         return SchedulerInvariantChecker(
             is_hybrid_swa=False,
             is_hybrid_ssm=False,
-            disaggregation_mode=DisaggregationMode.PREFILL,
             page_size=self.PAGE_SIZE,
             full_tokens_per_layer=None,
             swa_tokens_per_layer=None,
@@ -199,8 +196,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             token_to_kv_pool_allocator=self.allocator,
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
-            get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
+            get_launched_step=lambda: self.launched_step,
+            get_decoding=lambda: self.decoding,
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=None,
         )
@@ -249,8 +246,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             ),
             beam_group=None,
         )
-        self.last_batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
-        self.running_batch = self.last_batch
+        self.launched_step = SimpleNamespace(reqs=[req])
+        self.decoding = [req]
         return req
 
     def test_balanced_and_skewed_cache_ownership_conserve_full_pool(self):
@@ -300,13 +297,12 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         checker = self._make_checker()
         req = self._active_partial_page(checker)
         # Count the same request only once, including when it is parked
-        # between prefill chunks instead of appearing in either batch.
+        # between prefill chunks instead of decoding.
         for parked in (False, True):
             with self.subTest(parked=parked):
                 self.chunked_req = req
                 if parked:
-                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-                    self.running_batch = self.last_batch
+                    self.decoding = []
                 uncached, swa_uncached = checker._get_total_uncached_sizes()
                 self.assertEqual((uncached, swa_uncached), (self.PAGE_SIZE, 0))
                 stats = checker.pool_stats_observer.get_pool_stats()
@@ -326,8 +322,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             with self.subTest(parked=parked):
                 self.chunked_req = req
                 if parked:
-                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-                    self.running_batch = self.last_batch
+                    self.decoding = []
                 self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
                 self.assertEqual(
                     checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE

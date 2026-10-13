@@ -44,7 +44,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         target = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=object(), spec_algorithm=None),
             device="cpu",
-            forward_batch_generation=lambda batch, *, pp_proxy_tensors, capture_hidden_mode: (
+            forward_model=lambda batch, *, pp_proxy_tensors, capture_hidden_mode: (
                 SimpleNamespace(pp_hidden_states_proxy_tensors=pp_proxy_tensors)
             ),
         )
@@ -59,7 +59,9 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         worker.alloc_memory_pool()
         worker.init_attention_backends()
         worker.init_cuda_graphs()
-        batch = SimpleNamespace(seq_lens=torch.tensor([8]))
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([8]), spec_info=None, sampling_info=None
+        )
         result = worker.forward_batch_generation(batch, pp_proxy_tensors=proxy)
         self.assertIs(result.pp_hidden_states_proxy_tensors, proxy)
         self.assertIs(result.new_seq_lens, batch.seq_lens)

@@ -2,7 +2,7 @@
 
 Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
 clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
-`spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
+`verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
 the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
 repeat any of them (the scheduler-driven free function / resolve path already
 does).
@@ -32,7 +32,7 @@ _TRACKED_ATTRS = (
     "extend_batch_idx",
     "kv_committed_len",
     "kv_allocated_len",
-    "spec_verify_ct",
+    "verify_ct",
 )
 _EVICT_METHOD = "maybe_evict_swa"
 
@@ -55,27 +55,24 @@ _RESOLVE = (
 )
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
-    # non-spec scheduler
-    (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
-    (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
+    # Step counters, and the non-spec decode watermark, move at host commit.
+    (_SB, "commit_step_counters", "decode_batch_idx"): 1,
+    (_SB, "commit_step_counters", "extend_batch_idx"): 1,
+    (_SB, "commit_step_counters", "kv_committed_len"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_committed_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
-    (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
     # DFlash uses its stateful scheduler-side preparation instead of
-    # eagle_prepare_for_decode. spec_prepare_for_decode dispatches to exactly
-    # one of these two owners for each speculative decode iteration.
-    (*_DFLASH_DECODE, "decode_batch_idx"): 1,
+    # eagle_prepare_for_decode. The worker's _prepare_decode runs exactly one
+    # of these owners for each speculative decode iteration.
     (*_DFLASH_DECODE, "evict"): 1,
-    (*_UNO_DECODE, "decode_batch_idx"): 1,
     (*_UNO_DECODE, "evict"): 1,
     (
         "mem_cache/allocation.py",
@@ -83,7 +80,7 @@ _OWNER_SITES = {
         "kv_allocated_len",
     ): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
-    (*_RESOLVE, "spec_verify_ct"): 1,
+    (*_RESOLVE, "verify_ct"): 1,
     # Mixed-chunk spec tails: the mixed prefill step commits the pending
     # bonus token, advancing the watermark by exactly that one token.
     (
@@ -119,13 +116,13 @@ _OWNER_SITES = {
     ): 1,
     # A completed dLLM canvas is discarded while the context and slot stay owned.
     (
-        "dllm/mixin/scheduler.py",
-        "SchedulerDllmMixin._stash_dllm_context",
+        "dllm/manager.py",
+        "DllmManager._stash_dllm_context",
         "kv_committed_len",
     ): 1,
     (
-        "dllm/mixin/scheduler.py",
-        "SchedulerDllmMixin._stash_dllm_context",
+        "dllm/manager.py",
+        "DllmManager._stash_dllm_context",
         "kv_allocated_len",
     ): 1,
     # streaming session tail trimming

@@ -39,6 +39,18 @@ class CustomSpecAlgo:
     removed, so such algorithms run on the V2 scheduler schema with overlap
     disabled (synchronous). Migrate plugin workers to the V2 schema and
     overlap scheduling.
+
+    A plugin worker subclasses ``BaseSpecWorker`` and implements
+    ``_forward(batch, on_publish, pp_proxy_tensors, pending_grammar)``, as the
+    builtin workers do. The base's ``forward_batch_generation(step)`` takes
+    the step read-only, runs ``_forward`` on ``self.forward_input(step)`` (the
+    step's rows with their draft state and lengths gathered from FutureMap),
+    and commits the result: ``next_draft_input`` goes into the rows' FutureMap
+    slots (``SpecInput.relay_payload``), keyed by ``req_pool_idx``.
+    ``_forward`` calls ``on_publish`` with the new lengths as soon as they are
+    known, and passes ``pending_grammar`` to ``build_grammar_vocab_mask``. A
+    worker whose draft input is not an ``EagleDraftInput`` overrides
+    ``_new_draft_input``, from which ``keyed_draft_input`` builds a step's.
     """
 
     def __init__(
@@ -107,8 +119,8 @@ class CustomSpecAlgo:
         return False
 
     def supports_grammar_overlap(self) -> bool:
-        # Whether the worker advances the grammar FSM inside verify() (via the
-        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Whether the worker runs the previous step's grammar commit inside
+        # verify(), letting spec + grammar decode overlap.
         return False
 
     def has_draft_kv(self) -> bool:
@@ -168,6 +180,10 @@ class CustomSpecAlgo:
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
         """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        When ``draft_state_in_future_map(batch.enable_overlap)`` holds, key it
+        by ``batch.req_pool_indices`` and seed its slots with
+        ``future_map.seed`` (see ``build_eagle_disagg_draft_input``).
 
         The speculative config comes from ``runtime_context.get_spec()``, which
         follows a runtime override where the startup record does not.

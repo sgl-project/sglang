@@ -2546,7 +2546,6 @@ class MMReceiverBase(ABC):
             extra_key=recv_req.extra_key,
             cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
-            dllm_config=self.scheduler.dllm_config,
         )
         req.tokenizer = self.scheduler.tokenizer
         return req

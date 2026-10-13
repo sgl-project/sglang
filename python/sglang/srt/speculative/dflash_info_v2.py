@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -211,62 +211,8 @@ class DFlashDraftInputV2(SpecInput):
             # plan-stream context, so forward work cannot observe partially
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
-        for req in batch.reqs:
-            req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum
         self.nxt_kv_lens_cpu = nxt_kv_lens_cpu_t
         self.nxt_kv_lens_sum = nxt_kv_lens_sum
-
-    def filter_batch(
-        self,
-        new_indices: torch.Tensor,
-        new_indices_cpu: Optional[List[int]] = None,
-    ):
-        if self.nxt_kv_lens_cpu is not None:
-            if new_indices_cpu is not None:
-                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices_cpu]
-            else:
-                self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
-            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
-
-        if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
-            return
-
-        self.topk_p = self.topk_p[new_indices]
-        self.topk_index = self.topk_index[new_indices]
-        self.bonus_tokens = self.bonus_tokens[new_indices]
-        self.new_seq_lens = self.new_seq_lens[new_indices]
-        self.hidden_states = self.hidden_states[new_indices]
-
-    def merge_batch(self, spec_info: "DFlashDraftInputV2"):
-        if self.nxt_kv_lens_cpu is not None:
-            assert spec_info.nxt_kv_lens_cpu is not None
-            self.nxt_kv_lens_cpu = torch.cat(
-                [self.nxt_kv_lens_cpu, spec_info.nxt_kv_lens_cpu]
-            )
-            self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
-        elif spec_info.nxt_kv_lens_cpu is not None:
-            self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
-            self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
-
-        if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self.future_indices = torch.cat(
-                [self.future_indices, spec_info.future_indices]
-            )
-            return
-
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
-        self.bonus_tokens = torch.cat(
-            [self.bonus_tokens, spec_info.bonus_tokens], dim=0
-        )
-        self.new_seq_lens = torch.cat(
-            [self.new_seq_lens, spec_info.new_seq_lens], dim=0
-        )
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], dim=0
-        )

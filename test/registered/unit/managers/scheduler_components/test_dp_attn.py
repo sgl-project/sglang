@@ -294,13 +294,9 @@ class TestDPBalanceStats(CustomTestCase):
     def _adapter(self):
         return dp_attn.SchedulerDPAttnAdapter(
             model_runner=object(),
-            req_to_token_pool=object(),
-            token_to_kv_pool_allocator=object(),
-            tree_cache=object(),
             offload_tags=set(),
-            model_config=object(),
-            enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
+            new_step=lambda reqs: None,
             get_require_mlp_sync=lambda: True,
         )
 
@@ -338,20 +334,6 @@ class TestDPBalanceStats(CustomTestCase):
         # An iteration that ends without a batch drops what it carried.
         batchless_gather(0.004)
         adapter.drop_sync_wait_carry()
-        self.assertEqual(carry.seconds, 0.0)
-
-    def test_unrecorded_batch_steps_do_not_carry_wait(self):
-        carry = self._adapter().sync_wait_carry
-        carry.seconds = 0.003
-        # A prebuilt batch with no work anywhere runs a step but records nothing.
-        result = self._prepare_dp2_batch(
-            ForwardMode.PREBUILT,
-            local_tokens=0,
-            peer_tokens=0,
-            sync_wait_carry=carry,
-            wait_seconds=0.001,
-        )
-        self.assertIsNone(result.dp_balance_stats)
         self.assertEqual(carry.seconds, 0.0)
 
     def test_health_check_probe_steps_not_recorded(self):

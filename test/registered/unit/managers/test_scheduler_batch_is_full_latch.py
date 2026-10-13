@@ -1,4 +1,4 @@
-"""An empty running batch never keeps admission closed (#41841)."""
+"""An empty decoding list never keeps admission closed (#41841)."""
 
 import unittest
 from types import SimpleNamespace
@@ -9,14 +9,24 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.managers.scheduler_components.pending_steps import (
+    PendingStep,
+    PendingSteps,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _AdmissionAttempted(Exception):
     pass
+
+
+class _Req(SimpleNamespace):
+    # Hashed by identity, as Req is.
+    __hash__ = object.__hash__
 
 
 class TestEmptyBatchFullLatch(CustomTestCase):
@@ -26,6 +36,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
         s.waiting_queue = [SimpleNamespace(rid="req-0")]
+        s.decoding = []
         s.chunked_req = None
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
@@ -34,17 +45,45 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.policy = SimpleNamespace(calc_priority=Mock(side_effect=_AdmissionAttempted))
         return s
 
-    def test_latched_empty_batch_still_admits(self):
-        # Whichever pass set the flag on an empty batch (no KV room, or no free
-        # request slot), no later step shrinks the batch to clear it.
+    def test_latched_flag_with_nothing_decoding_still_admits(self):
+        # Whichever pass set the flag with nothing decoding (no KV room, or no
+        # free request slot), no later commit removes a request to clear it.
         s = self._scheduler()
-        running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        slot = ScheduleSlot(batch_is_full=True)
 
         with self.assertRaises(_AdmissionAttempted):
-            s._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=None, running_batch=running_batch
+            s._get_new_batch_prefill_raw(slot, prefill_delayer_single_pass=None)
+        self.assertFalse(slot.batch_is_full)
+
+    def test_skipping_a_request_finishing_in_flight_clears_the_flag(self):
+        # The decode step and a mixed step's decode rows both select here.
+        def req(rid, max_new_tokens):
+            return _Req(
+                rid=rid,
+                is_prefill_only=False,
+                beam_group=None,
+                output_ids=[1],
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
             )
-        self.assertFalse(running_batch.batch_is_full)
+
+        finishing, running = req("a", 2), req("b", 8)
+        s = self._scheduler()
+        s.decoding = [finishing, running]
+        s.enable_skip_finishing_decode = True
+        # One decode step of both is in flight.
+        s.pending = PendingSteps()
+        step = SimpleNamespace(
+            reqs=[finishing, running], forward_mode=ForwardMode.DECODE, chunked_req=None
+        )
+        slot = ScheduleSlot(batch_is_full=True)
+        s.pending.push(
+            PendingStep(
+                step=step, result=None, slot=slot, launch_ts=0.0, after_idle_gap=False
+            )
+        )
+
+        self.assertEqual(s._select_decode_reqs(slot), [running])
+        self.assertFalse(slot.batch_is_full)
 
 
 if __name__ == "__main__":

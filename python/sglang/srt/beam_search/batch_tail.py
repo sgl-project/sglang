@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Beam member rows riding a decode batch: layout, append/strip, retract.
+"""Beam member rows riding a decode batch: layout, append, retract.
 
 Everything here mutates or reads ScheduleBatch, but lives outside it so the
 batch class carries only the beam_tail field and one-line hook calls.
@@ -86,35 +86,8 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
                 torch.repeat_interleave(batch.seq_lens_cpu[leader_idx_cpu], widths_cpu),
             ]
         )
-    batch.orig_seq_lens = torch.cat(
-        [
-            batch.orig_seq_lens,
-            torch.repeat_interleave(batch.orig_seq_lens[leader_idx_dev], widths_dev),
-        ]
-    )
     batch.seq_lens_sum = None
     batch.beam_tail = BeamTail(num_base_rows=len(batch.reqs), entries=entries)
-
-
-def strip_beam_tail(batch: ScheduleBatch) -> None:
-    """Restore the 1:1 reqs<->rows layout. Called at the entry of every batch
-    mutation (filter / merge / prepare), so the tail spans one forward."""
-    tail = batch.beam_tail
-    if tail is None:
-        return
-    n = tail.num_base_rows
-    assert n == len(batch.reqs), "reqs changed while a beam tail was attached"
-    batch.beam_tail = None
-    batch.req_pool_indices = batch.req_pool_indices[:n]
-    batch.req_pool_indices_cpu = batch.req_pool_indices_cpu[:n]
-    batch.seq_lens = batch.seq_lens[:n]
-    if batch.seq_lens_cpu is not None:
-        batch.seq_lens_cpu = batch.seq_lens_cpu[:n]
-    batch.orig_seq_lens = batch.orig_seq_lens[:n]
-    if batch.input_ids is not None:
-        batch.input_ids = batch.input_ids[:n]
-    batch.out_cache_loc = None
-    batch.seq_lens_sum = None
 
 
 def num_beam_member_rows(reqs) -> int:

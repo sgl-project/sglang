@@ -14,12 +14,15 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.scheduler_components.pp_channel import (  # noqa: E402
+    PPChannel,
+)
+from sglang.srt.managers.scheduler_components.pp_ring import (  # noqa: E402
+    PPRing,
+    _pp_exchange_outputs_before_forward,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
-)
-from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
-    SchedulerPPMixin,
-    _pp_exchange_outputs_before_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
@@ -59,7 +62,6 @@ def _make_receiver() -> SchedulerRequestReceiver:
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
-        get_last_batch=lambda: None,
     )
 
 
@@ -171,7 +173,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
         enter_scope(self, _published_topology())
-        scheduler = SchedulerPPMixin()
+        scheduler = object.__new__(PPChannel)
         scheduler.world_group = _fake_group()
         scheduler.attn_tp_group = _fake_group()
         scheduler.attn_tp_cpu_group = _fake_group()
@@ -185,19 +187,21 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
         with (
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.point_to_point_pyobj",
+                "sglang.srt.managers.scheduler_components.pp_channel."
+                "point_to_point_pyobj",
                 side_effect=fake_point_to_point_pyobj,
             ),
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
+                "sglang.srt.managers.scheduler_components.pp_channel."
+                "attn_cp_tp_broadcast_pyobj",
                 side_effect=lambda data: data,
             ),
         ):
             self.assertEqual(
-                scheduler._pp_send_pyobj_to_next_stage(["data"], async_send=True),
+                scheduler.send_pyobj(["data"], async_send=True),
                 ["work"],
             )
-            self.assertEqual(scheduler._pp_recv_pyobj_from_prev_stage(), ["work"])
+            self.assertEqual(scheduler.recv_prev(), ["work"])
 
         self.assertEqual(
             calls,
@@ -209,7 +213,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
 
 class TestDSparkPPOutput(CustomTestCase):
-    def test_output_ring_rebinds_dspark_state_on_each_stage(self):
+    def test_output_ring_rebuilds_dspark_state_on_each_stage(self):
         from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
         from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -219,7 +223,7 @@ class TestDSparkPPOutput(CustomTestCase):
 
         payloads = []
         scheduler = SimpleNamespace(
-            _pp_spec_relay=False,
+            pp_spec_relay=None,
             pp_group=SimpleNamespace(is_first_rank=False),
             future_map=SimpleNamespace(
                 stash=lambda indices, value: payloads.append(value)
@@ -231,9 +235,8 @@ class TestDSparkPPOutput(CustomTestCase):
             req_pool_indices=torch.tensor([0, 1]),
             seq_lens=torch.tensor([8, 15]),
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            spec_info=object(),
         )
-        wire = SchedulerPPMixin._pp_prepare_tensor_dict(
+        wire = PPRing._prepare_tensor_dict(
             scheduler,
             SimpleNamespace(
                 next_token_ids=tokens,
@@ -245,16 +248,15 @@ class TestDSparkPPOutput(CustomTestCase):
             batch,
         )
         self.assertNotIn("draft_topk_p", wire)
-        result = SchedulerPPMixin._pp_prep_batch_result(
+        result = PPRing._prep_batch_result(
             scheduler,
             batch,
             SimpleNamespace(can_run_cuda_graph=False),
             PPProxyTensors(wire),
         )
         self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)
-        self.assertIs(batch.spec_info, result.next_draft_input)
-        torch.testing.assert_close(batch.spec_info.bonus_tokens, tokens)
-        torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
+        torch.testing.assert_close(result.next_draft_input.bonus_tokens, tokens)
+        torch.testing.assert_close(result.next_draft_input.new_seq_lens, batch.seq_lens)
         torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import ClassVar, List, Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -177,9 +177,6 @@ class UnoDraftInput(SpecInput):
             batch=batch,
         )
 
-        for req in batch.reqs:
-            req.decode_batch_idx += 1
-
         batch.seq_lens_cpu = torch.tensor(
             committed_lengths,
             dtype=torch.int64,
@@ -188,54 +185,6 @@ class UnoDraftInput(SpecInput):
         batch.seq_lens_sum = sum(committed_lengths)
         self.reserved_seq_lens_cpu = next_cpu
         self.reserved_seq_lens_sum = sum(next_lengths)
-
-    def filter_batch(
-        self,
-        new_indices: torch.Tensor,
-        new_indices_cpu: Optional[List[int]] = None,
-    ) -> None:
-        if self.reserved_seq_lens_cpu is not None:
-            host_indices = (
-                new_indices_cpu if new_indices_cpu is not None else new_indices.cpu()
-            )
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[host_indices]
-            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
-
-        if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
-            return
-
-        self.bonus_tokens = self.bonus_tokens[new_indices]
-        self.new_seq_lens = self.new_seq_lens[new_indices]
-
-    def merge_batch(self, other: "UnoDraftInput") -> None:
-        if not isinstance(other, UnoDraftInput):
-            raise TypeError(f"Cannot merge UnoDraftInput with {type(other).__name__}.")
-
-        if self.forward_width != other.forward_width:
-            raise RuntimeError("Cannot merge UNO states with different forward widths.")
-
-        self_has_reservation = self.reserved_seq_lens_cpu is not None
-        other_has_reservation = other.reserved_seq_lens_cpu is not None
-        if self_has_reservation != other_has_reservation:
-            raise RuntimeError("Cannot merge prepared and unprepared UNO states.")
-
-        if self_has_reservation:
-            self.reserved_seq_lens_cpu = torch.cat(
-                (
-                    self.reserved_seq_lens_cpu,
-                    other.reserved_seq_lens_cpu,
-                )
-            )
-            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
-
-        if self.future_indices is not None:
-            assert other.future_indices is not None
-            self.future_indices = torch.cat((self.future_indices, other.future_indices))
-            return
-
-        self.bonus_tokens = torch.cat((self.bonus_tokens, other.bonus_tokens))
-        self.new_seq_lens = torch.cat((self.new_seq_lens, other.new_seq_lens))
 
 
 @dataclass
