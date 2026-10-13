@@ -12,7 +12,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ADMIN_PATHS = [
     "/load_lora_adapter",
-    "/load_lora_adapter_from_tensors",
+    "/register_lora_adapter",
     "/unload_lora_adapter",
     "/start_profile",
     "/stop_profile",
