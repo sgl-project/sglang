@@ -250,7 +250,9 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
+def _low_ratio_source_projections(
+    layer, x, q_lora, positions, bufs, project_index: bool = True
+):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
     )
@@ -280,7 +282,9 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
         put("kv", kv)
         if score is not None:
             put("score", score)
-    if layer.indexer is not None:
+    if layer.indexer is not None and project_index:
+        # Only the captured consumers read these; a flat index layer projects
+        # once inside its eager break (_index_q_and_weights), so skip them there.
         indexer = layer.indexer
         put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
         put("w", indexer.head_weights(x[:real]))
@@ -3077,14 +3081,21 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            two_level = hasattr(self.prefill_candidates, "consume_prefill_captured")
+            captured_index = (
+                run_indexer
+                and layer.indexer is not None
+                and (layer.indexer.uses_candidates or not two_level)
+            )
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, captured_index
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
                 )
             if run_indexer and layer.indexer is not None:
-                two_level = hasattr(self.prefill_candidates, "consume_prefill_captured")
-                if layer.indexer.uses_candidates and two_level:
+                if captured_index:
                     # Captured: sparse scores of the published blocks only, so
                     # nothing here depends on the context length.
                     self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
