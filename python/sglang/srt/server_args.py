@@ -431,6 +431,7 @@ class ServerArgs:
             resolving_view(
                 self
             ).remote_instance_weight_loader_start_seed_via_transfer_engine
+            or resolving_view(self).remote_instance_weight_loader_start_seed_via_nixl
             or self.enable_engine_info_bootstrap
         )
 
