@@ -44,6 +44,7 @@ def _processor():
     p = _Processor.__new__(_Processor)
     p._tokenizer = _NoDecodeTokenizer()
     p.skip_tokenizer_init = False
+    p.preserve_processor_input_ids = False
     p.support_dynamic_frame_expansion = False
     loaded = {}
 
@@ -57,10 +58,16 @@ def _processor():
     return p, loaded
 
 
-def test_placeholder_runs_count_one_id_per_image_or_an_expanded_run_once():
+def test_placeholder_layout_prefers_one_id_per_image_then_collapses_runs():
     f = BaseMultimodalProcessor
     assert f._placeholder_runs([1, PAD, 2, PAD, PAD, PAD, 3], PAD) == 2
     assert f._collapse_placeholder_runs([1, PAD, PAD, 2, PAD], PAD) == [1, PAD, 2, PAD]
+    # one id per image, adjacent ids allowed (GLM has no marker between two images)
+    assert f._placeholder_layout([1, PAD, PAD, 2], PAD, 2) == [1, PAD, PAD, 2]
+    # the expanded form: each run is one image
+    assert f._placeholder_layout([1, PAD, PAD, PAD, 2, PAD], PAD, 2) == [1, PAD, 2, PAD]
+    with pytest.raises(ValueError, match=r"carry 3 image placeholder id\(s\) in 1 run\(s\) but 2 image"):
+        f._placeholder_layout([1, PAD, PAD, PAD], PAD, 2)
 
 
 @pytest.mark.parametrize("loader", ["load_mm_data", "legacy_load_mm_data"])
@@ -76,16 +83,30 @@ def test_an_ids_prompt_with_images_never_decodes(loader):
     assert loaded["input_ids"] == [1, PAD, 2, 3, PAD, 4]
     assert loaded["image_data"] == ["a.png", "b.png"]
     assert out.input_ids == [1, PAD, 2, 3, PAD, 4]
+    assert out.synthetic_text is True, "a failed expansion must raise, never fall back to this text"
 
 
 def test_a_placeholder_count_that_differs_from_the_images_is_a_client_error():
     p, _ = _processor()
-    with pytest.raises(ValueError, match=r"carry 1 image placeholder\(s\) but 2 image"):
+    with pytest.raises(ValueError, match=r"carry 1 image placeholder id\(s\) in 1 run\(s\) but 2 image"):
         asyncio.run(
             p.legacy_load_mm_data(
                 prompt=[1, PAD], multimodal_tokens=_tokens(), image_data=["a", "b"]
             )
         )
+
+
+def test_an_ids_prompt_outside_exact_token_mode_keeps_the_text_path(monkeypatch):
+    """With SGLANG_MM_AVOID_RETOKENIZE off the expanded ids would be discarded
+    for the processor's re-tokenization, so the synthetic text must not be
+    used: the old text path runs (here: the tokenizer's decode is reached)."""
+    import sglang.srt.managers.schedule_batch as environ_module
+
+    monkeypatch.setattr(environ_module.envs.SGLANG_MM_AVOID_RETOKENIZE, "get", lambda: False)
+    p, loaded = _processor()
+    with pytest.raises(AssertionError, match="decoded text must not be scanned"):
+        asyncio.run(p.legacy_load_mm_data(prompt=[1, PAD], multimodal_tokens=_tokens(), image_data=["a"]))
+    assert not loaded
 
 
 def test_text_prompts_video_audio_and_precomputed_features_keep_the_text_path():
