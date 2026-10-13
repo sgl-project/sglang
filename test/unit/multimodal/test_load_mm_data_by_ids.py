@@ -33,9 +33,15 @@ def _tokens():
     )
 
 
-def _processor():
+class _Processor(BaseMultimodalProcessor):
     """A BaseMultimodalProcessor shell: only the loader methods run."""
-    p = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+
+    async def process_mm_data_async(self, *args, **kwargs):  # pragma: no cover
+        raise NotImplementedError
+
+
+def _processor():
+    p = _Processor.__new__(_Processor)
     p._tokenizer = _NoDecodeTokenizer()
     p.skip_tokenizer_init = False
     p.support_dynamic_frame_expansion = False
