@@ -1541,6 +1541,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         requested = fraction < 1.0 and batch.do_classifier_free_guidance
         active = requested and not server_args.enable_cfg_parallel
         gate_step = int(num_steps * fraction) if active else num_steps + 1
+        max_reused_steps = getattr(
+            server_args.pipeline_config, "cfg_gate_max_reused_steps", None
+        )
+        if active and max_reused_steps is not None:
+            bounded_gate_step = max(gate_step, num_steps - max_reused_steps)
+            if bounded_gate_step != gate_step:
+                logger.warning(
+                    "%s limits CFG residual reuse to the last %d step(s) for "
+                    "quality: requested gate %d, effective gate %d/%d.",
+                    type(server_args.pipeline_config).__name__,
+                    max_reused_steps,
+                    gate_step,
+                    bounded_gate_step,
+                    num_steps,
+                )
+                gate_step = bounded_gate_step
         ctx.extra["cfg_gate_state"] = {
             "fraction": fraction,
             "requested": requested,

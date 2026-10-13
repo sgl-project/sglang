@@ -1312,6 +1312,30 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "single_transformer_blocks",
         ]
 
+    def _get_spectrum_context(self):
+        ctx = super()._get_spectrum_context()
+        if ctx is None or not ctx.do_cfg:
+            return ctx
+        # Even one final-step feature forecast can introduce border artifacts
+        # under FLUX.1 true CFG. Disable Spectrum for the request until a
+        # forecast policy passes independent image-quality validation; a None
+        # context skips all forecaster bookkeeping, matching the uncached path.
+        if ctx.current_step > 0:
+            self._spectrum_true_cfg_warned = False
+        elif not ctx.is_cfg_negative and not getattr(
+            self, "_spectrum_true_cfg_warned", False
+        ):
+            # begin and record both query the context at step 0; warn once.
+            self._spectrum_true_cfg_warned = True
+            logger.warning(
+                "FLUX.1 true CFG disables Spectrum for this request: all %d "
+                "steps use real forwards because even a final-step forecast "
+                "can introduce border artifacts. No Spectrum speedup is "
+                "expected.",
+                ctx.num_inference_steps,
+            )
+        return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,

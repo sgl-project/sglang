@@ -244,6 +244,35 @@ class TestCFGGating(CustomTestCase):
         self.assertFalse(ctx.extra["cfg_gate_state"]["active"])
         self.assertEqual(ctx.extra["cfg_gate_state"]["gate_step"], 11)
 
+    def test_flux_gate_quality_bound_preserves_explicit_disable_and_parallel(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+            Flux2PipelineConfig,
+            FluxPipelineConfig,
+        )
+
+        stage = DenoisingStage.__new__(DenoisingStage)
+        for steps in (20, 50):
+            for parallel in (False, True):
+                for fraction in (0.3, 1.0):
+                    with self.subTest(
+                        steps=steps, parallel=parallel, fraction=fraction
+                    ):
+                        ctx = SimpleNamespace(
+                            timesteps=torch.arange(steps), extra={}, is_warmup=True
+                        )
+                        args = self._make_server_args(parallel)
+                        args.pipeline_config = FluxPipelineConfig()
+                        stage._init_cfg_gate_state(
+                            ctx, self._make_batch(fraction), args
+                        )
+                        state = ctx.extra["cfg_gate_state"]
+                        active = fraction < 1 and not parallel
+                        self.assertEqual(state["active"], active)
+                        self.assertEqual(
+                            state["gate_step"], steps - 1 if active else steps + 1
+                        )
+        self.assertIsNone(Flux2PipelineConfig().cfg_gate_max_reused_steps)
+
     def test_rejects_invalid_gate_fraction(self):
         stage = DenoisingStage.__new__(DenoisingStage)
         ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
