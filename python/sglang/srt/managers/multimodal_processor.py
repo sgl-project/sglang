@@ -6,12 +6,16 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.token_space_processor import (
+    TokenSpaceMultimodalProcessor,
+)
 from sglang.srt.runtime_context import get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 PROCESSOR_MAPPING = {}
+TOKEN_SPACE_PROCESSOR_MAPPING = {}
 
 
 def import_processors(package_name: str, overwrite: bool = False):
@@ -33,13 +37,18 @@ def import_processors(package_name: str, overwrite: bool = False):
                 cls for cls in classes if issubclass(cls, BaseMultimodalProcessor)
             ):
                 assert hasattr(cls, "models")
+                mapping = (
+                    TOKEN_SPACE_PROCESSOR_MAPPING
+                    if issubclass(cls, TokenSpaceMultimodalProcessor)
+                    else PROCESSOR_MAPPING
+                )
                 for arch in getattr(cls, "models"):
                     if overwrite:
-                        for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+                        for model_cls, processor_cls in mapping.items():
                             if model_cls.__name__ == arch.__name__:
-                                del PROCESSOR_MAPPING[model_cls]
+                                del mapping[model_cls]
                                 break
-                    PROCESSOR_MAPPING[arch] = cls
+                    mapping[arch] = cls
 
 
 def get_mm_processor_cls(hf_config, model_config=None):
