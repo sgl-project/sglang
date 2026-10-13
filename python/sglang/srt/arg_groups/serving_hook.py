@@ -410,6 +410,14 @@ def handle_environment_variables(server_args: Any):
     )
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+        # Double-guess cuBLAS / cuDNN determinism here too, for code paths
+        # that might initialise cuBLAS between handle_deterministic_inference
+        # (pipeline step 228) and handle_environment_variables (step 318) —
+        # e.g. model loading or backend auto-detection.  Using setdefault
+        # means handle_deterministic_inference still wins when both run.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        os.environ.setdefault("CUDNN_DETERMINISTIC", "1")
+        os.environ.setdefault("CUDNN_BENCHMARK", "0")
     if cfg.debug_cuda_graph:
         if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(

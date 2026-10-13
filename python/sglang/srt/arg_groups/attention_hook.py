@@ -596,6 +596,39 @@ def handle_deterministic_inference(server_args: Any):
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
 
     if cfg.enable_deterministic_inference:
+        # --- cuBLAS / cuDNN / PyTorch deterministic knobs ---
+        # These settings must be applied before any cuBLAS/cuDNN lazy
+        # initialisation so the GPU libraries pick their deterministic code
+        # paths from the first call.  The cuBLAS workspace config pins the
+        # GEMM algorithm selection across different M/N/K shapes, which is
+        # what caused the BF16 batch-shape drift that crossed rounding
+        # boundaries (see issue #43956).  Setting them again after cuBLAS
+        # has already picked its workspace is a no-op, so the env vars go
+        # first and torch.use_deterministic_algorithms is called below as a
+        # soft fallback.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        os.environ.setdefault("CUDNN_DETERMINISTIC", "1")
+        os.environ.setdefault("CUDNN_BENCHMARK", "0")
+        try:
+            import torch
+
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+            if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+                    False
+                )
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+        except Exception as _e:  # pragma: no cover - torch may not be present yet
+            logger.debug(
+                "Could not apply PyTorch deterministic settings: %s", _e
+            )
+
         if cfg.enable_aiter_allreduce_fusion:
             logger.warning(
                 "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
