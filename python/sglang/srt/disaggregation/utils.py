@@ -10,6 +10,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -302,6 +303,7 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    pollers=None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -311,8 +313,9 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
+    if pollers is None:
+        pollers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(pollers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
             decode_req
@@ -982,6 +985,28 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def is_elided_entry(
+    src_len: int,
+    dst_lens: Optional[Sequence[int]],
+    dst_index: int,
+    *,
+    allow_dst_elision: bool = True,
+) -> bool:
+    """True when either peer elided this entry (a 0-row DSA index-K buffer).
+
+    Nothing moves for it, and the elided side never registered the buffer.
+    allow_dst_elision=False restricts the skip to a zero-length source.
+    """
+    if src_len == 0:
+        return True
+    return (
+        allow_dst_elision
+        and dst_lens is not None
+        and dst_index < len(dst_lens)
+        and dst_lens[dst_index] == 0
+    )
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1390,6 +1415,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPool,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
@@ -1405,6 +1431,7 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    kv_args.swa_kv_cache_layout = None
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
@@ -1455,6 +1482,12 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
+            ):
+                kv_args.swa_kv_cache_layout = (
+                    token_to_kv_pool.swa_kv_pool.kv_cache_layout
+                )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
             # Only the concrete SWAKVPool owns a full sub-pool; other
