@@ -21,6 +21,14 @@ from dataclasses import fields
 from pathlib import Path
 from typing import AsyncGenerator, List, Optional
 
+# The simulator client only needs model configuration, never GPU execution.
+os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+os.environ.setdefault("SGLANG_SIMULATOR_BOOTSTRAP", "1")
+
+from usercustomize import apply_cpu_simulation_compat
+
+apply_cpu_simulation_compat()
+
 import aiohttp
 import numpy as np
 from sglang_simulator.compat import validate_benchmark_runtime

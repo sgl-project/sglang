@@ -5,6 +5,14 @@ import os
 # Spawned interpreters inherit this marker before usercustomize runs.
 os.environ["SGLANG_SIMULATOR_BOOTSTRAP"] = "1"
 
+from usercustomize import apply_cpu_simulation_compat
+
+apply_cpu_simulation_compat()
+
+from sglang_simulator.simulation.sglang import sgl_kernel_hook
+
+sgl_kernel_hook.install_load_utils_stub()
+
 import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,
@@ -13,15 +21,12 @@ from sglang_simulator.simulation.sglang import (
     mem_pool_host,
     model_runner,
     scheduler,
-    sgl_kernel_hook,
     unified_radix_cache,
 )
 
 # A spawned worker imports this module while unpickling its target. ModelConfig
 # can import GPU kernels while later arguments are still being unpickled, before
 # the target wrapper executes, so the loader stub must already be present here.
-sgl_kernel_hook.install_load_utils_stub()
-
 _HOOKS_INSTALLED = False
 
 
