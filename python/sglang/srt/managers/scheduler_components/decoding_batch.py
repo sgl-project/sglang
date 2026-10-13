@@ -12,14 +12,12 @@ them. The normal and overlap loops, PD decode's included, take it back right
 after its launch, before its commit, so a commit must not rebind a field of the
 step that the rows need.
 
-The normal and overlap loops change the rows at launch and commit: right after
-a step's run the rows absorb it and the rows whose last prefill chunk it ran
-join (``join_launched``); after a commit the rows it finished leave. Between
-steps the rows are then exactly the requests still decoding. The PD decode
-normal and overlap loops do the same, except that their rows join from the
-prebuilt batch at the plan, as those requests prefilled on another server. The
-other loops join the step they launched last at the top of the next plan, and
-leave there; the pipeline PD decode loop leaves before its prebuilt join.
+The normal and overlap loops, PD decode's included, change the rows at launch
+and commit: right after a step's run the rows absorb it and its finished
+prefills join (``join_launched``; PD decode joins the prebuilt batch at the
+plan instead), and after a commit the rows it finished leave. Between steps the
+rows are then exactly the requests still decoding. The other loops join and
+leave at the top of the next plan.
 """
 
 from __future__ import annotations

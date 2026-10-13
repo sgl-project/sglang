@@ -1307,8 +1307,7 @@ class Scheduler(
         self.enable_skip_finishing_decode = False
         # Set by the normal and overlap loops, which join a launched step's
         # finished-prefill rows into the running rows at launch and drop
-        # finished rows at commit. The PD decode loops are named by
-        # disagg_decode_launches_copy below.
+        # finished rows at commit.
         self.rows_join_at_launch = False
         # Set by the PD decode loops that launch a copy of the running rows as
         # their decode step; the pipeline PD decode loop launches the rows.
