@@ -108,27 +108,17 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
             "UMBP_IO_ENGINE_PORT",
             "UMBP_PEER_SERVICE_PORT",
             "UMBP_BACKEND_POLICY",
-            "UMBP_DISTRIBUTED_MEDIUM",
-            "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE",
-            "UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES",
             "UMBP_STANDALONE_ADDRESS",
             "UMBP_STANDALONE_AUTO_START",
-            "UMBP_DRAM_CAPACITY",
-            "UMBP_EMBEDDED_DRAM_PAGE_SIZE",
-            "UMBP_SSD_ENABLED",
-            "UMBP_SSD_BACKEND",
-            "UMBP_SSD_DIR",
-            "UMBP_SSD_CAPACITY",
         ):
             server_env.pop(name, None)
-        # Without a distributed-medium selector, the standalone binary owns one
-        # embedded DRAM backend that every TP worker reaches through the UDS.
         server_env.update(
             {
                 "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
                 "UMBP_ROLE": "standalone",
+                "UMBP_DISTRIBUTED_MEDIUM": "DRAM",
+                "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE": str(UMBP_DRAM_PAGE_SIZE),
                 "UMBP_DRAM_CAPACITY": str(UMBP_DRAM_CAPACITY),
-                "UMBP_EMBEDDED_DRAM_PAGE_SIZE": str(UMBP_DRAM_PAGE_SIZE),
                 "UMBP_SSD_ENABLED": "0",
                 "UMBP_DRAM_USE_HUGEPAGES": "0",
                 "MORI_UMBP_LOG_LEVEL": "info",
@@ -243,7 +233,6 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
                 "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
                 "UMBP_STANDALONE_AUTO_START": "0",
                 "UMBP_STANDALONE_STARTUP_TIMEOUT_MS": "60000",
-                "UMBP_SSD_ENABLED": "0",
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
