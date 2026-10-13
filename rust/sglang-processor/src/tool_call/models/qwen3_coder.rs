@@ -419,6 +419,32 @@ fn convert_param_value(value: &str, name: &str, config: &Map<String, Value>) -> 
     }
 }
 
+/// The first code point of each run of ten Unicode decimal digits (Python 3.12,
+/// Unicode 15.0), which `int()` and `float()` read as 0 through 9.
+const DECIMAL_ZEROS: [u32; 68] = [
+    0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66,
+    0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90,
+    0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+    0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0, 0x11650,
+    0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60, 0x16AC0,
+    0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E950,
+    0x1FBF0,
+];
+
+/// `_PyUnicode_TransformDecimalAndSpaceToASCII`, as `int()` and `float()` read
+/// their argument: decimal digits become ASCII, other non-ASCII text is invalid.
+fn ascii_decimals(text: &str) -> Option<String> {
+    text.chars()
+        .map(|c| match c {
+            c if c.is_ascii() => Some(c),
+            c => DECIMAL_ZEROS
+                .iter()
+                .find(|&&zero| (zero..zero + 10).contains(&(c as u32)))
+                .map(|&zero| char::from(b'0' + (c as u32 - zero) as u8)),
+        })
+        .collect()
+}
+
 /// Digits separated by single underscores, as Python's `int()` and `float()` take them.
 fn digit_part(text: &str) -> bool {
     !text.is_empty()
@@ -430,7 +456,8 @@ fn digit_part(text: &str) -> bool {
 
 /// Python's `int(text)` in base 10, as its decimal digits.
 fn py_int(text: &str) -> Option<String> {
-    let text = py_strip(text);
+    let text = ascii_decimals(py_strip(text))?;
+    let text = text.as_str();
     let (negative, digits) = match text.as_bytes().first()? {
         b'-' => (true, &text[1..]),
         b'+' => (false, &text[1..]),
@@ -450,7 +477,8 @@ fn py_int(text: &str) -> Option<String> {
 
 /// Python's `float(text)`.
 fn py_float(text: &str) -> Option<f64> {
-    let text = py_strip(text);
+    let text = ascii_decimals(py_strip(text))?;
+    let text = text.as_str();
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
     let special = ["inf", "infinity", "nan"].contains(&unsigned.to_lowercase().as_str());
     if !special {
@@ -638,8 +666,7 @@ impl<'a> LiteralParser<'a> {
             }
             '-' | '+' => {
                 self.pos += 1;
-                self.skip_space();
-                match (c, self.number()?) {
+                match (c, self.grouped_number()?) {
                     ('+', number) => Some(number),
                     (_, Literal::Float(f)) => Some(Literal::Float(-f)),
                     (_, Literal::Int(digits)) if digits == "0" => Some(Literal::Int(digits)),
@@ -719,6 +746,22 @@ impl<'a> LiteralParser<'a> {
                 return self.eat('}').then_some(Literal::Dict(entries));
             }
         }
+    }
+
+    /// A number literal, in any parentheses: a sign takes no other operand.
+    fn grouped_number(&mut self) -> Option<Literal> {
+        self.skip_space();
+        if !self.eat('(') {
+            return self.number();
+        }
+        self.depth += 1;
+        let number = (self.depth <= MAX_NESTING)
+            .then(|| self.grouped_number())
+            .flatten();
+        self.skip_space();
+        let closed = self.eat(')');
+        self.depth -= 1;
+        number.filter(|_| closed)
     }
 
     /// An integer or float literal; imaginary ones fail.

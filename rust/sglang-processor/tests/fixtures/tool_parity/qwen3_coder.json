@@ -93,7 +93,9 @@
             "m": {"type": "null"},
             "n": {"type": "null"},
             "o": {"type": "null"},
-            "p": {"type": "null"}
+            "p": {"type": "null"},
+            "q": {"type": "null"},
+            "r": {"type": "null"}
           }
         }
       }
@@ -122,9 +124,11 @@
       ">\n\n  [1]\n</param", "eter>\n<parameter", "=j>\n[0x_1F, 0o17", ", 0b101, 00, 1.e",
       "5, -0.0]\n</param", "eter>\n<parameter", "=k>\n01\n</paramet", "er>\n<parameter=l",
       ">\n{1: 'a', True:", " 'b', 1.0: 'c', ", "2.5: 'd', -0.0: ", "'e', 0: 'f'}\n</p",
-      "arameter>\n<param", "eter=m>\n[1]\n  \n<", "/parameter>\n<par", "ameter=n>\n(1)\n</",
-      "parameter>\n<para", "meter=o>\n'a\nb'\n<", "/parameter>\n<par", "ameter=p>\n[1 + 2",
-      ", --1, -True]\n</", "parameter>\n</fun", "ction>\n</tool_ca", "ll>"
+      "arameter>\n<param", "eter=q>\n{'a': -(", "1), 'b': +((2.5)", "), 'c': - ( 3 ),",
+      " 'd': -(\n4\n)}\n</", "parameter>\n<para", "meter=r>\n[-(-1)]", "\n</parameter>\n<p",
+      "arameter=m>\n[1]\n", "  \n</parameter>\n", "<parameter=n>\n(1", ")\n</parameter>\n<",
+      "parameter=o>\n'a\n", "b'\n</parameter>\n", "<parameter=p>\n[1", " + 2, --1, -True",
+      "]\n</parameter>\n<", "/function>\n</too", "l_call>"
     ],
     ["Hello world!"],
     ["Plain <b>html</b", "> and a < sign, ", "3 < 4."],
@@ -194,12 +198,17 @@
       "eter=mode>\n-1e-7", "\n</parameter>\n</", "function>\n</tool", "_call>"
     ],
     [
+      "<tool_call>\n<fun", "ction=calc>\n<par", "ameter=x>\n١٢.٥\n<", "/parameter>\n<par",
+      "ameter=n>\n１２３\n</", "parameter>\n<para", "meter=y>\n１_000\n<", "/parameter>\n<par",
+      "ameter=mode>\n١٢\n", "</parameter>\n</f", "unction>\n</tool_", "call>"
+    ],
+    [
+      "<tool_call>\n<function=calc>\n<parameter=x>\n١٢.٥\n</parameter>\n<parameter=n>\n１２３\n</parameter>\n<parameter=y>\n１_000\n</parameter>\n<parameter=mode>\n١٢\n</parameter>\n</function>\n</tool_call>"
+    ],
+    [
       "<tool_call>\n<fun", "ction=calc>\n<par", "ameter=x>\nInfini", "ty\n</parameter>\n",
       "<parameter=y>\n-i", "nf\n</parameter>\n", "<parameter=n>\n1_", "_0\n</parameter>\n",
       "<parameter=mode>", "\n_1\n</parameter>", "\n</function>\n</t", "ool_call>"
-    ],
-    [
-      "<tool_call>\n<function=calc>\n<parameter=x>\nInfinity\n</parameter>\n<parameter=y>\n-inf\n</parameter>\n<parameter=n>\n1__0\n</parameter>\n<parameter=mode>\n_1\n</parameter>\n</function>\n</tool_call>"
     ],
     [
       "<tool_call>\n<fun", "ction=search>\n<p", "arameter=query>\n", "multi\nline\n\nvalu",
@@ -354,9 +363,11 @@
         ">\n\n  [1]\n</param", "eter>\n<parameter", "=j>\n[0x_1F, 0o17", ", 0b101, 00, 1.e",
         "5, -0.0]\n</param", "eter>\n<parameter", "=k>\n01\n</paramet", "er>\n<parameter=l",
         ">\n{1: 'a', True:", " 'b', 1.0: 'c', ", "2.5: 'd', -0.0: ", "'e', 0: 'f'}\n</p",
-        "arameter>\n<param", "eter=m>\n[1]\n  \n<", "/parameter>\n<par", "ameter=n>\n(1)\n</",
-        "parameter>\n<para", "meter=o>\n'a\nb'\n<", "/parameter>\n<par", "ameter=p>\n[1 + 2",
-        ", --1, -True]\n</", "parameter>\n</fun", "ction>\n</tool_ca", "ll>"
+        "arameter>\n<param", "eter=q>\n{'a': -(", "1), 'b': +((2.5)", "), 'c': - ( 3 ),",
+        " 'd': -(\n4\n)}\n</", "parameter>\n<para", "meter=r>\n[-(-1)]", "\n</parameter>\n<p",
+        "arameter=m>\n[1]\n", "  \n</parameter>\n", "<parameter=n>\n(1", ")\n</parameter>\n<",
+        "parameter=o>\n'a\n", "b'\n</parameter>\n", "<parameter=p>\n[1", " + 2, --1, -True",
+        "]\n</parameter>\n<", "/function>\n</too", "l_call>"
       ],
       "steps": [
         ["", []],
@@ -462,6 +473,13 @@
         ["", []],
         ["", [[0, null, ", \"l\": {\"1\": \"c\", \"2.5\": \"d\", \"-0.0\": \"f\"}"]]],
         ["", []],
+        ["", []],
+        ["", []],
+        ["", []],
+        ["", [[0, null, ", \"q\": {\"a\": -1, \"b\": 2.5, \"c\": -3, \"d\": -4}"]]],
+        ["", []],
+        ["", [[0, null, ", \"r\": \"[-(-1)]\""]]],
+        ["", []],
         ["", [[0, null, ", \"m\": \"[1]\\n  \""]]],
         ["", []],
         ["", [[0, null, ", \"n\": 1"]]],
@@ -478,7 +496,7 @@
         [
           [
             0, "literals",
-            "{\"a\": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]], \"b\": \"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\", \"c\": \"ǿ A \\\\d 😀\", \"d\": \"\\\\nxy\", \"e\": \"multi\\nline\", \"f\": [1, 2], \"g\": [1, 2], \"h\": [1], \"i\": \"\\n  [1]\", \"j\": [31, 15, 5, 0, 100000.0, -0.0], \"k\": \"01\", \"l\": {\"1\": \"c\", \"2.5\": \"d\", \"-0.0\": \"f\"}, \"m\": \"[1]\\n  \", \"n\": 1, \"o\": \"'a\\nb'\", \"p\": \"[1 + 2, --1, -True]\"}"
+            "{\"a\": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]], \"b\": \"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\", \"c\": \"ǿ A \\\\d 😀\", \"d\": \"\\\\nxy\", \"e\": \"multi\\nline\", \"f\": [1, 2], \"g\": [1, 2], \"h\": [1], \"i\": \"\\n  [1]\", \"j\": [31, 15, 5, 0, 100000.0, -0.0], \"k\": \"01\", \"l\": {\"1\": \"c\", \"2.5\": \"d\", \"-0.0\": \"f\"}, \"q\": {\"a\": -1, \"b\": 2.5, \"c\": -3, \"d\": -4}, \"r\": \"[-(-1)]\", \"m\": \"[1]\\n  \", \"n\": 1, \"o\": \"'a\\nb'\", \"p\": \"[1 + 2, --1, -True]\"}"
           ]
         ]
       ]
@@ -887,6 +905,48 @@
     },
     {
       "chunks": [
+        "<tool_call>\n<fun", "ction=calc>\n<par", "ameter=x>\n١٢.٥\n<", "/parameter>\n<par",
+        "ameter=n>\n１２３\n</", "parameter>\n<para", "meter=y>\n１_000\n<", "/parameter>\n<par",
+        "ameter=mode>\n١٢\n", "</parameter>\n</f", "unction>\n</tool_", "call>"
+      ],
+      "steps": [
+        ["", []],
+        ["", [[0, "calc", ""]]],
+        ["", []],
+        ["", [[0, null, "{"], [0, null, "\"x\": 12.5"]]],
+        ["", []],
+        ["", [[0, null, ", \"n\": 123"]]],
+        ["", []],
+        ["", [[0, null, ", \"y\": 1000"]]],
+        ["", []],
+        ["", [[0, null, ", \"mode\": \"١٢\""]]],
+        ["", [[0, null, "}"]]],
+        ["", []]
+      ],
+      "unary": ["", [[0, "calc", "{\"x\": 12.5, \"n\": 123, \"y\": 1000, \"mode\": \"١٢\"}"]]]
+    },
+    {
+      "chunks": [
+        "<tool_call>\n<function=calc>\n<parameter=x>\n١٢.٥\n</parameter>\n<parameter=n>\n１２３\n</parameter>\n<parameter=y>\n１_000\n</parameter>\n<parameter=mode>\n١٢\n</parameter>\n</function>\n</tool_call>"
+      ],
+      "steps": [
+        [
+          "",
+          [
+            [0, "calc", ""],
+            [0, null, "{"],
+            [0, null, "\"x\": 12.5"],
+            [0, null, ", \"n\": 123"],
+            [0, null, ", \"y\": 1000"],
+            [0, null, ", \"mode\": \"١٢\""],
+            [0, null, "}"]
+          ]
+        ]
+      ],
+      "unary": ["", [[0, "calc", "{\"x\": 12.5, \"n\": 123, \"y\": 1000, \"mode\": \"١٢\"}"]]]
+    },
+    {
+      "chunks": [
         "<tool_call>\n<fun", "ction=calc>\n<par", "ameter=x>\nInfini", "ty\n</parameter>\n",
         "<parameter=y>\n-i", "nf\n</parameter>\n", "<parameter=n>\n1_", "_0\n</parameter>\n",
         "<parameter=mode>", "\n_1\n</parameter>", "\n</function>\n</t", "ool_call>"
@@ -904,26 +964,6 @@
         ["", [[0, null, ", \"mode\": \"_1\""]]],
         ["", [[0, null, "}"]]],
         ["", []]
-      ],
-      "unary": ["", [[0, "calc", "{\"x\": Infinity, \"y\": -Infinity, \"n\": \"1__0\", \"mode\": \"_1\"}"]]]
-    },
-    {
-      "chunks": [
-        "<tool_call>\n<function=calc>\n<parameter=x>\nInfinity\n</parameter>\n<parameter=y>\n-inf\n</parameter>\n<parameter=n>\n1__0\n</parameter>\n<parameter=mode>\n_1\n</parameter>\n</function>\n</tool_call>"
-      ],
-      "steps": [
-        [
-          "",
-          [
-            [0, "calc", ""],
-            [0, null, "{"],
-            [0, null, "\"x\": Infinity"],
-            [0, null, ", \"y\": -Infinity"],
-            [0, null, ", \"n\": \"1__0\""],
-            [0, null, ", \"mode\": \"_1\""],
-            [0, null, "}"]
-          ]
-        ]
       ],
       "unary": ["", [[0, "calc", "{\"x\": Infinity, \"y\": -Infinity, \"n\": \"1__0\", \"mode\": \"_1\"}"]]]
     },
