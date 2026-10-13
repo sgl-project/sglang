@@ -998,14 +998,21 @@ def _glm_build_tool_call_rules(
             )
             prop_kv_pairs[prop_name] = pair
 
-        # Non-strict arguments may be omitted, repeated, or emitted in any order.
+        # Non-strict arguments may be omitted or emitted in any order. A key may
+        # repeat, but a call has at most as many pairs as the schema has keys,
+        # so a repeated key cannot loop until max_tokens. A rule that allows
+        # each key at most once in any order needs one state per subset of keys.
         all_props = list(properties.keys())
 
         if all_props:
             all_choices = " | ".join(prop_kv_pairs[k] for k in all_props)
-            arguments_rule = (
-                f"( ( {all_choices} ) ( {kv_separator} ( {all_choices} ) )* )?"
+            # llguidance rejects a {0,0} range, so one key gets no range.
+            more_choices = (
+                f" ( {kv_separator} ( {all_choices} ) ){{0,{len(all_props) - 1}}}"
+                if len(all_props) > 1
+                else ""
             )
+            arguments_rule = f"( ( {all_choices} ){more_choices} )?"
         else:
             arguments_rule = (
                 f'( "{special_tokens.begin_of_key}" text_without_special_tokens '
