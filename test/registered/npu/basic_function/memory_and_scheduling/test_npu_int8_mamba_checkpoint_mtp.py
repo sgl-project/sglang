@@ -237,6 +237,9 @@ class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
                 else:
                     args = []
                 args += [
+                    # Exercise text requests directly; the generic multimodal
+                    # warmup uses a fake image and is unrelated to this test.
+                    "--skip-server-warmup",
                     "--trust-remote-code",
                     "--device",
                     "npu",
