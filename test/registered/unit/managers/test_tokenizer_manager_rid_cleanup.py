@@ -261,6 +261,38 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
+    async def test_cumulative_stream_backlog_preserves_customized_info(self):
+        """Cumulative streaming returns only the last queued output.
+
+        A customized_info key that arrived on an earlier queued output must
+        still reach the client through the accumulated state.
+        """
+        self.tm.incremental_streaming_output = False
+        key = "request_score"
+        stream = self.tm._wait_one_response(self.state.obj)
+        self.state.customized_info_accumulated[key] = [386.25]
+        self.state.out_list.extend(
+            [
+                {
+                    "output_ids": [1],
+                    "meta_info": {"finish_reason": None, key: [386.25]},
+                },
+                {
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                },
+            ]
+        )
+        self.state.finished = True
+        self.state.event.set()
+
+        out = await anext(stream)
+
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["meta_info"][key], [386.25])
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
     async def test_cancelling_pending_wait_removes_event_waiter(self):
         stream = self.tm._wait_one_response(self.state.obj)
         pending = asyncio.create_task(anext(stream))
