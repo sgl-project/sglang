@@ -7,7 +7,10 @@ from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
-from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    dcp_trtllm_sparse_attention,
+    trtllm_rows_per_call,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,7 +31,7 @@ def _reference_page_table(page_table, dcp_size, rank):
     return torch.tensor(rows, dtype=page_table.dtype), torch.tensor(counts)
 
 
-def _sparse_attention(query, kv, page_table, seq_lens):
+def _sparse_attention(query, kv, page_table, seq_lens, workspace_bytes=512 << 20):
     rows = query.shape[0]
     return dcp_trtllm_sparse_attention(
         query=query,
@@ -36,7 +39,7 @@ def _sparse_attention(query, kv, page_table, seq_lens):
         seq_lens=seq_lens,
         cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
         kv_cache=kv.reshape(-1, 1, 64, 576),
-        workspace_buffer=torch.zeros(128 << 20, dtype=torch.uint8, device="cuda"),
+        workspace_buffer=torch.zeros(workspace_bytes, dtype=torch.uint8, device="cuda"),
         qk_nope_head_dim=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -114,6 +117,31 @@ class TestDsaDcpAttention(CustomTestCase):
                     torch.testing.assert_close(
                         merged_lse, expected_lse, atol=0.003, rtol=0.002
                     )
+
+    def test_rows_split_to_fit_the_workspace(self):
+        """A workspace too small for one call's softmax slab must split the rows, not overflow."""
+        generator = torch.Generator().manual_seed(1)
+        rows, heads, capacity, length = 2400, 32, 4096, 128
+        page_table = torch.full((rows, TOPK), -1, dtype=torch.int32)
+        for row in range(rows):
+            page_table[row, :length] = torch.randperm(capacity, generator=generator)[
+                :length
+            ]
+        page_table = page_table.cuda()
+        seq_lens = torch.full((rows,), length, dtype=torch.int32, device="cuda")
+        query = (torch.randn(rows, 1, heads, 576, generator=generator) * 0.25).cuda()
+        kv = (torch.randn(capacity, 576, generator=generator) * 0.25).cuda()
+        query, kv = query.to(torch.bfloat16), kv.to(torch.bfloat16)
+        expected, expected_lse = _sparse_attention(query, kv, page_table, seq_lens)
+        workspace_bytes = (128 << 20) + 64 * heads * 256 * 8
+        self.assertEqual(
+            trtllm_rows_per_call(workspace_bytes=workspace_bytes, heads=heads), 64
+        )
+        output, lse = _sparse_attention(
+            query, kv, page_table, seq_lens, workspace_bytes=workspace_bytes
+        )
+        torch.testing.assert_close(output, expected, atol=0.003, rtol=0.02)
+        torch.testing.assert_close(lse, expected_lse, atol=0.003, rtol=0.002)
 
 
 if __name__ == "__main__":

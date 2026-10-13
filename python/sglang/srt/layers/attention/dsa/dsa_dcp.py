@@ -11,6 +11,17 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 
 TRTLLM_MAX_BATCH_ROWS = 65535
+# FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
+# the rest is kernel scratch.
+_SOFTMAX_BYTES_PER_ROW_HEAD = 256 * 8
+_SCRATCH_RESERVE_BYTES = 128 << 20
+
+
+def trtllm_rows_per_call(*, workspace_bytes: int, heads: int) -> int:
+    rows = (workspace_bytes - _SCRATCH_RESERVE_BYTES) // (
+        heads * _SOFTMAX_BYTES_PER_ROW_HEAD
+    )
+    return max(1, min(TRTLLM_MAX_BATCH_ROWS, rows))
 
 
 class DcpPageTableCache(msgspec.Struct):
@@ -73,12 +84,16 @@ def dcp_trtllm_sparse_attention(
             torch.empty((0, heads), dtype=torch.float32, device=query.device),
         )
     lse = torch.empty((rows, heads), dtype=torch.float32, device=query.device)
-    if rows > TRTLLM_MAX_BATCH_ROWS:
+    workspace = attention_kwargs["workspace_buffer"]
+    step = trtllm_rows_per_call(
+        workspace_bytes=workspace.numel() * workspace.element_size(), heads=heads
+    )
+    if rows > step:
         attention_kwargs["enable_pdl"] = False
     top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)
     outputs = []
-    for start in range(0, rows, TRTLLM_MAX_BATCH_ROWS):
-        end = min(start + TRTLLM_MAX_BATCH_ROWS, rows)
+    for start in range(0, rows, step):
+        end = min(start + step, rows)
         output, _ = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query[start:end],
             block_tables=block_tables[start:end],
