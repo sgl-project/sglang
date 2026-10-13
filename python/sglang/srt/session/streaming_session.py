@@ -80,6 +80,7 @@ class StreamingSession:
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
             return None
@@ -160,6 +161,7 @@ class StreamingSession:
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 

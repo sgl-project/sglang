@@ -2006,6 +2006,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             else:
                 out = out_list[-1]
+                if (
+                    is_stream
+                    and not incremental_stream
+                    and state.customized_info_accumulated
+                ):
+                    meta_info = out.get("meta_info")
+                    if meta_info is not None:
+                        for key, values in state.customized_info_accumulated.items():
+                            meta_info.setdefault(key, list(values))
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -3830,15 +3839,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(obj.batch_size)
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            rids.add(rid)
+
+        new_states = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            new_states[rid] = state
+
+        self.rid_to_state.update(new_states)
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.
@@ -4006,13 +4022,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return span_attrs
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
-        """Set the default priority value."""
+        """Set the default priority and validate the signed 64-bit range."""
         if (
             self.enable_priority_scheduling
             and obj.priority is None
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+        if obj.priority is not None and not -(1 << 63) <= obj.priority < (1 << 63):
+            raise ValueError(
+                "priority must be a signed 64-bit integer "
+                "between -9223372036854775808 and 9223372036854775807"
+            )
 
 
 class ServerStatus(Enum):
