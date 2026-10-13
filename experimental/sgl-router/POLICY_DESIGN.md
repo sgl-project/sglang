@@ -3,7 +3,7 @@
 This document describes how the router picks engines when started with
 `--chat-routing reorg`; the default (legacy) routing path is not covered.
 
-- [1. Overview](#1-overview) — architecture, policies at a glance, configuration
+- [1. Overview](#1-overview) — architecture, policies at a glance, terms, configuration
 - [2. Load signals](#2-load-signals)
 - [3. Buckets](#3-buckets)
 - [4. Engine groups](#4-engine-groups)
@@ -35,31 +35,64 @@ Three layers, each with one job:
 | [Engine group](#4-engine-groups) | Which live engines are candidates | Ranks engines | `worker_ids` / `worker_services` |
 | [Policy](#5-policies) | Which candidate (**selection**) and whether it may take the request (**admission**) | Leaves its candidate set or bucket | `--policy`, group `policy` / `admission` / `affinity` |
 
-Rules that hold everywhere:
+One request goes through these steps:
 
-1. Both engines of a P/D pair come from the same bucket.
-2. The router moves to the next bucket only when a group has no candidates or
-   its policy rejects on admission. Any other error stops routing.
-3. Nothing is dispatched until a bucket has supplied the complete selection.
+1. **Resolve buckets**: list every bucket that fits the request, in preference
+   order ([3](#3-buckets)).
+2. **Try each bucket in order.** In each group of the bucket:
+   1. List the candidates ([4](#4-engine-groups)).
+   2. The selection policy picks one candidate. An affinity policy tries its
+      preferred engine first and falls back to `power_of_two`
+      ([5.2](#52-selection)).
+   3. Admission decides whether the pick may take the request
+      ([5.4](#54-admission)). In balanced mode, load may move the request off the
+      preferred engine ([5.3](#53-prefer-vs-balanced)).
+   4. P/D only: decode picks from the prefill engine's version group; if that
+      fails, prefill picks again outside that version group ([4](#4-engine-groups)).
+3. **Move on or stop.** A group with no candidates, or a rejection by admission,
+   sends the router to the next bucket. Any other error stops routing.
+4. **Dispatch** once one bucket has supplied the complete selection: one plain
+   engine, or a prefill and decode engine from the same bucket.
+5. **Retry** (optional): if dispatch fails before the client sees a response,
+   start again at step 1 without the failed engine ([6](#6-failures-and-retries)).
 
 Every model-serving endpoint uses this path: `/v1/chat/completions`,
-`/v1/completions`, `/generate`, `/v1/embeddings`, `/v1/classify` and `/v1/rerank`.
+`/v1/completions`, `/generate`, `/v1/messages`, `/v1/embeddings`, `/v1/classify`
+and `/v1/rerank`. The last three serve plain engines only, and return 400 when
+the model has P/D engines registered.
 
 ### 1.2 Policies at a glance
 
-A group's policy has two parts: **selection** picks one engine, **admission**
-decides whether that engine may take the request.
+Three independent settings decide how a group chooses an engine:
 
-| Policy | Part | Stages | [Affinity mode](#53-prefer-vs-balanced) | Reads |
-| --- | --- | --- | --- | --- |
-| [`power_of_two`](#power_of_two) | selection | all; the default, and always the decode default | — | engine load |
-| [`cache_aware`](#cache_aware) | selection | plain, prefill | `prefer` / `balanced` | prefix index + load |
-| [`session_aware`](#session_aware) | selection | all | `prefer` / `balanced` | session bindings + load |
-| [Admission caps](#54-admission) | admission | all; every group | — | engine load + router in-flight |
+| Setting | Choices | Applies to | Decides |
+| --- | --- | --- | --- |
+| [Selection policy](#52-selection) | `power_of_two`, `cache_aware`, `session_aware` | one per group | which candidate to try |
+| [Affinity mode](#53-prefer-vs-balanced) | `prefer` (default), `balanced` | `cache_aware` and `session_aware` groups | whether load may override the preferred engine |
+| [Admission caps](#54-admission) | up to five caps, or none | every group, whatever its policy | whether the chosen engine may take the request |
 
-`cache_aware` and `session_aware` are **affinity policies**: they have a preferred
-engine (a prefix owner or the bound session engine) and fall back to
-`power_of_two` when it is missing or rejected.
+The selection policies:
+
+| Policy | Stages | Preferred engine | Reads |
+| --- | --- | --- | --- |
+| [`power_of_two`](#power_of_two) | all; the default, and the decode default | none: the better of two random candidates | engine load |
+| [`cache_aware`](#cache_aware) | plain, prefill | the best prefix owner | prefix index + load |
+| [`session_aware`](#session_aware) | all | the engine bound to the session | session bindings + load |
+
+`cache_aware` and `session_aware` are **affinity policies**. Each tries its
+preferred engine first. It uses `power_of_two` as its fallback when that engine
+is missing or rejected, and in balanced mode as the alternative compared with it.
+
+Terms used below:
+
+| Term | Meaning |
+| --- | --- |
+| Engine | One serving instance. Config keys and code call it a *worker*. |
+| Candidate | An engine a group may pick for this request ([4](#4-engine-groups)). |
+| Prefix owner | A candidate whose cached prefix passes the `cache_aware` hit gate. |
+| Bound engine | The engine a session is bound to, per stage and bucket. |
+| Affinity engine (A) | An affinity policy's admitted preferred engine: the best admitted prefix owner, or the admitted bound engine. |
+| Fallback (B) | The `power_of_two` pick an affinity policy makes without an admitted preferred engine, or compares with A in balanced mode. |
 
 ### 1.3 Configuration
 
@@ -95,7 +128,10 @@ Precedence: **group JSON field > CLI flag > built-in default**. Without
 | `--affinity-load-factor` | 2 (must be ≥ 1) | `load_factor` |
 | `--affinity-load-gap` | 1024 tokens or 4 requests | `load_gap` |
 
-The last three require balanced mode.
+The last three require balanced mode. One exception to the precedence rule: a
+group whose `balanced_by` differs from `--affinity-balanced-by` ignores
+`--affinity-load-gap`, which is in the other metric's unit, and uses its own
+`load_gap` or that metric's default.
 
 **Cache-aware** (global; no group override)
 
@@ -191,7 +227,11 @@ Policies and admission read the same per-engine numbers.
 | --- | --- |
 | plain / prefill | est. prefill queue time (when both have it) → waiting uncached tokens → waiting requests → running requests → in-flight |
 | decode | waiting requests → running requests → KV usage % → KV used tokens → in-flight |
-| either engine lacks a fresh native report | in-flight only |
+| any compared engine lacks a fresh native report | in-flight only |
+
+`power_of_two` compares two engines. Cache-owner ranking compares the whole
+owner set, so one owner without a fresh native report makes every owner rank by
+in-flight requests.
 
 Example: prefill A reports a 120 ms queue and 9k waiting uncached tokens; B
 reports 80 ms and 12k. B wins on queue time. Without B's queue estimate, A would
@@ -262,8 +302,8 @@ pub trait Policy: Send + Sync + Debug {
   counts, token IDs and session key.
 - A policy owns its state handles (load table, prefix index, session store) and
   checks admission itself.
-- `Pick` is one engine plus a reason string, such as `cache_candidate` or
-  `session_rebound`.
+- `Pick` is one engine plus a short reason tag, such as `cache_candidate`. Reorg
+  routing does not currently log or export the tag.
 
 | Result | Meaning | Router action |
 | --- | --- | --- |
@@ -316,18 +356,33 @@ Example: a 10k-token prompt with `--cache-affinity-min-match-ratio 0.2` and
 Bindings are keyed by **stage + model + bucket + session ID** (read from
 `--session-id-header`) and expire after `--session-idle-secs` without use.
 
-| Situation | Behavior | Reason |
-| --- | --- | --- |
-| No session header | `power_of_two` + admission; nothing is bound | `no_session` |
-| No binding, or the bound engine is no longer a candidate | `power_of_two` + admission, then bind | `assigned` |
-| Bound engine admitted, `prefer` | Bound engine | `session_primary` |
-| Bound engine admitted, `balanced` | Compare with a `power_of_two` alternative ([5.3](#53-prefer-vs-balanced)) | `session_primary` or `session_rebound` |
-| Bound engine rejected | `power_of_two` over the other engines + admission, then rebind | `session_rebound` |
+| Situation | Behavior |
+| --- | --- |
+| No session header | `power_of_two` + admission; nothing is bound |
+| No binding, or the bound engine is not a candidate | `power_of_two` + admission, then bind |
+| Bound engine admitted, `prefer` | Bound engine |
+| Bound engine admitted, `balanced` | Compare with a `power_of_two` alternative ([5.3](#53-prefer-vs-balanced)); rebind if the alternative wins |
+| Bound engine rejected | `power_of_two` over the other engines + admission, then rebind |
 
-Bindings are written during selection, after admission; a later dispatch failure
-does not undo them. When two first requests race, the first binding wins and the
-second request checks admission on it. If the fallback is also rejected, the old
-binding is kept.
+The bound engine stops being a candidate when it is unhealthy or gone, when a
+[retry](#6-failures-and-retries) excludes it, or when P/D pairing is retrying
+prefill outside its version group.
+
+A binding is written as soon as its group's pick is admitted, before the rest of
+the bucket is decided, and nothing undoes it. So a session also moves or keeps
+its binding when:
+
+- **Balanced mode picks the alternative.** The session moves for good, not just
+  for this request.
+- **Decode rejects the prefill engine's version group.** Prefill picks again
+  without that version group, so the bound prefill engine is not a candidate and
+  the session is rebound.
+- **The bucket later fails**, on its decode side or at dispatch. The binding in
+  this bucket stays; the bucket that serves the request keeps its own binding.
+
+When two first requests race, the first binding wins and the second request
+checks admission on it. If the fallback is also rejected, the old binding is
+kept.
 
 ### 5.3 Prefer vs balanced
 
@@ -336,9 +391,9 @@ the best admitted prefix owner, or the admitted bound engine.
 
 | | `prefer` (default) | `balanced` |
 | --- | --- | --- |
-| A admitted | Use A | Sample B with `power_of_two` from the other admitted engines; use B only if A is clearly busier |
+| A admitted | Use A | Pick B with `power_of_two` from the other candidates (all but A and any rejected prefix owners) and check admission on B; use B only if B is admitted and A is clearly busier |
 | A missing or rejected | `power_of_two` fallback | same |
-| What moves traffic off A | Admission caps only | Admission caps, or the load comparison |
+| What moves traffic off A | Admission caps only | Admission caps, or the load comparison; `session_aware` then rebinds the session to B |
 
 Balanced switches from A to B only when **both** hold:
 
@@ -349,10 +404,10 @@ load(A) − load(B) > load_gap         default 1024 tokens or 4 requests
 
 | `balanced_by` | load(engine) | Effect |
 | --- | --- | --- |
-| `prefill_tokens` (default) | reported waiting uncached tokens + this request's uncached tokens on that engine | cache-aware: A pays only for its uncached suffix. session-aware: both pay for the full prompt |
+| `prefill_tokens` (default) | reported waiting uncached tokens + the tokens this request would prefill on that engine (every prompt in a batch, minus that engine's cached prefix) | cache-aware: each engine pays only for what it has not cached, including an engine whose partial match is below the hit gate. session-aware: no prefix signal, so both pay for the full input |
 | `running_requests` | reported running requests | the request is not counted |
 
-A missing report on either engine, or a tie, keeps A.
+A missing report on either engine, a tie, or a rejected or missing B keeps A.
 
 Examples (cache-aware, 10k prompt, A caches 8k, B caches nothing):
 
@@ -398,9 +453,14 @@ Where each policy checks:
 | Invalid signal, configuration or foreign pick | 500, immediately |
 
 With `--retry-max-attempts` above 1, a dispatch that fails before any response
-reaches the client (transport error, 5xx or 429) reruns selection from the first
-bucket with the failed engine excluded. A response the client has started to
-receive is never retried.
+reaches the client (transport error, 5xx or 429) is retried after a backoff.
+Selection reruns from the first bucket with the failed engine excluded:
+
+- In P/D, only the side blamed for the failure is excluded. Both sides are
+  excluded when the client set the request ID, which an engine refuses twice.
+- If reselection finds no engine, the client gets the previous attempt's
+  failure, not the 503 above.
+- A response the client has started to receive is never retried.
 
 ## 7. Code map
 
@@ -417,6 +477,7 @@ Paths are under `experimental/sgl-router/src/`.
 | `policies_reorg/admission.rs` | `AdmissionLimits`, `EngineMetrics` |
 | `policies_reorg/factory.rs` | `--bucket-config` schema, validation, policy construction |
 | `server/routes/chat/reorg.rs` | bucket loop and error mapping |
+| `server/routes/chat.rs`, `server/routes/chat/forward.rs` | retry loop and which engine a failure excludes |
 | `state/load_monitor/` | engine reports, freshness, ranking |
 | `state/kv_events/` | router-local prefix index |
 | `state/affinity_store.rs` | session bindings and expiry |
@@ -435,5 +496,7 @@ These are rejected at startup with `--chat-routing reorg`:
 - `--stable-pair`, `--session-affinity-mode` other than `bucket`, and
   `--affinity-mode soft` / `strict`.
 - `--min-load-choices` other than 2, `--worker-queue-limit`,
-  `--saturation-queue-floor` and `--cache-switch-margin-tokens`; use
+  `--saturation-queue-floor`, `--cache-switch-margin-tokens`, and the pressure
+  guard flags (`--pressure-abs-threshold-tokens`, `--pressure-abs-threshold-ms`,
+  `--pressure-rel-threshold`, `--disable-pressure-guard`); use
   [balanced mode](#53-prefer-vs-balanced) instead.
