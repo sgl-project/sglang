@@ -206,9 +206,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        return VerificationResult()
-
     def _load_control_video(
         self,
         control_path: str,
