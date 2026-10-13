@@ -1500,6 +1500,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
 
+        index_k_page8 = _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
+        if index_k_page8:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_has_fp4_rowgroup,
+            )
+
+            if not aiter_has_fp4_rowgroup():
+                logger.warning(
+                    "SGLANG_HIP_DSV41_INDEX_K_PAGE8 is set but the installed AITER has "
+                    "no row-group FP4 MQA logits kernel (#6145); keeping the page-64 "
+                    "index-K pool."
+                )
+                index_k_page8 = False
         self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
             ratio: self._make_indexer_pool(
                 config.indexer_size,
@@ -1527,9 +1540,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver,
                 force_fp4=True,
                 # only the candidate consumers (ratio 1) score a subset of blocks
-                index_k_page8=(
-                    ratio == 1 and _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
-                ),
+                index_k_page8=ratio == 1 and index_k_page8,
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.

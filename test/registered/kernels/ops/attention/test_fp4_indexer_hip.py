@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     _decode_cta_count,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
+    aiter_has_fp4_rowgroup,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
     index_k_page8_views,
@@ -81,6 +82,12 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
     reason="The FP4 indexer adapters wrap AITER CDNA4 (gfx95x) kernels.",
+)
+
+# The row-group kernels (8- and 64-row pages) need AITER >= ROCm/aiter#6145.
+requires_aiter_rowgroup = pytest.mark.skipif(
+    not (is_hip() and is_gfx95_supported() and aiter_has_fp4_rowgroup()),
+    reason="AITER has no row-group FP4 MQA logits kernel (ROCm/aiter#6145).",
 )
 
 HEAD_DIM = 128
@@ -832,6 +839,7 @@ def _verify_rows_case(case, rows_per_request: int):
     }
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize(
     "batch,seq_len,rows_per_request",
     [(1, 256, 1), (3, 512, 6), (4, 512, 6), (6, 1024, 6), (8, 2048, 1)],
@@ -934,6 +942,7 @@ def _page8_case(batch, seq_len, rows_per_request, *, ctx_lens=None):
     return case
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize("is_decode", [True, False])
 @pytest.mark.parametrize(
     "batch,seq_len,rows_per_request,ctx_lens",
@@ -967,6 +976,7 @@ def test_page8_full_scoring_matches_page64(
         )
 
 
+@requires_aiter_rowgroup
 def test_rowgroup_prefill_workspace_scores_ragged_requests() -> None:
     """A page8 prefill workspace scores consecutive requests' rows (one request empty) as the
     page-64 pool scores every row alone, and reuses a row range's query_start_loc."""
@@ -1035,6 +1045,7 @@ def test_rowgroup_prefill_workspace_scores_ragged_requests() -> None:
         )
 
 
+@requires_aiter_rowgroup
 def test_rowgroup_table_columns_fix_the_compiled_width() -> None:
     """Workspaces built with rowgroup_table_columns share one block-table width whatever
     the context, so the row-group kernel compiles one variant for it, and score exactly
@@ -1242,6 +1253,7 @@ _C4_STEP_CASES = [
 ]
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize("seq_lens,rows_per_request", _C4_STEP_CASES)
 def test_c4_rowgroup_matches_schedule_path_and_reference(
     seq_lens, rows_per_request, monkeypatch
@@ -1309,6 +1321,7 @@ def test_c4_rowgroup_matches_schedule_path_and_reference(
     assert torch.equal(pages_new.long(), expect)
 
 
+@requires_aiter_rowgroup
 def test_c4_rowgroup_stale_workspace_stays_on_rowgroup() -> None:
     """A row-group workspace sized for another row count (DP padding, truncated
     activations) is rebuilt per row on the same table width, not dropped onto the
@@ -1332,6 +1345,7 @@ def test_c4_rowgroup_stale_workspace_stays_on_rowgroup() -> None:
         assert torch.equal(with_stale[row, :end], fresh[row, :end]), f"row {row}"
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize("rows_per_request", [4, 7])
 def test_c4_rowgroup_workspace_and_logits_replay_in_a_graph(
     rows_per_request: int,
@@ -1396,6 +1410,7 @@ def test_c4_rowgroup_workspace_and_logits_replay_in_a_graph(
             )
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize(
     "batch,seq_len,rows_per_request,topk_blocks,topk",
     [(2, 1024, 1, 32, 64), (3, 2048, 6, 64, 128), (4, 4096, 2, 128, 256)],
@@ -1450,6 +1465,7 @@ def test_page8_candidates_match_gather(
         assert (got_pages[row, :n] >= 0).all() and (got_pages[row, n:] == -1).all()
 
 
+@requires_aiter_rowgroup
 def test_sliced_page8_table_matches_rebuilt() -> None:
     """A row chunk of candidates carrying their page8 table selects what the chunk with the
     table rebuilt from its own rows selects."""
@@ -1746,6 +1762,7 @@ def test_index_k_split_writer_matches_the_triton_chain(ratio: int) -> None:
     assert torch.equal(scale, ref_scale)
 
 
+@requires_aiter_rowgroup
 @pytest.mark.parametrize("writer", ["hip", "triton"])
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_index_k_page8_writers_match_pack_kv_cache(writer: str, ratio: int) -> None:
