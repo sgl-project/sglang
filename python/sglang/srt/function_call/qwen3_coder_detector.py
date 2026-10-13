@@ -3,6 +3,10 @@ import logging
 import re
 from typing import Any, List, Optional
 
+from jsonschema import Draft202012Validator
+from referencing import Registry
+from referencing.exceptions import Unresolvable
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -116,6 +120,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         param_type = self._get_param_type(param_config[param_name])
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+            schema = param_config[param_name]
+            if isinstance(schema, dict) and ("anyOf" in schema or "oneOf" in schema):
+                try:
+                    value = json.loads(param_value)
+                    if isinstance(value, (dict, list)) and Draft202012Validator(
+                        schema, registry=Registry()
+                    ).is_valid(value):
+                        return value
+                except (json.JSONDecodeError, Unresolvable):
+                    return param_value
             return param_value
         elif (
             param_type.startswith("int")
