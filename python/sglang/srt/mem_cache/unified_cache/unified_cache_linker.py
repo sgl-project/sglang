@@ -26,6 +26,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from dataclasses import replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -34,6 +35,9 @@ from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
+)
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    PoolExistenceBeliefs,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -242,6 +246,10 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids: list[str] = []
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
+        self.private_load_hashes: dict[str, list[str]] = {}
+        # KV pages loaded from the store, so write-through skips them. Changed only
+        # at rank-agreed points (load verdict, lookup boundary, reset).
+        self.stored_pages = PoolExistenceBeliefs()
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
@@ -286,6 +294,8 @@ class UnifiedCacheLinkerWrapper:
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        # Pages past the agreed hit are not restorable, whatever was loaded before.
+        self.stored_pages.invalidate_beyond(tail_hashes, hit_pages)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -435,6 +445,7 @@ class UnifiedCacheLinkerWrapper:
         ):
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
+        self.private_load_hashes[req.rid] = list(tail_hashes)
         self.inflight_load_rids.append(req.rid)
         return len(full_transfer.device_indices), req.last_node
 
@@ -473,7 +484,44 @@ class UnifiedCacheLinkerWrapper:
             if transfers is not None:
                 if self._skip_swa:
                     transfers = [t for t in transfers if t.name != PoolName.SWA]
-                self._offload_node(node_id, transfers)
+                transfers = self._drop_stored_pages(transfers)
+                if transfers:
+                    self._offload_node(node_id, transfers)
+                else:
+                    self._publish_stored_node(node_id)
+
+    def _drop_stored_pages(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+        """Drop the leading KV pages the store already holds; the pools indexed by
+        the KV transfer follow it. Empty when the node has nothing left to write."""
+        kv_index = next(
+            (i for i, t in enumerate(transfers) if t.name == PoolName.KV), None
+        )
+        if kv_index is None:
+            return transfers
+        kv = transfers[kv_index]
+        stored = 0
+        for page_hash in kv.keys:
+            if not self.stored_pages.contains(page_hash):
+                break
+            stored += 1
+        if stored == 0:
+            return transfers
+        if stored == len(kv.keys):
+            # Other pools (an SWA window) still need writing, and an offload
+            # cannot omit KV, so the node goes out unchanged.
+            return [] if len(transfers) == 1 else transfers
+        trimmed = replace(
+            kv,
+            keys=kv.keys[stored:],
+            device_indices=kv.device_indices[stored * self.cache.page_size :],
+        )
+        return [*transfers[:kv_index], trimmed, *transfers[kv_index + 1 :]]
+
+    def _publish_stored_node(self, node_id: NodeId) -> None:
+        """Record a node the store already holds as stored, without a write."""
+        tree_core = self.cache.tree_core
+        tree_core.mark_external_linker_offload_pending(node_id)
+        tree_core.finish_external_linker_offload([node_id], node_id, True)
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
@@ -550,6 +598,9 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
+            hashes = self.private_load_hashes.pop(rid, None)
+            if landed.item() and hashes:
+                self.stored_pages.add(hashes)
         if landed.item():
             return []
         logger.error(
@@ -564,6 +615,8 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
+        self.private_load_hashes.clear()
+        self.stored_pages.clear()
         self.inflight_load_index = -1
         self._release_pending_offloads()
 
@@ -582,9 +635,11 @@ class UnifiedCacheLinkerWrapper:
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
+            self.private_load_hashes.pop(rid, None)
 
     def close(self) -> None:
         self.cache_linker.close()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
+        self.private_load_hashes.clear()
         self._release_pending_offloads()
