@@ -1,4 +1,4 @@
-"""Exact distributed QSA top-k kernels and collective transport."""
+"""Distributed QSA top-k candidate transport and deterministic merge."""
 
 from __future__ import annotations
 
@@ -126,7 +126,6 @@ def _fused_publish_qsa_topk_candidates_kernel(
     TOPK: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    HAS_LOGICAL_POSITIONS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Materialize score/id pairs directly into the symmetric receive buffer."""
@@ -166,20 +165,16 @@ def _fused_publish_qsa_topk_candidates_kernel(
             mask=second_valid,
             other=-float("inf"),
         ).to(tl.float32)
-        if HAS_LOGICAL_POSITIONS:
-            first_id = tl.load(
-                logical_positions_ptr + row * logical_row_stride + first_local,
-                mask=first_valid,
-                other=-1,
-            ).to(tl.int32)
-            second_id = tl.load(
-                logical_positions_ptr + row * logical_row_stride + second_local,
-                mask=second_valid,
-                other=-1,
-            ).to(tl.int32)
-        else:
-            first_id = first_local * WORLD_SIZE + RANK
-            second_id = second_local * WORLD_SIZE + RANK
+        first_id = tl.load(
+            logical_positions_ptr + row * logical_row_stride + first_local,
+            mask=first_valid,
+            other=-1,
+        ).to(tl.int32)
+        second_id = tl.load(
+            logical_positions_ptr + row * logical_row_stride + second_local,
+            mask=second_valid,
+            other=-1,
+        ).to(tl.int32)
         first_id = tl.where(first_valid, first_id, -1)
         second_id = tl.where(second_valid, second_id, -1)
 
@@ -212,6 +207,8 @@ def fused_publish_and_merge_qsa_topk_candidates(
     static_buffers,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Publish local candidates with one no-pack multimem kernel, then merge."""
+    if logical_block_positions is None:
+        raise ValueError("fused candidate publish requires logical block positions")
     rows = local_indices.shape[0]
     static_buffers = static_buffers.for_batch(rows)
     state = static_buffers.candidate_symm_state
@@ -221,25 +218,19 @@ def fused_publish_and_merge_qsa_topk_candidates(
         raise ValueError("fused candidate publish requires an even topk")
     if logits.dtype != torch.float32 or local_indices.dtype != torch.int32:
         raise TypeError("fused candidate publish requires fp32 logits and int32 ids")
-    logical = (
-        logical_block_positions
-        if logical_block_positions is not None
-        else local_indices
-    )
     _fused_publish_qsa_topk_candidates_kernel[(4,)](
         logits,
         local_indices,
         row_starts,
-        logical,
+        logical_block_positions,
         state.symm_mem_hdl.multicast_ptr,
         state.symm_mem_hdl.signal_pad_ptrs_dev,
         logits.stride(0),
-        logical.stride(0),
+        logical_block_positions.stride(0),
         rows,
         TOPK=topk,
         RANK=int(group.rank_in_group),
         WORLD_SIZE=int(group.world_size),
-        HAS_LOGICAL_POSITIONS=logical_block_positions is not None,
         BLOCK_SIZE=256,
         num_warps=8,
     )
@@ -258,7 +249,7 @@ def fused_publish_and_merge_qsa_topk_candidates(
 
 
 def _candidate_order_keys(scores: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Build sortable int64 keys: score descending, then id ascending."""
+    """Order published candidates by score descending, then id ascending."""
 
     score_bits = scores.contiguous().view(torch.int32).to(torch.int64)
     score_bits &= 0xFFFFFFFF
@@ -363,7 +354,12 @@ def merge_qsa_topk_candidates(
     *,
     topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge fixed-width candidates entirely on their current device."""
+    """Select the best published candidates entirely on their current device.
+
+    Local selectors may return candidates in any order. Equal-score candidates
+    already omitted by a local top-k cannot be reconstructed here; global ids
+    only make the merge deterministic among candidates that were published.
+    """
 
     _validate_topk(topk)
     if gathered_candidates.ndim == 4:

@@ -20,6 +20,8 @@ from sglang.srt.layers.attention.qsa.cache_sharding import (
     validate_qsa_cache_sharding,
 )
 from sglang.srt.layers.attention.qsa.distributed_topk import (
+    fused_publish_and_merge_qsa_topk_candidates,
+    gather_and_merge_qsa_topk_candidates,
     merge_qsa_topk_candidates,
 )
 from sglang.srt.layers.attention.qsa.kernel import (
@@ -437,12 +439,116 @@ def _find_free_port():
         return sock.getsockname()[1]
 
 
+def _run_qsa_multimem_candidate_transport(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["SGLANG_QSA_CANDIDATE_SYMM_MEM"] = "1"
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        group = _QSAIntegrationGroup(rank, world_size)
+        rows, topk, page_size = 2, 512, 16
+        global_ids = torch.arange(
+            topk * world_size, dtype=torch.int32, device=device
+        )
+        logical_positions = global_ids[
+            (global_ids // page_size) % world_size == rank
+        ].unsqueeze(0).expand(rows, -1).contiguous()
+        local_indices = torch.arange(
+            topk, dtype=torch.int32, device=device
+        ).unsqueeze(0).expand(rows, -1).contiguous()
+        row_starts = torch.zeros(rows, dtype=torch.int32, device=device)
+        logits = -logical_positions.to(torch.float32)
+        logits = logits + torch.arange(
+            rows, dtype=torch.float32, device=device
+        ).unsqueeze(1) * 0.25
+        buffers = QSACacheShardingStaticBuffers(
+            max_rows=rows,
+            topk=topk,
+            num_heads=world_size,
+            head_dim=128,
+            world_size=world_size,
+            device=device,
+            dtype=torch.bfloat16,
+            candidate_group=group,
+        )
+        if buffers.candidate_symm_state is None:
+            raise AssertionError("H20 multimem candidate transport was not enabled")
+
+        def reference():
+            return gather_and_merge_qsa_topk_candidates(
+                logits,
+                logical_positions,
+                group=group,
+                topk=topk,
+            )
+
+        expected_scores, expected_indices = reference()
+        gathered_scores, gathered_indices = gather_and_merge_qsa_topk_candidates(
+            logits,
+            logical_positions,
+            group=group,
+            topk=topk,
+            static_buffers=buffers,
+        )
+        torch.testing.assert_close(gathered_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(gathered_indices, expected_indices, rtol=0, atol=0)
+
+        fused_scores, fused_indices = fused_publish_and_merge_qsa_topk_candidates(
+            logits,
+            local_indices,
+            row_starts,
+            logical_positions,
+            group=group,
+            topk=topk,
+            static_buffers=buffers,
+        )
+        torch.testing.assert_close(fused_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(fused_indices, expected_indices, rtol=0, atol=0)
+
+        dist.barrier(device_ids=[rank])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_scores, graph_indices = (
+                fused_publish_and_merge_qsa_topk_candidates(
+                    logits,
+                    local_indices,
+                    row_starts,
+                    logical_positions,
+                    group=group,
+                    topk=topk,
+                    static_buffers=buffers,
+                )
+            )
+        logits.add_(rank * 4096.0)
+        expected_scores, expected_indices = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(graph_indices, expected_indices, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_qsa_multirank_production_pipeline_eager_and_cuda_graph(world_size):
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} CUDA devices are required")
     mp.spawn(
         _run_qsa_multirank_production_integration,
+        args=(world_size, _find_free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def test_qsa_multimem_candidate_transport_eager_and_cuda_graph():
+    world_size = 4
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} CUDA devices are required")
+    mp.spawn(
+        _run_qsa_multimem_candidate_transport,
         args=(world_size, _find_free_port()),
         nprocs=world_size,
         join=True,
@@ -667,6 +773,35 @@ def _pack_global_topk_candidates(scores, *, world_size, page_size, topk):
     return torch.stack(ranks)
 
 
+def _select_page_sharded_topk_candidates(scores, *, world_size, page_size, topk):
+    global_ids = torch.arange(scores.shape[1], device=scores.device)
+    packed_ranks = []
+    for rank in range(world_size):
+        rank_ids = global_ids[(global_ids // page_size) % world_size == rank]
+        rank_scores = scores.index_select(1, rank_ids)
+        row_starts = torch.zeros(
+            scores.shape[0], dtype=torch.int32, device=scores.device
+        )
+        row_ends = torch.full_like(row_starts, rank_scores.shape[1])
+        local_indices = qsa_fast_topk(
+            rank_scores,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        selected_ids = rank_ids[local_indices.long()].to(torch.int32)
+        selected_scores = rank_scores.gather(1, local_indices.long())
+        packed = torch.empty(
+            (*local_indices.shape, 2),
+            dtype=torch.float32,
+            device=scores.device,
+        )
+        packed[..., 0].copy_(selected_scores)
+        packed[..., 1].view(torch.int32).copy_(selected_ids)
+        packed_ranks.append(packed)
+    return merge_qsa_topk_candidates(torch.stack(packed_ranks), topk=topk)
+
+
 def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
     scores = torch.tensor(
         [
@@ -694,6 +829,91 @@ def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
     torch.testing.assert_close(
         actual_scores, torch.tensor([[2.0, 1.0, float("-inf"), float("-inf")]])
     )
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_page_sharded_local_topk_matches_global_ids_without_ties(topk):
+    torch.manual_seed(20261013 + topk)
+    scores = torch.randn(1, topk * 8, dtype=torch.float32, device="cuda")
+    _, actual_indices = _select_page_sharded_topk_candidates(
+        scores,
+        world_size=4,
+        page_size=16,
+        topk=topk,
+    )
+    expected_indices = torch.topk(scores, topk, dim=1, sorted=False).indices.to(
+        torch.int32
+    )
+    torch.testing.assert_close(
+        actual_indices.sort(dim=1).values,
+        expected_indices.sort(dim=1).values,
+    )
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_page_sharded_local_topk_preserves_score_multiset_at_boundary_ties(topk):
+    scores = torch.full(
+        (1, topk * 8),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    strict_count = topk - 12
+    scores[0, :strict_count] = torch.arange(
+        strict_count,
+        0,
+        -1,
+        dtype=torch.float32,
+        device=scores.device,
+    )
+    scores[0, strict_count : strict_count + 64] = 0.0
+
+    actual_scores, _ = _select_page_sharded_topk_candidates(
+        scores,
+        world_size=4,
+        page_size=16,
+        topk=topk,
+    )
+    expected_scores = torch.topk(scores, topk, dim=1, sorted=False).values
+    torch.testing.assert_close(
+        actual_scores.sort(dim=1).values,
+        expected_scores.sort(dim=1).values,
+    )
+
+
+def test_distributed_topk_requires_explicit_logical_block_positions():
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    indexer.block_topk = 2
+    indexer.distributed_topk_group = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="distributed QSA top-k requires logical block positions",
+    ):
+        indexer._maybe_merge_distributed_topk(
+            logits=torch.tensor([[3.0, 2.0, 1.0]]),
+            local_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+            row_starts=torch.tensor([0], dtype=torch.int32),
+        )
+
+
+def test_fused_publish_requires_explicit_logical_block_positions():
+    with pytest.raises(
+        ValueError,
+        match="fused candidate publish requires logical block positions",
+    ):
+        fused_publish_and_merge_qsa_topk_candidates(
+            logits=torch.empty(1, 2),
+            local_indices=torch.empty(1, 2, dtype=torch.int32),
+            row_starts=torch.zeros(1, dtype=torch.int32),
+            logical_block_positions=None,
+            group=SimpleNamespace(world_size=2, rank_in_group=0),
+            topk=2,
+            static_buffers=None,
+        )
 
 
 @pytest.mark.parametrize("option", ["--qsa-cache-sharding-size", "--state-cp-size"])

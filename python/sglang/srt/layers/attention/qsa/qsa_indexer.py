@@ -534,11 +534,15 @@ class QSAIndexer(MultiPlatformOp):
         logical_block_positions: torch.Tensor | None = None,
         static_buffers=None,
     ) -> torch.Tensor:
-        """Convert local candidates to exact global top-k when explicitly enabled."""
+        """Merge rank-local candidates using their explicit logical block ids."""
 
         group = getattr(self, "distributed_topk_group", None)
         if group is None:
             return local_indices
+        if logical_block_positions is None:
+            raise ValueError(
+                "distributed QSA top-k requires logical block positions"
+            )
         if (
             static_buffers is not None
             and getattr(static_buffers, "candidate_symm_state", None) is not None
@@ -561,21 +565,22 @@ class QSAIndexer(MultiPlatformOp):
             )
             return merged_indices
         valid = local_indices >= 0
-        mapped_logical_positions = None
-        if logical_block_positions is not None:
-            if logical_block_positions.shape[1] == 0:
-                valid = torch.zeros_like(valid)
-            else:
-                within_local_row = local_indices < logical_block_positions.shape[1]
-                safe_local_indices = torch.where(
-                    valid & within_local_row,
-                    local_indices,
-                    torch.zeros_like(local_indices),
-                ).long()
-                mapped_logical_positions = logical_block_positions.gather(
-                    1, safe_local_indices
-                )
-                valid &= within_local_row & (mapped_logical_positions >= 0)
+        if logical_block_positions.shape[1] == 0:
+            valid = torch.zeros_like(valid)
+            mapped_logical_positions = torch.full_like(
+                local_indices, -1, dtype=torch.int64
+            )
+        else:
+            within_local_row = local_indices < logical_block_positions.shape[1]
+            safe_local_indices = torch.where(
+                valid & within_local_row,
+                local_indices,
+                torch.zeros_like(local_indices),
+            ).long()
+            mapped_logical_positions = logical_block_positions.gather(
+                1, safe_local_indices
+            )
+            valid &= within_local_row & (mapped_logical_positions >= 0)
         if logits is None or logits.shape[1] == 0:
             local_scores = torch.full(
                 local_indices.shape,
@@ -595,16 +600,10 @@ class QSAIndexer(MultiPlatformOp):
             local_scores = logits.gather(1, safe_absolute_indices).masked_fill(
                 ~valid, float("-inf")
             )
-        if logical_block_positions is None:
-            global_indices = local_indices.to(torch.int64) * int(
-                group.world_size
-            ) + int(group.rank_in_group)
-        elif logical_block_positions.shape[1] == 0:
-            global_indices = torch.full_like(local_indices, -1, dtype=torch.int64)
-        else:
-            global_indices = mapped_logical_positions
         global_indices = torch.where(
-            valid, global_indices, torch.full_like(global_indices, -1)
+            valid,
+            mapped_logical_positions,
+            torch.full_like(mapped_logical_positions, -1),
         ).to(torch.int32)
         graph_kwargs = (
             {"static_buffers": static_buffers} if static_buffers is not None else {}
