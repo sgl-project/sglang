@@ -1,5 +1,4 @@
 import logging
-from collections import OrderedDict
 import os
 from abc import ABC
 from typing import Callable, Generator, List, Optional
@@ -86,14 +85,6 @@ def create_offloader(dp_rank: int):
     return NoopOffloader()
 
 
-class _OffloadStateDict(OrderedDict):
-    """Fresh state destination retaining PyTorch metadata during compilation."""
-
-    def __init__(self):
-        super().__init__()
-        self._metadata = OrderedDict()
-
-
 class OffloaderV1(BaseOffloader):
     def __init__(self, cpu_offload_max_bytes: int):
         self._cpu_offload_bytes = 0
@@ -152,7 +143,7 @@ class OffloaderV1(BaseOffloader):
                     # here we blindly call `to(device)`
                     # if the parameter is already on the device, it will be a no-op
                     k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict(destination=_OffloadStateDict()).items()
+                    for k, v in module.state_dict().items()
                 }
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
