@@ -472,6 +472,87 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def test_minimax_sparse_ships_main_kv_and_index_k(self):
+        """Each page object must carry K, V and the sparse layers' index-K;
+        dense layers have no index-K, and unsupported layouts must fail loudly."""
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+        def minimax_pool():
+            kvcache = MiniMaxSparseKVPool.__new__(MiniMaxSparseKVPool)
+            kvcache.page_size = 2
+            kvcache.layer_num = 3
+            kvcache.start_layer = 0
+            kvcache.main_pool = SimpleNamespace(
+                is_quantized_kv_cache=False,
+                kv_cache_layout="nhd",
+                k_buffer=[torch.zeros((8, w), dtype=torch.uint8) for w in (3, 5, 7)],
+                v_buffer=[torch.zeros((8, w), dtype=torch.uint8) for w in (11, 13, 17)],
+            )
+            # Layer 0 is dense; layers 1 and 2 are K-only sparse layers.
+            kvcache.index_k_pool = SimpleNamespace(
+                k_buffer=[torch.zeros((8, w), dtype=torch.uint8) for w in (19, 23)]
+            )
+            kvcache.index_k_layer_id_mapping = {1: 0, 2: 1}
+            kvcache.dense_pool = None
+            kvcache.index_kv_pool = None
+            return kvcache
+
+        def resolve(kvcache, draft_pools=()):
+            return resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
+                components={ComponentType.FULL},
+            )
+
+        kvcache = minimax_pool()
+        group = resolve(kvcache)
+
+        self.assertEqual(group.num_layers, 3)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(
+            group.sources, {PoolName.KV: PoolName.KV, PoolName.INDEXER: PoolName.KV}
+        )
+        kv = group.entry_map[PoolName.KV]
+        locations = kv.prepare_locations(torch.tensor([2, 3]))
+        pointers, sizes, offsets = kv.get_prepared_layer_range_meta(locations, 1)
+        main = kvcache.main_pool
+        self.assertEqual(
+            pointers, [[main.k_buffer[1][2].data_ptr(), main.v_buffer[1][2].data_ptr()]]
+        )
+        self.assertEqual(sizes, [[10, 26]])
+        self.assertEqual(offsets, [[6, 52]])
+
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertIsNone(indexer.get_prepared_layer_range_meta(locations, 0))
+        pointers, sizes, offsets = indexer.get_prepared_layer_range_meta(locations, 2)
+        self.assertEqual(pointers, [[kvcache.index_k_pool.k_buffer[1][2].data_ptr()]])
+        self.assertEqual(sizes, [[46]])
+        self.assertEqual(offsets, [[38]])
+
+        resolved = group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["page-1"],
+                    device_indices=torch.tensor([2, 3]),
+                )
+            ]
+        )
+        self.assertEqual({t.name for t in resolved}, {PoolName.KV, PoolName.INDEXER})
+
+        for field, value in (
+            ("index_kv_pool", object()),
+            ("dense_pool", object()),
+        ):
+            with self.subTest(unsupported=field):
+                kvcache = minimax_pool()
+                setattr(kvcache, field, value)
+                with self.assertRaisesRegex(ValueError, "only K-only sparse layers"):
+                    resolve(kvcache)
+        with self.assertRaisesRegex(ValueError, "does not support MTP drafts"):
+            resolve(minimax_pool(), draft_pools=(object(),))
+
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""
         from sglang.srt.speculative import base_spec_worker as spec

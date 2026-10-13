@@ -442,6 +442,61 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _build_minimax_sparse_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "MiniMax sparse KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+    if mtp_draft_device_pools:
+        raise ValueError("MiniMax sparse direct linker does not support MTP drafts.")
+    # HiSparse and index-V layers keep state outside main_pool / index_k_pool.
+    if kvcache.dense_pool is not None or kvcache.index_kv_pool is not None:
+        raise ValueError(
+            "MiniMax sparse direct linker supports only K-only sparse layers "
+            "without HiSparse."
+        )
+    main = kvcache.main_pool
+    if main.is_quantized_kv_cache:
+        raise ValueError("MiniMax sparse direct linker does not support scaled KV.")
+
+    num_layers = kvcache.layer_num
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[main.k_buffer, main.v_buffer],
+            layer_mapping={layer: layer for layer in range(num_layers)},
+            page_size=page_size,
+            rows_are_pages=main.kv_cache_layout != "nhd",
+        )
+    ]
+    index_pool = kvcache.index_k_pool
+    if index_pool is not None:
+        # Index-K rows share the main KV slot ids; buffers are per sparse layer.
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=kvcache,
+                components=[index_pool.k_buffer],
+                layer_mapping={
+                    layer - kvcache.start_layer: index
+                    for layer, index in kvcache.index_k_layer_id_mapping.items()
+                },
+                page_size=page_size,
+                rows_are_pages=False,
+            )
+        )
+    # GQA KV heads are sharded across TP ranks, so each rank stores its own objects.
+    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=False)
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
