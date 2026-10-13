@@ -6,7 +6,6 @@ same unified-memory configuration to keep attention reduction order comparable.
 Covers GDN, SWA, tri-pool, and MLA layouts.
 """
 
-import importlib.util
 import time
 import unittest
 
@@ -179,14 +178,6 @@ class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
     ]
 
 
-# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
-_needs_tml_renderers = unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
-
-
-@_needs_tml_renderers
 class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
     """Full attention, sliding-window attention, and ShortConv state together."""
 

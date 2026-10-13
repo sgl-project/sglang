@@ -21,7 +21,7 @@ INKLING_DEFAULT_REASONING_EFFORT = 0.9
 
 TML_RENDERERS_INSTALL_HINT = (
     "Serving Inkling requires the `tml-renderers` package (TML's reference "
-    "TMLv0 renderer/parser, Python >= 3.11). Install it with "
+    "TMLv0 renderer/parser; wheels for Linux and macOS arm64). Install it with "
     "`pip install tml-renderers`."
 )
 

@@ -43,7 +43,6 @@ The imported `test_`-prefixed helpers are aliased so pytest does not collect the
 as tests.
 """
 
-import importlib.util
 import os
 import random
 import re
@@ -163,14 +162,6 @@ def _prefill_graph_count(base_url: str) -> float:
     return sum(map(float, matches), 0.0)
 
 
-# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
-_needs_tml_renderers = unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
-
-
-@_needs_tml_renderers
 class TestUnifiedHybridBitExact(CustomTestCase):
     """Prefill and decode must score a token identically once every kernel on the
     path is batch-invariant, so any drift is a stale conv/mamba checkpoint or a
@@ -289,7 +280,6 @@ class TestUnifiedMemoryHybridBitExact(TestUnifiedHybridBitExact):
         )
 
 
-@_needs_tml_renderers
 class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     """Same exactness bar with the host tier in the loop, over interleaved
     branches so hits land at many prefix lengths rather than one aligned one.
@@ -377,7 +367,6 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         )
 
 
-@_needs_tml_renderers
 class TestUnifiedHybridMTPBitExact(CustomTestCase):
     """Same exactness bar with MTP driving the decode loop.
 

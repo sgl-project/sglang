@@ -12,7 +12,6 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
 import gc
-import importlib.util
 import json
 import tempfile
 import unittest
@@ -4823,13 +4822,6 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
-# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
-_needs_tml_renderers = unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
-
-
 def _inkling_serving() -> OpenAIServingChat:
     serving = object.__new__(OpenAIServingChat)
     serving.chat_encoding_spec = "inkling"
@@ -4913,7 +4905,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving.apply_reasoning_enabled(request, True)
         self.assertEqual(request.reasoning_effort, "low")
 
-    @_needs_tml_renderers
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
@@ -4930,7 +4921,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
         self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
 
-    @_needs_tml_renderers
     def test_continue_final_message_resumes_open_model_text_block(self):
         """Bug regression: continue_final_message was silently ignored on the
         inkling path — the trailing assistant message rendered as a CLOSED
@@ -4966,7 +4956,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"], prompt_ids
         )
 
-    @_needs_tml_renderers
     def test_continue_final_message_leaves_tool_call_turns_closed(self):
         """A trailing assistant message with tool_calls cannot be continued —
         it must keep rendering as a closed historical turn."""
@@ -5003,7 +4992,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
-@_needs_tml_renderers
 class InklingTokenOutputTest(CustomTestCase):
     """Inkling chat responses are parsed from output token IDs, not text."""
 

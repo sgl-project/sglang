@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import sys
 import unittest
@@ -26,12 +25,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
-_needs_tml_renderers = unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
-
 _GOLDEN = json.loads(
     (Path(__file__).with_name("inkling_tmlv0_golden.json")).read_text()
 )
@@ -47,7 +40,6 @@ class TestTmlRenderersLoader(unittest.TestCase):
         self.assertEqual(str(ctx.exception), TML_RENDERERS_INSTALL_HINT)
 
 
-@_needs_tml_renderers
 class TestInklingRenderer(unittest.TestCase):
     def test_prompts_match_tmlv0_reference(self):
         """Golden input_ids were produced by tml-renderers itself (see the
@@ -151,7 +143,6 @@ def _stream(token_ids: list[int], **kwargs):
     return merged
 
 
-@_needs_tml_renderers
 class TestInklingOutputParser(unittest.TestCase):
     def test_outputs_match_tmlv0_reference(self):
         """Expected reasoning/content/tool_calls come from tml-renderers'

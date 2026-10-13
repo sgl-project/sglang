@@ -11,7 +11,6 @@ under thinking. tp=4 to match the runner; the checkpoint does not fit on fewer
 cards.
 """
 
-import importlib.util
 import os
 import random
 import unittest
@@ -81,14 +80,6 @@ KL_MAX_NEW_TOKENS = 1024
 KL_TRACK_INTERVAL = 128
 
 
-# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
-_needs_tml_renderers = unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
-
-
-@_needs_tml_renderers
 class TestInklingSmallNvfp4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -150,7 +141,6 @@ class TestInklingSmallNvfp4(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], GSM8K_THRESHOLD)
 
 
-@_needs_tml_renderers
 class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
     """Prefill and decode must score a token identically once every kernel on
     the path is batch-invariant, which is what deterministic inference buys.
@@ -255,7 +245,6 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-@_needs_tml_renderers
 class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
     """HiCache round trip must be bit exact, since nothing about moving a state
     to host memory and back is allowed to change it.

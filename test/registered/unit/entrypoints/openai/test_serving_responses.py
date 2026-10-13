@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import importlib.util
 import sys
 import unittest
 from contextlib import asynccontextmanager
@@ -1101,10 +1100,6 @@ class OutputItemsTestCase(CustomTestCase):
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("tml_renderers") is not None,
-    "tml-renderers is not installed (it requires Python >= 3.11)",
-)
 class InklingOutputItemsTestCase(CustomTestCase):
     """Inkling output items come from sampled token IDs in both response modes."""
 
