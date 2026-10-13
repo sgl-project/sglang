@@ -939,6 +939,17 @@ WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
     },
 )
 
+# Distilled checkpoint: guidance is folded into the weights, so the request runs the
+# model's 10-step, guidance-1.0 recipe over the same inputs, canvas and clip length.
+WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params = replace(
+    WAN_2_2_ANIMATE_2_14B_sampling_params,
+    extras={
+        **WAN_2_2_ANIMATE_2_14B_sampling_params.extras,
+        "num_inference_steps": 10,
+        "guidance_scale": 1.0,
+    },
+)
+
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
