@@ -19,7 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, MLATokenToKVPoolFP4
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -88,6 +88,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        if not is_dummy:
+            for index, pool in enumerate((device_pool, *self.mtp_draft_device_pools)):
+                if isinstance(pool, MLATokenToKVPoolFP4):
+                    role = "target" if index == 0 else f"draft[{index - 1}]"
+                    raise ValueError(
+                        f"MLA host cache does not support {role} FP4 KV: "
+                        "packed payload and separate block scales cannot be restored"
+                    )
 
         # Transfer buffers are captured below. The pool remains available for
         # NPU transfer APIs and device layer ownership.

@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
@@ -732,6 +733,96 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertFalse(mirror._is_device_layer_owned(stub, 1))
         # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
+
+
+class TestMlaFP4HostAdmission(CustomTestCase):
+    @staticmethod
+    def _pool(pool_type=MLATokenToKVPool, **kwargs):
+        return pool_type(
+            size=32,
+            page_size=4,
+            dtype=kwargs.pop("dtype", torch.bfloat16),
+            kv_lora_rank=128,
+            qk_rope_head_dim=16,
+            layer_num=kwargs.pop("layer_num", 2),
+            device="cpu",
+            enable_memory_saver=False,
+            **kwargs,
+        )
+
+    def test_rejects_fp4_target_and_draft_before_host_allocation(self):
+        """Host rows overstated packed FP4 width and omitted its block scales."""
+        from sglang.srt.mem_cache.pool_host import mla
+
+        for role in ("target", "draft[0]", "draft[1]"):
+            for layout in ("layer_first", "page_first"):
+                with self.subTest(role=role, layout=layout):
+                    target = self._pool(
+                        MLATokenToKVPoolFP4 if role == "target" else MLATokenToKVPool
+                    )
+                    drafts = tuple(
+                        self._pool(
+                            MLATokenToKVPoolFP4
+                            if role == f"draft[{i}]"
+                            else MLATokenToKVPool,
+                            layer_num=1,
+                        )
+                        for i in range(2)
+                    )
+                    allocations = []
+                    allocate = mla.ALLOC_MEMORY_FUNCS["cpu"]
+
+                    def track_allocation(*args, **kwargs):
+                        tensor = allocate(*args, **kwargs)
+                        allocations.append(tensor)
+                        return tensor
+
+                    host = None
+                    try:
+                        with (
+                            unittest.mock.patch.dict(
+                                mla.ALLOC_MEMORY_FUNCS, {"cpu": track_allocation}
+                            ),
+                            self.assertRaises(ValueError) as error,
+                        ):
+                            host = MLATokenToKVPoolHost(
+                                target,
+                                2,
+                                0,
+                                4,
+                                layout,
+                                pin_memory=False,
+                                mtp_draft_device_pools=drafts,
+                            )
+                        self.assertIn(role, str(error.exception))
+                        self.assertIn("separate block scales", str(error.exception))
+                        self.assertEqual(allocations, [])
+                    finally:
+                        if host is not None:
+                            host.destroy()
+
+    def test_fp4_dummy_retains_allocator_only_contract(self):
+        """A metadata-only allocator does not promise to transfer FP4 tensors."""
+        pool = self._pool(MLATokenToKVPoolFP4)
+        host = MLATokenToKVPoolHost(
+            pool,
+            2,
+            0,
+            4,
+            "page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+        try:
+            self.assertIsNone(host.kv_buffer)
+            slots = host.alloc(4)
+            self.assertEqual(slots.tolist(), [0, 1, 2, 3])
+            host.free(slots)
+            self.assertEqual(host.available_size(), host.size)
+            with self.assertRaises(AssertionError):
+                host.load_to_device_per_layer(pool, slots, slots, 0, "kernel")
+        finally:
+            host.destroy()
 
 
 if __name__ == "__main__":
