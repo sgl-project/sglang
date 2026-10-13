@@ -657,6 +657,10 @@ def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+    if cfg.prefill_decode_interval_min_running_requests < 0:
+        raise ValueError(
+            "--prefill-decode-interval-min-running-requests must be non-negative."
+        )
 
 
 def default_unset_prefill_decode_interval(server_args: Any):
