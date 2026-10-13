@@ -13,7 +13,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::py::{py_strip, python_dict, python_float, python_json, python_json_reencode};
+use crate::py::{
+    MAX_INT_DIGITS, py_strip, python_dict, python_float, python_json, python_json_reencode,
+};
 use crate::tool_call::{Parsed, ToolCallItem, ToolDetector};
 
 const TOOL_CALL_START: &str = "<tool_call>";
@@ -467,6 +469,9 @@ fn py_int(text: &str) -> Option<String> {
         return None;
     }
     let digits = digits.replace('_', "");
+    if digits.len() > MAX_INT_DIGITS {
+        return None;
+    }
     let digits = digits.trim_start_matches('0');
     Some(match (digits.is_empty(), negative) {
         (true, _) => "0".into(),
@@ -508,34 +513,40 @@ fn float_int(f: f64) -> String {
     }
     // f = mantissa * 2^exponent, with exponent > 0 here.
     let bits = f.to_bits();
-    let exponent = ((bits >> 52) & 0x7ff) as i32 - 1075;
+    let exponent = ((bits >> 52) & 0x7ff) as usize - 1075;
     let mantissa = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let binary = format!("{mantissa:b}{}", "0".repeat(exponent));
+    let sign = if f < 0.0 { "-" } else { "" };
+    format!("{sign}{}", to_decimal(&binary, 2).expect("binary digits"))
+}
+
+/// The decimal digits of the non-negative integer `digits` in `radix`, at any
+/// size, or `None` past [`MAX_INT_DIGITS`], which `json.dumps` cannot print.
+fn to_decimal(digits: &str, radix: u32) -> Option<String> {
+    const BASE: u64 = 1_000_000_000;
+    let digits = digits.trim_start_matches('0');
+    // 10^4300 is about 2^14284.5: bound the work before it.
+    if digits.len().saturating_sub(1) as f64 * f64::from(radix).log2() > 14_300.0 {
+        return None;
+    }
     // Little-endian base-1e9 limbs.
-    let mut limbs = vec![mantissa % 1_000_000_000, mantissa / 1_000_000_000];
-    for _ in 0..exponent {
-        let mut carry = 0;
+    let mut limbs = vec![0u64];
+    for c in digits.chars() {
+        let mut carry = u64::from(c.to_digit(radix)?);
         for limb in &mut limbs {
-            let doubled = *limb * 2 + carry;
-            *limb = doubled % 1_000_000_000;
-            carry = doubled / 1_000_000_000;
+            let value = *limb * u64::from(radix) + carry;
+            *limb = value % BASE;
+            carry = value / BASE;
         }
         if carry > 0 {
             limbs.push(carry);
         }
     }
-    while limbs.len() > 1 && limbs.last() == Some(&0) {
-        limbs.pop();
-    }
-    let mut digits = if f < 0.0 {
-        "-".to_owned()
-    } else {
-        String::new()
-    };
-    digits.push_str(&limbs.last().expect("a limb").to_string());
+    let mut out = limbs.last().expect("a limb").to_string();
     for limb in limbs.iter().rev().skip(1) {
-        digits.push_str(&format!("{limb:09}"));
+        out.push_str(&format!("{limb:09}"));
     }
-    digits
+    (out.len() <= MAX_INT_DIGITS).then_some(out)
 }
 
 /// A Python literal `json.dumps` can serialize.
@@ -626,21 +637,33 @@ impl<'a> LiteralParser<'a> {
         }
     }
 
-    /// Leading newlines; the first line must not be indented.
+    /// Blank and comment-only lines before the literal, whose line must not be indented.
     fn skip_blank_lines(&mut self) -> Option<()> {
-        let blank = self.rest().len() - self.rest().trim_start_matches('\n').len();
-        self.pos += blank;
-        (blank == 0 || !self.rest().starts_with([' ', '\t', '\x0c'])).then_some(())
+        let mut skipped = false;
+        while let Some((line, _)) = self.rest().split_once('\n')
+            && blank_line(line)
+        {
+            self.pos += line.len() + 1;
+            skipped = true;
+        }
+        (!skipped || !self.rest().starts_with([' ', '\t'])).then_some(())
     }
 
     fn at_end_of_line(&self) -> bool {
         matches!(self.peek(), None | Some('\n' | '#'))
     }
 
-    /// Only newlines may follow the expression's line.
+    /// Only blank and comment-only lines may follow the literal's line; a last
+    /// line of bare spaces, with no newline, is an `IndentationError`.
     fn end(&mut self) -> Option<()> {
         self.skip_space();
-        self.rest().bytes().all(|b| b == b'\n').then_some(())
+        let Some(rest) = self.rest().strip_prefix('\n') else {
+            return self.rest().is_empty().then_some(());
+        };
+        let mut lines = rest.split('\n');
+        let last = lines.next_back().expect("split yields a line");
+        let bare_spaces = !last.contains('#') && last.contains([' ', '\t']);
+        (lines.all(blank_line) && blank_line(last) && !bare_spaces).then_some(())
     }
 
     fn value(&mut self) -> Option<Literal> {
@@ -789,8 +812,7 @@ impl<'a> LiteralParser<'a> {
             if digits.is_empty() || digits.ends_with('_') || digits.contains("__") {
                 return None;
             }
-            let value = u128::from_str_radix(&digits.replace('_', ""), radix).ok()?;
-            return Some(Literal::Int(value.to_string()));
+            return to_decimal(&digits.replace('_', ""), radix).map(Literal::Int);
         }
         if token.contains(['.', 'e', 'E']) {
             // Python's float literals and `float()` take the same digit groups.
@@ -902,6 +924,14 @@ impl<'a> LiteralParser<'a> {
         }
         None
     }
+}
+
+/// A line Python's tokenizer skips: whitespace, then maybe a comment.
+fn blank_line(line: &str) -> bool {
+    line.trim_start_matches([' ', '\t', '\x0c'])
+        .chars()
+        .next()
+        .is_none_or(|c| c == '#')
 }
 
 /// Python's `==` between two hashable keys: `1`, `1.0` and `True` are one key.
