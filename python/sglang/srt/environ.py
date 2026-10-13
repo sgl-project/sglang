@@ -938,6 +938,11 @@ class Envs:
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Activation precision for MXFP4-weight dense linears, independent of the
+    # MoE: "fp4" is the checkpoint's own W4A4, "bf16" dequantizes the weights
+    # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
+    # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
+    SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
