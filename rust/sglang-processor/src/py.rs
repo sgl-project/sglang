@@ -1,6 +1,8 @@
 //! Python's `json.dumps` and `str.strip`, which SGLang's output text and
 //! tool-call arguments go through.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 /// Python's `json.dumps(value, ensure_ascii=ascii)`: `", "` and `": "` separators.
@@ -116,26 +118,37 @@ fn python_float(f: f64) -> String {
     format!("{sign}{int}.{frac}")
 }
 
+/// About as many containers as Python 3.12's `json.loads` opens before it
+/// raises `RecursionError` (its C recursion limit, less the caller's frames).
+const MAX_DEPTH: usize = 10_000;
+
 /// `json.dumps(json.loads(text), ensure_ascii=False)`, or `None` where
 /// `json.loads` raises. Integers keep their digits, as Python's `int` does; a
 /// duplicate key keeps its first position and last value. Lone surrogates,
-/// which Python keeps, have no Rust `char` and also give `None`.
+/// which Python keeps, have no Rust `char` and also give `None`. Neither the
+/// scan nor the dump recurses, so nesting costs heap, not stack.
 pub(crate) fn python_json_reencode(text: &str) -> Option<String> {
-    let mut scanner = PyJsonScanner { text, pos: 0 };
-    scanner.skip_ws();
-    let out = scanner.value()?;
-    scanner.skip_ws();
-    (scanner.pos == text.len()).then_some(out)
+    let mut scanner = PyJsonScanner {
+        text,
+        pos: 0,
+        nodes: Vec::new(),
+    };
+    let root = scanner.document()?;
+    Some(scanner.dump(root))
 }
 
 /// `json.dumps(dict(pairs), ensure_ascii=False)` over values already dumped: a
 /// repeated key keeps its first position and last value.
 pub(crate) fn python_dict(pairs: impl IntoIterator<Item = (String, String)>) -> String {
     let mut entries: Vec<(String, String)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for (key, value) in pairs {
-        match entries.iter_mut().find(|(k, _)| *k == key) {
-            Some(entry) => entry.1 = value,
-            None => entries.push((key, value)),
+        match index.get(&key) {
+            Some(&i) => entries[i].1 = value,
+            None => {
+                index.insert(key.clone(), entries.len());
+                entries.push((key, value));
+            }
         }
     }
     let mut out = String::from("{");
@@ -151,10 +164,20 @@ pub(crate) fn python_dict(pairs: impl IntoIterator<Item = (String, String)>) -> 
     out
 }
 
-/// The scanner of Python's `json` module (`_json.c`), re-encoding as it reads.
+/// A parsed JSON value; children are indices into the scanner's nodes.
+enum Node {
+    /// A scalar, already dumped.
+    Leaf(String),
+    Array(Vec<usize>),
+    /// Keys in first-seen order, each with its last value, and their positions.
+    Object(Vec<(String, usize)>, HashMap<String, usize>),
+}
+
+/// The scanner of Python's `json` module (`_json.c`).
 struct PyJsonScanner<'a> {
     text: &'a str,
     pos: usize,
+    nodes: Vec<Node>,
 }
 
 impl PyJsonScanner<'_> {
@@ -175,59 +198,161 @@ impl PyJsonScanner<'_> {
         found
     }
 
-    fn value(&mut self) -> Option<String> {
+    fn push(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// The whole text as one value, with the containers still open on a stack.
+    fn document(&mut self) -> Option<usize> {
+        // Each open container, with the key an object's next value goes under.
+        let mut open: Vec<(usize, Option<String>)> = Vec::new();
+        self.skip_ws();
+        loop {
+            let mut node = match self.rest().bytes().next()? {
+                open_byte @ (b'[' | b'{') => {
+                    if open.len() == MAX_DEPTH {
+                        return None;
+                    }
+                    self.pos += 1;
+                    self.skip_ws();
+                    let is_object = open_byte == b'{';
+                    let id = self.push(match is_object {
+                        true => Node::Object(Vec::new(), HashMap::new()),
+                        false => Node::Array(Vec::new()),
+                    });
+                    if self.eat(if is_object { "}" } else { "]" }) {
+                        id
+                    } else {
+                        let key = if is_object { Some(self.key()?) } else { None };
+                        open.push((id, key));
+                        continue;
+                    }
+                }
+                _ => {
+                    let leaf = self.scalar()?;
+                    self.push(Node::Leaf(leaf))
+                }
+            };
+            // Add the value to its container, then close every container it completes.
+            loop {
+                let Some(frame) = open.last_mut() else {
+                    self.skip_ws();
+                    return (self.pos == self.text.len()).then_some(node);
+                };
+                let (parent, key) = (frame.0, frame.1.take());
+                let is_object = match (&mut self.nodes[parent], key) {
+                    (Node::Array(items), _) => {
+                        items.push(node);
+                        false
+                    }
+                    (Node::Object(entries, index), Some(key)) => {
+                        match index.get(&key) {
+                            Some(&i) => entries[i].1 = node,
+                            None => {
+                                index.insert(key.clone(), entries.len());
+                                entries.push((key, node));
+                            }
+                        }
+                        true
+                    }
+                    _ => unreachable!("only containers are open, objects with a key"),
+                };
+                self.skip_ws();
+                if self.eat(",") {
+                    self.skip_ws();
+                    if is_object {
+                        open.last_mut().expect("still open").1 = Some(self.key()?);
+                    }
+                    break;
+                }
+                if !self.eat(if is_object { "}" } else { "]" }) {
+                    return None;
+                }
+                node = open.pop().expect("still open").0;
+            }
+        }
+    }
+
+    /// An object key and its `:`.
+    fn key(&mut self) -> Option<String> {
+        let key = self.rest().starts_with('"').then(|| self.string())??;
+        self.skip_ws();
+        self.eat(":").then_some(())?;
+        self.skip_ws();
+        Some(key)
+    }
+
+    /// A literal, string or number, dumped.
+    fn scalar(&mut self) -> Option<String> {
         for token in ["null", "true", "false", "NaN", "Infinity", "-Infinity"] {
             if self.eat(token) {
                 return Some(token.into());
             }
         }
-        match self.rest().bytes().next()? {
-            b'"' => {
-                let mut out = String::new();
-                write_python_str(&self.string()?, false, &mut out);
-                Some(out)
-            }
-            b'[' => Some(format!("[{}]", self.items(b']', Self::value)?.join(", "))),
-            b'{' => {
-                let pairs = self.items(b'}', |s| {
-                    let key = s.rest().starts_with('"').then(|| s.string())??;
-                    s.skip_ws();
-                    s.eat(":").then_some(())?;
-                    s.skip_ws();
-                    Some((key, s.value()?))
-                })?;
-                Some(python_dict(pairs))
-            }
-            _ => self.number(),
+        if self.rest().starts_with('"') {
+            let mut out = String::new();
+            write_python_str(&self.string()?, false, &mut out);
+            return Some(out);
         }
+        self.number()
     }
 
-    /// After the opening bracket: `,`-separated items up to `close`.
-    fn items<T>(
-        &mut self,
-        close: u8,
-        mut item: impl FnMut(&mut Self) -> Option<T>,
-    ) -> Option<Vec<T>> {
-        self.pos += 1;
-        self.skip_ws();
-        let mut items = Vec::new();
-        if self.rest().bytes().next() == Some(close) {
-            self.pos += 1;
-            return Some(items);
-        }
-        loop {
-            self.skip_ws();
-            items.push(item(self)?);
-            self.skip_ws();
-            match self.rest().bytes().next()? {
-                b',' => self.pos += 1,
-                c if c == close => {
-                    self.pos += 1;
-                    return Some(items);
+    /// `json.dumps` of the value at `root`, walking the nodes with a stack.
+    fn dump(&self, root: usize) -> String {
+        let mut out = String::new();
+        // Each node being written, with how many children it has written.
+        let mut stack = vec![(root, 0)];
+        while let Some(&(id, written)) = stack.last() {
+            let top = stack.len() - 1;
+            let next = match &self.nodes[id] {
+                Node::Leaf(text) => {
+                    out.push_str(text);
+                    None
                 }
-                _ => return None,
+                Node::Array(items) => {
+                    if written == 0 {
+                        out.push('[');
+                    }
+                    let child = items.get(written).copied();
+                    if child.is_none() {
+                        out.push(']');
+                    } else if written > 0 {
+                        out.push_str(", ");
+                    }
+                    child
+                }
+                Node::Object(entries, _) => {
+                    if written == 0 {
+                        out.push('{');
+                    }
+                    match entries.get(written) {
+                        Some((key, child)) => {
+                            if written > 0 {
+                                out.push_str(", ");
+                            }
+                            write_python_str(key, false, &mut out);
+                            out.push_str(": ");
+                            Some(*child)
+                        }
+                        None => {
+                            out.push('}');
+                            None
+                        }
+                    }
+                }
+            };
+            match next {
+                Some(child) => {
+                    stack[top].1 += 1;
+                    stack.push((child, 0));
+                }
+                None => {
+                    stack.pop();
+                }
             }
         }
+        out
     }
 
     /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?`: an `int` without a
@@ -339,6 +464,26 @@ pub(crate) fn py_rstrip(text: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Nesting costs heap, not stack: past `MAX_DEPTH`, where Python raises
+    /// `RecursionError`, the text is not JSON, even on a small stack.
+    #[test]
+    fn deep_nesting_is_bounded() {
+        let nested = |depth: usize| "[".repeat(depth) + &"]".repeat(depth);
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                assert_eq!(
+                    python_json_reencode(&nested(MAX_DEPTH)),
+                    Some(nested(MAX_DEPTH))
+                );
+                assert_eq!(python_json_reencode(&nested(MAX_DEPTH + 1)), None);
+                assert_eq!(python_json_reencode(&nested(1 << 20)), None);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn python_json_matches_json_dumps() {

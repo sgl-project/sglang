@@ -5,6 +5,8 @@
 
 use serde_json::{Map, Value, json};
 
+use super::Unsupported;
+
 use crate::kimi_k3_format::{
     CALL_CLOSE, CALL_OPEN, THINK_CLOSE, THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
 };
@@ -32,6 +34,12 @@ const TYPE_KEYWORDS: [(&str, &str); 4] = [
     ),
 ];
 
+/// How deep and how long `_schema_types` may run on one argument. Python
+/// recurses until its recursion limit and then drops the tag; a schema past
+/// these bounds is left to the engine, which does exactly that.
+const MAX_SCHEMA_DEPTH: usize = 64;
+const MAX_SCHEMA_STEPS: usize = 10_000;
+
 /// The auto tag over `tools` (request tool definitions), without the `strip`
 /// tokens `strip_structural_tag_excludes` removes; `None` without tools. Only
 /// the trigger's excludes hold think tokens.
@@ -39,14 +47,15 @@ pub(super) fn auto_tool_call_tag(
     tools: &[Value],
     parallel_tool_calls: bool,
     strip: &[&str],
-) -> Option<Value> {
+) -> Result<Option<Value>, Unsupported> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let call_tags = tools
         .iter()
         .map(|tool| tool_call_tag(&tool["function"]))
-        .collect();
+        .collect::<Option<_>>()
+        .ok_or(Unsupported("tool_definition"))?;
     let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
     // `_auto_suffix`: a retriggered second tools section would evade the single-call limit.
     let excludes: Vec<&str> = [THINK_OPEN, THINK_CLOSE, CALL_OPEN]
@@ -61,7 +70,7 @@ pub(super) fn auto_tool_call_tag(
         "stop_after_first": !parallel_tool_calls,
         "excludes": excludes,
     });
-    Some(json!({"type": "structural_tag", "format": format}))
+    Ok(Some(json!({"type": "structural_tag", "format": format})))
 }
 
 fn escape_attr(value: &str) -> String {
@@ -76,19 +85,19 @@ fn sequence(elements: Vec<Value>) -> Value {
     json!({"type": "sequence", "elements": elements})
 }
 
-/// `_tool_call_tag` with `_auto_tool_arguments_format`.
-fn tool_call_tag(function: &Value) -> Value {
+/// `_tool_call_tag` with `_auto_tool_arguments_format`; `None` past the schema bounds.
+fn tool_call_tag(function: &Value) -> Option<Value> {
     let name = escape_attr(function["name"].as_str().unwrap_or_default());
-    json!({
+    Some(json!({
         "type": "tag",
         "begin": format!("{CALL_OPEN} tool=\"{name}\" index=\""),
         "content": sequence(vec![
             json!({"type": "regex", "pattern": "[1-9][0-9]*"}),
             json!({"type": "const_string", "value": "\"<|sep|>"}),
-            auto_arguments_format(&function["parameters"]),
+            auto_arguments_format(&function["parameters"])?,
         ]),
         "end": CALL_CLOSE,
-    })
+    }))
 }
 
 /// `_tool_calls_tag`.
@@ -122,8 +131,8 @@ fn nonempty_argument_format(key: &str, xtml_type: &str) -> Value {
 }
 
 /// `_auto_tool_arguments_format`: required arguments present and non-empty, then any text.
-fn auto_arguments_format(parameters: &Value) -> Value {
-    let loose = || any_text(&[]);
+fn auto_arguments_format(parameters: &Value) -> Option<Value> {
+    let loose = || Some(any_text(&[]));
     let Value::Object(schema) = parameters else {
         return loose();
     };
@@ -145,22 +154,20 @@ fn auto_arguments_format(parameters: &Value) -> Value {
         else {
             return loose();
         };
-        let Some(xtml_type) = single_xtml_type(property, parameters) else {
+        let Some(xtml_type) = single_xtml_type(property, parameters)? else {
             return loose();
         };
         elements.push(nonempty_argument_format(key, xtml_type));
     }
     if elements.is_empty() {
-        let mut alternatives: Vec<Value> = properties
-            .iter()
-            .filter(|(_, s)| s.is_boolean() || s.is_object())
-            .filter_map(|(key, s)| {
-                Some(nonempty_argument_format(
-                    key,
-                    single_xtml_type(s, parameters)?,
-                ))
-            })
-            .collect();
+        let mut alternatives = Vec::new();
+        for (key, property) in properties {
+            if (property.is_boolean() || property.is_object())
+                && let Some(xtml_type) = single_xtml_type(property, parameters)?
+            {
+                alternatives.push(nonempty_argument_format(key, xtml_type));
+            }
+        }
         match alternatives.len() {
             0 => return loose(),
             1 => elements.push(alternatives.remove(0)),
@@ -168,16 +175,19 @@ fn auto_arguments_format(parameters: &Value) -> Value {
         }
     }
     elements.push(any_text(&[CALL_OPEN, CALL_CLOSE]));
-    sequence(elements)
+    Some(sequence(elements))
 }
 
-/// `_single_xtml_type`.
-fn single_xtml_type(schema: &Value, root: &Value) -> Option<&'static str> {
-    match schema_types(schema, root, &mut Vec::new()).as_slice() {
-        ["integer"] => Some("number"),
-        [only] => Some(only),
-        _ => None,
-    }
+/// `_single_xtml_type`; the outer `None` is past the schema bounds.
+fn single_xtml_type(schema: &Value, root: &Value) -> Option<Option<&'static str>> {
+    let mut steps = 0;
+    Some(
+        match schema_types(schema, root, &[], &mut steps)?.as_slice() {
+            ["integer"] => Some("number"),
+            [only] => Some(*only),
+            _ => None,
+        },
+    )
 }
 
 /// `_json_type`.
@@ -210,38 +220,52 @@ fn ordered(set: impl Fn(&str) -> bool) -> Vec<&'static str> {
 }
 
 /// `_schema_types`; `seen` holds the `$ref`s already followed on this path.
-fn schema_types(schema: &Value, root: &Value, seen: &mut Vec<String>) -> Vec<&'static str> {
+/// `None` past `MAX_SCHEMA_DEPTH` or `MAX_SCHEMA_STEPS`.
+fn schema_types(
+    schema: &Value,
+    root: &Value,
+    seen: &[&str],
+    steps: &mut usize,
+) -> Option<Vec<&'static str>> {
+    *steps += 1;
+    if seen.len() > MAX_SCHEMA_DEPTH || *steps > MAX_SCHEMA_STEPS {
+        return None;
+    }
     let schema = match schema {
-        Value::Bool(false) => return Vec::new(),
+        Value::Bool(false) => return Some(Vec::new()),
         Value::Object(schema) => schema,
-        _ => return JSON_TYPES.to_vec(),
+        _ => return Some(JSON_TYPES.to_vec()),
     };
     if let Some(Value::String(reference)) = schema.get("$ref")
-        && !seen.contains(reference)
+        && !seen.contains(&reference.as_str())
         && let Some(target) = resolve_local_ref(reference, root)
     {
-        let mut seen = seen.clone();
-        seen.push(reference.clone());
-        return schema_types(target, root, &mut seen);
+        let seen = [seen, &[reference.as_str()]].concat();
+        return schema_types(target, root, &seen, steps);
     }
+    // Nesting without `$ref`s also counts toward the depth.
+    let nested = [seen, &[""]].concat();
+    let mut branches = |options: &Vec<Value>| -> Option<Vec<Vec<&'static str>>> {
+        options
+            .iter()
+            .filter(|o| o.is_boolean() || o.is_object())
+            .map(|o| schema_types(o, root, &nested, steps))
+            .collect()
+    };
     match schema.get("type") {
         Some(Value::String(t)) => {
-            return match JSON_TYPES.iter().find(|j| *j == t) {
+            return Some(match JSON_TYPES.iter().find(|j| *j == t) {
                 Some(t) => vec![*t],
                 None => JSON_TYPES.to_vec(),
-            };
+            });
         }
-        Some(Value::Array(types)) => return ordered(|t| types.iter().any(|v| v == t)),
+        Some(Value::Array(types)) => return Some(ordered(|t| types.iter().any(|v| v == t))),
         _ => {}
     }
     for keyword in ["anyOf", "oneOf"] {
         if let Some(Value::Array(options)) = schema.get(keyword) {
-            let types: Vec<&str> = options
-                .iter()
-                .filter(|o| o.is_boolean() || o.is_object())
-                .flat_map(|o| schema_types(o, root, seen))
-                .collect();
-            return ordered(|t| types.contains(&t));
+            let types = branches(options)?.concat();
+            return Some(ordered(|t| types.contains(&t)));
         }
     }
     if let Some(Value::Array(options)) = schema.get("allOf") {
@@ -252,10 +276,8 @@ fn schema_types(schema: &Value, root: &Value, seen: &mut Vec<String>) -> Vec<&'s
             }
             types
         };
-        let constrained: Vec<Vec<&'static str>> = options
-            .iter()
-            .filter(|o| o.is_boolean() || o.is_object())
-            .map(|o| schema_types(o, root, seen))
+        let constrained: Vec<Vec<&'static str>> = branches(options)?
+            .into_iter()
             .filter(|types| ordered(|t| types.contains(&t)) != JSON_TYPES.to_vec())
             .collect();
         if let Some((first, rest)) = constrained.split_first() {
@@ -268,18 +290,66 @@ fn schema_types(schema: &Value, root: &Value, seen: &mut Vec<String>) -> Vec<&'s
             if result.contains(&"number") {
                 result.retain(|t| *t != "integer");
             }
-            return ordered(|t| result.contains(&t));
+            return Some(ordered(|t| result.contains(&t)));
         }
     }
     if let Some(value) = schema.get("const") {
-        return vec![json_type(value)];
+        return Some(vec![json_type(value)]);
     }
     if let Some(Value::Array(values)) = schema.get("enum") {
         let types: Vec<&str> = values.iter().map(json_type).collect();
-        return ordered(|t| types.contains(&t));
+        return Some(ordered(|t| types.contains(&t)));
     }
-    TYPE_KEYWORDS
-        .iter()
-        .find(|(_, keywords)| keywords.split_whitespace().any(|k| schema.contains_key(k)))
-        .map_or_else(|| JSON_TYPES.to_vec(), |(json_type, _)| vec![*json_type])
+    Some(
+        TYPE_KEYWORDS
+            .iter()
+            .find(|(_, keywords)| keywords.split_whitespace().any(|k| schema.contains_key(k)))
+            .map_or_else(|| JSON_TYPES.to_vec(), |(json_type, _)| vec![*json_type]),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool whose required argument is `hops + 1` `$ref`s from its type, or
+    /// with `fanout`, `hops` levels that each refer twice to the next.
+    fn ref_tool(hops: usize, fanout: bool) -> Value {
+        let mut defs: Map<String, Value> = (0..hops)
+            .map(|i| {
+                let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+                let def = match fanout {
+                    true => json!({"anyOf": [next, next]}),
+                    false => next,
+                };
+                (format!("D{i}"), def)
+            })
+            .collect();
+        defs.insert(format!("D{hops}"), json!({"type": "integer"}));
+        json!({"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {"x": {"$ref": "#/$defs/D0"}},
+            "required": ["x"], "$defs": defs,
+        }}})
+    }
+
+    /// `$ref` chains and fan-outs past the bounds go to the engine, on a small stack.
+    #[test]
+    fn schema_types_are_bounded() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let tag = |tool| auto_tool_call_tag(&[tool], true, &[]);
+                assert!(matches!(
+                    tag(ref_tool(MAX_SCHEMA_DEPTH - 1, false)),
+                    Ok(Some(_))
+                ));
+                assert!(tag(ref_tool(MAX_SCHEMA_DEPTH, false)).is_err());
+                assert!(tag(ref_tool(10_000, false)).is_err());
+                // Within the depth bound, 2^30 paths exhaust the steps.
+                assert!(tag(ref_tool(30, true)).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

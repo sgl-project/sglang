@@ -309,7 +309,7 @@ pub fn lower_chat(
             .map(|config| config.think_tokens())
             .unwrap_or_default();
         let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
-        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip) {
+        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling["structural_tag"] = python_json(&tag, true).into();
         }
     }
