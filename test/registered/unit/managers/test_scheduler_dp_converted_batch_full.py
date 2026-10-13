@@ -1,5 +1,6 @@
-"""A running batch that DP attention converts to extend stays the running batch."""
+"""DP attention converts a decode step to extend; the running rows keep decoding."""
 
+import copy
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -17,18 +18,32 @@ from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatc
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+_DECODE = SimpleNamespace(is_extend=lambda: False)
+_EXTEND = SimpleNamespace(is_extend=lambda: True)
+
+
 class _RunningBatch:
-    """A running batch that DP attention converts to extend in place."""
+    """Running rows whose decode step DP attention converts to extend."""
 
     def __init__(self, num_reqs):
         self.reqs = [SimpleNamespace(finished=False) for _ in range(num_reqs)]
-        self.forward_mode = SimpleNamespace(is_extend=lambda: False)
+        self.forward_mode = _DECODE
+        self.num_decode_rows = 0
         self.chunked_req = None
         self.is_prefill_only = False
 
+    def shallow_copy(self):
+        batch = copy.copy(self)
+        batch.reqs = self.reqs[:]
+        return batch
+
     def convert_decode_to_extend(self):
-        self.forward_mode = SimpleNamespace(is_extend=lambda: True)
+        self.forward_mode = _EXTEND
+        self.num_decode_rows = len(self.reqs)
         return self
+
+    def has_prefill_rows(self):
+        return self.forward_mode.is_extend() and self.num_decode_rows < len(self.reqs)
 
     def batch_size(self):
         return len(self.reqs)
@@ -76,7 +91,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.get_new_batch_prefill = get_new_batch_prefill
         return s
 
-    def test_converted_batch_stays_running_and_admits_next_step(self):
+    def test_rows_unchanged_by_conversion_and_admit_next_step(self):
         seen = []
         s = self._scheduler(seen)
         running = _RunningBatch(num_reqs=3)
@@ -84,10 +99,13 @@ class TestDpConvertedBatchFull(unittest.TestCase):
 
         # Step N: decode is converted to extend because a peer rank extends.
         plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=None)
-        self.assertIs(plan.batch_to_run, running)
+        self.assertIsNot(plan.batch_to_run, running)
+        self.assertIs(plan.batch_to_run.forward_mode, _EXTEND)
         self.assertIs(plan.running_batch, running)
+        self.assertIs(running.forward_mode, _DECODE)
 
-        # Step N+1: one row finished; the batch comes back as last_batch.
+        # Step N+1: one row finished; the converted step comes back as
+        # last_batch and is not joined: its rows are the running rows.
         running.reqs[0].finished = True
         plan = s.get_next_batch_to_run(
             decoding_batch=decoding_batch, last_batch=plan.batch_to_run
@@ -96,6 +114,8 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         self.assertIs(seen[-1], running)
         self.assertEqual(running.batch_size(), 2)
+        self.assertIs(running.forward_mode, _DECODE)
+        self.assertEqual(running.num_decode_rows, 0)
 
 
 if __name__ == "__main__":

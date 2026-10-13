@@ -364,19 +364,57 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
+    def test_retract_order_is_kept_when_the_rows_joined_at_launch(self):
+        """A loop that joins at launch already holds the last step's finished
+        prefills among the running rows; retract keeps the order of a join at
+        the next plan: the other rows, then the step's rows in its order, with
+        the mid-chunk request where admission put it."""
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                scheduler = self._new_scheduler()
+                old = self._make_req("old")
+                chunk = self._make_req("chunk")
+                new = self._make_req("new")
+                if mixed:
+                    # The mixed step ran old as its tail: the rows are its
+                    # rows, new first.
+                    rows, launched = [new, old], [chunk, new, old]
+                else:
+                    rows, launched = [old, new], [chunk, new]
+                scheduler.running_batch = self._make_batch(
+                    scheduler, reqs=rows, with_tensors=True
+                )
+                scheduler.last_batch = self._make_batch(
+                    scheduler,
+                    reqs=launched,
+                    forward_mode=ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
+                    with_tensors=True,
+                )
+                scheduler.last_batch.num_decode_rows = 1 if mixed else 0
+                scheduler.chunked_req = chunk
+                requeue_log = self._spy_requeue(scheduler)
+
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+                expected = [chunk, new, old] if mixed else [old, chunk, new]
+                self.assertEqual([entry["req"] for entry in requeue_log], expected)
+                self.assertEqual([r.retraction_count for r in expected], [1, 1, 1])
+
     def test_retract_after_dp_conversion_releases_each_req_once(self):
-        """retract after DP attention converted the running batch to extend
-        (running_batch is last_batch) releases each request once."""
+        """retract after DP attention converted the decode step of the running
+        rows to extend releases each request once."""
         scheduler = self._new_scheduler()
         run_req_a = self._make_req("run-a")
         run_req_b = self._make_req("run-b")
-        converted = self._make_batch(
+        scheduler.running_batch = self._make_batch(
             scheduler,
             reqs=[run_req_a, run_req_b],
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=ForwardMode.DECODE,
             with_tensors=True,
         )
-        scheduler.running_batch = converted
+        converted = scheduler.decoding_batch.decode_step()
+        converted.forward_mode = ForwardMode.EXTEND
+        converted.num_decode_rows = 2
         scheduler.last_batch = converted
         requeue_log = self._spy_requeue(scheduler)
 

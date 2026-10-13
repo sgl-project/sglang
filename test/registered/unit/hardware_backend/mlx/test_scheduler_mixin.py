@@ -384,6 +384,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         batch.reqs = [req]
         batch.return_logprob = False
         batch.forward_mode.is_extend.return_value = False
+        batch.has_prefill_rows.return_value = False
         batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
         scheduler.running_batch = batch
         scheduler.decoding_batch = DecodingBatch(batch)

@@ -1317,8 +1317,9 @@ class Scheduler(
         self._engine_paused = False
         self._deferred_input_requests: List = []
 
-    # A read alias of the running rows. The event loops change the rows only
-    # through decoding_batch; assigning here gives the rows a new owner.
+    # A read alias of the running rows. The event loops change the rows through
+    # decoding_batch, except PrefillAdder's preemption, which filters them in
+    # place. Only tests assign here; that gives the rows a new owner.
     @property
     def running_batch(self) -> ScheduleBatch:
         return self.decoding_batch.rows
@@ -3773,6 +3774,9 @@ class Scheduler(
     def get_next_batch_to_run(
         self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # The last decode step from these rows has run and committed (overlap
+        # commits a copy of it), so the rows take back what its run rebound.
+        decoding_batch.absorb()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -3807,11 +3811,9 @@ class Scheduler(
                 decoding_batch.join(new_batch)
                 decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
-        if (
-            not self.enable_hisparse
-            and last_batch
-            and last_batch.forward_mode.is_extend()
-        ):
+        # A step without prefill rows is a decode step, or its DP extend view:
+        # its rows are the running rows, and the leave below drops the finished.
+        if not self.enable_hisparse and last_batch and last_batch.has_prefill_rows():
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -3823,11 +3825,10 @@ class Scheduler(
             # Filter batch
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
-            # Merge the new batch into the running batch. A running batch that
-            # DP attention converted to extend is last_batch itself: filtered
-            # in place above, nothing to merge.
-            if not last_batch.is_empty() and last_batch is not decoding_batch.rows:
-                decoding_batch.join(last_batch)
+            # Merge a copy of the new batch into the running batch: the launched
+            # step never becomes the running rows.
+            if not last_batch.is_empty():
+                decoding_batch.join(last_batch.shallow_copy())
 
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
@@ -3906,14 +3907,13 @@ class Scheduler(
             and self.select_decode_rows(decoding_batch, retract=True)
             and not decoding_batch.rows.is_empty()
         ):
-            return decoding_batch.rows
+            return decoding_batch.decode_step()
         return None
 
     def _finalize_step(self, ret: Optional[ScheduleBatch]) -> Optional[ScheduleBatch]:
         """Prepare the gathered batch to run: DP extend view, ngram inputs, timing."""
         # Decode->extend conversion keeps a heterogeneous dp step replayable.
-        # A converted running batch stays the running batch; next step it comes
-        # back as last_batch and is filtered in place, not merged with itself.
+        # It converts the decode step; the running rows keep decoding.
         ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
         self._arm_prefill_decode_interval(ret)
 
@@ -5667,21 +5667,31 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
 
-        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        launched_reqs = []
         for batch in running_and_inflight_batches(self):
             if (
                 batch is not None
-                # A running batch that DP attention converted to extend is
-                # last_batch itself; its requests are already listed above.
                 and batch is not self.running_batch
-                and batch.forward_mode.is_extend()
+                # A step without prefill rows is a decode step, or its DP extend
+                # view; its requests are the running ones.
+                and batch.has_prefill_rows()
                 # Skip merge for disagg prefill: completed prefill requests are
                 # already in disagg_prefill_inflight_queue. Merging them into
                 # running_batch leaks them, since the prefill event loop never
                 # calls update_running_batch to clean them up.
                 and self.disaggregation_mode != DisaggregationMode.PREFILL
             ):
-                retract_reqs += [r for r in batch.reqs if not r.finished()]
+                launched_reqs += batch.reqs
+        # The rows the last step did not launch, then that step's rows in its
+        # order, where a mid-chunk request sits where admission put it. Running
+        # rows that already joined from that step are listed once, at its order.
+        launched_ids = {id(r) for r in launched_reqs}
+        retract_reqs = [
+            r
+            for r in self.running_batch.reqs
+            if not r.finished() and id(r) not in launched_ids
+        ]
+        retract_reqs += [r for r in launched_reqs if not r.finished()]
 
         if (
             self.chunked_req is not None

@@ -560,8 +560,10 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     # A read alias of each slot's running rows, set up by the pipeline loops.
-    # The loops change the rows only through decoding_batches; assigning here
-    # gives every slot's rows a new owner.
+    # The loops change the rows through decoding_batches, except PrefillAdder's
+    # preemption, which filters them in place. Only tests assign here; that
+    # gives every slot's rows a new owner, and the slot the loop selected keeps
+    # its old one.
     @property
     def running_mbs(self: Scheduler) -> List[ScheduleBatch]:
         return [decoding_batch.rows for decoding_batch in self.decoding_batches]

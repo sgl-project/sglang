@@ -2592,6 +2592,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def first_decode_row(self) -> int:
         return len(self.reqs) - self.num_decode_rows
 
+    def has_prefill_rows(self) -> bool:
+        return self.forward_mode.is_extend() and self.num_decode_rows < len(self.reqs)
+
     def is_dllm(self):
         return self.dllm_config is not None
 
@@ -3189,6 +3192,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
+        self._set_mixed_mamba_track_plan()
         self.num_decode_rows = running_bs
         self.out_cache_loc = out_cache_loc
         if merged_seq_lens_cpu is not None:
@@ -3209,6 +3213,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+
+    def _set_mixed_mamba_track_plan(self):
+        """The mamba track plan of a mixed step: no row tracks. A decode row
+        gets a plan again at its next decode-only step."""
+        self._clear_mamba_track_plan()
+
+    def _clear_mamba_track_plan(self):
+        """Drop the per-row mamba track plan; prepare_for_decode or
+        prepare_for_extend builds the next one."""
+        self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
+        self.mamba_lazy_spec_track_positions_cpu = None
+
+    # The fields convert_decode_to_extend sets; nothing else on the batch
+    # changes. A class attribute without an annotation, so not a dataclass field.
+    EXTEND_VIEW_FIELDS = frozenset(
+        {
+            "forward_mode",
+            "chunked_req",
+            "prefill_stats",
+            "prefix_lens",
+            "extend_lens",
+            "extend_num_tokens",
+            "extend_logprob_start_lens",
+            "num_decode_rows",
+            "is_prefill_only",
+        }
+    )
 
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
@@ -3720,16 +3759,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
-        self.mamba_track_indices = None
-        self.mamba_track_buffer_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
-        self.mamba_track_seqlens_cpu = None
-        self.mamba_prefill_track_mask_cpu = None
-        self.mamba_track_mask_cpu = None
-        self.mamba_track_mask_next_cpu = None
-        self.mamba_decode_batch_idx_cpu = None
-        self.mamba_lazy_spec_track_positions_cpu = None
+        self._clear_mamba_track_plan()
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -3789,16 +3819,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = None
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-        self.mamba_track_indices = None
-        self.mamba_track_buffer_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
-        self.mamba_track_seqlens_cpu = None
-        self.mamba_prefill_track_mask_cpu = None
-        self.mamba_track_mask_cpu = None
-        self.mamba_track_mask_next_cpu = None
-        self.mamba_decode_batch_idx_cpu = None
-        self.mamba_lazy_spec_track_positions_cpu = None
+        self._clear_mamba_track_plan()
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
@@ -3878,6 +3899,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
         )
+
+    def shallow_copy(self) -> ScheduleBatch:
+        """A batch with every field of this one and its own reqs list.
+
+        Tensors, sampling_info and spec_info are shared, so an in-place write
+        through either batch reaches both; a field rebound on one is not seen
+        by the other.
+        """
+        batch = copy.copy(self)
+        batch.reqs = self.reqs[:]
+        return batch
 
     def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
         """Pick this forward's per-request SWA eviction trigger.
