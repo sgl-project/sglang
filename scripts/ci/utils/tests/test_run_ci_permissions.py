@@ -68,9 +68,7 @@ class ResolveTagRunCiPermissionsTest(unittest.TestCase):
         repo = Mock()
         repo.get_collaborator_permission.side_effect = RuntimeError("API unavailable")
 
-        result = handler.resolve_tag_run_ci_permissions(
-            repo, "unknown-user", None
-        )
+        result = handler.resolve_tag_run_ci_permissions(repo, "unknown-user", None)
 
         self.assertNotIn("can_tag_run_ci_label", result)
 

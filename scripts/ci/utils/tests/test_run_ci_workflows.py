@@ -11,9 +11,7 @@ class RunCiWorkflowContractTest(unittest.TestCase):
     def test_slash_handler_executes_default_branch_code(self):
         workflow = self.read_workflow("slash-command-handler.yml")
 
-        self.assertIn(
-            "ref: ${{ github.event.repository.default_branch }}", workflow
-        )
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", workflow)
         self.assertNotIn("refs/pull/", workflow)
         self.assertNotIn("headRefName", workflow)
 
