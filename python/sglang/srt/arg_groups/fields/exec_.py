@@ -316,9 +316,9 @@ class ExecKernel(msgspec.Struct):
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
             "through the flashinfer trtllm-gen sparse MLA kernel. "
-            "'flashmla_mega' (opt-in, DeepSeek-V4.1 on SM100/SM103) fuses "
-            "Q RoPE, sparse attention, inverse output RoPE and MXFP8 casting, "
-            "with packed FP4 compressed KV and an MXFP8 WO-A projection. "
+            "'flashmla_mega' (opt-in, DeepSeek-V4.1 on SM100/SM103) runs the "
+            "fused Q-RoPE + sparse attention + inverse-RoPE + MXFP8 kernel "
+            "over packed V4.1 KV and feeds WO-A directly. "
             "The backend choice is shared by prefill and decode.",
             choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
             resolvable=True,

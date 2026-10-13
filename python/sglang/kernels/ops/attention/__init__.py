@@ -58,23 +58,15 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
-for _fn, _backend in (
-    ("pack_mega_query", KernelBackend.TRITON),
-    ("flashmla_mega_decode", KernelBackend.AOT),
-    ("flashmla_mega_prefill", KernelBackend.AOT),
-):
-    register_kernel(
-        KernelSpec(
-            op=f"attention.{_fn}",
-            backend=_backend,
-            target=f"sglang.kernels.ops.attention.dsv4.mega_attention:{_fn}",
-            capabilities=frozenset(
-                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
-            ),
-            description="DeepSeek-V4.1 FlashMLA MegaAttention (64/128 padded heads)",
-        )
+register_kernel(
+    KernelSpec(
+        op="attention.pack_mega_query",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.mega_attention:pack_mega_query",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description="Chunk-interleaved, head-padded Q for FlashMLA MegaAttention.",
     )
-del _fn, _backend
+)
 
 register_kernel(
     KernelSpec(

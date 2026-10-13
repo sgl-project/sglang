@@ -1007,16 +1007,15 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
-        self.rope_cache_key = (
-            self.qk_rope_head_dim,
-            config.max_position_embeddings,
-            original_seq_len,
-            self.rope_base,
-            scaling.get("factor", 1.0),
-            scaling.get("beta_fast", 32),
-            scaling.get("beta_slow", 1),
+        freqs_cis = precompute_freqs_cis(
+            dim=self.qk_rope_head_dim,
+            seqlen=config.max_position_embeddings,
+            original_seq_len=original_seq_len,
+            base=self.rope_base,
+            factor=scaling.get("factor", 1.0),
+            beta_fast=scaling.get("beta_fast", 32),
+            beta_slow=scaling.get("beta_slow", 1),
         )
-        freqs_cis = precompute_freqs_cis(*self.rope_cache_key)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -1258,29 +1257,28 @@ class MQALayer(MqaAttentionBase):
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
         if self.use_mega_attention:
+            from sgl_kernel.flash_mla_mega import is_flash_mla_mega_available
+
+            if not is_flash_mla_mega_available():
+                raise ImportError(
+                    "flashmla_mega needs sgl-kernel built with the FlashMLA "
+                    "MegaAttention ops (CUDA >= 12.9)"
+                )
             if (
                 self.q_head_norm
                 or self.head_dim != 512
                 or self.qk_rope_head_dim != 64
                 or self.n_local_heads > 128
-                or self.n_local_groups <= 0
                 or self.n_local_heads != 8 * self.n_local_groups
                 or self.wo_a_fp8
             ):
                 raise ValueError(
-                    "MegaAttention requires DeepSeek-V4.1 with eight 512-dim "
-                    "heads per WO-A group and BF16 source WO-A weights"
+                    "flashmla_mega needs DeepSeek-V4.1 attention with eight "
+                    "512-dim heads per WO-A group and BF16 WO-A weights"
                 )
-            from sglang.srt.layers.attention.dsv4.mega_attention import (
-                get_mega_cos_sin_cache,
-            )
-
-            self.mega_cos_sin_cache = get_mega_cos_sin_cache(
-                self.freqs_cis, self.rope_cache_key
-            )
+            self.mega_cos_sin_cache = None
             self.mega_wq_b = None
-            self.register_buffer("mega_wo_weight", None, persistent=False)
-            self.register_buffer("mega_wo_scale", None, persistent=False)
+            self.mega_wo_a = None
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1304,40 +1302,26 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        if self.use_mega_attention:
-            from sglang.srt.layers.attention.dsv4.mega_attention import (
-                get_mega_cos_sin_cache,
-            )
-
-            self.mega_cos_sin_cache = get_mega_cos_sin_cache(
-                self.freqs_cis, self.rope_cache_key
-            )
         if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
 
     def setup_mega_attention(self) -> None:
+        """Derive the fused kernel's weight layouts; rerun after every weight load."""
         if not self.use_mega_attention:
             return
-        from sglang.kernels.ops.attention.dsv4.mega_attention import (
-            require_mega_attention,
-        )
         from sglang.srt.layers.attention.dsv4.mega_attention import (
-            prepare_mega_q_projection,
+            mega_cos_sin_cache,
             prepare_mega_wo_a,
+            prepare_mega_wq_b,
         )
 
-        require_mega_attention()
-        weight = getattr(self.wo_a, "weight", None)
-        if weight is None or weight.dtype != torch.bfloat16:
-            raise ValueError("MegaAttention requires BF16 source WO-A weights")
-        # Rebuild after each load, before CUDA graph capture. Keeping the source
-        # parameter in checkpoint order avoids corrupting hot weight reloads.
-        self.mega_wo_weight, self.mega_wo_scale = prepare_mega_wo_a(
-            weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        self.mega_cos_sin_cache = mega_cos_sin_cache(self.freqs_cis)
+        self.mega_wq_b = prepare_mega_wq_b(self.wq_b, self.n_local_heads)
+        self.mega_wo_a = prepare_mega_wo_a(
+            self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         )
-        self.mega_wq_b = prepare_mega_q_projection(self.wq_b, self.n_local_heads)
 
     def _get_npu_rope_position_cache(
         self,
@@ -2494,21 +2478,14 @@ class MQALayer(MqaAttentionBase):
 
         if self.use_mega_attention:
             from sglang.kernels.ops.attention.dsv4.mega_attention import pack_mega_query
-            from sglang.srt.layers.attention.dsv4.mega_attention import (
-                project_mega_attention,
-            )
+            from sglang.srt.layers.attention.dsv4.mega_attention import apply_mega_wo_a
 
-            if self.mega_wo_weight is None:
-                raise RuntimeError(
-                    "MegaAttention WO-A was not prepared after weight loading"
-                )
             if forward_batch.forward_mode.is_idle():
-                # An idle DP rank may have padded rows, but no attention work.
                 o = x.new_zeros(x.shape[0], self.n_local_groups, self.o_lora_rank)
             else:
                 if not self._use_mega_q_projection():
                     q = pack_mega_query(q, kernel_num_heads)
-                out = attn_backend.forward(
+                data, scale = attn_backend.forward(
                     q=q,
                     k=q,
                     v=q,
@@ -2517,12 +2494,9 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=False,
-                    mega_positions=positions,
-                    mega_cos_sin_cache=self.mega_cos_sin_cache,
+                    cos_sin_cache=self.mega_cos_sin_cache,
                 )
-                o = project_mega_attention(
-                    out.data, out.scale, self.mega_wo_weight, self.mega_wo_scale
-                )
+                o = apply_mega_wo_a(data, scale, self.mega_wo_a)
             return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is

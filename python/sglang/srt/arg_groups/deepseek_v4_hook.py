@@ -61,9 +61,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             )
         if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"):
             raise ValueError(
-                "--dsv4-attn-backend flashmla_mega requires "
-                "--kv-cache-dtype auto or fp8_e4m3 for byte-packed KV storage; "
-                "NVFP4 compressed KV is selected separately by its layout"
+                "--dsv4-attn-backend flashmla_mega requires --kv-cache-dtype fp8_e4m3"
             )
         unsupported = (
             (
@@ -75,15 +73,19 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
+            # Tail-row replays hand attention fewer rows than the metadata positions.
+            (
+                "SWA bounded replay",
+                cfg.enable_encoder_swa_bounded_replay
+                or cfg.enable_decoder_swa_bounded_replay,
+            ),
         )
         for feature, enabled in unsupported:
             if enabled:
                 raise ValueError(
                     f"--dsv4-attn-backend flashmla_mega does not support {feature} yet"
                 )
-        logger.info(
-            "DeepSeek-V4.1 MegaAttention enabled (packed KV, fused RoPE and MXFP8 WO-A)"
-        )
+        logger.info("DeepSeek-V4.1 attention: flashmla_mega backend enabled.")
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported

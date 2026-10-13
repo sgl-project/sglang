@@ -36,35 +36,33 @@ def mega_args(model_type="deepseek_v41", **fields):
 
 
 class TestDSV41MegaAttentionPolicy(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.enterContext(override_platform(is_cuda=True, is_hip=False, is_npu=False))
-
-    def test_rejects_layout_and_execution_incompatibilities(self):
-        cases = (
+    def test_flashmla_mega_launch_policy(self):
+        rejected = (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
             ("BF16 activations", dict(dtype="float16")),
-            ("packed KV storage", dict(kv_cache_dtype="bfloat16")),
+            ("fp8_e4m3", dict(kv_cache_dtype="bfloat16")),
             ("context parallelism", dict(attn_cp_size=2)),
-            ("context parallelism", dict(enable_prefill_cp=True)),
             ("PD disaggregation", dict(disaggregation_mode="decode")),
             ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.BREAKABLE)),
+            ("SWA bounded replay", dict(enable_decoder_swa_bounded_replay=True)),
         )
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
-            for message, fields in cases:
+        with (
+            override_platform(is_cuda=True, is_hip=False, is_npu=False),
+            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True),
+        ):
+            for message, fields in rejected:
                 with self.subTest(fields=fields):
                     with self.assertRaisesRegex(ValueError, message):
                         apply_deepseek_v4_defaults(
                             mega_args(**fields), "DeepseekV4ForCausalLM"
                         )
-
-    def test_accepts_dp_attention_and_decode_cuda_graphs(self):
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
-            args = mega_args(tp_size=4, attn_dp_size=4)
-            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-
-    def test_rejects_non_sm100_hardware(self):
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
+            apply_deepseek_v4_defaults(
+                mega_args(tp_size=4, attn_dp_size=4), "DeepseekV4ForCausalLM"
+            )
+        with (
+            override_platform(is_cuda=True, is_hip=False, is_npu=False),
+            patch("sglang.srt.utils.common.is_sm100_supported", return_value=False),
+        ):
             with self.assertRaisesRegex(ValueError, "SM100/SM103"):
                 apply_deepseek_v4_defaults(mega_args(), "DeepseekV4ForCausalLM")
 

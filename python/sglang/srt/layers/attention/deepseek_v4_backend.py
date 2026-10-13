@@ -126,7 +126,6 @@ from sglang.srt.utils.common import async_h2d
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
-    from sglang.kernels.ops.attention.dsv4.mega_attention import MegaAttentionOutput
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -1143,6 +1142,7 @@ class DeepseekV4AttnBackend(
         )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
+        self.mega_attn = get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
@@ -3623,10 +3623,9 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
-        mega_positions: Optional[torch.Tensor] = None,
-        mega_cos_sin_cache: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
         **_,
-    ) -> Union[torch.Tensor, MegaAttentionOutput]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
@@ -3750,23 +3749,19 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
-                    mega_positions=mega_positions,
-                    mega_cos_sin_cache=mega_cos_sin_cache,
+                    cos_sin_cache=cos_sin_cache,
                 )
 
-            if mega_positions is not None:
-                from sglang.kernels.ops.attention.dsv4.mega_attention import (
-                    flashmla_mega_decode,
-                )
+            if self.mega_attn:
+                from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
-                assert mega_cos_sin_cache is not None
-                return flashmla_mega_decode(
-                    q=q.squeeze(1),
-                    kv=swa_k_cache,
-                    indices=swa_page_indices.squeeze(1),
-                    positions=mega_positions,
-                    cos_sin_cache=mega_cos_sin_cache,
-                    softmax_scale=self.softmax_scale,
+                data, scale, _ = flash_mla_mega_decode(
+                    q.squeeze(1),
+                    swa_k_cache,
+                    swa_page_indices.squeeze(1),
+                    match_num_queries(core_attn_metadata.positions, value=0),
+                    cos_sin_cache,
+                    self.softmax_scale,
                     attn_sink=attn_sink,
                     topk_length=swa_topk_lengths,
                     extra_kv=extra_k_cache,
@@ -3775,6 +3770,7 @@ class DeepseekV4AttnBackend(
                     else extra_indices.squeeze(1),
                     extra_topk_length=extra_topk_lengths,
                 )
+                return data, scale
 
             if (
                 self.is_dsv41
@@ -3881,9 +3877,8 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
-        mega_positions: Optional[torch.Tensor] = None,
-        mega_cos_sin_cache: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, MegaAttentionOutput]:
+        cos_sin_cache: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
@@ -3942,22 +3937,20 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if mega_positions is not None:
-            from sglang.kernels.ops.attention.dsv4.mega_attention import (
-                flashmla_mega_prefill,
-            )
+        if self.mega_attn:
+            from sgl_kernel.flash_mla_mega import flash_mla_mega_prefill
 
-            assert mega_cos_sin_cache is not None
-            return flashmla_mega_prefill(
-                q=q_flat,
-                kv=kv,
-                indices=combined_indices.unsqueeze(1),
-                positions=mega_positions,
-                cos_sin_cache=mega_cos_sin_cache,
-                softmax_scale=self.softmax_scale,
+            data, scale, _, _ = flash_mla_mega_prefill(
+                q_flat,
+                kv,
+                combined_indices.unsqueeze(1),
+                core_attn_metadata.positions,
+                cos_sin_cache,
+                self.softmax_scale,
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
             )
+            return data, scale
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

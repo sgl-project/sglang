@@ -1,28 +1,25 @@
-"""Load-time WO-A preparation and projection of fused attention's MXFP8 output."""
-
 from __future__ import annotations
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.mega_layout import permute_mega_wo_a
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.runtime_context import get_buffer
 
 
-def get_mega_cos_sin_cache(freqs_cis: torch.Tensor, rope_key: tuple) -> torch.Tensor:
-    from sglang.srt.runtime_context import get_buffer
-
-    caches = get_buffer("dsv4_mega_cos_sin", dict)
-    key = (rope_key, freqs_cis.device, freqs_cis.dtype)
-    if key not in caches:
-        caches[key] = torch.cat(
-            (freqs_cis.real.float(), freqs_cis.imag.float()), dim=-1
-        ).contiguous()
-    return caches[key]
+def mega_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+    tables = get_buffer("dsv4_mega_cos_sin", dict)
+    key = freqs_cis.data_ptr()
+    if key not in tables:
+        # The fused kernel reads [positions, cos(32) | sin(32)], not interleaved pairs.
+        tables[key] = torch.cat((freqs_cis.real, freqs_cis.imag), dim=-1)
+    return tables[key]
 
 
-def prepare_mega_q_projection(linear, num_heads: int) -> torch.nn.Module | None:
+def prepare_mega_wq_b(
+    linear: torch.nn.Module, num_heads: int
+) -> torch.nn.Module | None:
     method = linear.quant_method
     backend = getattr(method, "mxfp8_dense_backend", None)
     if (
@@ -46,62 +43,54 @@ def prepare_mega_q_projection(linear, num_heads: int) -> torch.nn.Module | None:
     ):
         return None
 
-    def permute_rows(tensor):
-        return (
-            tensor.view(num_heads, 32, 16, -1)
-            .transpose(0, 1)
-            .contiguous()
-            .view(rows, -1)
-        )
+    def permute_rows(tensor: torch.Tensor) -> torch.Tensor:
+        # (head, chunk, 16) -> (chunk, head, 16): the kernel's Q row order.
+        return tensor.view(num_heads, 32, 16, -1).transpose(0, 1).reshape(rows, -1)
 
+    # Only .weight / .weight_scale_inv_swizzled are read by quant_method.apply.
     projection = torch.nn.Module()
-    projection.register_buffer("weight", permute_rows(weight), persistent=False)
-    projection.register_buffer(
-        "weight_scale_inv_swizzled",
-        block_scale_interleave(permute_rows(scale)).contiguous(),
-        persistent=False,
-    )
+    projection.weight = permute_rows(weight)
+    projection.weight_scale_inv_swizzled = block_scale_interleave(
+        permute_rows(scale)
+    ).contiguous()
     return projection
 
 
 def prepare_mega_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    permuted = permute_mega_wo_a(weight)
-    quantized = [
-        sglang_per_token_group_quant_fp8(
-            group,
-            group_size=32,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=True,
-        )
-        for group in permuted.unbind(0)
-    ]
-    return (
-        torch.stack([data for data, _ in quantized]),
-        torch.stack([scale.transpose(0, 1) for _, scale in quantized]).transpose(1, 2),
+    groups, rank, hidden = weight.shape
+    # The kernel emits each group's 512 dims as 32-element chunks interleaved across its 8 heads.
+    permuted = (
+        weight.view(groups, rank, 8, 16, 32).transpose(2, 3).reshape(weight.shape)
+    )
+    return sglang_per_token_group_quant_fp8(
+        permuted,
+        group_size=32,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        # Fully-masked batched quant: the one layout with per-group column-major scales.
+        masked_m=torch.full((groups,), rank, dtype=torch.int32, device=weight.device),
     )
 
 
-def project_mega_attention(
+def apply_mega_wo_a(
     data: torch.Tensor,
     scale: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
+    wo_a: tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
     import deep_gemm
 
-    tokens, groups, rank = data.shape[0], weight.shape[0], weight.shape[1]
-    output = torch.empty(
-        (tokens, groups, rank), dtype=torch.bfloat16, device=data.device
+    weight, weight_scale = wo_a
+    groups, rank = weight.shape[:2]
+    out = torch.empty(
+        (data.shape[0], groups, rank), dtype=torch.bfloat16, device=data.device
     )
-    if tokens:
-        # The fused kernel already applied inverse RoPE and produced packed,
-        # TMA-aligned per-32 scales. No cast/quantization/repacking belongs here.
-        deep_gemm.fp8_einsum(
-            "bhr,hdr->bhd",
-            (data[:, :groups], scale[:, :groups]),
-            (weight, weight_scale),
-            output,
-            recipe=(1, 1, 32),
-        )
-    return output
+    # Groups past the real heads hold the kernel's zero-padded heads.
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (data[:, :groups], scale[:, :groups]),
+        (weight, weight_scale),
+        out,
+        recipe=(1, 1, 32),
+    )
+    return out
