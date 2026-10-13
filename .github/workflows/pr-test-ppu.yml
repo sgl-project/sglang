@@ -1,15 +1,11 @@
 name: PR Test (PPU)
 
 on:
-  # No pull_request trigger: the PR path is orchestrated by ci.yaml
-  # (org-level gate chain: precheck -> smoke/AI review -> human review ->
-  # this workflow via workflow_call), and a direct pull_request trigger
-  # here would double-run alongside that chain. The run-ci label gate
-  # below still applies to the inherited pull_request event on the
-  # workflow_call path unless the caller opts out via
-  # require_run_ci_label: false (which ci.yaml does, since human approval
-  # already gated the run). Manual verification keeps using
-  # workflow_dispatch, which bypasses the gate.
+  # No pull_request trigger: the PR path is orchestrated by ci.yaml, and a
+  # direct pull_request trigger here would double-run alongside that chain.
+  # The run-ci label gate below still applies to the inherited pull_request
+  # event on the workflow_call path. Manual verification keeps using
+  # workflow_dispatch, which bypasses the PR-event gate.
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -26,8 +22,7 @@ on:
       require_run_ci_label:
         description: >-
           Whether the run-ci label gate applies when the caller's event
-          is pull_request. ci.yaml passes false so Full CI runs after
-          human approval without needing the label.
+          is pull_request. ci.yaml keeps the default enabled.
         required: false
         type: boolean
         default: true
@@ -49,10 +44,8 @@ jobs:
   check-changes:
     # PPU runner consumption is gated behind the `run-ci` label on the
     # pull_request event. A called workflow inherits the caller's event,
-    # so the gate also applies on the ci.yaml -> workflow_call path;
-    # ci.yaml bypasses it with require_run_ci_label: false because its
-    # human-review job already authorized the run. Manual runs
-    # (workflow_dispatch) bypass the gate via the event check.
+    # so the default-enabled gate also applies on the ci.yaml -> workflow_call
+    # path. Manual runs (workflow_dispatch) bypass the gate via the event check.
     if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:

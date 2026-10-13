@@ -2,7 +2,7 @@ name: CI Pipeline
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   pull_request_review:
     types: [submitted]
 
@@ -11,12 +11,14 @@ permissions:
   pull-requests: read
 
 concurrency:
-  # Ignored review events use a per-run suffix so they cannot cancel active PR CI.
+  # Ignored review and unrelated-label events use a per-run suffix so they
+  # cannot cancel active PR CI.
   group: >-
     ci-${{ github.event.pull_request.number }}-${{
-    github.event_name == 'pull_request_review' &&
-    (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot') &&
-    github.run_id || 'active' }}
+    ((github.event_name == 'pull_request_review' &&
+    (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
+    (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+    github.event.label.name != 'run-ci')) && github.run_id || 'active' }}
   cancel-in-progress: true
 
 jobs:
@@ -51,16 +53,17 @@ jobs:
     uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
-  # Stage 4: 完整业务 CI —— 人工审批通过后，经 workflow_call 串起完整 PPU 套件。
-  # 被调 workflow 继承本 workflow 的 pull_request 事件，其 run-ci label 门禁会默认
-  # 静默跳过全部作业，故显式传 require_run_ci_label: false 绕过（human-review 已放行）。
-  # 同仓 ./ 引用：被调方从本次 commit（PR merge ref）加载；不额外传 ref，其
-  # `inputs.ref || github.ref` 回退到 PR merge ref。PPU_ARTIFACTORY 凭据经
-  # secrets: inherit 传递。
+  # Stage 4: Full PPU CI. The run-ci label authorizes PPU consumption;
+  # Registration Validation remains the technical prerequisite. Human Review
+  # is an independent merge gate and does not delay PPU feedback.
+  # For labeled events, only adding run-ci starts Full CI; adding another label
+  # to a PR that already has run-ci must not create a duplicate run.
   ci:
     name: Full CI
-    needs: human-review
+    needs: registration-validation
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     uses: ./.github/workflows/pr-test-ppu.yml
-    with:
-      require_run_ci_label: false
     secrets: inherit

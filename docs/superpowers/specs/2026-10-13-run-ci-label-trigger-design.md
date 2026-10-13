@@ -31,7 +31,7 @@ Human Review job 保持现状，继续产生独立 required check。PPU workflow
 | synchronize | 否 | 跳过 |
 | pull_request_review | 任意 | 只更新 Human Review，不启动 Full CI |
 
-标签添加后保留在 PR 上，不自动移除。现有 concurrency 继续取消同一 PR 的过期 run，确保只保留最新提交对应的执行。
+标签添加后保留在 PR 上，不自动移除。有效的 PR CI 事件继续共享 active concurrency group，以取消同一 PR 的过期 run；非 `run-ci` 的 `labeled` 事件使用 per-run suffix，避免其取消正在执行的 Full CI。
 
 ## Slash Command 与授权
 
