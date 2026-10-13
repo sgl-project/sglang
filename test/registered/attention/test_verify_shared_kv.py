@@ -59,6 +59,49 @@ def _build_inputs(
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestVerifySharedKV(CustomTestCase):
+    def test_split_partials_preserve_cancellation_residual(self):
+        from sglang.kernels.ops.attention.verify_mla import VerifyMLA, block_config
+
+        for dim in (64, 256):
+            with self.subTest(head_dim=dim):
+                block_h, block_n, num_warps = block_config(dim)
+                prefix = 2 * block_n
+                q = torch.zeros(3, 16, dim, device="cuda", dtype=torch.bfloat16)
+                k = torch.zeros(3, 1, dim, device="cuda", dtype=q.dtype)
+                v = torch.zeros_like(k)
+                kb = torch.zeros(prefix, 1, dim, device="cuda", dtype=q.dtype)
+                vb = torch.full_like(kb, -32)
+                vb[:block_n] = 32
+                vb[:7] = 32.25
+                qo = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+                kp = torch.tensor([0, prefix], device="cuda", dtype=torch.int32)
+                ids = torch.arange(prefix, device="cuda", dtype=torch.int64)
+                kernel = VerifyMLA(
+                    1,
+                    16,
+                    dim,
+                    dim,
+                    3,
+                    block_h=block_h,
+                    block_n=block_n,
+                    num_warps=num_warps,
+                )
+                # Uniform attention: opposite V blocks leave a total of 1.75.
+                ref = 1.75 / (
+                    prefix + torch.arange(1, 4, device="cuda", dtype=torch.float64)
+                )
+                ref = ref[:, None, None].expand_as(q)
+                out = kernel(q, k, v, kb, vb, qo, kp, ids, dim**-0.5)
+                torch.testing.assert_close(out.double(), ref, atol=5e-5, rtol=0)
+                # Growing cached scratch must retain the same precision policy.
+                kernel.grow_buffers(2)
+                self.assertEqual(kernel.att_out.dtype, torch.float32)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    out = kernel(q, k, v, kb, vb, qo, kp, ids, dim**-0.5)
+                graph.replay()
+                torch.testing.assert_close(out.double(), ref, atol=5e-5, rtol=0)
+
     def _run_parity(
         self,
         head_dim,
