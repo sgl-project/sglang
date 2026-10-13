@@ -28,9 +28,14 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    FP4MXBlock16KVCacheMethod,
+    NVFP4KVCacheMethod,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
 )
 from sglang.srt.mem_cache.pool_host.base import (
@@ -143,10 +148,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         pool_label: str = "kv",
     ):
         for pool in (device_pool, *mtp_draft_device_pools):
-            if pool.store_dtype == torch.uint8 and pool.k_scale_buffer is not None:
+            if isinstance(pool, MHATokenToKVPoolFP4) or isinstance(
+                pool.quant_method, (NVFP4KVCacheMethod, FP4MXBlock16KVCacheMethod)
+            ):
                 raise ValueError(
-                    f"{pool_label}: MHA host transfers do not support packed uint8 "
-                    f"KV with separate block scales (pool={type(pool).__name__})."
+                    f"{pool_label}: MHA host transfers do not support FP4 "
+                    f"KV cache (pool={type(pool).__name__})."
                 )
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num

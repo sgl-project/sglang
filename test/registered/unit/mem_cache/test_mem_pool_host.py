@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
-    get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
@@ -286,74 +285,6 @@ class TestHostKVCache(CustomTestCase):
         self.assertEqual(self.host_pool.num_release_slots, 0)
         self.assertEqual(self.host_pool.release_slots, [])
 
-    def test_npu_fp8_host_constructor_with_cpu_allocations(self):
-        """NPU byte-backed FP8 has no block scales and remains admitted."""
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
-
-        with unittest.mock.patch.dict("os.environ", {"ASCEND_USE_FIA": "True"}):
-            pool = NPUMHATokenToKVPool(
-                size=32,
-                page_size=16,
-                dtype=torch.float8_e4m3fn,
-                head_num=2,
-                head_dim=64,
-                layer_num=1,
-                device="cpu",
-                enable_memory_saver=False,
-                enable_alt_stream=False,
-            )
-        with unittest.mock.patch("sglang.srt.mem_cache.pool_host.mha._is_npu", True):
-            host = MHATokenToKVPoolHost(
-                device_pool=pool,
-                host_to_device_ratio=2,
-                host_size=0,
-                page_size=16,
-                layout="layer_first",
-                pin_memory=False,
-            )
-        self.addCleanup(host.destroy)
-        self.assertEqual(host.get_size_per_token(), 2 * 2 * 64)
-
-    def test_unscaled_fp8_and_asymmetric_host_capacity(self):
-        """The FP4 guard must not reject byte-backed FP8 or asymmetric rows."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            CPUFP8KVCacheMethod,
-        )
-
-        for dtype, method, v_head_dim in (
-            (torch.float8_e4m3fn, None, 64),
-            (torch.bfloat16, CPUFP8KVCacheMethod(), 64),
-            (torch.bfloat16, None, 32),
-        ):
-            with self.subTest(dtype=dtype, method=method, v_head_dim=v_head_dim):
-                pool = MHATokenToKVPool(
-                    size=32,
-                    page_size=16,
-                    dtype=dtype,
-                    head_num=2,
-                    head_dim=64,
-                    v_head_dim=v_head_dim,
-                    layer_num=1,
-                    device="cpu",
-                    enable_memory_saver=False,
-                    enable_alt_stream=False,
-                    quant_method=method,
-                )
-                host = get_mha_host_pool_cls(pool)(
-                    device_pool=pool,
-                    host_to_device_ratio=2,
-                    host_size=0,
-                    page_size=16,
-                    layout="page_first",
-                    pin_memory=False,
-                )
-                self.addCleanup(host.destroy)
-                expected_bytes = sum(
-                    buf.numel() * buf.element_size()
-                    for buf in (*pool.k_buffer, *pool.v_buffer)
-                ) // (pool.size + pool.page_size)
-                self.assertEqual(host.get_size_per_token(), expected_bytes)
-
     def test_reject_packed_scaled_kv_before_host_allocation(self):
         """Packed target or draft KV previously lost scales and used wrong row bytes."""
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -395,7 +326,7 @@ class TestHostKVCache(CustomTestCase):
                         ),
                     ):
                         with self.assertRaisesRegex(
-                            ValueError, "packed uint8 KV with separate block scales"
+                            ValueError, "MHA host transfers do not support FP4 KV cache"
                         ):
                             MHATokenToKVPoolHost(
                                 device_pool=target,
