@@ -741,6 +741,7 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    force_greedy: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -813,7 +814,7 @@ def eagle_sample(
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
+        is_all_greedy=sampling_info.is_all_greedy or force_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
