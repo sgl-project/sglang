@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 
+from ..executors.base import NATIVE_BATCHING_MODES
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
@@ -142,9 +143,13 @@ def _h3_detect_companion(gguf_ref: str) -> str:
     )
 
 
-def _check_native_batching(enabled: bool, adapter, sgld_options: dict) -> None:
+def _check_native_batching(mode: str, adapter, sgld_options: dict) -> None:
     """Allow native batching only where it was checked against the per-row path."""
-    if not enabled:
+    if mode not in NATIVE_BATCHING_MODES:
+        raise ValueError(
+            f"native_batching must be one of {list(NATIVE_BATCHING_MODES)}, got {mode!r}"
+        )
+    if mode == "off":
         return
     if not adapter.supports_native_batching:
         verified = sorted(
@@ -518,7 +523,7 @@ class SGLDiffusionGenerator:
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
-        native_batching = bool(sgld_options.pop("native_batching", False))
+        native_batching = sgld_options.pop("native_batching", "off")
         set_model_type = sgld_options.pop("model_type", None)
         runtime_model_path = sgld_options.pop("runtime_model_path", None)
         if bool(runtime_model_path) != (set_model_type in ("fast_h3", "vdn_h3")):

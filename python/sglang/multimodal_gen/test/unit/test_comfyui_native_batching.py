@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in native batching: one worker request for a whole ComfyUI batch."""
+"""Opt-in native batching: fewer worker requests for a ComfyUI batch."""
 
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -13,12 +14,15 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     _check_native_batching,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+    NATIVE_BATCHING_MODES,
     SGLDiffusionExecutor,
+    WorkerOutOfMemoryError,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -27,13 +31,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 class _Executor(SGLDiffusionExecutor):
     """Real forward/pack/unpack; the worker round trip records the request."""
 
-    def __init__(self, adapter, native_batching):
+    def __init__(self, adapter, native_batching, max_rows=None):
         torch.nn.Module.__init__(self)
         self.adapter = adapter
         self.native_batching = native_batching
+        # Requests with more rows than this "run out of GPU memory".
+        self.max_rows = max_rows
         self.sent = []
+        self._run_id = 0
 
     def _execute_packed(self, packed, x, timestep):
+        rows = packed.latents.shape[0]
+        if self.max_rows is not None and rows > self.max_rows:
+            raise WorkerOutOfMemoryError(
+                "SGLang Diffusion worker failed: CUDA out of memory"
+            )
         self.sent.append(packed)
         # Fake noise_pred: each row is filled with its own context mean.
         rows = packed.prompt_embeds[0].reshape(packed.latents.shape[0], -1).mean(1)
@@ -49,7 +61,7 @@ def _zimage_batch(batch=2, seq=5):
 
 
 def test_native_batch_is_one_request_with_per_row_timesteps() -> None:
-    ex = _Executor(ZImageAdapter(), native_batching=True)
+    ex = _Executor(ZImageAdapter(), native_batching="full")
     x, timestep, context = _zimage_batch(batch=3)
     out = ex(x, timestep, context, transformer_options={"uuids": ["pos", "neg"]})
 
@@ -61,13 +73,13 @@ def test_native_batch_is_one_request_with_per_row_timesteps() -> None:
     # One step for the loop; each row keeps its own timestep, in order.
     assert torch.equal(packed.timesteps, timestep[:1] * 1000.0)
     assert torch.equal(packed.extra_req["comfyui_row_timesteps"], timestep * 1000.0)
-    assert packed.unpack_ctx["comfyui_cond_uuid"] == (("pos", "neg"), "batch")
+    assert packed.unpack_ctx["comfyui_cond_uuid"] == (("pos", "neg"), ("batch", None))
     assert out.shape == x.shape
     assert [float(out[i].mean()) for i in range(3)] == [1.0, 2.0, 3.0]
 
 
 def test_default_still_sends_one_request_per_row() -> None:
-    ex = _Executor(ZImageAdapter(), native_batching=False)
+    ex = _Executor(ZImageAdapter(), native_batching="off")
     x, timestep, context = _zimage_batch(batch=2)
     out = ex(x, timestep, context)
     assert len(ex.sent) == 2
@@ -77,7 +89,7 @@ def test_default_still_sends_one_request_per_row() -> None:
 
 
 def test_batch_of_one_is_unchanged_with_native_batching() -> None:
-    ex = _Executor(ZImageAdapter(), native_batching=True)
+    ex = _Executor(ZImageAdapter(), native_batching="full")
     x, timestep, context = _zimage_batch(batch=1)
     ex(x, timestep, context)
     packed = ex.sent[0]
@@ -95,10 +107,123 @@ def test_batch_of_one_is_unchanged_with_native_batching() -> None:
     ],
 )
 def test_rows_that_do_not_match_the_batch_are_rejected(timestep, context) -> None:
-    ex = _Executor(ZImageAdapter(), native_batching=True)
+    ex = _Executor(ZImageAdapter(), native_batching="full")
     with pytest.raises(ValueError, match="one (timestep|context) row per latent row"):
         ex(torch.zeros(2, 16, 4, 6), timestep, context)
     assert ex.sent == []
+
+
+def _cfg_batch(images=2):
+    """ComfyUI layout: a cond chunk then an uncond chunk, each with every image."""
+    x, timestep, context = _zimage_batch(batch=2 * images)
+    timestep = torch.cat([torch.linspace(0.9, 0.3, images)] * 2)
+    options = {
+        "cond_or_uncond": [0, 1],
+        "uuids": ["pos", "neg"],
+        "sigmas": timestep[:images],
+    }
+    return x, timestep, context, options
+
+
+def test_cfg_only_sends_one_request_per_image() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="cfg_only")
+    x, timestep, context, options = _cfg_batch(images=2)
+    out = ex(x, timestep, context, transformer_options=options)
+
+    assert len(ex.sent) == 2
+    for image, packed in enumerate(ex.sent):
+        rows = [image, image + 2]  # this image's cond row and uncond row
+        assert packed.latents.shape[0] == 2
+        assert torch.equal(packed.prompt_embeds[0], context[rows])
+        assert torch.equal(
+            packed.extra_req["comfyui_row_timesteps"], timestep[rows] * 1000.0
+        )
+        assert packed.unpack_ctx["comfyui_cond_uuid"] == (
+            ("pos", "neg"),
+            ("batch", image),
+        )
+    # Rows come back in ComfyUI's order.
+    assert [float(out[i].mean()) for i in range(4)] == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_cfg_only_with_one_image_is_one_request() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="cfg_only")
+    x, timestep, context, options = _cfg_batch(images=1)
+    ex(x, timestep, context, transformer_options=options)
+    assert len(ex.sent) == 1 and ex.sent[0].latents.shape[0] == 2
+
+
+def test_cfg_only_needs_the_cond_chunks() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="cfg_only")
+    x, timestep, context = _zimage_batch(batch=4)
+    with pytest.raises(ValueError, match="cond_or_uncond"):
+        ex(x, timestep, context, transformer_options={"cond_or_uncond": [0, 1, 0]})
+    assert ex.sent == []
+
+
+def test_out_of_memory_steps_down_for_the_rest_of_the_run(caplog) -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="full", max_rows=2)
+    x, timestep, context, options = _cfg_batch(images=2)
+    ex.begin_sampler_run()
+    with caplog.at_level(logging.WARNING):
+        out = ex(x, timestep, context, transformer_options=options)
+    # full (4 rows) ran out of memory; cfg_only (2 rows per request) fits.
+    assert [p.latents.shape[0] for p in ex.sent] == [2, 2]
+    assert "native_batching=full; using cfg_only" in caplog.text
+    assert [float(out[i].mean()) for i in range(4)] == [1.0, 2.0, 3.0, 4.0]
+
+    ex.sent.clear()
+    ex(x, timestep, context, transformer_options=options)
+    assert [p.latents.shape[0] for p in ex.sent] == [2, 2]  # no new full attempt
+
+    ex.begin_sampler_run()  # a new run tries full again
+    ex.max_rows = None
+    ex.sent.clear()
+    ex(x, timestep, context, transformer_options=options)
+    assert [p.latents.shape[0] for p in ex.sent] == [4]
+
+
+def test_out_of_memory_falls_back_to_per_row() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="full", max_rows=1)
+    x, timestep, context, options = _cfg_batch(images=2)
+    ex(x, timestep, context, transformer_options=options)
+    assert [p.latents.shape[0] for p in ex.sent] == [1, 1, 1, 1]
+
+
+def test_out_of_memory_per_row_is_raised() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="off", max_rows=0)
+    x, timestep, context = _zimage_batch(batch=2)
+    with pytest.raises(WorkerOutOfMemoryError):
+        ex(x, timestep, context)
+
+
+def test_worker_out_of_memory_error_is_recognised() -> None:
+    ex = SGLDiffusionExecutor.__new__(SGLDiffusionExecutor)
+    torch.nn.Module.__init__(ex)
+    ex.adapter, ex.model_path = ZImageAdapter(), "/test-model"
+    ex.session_id, ex._run_id, ex._sent_conds = "oom-test", 0, set()
+    errors = iter(["CUDA out of memory. Tried to allocate 2.00 GiB", "shape mismatch"])
+    ex.generator = SimpleNamespace(
+        server_args=SimpleNamespace(attention_backend_config={}, enable_trace=False),
+        _send_to_scheduler_and_wait_for_response=lambda reqs: SimpleNamespace(
+            noise_pred=None, error=next(errors)
+        ),
+    )
+    x, timestep, context = _zimage_batch(batch=1)
+    packed = ex.adapter.pack(x, timestep, context)
+    with (
+        mock.patch.object(
+            SamplingParams,
+            "from_user_sampling_params_args",
+            side_effect=lambda model_path, server_args, **kw: SamplingParams(**kw),
+        ),
+        mock.patch.object(torch, "Generator", side_effect=lambda device: object()),
+    ):
+        with pytest.raises(WorkerOutOfMemoryError, match="worker failed: CUDA out"):
+            ex._execute_packed(packed, x, timestep)
+        with pytest.raises(RuntimeError) as error:
+            ex._execute_packed(packed, x, timestep)
+    assert not isinstance(error.value, WorkerOutOfMemoryError)
 
 
 def test_log_suppression_accepts_a_timestep_per_row() -> None:
@@ -129,14 +254,17 @@ def test_worker_rejects_row_timesteps_of_the_wrong_length() -> None:
 
 
 def test_native_batching_is_refused_for_unverified_models() -> None:
-    _check_native_batching(False, FluxAdapter, {})
-    _check_native_batching(True, ZImageAdapter, {"num_gpus": 1})
+    _check_native_batching("off", FluxAdapter, {"num_gpus": 2})
+    _check_native_batching("cfg_only", ZImageAdapter, {"num_gpus": 1})
+    _check_native_batching("full", ZImageAdapter, {})
+    with pytest.raises(ValueError, match="must be one of"):
+        _check_native_batching(True, ZImageAdapter, {})
     with pytest.raises(
         ValueError, match=r"only verified for model types \['lumina2'\]"
     ):
-        _check_native_batching(True, FluxAdapter, {})
+        _check_native_batching("cfg_only", FluxAdapter, {})
     with pytest.raises(ValueError, match="one GPU"):
-        _check_native_batching(True, ZImageAdapter(), {"num_gpus": 2})
+        _check_native_batching("full", ZImageAdapter(), {"num_gpus": 2})
 
 
 def test_options_node_sets_native_batching_only_when_enabled() -> None:
@@ -156,6 +284,7 @@ def test_options_node_sets_native_batching_only_when_enabled() -> None:
         from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import nodes
     node = nodes.SGLDOptions()
     spec = nodes.SGLDOptions.INPUT_TYPES()["optional"]["native_batching"]
-    assert spec == ("BOOLEAN", {"default": False})
+    assert spec == (list(NATIVE_BATCHING_MODES), {"default": "off"})
     assert "native_batching" not in node.create_options()[0]
-    assert node.create_options(native_batching=True)[0]["native_batching"] is True
+    options = node.create_options(native_batching="cfg_only")[0]
+    assert options["native_batching"] == "cfg_only"

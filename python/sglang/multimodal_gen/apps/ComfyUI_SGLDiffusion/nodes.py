@@ -107,8 +107,8 @@ class SGLDOptions:
                     {"default": False},
                 ),
                 "native_batching": (
-                    "BOOLEAN",
-                    {"default": False},
+                    ["off", "cfg_only", "full"],
+                    {"default": "off"},
                 ),
                 "quantization": (
                     "STRING",
@@ -146,7 +146,7 @@ class SGLDOptions:
         attention_backend: str = "",
         dit_layerwise_offload: bool = False,
         enable_cache_dit: bool = False,
-        native_batching: bool = False,
+        native_batching: str = "off",
         quantization: str = "",
         transformer_weights_path: str = "",
         runtime_model_path: str = "",
@@ -180,8 +180,8 @@ class SGLDOptions:
         }
         if enable_cache_dit:
             options["enable_cache_dit"] = True
-        if native_batching:
-            options["native_batching"] = True
+        if native_batching != "off":
+            options["native_batching"] = native_batching
         quantization = (quantization or "").strip()
         if quantization:
             options["quantization"] = quantization
