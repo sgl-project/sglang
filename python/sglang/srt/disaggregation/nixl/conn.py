@@ -632,6 +632,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # created in __init__ (per-worker), independent of the kv
         # tensors. This setter only stashes the tensor metadata used by
         # send_kvcache_staged().
+        # slot_layer_ids follows the staging slot order (every k_buffer, then
+        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
