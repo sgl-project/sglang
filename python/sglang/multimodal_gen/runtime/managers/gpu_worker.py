@@ -178,7 +178,7 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
 def _bind_worker_to_gpu_numa_node(
     server_args: ServerArgs, local_rank: int
 ) -> int | None:
-    """Bind this worker's CPUs and host memory to its GPU's NUMA node, as srt does.
+    """Bind this worker's CPUs, and host memory when permitted, to its GPU's NUMA node.
 
     Must run before CUDA init and model load so first-touch host memory lands
     on that node; an unbound worker drifts across sockets and every
@@ -189,8 +189,6 @@ def _bind_worker_to_gpu_numa_node(
         numa_bind_to_node,
     )
 
-    # Pods without SYS_NICE cannot set memory policy; CPU affinity alone still
-    # removes the cross-socket drift (FLUX.1 TP2 on GB300: spread 26-60% -> 6-8%).
     numa_node = get_numa_node_if_available(server_args=server_args, gpu_id=local_rank)
     if numa_node is not None:
         numa_bind_to_node(numa_node)

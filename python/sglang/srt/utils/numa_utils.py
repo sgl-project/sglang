@@ -33,6 +33,7 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
             numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
             if numactl_args is not None and not _can_set_mempolicy():
                 numactl_args = _strip_memory_args(numactl_args)
+                _log_cpu_only_binding(numa_node)
             if numactl_args is not None:
                 # Verify numactl can actually apply the binding before we exec it
                 # in front of the interpreter; relax the memory policy if not.
@@ -185,10 +186,19 @@ def numa_bind_to_node(node: int):
         os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-    # Without memory-policy permission, CPU affinity alone keeps first-touch
-    # allocations on the node.
+    # Without memory policy, CPU affinity alone keeps first-touch allocations local;
+    # measured on FLUX.1 TP2 on GB300, run-to-run spread fell from 26-60% to 6-8%.
     if _can_set_mempolicy():
         libnuma.numa_set_preferred(ctypes.c_int(node))
+    else:
+        _log_cpu_only_binding(node)
+
+
+def _log_cpu_only_binding(node: int) -> None:
+    logger.info(
+        f"NUMA memory policy not permitted; binding CPUs only to NUMA node {node}. "
+        "If using docker, --cap-add SYS_NICE also binds host memory."
+    )
 
 
 class _Bitmask(ctypes.Structure):
@@ -381,12 +391,6 @@ def _is_numa_available() -> bool:
             "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
         )
         return False
-
-    if not _can_set_mempolicy():
-        logger.info(
-            "User lacks permission to set NUMA memory policy; binding CPUs only. "
-            "If using docker, --cap-add SYS_NICE also binds host memory."
-        )
 
     return True
 

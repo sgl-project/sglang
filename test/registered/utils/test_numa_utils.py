@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.numa_utils import (
     _handle_numa_bind_failure,
     _is_numa_available,
@@ -79,10 +80,57 @@ class TestNumaBindWithoutMempolicy(unittest.TestCase):
         return libnuma
 
     def test_cpus_bound_and_memory_policy_skipped(self):
-        self._bind(mempolicy_ok=False).numa_set_preferred.assert_not_called()
+        with self.assertLogs("sglang.srt.utils.numa_utils", level="INFO") as cm:
+            libnuma = self._bind(mempolicy_ok=False)
+        libnuma.numa_set_preferred.assert_not_called()
+        self.assertTrue(any("binding CPUs only" in msg for msg in cm.output))
 
     def test_memory_policy_set_when_permitted(self):
         self._bind(mempolicy_ok=True).numa_set_preferred.assert_called_once()
+
+
+class TestConfigureSubprocessCpuOnly(unittest.TestCase):
+    """Without memory-policy permission the numactl wrapper drops --membind and says so,
+    including for an explicit --numa-node, which skips the auto-detection path."""
+
+    def _configure(self, mempolicy_ok: bool) -> MagicMock:
+        server_args = MagicMock()
+        server_args.numa_node = [0]
+        with (
+            envs.SGLANG_NUMA_BIND_V2.override(True),
+            patch(
+                "sglang.srt.utils.numa_utils._numactl_cpu_mem_args",
+                return_value="--cpunodebind=0 --membind=0",
+            ),
+            patch(
+                "sglang.srt.utils.numa_utils._can_set_mempolicy",
+                return_value=mempolicy_ok,
+            ),
+            patch(
+                "sglang.srt.utils.numa_utils._probe_numactl_args",
+                side_effect=lambda args: (args, ""),
+            ) as probe,
+            patch(
+                "sglang.srt.utils.numa_utils._create_numactl_executable",
+                return_value=("numactl-exe", ""),
+            ),
+            patch("sglang.srt.utils.numa_utils._mp_set_executable"),
+            patch("sglang.srt.utils.numa_utils._get_nvml_device_index", return_value=0),
+        ):
+            with configure_subprocess(server_args=server_args, gpu_id=0):
+                pass
+        return probe
+
+    def test_memory_segment_stripped_and_logged(self):
+        with self.assertLogs("sglang.srt.utils.numa_utils", level="INFO") as cm:
+            probe = self._configure(mempolicy_ok=False)
+        probe.assert_called_once_with("--cpunodebind=0")
+        self.assertTrue(any("binding CPUs only" in msg for msg in cm.output))
+
+    def test_memory_segment_kept_when_permitted(self):
+        self._configure(mempolicy_ok=True).assert_called_once_with(
+            "--cpunodebind=0 --membind=0"
+        )
 
 
 # Pin _is_xpu=False so these cases still reach the mocked pynvml on a real XPU
