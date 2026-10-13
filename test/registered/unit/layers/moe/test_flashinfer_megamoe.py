@@ -47,6 +47,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT=types.SimpleNamespace(
+            get=lambda: True
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
@@ -56,6 +59,16 @@ def _load_megamoe_module(monkeypatch):
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
+    buffers = {}
+
+    def get_buffer(name, factory):
+        if name not in buffers:
+            buffers[name] = factory()
+        return buffers[name]
+
+    runtime_context.get_buffer = get_buffer
+    resources = types.SimpleNamespace(flashinfer_megamoe_workspaces={})
+    runtime_context.get_resources = lambda: resources
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -357,6 +370,35 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     assert module._resolve_max_tokens_per_rank() == 1024
 
 
+def _use_cpu_for_shared_tensor(monkeypatch):
+    # The shared tensor is allocated on the current CUDA device; CPU CI has none.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+
+
+def test_persistent_finalize_kwargs_share_one_tensor(monkeypatch):
+    """The shared workspace borrows the first layer's tensor, so every layer
+    must hand out the same object or later layers update a tensor nobody reads."""
+    module = _load_megamoe_module(monkeypatch)
+    _use_cpu_for_shared_tensor(monkeypatch)
+
+    first = module._persistent_finalize_kwargs()
+    second = module._persistent_finalize_kwargs()
+
+    assert first["use_persistent_finalize_kernel"] is True
+    tensor = first["num_valid_tokens_tensor"]
+    assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (1,)
+    assert second["num_valid_tokens_tensor"] is tensor
+
+
+def test_persistent_finalize_env_off_requests_nothing(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    module.envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT = (
+        types.SimpleNamespace(get=lambda: False)
+    )
+
+    assert module._persistent_finalize_kwargs() == {}
+
+
 def test_adapter_keeps_router_ids_int32(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
@@ -451,6 +493,80 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
     assert mega.return_workspace_view is supports_output_view
+
+
+def test_persistent_finalize_uses_runtime_sized_output(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    output = torch.empty((2, 4), dtype=torch.bfloat16)
+
+    class Mega:
+        supports_output_view = True
+        _megakernel_config = types.SimpleNamespace(use_persistent_finalize_kernel=True)
+
+        def forward(self, tensors, *, return_workspace_view=False):
+            self.return_workspace_view = return_workspace_view
+            return output
+
+    mega = Mega()
+    forward = module._select_megamoe_forward(mega)
+
+    assert forward(mega, object()) is output
+    assert mega.return_workspace_view is False
+
+
+def test_adapter_refreshes_the_tensor_the_layer_holds_on_every_call(monkeypatch):
+    """The kernel reads the count at launch, so a stale value from an earlier
+    batch (or another graph shape) would make it reduce the wrong row count.
+    It must be the tensor the layer's config holds (the one the workspace
+    borrowed), not whatever a fresh buffer lookup returns."""
+    module = _load_megamoe_module(monkeypatch)
+
+    class FakeMoEEpTensors:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEEpTensors = FakeMoEEpTensors
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.moe_ep = fake_moe_ep
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+    owned = torch.zeros(1, dtype=torch.int32)
+    seen = []
+
+    class Mega:
+        supports_output_view = False
+
+        def __init__(self, persistent):
+            self._megakernel_config = types.SimpleNamespace(
+                use_persistent_finalize_kernel=persistent,
+                num_valid_tokens_tensor=owned,
+            )
+
+        def forward(self, tensors):
+            seen.append(int(owned.item()))
+            return tensors.hidden_states
+
+    def run(rows, persistent):
+        module.run_flashinfer_megamoe(
+            types.SimpleNamespace(
+                hidden_states=torch.zeros((rows, 4), dtype=torch.bfloat16),
+                topk_output=types.SimpleNamespace(
+                    topk_ids=torch.zeros((rows, 2), dtype=torch.int32),
+                    topk_weights=torch.ones((rows, 2)),
+                ),
+            ),
+            module.FlashInferMegaMoeQuantInfo(mega=Mega(persistent)),
+            types.SimpleNamespace(routed_scaling_factor=1.0),
+        )
+
+    run(5, persistent=True)
+    run(3, persistent=True)
+    run(9, persistent=False)
+
+    assert seen == [5, 3, 3]
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):

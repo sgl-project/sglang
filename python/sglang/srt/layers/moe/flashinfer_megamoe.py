@@ -137,8 +137,21 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
     return mega.forward(tensors)
 
 
+def _megamoe_uses_persistent_finalize(mega: Any) -> bool:
+    return bool(
+        getattr(
+            getattr(mega, "_megakernel_config", None),
+            "use_persistent_finalize_kernel",
+            False,
+        )
+    )
+
+
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    if mega.supports_output_view:
+    # Persistent finalize needs the output extent to be the runtime token
+    # count. The workspace view is capacity-sized, so keep it for the static
+    # reducer only.
+    if mega.supports_output_view and not _megamoe_uses_persistent_finalize(mega):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -193,6 +206,34 @@ def _scalar_float(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().to(torch.float32).max())
     return float(value)
+
+
+_NUM_VALID_TOKENS_BUFFER = "flashinfer_megamoe_num_valid_tokens"
+
+
+def _num_valid_tokens_tensor() -> torch.Tensor:
+    """The live-token count the persistent finalize kernel reads.
+
+    One tensor for every layer: FlashInfer pools workspaces keyed on this
+    tensor's identity and the pooled workspace borrows it, so each layer must
+    pass and update that same object. Create it at layer build time, outside
+    CUDA graph capture.
+    """
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer(
+        _NUM_VALID_TOKENS_BUFFER,
+        lambda: torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device()),
+    )
+
+
+def _persistent_finalize_kwargs() -> dict[str, Any]:
+    if not envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get():
+        return {}
+    return {
+        "use_persistent_finalize_kernel": True,
+        "num_valid_tokens_tensor": _num_valid_tokens_tensor(),
+    }
 
 
 def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.Tensor:
@@ -377,8 +418,9 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            **_persistent_finalize_kwargs(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
         ),
@@ -402,6 +444,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            **_persistent_finalize_kwargs(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -571,6 +614,12 @@ def run_flashinfer_megamoe(
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
+
+    if _megamoe_uses_persistent_finalize(mega):
+        # Write the tensor the workspace borrowed, not a fresh lookup. Refreshed
+        # every call: the kernel reads it at launch, and inside a CUDA graph the
+        # fill replays with the value baked for that capture shape.
+        mega._megakernel_config.num_valid_tokens_tensor.fill_(x.shape[0])
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
