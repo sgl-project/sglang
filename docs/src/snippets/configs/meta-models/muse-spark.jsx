@@ -220,7 +220,7 @@ export const config = {
     PORT: { target: "command", label: "Bind port", default: "30000" },
     NODE0_IP: { target: "command", label: "Head node IP", default: "<node0-ip>" },
     NODE_RANK: { target: "command", label: "This node rank", default: "<node-rank>" },
-    DRAFT_MODEL_ID: { target: "command", label: "Dflash V2 draft model", default: "<draft_model_id>" },
+    DRAFT_MODEL_ID: { target: "command", label: "Dflash V2 draft model", default: "RadixArk/Muse-Spark-Dflash2" },
     HF_TOKEN: { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
