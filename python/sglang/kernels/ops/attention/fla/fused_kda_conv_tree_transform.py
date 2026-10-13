@@ -1,7 +1,8 @@
 """Experimental fused UBTree causal-conv and KDA node transform.
 
-The kernel is deliberately shape-restricted to the production BS=1-style
-factorized UBTree contract (49/65 nodes, conv width 4, H == HV, K == V).  It
+The kernel is deliberately shape-restricted to the production factorized
+UBTree contract (31/33/49/65 nodes, conv width 4, H == HV, K == V). It supports
+multiple batches through an explicit batch program axis. It
 replaces the tree causal-conv launch plus
 ``fused_sigmoid_gating_delta_rule_tree_transform_kernel`` while preserving the
 materialized post-conv Q/K/V tensor consumed by factor generation.
@@ -61,6 +62,7 @@ def _fused_kda_conv_tree_transform_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     LOWER_BOUND: tl.constexpr,
     TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     BK: tl.constexpr,
@@ -231,10 +233,10 @@ def _fused_kda_conv_tree_transform_kernel(
 
     if CACHE_TREE_FACTORS:
         cache_mask = mask & (factor_slot >= 0)
-        tl.store(tree_rawv + factor_slot * stride_rawv_slot + (hv * TREE_WIDTH + node) * K + offsets, v_conv_fp32, mask=cache_mask)
-        tl.store(tree_rawk + factor_slot * stride_rawk_slot + (hv * TREE_WIDTH + node) * K + offsets, raw_k_conv, mask=cache_mask)
-        tl.store(tree_g + factor_slot * stride_g_slot + (hv * TREE_WIDTH + node) * K + offsets, g, mask=cache_mask)
-        tl.store(tree_beta + factor_slot * stride_beta_slot + hv * TREE_WIDTH + node, beta, mask=factor_slot >= 0)
+        tl.store(tree_rawv + factor_slot * stride_rawv_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, v_conv_fp32, mask=cache_mask)
+        tl.store(tree_rawk + factor_slot * stride_rawk_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, raw_k_conv, mask=cache_mask)
+        tl.store(tree_g + factor_slot * stride_g_slot + (hv * CACHE_TREE_WIDTH + node) * K + offsets, g, mask=cache_mask)
+        tl.store(tree_beta + factor_slot * stride_beta_slot + hv * CACHE_TREE_WIDTH + node, beta, mask=factor_slot >= 0)
 
 
 def fused_kda_conv_tree_transform(
@@ -267,8 +269,8 @@ def fused_kda_conv_tree_transform(
     if x.ndim != 3:
         raise ValueError("x must be [batch, 3 * HV * K, tree_width]")
     batch, dim, tree_width = x.shape
-    if tree_width not in (49, 65):
-        raise ValueError(f"tree_width must be 49 or 65, got {tree_width}")
+    if tree_width not in (31, 33, 49, 65):
+        raise ValueError(f"tree_width must be 31, 33, 49, or 65, got {tree_width}")
     hv, key_dim = processed_beta.shape[1], processed_k.shape[-1]
     if dim != 3 * hv * key_dim or processed_k.shape != (batch, hv, tree_width, key_dim):
         raise ValueError("only equal Q/K/V head geometry is supported")
@@ -278,6 +280,9 @@ def fused_kda_conv_tree_transform(
         raise ValueError("processed transform shapes do not match")
     if retrieve_parent_token.shape != (batch, tree_width):
         raise ValueError("retrieve_parent_token shape mismatch")
+    cache_tree_width = tree_rawv.shape[-2]
+    if cache_tree_width < tree_width:
+        raise ValueError("tree factor cache does not cover logical tree width")
     if x.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
         raise ValueError("the experimental kernel requires BF16 activations and conv state")
     if conv_weight.dtype not in (torch.bfloat16, torch.float32):
@@ -301,7 +306,8 @@ def fused_kda_conv_tree_transform(
         tree_rawv.stride(0), tree_rawk.stride(0), tree_g.stride(0), tree_beta.stride(0),
         SOFTPLUS_BETA=softplus_beta, SOFTPLUS_THRESHOLD=softplus_threshold,
         LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
-        TREE_WIDTH=tree_width, HV=hv, K=key_dim, BK=bk,
+        TREE_WIDTH=tree_width, CACHE_TREE_WIDTH=cache_tree_width,
+        HV=hv, K=key_dim, BK=bk,
         USE_LOWER_BOUND=lower_bound is not None, CACHE_TREE_FACTORS=True,
         HAS_BIAS=conv_bias is not None, num_warps=2, num_stages=1,
     )

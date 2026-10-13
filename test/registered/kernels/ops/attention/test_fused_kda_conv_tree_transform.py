@@ -26,22 +26,26 @@ def _outputs(batch, heads, nodes, dim, device):
     return pk, pd, pb, rv, rk, g, beta
 
 
-@pytest.mark.parametrize("nodes", [49, 65])
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize(
+    "nodes,cache_nodes", [(31, 31), (31, 49), (33, 33), (49, 49), (65, 65)]
+)
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
-def test_fused_conv_tree_transform_matches_reference(nodes, weight_dtype):
+def test_fused_conv_tree_transform_matches_reference(
+    batch, nodes, cache_nodes, weight_dtype
+):
     torch.manual_seed(20260918 + nodes)
     device = "cuda"
-    batch, heads, head_dim = 1, 16, 128
+    heads, head_dim = 16, 128
     model_dim = 3 * heads * head_dim
     x = torch.randn(batch, model_dim, nodes, device=device, dtype=torch.bfloat16)
     weight = torch.randn(model_dim, 4, device=device, dtype=weight_dtype) * 0.1
     state = torch.randn(batch, model_dim, 3, device=device, dtype=torch.bfloat16)
     state_indices = torch.arange(batch, dtype=torch.int32, device=device)
     factor_indices = state_indices.clone()
+    parent_row = [-1] + [(i - 1) // 4 for i in range(1, nodes)]
     parents = torch.tensor(
-        [[-1] + [(i - 1) // 4 for i in range(1, nodes)]],
-        dtype=torch.int32,
-        device=device,
+        [parent_row] * batch, dtype=torch.int32, device=device
     )
     tree_marker = torch.zeros_like(parents)
     inter_ref = torch.empty(
@@ -56,7 +60,26 @@ def test_fused_conv_tree_transform_matches_reference(nodes, weight_dtype):
     dt_bias = torch.randn(heads, head_dim, device=device, dtype=torch.bfloat16)
     cu = torch.arange(0, (batch + 1) * nodes, nodes, device=device, dtype=torch.int32)
     ref = _outputs(batch, heads, nodes, head_dim, device)
-    fused = _outputs(batch, heads, nodes, head_dim, device)
+    fused = list(_outputs(batch, heads, nodes, head_dim, device))
+    fused[3] = torch.full(
+        (batch, heads, cache_nodes, head_dim),
+        float("nan"),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    fused[4] = torch.full_like(fused[3], float("nan"))
+    fused[5] = torch.full(
+        (batch, heads, cache_nodes, head_dim),
+        float("nan"),
+        device=device,
+        dtype=torch.float32,
+    )
+    fused[6] = torch.full(
+        (batch, heads, cache_nodes),
+        float("nan"),
+        device=device,
+        dtype=torch.float32,
+    )
 
     out_ref = causal_conv1d_update(
         x,
@@ -103,6 +126,7 @@ def test_fused_conv_tree_transform_matches_reference(nodes, weight_dtype):
         stride_v=v.view(1, batch * nodes, heads, head_dim).stride(-3),
         stride_b=b.stride(-2),
         TREE_WIDTH=nodes,
+        CACHE_TREE_WIDTH=nodes,
         H=heads,
         HV=heads,
         K=head_dim,
@@ -146,11 +170,15 @@ def test_fused_conv_tree_transform_matches_reference(nodes, weight_dtype):
         "processed_k": (fused[0], ref[0]),
         "processed_decay": (fused[1], ref[1]),
         "processed_beta": (fused[2], ref[2]),
-        "rawv": (fused[3], ref[3]),
-        "rawk": (fused[4], ref[4]),
-        "g": (fused[5], ref[5]),
-        "beta": (fused[6], ref[6]),
+        "rawv": (fused[3][:, :, :nodes], ref[3]),
+        "rawk": (fused[4][:, :, :nodes], ref[4]),
+        "g": (fused[5][:, :, :nodes], ref[5]),
+        "beta": (fused[6][:, :, :nodes], ref[6]),
     }
+    if cache_nodes > nodes:
+        for padded in fused[3:]:
+            assert torch.isnan(padded[:, :, nodes:]).all()
+
     for name, (got, expected) in pairs.items():
         if weight_dtype == torch.float32:
             # Production Ling KDA weights are FP32. Keep this path bitwise exact:
