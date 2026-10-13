@@ -1350,5 +1350,48 @@ class TestLoRARequestLifecycle(CustomTestCase):
         asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
 
 
+class TestPriorityRange(CustomTestCase):
+    """Request priorities reach the radix cache as signed 64-bit integers, so an
+    out-of-range value is rejected before dispatch instead of failing inside
+    the scheduler, and the boundary values themselves pass through unchanged."""
+
+    INT64_MIN = -(1 << 63)
+    INT64_MAX = (1 << 63) - 1
+
+    def test_int64_boundaries_are_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_priority_scheduling = True
+        tm.default_priority_value = 0
+        for priority in (self.INT64_MIN, self.INT64_MAX):
+            with self.subTest(priority=priority):
+                obj = GenerateReqInput(input_ids=[1], priority=priority)
+                tm._set_default_priority(obj)
+                self.assertEqual(obj.priority, priority)
+
+    def test_out_of_range_priority_is_rejected_before_dispatch(self):
+        for enabled in (False, True):
+            for priority in (self.INT64_MIN - 1, self.INT64_MAX + 1):
+                for source in ("body", "default"):
+                    if source == "default" and not enabled:
+                        continue
+                    with self.subTest(
+                        enabled=enabled, priority=priority, source=source
+                    ):
+                        tm = _make_tm_for_generate(self)
+                        del tm._set_default_priority  # the real one is under test
+                        tm.enable_priority_scheduling = enabled
+                        tm.default_priority_value = (
+                            priority if source == "default" else 0
+                        )
+                        tm._init_req_state = Mock()
+                        obj = GenerateReqInput(
+                            input_ids=[1],
+                            priority=priority if source == "body" else None,
+                        )
+                        with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+                            asyncio.run(tm.generate_request(obj).__anext__())
+                        tm._init_req_state.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
