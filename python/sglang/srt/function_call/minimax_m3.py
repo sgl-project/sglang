@@ -249,16 +249,27 @@ class MinimaxM3Detector(BaseFormatDetector):
         if gt == -1:
             return False
 
+        rest = self._buffer[gt + 1 :]
+        if rest and self.PARAM_START_PREFIX.startswith(rest):
+            # The next tag may open a child or close this parameter; wait for it.
+            return False
+
         tag = self._buffer[start + len(self.PARAM_START_PREFIX) : gt].strip()
-        self._buffer = self._buffer[gt + 1 :]
+        self._buffer = rest
         self._current_param_name = tag
         self._current_param_schema = self._get_child_schema(
             self._current_function_schema, tag
         )
         self._current_param_buffer = ""
+        # Mirrors _parse_parameter: an empty scalar value is not an empty container.
+        closes_empty_scalar = self._buffer.startswith(
+            self.PARAM_START_PREFIX + "/"
+        ) and self._is_scalar_schema(self._current_param_schema)
         self._current_param_is_complex = self._schema_has_type(
             self._current_param_schema, ("object", "array")
-        ) or self._buffer.startswith(self.PARAM_START_PREFIX)
+        ) or (
+            self._buffer.startswith(self.PARAM_START_PREFIX) and not closes_empty_scalar
+        )
         self._current_string_started = False
 
         prefix = "{}{}: ".format(
@@ -298,9 +309,7 @@ class MinimaxM3Detector(BaseFormatDetector):
             return False
 
         self._stream_scalar_text(self._buffer[:end], calls)
-        if self._schema_has_type(self._current_param_schema, tuple(STRING_TYPES)):
-            if not self._current_string_started:
-                self._append_stream_call(calls, '"')
+        if self._current_string_started:
             self._append_stream_call(calls, '"')
         else:
             value = self._convert_leaf_value(
@@ -317,6 +326,15 @@ class MinimaxM3Detector(BaseFormatDetector):
             return
 
         if self._schema_has_type(self._current_param_schema, tuple(STRING_TYPES)):
+            if not self._current_string_started and self._schema_has_type(
+                self._current_param_schema, ("null",)
+            ):
+                # Hold back text that may still become a null spelling.
+                text = self._current_param_buffer + text
+                if any(null.startswith(text) for null in NULL_STRINGS):
+                    self._current_param_buffer = text
+                    return
+                self._current_param_buffer = ""
             escaped = json.dumps(text, ensure_ascii=False)[1:-1]
             if self._current_string_started:
                 self._append_stream_call(calls, escaped)
