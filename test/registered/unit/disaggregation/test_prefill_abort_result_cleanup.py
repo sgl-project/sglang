@@ -203,7 +203,7 @@ def test_cache_only_partial_coverage_aborts_before_transfer(
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None
     req.pending_bootstrap = False
-    req.extend_range = None if coverage is None else SimpleNamespace(end=coverage)
+    req.extend_end = coverage
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _cache_only_result())
 
@@ -211,7 +211,9 @@ def test_cache_only_partial_coverage_aborts_before_transfer(
     assert "full-prompt coverage" in prepare_abort.call_args.args[1]
     scheduler.send_kv_chunk.assert_not_called()
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     assert scheduler.disagg_prefill_inflight_queue == []
 
 
@@ -220,7 +222,7 @@ def test_cache_only_full_coverage_is_published():
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None
     req.pending_bootstrap = False
-    req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+    req.extend_end = len(req.origin_input_ids)
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _cache_only_result())
 
