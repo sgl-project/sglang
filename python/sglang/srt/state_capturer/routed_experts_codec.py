@@ -1,18 +1,17 @@
 """Wire encodings of returned routed experts, chosen by ``--routed-experts-encoding``.
 
-``base64_int32`` (the default, unlabelled) is base64 of the int32
-``[num_tokens, num_layers, topk]`` buffer. ``zstd`` (labelled in
-``meta_info["routed_experts_encoding"]``) is base64 of a ``<BIHH`` header (dtype
-itemsize, num_tokens, num_layers, topk) and one zstd frame of the rows, sorted and
-narrowed to the smallest dtype that fits, laid out ``[num_layers, num_tokens, topk]``.
+Rows arrive sorted and in the capturer's narrow host dtype. ``base64_int32`` (the
+default, unlabelled) is base64 of them widened to int32 ``[num_tokens, num_layers,
+topk]``. ``zstd`` (labelled in ``meta_info["routed_experts_encoding"]``) is base64 of
+a ``<BIHH`` header (dtype itemsize, num_tokens, num_layers, topk) and one zstd frame
+of the rows as captured, laid out ``[num_layers, num_tokens, topk]``.
 """
 
 import struct
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 import pybase64
-import torch
 import zstandard
 
 BASE64_INT32 = "base64_int32"
@@ -36,28 +35,6 @@ _ITEMSIZE_TO_DTYPE = {
     2: np.dtype(np.uint16),
     4: np.dtype(np.int32),
 }
-
-
-def host_dtype(encoding: str, num_physical_experts: Optional[int]) -> torch.dtype:
-    """Host-cache dtype for captured expert ids, all in [0, num_physical_experts)."""
-    if encoding != ZSTD or num_physical_experts is None:
-        return torch.int32
-    if num_physical_experts <= 1 << 8:
-        return torch.uint8
-    if num_physical_experts <= 1 << 15:
-        return torch.int16
-    return torch.int32
-
-
-def _narrowest_dtype(arr: np.ndarray) -> np.dtype:
-    if arr.size == 0 or arr.dtype == np.uint8:
-        return np.dtype(np.uint8)
-    lo, hi = int(arr.min()), int(arr.max())
-    if lo >= 0 and hi <= np.iinfo(np.uint8).max:
-        return np.dtype(np.uint8)
-    if lo >= 0 and hi <= np.iinfo(np.uint16).max:
-        return np.dtype(np.uint16)
-    return np.dtype(np.int32)
 
 
 def _swap_leading_axes(arr: np.ndarray) -> np.ndarray:
@@ -86,28 +63,26 @@ def _swap_leading_axes(arr: np.ndarray) -> np.ndarray:
     return out.view(arr.dtype).reshape(b, a, topk)
 
 
-def encode_routed_experts(topk: Union[np.ndarray, torch.Tensor], encoding: str) -> str:
-    """Encode one request's ``[num_tokens, num_layers, topk]`` CPU rows."""
-    arr = topk if isinstance(topk, np.ndarray) else topk.numpy()
+def encode_routed_experts(arr: np.ndarray, encoding: str) -> str:
+    """Encode one request's ``[num_tokens, num_layers, topk]`` rows."""
     if encoding == BASE64_INT32:
         arr = arr.astype(np.int32, copy=False)
         return pybase64.b64encode(arr.tobytes()).decode("utf-8")
     if encoding != ZSTD:
         raise ValueError(f"unknown routed experts encoding {encoding!r}")
-    dtype = _narrowest_dtype(arr)
-    layer_major = _swap_leading_axes(
-        np.ascontiguousarray(arr.astype(dtype, copy=False))
-    )
+    # captured ids are non-negative, so int16 rows read the same as uint16
+    rows = np.ascontiguousarray(arr.view(np.uint16) if arr.dtype == np.int16 else arr)
+    layer_major = _swap_leading_axes(rows)
     threads = _ZSTD_THREADS if layer_major.nbytes >= _ZSTD_THREADED_MIN_BYTES else 0
     frame = zstandard.ZstdCompressor(level=_ZSTD_LEVEL, threads=threads).compress(
         layer_major.data
     )
-    header = _ZSTD_HEADER.pack(dtype.itemsize, *arr.shape)
+    header = _ZSTD_HEADER.pack(rows.itemsize, *arr.shape)
     return pybase64.b64encode(header + frame).decode("utf-8")
 
 
 def encode_routed_experts_per_request(
-    data_list: Optional[List[Optional[Union[np.ndarray, torch.Tensor]]]], encoding: str
+    data_list: Optional[List[Optional[np.ndarray]]], encoding: str
 ) -> Optional[List[Optional[str]]]:
     if data_list is None:
         return None

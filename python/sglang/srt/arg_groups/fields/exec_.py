@@ -88,11 +88,11 @@ class ExecFeatures(msgspec.Struct):
     routed_experts_encoding: A[
         str,
         Arg(
-            help="Wire encoding of returned routed experts, echoed as "
-            "meta_info.routed_experts_encoding. `base64_int32`: raw int32 rows in "
-            "router order. `zstd`: rows sorted ascending (replay needs only the "
-            "expert set), narrowed to the smallest dtype, laid out "
-            "[layers, tokens, topk] and zstd-compressed; see "
+            help="Wire encoding of returned routed experts; rows are sorted ascending "
+            "either way (replay needs only the expert set). `base64_int32`: int32 "
+            "[tokens, layers, topk]. `zstd`: the captured narrow dtype (uint8 up to "
+            "256 experts), laid out [layers, tokens, topk] and zstd-compressed, "
+            "labelled in meta_info.routed_experts_encoding; see "
             "sglang.srt.state_capturer.routed_experts_codec.",
             choices=["base64_int32", "zstd"],
         ),

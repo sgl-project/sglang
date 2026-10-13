@@ -22,16 +22,21 @@ from sglang.srt.runtime_context import (
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.srt.state_capturer.routed_experts_codec import (
     BASE64_INT32,
-    ZSTD,
     decode_routed_experts,
-    host_dtype,
 )
 
 
-def _num_physical_experts() -> Optional[int]:
-    """Exclusive bound on captured ids, logical or (on some backends) physical."""
+def _host_dtype() -> torch.dtype:
+    """Narrowest dtype holding every captured id: logical, or physical on some
+    backends, so all below num_physical_experts."""
     metadata = get_global_expert_location_metadata()
-    return metadata.num_physical_experts if metadata is not None else None
+    if metadata is None:
+        return torch.int32
+    if metadata.num_physical_experts <= 1 << 8:
+        return torch.uint8
+    if metadata.num_physical_experts <= 1 << 15:
+        return torch.int16  # CPU indexing has no uint16 kernels
+    return torch.int32
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -80,9 +85,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
-        encoding = get_exec().features.routed_experts_encoding
-        # replay needs only the expert set, and sorted rows compress far better
-        self.sort_rows = encoding == ZSTD
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
@@ -104,7 +106,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
-            host_dtype=host_dtype(encoding, _num_physical_experts()),
+            host_dtype=_host_dtype(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -131,9 +133,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         super().capture(layer_id, topk_indices)
 
     def _canonicalize_rows(self, slice_gpu: torch.Tensor) -> torch.Tensor:
-        if self.sort_rows:
-            slice_gpu = slice_gpu.sort(dim=-1).values
-        return slice_gpu.to(self.host_cache.buffer.dtype)
+        # replay needs only the expert set; sorted rows compress far better. Only the
+        # padded rows hold -1, and they are sliced off before this, so narrowing is exact.
+        return slice_gpu.sort(dim=-1).values.to(self.host_cache.buffer.dtype)
 
     def _get_local_slice(
         self,
