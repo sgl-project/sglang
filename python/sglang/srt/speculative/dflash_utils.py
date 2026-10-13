@@ -14,13 +14,16 @@ import triton.language as tl
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
-    top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.probability_transforms import (
+    top_k_renorm_probs,
+    top_p_renorm_probs,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -42,9 +45,6 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 
 if is_cuda():
-    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
@@ -52,29 +52,12 @@ if is_cuda():
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 elif is_musa():
     try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        from sgl_kernel import tree_speculative_sampling_target_only
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
 
@@ -119,33 +102,20 @@ def _dflash_npu_top_k_top_p_renorm_prob(
 def _dflash_top_k_renorm_prob(
     probs: torch.Tensor, top_ks: torch.Tensor
 ) -> torch.Tensor:
-    if top_k_renorm_prob is not None:
-        return top_k_renorm_prob(probs, top_ks)
-
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
     if npu_probs is not None:
         return npu_probs
 
-    vocab_size = probs.shape[-1]
-    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
-    top_ks = top_ks.clamp(min=1, max=vocab_size)
-    max_top_k = int(top_ks.max().item())
-    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
-    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
-    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
-    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+    return top_k_renorm_probs(probs, top_ks)
 
 
 def _dflash_top_p_renorm_prob(
     probs: torch.Tensor, top_ps: torch.Tensor
 ) -> torch.Tensor:
-    if top_p_renorm_prob is not None:
-        return top_p_renorm_prob(probs, top_ps)
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
     if npu_probs is not None:
         return npu_probs
-    return top_p_normalize_probs_torch(probs, top_ps)
+    return top_p_renorm_probs(probs, top_ps)
 
 
 def dflash_draft_cell_size_per_token(

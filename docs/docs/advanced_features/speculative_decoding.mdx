@@ -154,6 +154,32 @@ For further details please see the [EAGLE3 paper](https://arxiv.org/pdf/2503.018
 
 ---
 
+## Draft sampling parameters
+
+Draft paths that sample their proposals can use sampling settings separate from
+the target's. Each omitted option inherits the request's value:
+
+| Option | Override |
+| --- | --- |
+| `--speculative-draft-temperature` | Non-negative; `0` makes proposals greedy |
+| `--speculative-draft-top-k` | Positive integer; `-1` disables the cutoff |
+| `--speculative-draft-top-p` | In `(0, 1]`; `1` disables the cutoff |
+
+Greedy requests (`temperature=0` or `top_k=1`) always draft greedily. The draft
+applies temperature, then top-k, then top-p to the model's final (corrected)
+scores, and verification uses exactly that distribution.
+
+| Draft path | Support the settings apply to |
+| --- | --- |
+| EAGLE/EAGLE3/MTP with `--speculative-use-rejection-sampling` | Draft vocabulary |
+| DSpark | Full vocabulary, after the Markov correction |
+| DFlash2 selector, sampled LiLiCorr | The model's K candidates; top-k cannot add tokens |
+
+Plain DFlash, Domino, unsampled LiLiCorr, and EAGLE tree search ignore these
+options.
+
+---
+
 ## EAGLE Decoding
 
 To enable EAGLE speculative decoding the following parameters are relevant:

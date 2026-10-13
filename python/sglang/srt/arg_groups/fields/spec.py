@@ -117,6 +117,22 @@ class Spec(msgspec.Struct):
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
     ] = False
+    speculative_draft_temperature: A[
+        Optional[float],
+        "Draft proposal temperature; 0 makes proposals greedy. Defaults to each "
+        "request's temperature. Applies only where the draft samples its proposal "
+        "(see the speculative decoding docs).",
+    ] = None
+    speculative_draft_top_k: A[
+        Optional[int],
+        "Draft proposal top-k; -1 disables it. Defaults to each request's top_k. "
+        "Greedy requests stay greedy.",
+    ] = None
+    speculative_draft_top_p: A[
+        Optional[float],
+        "Draft proposal top-p in (0, 1]; 1 disables it. Defaults to each "
+        "request's top_p.",
+    ] = None
     speculative_use_block_verification: A[
         bool,
         "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "

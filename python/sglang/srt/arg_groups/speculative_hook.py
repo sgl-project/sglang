@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -117,8 +118,22 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _validate_draft_sampling(cfg) -> None:
+    # Negated comparisons also reject NaN.
+    temperature = cfg.speculative_draft_temperature
+    if temperature is not None and not 0 <= temperature < math.inf:
+        raise ValueError("--speculative-draft-temperature must be finite and >= 0")
+    top_k = cfg.speculative_draft_top_k
+    if top_k is not None and not (top_k == -1 or top_k >= 1):
+        raise ValueError("--speculative-draft-top-k must be -1 or a positive integer")
+    top_p = cfg.speculative_draft_top_p
+    if top_p is not None and not 0 < top_p <= 1:
+        raise ValueError("--speculative-draft-top-p must be in (0, 1]")
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    _validate_draft_sampling(cfg)
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None
