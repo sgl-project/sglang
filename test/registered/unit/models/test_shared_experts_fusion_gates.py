@@ -707,6 +707,134 @@ class TestBailingMoeV3Gate(_FusionGateCase):
     def test_compressed_tensors_uniform_expert_layout_can_fuse(self):
         self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
 
+    def test_layers_with_different_swiglu_limits_keep_shared_expert_standalone(self):
+        """A layer whose shared-expert SwiGLU limit differs from the routed one must
+        not fuse, and its shared-expert weights must stay out of the fused slot."""
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+        BailingMoE = bailing_moe_v3.BailingMoE
+
+        config = SimpleNamespace(
+            expert_swiglu_limit_list=[7.0, 7.0, 7.0],
+            share_expert_swiglu_limit_list=[7.0, 0.0, 7.0],
+        )
+        self.assertEqual(
+            [
+                BailingMoE._resolve_num_fused_shared_experts(config, i, 1)
+                for i in range(3)
+            ],
+            [1, 0, 1],
+        )
+        # Indices past both lists (an MTP layer without entries) have no clamp.
+        self.assertEqual(BailingMoE._resolve_num_fused_shared_experts(config, 3, 1), 1)
+
+        model = bailing_moe_v3.BailingMoeV3ForCausalLM.__new__(
+            bailing_moe_v3.BailingMoeV3ForCausalLM
+        )
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(num_experts=256)
+        body = torch.nn.Module()
+        body.layers = torch.nn.ModuleList()
+        for num_fused in (1, 0):
+            layer = torch.nn.Module()
+            layer.mlp = BailingMoE.__new__(BailingMoE)
+            torch.nn.Module.__init__(layer.mlp)
+            layer.mlp.num_fused_shared_experts = num_fused
+            body.layers.append(layer)
+        from sglang.srt.layers.utils import PPMissingLayer
+
+        body.layers.append(PPMissingLayer())
+        model.model = body
+        name = "model.layers.{}.mlp.shared_experts.gate_proj.weight"
+        self.assertEqual(
+            [
+                model._resolve_shared_expert_weight_name(name.format(i))
+                for i in range(3)
+            ],
+            [
+                "model.layers.0.mlp.experts.256.gate_proj.weight",
+                name.format(1),
+                name.format(2),
+            ],
+        )
+
+        nextn = bailing_moe_nextn.BailingMoeForCausalLMNextN.__new__(
+            bailing_moe_nextn.BailingMoeForCausalLMNextN
+        )
+        torch.nn.Module.__init__(nextn)
+        nextn.config = model.config
+        nextn.model = torch.nn.Module()
+        nextn.model.decoder = body.layers[0]
+        self.assertEqual(
+            nextn._resolve_shared_expert_weight_name(
+                "model.decoder.mlp.shared_experts.down_proj.weight"
+            ),
+            "model.decoder.mlp.experts.256.down_proj.weight",
+        )
+
+    def test_nextn_layer_reads_swiglu_limits_at_its_checkpoint_index(self):
+        """The NextN decoder is built with layer_id 0 but must take its routed and
+        shared clamps, and so its fusion layout, from index num_hidden_layers."""
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+
+        class _Recorder(torch.nn.Module):
+            should_fuse_routed_scaling_factor_in_topk = False
+
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.kwargs = kwargs
+
+        config = SimpleNamespace(
+            architectures=["BailingMoeForCausalLMNextN"],
+            model_type="bailing_hybrid",
+            use_kda=True,
+            full_attention_type="mha",
+            num_hidden_layers=2,
+            first_k_dense_replace=0,
+            hidden_size=64,
+            vocab_size=128,
+            rms_norm_eps=1e-6,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            moe_intermediate_size=32,
+            intermediate_size=64,
+            expert_swiglu_limit_list=[7.0, 7.0, 5.0],
+            share_expert_swiglu_limit_list=[7.0, 7.0, 0.0],
+        )
+        self._seed()
+        with (
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                attn_cp_size=1,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_dp_size=1,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+            ),
+            unittest.mock.patch.object(
+                bailing_moe_v3, "BailingMoEAttention", _Recorder
+            ),
+            unittest.mock.patch.object(
+                bailing_moe_v3, "get_moe_impl_class", lambda quant_config: _Recorder
+            ),
+            unittest.mock.patch.object(bailing_moe_v3, "TopK", _Recorder),
+        ):
+            model = bailing_moe_nextn.BailingMoEModelNextN(
+                config, num_fused_shared_experts=1
+            )
+
+        moe = model.decoder.mlp
+        self.assertEqual(moe.experts.kwargs["gemm1_clamp_limit"], 5.0)
+        self.assertEqual(moe.num_fused_shared_experts, 0)
+        self.assertEqual(moe.experts.kwargs["num_experts"], config.num_experts)
+        self.assertIsInstance(moe.shared_experts, bailing_moe_v3.BailingMLP)
+        self.assertIsNone(moe.shared_experts.swiglu_limit)
+
     def test_nextn_uses_its_rewritten_architecture(self):
         bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
 

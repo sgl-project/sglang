@@ -439,6 +439,27 @@ class BailingMoE(nn.Module):
             return None
         return limit_list[layer_num] or None
 
+    @classmethod
+    def _resolve_num_fused_shared_experts(
+        cls,
+        config: PretrainedConfig,
+        layer_id: int,
+        requested_num_fused_shared_experts: int,
+    ) -> int:
+        if requested_num_fused_shared_experts <= 0:
+            return 0
+        # The fused MoE applies one GEMM1 clamp to routed and shared experts alike,
+        # so a layer whose two limits differ keeps its shared expert standalone.
+        expert_limit = cls._get_swiglu_limit(
+            getattr(config, "expert_swiglu_limit_list", None), layer_id
+        )
+        shared_limit = cls._get_swiglu_limit(
+            getattr(config, "share_expert_swiglu_limit_list", None), layer_id
+        )
+        if expert_limit != shared_limit:
+            return 0
+        return requested_num_fused_shared_experts
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -447,10 +468,13 @@ class BailingMoE(nn.Module):
         prefix: str = "moe",
         num_fused_shared_experts: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        swiglu_limit_layer_id: Optional[int] = None,
     ):
         super().__init__()
 
         self.layer_id = layer_id
+        if swiglu_limit_layer_id is None:
+            swiglu_limit_layer_id = layer_id
         self.alt_stream = alt_stream
 
         self.tp_size = get_parallel().tp_size
@@ -466,18 +490,26 @@ class BailingMoE(nn.Module):
         self.score_function = getattr(config, "score_function", None)
         self.multi_gate = is_bailing_multi_gate_enabled(config)
 
-        self.num_fused_shared_experts = num_fused_shared_experts
-
         expert_swiglu_limit_list = getattr(config, "expert_swiglu_limit_list", None)
         share_expert_swiglu_limit_list = getattr(
             config, "share_expert_swiglu_limit_list", None
         )
         self.expert_swiglu_limit = self._get_swiglu_limit(
-            expert_swiglu_limit_list, layer_id
+            expert_swiglu_limit_list, swiglu_limit_layer_id
         )
         self.share_expert_swiglu_limit = self._get_swiglu_limit(
-            share_expert_swiglu_limit_list, layer_id
+            share_expert_swiglu_limit_list, swiglu_limit_layer_id
         )
+        self.num_fused_shared_experts = self._resolve_num_fused_shared_experts(
+            config, swiglu_limit_layer_id, num_fused_shared_experts
+        )
+        if num_fused_shared_experts > 0 and self.num_fused_shared_experts == 0:
+            log_info_on_rank0(
+                logger,
+                f"Bailing shared-expert fusion is disabled for layer {layer_id}: "
+                f"routed/shared SwiGLU limits differ ({self.expert_swiglu_limit} "
+                f"vs {self.share_expert_swiglu_limit}).",
+            )
 
         # Run the MoE gate in bf16. ling-v3's config sets router_dtype="fp32",
         # but on Hopper that fp32 gate GEMM falls back to a slow sm80 (Ampere)
@@ -1096,6 +1128,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     prefix=prefix,
                     num_fused_shared_experts=num_fused_shared_experts,
                     alt_stream=alt_stream,
+                    # The MTP layer is built with layer_id 0; its limits live at
+                    # its checkpoint index, after the target decoder layers.
+                    swiglu_limit_layer_id=(
+                        config.num_hidden_layers if is_nextn else self.layer_id
+                    ),
                 )
             else:
                 self.mlp = BailingMLP(
@@ -1793,6 +1830,14 @@ class BailingMoeV3ForCausalLM(nn.Module):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
+    def _resolve_shared_expert_weight_name(self, weight_name: str) -> str:
+        layer = self.get_submodule(weight_name.split(".mlp.", 1)[0])
+        if isinstance(layer, PPMissingLayer) or layer.mlp.num_fused_shared_experts == 0:
+            return weight_name
+        return weight_name.replace(
+            "mlp.shared_experts", f"mlp.experts.{self.config.num_experts}"
+        )
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         num_groups = getattr(config, "n_group", 0)
@@ -1891,10 +1936,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 layer_idx = 0
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.num_experts}",
-                )
+                name = self._resolve_shared_expert_weight_name(name)
 
             weight_names.append(name)
 
