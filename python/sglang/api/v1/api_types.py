@@ -367,6 +367,7 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
     max_tokens_per_frame: Optional[int] = None
     max_image_tokens: Optional[int] = None
     use_audio: Optional[bool] = None
+    image_grid_thw: Optional[ImageGridThw] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "MediaRef":
@@ -528,6 +529,9 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
+
+# sglang.api.v1.ImageGridThw: JSON bare array.
+ImageGridThw = List[Int64List]
 
 # sglang.api.v1.MediaItem: JSON: the value's shape picks the arm.
 MediaItem = Union[str, MediaRef]
@@ -1334,7 +1338,7 @@ def encode_GenerateStreamError(v: GenerateStreamError) -> Dict[str, Any]:
     return d
 
 
-_FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio",)
+_FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio", "image_grid_thw",)
 
 
 def decode_MediaRef(value: Any) -> MediaRef:
@@ -1369,6 +1373,8 @@ def decode_MediaRef(value: Any) -> MediaRef:
             kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64")
         elif key == "use_audio":
             kw["use_audio"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "image_grid_thw":
+            kw["image_grid_thw"] = None if x is None else decode_ImageGridThw(x)
         else:
             raise _unknown_field(key, fields=_FIELDS_MediaRef)
     return MediaRef(**kw)
@@ -1403,7 +1409,17 @@ def encode_MediaRef(v: MediaRef) -> Dict[str, Any]:
         d["max_image_tokens"] = v.max_image_tokens
     if v.use_audio is not None:
         d["use_audio"] = v.use_audio
+    if v.image_grid_thw is not None:
+        d["image_grid_thw"] = encode_ImageGridThw(v.image_grid_thw)
     return d
+
+
+def decode_ImageGridThw(value: Any) -> ImageGridThw:
+    return [decode_Int64List(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_ImageGridThw(v: ImageGridThw) -> List[Any]:
+    return [encode_Int64List(e) for e in v]
 
 
 def decode_MediaItem(value: Any) -> MediaItem:
