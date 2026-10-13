@@ -110,7 +110,7 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan):
     has_draft_tokens = bool(server_info.get("speculative_num_draft_tokens"))
     assert has_draft_tokens is mtp_enabled
 
-    _check_cached_output_matches_recompute(mtp_enabled)
+    _check_cached_output_matches_recompute(int8_enabled, mtp_enabled)
 
     results = {}
     for K, (warm, probe) in plan.items():
@@ -145,7 +145,7 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan):
     return results
 
 
-def _check_cached_output_matches_recompute(mtp_enabled):
+def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled):
     """Check a one-token answer after reuse and observe runtime MTP acceptance."""
     prompt = (
         "\n\n".join(
@@ -180,6 +180,13 @@ def _check_cached_output_matches_recompute(mtp_enabled):
         "both after recompute and after a cache hit: "
         f"recompute={recompute['text']!r}, cached={cached['text']!r}"
     )
+    print(
+        f"[int8={'on' if int8_enabled else 'off'}, "
+        f"mtp={'on' if mtp_enabled else 'off'}] cache-hit answer: "
+        f"recompute={recompute['text']!r}, cached={cached['text']!r}, "
+        f"cached_tokens={cached['meta_info']['cached_tokens']}",
+        flush=True,
+    )
 
     if mtp_enabled:
         # Generate enough tokens to run the speculative verifier, reusing the
@@ -203,6 +210,15 @@ def _check_cached_output_matches_recompute(mtp_enabled):
         )
         assert meta.get("spec_verify_ct", 0) > 0, (
             "MTP was configured but the cache-hit generation did not run verification"
+        )
+        print(
+            f"[int8={'on' if int8_enabled else 'off'}, mtp=on] cache-hit "
+            "speculation: "
+            f"spec_accept_length={meta['spec_accept_length']}, "
+            f"spec_num_correct_drafts={meta['spec_num_correct_drafts']}, "
+            f"spec_verify_ct={meta['spec_verify_ct']}, "
+            f"cached_tokens={meta['cached_tokens']}",
+            flush=True,
         )
 
 
