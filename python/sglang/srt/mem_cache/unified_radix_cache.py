@@ -2670,7 +2670,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
-        # A missing reduced KV verdict means some rank did not query storage.
+        # No rank-agreed KV query evidence; leave beliefs unchanged.
         if PoolName.KV not in verdicts:
             return
         folded_pages = operation.storage_hit_count // self.page_size
@@ -2992,7 +2992,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                # Consume query evidence only after rank synchronization.
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
