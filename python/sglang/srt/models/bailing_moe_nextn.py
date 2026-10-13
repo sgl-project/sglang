@@ -267,6 +267,11 @@ class BailingMoeForCausalLMNextN(nn.Module):
         # that enables KDA-style layers on NextN doesn't hit AttributeError.
         BailingMoeV3ForCausalLM.weight_direct_load(param, loaded_weight)
 
+    def _resolve_shared_expert_weight_name(self, weight_name: str) -> str:
+        return BailingMoeV3ForCausalLM._resolve_shared_expert_weight_name(
+            self, weight_name
+        )
+
     @torch.no_grad()
     def forward(
         self,
