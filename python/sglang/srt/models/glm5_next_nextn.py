@@ -43,7 +43,9 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             draft_rules[f"{ckpt_prefix}.enorm"] = "model.enorm"
             draft_rules[f"{ckpt_prefix}.hnorm"] = "model.hnorm"
             draft_rules[ckpt_prefix] = "model.decoder"
-        # target rules still normalize the non-draft layers and vision tower in `exclude`
+        # reuse the target mapper (model.language_model. -> model., model.visual ->
+        # visual, .attn.qkv -> .attn.qkv_proj) to normalize the non-draft layers and
+        # vision tower; the draft rules add the NextN block on top
         return Glm5NextForConditionalGeneration.hf_to_sglang_mapper | WeightsMapper(
             orig_to_new_substr=draft_rules,
         )
