@@ -192,18 +192,9 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
 
-<<<<<<< HEAD
-    ref = residual + update * gate
-    if torch.version.hip is None:
-        assert can_use_residual_gate_add_cuda(residual, update, gate)
-        _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
-    else:
-        assert not can_use_residual_gate_add_cuda(residual, update, gate)
-=======
     assert can_use_residual_gate_add_fast(residual, update, gate)
     ref = residual + update * gate
     _assert_gate_add(residual_gate_add_fast(residual, update, gate), ref)
->>>>>>> 0cd080ec97 ([AMD][Diffusion] Test ROCm residual gate dispatch)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
 
 
@@ -354,6 +345,7 @@ def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
     _assert_gate_add(residual_gate_add(residual, update, gate), expected)
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA implementation only")
 def test_residual_gate_add_batched_rows_cuda_graph():
     residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
