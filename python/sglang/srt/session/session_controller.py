@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from array import array
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -208,6 +209,7 @@ class Session:
         vocab_size: int,
         eos_token_ids=None,
         disagg_mode: Optional[DisaggregationMode] = None,
+        req_factory: Callable[..., Req] = Req,
     ):
         assert req.session_params is not None
         session_params = req.session_params
@@ -296,7 +298,7 @@ class Session:
                 "A session request must contain input tokens after restoring history."
             )
 
-        new_req = Req(
+        new_req = req_factory(
             rid=req.rid,
             origin_input_text=None,
             origin_input_ids=input_ids,
