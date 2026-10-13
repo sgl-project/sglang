@@ -1591,13 +1591,12 @@ class ModelConfig:
     def get_num_kv_heads(self, tensor_parallel_size: int, dcp_size: int = 1) -> int:
         """Number of KV heads per GPU.
 
-        DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups.
-        Drafts never join the group and ignore ``dcp_size``. With fewer heads
-        than groups, each GPU keeps one.
+        DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups;
+        ``dcp_size`` is the caller's own KV width (a draft passes
+        ``speculative_dcp_size``). With fewer heads than groups,
+        each GPU keeps one.
         """
         total_num_kv_heads = self.get_total_num_kv_heads()
-        if self.is_draft_model:
-            dcp_size = 1
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 

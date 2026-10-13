@@ -136,6 +136,7 @@ class TestAscendPageDcpSend(CustomTestCase):
             kv_item_lens=[20, 8, 4],
             page_size=2,
             mla_compression_ratios=None,
+            num_draft_entries=0,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
         mgr._transfer_data = Mock(return_value=0)
@@ -175,6 +176,7 @@ class TestAscendPageDcpSend(CustomTestCase):
             kv_item_lens=[20, 8, 4],
             page_size=2,
             mla_compression_ratios=None,
+            num_draft_entries=0,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
         mgr._transfer_data = Mock(return_value=0)

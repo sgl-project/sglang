@@ -243,6 +243,8 @@ class KVArgsRegisterInfo:
     dst_kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
+    dst_draft_dcp_size: int = 1
+    dst_draft_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dcp_dst_region_indices: Optional[List[int]] = None
@@ -317,6 +319,12 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 0
+            ),
+            dst_draft_dcp_size=(
+                int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] != b"" else 1
+            ),
+            dst_draft_dcp_rank=(
+                int(msg[24].decode("ascii")) if len(msg) > 24 and msg[24] != b"" else 0
             ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
@@ -1143,6 +1151,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
                 dst_kv_item_lens,
                 peer_info.dst_dcp_size,
+                dst_draft_dcp_size=peer_info.dst_draft_dcp_size,
             )
             return
 
@@ -1402,6 +1411,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     src_page_offset=(kv_chunk.index_slice.start or 0),
                                     decode_prefix_len=req.decode_prefix_len or 0,
                                     num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    draft_dcp_size=dst_info.dst_draft_dcp_size,
+                                    draft_dcp_rank=dst_info.dst_draft_dcp_rank,
                                 )
                                 packed_src = self._pack_dcp_rank_once(
                                     pack_buffer,
@@ -3580,6 +3591,8 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
+                            str(self.kv_mgr.draft_dcp_size).encode("ascii"),
+                            str(self.kv_mgr.draft_dcp_rank).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

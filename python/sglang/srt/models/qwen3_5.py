@@ -1248,8 +1248,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
-        # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
-        dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
+        # so is_nextn marks it; its KV shards at the draft's own DCP width.
+        dcp_size = (
+            get_parallel().speculative_dcp_size
+            if is_nextn
+            else get_parallel().attn_dcp_size
+        )
         kv_parallel_group = ReplicatedParallelGroup("attn_tp", dcp_size)
         self.kv_tp_rank, self.kv_tp_size = resolve_linear_parallel_group(
             kv_parallel_group

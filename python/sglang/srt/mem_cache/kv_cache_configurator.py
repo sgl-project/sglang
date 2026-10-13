@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
+    get_draft_loc_space_scale,
     get_mamba_tracking_slots,
     get_req_to_token_extra_context_len,
 )
@@ -472,8 +473,7 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        return get_draft_loc_space_scale() if self.is_draft_worker else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -838,7 +838,12 @@ class KVCacheConfigurator:
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             fused_draft=self._fused_draft_for_mamba_factory(),
@@ -912,7 +917,12 @@ class KVCacheConfigurator:
             extra_max_context_len += get_spec().speculative_num_draft_tokens
 
         head_num = self.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size,
+            (
+                get_parallel().speculative_dcp_size
+                if self.is_draft_worker
+                else get_parallel().attn_dcp_size
+            ),
         )
         head_dim = self.model_config.head_dim
         if self.is_hybrid_swa_compress:
@@ -1279,7 +1289,12 @@ class KVCacheConfigurator:
         req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size,
+            (
+                get_parallel().speculative_dcp_size
+                if self.is_draft_worker
+                else get_parallel().attn_dcp_size
+            ),
         )
         head_dim = self.model_config.head_dim
         if self.is_hybrid_swa_compress:
@@ -1876,7 +1891,12 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
@@ -1987,7 +2007,12 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             layer_num=self.layer_info.num_effective_layers,
@@ -2207,7 +2232,12 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
@@ -2249,7 +2279,12 @@ class KVCacheConfigurator:
                 model_dtype=self.model_dtype,
             ),
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],
@@ -2357,7 +2392,12 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             # if draft worker, we only need 1 attention layer's kv pool
@@ -2440,7 +2480,12 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                get_parallel().attn_tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if self.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             ),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,

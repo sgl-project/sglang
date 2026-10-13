@@ -156,6 +156,8 @@ class KVArgsRegisterInfo:
     dst_state_layer_ids: List[List[int]]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
+    dst_draft_dcp_size: int = 1
+    dst_draft_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
@@ -205,6 +207,12 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dst_draft_dcp_size=(
+                int(msg[20].decode("ascii")) if len(msg) > 20 and msg[20] != b"" else 1
+            ),
+            dst_draft_dcp_rank=(
+                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] != b"" else 0
             ),
             dst_kv_item_lens=(
                 list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
@@ -1317,6 +1325,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        dst_draft_dcp_size: int = 1,
+        dst_draft_dcp_rank: int = 0,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -1357,6 +1367,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
+            draft_dcp_size=dst_draft_dcp_size,
+            draft_dcp_rank=dst_draft_dcp_rank,
         )
         if plan.empty():
             return 0
@@ -1409,7 +1421,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_width = src_width
                 if dst_kv_item_lens:
                     dst_width, remainder = divmod(
-                        dst_kv_item_lens[entry], physical_page_size * dst_dcp_size
+                        dst_kv_item_lens[entry],
+                        physical_page_size * dst_dcp_size // dst_draft_dcp_size,
                     )
                     if remainder or dst_width <= 0:
                         raise ValueError("Invalid PD DCP draft destination token width")
@@ -2558,6 +2571,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_draft_dcp_size=target_rank_registration_info.dst_draft_dcp_size,
+                                dst_draft_dcp_rank=target_rank_registration_info.dst_draft_dcp_rank,
                             )
                         elif (
                             self.is_mla_backend
@@ -2865,6 +2880,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self.prepare_dcp_token_item_lens(
                                 dst_item_lens,
                                 decode_kv_args.dst_dcp_size,
+                                dst_draft_dcp_size=decode_kv_args.dst_draft_dcp_size,
                             )
                         )
                         self._init_dcp_pack_buffers_once(
@@ -3291,6 +3307,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            str(self.kv_mgr.draft_dcp_size).encode("ascii"),
+                            str(self.kv_mgr.draft_dcp_rank).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

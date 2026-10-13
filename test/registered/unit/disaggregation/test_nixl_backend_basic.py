@@ -362,6 +362,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
             b"4",
             b"3",
+            b"2",
+            b"1",
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -385,6 +387,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dst_draft_dcp_size, 2)
+        self.assertEqual(info.dst_draft_dcp_rank, 1)
         self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertEqual(info.staging_base_ptr, staging_ptr)
@@ -414,6 +418,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertEqual(info.dst_dcp_size, 1)
         self.assertEqual(info.dst_dcp_rank, 0)
+        self.assertEqual(info.dst_draft_dcp_size, 1)
+        self.assertEqual(info.dst_draft_dcp_rank, 0)
         self.assertEqual(info.staging_base_ptr, 0)
         self.assertEqual(info.staging_total_size, 0)
 
@@ -764,6 +770,8 @@ class TestNixlTransferWorker(CustomTestCase):
                 requires_dcp_relayout=True,
                 dst_dcp_size=2,
                 dst_dcp_rank=dcp_rank,
+                dst_draft_dcp_size=1,
+                dst_draft_dcp_rank=0,
                 dcp_dst_region_indices=[0],
                 dcp_token_item_lens=[4],
             )

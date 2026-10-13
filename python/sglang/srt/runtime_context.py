@@ -248,6 +248,7 @@ _RANK_AND_WIDTH = (
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
     ("moe_ep_rank", "moe_ep_size"),
+    ("speculative_dcp_rank", "speculative_dcp_size"),
 )
 
 # MoE-DP may alias a wider attention-CP group, so its configured width
@@ -1559,6 +1560,8 @@ def _configure_context(
     # Disabled DCP has rank zero even in processes without a rank bundle.
     if not context.parallel.dcp_enabled:
         context.parallel.override_permanently(attn_dcp_rank=0)
+    if context.parallel.speculative_dcp_size == 1:
+        context.parallel.override_permanently(speculative_dcp_rank=0)
     # The device is assigned by the launcher; it is not a config field.
     context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
@@ -1585,6 +1588,9 @@ def _configure_context(
         if parallel.dcp_enabled:
             placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
         placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
+        placement["speculative_dcp_rank"] = (
+            placement["tp_rank"] % parallel.speculative_dcp_size
+        )
         parallel.override_permanently(**placement)
         _validate_parallel(parallel, "publish")
     if _ROLE_NS_MODE == "record":

@@ -87,20 +87,28 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+def _should_use_verify_shared_kv(
+    model_config,
+    topk,
+    use_mla,
+    use_verify_splitkv,
+    *,
+    is_draft_worker: bool = False,
+):
     if not is_gfx95_supported() or topk != 1:
         return False
     if use_mla:
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
+    parallel = get_parallel()
+    dcp_size = (
+        parallel.speculative_dcp_size if is_draft_worker else parallel.attn_dcp_size
+    )
     return (
         use_verify_splitkv
         and is_qwen3_5(model_config.hf_config)
-        and model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-        )
-        == 1
+        and model_config.get_num_kv_heads(parallel.attn_tp_size, dcp_size) == 1
     )
 
 
@@ -243,26 +251,21 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+            is_draft_worker=model_runner.is_draft_worker,
         )
-        # TODO: this logic should be fixed in non-hip platform
-        self.is_hip_dspark_draft = (
-            _is_hip
-            and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dspark()
-        )
-        if self.is_hip_dspark_draft:
-            # Drafts never join the dcp group so we ignore it
-            self.dcp_size = 1
-            self.dcp_rank = 0
+        parallel = get_parallel()
+        if model_runner.is_draft_worker:
+            self.dcp_size = parallel.speculative_dcp_size
+            self.dcp_rank = parallel.speculative_dcp_rank
         else:
-            self.dcp_size = get_parallel().attn_dcp_size
-            self.dcp_rank = get_parallel().attn_dcp_rank
+            self.dcp_size = parallel.attn_dcp_size
+            self.dcp_rank = parallel.attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size, self.dcp_size
         )
         mla_config = model_runner.model_config
         self.use_dense_fp8_chunked_prefill = (

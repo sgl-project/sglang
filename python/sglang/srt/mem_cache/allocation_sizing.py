@@ -25,6 +25,13 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
+def get_draft_loc_space_scale() -> int:
+    """Allocator virtual ids one draft-pool row spans: the draft pool is
+    replicated across the target's DCP ranks it does not shard over."""
+    parallel = get_parallel()
+    return parallel.attn_dcp_size // parallel.speculative_dcp_size
+
+
 def get_alloc_len_per_decode() -> int:
     """KV length one request may allocate in a single decode step.
 

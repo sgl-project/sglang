@@ -720,6 +720,18 @@ class TestParallelDCP(_IsolatedOverrides):
         with self.assertRaises(RuntimeError):
             parallel.dcp_rank
 
+    def test_the_draft_width_does_not_follow_the_target_group(self):
+        """The draft KV cache shards at --speculative-dcp-size, so a DCP-8 target
+        leaves the draft at width one, rank zero on every TP rank."""
+        parallel = self._placed(5, tp_size=8, dcp_size=8)
+        self.assertEqual(parallel.attn_dcp_size, 8)
+        self.assertEqual(parallel.speculative_dcp_size, 1)
+        self.assertEqual(parallel.speculative_dcp_rank, 0)
+
+    def test_the_draft_rank_answers_without_a_spawn_bundle(self):
+        parallel = self._published(tp_size=8, dcp_size=8)
+        self.assertEqual(parallel.speculative_dcp_rank, 0)
+
     def test_the_width_does_not_consult_the_platform(self):
         with patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda:
             parallel = self._published(tp_size=8, dcp_size=8)

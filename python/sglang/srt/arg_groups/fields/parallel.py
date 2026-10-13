@@ -56,6 +56,13 @@ class Parallel(msgspec.Struct):
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    speculative_dcp_size: A[
+        int,
+        "Decode context parallelism size for the speculative draft KV cache. The "
+        "draft KV cache is head-sharded across the TP group like the target's; set "
+        "to 1 (the default) to keep it that way. Sharding the draft KV cache along "
+        "the sequence (> 1) is not supported yet and is rejected.",
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -360,6 +367,12 @@ class Parallel(msgspec.Struct):
         doc=(
             "Decode context-parallel rank inside the attention TP group, "
             "zero where decode context parallelism is off."
+        )
+    )
+    speculative_dcp_rank = Derived(
+        doc=(
+            "This process's place in the speculative draft KV cache's decode "
+            "context-parallel slice, zero while `speculative_dcp_size` is one."
         )
     )
     attn_dp_rank = Derived(

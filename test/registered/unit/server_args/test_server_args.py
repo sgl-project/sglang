@@ -2387,6 +2387,15 @@ class TestDecoupledSpecArgs(CustomTestCase):
             )
 
 
+class TestSpeculativeDcpSize(CustomTestCase):
+    def test_rejects_sharded_draft_kv_cache(self):
+        """--speculative-dcp-size > 1 is refused until the draft KV cache can be sharded."""
+        args = ServerArgs(model_path="dummy")
+        args.speculative_dcp_size = 2
+        with self.assertRaisesRegex(ValueError, "--speculative-dcp-size must be 1"):
+            handle_speculative_decoding(args)
+
+
 class TestAdaptiveSpecArgs(CustomTestCase):
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

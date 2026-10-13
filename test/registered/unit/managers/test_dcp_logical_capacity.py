@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -143,6 +144,9 @@ class TestDcpLogicalCapacity(CustomTestCase):
         # Draft sizes already carry loc_space_scale; SWA never widens.
         runner.kv_cache_configurator = make_configurator(is_draft_worker=True)
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
+        # A draft sharded at its own width replicates over fewer ranks.
+        with get_parallel().override(speculative_dcp_size=2):
+            self.assertEqual(runner.logical_max_total_num_tokens, 64 * 2)
         runner.is_hybrid_swa = True
         runner.kv_cache_configurator = make_configurator(is_hybrid_swa=True)
         runner.full_max_total_num_tokens = 32
