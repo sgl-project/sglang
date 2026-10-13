@@ -177,8 +177,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
 
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
