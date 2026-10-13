@@ -1058,6 +1058,9 @@ class FusedMoE(torch.nn.Module):
         ):
             return False
 
+        # Quark MXFP4 checkpoints store block-FP8 scales as raw UE8M0 bytes.
+        if "weight_scale_inv" in weight_name and loaded_weight.dtype == torch.uint8:
+            loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
         is_weight = (
             "weight" in weight_name
             and "scale" not in weight_name
@@ -1071,9 +1074,17 @@ class FusedMoE(torch.nn.Module):
             return False
 
         weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
-        scale_param = (
-            self.w2_weight_scale_inv if shard_id == "w2" else self.w13_weight_scale_inv
-        )
+        # ModelOpt FP4 layers register *_weight_scale_inv. Quark MXFP4 registers
+        # *_weight_scale. getattr returns None when the ModelOpt name is absent;
+        # a direct attribute read raises AttributeError on nn.Module.
+        if shard_id == "w2":
+            scale_param = getattr(self, "w2_weight_scale_inv", None)
+            if scale_param is None:
+                scale_param = self.w2_weight_scale
+        else:
+            scale_param = getattr(self, "w13_weight_scale_inv", None)
+            if scale_param is None:
+                scale_param = self.w13_weight_scale
         if param is not weight_param and param is not scale_param:
             return False
 
@@ -1100,13 +1111,24 @@ class FusedMoE(torch.nn.Module):
 
         weight_block_size = getattr(self.quant_config, "weight_block_size", None)
         if weight_block_size is None:
-            raise ValueError(
-                "Loading FP8 shared expert weights into FP4 fused MoE weights "
-                "requires block-FP8 weight_block_size."
-            )
+            # Quark MXFP4 has no weight_block_size. Shared-expert FP8 scales are
+            # one UE8M0 value per 32 K elements, so each block is [1, 32].
+            if getattr(self.quant_config, "get_name", lambda: "")() == "quark":
+                weight_block_size = [1, 32]
+            else:
+                raise ValueError(
+                    "Loading FP8 shared expert weights into FP4 fused MoE weights "
+                    "requires block-FP8 weight_block_size."
+                )
         fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
             fp8_weight, fp8_scale, weight_block_size
         )
+        # Quark stores packed MXFP4 weights and UE8M0 scales as uint8. view()
+        # keeps the bits; a dtype cast would reinterpret them.
+        if weight_param.dtype == torch.uint8 and fp4_weight.dtype != torch.uint8:
+            fp4_weight = fp4_weight.view(torch.uint8)
+        if scale_param.dtype == torch.uint8 and fp4_scale.dtype != torch.uint8:
+            fp4_scale = fp4_scale.contiguous().view(torch.uint8)
 
         weight_data = weight_param.data[expert_id]
         scale_data = scale_param.data[expert_id]
