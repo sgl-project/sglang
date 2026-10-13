@@ -159,6 +159,19 @@ def initialize_fp4_gemm_config() -> None:
         else:
             backend = "flashinfer_cutlass"
 
+    # FP4 Marlin is weight-only (W4A16) and does not support W4A4 GEMM.
+    # FlashInfer's mm_fp4 rejects backend='marlin' on SM100+, so force a
+    # fallback whenever the user (or auto-selection) picks marlin on
+    # Blackwell GPUs. See issue #43988.
+    if backend == "marlin" and get_platform().is_blackwell:
+        fallback = "flashinfer_cutedsl" if get_platform().is_sm100 else "flashinfer_cutlass"
+        logger.warning(
+            "FP4 Marlin does not support SM100+ (Blackwell); falling back to %s. "
+            "FlashInfer's mm_fp4 has no 'marlin' backend for capability 100.",
+            fallback,
+        )
+        backend = fallback
+
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
 
 
