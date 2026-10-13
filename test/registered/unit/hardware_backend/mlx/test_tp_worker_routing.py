@@ -72,6 +72,7 @@ class _FakeRunner:
         # (op, rid) -> needs_logits as received; guards the worker's
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
+        self.prefix_slot_ids: dict[str, list[int]] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -87,7 +88,7 @@ class _FakeRunner:
     def store_auxiliary_state_for_request(self, rid):
         pass
 
-    def flush_all_decode_kv(self):
+    def release_request_row(self, rid, owned_len):
         pass
 
     def ops_for(self, rid):
@@ -138,6 +139,7 @@ class _FakeRunner:
 
         self.calls.append(("prefill_start", req_id))
         self.logits_flags[("prefill_start", req_id)] = needs_logits
+        self.prefix_slot_ids[req_id] = list(prefix_slot_ids)
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
@@ -183,13 +185,14 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
-        self.prefix_indices = torch.empty(0, dtype=torch.long)
+        self.retraction_count = 0
+        self.prefix_len = 0
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
-        # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
+        # MlxTpModelWorker._chunk_needs_logits: extend_end=None means
         # "not truncated" (final chunk / plain prefill).
-        self.extend_range = None
+        self.extend_end = None
         self.full_untruncated_fill_ids = self.fill_ids
 
     def get_fill_ids(self):
@@ -231,6 +234,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
         worker._mlx_finished_rids = set()
+        worker._req_retraction_count = {}
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -271,6 +275,23 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
 
+    # ---------- retraction ----------
+
+    def test_retracted_request_reprefills_from_scratch(self):
+        """A request retracted after its MLX state was made drops that state,
+        so its re-prefill routes as a fresh prefill."""
+        worker = self._worker(known_rids=set())
+        req = _FakeReq("r1")
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        worker._mlx_runner._known.add("r1")
+
+        req.retraction_count += 1
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"),
+            ["prefill_start", "remove_request", "prefill_start"],
+        )
+
     # ---------- sync path: _forward_batch_generation_mlx ----------
 
     def _run_sync(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
@@ -284,18 +305,18 @@ class TestMlxExtendRouting(CustomTestCase):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
-        # Untruncated (extend_range None) => final chunk => logits required.
+        # Untruncated (extend_end None) => final chunk => logits required.
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
 
     def test_sync_non_final_chunk_skips_logits(self):
-        """Head-skip derivation: a scheduler-truncated chunk (extend_range.end
+        """Head-skip derivation: a scheduler-truncated chunk (extend_end
         below the request's full untruncated length) reaches the runner with
         needs_logits=False; its next-token output is popped as the stale
         intermediate token, so computing the vocab head for it is pure waste.
         Everything else about routing is unchanged."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)  # 4 < 8: non-final
+        req.extend_end = 4  # 4 < 8: non-final
         runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
@@ -309,10 +330,7 @@ class TestMlxExtendRouting(CustomTestCase):
     # ---------- async path: _async_extend_batch ----------
 
     def _run_async(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
-
-        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker._mlx_runner = _FakeRunner(known_rids)
+        worker = self._worker(known_rids)
         batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
         launch = worker._async_extend_batch(batch)
         return worker._mlx_runner, launch
@@ -331,10 +349,26 @@ class TestMlxExtendRouting(CustomTestCase):
         """Async twin of the head-skip derivation guard."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)
+        req.extend_end = 4
         runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
+
+    def test_async_prefix_hit_reads_slots_from_runner_pool(self):
+        """A radix prefix hit takes its slots from the stub runner's pool:
+        the worker's own req_to_token_pool is None on MLX."""
+        req_to_token = torch.zeros(2, 8, dtype=torch.int32)
+        req_to_token[1, :5] = torch.tensor([11, 12, 13, 14, 15])
+        worker = self._worker(known_rids=set())
+        worker.req_to_token_pool = None
+        worker._model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        req = _FakeReq("r1", req_pool_idx=1)
+        req.prefix_len = 3
+        batch = _FakeBatch(ForwardMode.EXTEND, [req], [2])
+        worker._async_extend_batch(batch)
+        self.assertEqual(worker._mlx_runner.prefix_slot_ids["r1"], [11, 12, 13])
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
@@ -346,7 +380,11 @@ class TestMlxExtendRouting(CustomTestCase):
 
 def _finished_req(rid):
     """Minimal Req stand-in for prepare_for_kv_cache_release."""
-    return SimpleNamespace(rid=rid, kv=SimpleNamespace(mamba_last_track_seqlen=None))
+    return SimpleNamespace(
+        rid=rid,
+        kv=SimpleNamespace(mamba_last_track_seqlen=None),
+        owned_kv_len=lambda: 0,
+    )
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
@@ -367,6 +405,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         worker._mlx_runner = _FakeRunner(active_rids)
         worker._mlx_active_rids = set(active_rids)
         worker._mlx_finished_rids = set()
+        worker._req_retraction_count = {rid: 0 for rid in active_rids}
         worker._mlx_pool_initialized = True
         return worker
 
@@ -381,6 +420,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         self.assertFalse(worker._mlx_runner.has_request("b"))
         self.assertEqual(worker._mlx_active_rids, {"c"})
         self.assertEqual(worker._mlx_finished_rids, set())
+        self.assertEqual(worker._req_retraction_count, {})
 
     def test_unfinished_requests_survive_extend_launch(self):
         worker = self._worker({"a", "b"})
@@ -391,6 +431,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         self.assertFalse(worker._mlx_runner.has_request("a"))
         self.assertTrue(worker._mlx_runner.has_request("b"))
         self.assertEqual(worker._mlx_active_rids, {"b", "c"})
+        self.assertEqual(worker._req_retraction_count, {"b": 0})
 
     def test_decode_launch_still_drops_silently_departed_requests(self):
         # An abort leaves the batch without a finish notification; the
@@ -402,6 +443,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         self.assertFalse(worker._mlx_runner.has_request("a"))
         self.assertTrue(worker._mlx_runner.has_request("b"))
         self.assertEqual(worker._mlx_active_rids, {"b"})
+        self.assertEqual(worker._req_retraction_count, {"b": 0})
 
     def test_unknown_request_is_not_marked(self):
         worker = self._worker({"a"})
@@ -523,6 +565,33 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         self.assertIsNot(launch.prefills[0].cache, old_cache)
         worker.finalize_mlx_result(launch, [new_req])
 
+    def test_retracted_prefill_completion_releases_runner_state(self):
+        """A prefill-only request completing after retraction must not leave
+        runner state behind when the next prefill wave starts."""
+        worker = self._worker({"retracted"})
+        runner = worker._mlx_runner
+        req = self._req("retracted")
+        req.retraction_count = 1
+        req.full_untruncated_fill_ids = array("q", [1, 2])
+        launch = worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [req], [2])
+        )
+        worker.finalize_mlx_result(launch, [req])
+        runner._known.add(req.rid)  # the new prefill finalized
+        runner._req_caches[req.rid] = launch.prefills[0].cache
+        self._process_prefill(worker, [req])
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [_FakeReq("fresh")], [2])
+        )
+
+        self.assertTrue(req.finished())
+        self.assertFalse(runner.has_request(req.rid))
+        self.assertNotIn(req.rid, runner._req_caches)
+        self.assertNotIn(req.rid, worker._req_retraction_count)
+        self.assertEqual(worker._mlx_active_rids, {"fresh"})
+        self.assertFalse(worker._mlx_finished_rids)
+
     def test_overlap_drains_chained_decode_before_mixed_launch_cleanup(self):
         import mlx.core as mx
 
@@ -534,8 +603,8 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         events = []
         worker = self._worker({"finished", "live"})
         runner = worker._mlx_runner
-        # Exercise remove_request's radix-enabled pool flush, with synthetic
-        # cache tensors / scheduler rows and a mocked pool-write destination.
+        # Sync while the request owns its row; removing state after a chained
+        # decode drains must not write through a row the scheduler has reused.
         runner.disable_radix_cache = False
         runner._cache_layout = SimpleNamespace(
             has_auxiliary_state=False,
@@ -561,7 +630,7 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
             "_sync_new_kv_to_pool",
             "_first_attention_cache",
             "_release_cache",
-            "flush_all_decode_kv",
+            "release_request_row",
         ):
             setattr(runner, name, getattr(MlxModelRunner, name).__get__(runner))
 
@@ -604,6 +673,9 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         def prefill_finalize(pending):
             runner._known.add(pending.req_id)
             runner._req_caches[pending.req_id] = pending.cache
+            pending.cache[0].offset = 2
+            runner._req_synced_offset[pending.req_id] = 2
+            runner._req_pool_idx[pending.req_id] = 0
             return 3
 
         runner.prefill_finalize = prefill_finalize
@@ -613,8 +685,9 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         for req in (finished, live, fresh):
             req.return_logprob = False
             req.full_untruncated_fill_ids = array("q", [1, 2])
-            req.extend_range = SimpleNamespace(end=2, length=2)
-            req.prefix_indices = torch.empty(0, dtype=torch.long)
+            req.extend_end = 2
+            req.prefix_len = 0
+            req.kv.kv_committed_len = 2
 
         def batch(mode, reqs, lengths, decoding_reqs=None):
             out = ScheduleBatch(reqs=reqs)
@@ -664,6 +737,11 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         def release(req, *_args, **_kwargs):
             self.assertIn(req.rid, worker._mlx_finished_rids)
             self.assertTrue(runner.has_request(req.rid))
+            self.assertNotIn(req.rid, runner._req_pool_idx)
+            if req.rid == "finished":
+                writes = runner._attention_kv_pool.set_kv_all_layers.call_args_list
+                self.assertEqual([call.args[0].tolist() for call in writes], [[1]])
+                runner._req_to_token_pool.req_to_token[0] = torch.tensor([8, 9, 10, 11])
             events.append(("finish", req.rid))
 
         module = "sglang.srt.managers.scheduler_components.batch_result_processor"
@@ -697,7 +775,8 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
         self.assertEqual(worker._mlx_finished_rids, {"fresh"})
         self.assertFalse(live.finished())
         pool_writes = runner._attention_kv_pool.set_kv_all_layers.call_args_list
-        self.assertEqual([call.args[0].tolist() for call in pool_writes], [[1], [5]])
+        self.assertEqual([call.args[0].tolist() for call in pool_writes], [[1]])
+        self.assertNotIn("finished", worker._req_retraction_count)
         self.assertEqual(len(scheduler.result_queue), 0)
 
     def test_generation_finished_during_prefill_is_marked(self):

@@ -37,12 +37,13 @@ class _Req:
         self.disagg_kv_sender = Mock()
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
+        self.discard_output_reason = None
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
-        self.extend_range = None
+        self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
@@ -128,7 +129,7 @@ def test_aborted_final_result_releases_hybrid_cache(
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=50)
+    req.extend_end = 50
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
@@ -143,7 +144,7 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+    req.extend_end = len(req.origin_input_ids)
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
@@ -226,6 +227,28 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     scheduler.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
     assert req.kv.mamba_pool_idx is None
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
+    scheduler = _Scheduler()
+    req = _Req(inflight_middle_chunks=0)
+    req.to_finish = None
+    req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([11]),
+        logits_output=LogitsProcessorOutput(next_token_logits=None),
+    )
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+
+    assert req.finished_reason.status_code == 503
+    assert req.output_ids == []
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
+    req.disagg_kv_sender.abort.assert_called_once_with()
+    scheduler.send_kv_chunk.assert_not_called()
 
 
 @pytest.mark.parametrize("transport_error", [False, True])
