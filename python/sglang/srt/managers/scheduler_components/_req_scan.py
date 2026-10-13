@@ -15,6 +15,5 @@ def running_and_inflight_batches(
 ) -> List[Optional[ScheduleBatch]]:
     """The running batch, then the batch launched last; either may be None,
     and they may be the same batch. Under PP they are the current
-    micro-batch's. Callers that also read the overlap result queue or the PP
-    micro-batch lists read those themselves."""
+    micro-batch's."""
     return [scheduler.running_batch, scheduler.last_batch]
