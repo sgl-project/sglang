@@ -667,7 +667,10 @@ class ServerArgsAutoTuner:
             # Do not merge implicit defaults into that explicit mode.
             # Still apply the model's prefetch default. Leaving it at 0
             # streams one layer at a time and makes Wan 2.2 ~8x slower.
-            if args.dit_layerwise_offload is True or args.is_dit_layerwise_offload_selected:
+            if (
+                args.dit_layerwise_offload is True
+                or args.is_dit_layerwise_offload_selected
+            ):
                 self._set_default_dit_offload_prefetch_size()
             return []
 
