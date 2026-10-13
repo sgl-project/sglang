@@ -159,15 +159,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
     run_hook(handle_decode_context_parallelism, server_args)
 
-    # Model-arch defaults must land before parsing the CUDA-graph flags.
-    # Inkling opts into full-graph prefill capture here.
+    # Model-arch prefill CUDA-graph default must land before cuda-graph
+    # resolution (the declarative registry materializes too late to affect
+    # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+        apply_prefill_cp_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
-        parse_cuda_graph_config,
     )
 
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
@@ -176,7 +177,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     run_hook(handle_dwdp, server_args)
 
-    parse_cuda_graph_config(server_args)
+    run_hook(handle_cuda_graph_config, server_args)
 
     from sglang.srt.arg_groups.platform_hook import (
         handle_amd_specifics,
@@ -201,10 +202,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
-    from sglang.srt.arg_groups.memory_hook import (
-        handle_gpu_memory_settings,
-        handle_static_memory_settings,
-    )
+    from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 
     run_hook(handle_gpu_memory_settings, server_args)
 
@@ -267,10 +265,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
-    # Graph policy needs the resolved CP/backend; memory budgeting needs the
-    # resulting graph backends and aligned capture buckets.
-    run_hook(handle_cuda_graph_config, server_args)
-    run_hook(handle_static_memory_settings, server_args)
+    run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.

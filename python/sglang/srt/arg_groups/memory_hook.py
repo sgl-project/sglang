@@ -45,7 +45,29 @@ def handle_offload_compatibility(server_args: Any) -> None:
 
 
 def handle_gpu_memory_settings(server_args: Any):
-    """Set GPU-dependent chunk and graph capacities before model resolution."""
+    """
+    Configure GPU memory-dependent settings including
+    chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
+
+    Here are our heuristics:
+    - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
+      This is because GPUs with more memory are generally more powerful, we need to use a larger
+      chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
+    - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
+
+      GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+
+      The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
+      or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
+
+      In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
+      The activation memory is proportional to the chunked_prefill_size.
+      The cuda graph memory is proportional to the decode max_bs.
+      We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
+      and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
+
+      The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
+    """
     from sglang.srt.arg_groups.cuda_graph_hook import (
         generate_cpu_graph_batch_sizes,
         generate_decode_cuda_graph_batch_sizes,
@@ -211,23 +233,17 @@ def handle_gpu_memory_settings(server_args: Any):
     if prefill_cuda_graph_config.max_bs is None:
         # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
         # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-        # DeepEP also keeps its existing 2048-token default; its bucket alignment
-        # now runs after backend and CP resolution.
-        if use_mla_backend(server_args) or (
-            resolved_view(server_args).moe_a2a_backend == "deepep"
-            and prefill_cuda_graph_config.backend == Backend.BREAKABLE
-            and prefill_cuda_graph_config.bs is None
-        ):
-            prefill_cuda_graph_config.max_bs = 2048
-        else:
+        # To avoid the performance regression, we set max_bs to 2048 by default.
+        if not use_mla_backend(server_args):
             prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
+        else:
+            prefill_cuda_graph_config.max_bs = 2048
 
         # For opt-in PP breakable graphs, capture small aggregate-token
         # buckets by default and leave larger forwards on the eager path.
         # Explicit max_bs or bs settings retain their existing semantics.
         if (
             cfg.pp_size > 1
-            and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
             and prefill_cuda_graph_config.backend == Backend.BREAKABLE
             and (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked
             and prefill_cuda_graph_config.max_bs
@@ -259,24 +275,6 @@ def handle_gpu_memory_settings(server_args: Any):
             "_handle_gpu_memory_settings",
             cuda_graph_config=cuda_graph_config,
         )
-
-    # ------------------------------------------------------------------
-    # Symmetric-memory preallocation
-    # ------------------------------------------------------------------
-
-    if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
-        envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
-        logger.warning(
-            "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
-            "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
-        )
-
-
-def handle_static_memory_settings(server_args: Any):
-    """Budget static memory after graph backends and CP topology resolve."""
-    cfg = resolving_view(server_args)
-    gpu_mem = get_device_memory_capacity(cfg.device)
-    decode_cuda_graph_config = cfg.cuda_graph_config.decode
 
     # ------------------------------------------------------------------
     # Static memory and runtime headroom
@@ -342,38 +340,20 @@ def handle_static_memory_settings(server_args: Any):
 
         declare_resolution(
             server_args,
-            "_handle_static_memory_settings",
+            "_handle_gpu_memory_settings",
             mem_fraction_static=mem_fraction_static,
         )
 
-    # AITER needs additional workspace at long context lengths.
-    model_config = model_config_of(server_args)
-    if resolved_view(server_args).attention_backend == "aiter":
-        if model_config.context_len > 8192:
-            # Check whether the operator supplied a memory fraction using
-            # the raw input snapshot; resolution may have filled the value in.
-            explicit_mem_fraction = (
-                getattr(server_args, "_raw_input", None) or {}
-            ).get("mem_fraction_static") is not None
-            if (
-                explicit_mem_fraction
-                and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
-            ):
-                logger.warning(
-                    "attention_backend=aiter with context_len=%d (>8192) normally "
-                    "scales mem_fraction_static by 0.85 to reserve non-static "
-                    "workspace, but SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION is set, "
-                    "so mem_fraction_static=%.3f is used as-is. Ensure enough memory "
-                    "is left for attention workspace and CUDA graphs.",
-                    model_config.context_len,
-                    cfg.mem_fraction_static,
-                )
-            else:
-                declare_resolution(
-                    server_args,
-                    "_handle_static_memory_settings",
-                    mem_fraction_static=cfg.mem_fraction_static * 0.85,
-                )
+    # ------------------------------------------------------------------
+    # Symmetric-memory preallocation
+    # ------------------------------------------------------------------
+
+    if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
+        envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
+        logger.warning(
+            "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
+            "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+        )
 
 
 def reserve_for_graph_mb(server_args: Any) -> float:
