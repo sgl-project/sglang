@@ -1,5 +1,4 @@
 import unittest
-from collections import deque
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -9,6 +8,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -37,12 +37,13 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None
+        scheduler.recv_skipper = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.result_queue = deque()
+        scheduler.inflight_steps = InflightQueue(depth=1)
         scheduler.waiting_queue = []
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False

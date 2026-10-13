@@ -68,6 +68,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def setUp(self):
         super().setUp()
         enter_scope(self, published_topology(role="scheduler"))
+        enter_scope(self, envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True))
 
     @parameterized.expand(
         [
@@ -502,6 +503,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
+        scheduler.recv_skipper = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_inflight_queue = []

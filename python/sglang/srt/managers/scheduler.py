@@ -237,6 +237,7 @@ from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
 )
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
@@ -1295,9 +1296,10 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
-        self.result_queue: deque[
-            tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
-        ] = deque()
+        # Launched batches whose results are not committed yet. The normal,
+        # overlap and PD event loops install their own on entry; the pipeline
+        # and MLX loops keep their own holders.
+        self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
@@ -1939,6 +1941,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        self.inflight_steps = InflightQueue(depth=0)
         while True:
             if self.gracefully_exit:
                 break
@@ -1960,7 +1963,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                self.inflight_steps.push(batch, result)
+                self._commit_due_step()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -1968,6 +1972,9 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1975,14 +1982,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
-        self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-        ] = deque()
-
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+        self.inflight_steps = InflightQueue(depth=1)
 
         while True:
             if self.gracefully_exit:
@@ -2008,7 +2008,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                self._commit_due_step()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -2023,15 +2023,17 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                self.inflight_steps.push(batch.copy(), batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True
 
             # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
+            self._debug_check_commit_gate(
+                self.last_batch is not None and not disable_overlap_for_batch
+            )
+            if self.inflight_steps.has_due():
+                self._commit_due_step()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -2043,9 +2045,20 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _commit_due_step(self) -> None:
+        record = self.inflight_steps.pop_due()
+        self.process_batch_result(record.batch, record.result)
+
+    def _debug_check_commit_gate(self, last_batch_gate: bool) -> None:
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
+            assert self.inflight_steps.has_due() == last_batch_gate
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -2076,8 +2089,13 @@ class Scheduler(
             and not batch.spec_algorithm.is_none()
             and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
+            and len(self.inflight_steps) > 0
         )
+        # Every DP attention rank must take the same decision, but this term is
+        # rank-local. The built-in algorithms that need it (NGRAM) reject DP
+        # attention at startup; a plugin algorithm without grammar overlap
+        # support fails here on its first grammar request.
+        assert not (self.attn_dp_enabled and need_grammar_sync)
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
@@ -2092,8 +2110,8 @@ class Scheduler(
         (before generate_token_bitmask) so the CPU advance overlaps the target
         verify forward. Idempotent; no-op when the queue is empty or has no grammar.
         """
-        for prev_batch, prev_result in self.result_queue:
-            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+        for record in self.inflight_steps:
+            self.batch_result_processor.advance_grammar_fsm(record.result, record.batch)
 
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
@@ -2369,7 +2387,6 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
-            get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -4301,11 +4318,11 @@ class Scheduler(
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
-        if not self.enable_skip_finishing_decode or not self.result_queue:
+        if not self.enable_skip_finishing_decode or not self.inflight_steps:
             return []
         # At scheduling time the overlap loop has processed every result but the last.
-        assert len(self.result_queue) == 1
-        queued_reqs = set(self.result_queue[0][0].reqs)
+        assert len(self.inflight_steps) == 1
+        queued_reqs = set(self.inflight_steps.head().batch.reqs)
         return [
             req
             for req in batch.reqs
@@ -4486,7 +4503,7 @@ class Scheduler(
                 batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode batches contribute 0.
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
@@ -4498,10 +4515,6 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
-
-        # Place holder handling for pd-disagg decode event loop
-        if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4886,7 +4899,7 @@ class Scheduler(
         # The delay_sample_func closure captures forward_batch (which holds
         # sampling_info with vocab_mask) and logits_output (which holds
         # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
+        # batch_result in inflight_steps and batch_record_buf until the next
         # iteration, causing a steady VRAM leak with structured output.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
@@ -4919,8 +4932,6 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
@@ -5157,7 +5168,7 @@ class Scheduler(
             )
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (not self.enable_overlap or len(self.inflight_steps) == 0)
             and self._pp_microbatches_drained()
         )
 
@@ -5330,6 +5341,8 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(None)
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5430,9 +5443,9 @@ class Scheduler(
             inflight_batches = running_and_inflight_batches(self)
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
-        if self.enable_continuous_input_polling and self.result_queue:
+        if self.enable_continuous_input_polling and self.inflight_steps:
             # Polling can run intake before the newest queued batch becomes last_batch.
-            inflight_batches.extend(batch for batch, _ in self.result_queue)
+            inflight_batches.extend(record.batch for record in self.inflight_steps)
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
@@ -5588,22 +5601,23 @@ class Scheduler(
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
             # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
+            # inflight_steps) is left untouched. On resume, the normal event
             # loop (get_next_batch_to_run) handles last_batch merge,
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and len(self.inflight_steps) > 0:
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
                 and (req := self.chunked_req) is not None
             ):
                 # Retract skips the chunk step that sets this result's KV send boundary.
                 req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            # The overlap loops hold exactly one record between steps.
+            (record,) = self.inflight_steps.drain()
+            self.process_batch_result(record.batch, record.result)
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
 
@@ -5642,6 +5656,8 @@ class Scheduler(
                 retract_reqs += staged
 
         self.last_batch = None
+        if self.recv_skipper is not None:
+            self.recv_skipper.on_launch(None)
         self.cur_batch_for_debug = None
 
         if self.decode_offload_manager is not None:

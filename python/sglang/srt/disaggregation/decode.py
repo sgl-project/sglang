@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -77,7 +76,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2039,16 +2038,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved_tokens, need_space_for_single_req
         )
 
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
-            )
-
         if count_retracted:
             for req in self.retracted_queue:
                 full_required, _ = self._prealloc_required_tokens(req)
@@ -2111,19 +2100,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             + swa_evictable
             - max(swa_reserved_tokens, need_swa_space_for_single_req)
         )
-
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
-            )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
-            prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
-            swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
 
         if count_retracted:
             for req in self.retracted_queue:
@@ -3009,6 +2985,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        self.inflight_steps = InflightQueue(depth=0)
 
         while True:
             if self.gracefully_exit:
@@ -3039,7 +3016,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                self.inflight_steps.push(batch, result)
+                self._commit_due_step()
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -3047,15 +3025,16 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        self.result_queue = deque()
+        self.inflight_steps = InflightQueue(depth=1)
         self.last_batch: Optional[ScheduleBatch] = None
-
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+        if self.recv_skipper is not None:
+            self.recv_skipper.on_launch(None)
 
         while True:
             if self.gracefully_exit:
@@ -3087,22 +3066,24 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, last_batch=self.last_batch
             )
 
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+            if disable_overlap_for_batch and self.inflight_steps.has_due():
+                self._commit_due_step()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                self.inflight_steps.push(batch.copy(), batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True
 
             # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
+            self._debug_check_commit_gate(
+                self.last_batch is not None and not disable_overlap_for_batch
+            )
+            if self.inflight_steps.has_due():
+                self._commit_due_step()
             elif batch is None:
                 self.on_idle()
 
@@ -3112,17 +3093,9 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-
-    def _run_batch_prebuilt(
-        self: Scheduler, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
-        if batch.inner_idle_batch is not None:
-            idle_batch = batch.inner_idle_batch
-            # Reset the inner idle batch to avoid reusing it.
-            batch.inner_idle_batch = None
-            return self.run_batch(idle_batch)
-
-        return GenerationBatchResult()
+            if self.recv_skipper is not None:
+                self.recv_skipper.on_launch(batch)
+            self.inflight_steps.end_step()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(

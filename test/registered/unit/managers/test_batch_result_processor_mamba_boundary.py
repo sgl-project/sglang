@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -127,6 +128,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler._apply_war_barrier = MagicMock()
                 scheduler.is_generation = False
                 scheduler.last_batch = None
+                scheduler.recv_skipper = None
 
                 plan_count = 0
 
@@ -164,6 +166,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler.process_batch_result = process_batch_result
 
                 with (
+                    envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True),
                     # The mamba predicates and the track interval read the
                     # published bags, so publish the configuration under test
                     # (non-lazy extra buffer, interval 4); observability and

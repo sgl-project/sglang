@@ -343,11 +343,13 @@ class TestDPBalanceStats(CustomTestCase):
     def test_unrecorded_batch_steps_do_not_carry_wait(self):
         carry = self._adapter().sync_wait_carry
         carry.seconds = 0.003
-        # A prebuilt batch with no work anywhere runs a step but records nothing.
+        # A health-check probe runs a step but records nothing.
+        probe = SimpleNamespace(rid=f"{HEALTH_CHECK_RID_PREFIX}-0", seqlen=1)
         result = self._prepare_dp2_batch(
-            ForwardMode.PREBUILT,
-            local_tokens=0,
+            ForwardMode.DECODE,
+            local_tokens=1,
             peer_tokens=0,
+            reqs=[probe],
             sync_wait_carry=carry,
             wait_seconds=0.001,
         )

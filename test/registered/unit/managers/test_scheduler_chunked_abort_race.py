@@ -1,7 +1,6 @@
 """Tests for deferred chunked-prefill aborts."""
 
 import unittest
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +15,9 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.inflight_queue import (  # noqa: E402
+    InflightQueue,
+)
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -37,7 +39,7 @@ class _FakeReq:
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
     sched.enable_continuous_input_polling = False
-    sched.result_queue = deque()
+    sched.inflight_steps = InflightQueue(depth=1)
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.waiting_queue = []
