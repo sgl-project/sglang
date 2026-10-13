@@ -520,26 +520,28 @@ class TestLing3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I need a tool")
         self.assertEqual(result.normal_text, "<tool_call>get_weather</tool_call>")
 
-    def test_reasoning_only_swaps_to_normal_text(self):
+    def test_reasoning_only_stays_in_reasoning_text_by_default(self):
         text = "<think>Final answer without a closing think tag"
         result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "")
-        self.assertEqual(result.normal_text, "Final answer without a closing think tag")
+        self.assertEqual(
+            result.reasoning_text, "Final answer without a closing think tag"
+        )
+        self.assertEqual(result.normal_text, "")
 
-    def test_reasoning_only_with_end_token_swaps_to_normal_text(self):
+    def test_reasoning_only_with_end_token_stays_in_reasoning_text_by_default(self):
         text = "<think>Final answer accidentally wrapped as reasoning</think>"
         result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "")
         self.assertEqual(
-            result.normal_text, "Final answer accidentally wrapped as reasoning"
+            result.reasoning_text, "Final answer accidentally wrapped as reasoning"
         )
+        self.assertEqual(result.normal_text, "")
 
-    def test_force_nonempty_content_false_disables_swap(self):
-        detector = Ling3Detector(force_nonempty_content=False)
+    def test_force_nonempty_content_true_enables_swap(self):
+        detector = Ling3Detector(force_nonempty_content=True)
         text = "<think>Reasoning only</think>"
         result = detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "Reasoning only")
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "Reasoning only")
 
     def test_does_not_swap_when_normal_text_exists(self):
         text = "<think>Reasoning here</think>The answer is 42."

@@ -951,10 +951,11 @@ class Ling3Detector(Glm45Detector):
     omitted, which the generic template detector cannot infer). Tool calls also
     terminate reasoning when the model omits </think>.
 
-    If non-streaming output only contains reasoning text and no tool call, Ling3
-    moves that text into normal content as a client-experience fallback. Streaming
-    parsing still emits reasoning increments as they arrive because this parser
-    does not receive a final end-of-generation signal.
+    By default, non-streaming reasoning-only output remains in reasoning content.
+    Callers can set ``force_nonempty_content=True`` to move it into normal content
+    as a compatibility fallback. Streaming parsing still emits reasoning increments
+    as they arrive because this parser does not receive a final end-of-generation
+    signal.
     """
 
     def __init__(
@@ -963,7 +964,7 @@ class Ling3Detector(Glm45Detector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
-        force_nonempty_content: bool = True,
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             stream_reasoning=stream_reasoning,
