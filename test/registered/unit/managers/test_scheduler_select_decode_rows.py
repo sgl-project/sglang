@@ -13,8 +13,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -159,13 +159,15 @@ class TestMixedStepKeepsDecodeRows(CustomTestCase):
         self.assertIs(plan.running_batch, running_batch)
         reader = SimpleNamespace(
             running_batch=decoding_batch.rows,
-            last_batch=None,
+            rows_join_at_launch=True,
+            inflight_steps=InflightQueue(depth=0),
+            chunked_req=None,
             enable_continuous_input_polling=False,
         )
         with patch.object(
-            request_queries, "get_parallel", lambda: SimpleNamespace(pp_size=1)
+            scheduler_module, "get_parallel", lambda: SimpleNamespace(pp_size=1)
         ):
-            inflight = request_queries.inflight_reqs(reader)
+            inflight = Scheduler._collect_inflight_req_list(reader)
         self.assertEqual({r.rid for r in inflight}, {"d"})
 
     def test_a_loop_joining_at_the_next_plan_parks_the_rows(self):

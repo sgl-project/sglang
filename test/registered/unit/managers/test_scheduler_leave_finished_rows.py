@@ -1,6 +1,7 @@
 """Finished running rows leave at the top of the next plan: before admission,
-and in PD decode before preallocation. The step launched last, which readers
-between steps see as last_batch, drops them at that plan too."""
+and in PD decode before preallocation. Under a loop that joins at the next
+plan, the step launched last, which readers between steps see as last_batch,
+drops them at that plan too."""
 
 import copy
 import unittest
@@ -16,7 +17,6 @@ from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -174,6 +174,7 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
         s.enable_overlap = False
         s.last_batch = None
         s.recv_skipper = None
+        s.hisparse_coordinator = None
         s.waiting_queue = []
         s.grammar_manager = SimpleNamespace(grammar_queue=[])
         s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
@@ -199,19 +200,19 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
 
         s.ingest_requests = ingest_requests
         idle_seen = []
-        s.on_idle = lambda: idle_seen.append(request_queries.is_idle(s))
+        s.on_idle = lambda: idle_seen.append(s.is_fully_idle())
         with published_topology(role="scheduler"), self.assertRaises(_StopLoop):
             Scheduler.event_loop_normal(s)
         return idle_seen
 
     def test_after_a_decode_step(self):
         # The decode step is a copy of the rows; the rows dropped the row at
-        # the commit, and the copy, still last_batch, drops it at the plan.
+        # the commit, and the readers do not list the step.
         self.assertEqual(self._run(rows=[_Req("a")], first_step=None), [True])
 
     def test_after_a_prefill_step(self):
         # The row joined the rows at launch and left them at the commit; the
-        # prefill step, still last_batch, drops it at the plan.
+        # readers do not list the prefill step.
         step = _Batch([_Req("a")], extend=True)
         self.assertEqual(self._run(rows=[], first_step=step), [True])
 
