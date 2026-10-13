@@ -159,6 +159,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.watermarking.core import (
+    redact_watermark_command_line,
+    redact_watermark_secrets,
+    resolve_watermark_request,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -194,6 +199,21 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_watermark_request(sampling_params: SamplingParams) -> None:
+    watermark = sampling_params.watermark
+    features = get_exec().features
+    _, _, enabled = resolve_watermark_request(
+        watermark,
+        server_enabled=features.enable_watermark,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    if enabled and (sampling_params.beam_width or 1) > 1:
+        raise ValueError("beam search is not supported with watermarking")
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1518,7 +1538,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
-            sampling_kwargs = obj.sampling_params
+            sampling_kwargs = dict(obj.sampling_params)
+        if isinstance(obj, GenerateReqInput) and obj.watermark is not None:
+            if sampling_kwargs.get("watermark") is not None:
+                raise ValueError(
+                    "watermark must be provided either at the request top level or "
+                    "inside sampling_params, not both"
+                )
+            sampling_kwargs["watermark"] = obj.watermark
         if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
             sampling_kwargs = dict(sampling_kwargs)
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
@@ -1527,6 +1554,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        _validate_watermark_request(sampling_params)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -1940,6 +1968,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             else:
                 out = out_list[-1]
+                if (
+                    is_stream
+                    and not incremental_stream
+                    and state.customized_info_accumulated
+                ):
+                    meta_info = out.get("meta_info")
+                    if meta_info is not None:
+                        for key, values in state.customized_info_accumulated.items():
+                            meta_info.setdefault(key, list(values))
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -2282,10 +2319,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return self.resolved_config_dict(self.server_args.resolved_dict())
+            return redact_watermark_secrets(
+                self.resolved_config_dict(self.server_args.resolved_dict())
+            )
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
+
+    def _server_args_for_dump(self) -> Union[ServerArgs, Dict[str, Any]]:
+        if not get_exec().features.enable_watermark:
+            return self.server_args
+        return redact_watermark_secrets(self.server_args.resolved_dict())
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
@@ -3259,10 +3303,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         logger.info(log_message)
         to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "config_updates": get_context().overrides_log(),
+            "server_args": self._server_args_for_dump(),
+            "config_updates": redact_watermark_secrets(get_context().overrides_log()),
             "resolved_config": self._dump_config_snapshot(),
-            "requests": data_list.copy(),
+            "requests": redact_watermark_secrets(data_list.copy()),
         }
 
         def background_task():
@@ -3344,11 +3388,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Write the data to the file
                 data_to_dump_with_server_args = {
-                    "server_args": self.server_args,
-                    "config_updates": get_context().overrides_log(),
+                    "server_args": self._server_args_for_dump(),
+                    "config_updates": redact_watermark_secrets(
+                        get_context().overrides_log()
+                    ),
                     "resolved_config": self._dump_config_snapshot(),
-                    "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
+                    "requests": redact_watermark_secrets(data_to_dump),
+                    "launch_command": redact_watermark_command_line(
+                        sys.argv, self.server_args.watermark_config
+                    ),
                 }
                 with open(filename, "wb") as f:
                     try:
@@ -3721,15 +3769,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            rids.add(rid)
+
+        new_states = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            new_states[rid] = state
+
+        self.rid_to_state.update(new_states)
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.
@@ -3895,13 +3950,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return span_attrs
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
-        """Set the default priority value."""
+        """Set the default priority and validate the signed 64-bit range."""
         if (
             self.enable_priority_scheduling
             and obj.priority is None
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+        if obj.priority is not None and not -(1 << 63) <= obj.priority < (1 << 63):
+            raise ValueError(
+                "priority must be a signed 64-bit integer "
+                "between -9223372036854775808 and 9223372036854775807"
+            )
 
 
 class ServerStatus(Enum):

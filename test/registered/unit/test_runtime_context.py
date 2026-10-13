@@ -808,6 +808,40 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             get_server_args()
 
 
+class TestEmbeddedRuntimeContext(unittest.TestCase):
+    def test_embedded_context_is_scoped_and_keeps_its_overrides(self):
+        """An embedded engine context must neither replace nor leak into the process one."""
+        from sglang.srt import runtime_context as rc
+
+        self.addCleanup(rc.restore_context, rc.snapshot_context())
+        rc.reset_context()
+        outer_args = ServerArgs(model_path="dummy", tp_size=1)
+        outer = publish(
+            outer_args, role="diffusion_gpu_worker", ranks=SpawnRanks(world_rank=0)
+        )
+        inner = rc.create_context(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+        self.assertIs(get_context(), outer)
+
+        with self.assertRaisesRegex(RuntimeError, "inner failure"):
+            with rc.use_context(inner):
+                self.assertIs(get_parallel(), inner.parallel)
+                self.assertEqual(get_parallel().tp_rank, 1)
+                inner.override("encoder.setup", page_size=16)
+                raise RuntimeError("inner failure")
+        self.assertIs(get_context(), outer)
+        self.assertIs(get_server_args(), outer_args)
+        self.assertEqual(get_parallel().tp_rank, 0)
+        self.assertEqual(publish_role(), "diffusion_gpu_worker")
+        self.assertNotEqual(rc.get_schedule().page_size, 16)
+
+        with rc.use_context(inner):
+            self.assertEqual(rc.get_schedule().page_size, 16)
+
+
 class TestAssertPublished(_IsolatedServerArgs):
     """Publishing is the process entry's job; the constructors only check.
 
@@ -1126,6 +1160,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
+
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
