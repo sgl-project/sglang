@@ -208,9 +208,9 @@ export const config = {
     int4: "intel-ai/Muse-Spark-1.2-open-816B-A42B-INT4",
   },
   dockerImages: {
-    b300: "lmsysorg/sglang:muse-spark-1.2",
-    gb300: "lmsysorg/sglang:muse-spark-1.2",
-    b200: "lmsysorg/sglang:muse-spark-1.2",
+    b300: "lmsysorg/sglang:dev-muse-spark",
+    gb300: "lmsysorg/sglang:dev-muse-spark",
+    b200: "lmsysorg/sglang:dev-muse-spark",
     mi355x: "lmsysorg/sglang-rocm:muse-spark-1.2",
     xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
   },
