@@ -119,6 +119,43 @@ class TestQuantizedKVPool(unittest.TestCase):
         self.assertEqual(pool.k_buffer[0][loc].unique().tolist(), [1])
         self.assertEqual(pool.v_buffer[0][loc].unique().tolist(), [2])
 
+    def test_mla_fp4_move_kv_cache_moves_block_scales_with_data(self):
+        """move_kv_cache carries each slot's block scales with its FP4 data;
+        stale target scales would dequantize the moved data wrong."""
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
+
+        pool = MLATokenToKVPoolFP4(
+            size=6,
+            page_size=1,
+            dtype=torch.bfloat16,
+            kv_lora_rank=16,
+            qk_rope_head_dim=16,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        for layer_id, (data, scale) in enumerate(
+            zip(pool.kv_buffer, pool.kv_scale_buffer)
+        ):
+            data.copy_(torch.arange(data.numel()).reshape(data.shape) + 50 * layer_id)
+            scale.copy_(
+                torch.arange(scale.numel()).reshape(scale.shape) + 200 + 20 * layer_id
+            )
+        src_loc = torch.tensor([5, 6], dtype=torch.int64)
+        tgt_loc = torch.tensor([1, 2], dtype=torch.int64)
+        expected = [
+            (data[src_loc].clone(), scale[src_loc].clone())
+            for data, scale in zip(pool.kv_buffer, pool.kv_scale_buffer)
+        ]
+
+        pool.move_kv_cache(tgt_loc, src_loc)
+
+        for (data, scale), (want_data, want_scale) in zip(
+            zip(pool.kv_buffer, pool.kv_scale_buffer), expected
+        ):
+            self.assertTrue(torch.equal(data[tgt_loc], want_data))
+            self.assertTrue(torch.equal(scale[tgt_loc], want_scale))
+
 
 if __name__ == "__main__":
     unittest.main()
