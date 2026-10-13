@@ -63,8 +63,6 @@ class TestSchedulingTraceWriter(CustomTestCase):
         self.assertEqual([r["retracted"] for r in records[1:]], [[], ["r0"], []])
 
     def test_paused_iterations_record_reader_values(self):
-        # A paused iteration plans nothing, so no schedule record would carry
-        # the idle values that flush_cache and pause see in that state.
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(
             _engine_paused=False,

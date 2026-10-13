@@ -1,29 +1,9 @@
 """Per-step scheduling traces of scripted runs, and a diff of two trace dirs.
 
-With SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR set, every executed script writes
-one JSONL file there: a ``header`` record with the trace format and the
-server config the trace ran under, then a ``schedule`` record each time the
-scheduler picks the next batch and a ``result`` record each time a batch
-result is processed.
-A schedule record also carries what the scheduler's readers (the idle checks
-behind health check, pause and flush, the in-flight set that abort and weight
-updates reach, and the load report) saw at the top of that scheduler
-iteration, where they run. Iterations while the engine is paused plan
-nothing, so each writes those reader values as a ``paused`` record instead;
-the script's yields fix how many there are.
-Records hold only what two runs of one commit reproduce: rids are relabeled
-r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
-
-Two commits are compared by running the same scripted tests on each with a
-different trace dir, then:
-
-    python -m sglang.test.scripted_runtime.scheduling_trace OLD_DIR NEW_DIR
-
-SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS (a JSON object such as
-'{"disable_overlap_schedule": true}' or '{"enable_mixed_chunk": true}') runs
-the same tests under another server config. Traces whose headers differ
-(another config or trace format) are reported as a config mismatch and not
-compared.
+With SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR set, each executed script writes one
+JSONL trace there. Records hold only what two runs of one commit reproduce (rids
+relabeled in first-seen order, no timestamps), so traces of two commits diff
+cleanly: ``python -m sglang.test.scripted_runtime.scheduling_trace OLD NEW``.
 """
 
 from __future__ import annotations
@@ -68,8 +48,7 @@ HEADER_ENVS = (
 
 class SchedulingTraceWriter:
     def __init__(self, path: Path, header: Dict[str, Any]) -> None:
-        # Line-buffered: each record is on disk once written, also when the
-        # server dies mid-script.
+        # Line-buffered so written records survive the server dying mid-script.
         self._file = path.open("w", buffering=1)
         self._step = 0
         self._rid_labels: Dict[str, str] = {}
@@ -101,19 +80,16 @@ class SchedulingTraceWriter:
         self._file.close()
 
     def observe_readers(self, scheduler: Scheduler) -> None:
-        """Snapshot the readers' values for the next schedule record.
+        """Snapshot reader values at the top of an iteration for the next record.
 
-        Called at the top of each scheduler iteration. Not asked from
-        record_schedule: during planning, scheduler.running_batch is not yet
-        the plan's running batch, a state no reader sees. A paused iteration
-        skips planning, so its values are written as a ``paused`` record.
+        Not taken in record_schedule: mid-planning, scheduler.running_batch is
+        not yet the plan's running batch, a state no reader sees.
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {
             "idle": scheduler.is_fully_idle(),
             "idle_ignore_waiting": scheduler.is_fully_idle(ignore_waiting=True),
-            # The reqs abort-all and weight-version changes reach. A set, so
-            # sorted; each was already labeled by an earlier schedule record.
+            # A set, so sorted; each req was labeled by an earlier schedule record.
             "inflight": sorted(self._labels(scheduler.collect_inflight_reqs())),
             "load": {
                 "running": load.num_running_reqs,
@@ -175,9 +151,8 @@ class SchedulingTraceWriter:
         )
 
     def _newly_retracted(self, reqs: Iterable) -> List:
-        # A retracted req can be re-admitted in the same plan that first sees
-        # it (e.g. on resume after pause_generation), so look at every req the
-        # record sees, not only the waiting queue.
+        # A retracted req can be re-admitted by the plan that first sees it (on
+        # resume after pause_generation), so scan every req, not only waiting.
         retracted = []
         for req in reqs:
             if req.retraction_count > self._retraction_counts.get(req.rid, 0):
@@ -234,7 +209,6 @@ def _strip(record: Dict[str, Any], ignore: set) -> Dict[str, Any]:
 def diff_trace_dirs(
     old_dir: Path, new_dir: Path, *, ignore: Iterable[str] = (), out=sys.stdout
 ) -> int:
-    """Print the per-script comparison; return the number of scripts that differ."""
     ignore = set(ignore)
     old_names = {p.name for p in old_dir.glob("*.jsonl")}
     new_names = {p.name for p in new_dir.glob("*.jsonl")}
