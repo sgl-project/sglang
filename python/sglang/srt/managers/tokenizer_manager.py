@@ -1439,10 +1439,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
-        if not get_mm().limit_mm_data_per_request:
-            return
+        # Build the effective per-modality limits dict.
+        # If the user explicitly set --limit-mm-data-per-request, use it as-is
+        # (an empty dict means "no limits"). Otherwise apply sensible defaults
+        # to prevent OOM from unbounded multi-image requests (each 4K image
+        # costs roughly ~1 GiB GPU memory with the fast image processor).
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
 
-        for modality, limit in get_mm().limit_mm_data_per_request.items():
+        DEFAULT_IMAGE_NUM_LIMITATION = (
+            BaseMultimodalProcessor.DEFAULT_IMAGE_NUM_LIMITATION
+        )
+
+        user_limits = get_mm().limit_mm_data_per_request
+        if user_limits is None:
+            limits = {"image": DEFAULT_IMAGE_NUM_LIMITATION}
+        else:
+            limits = user_limits
+            if not limits:
+                # Empty dict: user explicitly disabled all limits
+                return
+
+        for modality, limit in limits.items():
             data = getattr(obj, f"{modality}_data", None)
             if data:
                 count = len(data) if isinstance(data, list) else 1

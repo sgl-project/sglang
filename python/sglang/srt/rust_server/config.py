@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_mm_limit_for_rust() -> dict:
+    """Return the per-modality mm limits dict for the Rust ingress.
+
+    Mirrors ``BaseMultimodalProcessor.DEFAULT_IMAGE_NUM_LIMITATION`` as a
+    launch-time default so Rust-side requests are subject to the same OOM
+    protection as Python-side requests.
+    """
+    from sglang.srt.multimodal.processors.base_processor import (
+        BaseMultimodalProcessor,
+    )
+
+    user_limits = get_mm().limit_mm_data_per_request
+    if user_limits is not None:
+        return user_limits if isinstance(user_limits, dict) else {}
+    return {"image": BaseMultimodalProcessor.DEFAULT_IMAGE_NUM_LIMITATION}
+
+
 def _build_server_args(
     scheduler: Scheduler, *, extension: Optional[ModuleType] = None
 ) -> ServerArgs:
@@ -95,7 +112,7 @@ def _build_server_args(
             if get_serving().preferred_sampling_params is not None
             else None
         ),
-        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
+        limit_mm_data_per_request=_resolve_mm_limit_for_rust(),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the

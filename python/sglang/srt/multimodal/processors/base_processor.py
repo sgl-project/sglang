@@ -239,6 +239,10 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    # Default max number of images per request. Subclasses may override.
+    # Each 4K image costs roughly ~1 GiB GPU memory with the fast image
+    # processor, so unbounded multi-image requests can easily OOM.
+    DEFAULT_IMAGE_NUM_LIMITATION = 5
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -1201,11 +1205,40 @@ class BaseMultimodalProcessor(ABC):
           item whose format is one of the two above).
 
         Empty or None lists are considered valid.
+
+        Additionally enforces ``DEFAULT_IMAGE_NUM_LIMITATION`` to prevent OOM
+        from unbounded multi-image requests.
         """
 
         BaseMultimodalProcessor._validate_one_modality(Modality.IMAGE, image_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
+
+        # Enforce default image count limit as a defensive safeguard.
+        # Respect the user-provided --limit-mm-data-per-request override if set.
+        image_limit = BaseMultimodalProcessor._resolve_effective_image_limit()
+        if image_data and len(image_data) > image_limit:
+            raise ValueError(
+                f"Image count {len(image_data)} exceeds the limit of "
+                f"{image_limit} per request. "
+                f"Use --limit-mm-data-per-request '{{}}' to disable this limit, "
+                f"or specify an image entry to override it "
+                f"(e.g. '{{\"image\": 10}}')."
+            )
+
+    @staticmethod
+    def _resolve_effective_image_limit() -> int:
+        """Return the effective image count limit for the current server config.
+
+        Uses the user-provided ``--limit-mm-data-per-request`` image entry when
+        set; otherwise falls back to ``DEFAULT_IMAGE_NUM_LIMITATION``. A user
+        value of ``0`` disables the check.
+        """
+        user_limits = get_mm().limit_mm_data_per_request
+        if user_limits is not None and isinstance(user_limits, dict):
+            if "image" in user_limits:
+                return user_limits["image"]
+        return BaseMultimodalProcessor.DEFAULT_IMAGE_NUM_LIMITATION
 
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
