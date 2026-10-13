@@ -19,6 +19,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_cp_test_utils import cp_context, simulated_collective
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +31,77 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
+    def test_cp_sources_trim_capture_padding_before_request_expansion(self):
+        """A short batch in a larger BCG bucket must not become request rows."""
+        for lengths, bucket in (((5, 9), 16), ((5003, 9777), 14848)):
+            total = sum(lengths)
+            full = torch.zeros(bucket, 3)
+            full[:total] = torch.arange(total * 3).reshape(total, 3)
+            for rank in range(4):
+                with (
+                    self.subTest(lengths=lengths, rank=rank),
+                    get_context().override_server_args(tp_size=4, attn_cp_size=4),
+                    get_parallel().override(attn_cp_rank=rank),
+                    cp_context(4, rank, lengths) as (strategy, batch),
+                ):
+                    batch.req_pool_indices = torch.tensor([2, 7])
+                    batch.extend_seq_lens = torch.tensor(lengths)
+                    positions = torch.zeros(bucket, dtype=torch.int64)
+                    positions[:total] = batch.positions
+                    batch.positions = positions
+                    metadata = batch.attn_cp_metadata
+                    metadata.total_seq_lens = bucket
+                    metadata.per_rank_actual_token = [bucket // 4] * 4
+                    metadata.per_rank_logical_token = [bucket // 4] * 4
+                    outputs = {}
+
+                    def compress(layer, x, req, pos):
+                        outputs["compressed"] = (x.clone(), req.clone(), pos.clone())
+
+                    def index(layer, x, q, req, pos, fb, *, rows_per_request):
+                        outputs["indexed"] = (x.clone(), q.clone(), pos.clone())
+                        outputs["lengths"] = rows_per_request
+
+                    backend = NS(
+                        forward_metadata=NS(late_layer_tail=None),
+                        _low_ratio_compress_torch=compress,
+                        _low_ratio_index_topk=index,
+                    )
+                    local = full[rank::4].contiguous()
+                    with (
+                        simulated_collective(strategy, batch, full),
+                        patch(
+                            "sglang.srt.layers.attention.deepseek_v4_backend.torch.cuda.current_stream",
+                            return_value=None,
+                        ),
+                    ):
+                        DeepseekV4AttnBackend._forward_low_ratio_sources_cp(
+                            backend,
+                            layer=NS(compressor=object(), indexer=object()),
+                            x=local,
+                            q_lora=local + 100,
+                            positions=positions[rank::4],
+                            forward_batch=batch,
+                            run_compressor=True,
+                            run_indexer=True,
+                        )
+                    x, req, pos = outputs["compressed"]
+                    torch.testing.assert_close(x, full[:total])
+                    torch.testing.assert_close(
+                        req, torch.tensor([2] * lengths[0] + [7] * lengths[1])
+                    )
+                    torch.testing.assert_close(pos, positions[:total])
+                    x, q, pos = outputs["indexed"]
+                    torch.testing.assert_close(x, full[:total][rank::4])
+                    torch.testing.assert_close(q, full[:total][rank::4] + 100)
+                    torch.testing.assert_close(pos, positions[:total][rank::4])
+                    expected_lens = [
+                        sum(row % 4 == rank for row in range(start, start + length))
+                        for start, length in ((0, lengths[0]), (lengths[0], lengths[1]))
+                    ]
+                    self.assertEqual(outputs["lengths"], expected_lens)
+                    self.assertEqual(metadata.total_seq_lens, bucket)
+
     def test_tail_moe_count_is_prepared_per_batch_without_lazy_device_copy(self):
         for rank in range(4):
             with (

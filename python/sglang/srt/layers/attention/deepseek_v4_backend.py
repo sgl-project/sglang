@@ -3093,15 +3093,18 @@ class DeepseekV4AttnBackend(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
-        cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
+            total = pos_global.shape[0]
         else:
+            # BCG keeps CP collectives bucket-sized. Eager sources must instead
+            # expand request IDs and compress only the live logical token rows.
+            extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+            total = sum(extend_lens_cpu)
             q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                extend_lens_cpu,
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )
