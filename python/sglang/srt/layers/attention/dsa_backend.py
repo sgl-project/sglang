@@ -476,6 +476,8 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.dcp_owned_prefill: bool = False
+        self.dcp_split_indexer: bool = False
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -2129,9 +2131,7 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if forward_batch.dcp_owned_prefill or (
-            get_parallel().dcp_enabled and phase == "decode"
-        ):
+        if self.dcp_owned_prefill or (get_parallel().dcp_enabled and phase == "decode"):
             # Q arrives all-gathered; attend owned slots, the caller LSE-merges.
             # Verify / draft-extend rows are one query per draft token.
             if q_rope is not None:
@@ -2161,7 +2161,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache,
                 slots,
                 layer,
-                persistent_workspace=not forward_batch.dcp_owned_prefill,
+                persistent_workspace=not self.dcp_owned_prefill,
             )
         prefill_page_table_1 = metadata.page_table_1
         if (
@@ -3878,6 +3878,10 @@ class DeepseekSparseAttnBackend(
         get_device_sm = self._get_device_sm
         is_blackwell = self._is_blackwell
 
+        # Reset alongside use_mha below: only a DCP extend batch turns these on.
+        self.dcp_owned_prefill = False
+        self.dcp_split_indexer = False
+
         # Decide MHA vs MLA
         if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
             # Can't branch on seq_lens_cpu in graph replay, force MHA off to
@@ -3909,7 +3913,7 @@ class DeepseekSparseAttnBackend(
                 and (self.hisparse_coordinator is None)
             )
             if get_parallel().dcp_enabled:
-                forward_batch.dcp_owned_prefill = (
+                self.dcp_owned_prefill = (
                     not self.use_mha
                     and forward_batch.extend_num_tokens is not None
                     and dcp_use_owned_prefill(
@@ -3918,9 +3922,9 @@ class DeepseekSparseAttnBackend(
                         self.num_q_heads * get_parallel().attn_dcp_size,
                     )
                 )
-                forward_batch.dcp_split_indexer = (
+                self.dcp_split_indexer = (
                     not self.use_mha
-                    and not forward_batch.dcp_owned_prefill
+                    and not self.dcp_owned_prefill
                     and forward_batch.extend_seq_lens_cpu is not None
                     and dcp_use_split_indexer(
                         forward_batch.extend_prefix_lens_cpu,

@@ -34,6 +34,8 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    dcp_dsa_owned_prefill,
+    dcp_dsa_split_indexer,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -1555,7 +1557,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return topk_result
 
         dcp = get_parallel().dcp_enabled
-        if dcp and forward_batch.dcp_owned_prefill:
+        if dcp and dcp_dsa_owned_prefill():
             return self._get_topk_ragged_dcp_owned(
                 layer_id, q_fp8, weights, metadata, topk_result
             )
@@ -1595,7 +1597,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
         # DCP split: this rank scores rows [row_lo, row_hi), then all-gathers top-k.
-        split = dcp and forward_batch.dcp_split_indexer
+        split = dcp and dcp_dsa_split_indexer()
         if split:
             row_lo, row_hi, row_per = dcp_split_rows(q_offset)
         else:
