@@ -175,9 +175,18 @@ class TestEngineStateNotifications(CustomTestCase):
 
 
 class TestServerInfo(CustomTestCase):
-    def test_advertises_multimodal_inputs_only_for_multimodal_models(self):
-        for mm_processor, features in ((object(), ["multimodal_inputs"]), (None, [])):
-            with self.subTest(mm_processor=mm_processor):
+    def test_advertises_each_media_kind_the_processor_places(self):
+        vision = SimpleNamespace(
+            mm_tokens=SimpleNamespace(
+                image_token="<image>", video_token="<video>", audio_token=None
+            )
+        )
+        for mm_processor, features in (
+            (vision, ["image_inputs", "video_inputs"]),
+            (SimpleNamespace(mm_tokens=None), []),
+            (None, []),
+        ):
+            with self.subTest(features=features, mm_processor=mm_processor):
                 handle = RuntimeHandle.__new__(RuntimeHandle)
                 handle.tokenizer_manager = SimpleNamespace(
                     server_args=None, mm_processor=mm_processor
