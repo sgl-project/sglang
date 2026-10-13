@@ -71,7 +71,7 @@ def make_host_pool(dtype, layout="page_first"):
     return host
 
 
-def make_device_pool(dtype):
+def make_device_pool(dtype, host):
     k_buffer = [
         torch.empty(TOTAL_ITEMS, HEAD_NUM, K_HEAD_DIM, dtype=dtype, device=DEVICE)
         for _ in range(NUM_LAYERS)
@@ -84,7 +84,17 @@ def make_device_pool(dtype):
         fill_with_offset(k_buffer[layer_id], layer_id * 1000)
         fill_with_offset(v_buffer[layer_id], layer_id * 1000 + 100)
 
-    return SimpleNamespace(
+    host.device_k_buffers = tuple(k_buffer)
+    host.device_v_buffers = tuple(v_buffer)
+    host.device_k_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in k_buffer], dtype=torch.uint64, device=DEVICE
+    )
+    host.device_v_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in v_buffer], dtype=torch.uint64, device=DEVICE
+    )
+    host.device_pool = SimpleNamespace(
+        layer_num=host.layer_num,
+        layer_shard_enabled=False,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
         k_data_ptrs=torch.tensor(
@@ -94,6 +104,7 @@ def make_device_pool(dtype):
             [x.data_ptr() for x in v_buffer], dtype=torch.uint64, device=DEVICE
         ),
     )
+    return host.device_pool
 
 
 def _host_k_tokens(host, indices, layer_id):
@@ -139,7 +150,7 @@ def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
     # Covers D2H backup + H2D load through AsymmetricMHATokenToKVPoolHost using
     # MiMoV2's real K/V head dims and the real MLA single-buffer kernels.
     host = make_host_pool(dtype)
-    device_pool = make_device_pool(dtype)
+    device_pool = make_device_pool(dtype, host)
 
     device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)
     host_pages = torch.tensor([0, 1, 2], dtype=torch.int64)
@@ -175,7 +186,7 @@ def test_asymmetric_mha_direct_page_first_direct_roundtrip(dtype):
     # page_first_direct/direct. K and V are copied through separate direct calls
     # because their per-token strides differ.
     host = make_host_pool(dtype, layout="page_first_direct")
-    device_pool = make_device_pool(dtype)
+    device_pool = make_device_pool(dtype, host)
     direct_stream = torch.cuda.Stream()
 
     device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)

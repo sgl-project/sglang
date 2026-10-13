@@ -8,6 +8,7 @@ DEVICE_TYPE=$1
 CANN_VERSION="${CANN_VERSION:-9.1.0}"
 PYTORCH_VERSION="${PYTORCH_VERSION:-2.10.0}"
 SGLANG_KERNEL_NPU_TAG="${SGLANG_KERNEL_NPU_TAG:-2026.9.0.post9}"
+PYARROW_VERSION="${PYARROW_VERSION:-23.0.1}"
 
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-${CANN_VERSION}}"
 export ASCEND_HOME_PATH
@@ -116,6 +117,4 @@ mkdir -p cann-custom-ops
 rm -rf cann-custom-ops
 
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-# pyarrow 26 needs NumPy 2 at import, but triton-ascend pins numpy 1.26.4;
-# drop the cap once triton-ascend allows NumPy 2.
-${UV_PIP_INSTALL} -v -e "python[dev_npu]" "pyarrow<26"
+${UV_PIP_INSTALL} -v -e "python[dev_npu]" "pyarrow==${PYARROW_VERSION}"
