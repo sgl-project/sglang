@@ -2128,13 +2128,6 @@ def hc_post(
 # torch_npu mHC ops. A2/A3 keep the fused cann-recipes ``custom.npu_hc_pre``.
 
 
-def _npu_use_torch_npu_mhc() -> bool:
-    """True on NPU arch35 (Ascend 950), the only SKU with the torch_npu mHC ops."""
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-    return is_npu_arch35()
-
-
 def _npu_hc_pre_arch35(
     x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, rms_norm_eps, hc_eps
 ):
@@ -2227,8 +2220,11 @@ def npu_hc_pre(
         return y, post, comb, False
 
     # Arch-gated dispatch: only Ascend 950 (arch35) has the torch_npu mHC ops;
-    # A2/A3 fall through to the legacy fused kernel.
-    impl = _npu_hc_pre_arch35 if _npu_use_torch_npu_mhc() else _npu_hc_pre_custom
+    # A2/A3 fall through to the legacy fused kernel. The NPU helper is imported
+    # lazily so this kernel module stays free of NPU backend imports elsewhere.
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    impl = _npu_hc_pre_arch35 if is_npu_arch35() else _npu_hc_pre_custom
     y, post, comb = impl(
         x,
         hc_fn,
