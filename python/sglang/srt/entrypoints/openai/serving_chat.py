@@ -12,7 +12,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_exec, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -1454,11 +1454,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 # the named tool. With the switch every tool stays in the prompt,
                 # so a turn that names a tool still extends the prompt of the turns
                 # before it and reuses their prefix cache. The switch needs an
-                # output constraint. Without one, the one-tool prompt is the only
-                # thing that selects the named tool.
+                # output constraint enforced by the active backend. Only XGrammar
+                # honors the forcing property of structural tags; llguidance's
+                # legacy tags ignore at_least_one and allow free text. Otherwise
+                # the one-tool prompt is the only thing that selects the tool.
+                grammar_backend = get_exec().kernel.grammar_backend
                 keep_tools = (
                     envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.get()
                     and tool_call_constraint is not None
+                    and grammar_backend in ("xgrammar", "llguidance", "outlines")
+                    and (
+                        tool_call_constraint[0] != "structural_tag"
+                        or grammar_backend == "xgrammar"
+                    )
                 )
                 tools = [
                     item.model_dump()

@@ -1322,7 +1322,10 @@ class ServingChatTestCase(CustomTestCase):
 
         self.chat._process_messages(auto_req, is_multimodal=False)
         auto_tools = self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
-        with envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.override(True):
+        with (
+            get_context().override_server_args(grammar_backend="xgrammar"),
+            envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.override(True),
+        ):
             result = self.chat._process_messages(req, is_multimodal=False)
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
@@ -1348,6 +1351,52 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIsNone(result.tool_call_constraint)
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_nonforcing_backend_keeps_the_one_tool_prompt(self):
+        """When the backend cannot force a named call, the prompt must keep
+        advertising only the named tool despite a requested forcing tag."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "inkling"
+        req = self._named_tool_choice_request()
+
+        for backend in ("llguidance", "outlines", "none"):
+            with (
+                get_context().override_server_args(grammar_backend=backend),
+                envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.override(True),
+                self.subTest(backend=backend),
+            ):
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                kind, tag = result.tool_call_constraint
+                self.assertEqual(kind, "structural_tag")
+                self.assertTrue(tag.at_least_one)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_json_constraint_requires_an_active_backend(self):
+        """llguidance can enforce a named JSON call even though its legacy
+        structural tags cannot; disabling grammar removes that protection."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = None
+        req = self._named_tool_choice_request()
+
+        for backend, tools in (
+            ("llguidance", req.tools),
+            ("none", [req.tools[2]]),
+            (None, [req.tools[2]]),
+        ):
+            with (
+                get_context().override_server_args(grammar_backend=backend),
+                envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.override(True),
+                self.subTest(backend=backend),
+            ):
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                self.assertEqual(result.tool_call_constraint[0], "json_schema")
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["tools"], [tool.model_dump() for tool in tools])
 
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
