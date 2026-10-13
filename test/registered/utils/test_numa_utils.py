@@ -52,19 +52,10 @@ class TestIsNumaAvailable(unittest.TestCase):
     @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
-    def test_returns_false_when_mempolicy_not_permitted(
-        self, _mock_isdir, _mock_which, _mock_mempolicy
-    ):
-        self.assertFalse(_is_numa_available())
-
-    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
-    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
-    @patch("os.path.isdir", return_value=True)
     def test_cpu_only_accepted_when_mempolicy_not_permitted(
         self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
-        self.assertTrue(_is_numa_available(require_mempolicy=False))
+        self.assertTrue(_is_numa_available())
 
 
 class TestNumaBindWithoutMempolicy(unittest.TestCase):
