@@ -398,12 +398,10 @@ def _modulate_rmsnorm_scale_shift(
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    quant_method = linear.quant_method
     return (
         isinstance(linear, LinearBase)
-        and quant_method is not None
-        and isinstance(quant_method, LinearMethodBase)
-        and quant_method.accepts_mxfp8_input(linear)
+        and isinstance(linear.quant_method, LinearMethodBase)
+        and linear.quant_method.accepts_mxfp8_input(linear)
     )
 
 
