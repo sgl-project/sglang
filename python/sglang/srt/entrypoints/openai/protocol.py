@@ -1736,6 +1736,14 @@ class DetokenizeResponse(BaseModel):
     text: Union[str, List[str]]
 
 
+class ParseRequest(BaseModel):
+    """Request schema for the /v1/parse endpoint."""
+
+    model: str = DEFAULT_MODEL_NAME
+    tokens: List[int]
+    tools: Optional[List[Tool]] = None
+
+
 OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
@@ -1746,6 +1754,7 @@ OpenAIServingRequest = Union[
     V1RerankReqInput,
     TokenizeRequest,
     DetokenizeRequest,
+    ParseRequest,
 ]
 
 
