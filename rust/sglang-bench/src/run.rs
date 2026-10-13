@@ -9,17 +9,22 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use sglang_api_types::api::v1 as api;
 use tokio::sync::Semaphore;
 
-use crate::args::Args;
+use crate::args::{Args, Protocol};
 use crate::dataset::DatasetRow;
-use crate::request::{RequestOutput, RequestTemplate};
+use crate::request::{GrpcClient, RequestOutput, RequestTemplate};
 use crate::{dataset, hf, metrics, request};
 
 /// aiohttp's benchmark session allows 6 hours for one request; a long
 /// generation under heavy load legitimately takes minutes, and a shorter
 /// timeout would report the client's impatience as a server failure.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The Rust server's gRPC listener accepts 64 MiB messages; a cumulative
+/// `/generate` frame on a long request outgrows tonic's 4 MiB default.
+const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Run one benchmark to completion and return its result document, the same
 /// object the Python client writes to its `.jsonl`.
@@ -56,40 +61,67 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         .build()
         .context("cannot build the HTTP client")?;
 
+    // gRPC speaks to the server through one multiplexed HTTP/2 channel; the
+    // HTTP backends keep using `http`.
+    let grpc = if args.protocol == Protocol::Grpc {
+        Some(connect_grpc(&base_url)?)
+    } else {
+        None
+    };
+    let server = Server {
+        http: &http,
+        base_url: &base_url,
+        headers: &headers,
+        grpc: grpc.clone(),
+    };
+
     if args.ready_check_timeout_sec > 0 {
-        wait_for_endpoint(
-            &http,
-            &format!("{base_url}/v1/models"),
-            &headers,
-            args.ready_check_timeout_sec,
-        )
-        .await?;
+        server
+            .wait_until_ready(args.ready_check_timeout_sec)
+            .await?;
     }
 
-    let model = resolve_model(&http, &base_url, &headers, &args).await?;
+    let model_info = server.model_info().await;
+    let model = match &args.model {
+        Some(model) => model.clone(),
+        None => model_info
+            .as_ref()
+            .and_then(|info| info.served_model_name.clone())
+            .with_context(|| {
+                format!("no model found at {base_url}; pass --model, or check --host and --port")
+            })?,
+    };
     let model_id = args
         .served_model_name
         .clone()
         .unwrap_or_else(|| model.clone());
     let tokenizer_source = match &args.tokenizer {
         Some(source) => source.clone(),
-        None => resolve_tokenizer_source(&http, &base_url, &headers)
-            .await
+        None => model_info
+            .as_ref()
+            .and_then(|info| info.tokenizer_path.clone())
             .unwrap_or_else(|| model.clone()),
     };
 
-    println!("Loading tokenizer from {tokenizer_source}...");
-    let tokenizer_path = hf::resolve_tokenizer(&http, &tokenizer_source).await?;
-    let tokenizer = hf::load_tokenizer(&tokenizer_path)?;
+    // `--vocab-size` is the one configuration that reads nothing from the
+    // tokenizer, so none is loaded: the client then needs no model files.
+    let tokenizer = if args.vocab_size.is_some() {
+        println!("Running without a tokenizer (--vocab-size given); retokenized totals report 0.");
+        None
+    } else {
+        println!("Loading tokenizer from {tokenizer_source}...");
+        let tokenizer_path = hf::resolve_tokenizer(&http, &tokenizer_source).await?;
+        Some(hf::load_tokenizer(&tokenizer_path)?)
+    };
     let corpus = if dataset::needs_corpus(args.dataset_name) {
         Some(hf::resolve_sharegpt(&http, &args.dataset_path).await?)
     } else {
         None
     };
-    let rows = dataset::load(&args, &tokenizer, corpus.as_deref())?;
+    let rows = dataset::load(&args, tokenizer.as_ref(), corpus.as_deref())?;
 
     let template = RequestTemplate {
-        protocol: args.backend.protocol(),
+        api: args.backend.api(),
         api_url: args.api_url(),
         model: model_id,
         stream: !args.disable_stream,
@@ -100,26 +132,38 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         top_logprobs_num: args.top_logprobs_num,
         logprob_start_len: args.logprob_start_len,
         extra_body: args.parse_extra_body()?,
-        headers,
+        headers: headers.clone(),
+        grpc,
     };
 
     // One time base for every request, so the peak-window buckets in `metrics`
     // place all of them on a single timeline.
     let base = Instant::now();
     warmup(&http, &template, &rows, &args, base).await?;
+    // Cache flush is an HTTP-only control; a gRPC run skips it loudly rather
+    // than measuring a run that silently kept its cache.
     if should_flush_cache(&args) {
-        flush_cache(
-            &http,
-            &base_url,
-            &template.headers,
-            args.flush_cache_timeout,
-        )
-        .await;
+        if server.grpc.is_some() {
+            eprintln!("flush_cache is not exposed over gRPC; skipping");
+        } else {
+            flush_cache(
+                &http,
+                &base_url,
+                &template.headers,
+                args.flush_cache_timeout,
+            )
+            .await;
+        }
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    // The profiler is an HTTP-only control; a gRPC run skips it loudly.
     if args.profile {
-        profile(&http, &base_url, &template.headers, "start").await;
+        if server.grpc.is_some() {
+            eprintln!("the profiler is not exposed over gRPC; skipping");
+        } else {
+            profile(&http, &base_url, &template.headers, "start").await;
+        }
     }
 
     println!(
@@ -132,12 +176,12 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     let outputs = dispatch(&http, &template, &rows, &args, request_rate, base).await;
     let duration_s = started.elapsed().as_secs_f64();
 
-    if args.profile {
+    if args.profile && server.grpc.is_none() {
         profile(&http, &base_url, &template.headers, "stop").await;
     }
 
     let server_info = if metrics::reports_server_info(args.backend) {
-        fetch_json(&http, &format!("{base_url}/server_info"), &template.headers).await
+        server.server_info().await
     } else {
         None
     };
@@ -145,7 +189,7 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         .as_ref()
         .and_then(metrics::accept_length_from_server_info);
 
-    let retokenized = retokenize(&tokenizer, &outputs, &args)?;
+    let retokenized = retokenize(tokenizer.as_ref(), &outputs, &args)?;
     let metrics = metrics::calculate(&outputs, &retokenized, duration_s);
     metrics::print_report(&metrics, &args, request_rate, duration_s, accept_length);
     report_failures(&outputs);
@@ -327,13 +371,13 @@ async fn profile(http: &reqwest::Client, base_url: &str, headers: &HeaderMap, ac
 /// Re-tokenize the generated texts, batched so the tokenizer's own
 /// parallelism applies. `--disable-retokenize` reports zeros instead.
 fn retokenize(
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: Option<&tokenizers::Tokenizer>,
     outputs: &[RequestOutput],
     args: &Args,
 ) -> Result<Vec<usize>> {
-    if args.disable_retokenize {
+    let Some(tokenizer) = tokenizer.filter(|_| !args.disable_retokenize) else {
         return Ok(vec![0; outputs.len()]);
-    }
+    };
     let texts: Vec<&str> = outputs
         .iter()
         .map(|output| {
@@ -466,74 +510,150 @@ fn build_headers(args: &Args) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-/// Poll until the server answers, so a benchmark started alongside a server
-/// waits for it instead of reporting a wall of connection errors.
-async fn wait_for_endpoint(
-    http: &reqwest::Client,
-    url: &str,
-    headers: &HeaderMap,
-    timeout_sec: u64,
-) -> Result<()> {
-    println!("Waiting up to {timeout_sec}s for {url} to become ready...");
-    let started = Instant::now();
-    loop {
-        let ready = http
-            .get(url)
-            .headers(headers.clone())
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success());
-        if ready {
-            println!("Server ready in {:.1}s.", started.elapsed().as_secs_f64());
-            return Ok(());
+/// Open the api.v1 channel. One connection carries every request stream,
+/// multiplexed by HTTP/2; it connects on first use so a server that is still
+/// starting is handled by the readiness poll rather than here.
+fn connect_grpc(base_url: &str) -> Result<GrpcClient> {
+    let channel = tonic::transport::Endpoint::from_shared(base_url.to_owned())
+        .with_context(|| format!("{base_url} is not a valid gRPC endpoint"))?
+        .connect_timeout(Duration::from_secs(5))
+        .connect_lazy();
+    Ok(GrpcClient::new(channel).max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE))
+}
+
+/// What the server says about itself, in the shape both transports share.
+struct ServerModelInfo {
+    served_model_name: Option<String>,
+    tokenizer_path: Option<String>,
+}
+
+/// The control-plane calls, each over whichever transport the run uses.
+struct Server<'a> {
+    http: &'a reqwest::Client,
+    base_url: &'a str,
+    headers: &'a HeaderMap,
+    grpc: Option<GrpcClient>,
+}
+
+impl Server<'_> {
+    /// Poll until the server answers, so a benchmark started alongside a
+    /// server waits for it instead of reporting a wall of connection errors.
+    async fn wait_until_ready(&self, timeout_sec: u64) -> Result<()> {
+        let target = match &self.grpc {
+            Some(_) => format!("{} (gRPC GetModelInfo)", self.base_url),
+            None => format!("{}/v1/models", self.base_url),
+        };
+        println!("Waiting up to {timeout_sec}s for {target} to become ready...");
+        let started = Instant::now();
+        loop {
+            if self.is_ready().await {
+                println!("Server ready in {:.1}s.", started.elapsed().as_secs_f64());
+                return Ok(());
+            }
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_secs(timeout_sec),
+                "server at {target} did not become ready within {timeout_sec}s"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        anyhow::ensure!(
-            started.elapsed() < Duration::from_secs(timeout_sec),
-            "server at {url} did not become ready within {timeout_sec}s"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    async fn is_ready(&self) -> bool {
+        match &self.grpc {
+            Some(client) => client
+                .clone()
+                .get_model_info(api::GetModelInfoRequest {})
+                .await
+                .is_ok(),
+            None => self
+                .http
+                .get(format!("{}/v1/models", self.base_url))
+                .headers(self.headers.clone())
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success()),
+        }
+    }
+
+    /// The served model name and the tokenizer the server itself loaded.
+    /// HTTP reads `/v1/models` for the name and `/model_info` for the path;
+    /// gRPC gets both from `GetModelInfo`.
+    async fn model_info(&self) -> Option<ServerModelInfo> {
+        if let Some(client) = &self.grpc {
+            let info = client
+                .clone()
+                .get_model_info(api::GetModelInfoRequest {})
+                .await
+                .ok()?
+                .into_inner();
+            return Some(ServerModelInfo {
+                served_model_name: non_empty(info.served_model_name)
+                    .or_else(|| non_empty(info.model_path.clone())),
+                tokenizer_path: non_empty(info.tokenizer_path)
+                    .or_else(|| non_empty(info.model_path)),
+            });
+        }
+        let served_model_name = fetch_json(
+            self.http,
+            &format!("{}/v1/models", self.base_url),
+            self.headers,
+        )
+        .await
+        .and_then(|body| {
+            body.get("data")?
+                .get(0)?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned)
+        });
+        let tokenizer_path = fetch_json(
+            self.http,
+            &format!("{}/model_info", self.base_url),
+            self.headers,
+        )
+        .await
+        .and_then(|info| {
+            ["tokenizer_path", "model_path"].iter().find_map(|key| {
+                info.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+            })
+        });
+        Some(ServerModelInfo {
+            served_model_name,
+            tokenizer_path,
+        })
+    }
+
+    /// `/server_info`, or its gRPC twin rendered to the same JSON shape so
+    /// the accept-length extractor reads both.
+    async fn server_info(&self) -> Option<serde_json::Value> {
+        match &self.grpc {
+            Some(client) => {
+                let info = client
+                    .clone()
+                    .get_server_info(api::GetServerInfoRequest {})
+                    .await
+                    .ok()?
+                    .into_inner();
+                serde_json::to_value(info).ok()
+            }
+            None => {
+                fetch_json(
+                    self.http,
+                    &format!("{}/server_info", self.base_url),
+                    self.headers,
+                )
+                .await
+            }
+        }
     }
 }
 
-/// `--model`, else the first entry the server lists on `/v1/models`.
-async fn resolve_model(
-    http: &reqwest::Client,
-    base_url: &str,
-    headers: &HeaderMap,
-    args: &Args,
-) -> Result<String> {
-    if let Some(model) = &args.model {
-        return Ok(model.clone());
-    }
-    let url = format!("{base_url}/v1/models");
-    let listed = fetch_json(http, &url, headers).await.and_then(|body| {
-        body.get("data")?
-            .get(0)?
-            .get("id")?
-            .as_str()
-            .map(str::to_owned)
-    });
-    listed.with_context(|| {
-        format!("no model found at {url}; pass --model, or check --host and --port")
-    })
-}
-
-/// The tokenizer the server itself loaded, from `/model_info`.
-async fn resolve_tokenizer_source(
-    http: &reqwest::Client,
-    base_url: &str,
-    headers: &HeaderMap,
-) -> Option<String> {
-    let info = fetch_json(http, &format!("{base_url}/model_info"), headers).await?;
-    for key in ["tokenizer_path", "model_path"] {
-        if let Some(path) = info.get(key).and_then(serde_json::Value::as_str)
-            && !path.is_empty()
-        {
-            return Some(path.to_owned());
-        }
-    }
-    None
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 async fn fetch_json(

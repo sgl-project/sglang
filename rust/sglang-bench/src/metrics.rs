@@ -254,6 +254,7 @@ pub fn print_report(
 ) {
     println!("\n{:=^50}", " Serving Benchmark Result ");
     println!("{:<40} {:<10}", "Backend:", args.backend.as_str());
+    println!("{:<40} {:<10}", "Protocol:", args.protocol.as_str());
     let rate = if request_rate.is_infinite() {
         "inf".to_owned()
     } else {
@@ -390,6 +391,9 @@ pub fn result_json(
         // Arguments.
         put("tag", serde_json::json!(args.tag));
         put("backend", serde_json::json!(args.backend.as_str()));
+        // The one key the Python client does not write: an HTTP and a gRPC run of
+        // the same backend land in the same default file and must stay apart.
+        put("protocol", serde_json::json!(args.protocol.as_str()));
         put(
             "dataset_name",
             serde_json::json!(args.dataset_name.as_str()),

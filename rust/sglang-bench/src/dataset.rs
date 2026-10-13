@@ -56,7 +56,13 @@ pub fn needs_corpus(name: DatasetName) -> bool {
 
 /// Build the request set for `--dataset-name`. `corpus` is the ShareGPT path
 /// when [`needs_corpus`] asked for one.
-pub fn load(args: &Args, tokenizer: &Tokenizer, corpus: Option<&Path>) -> Result<Vec<DatasetRow>> {
+/// `tokenizer` may be absent only for `random-ids` with `--tokenize-prompt
+/// --vocab-size`, the one combination that reads nothing from it.
+pub fn load(
+    args: &Args,
+    tokenizer: Option<&Tokenizer>,
+    corpus: Option<&Path>,
+) -> Result<Vec<DatasetRow>> {
     let mut rng = StdRng::seed_from_u64(args.seed);
     let rows = match args.dataset_name {
         DatasetName::Random | DatasetName::RandomIds => {
@@ -64,7 +70,7 @@ pub fn load(args: &Args, tokenizer: &Tokenizer, corpus: Option<&Path>) -> Result
         }
         DatasetName::Sharegpt => {
             let corpus = corpus.context("the sharegpt dataset needs a corpus path")?;
-            sample_sharegpt(args, tokenizer, corpus, &mut rng)?
+            sample_sharegpt(args, required(tokenizer)?, corpus, &mut rng)?
         }
     };
     anyhow::ensure!(
@@ -97,7 +103,7 @@ fn random_lens(full_len: usize, range_ratio: f64, count: usize, rng: &mut StdRng
 /// that no tokenizer would produce.
 fn sample_random(
     args: &Args,
-    tokenizer: &Tokenizer,
+    tokenizer: Option<&Tokenizer>,
     corpus: Option<&Path>,
     rng: &mut StdRng,
 ) -> Result<Vec<DatasetRow>> {
@@ -109,14 +115,17 @@ fn sample_random(
     if return_text {
         // The server adds its own special tokens, so leave room for them or
         // every prompt arrives longer than requested.
-        let special = num_special_tokens(tokenizer);
+        let special = num_special_tokens(required(tokenizer)?);
         for len in &mut input_lens {
             *len = len.saturating_sub(special).max(1);
         }
     }
 
     if args.dataset_name == DatasetName::RandomIds {
-        let vocab_size = tokenizer.get_vocab_size(false) as u32;
+        let vocab_size = match args.vocab_size {
+            Some(size) => size,
+            None => required(tokenizer)?.get_vocab_size(false) as u32,
+        };
         anyhow::ensure!(vocab_size > 0, "the tokenizer reports an empty vocabulary");
         let mut rows = Vec::with_capacity(count);
         for (index, (&input_len, &output_len)) in
@@ -139,6 +148,7 @@ fn sample_random(
     }
 
     let corpus = corpus.context("the random dataset samples prompts from a corpus")?;
+    let tokenizer = required(tokenizer)?;
     let corpus = load_sharegpt_pairs(corpus, rng)?;
     let mut rows = Vec::with_capacity(count);
     for (prompt, _) in &corpus {
@@ -153,7 +163,7 @@ fn sample_random(
         let target = input_lens[index];
         let ids: Vec<u32> = token_ids.iter().copied().cycle().take(target).collect();
         rows.push(DatasetRow::new(
-            to_prompt(ids, return_text, tokenizer)?,
+            to_prompt(ids, return_text, Some(tokenizer))?,
             target,
             output_lens[index],
         ));
@@ -241,11 +251,17 @@ fn load_sharegpt_pairs(path: &Path, rng: &mut StdRng) -> Result<Vec<(String, Str
     Ok(pairs)
 }
 
-fn to_prompt(ids: Vec<u32>, return_text: bool, tokenizer: &Tokenizer) -> Result<Prompt> {
+fn required(tokenizer: Option<&Tokenizer>) -> Result<&Tokenizer> {
+    tokenizer.context(
+        "this dataset needs a tokenizer; --vocab-size only covers random-ids with --tokenize-prompt",
+    )
+}
+
+fn to_prompt(ids: Vec<u32>, return_text: bool, tokenizer: Option<&Tokenizer>) -> Result<Prompt> {
     if !return_text {
         return Ok(Prompt::TokenIds(ids));
     }
-    let text = tokenizer
+    let text = required(tokenizer)?
         .decode(&ids, false)
         .map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
     Ok(Prompt::Text(text))

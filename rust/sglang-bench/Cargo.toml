@@ -28,7 +28,11 @@ futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `--protocol grpc` speaks the server's api.v1 service with the same
+# generated request type the HTTP route decodes.
+sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 tokio = { workspace = true }
+tonic = { workspace = true }
 
 # Declared here rather than in [workspace.dependencies]: no other member uses
 # them, and a benchmark client's dependency choices should not constrain the
@@ -47,3 +51,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+# The gRPC end-to-end test hosts a tonic mock of the api.v1 service.
+tokio-stream = { workspace = true }

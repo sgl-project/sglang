@@ -53,6 +53,9 @@ SUPPORTED_DATASETS = frozenset({"random", "random-ids", "sharegpt"})
 #: needing conversion is handled in :func:`build_config`.
 _DIRECT_FIELDS = (
     "backend",
+    # Rust-only: ``http`` (default) or ``grpc``. `serving.py` has no such
+    # flag, so this arrives only from a programmatic caller.
+    "protocol",
     "base_url",
     "host",
     "port",

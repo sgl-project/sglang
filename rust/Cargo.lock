@@ -3722,8 +3722,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sglang-api-types",
  "tokenizers",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

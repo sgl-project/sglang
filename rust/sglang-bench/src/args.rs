@@ -27,6 +27,19 @@ pub enum Backend {
     LmdeployChat,
 }
 
+/// The wire the request travels on. Orthogonal to `--backend`, which picks
+/// the API shape: `grpc` carries the same `/generate` contract as HTTP, on
+/// the Rust server's `sglang.api.v1` service.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    /// JSON over HTTP, streamed as SSE. What the Python client speaks.
+    #[default]
+    Http,
+    /// The Rust server's gRPC service; native-API backends only.
+    Grpc,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum DatasetName {
@@ -55,6 +68,12 @@ pub enum DatasetName {
 pub struct Args {
     #[arg(long, value_enum, default_value = "sglang")]
     pub backend: Backend,
+
+    /// Wire protocol. `grpc` needs a native-API backend (`sglang`) and talks
+    /// to the Rust server's gRPC listener, whose default port is the HTTP
+    /// port plus 10000.
+    #[arg(long, value_enum, default_value = "http")]
+    pub protocol: Protocol,
 
     /// Full base URL. Overrides `--host` / `--port`.
     #[arg(long)]
@@ -169,8 +188,17 @@ pub struct Args {
     pub headers: Vec<String>,
 
     /// Send `input_ids` instead of `text`. Only for the random datasets.
+    /// The response side follows automatically: a server launched with
+    /// `--skip-tokenizer-init` returns `output_ids` and no text, and tokens
+    /// are then counted from the ids.
     #[arg(long)]
     pub tokenize_prompt: bool,
+
+    /// Vocabulary size for `random-ids` with `--tokenize-prompt`. Given, no
+    /// tokenizer is loaded at all, so the client needs no model files; the
+    /// retokenized totals are then reported as 0.
+    #[arg(long)]
+    pub vocab_size: Option<u32>,
 
     /// Skip re-tokenizing the generated text. The retokenized totals are then
     /// reported as 0; use it when only throughput and latency matter.
@@ -211,22 +239,27 @@ impl Backend {
         }
     }
 
-    /// The Python per-backend default port.
-    pub fn default_port(self) -> u16 {
-        match self {
+    /// The Python per-backend default port. The Rust server's gRPC listener
+    /// defaults to its HTTP port plus 10000 (`--grpc-port`).
+    pub fn default_port(self, protocol: Protocol) -> u16 {
+        let http = match self {
             Self::Sglang | Self::SglangNative | Self::SglangOai | Self::SglangOaiChat => 30000,
             Self::Vllm | Self::VllmChat => 8000,
             Self::Lmdeploy | Self::LmdeployChat => 23333,
+        };
+        match protocol {
+            Protocol::Http => http,
+            Protocol::Grpc => http + 10000,
         }
     }
 
-    /// The wire protocol this backend speaks, which decides how a streamed
-    /// chunk is read.
-    pub fn protocol(self) -> Protocol {
+    /// The API shape this backend speaks, which decides how a request is
+    /// built and how a streamed chunk is read.
+    pub fn api(self) -> Api {
         match self {
-            Self::Sglang | Self::SglangNative => Protocol::SglangGenerate,
-            Self::SglangOai | Self::Vllm | Self::Lmdeploy => Protocol::OpenaiCompletions,
-            Self::SglangOaiChat | Self::VllmChat | Self::LmdeployChat => Protocol::OpenaiChat,
+            Self::Sglang | Self::SglangNative => Api::SglangGenerate,
+            Self::SglangOai | Self::Vllm | Self::Lmdeploy => Api::OpenaiCompletions,
+            Self::SglangOaiChat | Self::VllmChat | Self::LmdeployChat => Api::OpenaiChat,
         }
     }
 
@@ -249,11 +282,22 @@ impl Backend {
     }
 }
 
+/// The request and frame shape, independent of the wire it travels on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Protocol {
+pub enum Api {
+    /// SGLang's native `/generate`, over HTTP or the gRPC service.
     SglangGenerate,
     OpenaiCompletions,
     OpenaiChat,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Grpc => "grpc",
+        }
+    }
 }
 
 impl DatasetName {
@@ -290,7 +334,9 @@ impl Args {
         if let Some(url) = &self.base_url {
             return url.trim_end_matches('/').to_owned();
         }
-        let port = self.port.unwrap_or_else(|| self.backend.default_port());
+        let port = self
+            .port
+            .unwrap_or_else(|| self.backend.default_port(self.protocol));
         let host = if self.host.contains(':') && !self.host.starts_with('[') {
             format!("[{}]", self.host)
         } else {
@@ -299,8 +345,13 @@ impl Args {
         format!("http://{host}:{port}")
     }
 
+    /// Where requests go: the route under the base URL over HTTP, the bare
+    /// endpoint over gRPC, whose service lives at the connection's root.
     pub fn api_url(&self) -> String {
-        format!("{}{}", self.base_url(), self.backend.api_path())
+        match self.protocol {
+            Protocol::Http => format!("{}{}", self.base_url(), self.backend.api_path()),
+            Protocol::Grpc => self.base_url(),
+        }
     }
 
     /// `--extra-request-body`, which must be a JSON object.
@@ -328,14 +379,27 @@ impl Args {
             "--tokenize-prompt is only supported by the random datasets"
         );
         anyhow::ensure!(
-            !self.tokenize_prompt || self.backend.protocol() != Protocol::OpenaiChat,
+            !self.tokenize_prompt || self.backend.api() != Api::OpenaiChat,
             "--tokenize-prompt cannot be used with a chat backend, which sends messages"
+        );
+        anyhow::ensure!(
+            self.protocol == Protocol::Http || self.backend.api() == Api::SglangGenerate,
+            "--protocol grpc carries the native /generate contract only; use --backend sglang \
+             (the OpenAI routes have no gRPC service)"
         );
         if let Some(len) = self.sharegpt_output_len {
             anyhow::ensure!(len >= 4, "--sharegpt-output-len is too small, got {len}");
         }
         if let Some(limit) = self.max_concurrency {
             anyhow::ensure!(limit > 0, "--max-concurrency must be at least 1");
+        }
+        if let Some(size) = self.vocab_size {
+            anyhow::ensure!(size > 0, "--vocab-size must be at least 1");
+            anyhow::ensure!(
+                self.tokenize_prompt && self.dataset_name == DatasetName::RandomIds,
+                "--vocab-size is only meaningful with --tokenize-prompt --dataset-name random-ids; \
+                 every other dataset needs the tokenizer"
+            );
         }
         Ok(())
     }
@@ -372,6 +436,36 @@ mod tests {
             args(&["--base-url", "https://example.com/"]).api_url(),
             "https://example.com/generate"
         );
+        // gRPC has no route path, and its default port is the server's
+        // HTTP port plus 10000.
+        assert_eq!(
+            args(&["--protocol", "grpc"]).api_url(),
+            "http://0.0.0.0:40000"
+        );
+        assert_eq!(
+            args(&["--protocol", "grpc", "--port", "7"]).api_url(),
+            "http://0.0.0.0:7"
+        );
+    }
+
+    /// Only the native API has a gRPC service, so the protocol is rejected
+    /// for the OpenAI-shaped backends rather than quietly sent over HTTP.
+    #[test]
+    fn grpc_requires_a_native_backend() {
+        assert!(args(&["--protocol", "grpc"]).validate().is_ok());
+        assert!(
+            args(&["--protocol", "grpc", "--backend", "sglang-native"])
+                .validate()
+                .is_ok()
+        );
+        for backend in ["sglang-oai", "sglang-oai-chat", "vllm", "lmdeploy-chat"] {
+            assert!(
+                args(&["--protocol", "grpc", "--backend", backend])
+                    .validate()
+                    .is_err(),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -436,6 +530,43 @@ mod tests {
         );
         assert!(args(&["--sharegpt-output-len", "2"]).validate().is_err());
         assert!(args(&["--max-concurrency", "0"]).validate().is_err());
+    }
+
+    /// `--vocab-size` replaces the tokenizer, so it is only coherent where the
+    /// tokenizer's sole job was to supply that number.
+    #[test]
+    fn vocab_size_requires_the_tokenizer_free_dataset() {
+        let ok = [
+            "--vocab-size",
+            "1000",
+            "--tokenize-prompt",
+            "--dataset-name",
+            "random-ids",
+        ];
+        assert!(args(&ok).validate().is_ok());
+        assert!(args(&["--vocab-size", "1000"]).validate().is_err());
+        assert!(
+            args(&[
+                "--vocab-size",
+                "1000",
+                "--tokenize-prompt",
+                "--dataset-name",
+                "random"
+            ])
+            .validate()
+            .is_err()
+        );
+        assert!(
+            args(&[
+                "--vocab-size",
+                "0",
+                "--tokenize-prompt",
+                "--dataset-name",
+                "random-ids"
+            ])
+            .validate()
+            .is_err()
+        );
     }
 
     /// A JSON config sets only the keys it names; the rest take the same

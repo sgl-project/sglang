@@ -87,8 +87,10 @@ cp target/release/libsglang_bench.so \
 ## Covered
 
 - **Backends**: `sglang` / `sglang-native` (`/generate`), `sglang-oai`,
-  `vllm`, `lmdeploy` (`/v1/completions`), and `sglang-oai-chat`, `vllm-chat`,
+  `vllm`, `lmdeploy` (`/v1/completions`), `sglang-oai-chat`, `vllm-chat`,
   `lmdeploy-chat` (`/v1/chat/completions`), streaming and not.
+- **Protocols**: `--protocol http` (default) and `--protocol grpc`, the Rust
+  server's `sglang.api.v1` service (below).
 - **Datasets**: `random`, `random-ids`, `sharegpt`.
 - Poisson request pacing (`--request-rate`), a concurrency cap, warmup, cache
   flush, profiler start/stop, the readiness probe, `--extra-request-body`,
@@ -97,6 +99,37 @@ cp target/release/libsglang_bench.so \
   peak-concurrency windows, with NumPy's percentile interpolation and
   population standard deviation so the numbers line up with the Python
   script's.
+
+### Token ids on both ends
+
+`--tokenize-prompt` sends `input_ids` instead of `text`. On the response side
+tokens are counted from `meta_info.completion_tokens`, with the `output_ids`
+a frame carries as the fallback, so a server launched with
+`--skip-tokenizer-init`, which returns ids and an empty `text`, measures the
+same way a decoding server does. The Python client cannot benchmark such a
+server: it counts a token only where it sees text.
+
+With `--dataset-name random-ids --tokenize-prompt --vocab-size N` the client
+loads no tokenizer at all and needs no model files; the retokenized totals
+then report 0, since there is no text to re-encode. That combination takes
+the tokenizer and detokenizer out of the measurement on both ends, which is
+the datapath `sglang-server` is built around.
+
+### gRPC
+
+`--protocol grpc` sends the same backend's requests over the Rust server's
+`sglang.api.v1` service (`Generate`, `GetModelInfo`, `GetServerInfo`) instead
+of HTTP. It is a transport choice, not a backend: only the native API has a
+gRPC service, so it pairs with `--backend sglang`, and the default port is the
+server's HTTP port plus 10000, matching `--grpc-port`. The request is the
+same schema the `/generate` route decodes, built once and deserialized into
+the generated type, and each streamed frame is fed to the same accounting as
+an SSE frame through its JSON form, so an HTTP run and a gRPC run differ only
+in transport and are directly comparable. The result line carries a
+`protocol` key, the one key the Python client does not write, so the two
+kinds of run stay apart in a shared file. Two differences to know about: all
+request streams share one HTTP/2 connection, and cache flush and the profiler
+are HTTP-only controls, so a gRPC run reports and skips them.
 
 ## Not covered
 
