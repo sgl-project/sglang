@@ -12,9 +12,10 @@ The CUDA side is split into independent pieces:
 - ``Communicator``: the two planes above (either may be absent), the handle
   every kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
-  graph_params, use_multicast)`` with three algorithms (1shot_push /
-  1shot_pull / 2shot_pull) and three pull data sources (eager pull buffer /
-  CUDA-graph pointer table / multicast address).
+  graph_params, use_multicast, peer_bases, peer_offset)`` with three
+  algorithms (1shot_push / 1shot_pull / 2shot_pull) and four pull data
+  sources (eager pull buffer / CUDA-graph pointer table / symmetric-pool
+  input / multicast address).
 
 All storage is allocated and owned here, in Python.
 
@@ -22,8 +23,14 @@ CUDA-graph inputs are exchanged from Python after capture (cudaIpc handles
 for cudaMalloc-backed pointers, fabric/posix-fd VMM mapping for expandable
 segments) and written into a device-side pointer table (``graph_params``);
 the kernel captured in the graph dereferences its row at replay time.
+
+Eager inputs allocated from the NCCL symmetric pool (``--enable-symm-mem``)
+are zero-copy too: each pool segment is peer-mapped once, and a call passes
+the per-rank segment bases plus the input's offset, which is the same on
+every rank.
 """
 
+import bisect
 import logging
 import math
 from contextlib import contextmanager
@@ -40,6 +47,9 @@ from sglang.kernels.ops.communication.all_reduce import (
     PullPlane,
     PushPlane,
     custom_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    get_symmetric_segments,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
@@ -183,6 +193,7 @@ class CustomAllReduceV2:
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._symm_supported = not is_multinode
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -201,6 +212,20 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        self._in_capture = False
+        # peer-mapped symmetric-pool segments, sorted by base:
+        # (base, end, CPU int64 tensor of every rank's base)
+        self._symm_bases: List[int] = []
+        self._symm_segments: List[Tuple[int, int, torch.Tensor]] = []
+        self._symm_seen = 0
+        self._symm_pending: List[Tuple[int, int]] = []
+        self._symm_sink = _SegmentSink()
+        self._symm_vmm = VmmGraphInputManager(
+            obj=self._symm_sink,
+            group=self.group,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
         self.disabled = False
 
     def _init_workspace(self) -> None:
@@ -343,7 +368,8 @@ class CustomAllReduceV2:
             return False
         if self.override_algo is not None:
             return inp_size <= self.max_size
-        return self._pick_config(inp_size, self._can_use_graph()) is not None
+        zero_copy = self._can_use_graph() or self._lookup_symmetric(inp) is not None
+        return self._pick_config(inp_size, zero_copy) is not None
 
     # ------------------------------------------------------------------
     # All-reduce
@@ -352,22 +378,76 @@ class CustomAllReduceV2:
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
         can_use_graph = self._can_use_graph()
+        symm = None if can_use_graph else self._lookup_symmetric(input)
         if self.override_algo is not None:
             # TODO: enhance this override pattern
             algo, use_multicast = self.override_algo, False
         else:
-            config = self._pick_config(nbytes, can_use_graph)
+            # a symmetric input is as zero-copy as a graph-registered one
+            config = self._pick_config(nbytes, can_use_graph or symm is not None)
             assert config is not None, f"No config for {nbytes = }"
             algo, use_multicast = config
-        use_graph = can_use_graph and not algo.is_push() and not use_multicast
+        staged = algo.is_push() or use_multicast
+        use_graph = can_use_graph and not staged
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
+        peer_bases, peer_offset = (None, 0) if staged or symm is None else symm
         return custom_all_reduce(
             self.obj,
             input,
             algo=algo,
             graph_params=graph_params,
             use_multicast=use_multicast,
+            peer_bases=peer_bases,
+            peer_offset=peer_offset,
         )
+
+    # ------------------------------------------------------------------
+    # Symmetric-pool inputs
+    # ------------------------------------------------------------------
+
+    def _lookup_symmetric(
+        self, input: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, int]]:
+        """Every rank's segment base and the offset of ``input``, when it lies
+        in a peer-mapped NCCL symmetric-pool segment."""
+        if not self._symm_supported or self._in_capture:
+            return None
+        if is_in_tc_piecewise_cuda_graph():
+            return None
+        ptr = input.data_ptr()
+        end = ptr + input.numel() * input.element_size()
+        i = bisect.bisect_right(self._symm_bases, ptr) - 1
+        if i < 0 or end > self._symm_segments[i][1]:
+            if not self._map_symmetric_segments(ptr, end):
+                return None
+            i = bisect.bisect_right(self._symm_bases, ptr) - 1
+            if i < 0 or end > self._symm_segments[i][1]:
+                return None
+        base, _, peer_bases = self._symm_segments[i]
+        return peer_bases, ptr - base
+
+    def _map_symmetric_segments(self, ptr: int, end: int) -> bool:
+        """Peer-map the pending pool segments once an input lands in one.
+
+        Collective over the group. Like NCCL's own window registration, it
+        relies on every rank allocating the pool identically, so all ranks
+        see the same segments and take this branch on the same call.
+        """
+        new = get_symmetric_segments(self._symm_seen)
+        self._symm_seen += len(new)
+        self._symm_pending += [seg for seg in new if is_vmm_pointer(seg[0])]
+        if not any(b <= ptr and end <= b + n for b, n in self._symm_pending):
+            return False
+        segments, self._symm_pending = self._symm_pending, []
+        self._symm_sink.segments = segments
+        self._symm_vmm.register_graph_inputs()
+        for (base, size), row in zip(segments, self._symm_sink.peer_ptrs):
+            k = bisect.bisect_left(self._symm_bases, base)
+            self._symm_bases.insert(k, base)
+            self._symm_segments.insert(
+                k, (base, base + size, torch.tensor(row, dtype=torch.int64))
+            )
+        return True
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
@@ -386,9 +466,11 @@ class CustomAllReduceV2:
             return
         try:
             self._graph_mode_allowed = self._is_graph_mode_supported
+            self._in_capture = True
             yield
         finally:
             self._graph_mode_allowed = False
+            self._in_capture = False
         assert not torch.cuda.is_current_stream_capturing(), (
             "Cannot register graph inputs while capturing CUDA graph"
         )
@@ -453,9 +535,26 @@ class CustomAllReduceV2:
             del self.obj  # drop the pointer holder before the workspace tensors
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
+        if hasattr(self, "_symm_vmm"):
+            self._symm_vmm.close()
 
     def __del__(self):
         self.close()
+
+
+class _SegmentSink:
+    """Feeds pool segments through ``VmmGraphInputManager`` (which maps
+    graph inputs) and keeps each segment's per-rank bases."""
+
+    def __init__(self) -> None:
+        self.segments: List[Tuple[int, int]] = []
+        self.peer_ptrs: List[List[int]] = []
+
+    def get_graph_capture_bases(self):
+        return compute_graph_capture_bases(self.segments)
+
+    def register_peer_mapped_inputs(self, peer_ptrs: List[List[int]]) -> None:
+        self.peer_ptrs = peer_ptrs
 
 
 def _is_vmm_backed_allocator(device: torch.device) -> bool:

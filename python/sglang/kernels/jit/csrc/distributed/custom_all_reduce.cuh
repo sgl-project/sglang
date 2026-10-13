@@ -311,7 +311,9 @@ struct AllReduceKernel {
       const Tensor in,
       const std::string algo,
       const tvm::ffi::Optional<TensorView> graph_params_opt,
-      const bool use_multicast) {
+      const bool use_multicast,
+      const tvm::ffi::Optional<TensorView> peer_bases_opt,
+      const int64_t peer_offset) {
     using namespace host;
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
@@ -325,9 +327,10 @@ struct AllReduceKernel {
     const auto num_vecs = static_cast<uint32_t>(num_elems / (16 / sizeof(T)));
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto use_graph = graph_params_opt.has_value();
+    const auto use_peer_inputs = peer_bases_opt.has_value();
 
     if (algo == "1shot_push") {
-      CHECK_HOST(!use_graph && !use_multicast);
+      CHECK_HOST(!use_graph && !use_multicast && !use_peer_inputs);
       const auto& push = comm.get_push_obj();
       Tensor out = ffi::empty_like(in);
       const auto params = PushParams{
@@ -347,18 +350,32 @@ struct AllReduceKernel {
 
     const auto& pull = comm.get_pull_obj();
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
-    // only 2shot pull + graph mode forces inplace implementation
-    const auto is_inplace = use_graph && algo == "2shot_pull";
+    CHECK_HOST(!(use_peer_inputs && (use_graph || use_multicast)));
+    // Peers read the caller's own buffers (a graph pointer row, or symmetric
+    // inputs at a common offset), so nothing is staged through the plane.
+    const auto zero_copy = use_graph || use_peer_inputs;
+    // only 2shot pull + zero copy forces inplace implementation
+    const auto is_inplace = zero_copy && algo == "2shot_pull";
     Tensor out = is_inplace ? in : ffi::empty_like(in);
-    const auto params = PullParams{
+    auto params = PullParams{
         .output = out.data_ptr(),
         .num_vecs = num_vecs,
         .rank = pull.rank,
         .graph_params = static_cast<void* const*>(graph_params),
         // Graph mode reduces over the caller's own registered buffers and only
         // barriers on this plane; the eager modes stage the input through it.
-        .ws = pull.get_workspace<kWorldSize>(use_graph ? 0 : nbytes),
+        .ws = pull.get_workspace<kWorldSize>(zero_copy ? 0 : nbytes),
     };
+    if (use_peer_inputs) {
+      const auto peer_bases = peer_bases_opt.value();
+      CHECK_HOST(peer_bases.device().device_type == kDLCPU && is_type<int64_t>(peer_bases.dtype()));
+      CHECK_HOST(peer_bases.numel() == kWorldSize) << peer_bases.numel();
+      const auto bases = static_cast<const int64_t*>(peer_bases.data_ptr());
+      CHECK_HOST(bases[pull.rank] + peer_offset == reinterpret_cast<int64_t>(in.data_ptr()));
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        params.ws.workspaces[i] = reinterpret_cast<uint8_t*>(bases[i] + peer_offset);
+      }
+    }
     const auto& ws = params.ws;
     CHECK_HOST(!use_multicast || ws.mc_workspace != nullptr) << "multicast needs a plane with an mc workspace";
 
@@ -388,7 +405,7 @@ struct AllReduceKernel {
     if (algo == "1shot_pull") {
       // first copy to the workspace
       CHECK_HOST(!use_multicast);
-      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
+      if (!zero_copy) cuda_memcpy(local_workspace, in.data_ptr());
       const auto kernel = use_graph ? all_reduce_1shot_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
                                     : all_reduce_1shot_pull_kernel<LS, T, kWorldSize, kUsePDL>;
       // then launch kernel to reduce and write to output
@@ -397,7 +414,7 @@ struct AllReduceKernel {
     } else /* algo == "2shot_pull" */ {
       const uint32_t avg_vecs = div_ceil(num_vecs, kWorldSize);
       // first copy to the workspace
-      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
+      if (!zero_copy) cuda_memcpy(local_workspace, in.data_ptr());
 
       // then launch kernel to reduce in the workspace
       if (use_multicast) {
@@ -416,7 +433,7 @@ struct AllReduceKernel {
       }
 
       // finally copy from the workspace to output
-      if (!use_graph) cuda_memcpy(out.data_ptr(), local_workspace);
+      if (!zero_copy) cuda_memcpy(out.data_ptr(), local_workspace);
     }
     return out;
   }

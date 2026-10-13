@@ -222,9 +222,22 @@ def custom_all_reduce(
     *,
     graph_params: torch.Tensor | None = None,
     use_multicast: bool = False,
+    peer_bases: torch.Tensor | None = None,
+    peer_offset: int = 0,
 ) -> torch.Tensor:
+    """``peer_bases`` (CPU int64, one per rank) + ``peer_offset`` locate the
+    input on every rank when it lives in peer-mapped symmetric memory; the
+    pull algos then read it in place instead of staging it."""
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    result = module.all_reduce(
+        comm,
+        input,
+        algo.algo_name,
+        graph_params,
+        use_multicast,
+        peer_bases,
+        peer_offset,
+    )
     return torch.from_dlpack(result)
 
 

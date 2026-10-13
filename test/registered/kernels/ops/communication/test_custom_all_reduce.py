@@ -37,6 +37,9 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    get_nccl_mem_pool,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -230,6 +233,42 @@ def test_custom_all_reduce(
         # while triton's converts to numpy on the host (~0.6 s per 32 MB
         # tensor) and would dominate the test wall time.
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "algo", [AllReduceAlgo.ONE_SHOT_PULL, AllReduceAlgo.TWO_SHOT_PULL]
+)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_custom_all_reduce_symmetric(
+    size: int,
+    dtype: torch.dtype,
+    algo: AllReduceAlgo,
+) -> None:
+    """Eager pull over inputs from the NCCL symmetric pool: zero-copy."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    comm.override_algo = algo
+    with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
+        symm_inp = torch.empty((TEST_LAYERS, size), dtype=dtype, device=device)
+
+    for _ in range(TEST_LOOP):
+        inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
+        out_ref = inp.clone()
+        dist.all_reduce(out_ref, group=nccl_group)
+        symm_inp.copy_(inp)
+        outs = []
+        for i in range(TEST_LAYERS):
+            assert comm._lookup_symmetric(symm_inp[i]) is not None
+            out = comm.custom_all_reduce(symm_inp[i])
+            if algo == AllReduceAlgo.TWO_SHOT_PULL:
+                # in place: the sum lands in the symmetric input itself
+                assert out.data_ptr() == symm_inp[i].data_ptr()
+            outs.append(out)
+            torch.cuda.synchronize()
+        torch.testing.assert_close(out_ref, torch.stack(outs), atol=0, rtol=0)
 
 
 if __name__ == "__main__":
