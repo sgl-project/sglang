@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import time
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Any
 
@@ -27,9 +28,16 @@ from sglang_simulator.simulation.utils import (
     calc_iteration_metrics,
     calc_metrics,
 )
-from sglang_simulator.time_predictor import InferTimePredictor
-from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
-from sglang_simulator.time_predictor import ScheduleRequest
+from sglang_simulator.time_predictor.base import (
+    InferTimePredictor,
+    PredictorError,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleBatch as SimulationScheduleBatch,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleRequest,
+)
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
@@ -38,6 +46,78 @@ logger = get_logger("sgl_simulator")
 
 def simulation_mode_log_message(mode: SimulationMode) -> str:
     return f"SGLang Simulator simulation mode: {mode.value}"
+
+
+def _host_int(value):
+    value = value.item() if hasattr(value, "item") else value
+    if type(value) is not int:
+        raise PredictorError("invalid_batch", "prepared token lengths must be integers")
+    return value
+
+
+def _request_prefix_len(req):
+    value = getattr(req, "prefix_len", None)
+    if value is None:
+        value = len(req.prefix_indices)
+    return _host_int(value)
+
+
+def build_predictor_batch(batch) -> SimulationScheduleBatch:
+    """Copy prepared SGLang forward metadata into the predictor contract."""
+    mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+    batch_size = len(batch.reqs)
+
+    if mode in {"EXTEND", "MIXED"}:
+        extend_lens = getattr(batch, "extend_lens", None)
+        prefix_lens = getattr(batch, "prefix_lens", None)
+        if (
+            extend_lens is None
+            or prefix_lens is None
+            or len(extend_lens) != batch_size
+            or len(prefix_lens) != batch_size
+        ):
+            raise PredictorError(
+                "invalid_batch",
+                "prepared extend and prefix lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=_host_int(extend),
+                past_kv_length=_host_int(prefix),
+            )
+            for extend, prefix in zip(extend_lens, prefix_lens)
+        ]
+    elif mode == "DECODE":
+        seq_lens = getattr(batch, "seq_lens_cpu", None)
+        if seq_lens is None or len(seq_lens) != batch_size:
+            raise PredictorError(
+                "invalid_batch",
+                "prepared decode lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=1,
+                # prepare_for_decode increments seq_lens_cpu for the token
+                # entering this forward. InferCast history is the KV length
+                # before that token.
+                past_kv_length=_host_int(seq_len) - 1,
+            )
+            for seq_len in seq_lens
+        ]
+    elif mode == "IDLE":
+        reqs = []
+    else:
+        raise PredictorError(
+            "unsupported_forward_mode",
+            f"unsupported SGLang forward mode {mode!r}",
+            forward_mode=mode,
+        )
+
+    return SimulationScheduleBatch(reqs=reqs, forward_mode=mode)
 
 
 def effective_l2_load_delay(
@@ -74,7 +154,7 @@ class C_SglangPrefillAdderHook(BaseHook):
                 **kwargs,
             )
             req_infos = request_stats_manager.get_req_stats(req.rid)
-            req_infos.before_adder_device_hit_len = req.prefix_len
+            req_infos.before_adder_device_hit_len = _request_prefix_len(req)
             req_infos.final_host_hit_len = req.host_hit_length
 
             return original_add_one_req(self, *args, **kwargs)
@@ -277,6 +357,8 @@ class C_SchedulerHook(BaseHook):
 
     ITERATION_STATS: list[dict] = []
     TOTAL_PREDICTOR_TIME_COST = 0
+    CURRENT_PREDICTOR_TIME_COST = 0
+    CURRENT_PREDICTED_LATENCY = 0
     GET_NEW_BATCH_PREFILL_TIME_COST = 0
 
     SIMULATION_BATCH: SimulationScheduleBatch = None
@@ -411,10 +493,11 @@ class C_SchedulerHook(BaseHook):
                 **kwargs,
             )
             req_stats = request_stats_manager.get_req_stats(req.rid)
-            req_stats.recv_device_hit_len = req.prefix_len
+            req_stats.recv_device_hit_len = _request_prefix_len(req)
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
             ret = original_run_batch(self, *args, **kwargs)
 
             batch = get_obj_from_args(
@@ -422,40 +505,54 @@ class C_SchedulerHook(BaseHook):
             )
 
             if ret.__class__.__name__ == "GenerationBatchResult":
-                simulation_batch = SimulationScheduleBatch(reqs=[])
-                if batch.forward_mode.is_extend():
-                    for req in batch.reqs:
-                        extend_length = getattr(req, "extend_input_len", None)
-                        if extend_length is None:
-                            extend_length = req.extend_len
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=extend_length,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                prepared_batch = getattr(
+                    C_SchedulerHook.INFERENCE_PREDICTOR,
+                    "requires_prepared_batch",
+                    False,
+                )
+                if prepared_batch:
+                    simulation_batch = build_predictor_batch(batch)
+                else:
+                    simulation_batch = SimulationScheduleBatch(reqs=[])
+                    if batch.forward_mode.is_extend():
+                        for req in batch.reqs:
+                            extend_length = getattr(req, "extend_input_len", None)
+                            if extend_length is None:
+                                extend_length = req.extend_len
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=extend_length,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
                             )
-                        )
-                elif batch.forward_mode.is_decode():
-                    for req in batch.reqs:
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                    elif batch.forward_mode.is_decode():
+                        for req in batch.reqs:
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=1,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
                             )
-                        )
 
                 if not simulation_batch.is_empty():
-                    StateManager.inc_iteration()
+                    if not prepared_batch:
+                        StateManager.inc_iteration()
                     pred_start = time.perf_counter()
                     predicted_latency = (
                         C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
                             simulation_batch
                         )
                     )
-                    # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
-                    )
+                    predictor_time_cost = time.perf_counter() - pred_start
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_time_cost
+                    if prepared_batch:
+                        C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = (
+                            predictor_time_cost
+                        )
                     predicted_latency = float(predicted_latency)
+                    if prepared_batch:
+                        StateManager.inc_iteration()
+                    C_SchedulerHook.CURRENT_PREDICTED_LATENCY = predicted_latency
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
@@ -503,8 +600,16 @@ class C_SchedulerHook(BaseHook):
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
+                predictor_wall_dur = (
+                    C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST
+                    if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
+                    else 0
+                )
                 cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
+                    now
+                    - StateManager.get_last_real_time_ts()
+                    - blocked_l2_wall_dur
+                    - predictor_wall_dur,
                     0.0,
                 )
                 StateManager.step_global_clock(cpu_overhead)
@@ -526,6 +631,14 @@ class C_SchedulerHook(BaseHook):
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
+                        **(
+                            {
+                                "forward_mode": C_SchedulerHook.SIMULATION_BATCH.forward_mode,
+                                "predicted_forward_latency": C_SchedulerHook.CURRENT_PREDICTED_LATENCY,
+                            }
+                            if C_SchedulerHook.SIMULATION_BATCH.forward_mode is not None
+                            else {}
+                        ),
                         "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
@@ -552,7 +665,7 @@ class C_SchedulerHook(BaseHook):
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
                 if item.rid is not None and item.input_length > 0:
-                    stats.append(item)
+                    stats.append(deepcopy(item))
 
             stats = sorted(stats, key=lambda req: req.created_time)
 
@@ -596,6 +709,13 @@ class C_SchedulerHook(BaseHook):
 
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
+                    ProfileReqOutput = importlib.import_module(
+                        "sglang.srt.managers.io_struct"
+                    ).ProfileReqOutput
+                    return ProfileReqOutput(
+                        success=False,
+                        message=f"Failed to save simulation results: {e}",
+                    )
             else:
                 logger.warning("No request statistics available.")
 
@@ -604,6 +724,7 @@ class C_SchedulerHook(BaseHook):
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
             C_SchedulerHook.REQ_DISPATCHER.reset()
             C_SchedulerHook.REQ_DISPATCHER.profile_active = is_start_profile
             C_SchedulerHook.INFERENCE_PREDICTOR.reset_metrics()
