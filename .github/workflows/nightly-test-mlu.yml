@@ -1,0 +1,74 @@
+name: Nightly Test (MLU)
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 2:00 a.m. Beijing Time every day
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-test-mlu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly-test-mlu:
+    name: MLU / ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - nightly-test-2-mlu
+    runs-on:
+      group: mlu-ci
+      labels: mlu-nightly
+    timeout-minutes: 480
+    steps:
+      # Fetch the helper from the trusted workflow commit, never the PR/test ref.
+      - name: Checkout MLU CI helper
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: mlu-ci-workflow
+          persist-credentials: false
+          sparse-checkout: scripts/ci/utils/resolve_mlu_ci_ref.sh
+          sparse-checkout-cone-mode: false
+      - name: Resolve MLU CI ref to commit SHA
+        id: resolve-ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          DEFAULT_SHA: ${{ github.sha }}
+          REPO_URL: ${{ format('{0}/{1}.git', github.server_url, github.repository) }}
+        run: bash mlu-ci-workflow/scripts/ci/utils/resolve_mlu_ci_ref.sh
+      - name: Submit nightly MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_REPO_URL: ${{ format('{0}/{1}.git', github.server_url, github.repository) }}
+          SGLANG_MLU_CI_GIT_REF: ${{ inputs.ref || github.ref_name }}
+          SGLANG_MLU_CI_COMMIT_SHA: ${{ steps.resolve-ref.outputs.commit_sha }}
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ matrix.suite }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "27000"
+          SGLANG_MLU_CI_LOG_DIR: ${{ runner.temp }}/mlu-ci-logs
+        run: |
+          if ! command -v sglang-mlu-ci >/dev/null 2>&1; then
+            echo "::error::The runner does not provide the sglang-mlu-ci client"
+            exit 1
+          fi
+          exec sglang-mlu-ci
+
+      - name: Upload MLU Jenkins log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-jenkins-log-nightly-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.suite }}
+          path: ${{ runner.temp }}/mlu-ci-logs/
+          if-no-files-found: warn
