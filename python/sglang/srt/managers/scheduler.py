@@ -2057,7 +2057,6 @@ class Scheduler(
         self.process_batch_result(record.batch, record.result)
 
     def _debug_check_commit_gate(self, last_batch_gate: bool) -> None:
-        # A record is due exactly when the last_batch gate would commit.
         if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
             assert self.inflight_steps.has_due() == last_batch_gate
 
