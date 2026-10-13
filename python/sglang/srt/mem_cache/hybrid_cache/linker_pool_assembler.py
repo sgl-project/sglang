@@ -478,12 +478,11 @@ def _mha_device_pool_entry(
     )
 
 
-def _build_mamba_swa_device_pool_group(
-    kvcache: Any, params: Any, page_size: int
-) -> DevicePoolGroup:
+def _mamba_device_pool_entry(
+    req_to_token_pool: Any, start_layer: int
+) -> DevicePoolEntry:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
-        _swa_layer_mappings,
     )
 
     if get_memory().enable_unified_memory:
@@ -491,7 +490,6 @@ def _build_mamba_swa_device_pool_group(
             "The direct external linker does not support --enable-unified-memory "
             "on hybrid Mamba models yet."
         )
-    req_to_token_pool = params.req_to_token_pool
     if (
         req_to_token_pool.mamba_ckpt_pool is not None
         or req_to_token_pool.short_conv_pool.enabled
@@ -502,22 +500,39 @@ def _build_mamba_swa_device_pool_group(
             "or Mamba side states yet."
         )
 
-    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
-    mamba_mapping = _stage_local_layer_mapping(
-        req_to_token_pool.mamba_map, kvcache.start_layer
-    )
     mamba_pool = req_to_token_pool.mamba_pool
     mamba_cache = mamba_pool.mamba_cache
     layers = range(mamba_pool.num_mamba_layers)
     # One row per state slot; conv-only models carry an empty temporal state.
-    mamba_components = [
+    components = [
         [state[layer] for layer in layers]
         for state in (mamba_cache.temporal, *mamba_cache.conv)
         if state.numel() > 0
     ]
     _require_contiguous_rows(
-        PoolName.MAMBA, [buffer for group in mamba_components for buffer in group]
+        PoolName.MAMBA, [buffer for group in components for buffer in group]
     )
+    return DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=mamba_pool,
+        components=components,
+        layer_mapping=_stage_local_layer_mapping(
+            req_to_token_pool.mamba_map, start_layer
+        ),
+        page_size=1,
+        rows_are_pages=True,
+    )
+
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
     entries = [
         _mha_device_pool_entry(
             PoolName.KV, kvcache.full_kv_pool, full_mapping, page_size
@@ -525,17 +540,9 @@ def _build_mamba_swa_device_pool_group(
         _mha_device_pool_entry(
             PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
         ),
-        DevicePoolEntry(
-            name=PoolName.MAMBA,
-            indices_from_pool=PoolName.MAMBA,
-            device_pool=mamba_pool,
-            components=mamba_components,
-            layer_mapping=mamba_mapping,
-            page_size=1,
-            rows_are_pages=True,
-        ),
+        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
     ]
-    num_layers = max(full_mapping.keys() | swa_mapping.keys() | mamba_mapping.keys())
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 

@@ -1284,10 +1284,6 @@ class SWAComponent(TreeComponent):
             page = self.cache.page_size
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
             req.kv.set_evicted_seqlen(
                 self.component_type,
                 max(req.kv.get_evicted_seqlen(self.component_type), boundary),

@@ -504,13 +504,18 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self, required: bool = True) -> Optional[torch.Tensor]:
+    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary."""
-        slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        allocator = self.cache.req_to_token_pool.mamba_allocator
+        slot = allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None or not required, "Can not alloc mamba cache"
+            slot = allocator.alloc(1)
+        return slot
+
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        slot = self._try_alloc_mamba_slot()
+        assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -716,7 +721,7 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         if phase == LinkerTransferPhase.LOAD:
-            transfer.device_indices = self._alloc_mamba_slot(required=False)
+            transfer.device_indices = self._try_alloc_mamba_slot()
             if transfer.device_indices is None:
                 return None
         return transfer
@@ -735,29 +740,26 @@ class MambaComponent(TreeComponent):
             return None
 
         assert phase == ExternalLinkerLoadPhase.PREPARE
-        if req.kv is None:
-            from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-            req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
         if req.kv.holds_mamba:
             pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         # The layer-gated load writes the request's private state directly.
         req.kv.mamba_pool_idx = transfer.device_indices[0]
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_needs_clear = False
         if req.kv.req_pool_idx is not None:
             pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = (
                 req.kv.mamba_pool_idx
             )
-        if pool.mamba_pool.replayssm_write_pos is not None:
-            indices = pool.translate_mamba_indices(transfer.device_indices)
-            pool.mamba_pool.replayssm_write_pos[indices] = 0
-        if (
-            req.mamba_branching_seqlen is not None
-            and req.mamba_branching_seqlen <= prefix_len
-        ):
-            req.mamba_branching_seqlen = None
+        self._adopt_loaded_state(req)
         return transfer
+
+    def _adopt_loaded_state(self, req: Req) -> None:
+        # A loaded state supersedes the replay cursor and the deferred CoW/clear.
+        pool = self.cache.req_to_token_pool
+        write_pos = pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            slot = req.kv.mamba_pool_idx.unsqueeze(0)
+            write_pos[pool.translate_mamba_indices(slot)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 
@@ -780,10 +782,7 @@ class MambaComponent(TreeComponent):
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-        if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        dst = self._try_alloc_mamba_slot()
         if dst is not None:
             req.kv.mamba_pool_idx = dst[0]
         return dst
@@ -1098,14 +1097,7 @@ class _MambaBufferLoadBackContext(BufferLoadBackContext):
         if not success:
             self.component.finalize_load_back(req, self.prep, success=False)
             return
-        # The H2D supersedes the replay cursor and the deferred CoW/clear.
-        req_to_token_pool = self.component.cache.req_to_token_pool
-        write_pos = req_to_token_pool.mamba_pool.replayssm_write_pos
-        if write_pos is not None:
-            slot = req.kv.mamba_pool_idx.unsqueeze(0)
-            write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_needs_clear = False
+        self.component._adopt_loaded_state(req)
 
     def get_insert_fields(self) -> dict[str, torch.Tensor]:
         return {"mamba_value": self.node_copy.device_indices}

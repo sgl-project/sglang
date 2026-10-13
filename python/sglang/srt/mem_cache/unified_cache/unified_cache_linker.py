@@ -408,6 +408,10 @@ class UnifiedCacheLinkerWrapper:
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             return 0, req.last_node
+        if req.kv is None:
+            from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+            req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -419,22 +423,23 @@ class UnifiedCacheLinkerWrapper:
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
         # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
         if self._skip_swa:
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
             req.kv.set_evicted_seqlen(
                 ComponentType.SWA,
                 max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
             )
 
-        # match placed the SWA branch point before this tail was known; a point
+        # match placed the branch points before this tail was known; a point
         # the tail covers is gone, since the request inserts the whole tail.
         if (
             req.swa_branching_seqlen is not None
             and req.swa_branching_seqlen <= prefix_len
         ):
             req.swa_branching_seqlen = None
+        if (
+            req.mamba_branching_seqlen is not None
+            and req.mamba_branching_seqlen <= prefix_len
+        ):
+            req.mamba_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
         return len(full_transfer.device_indices), req.last_node

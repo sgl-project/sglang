@@ -859,6 +859,49 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         allocator.free(held)
         consumer.sanity_check()
 
+    def test_mamba_load_supersedes_a_shorter_device_cow(self):
+        tokens = list(range(1, 7))
+        consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
+            tokens
+        )
+        self._insert(
+            consumer,
+            consumer.token_to_kv_pool_allocator,
+            consumer_req_pool,
+            tokens[:3],
+        )
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req, cow_mamba=True)
+        )
+        self.assertEqual(match.device_prefix_len, 3)
+        self.assertEqual(match.host_hit_length, 3)
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
+        self._apply_match_to_req(req, match)
+        allocator = consumer_req_pool.mamba_allocator
+        before = allocator.available_size()
+
+        consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        # The CoW from the shorter checkpoint would overwrite the loaded state.
+        loaded_state = next(
+            transfer.device_indices
+            for transfer in consumer_linker.queued_loads[req.rid]
+            if transfer.name == PoolName.MAMBA
+        )
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(allocator.available_size(), before)
+
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.sanity_check()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
@@ -1553,6 +1596,7 @@ def test_linker_load_preserves_swa_boundaries(
         last_node=0,
         priority=0,
         swa_branching_seqlen=2,  # inside the loaded tail
+        mamba_branching_seqlen=None,
     )
     restored_len, last_node = wrapper.load_back(req)
 
