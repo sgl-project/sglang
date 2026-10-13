@@ -868,8 +868,7 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
-    # Set only by /v1/tokenize when the caller supplies add_generation_prompt:
-    # render the messages as given with these options. None keeps chat rendering.
+    # Set only by /v1/tokenize; None keeps chat-completion rendering.
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 

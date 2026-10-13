@@ -98,7 +98,6 @@ class OpenAIServingTokenize(OpenAIServingBase):
         if validation_error:
             raise ValueError(validation_error)
         if chat_request._format_add_generation_prompt is not None:
-            # Only the Jinja chat template path takes these options.
             if (
                 self.chat_serving.template_manager.chat_template_name is not None
                 or self.chat_serving.chat_encoding_spec is not None

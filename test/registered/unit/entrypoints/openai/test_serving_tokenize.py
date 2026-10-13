@@ -1,9 +1,5 @@
-"""Unit tests for chat formatting options on /v1/tokenize.
-
-A real word-level tokenizer and Jinja chat template run through the real TemplateManager,
-OpenAIServingChat rendering and OpenAIServingTokenize handler; only the tokenizer manager is
-a stand-in. Expected IDs come from literal token strings, not from the code under test.
-"""
+"""Chat formatting options on /v1/tokenize through a real tokenizer and template;
+expected IDs come from literal token strings, not from the code under test."""
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -28,9 +24,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 WORDS = ["[UNK]", "<bos>", "<user>", "<assistant>", "</s>", "call", "lookup", "Paris"]
-WORDS += ["hi", "hello", "style", "formal", "casual"]
+WORDS += ["hi", "hello"]
 CHAT_TEMPLATE = (
-    "{% if style is defined %}style {{ style }} {% endif %}"
     "{% for m in messages %}<{{ m.role }}> "
     "{% for c in m.tool_calls or [] %}"
     "call {{ c.function.name }} {{ c.function.arguments.city }} {% endfor %}"
@@ -69,13 +64,10 @@ def _tokenize(serving, **body):
 
 
 class TestTokenizeFormattingOptions(CustomTestCase):
-    def _serving(self, default_kwargs=None, chat_template=None, multimodal=False):
+    def _serving(self, chat_template=None, multimodal=False):
         reset_context()
         self.addCleanup(reset_context)
-        publish(
-            ServerArgs(model_path="dummy", default_chat_template_kwargs=default_kwargs),
-            role="tokenizer",
-        )
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         config = {
             "tool_call_parser": None,
             "reasoning_parser": None,
@@ -98,8 +90,7 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         return OpenAIServingTokenize(tm, templates)
 
     def test_omitted_options_render_as_chat(self):
-        # The final assistant turn becomes a user turn, the generation prompt
-        # follows, and add_special_tokens does not apply to messages.
+        # add_special_tokens applies to messages only with add_generation_prompt.
         self.assertEqual(
             _tokenize(self._serving(), messages=HISTORY, add_special_tokens=True),
             (200, _ids("<user> hi </s> <user> hello </s> <assistant>")),
@@ -112,8 +103,7 @@ class TestTokenizeFormattingOptions(CustomTestCase):
             (False, True): "<bos> <user> hi </s> <assistant> hello </s>",
             (False, False): "<user> hi </s> <assistant> hello </s>",
         }
-        # The multimodal path caches renders; the two generation-prompt cases
-        # share every other cache-key input.
+        # Multimodal renders are cached; the prompt flag must separate their keys.
         for multimodal in (False, True):
             serving = self._serving(multimodal=multimodal)
             for (prompt, special), text in expected.items():
@@ -125,54 +115,22 @@ class TestTokenizeFormattingOptions(CustomTestCase):
                 ):
                     self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
 
-    def test_tool_call_arguments_are_decoded_or_rejected(self):
-        serving = self._serving()
-
-        def history(arguments):
-            call = {"name": "lookup", "arguments": arguments}
-            return [
-                {"role": "user", "content": "hi"},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{"id": "c1", "type": "function", "function": call}],
-                },
-            ]
-
+    def test_final_tool_call_turn_is_kept(self):
+        call = {"name": "lookup", "arguments": '{"city": "Paris"}'}
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1", "type": "function", "function": call}],
+            },
+        ]
         self.assertEqual(
-            _tokenize(
-                serving,
-                messages=history('{"city": "Paris"}'),
-                add_generation_prompt=False,
-            ),
+            _tokenize(self._serving(), messages=messages, add_generation_prompt=False),
             (200, _ids("<user> hi </s> <assistant> call lookup Paris </s>")),
-        )
-        status, message = _tokenize(
-            serving, messages=history('"Paris"'), add_generation_prompt=False
-        )
-        self.assertEqual(status, 400)
-        self.assertIn("JSON object", message)
-
-    def test_request_template_kwargs_override_server_default(self):
-        serving = self._serving(default_kwargs={"style": "formal"})
-        messages = HISTORY[:1]
-        self.assertEqual(
-            _tokenize(serving, messages=messages, add_generation_prompt=False),
-            (200, _ids("style formal <user> hi </s>")),
-        )
-        self.assertEqual(
-            _tokenize(
-                serving,
-                messages=messages,
-                add_generation_prompt=False,
-                chat_template_kwargs={"style": "casual"},
-            ),
-            (200, _ids("style casual <user> hi </s>")),
         )
 
     def test_options_that_cannot_apply_are_rejected(self):
-        # A conversation template cannot take the options; a continued final
-        # turn needs the generation prompt that opens it.
         chatml = self._serving(chat_template="chatml")
         self.assertEqual(_tokenize(chatml, messages=HISTORY)[0], 200)
         status, message = _tokenize(

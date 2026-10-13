@@ -2063,7 +2063,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 openai_compatible_messages.append(processed_msg)
 
-            # Handle continue_final_message: separate final assistant message.
+            # Handle continue_final_message: separate final assistant message
             # An explicit /v1/tokenize format keeps a complete final assistant turn.
             add_generation_prompt = request._format_add_generation_prompt
             assistant_prefix = None
