@@ -865,7 +865,10 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        from sglang.srt.layers.sampler import greedy_token_ids
+
+        # torch.argmax reduces each of these few, vocab-wide rows in one block
+        target_predict = greedy_token_ids(next_token_logits).to(torch.int64)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
