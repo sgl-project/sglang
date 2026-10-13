@@ -15,11 +15,15 @@ def _gemm(
     Y,
     BM: ct.Constant[int],
     BN: ct.Constant[int],
+    BK: ct.Constant[int],
     SPLIT_K: ct.Constant[int],
     EXPERT_MAJOR: ct.Constant[bool],
+    PDL: ct.Constant[bool],
 ):
     col, row, part = ct.bid(0), ct.bid(1), ct.bid(2)
-    steps = ct.cdiv(ct.cdiv(X.shape[1], 256), SPLIT_K)
+    if PDL:
+        ct.grid_dependency_control_launch_dependents()
+    steps = ct.cdiv(ct.cdiv(X.shape[1], BK), SPLIT_K)
     if EXPERT_MAJOR:
         total = ct.full((4 * BN, BM), 0, ct.float32)
     else:
@@ -30,20 +34,20 @@ def _gemm(
         x = ct.load(
             X,
             (row, k),
-            (BM, 256),
+            (BM, BK),
             padding_mode=ct.PaddingMode.ZERO,
-            latency=4 if EXPERT_MAJOR else 8,
+            latency=4 if EXPERT_MAJOR or BK == 128 else 8,
         )
         if EXPERT_MAJOR:
             w = ct.load(
                 W,
                 (0, col, k),
-                (4, BN, 256),
+                (4, BN, BK),
                 padding_mode=ct.PaddingMode.ZERO,
                 latency=4,
             )
             local = ct.mma(
-                ct.reshape(w, (4 * BN, 256)),
+                ct.reshape(w, (4 * BN, BK)),
                 ct.transpose(x),
                 ct.full((4 * BN, BM), 0, ct.float32),
             )
@@ -51,28 +55,28 @@ def _gemm(
             w0 = ct.load(
                 W,
                 (0, col, k),
-                (1, BN, 256),
+                (1, BN, BK),
                 padding_mode=ct.PaddingMode.ZERO,
-                latency=8,
+                latency=4 if BK == 128 else 8,
             )
             wr = ct.load(
                 WR,
                 (0, col, k),
-                (2, BN, 256),
+                (2, BN, BK),
                 padding_mode=ct.PaddingMode.ZERO,
-                latency=8,
+                latency=4 if BK == 128 else 8,
             )
             local = ct.mma(
                 x,
-                ct.transpose(ct.reshape(w0, (BN, 256))),
+                ct.transpose(ct.reshape(w0, (BN, BK))),
                 ct.full((BM, BN), 0, ct.float32),
             )
             residual = ct.mma(
                 x,
-                ct.transpose(ct.reshape(wr, (2 * BN, 256))),
+                ct.transpose(ct.reshape(wr, (2 * BN, BK))),
                 residual,
             )
-        # Round each K256 main-product sum before adding the next tile.
+        # Round each main-product tile before adding the next tile.
         total = ct.add(total, local, rounding_mode=ct.RoundingMode.RN)
     if EXPERT_MAJOR:
         main = ct.extract(total, (0, 0), (BN, BM))
@@ -101,7 +105,9 @@ def _gemm(
 
 
 @ct.kernel
-def _reduce(P, Y, SPLIT_K: ct.Constant[int]):
+def _reduce(P, Y, SPLIT_K: ct.Constant[int], PDL: ct.Constant[bool] = False):
+    if PDL:
+        ct.grid_dependency_control_wait()
     if SPLIT_K == 2:
         values = ct.load(
             P,
@@ -153,6 +159,8 @@ def router_gemm_bf16x3_cutile(x: torch.Tensor, parts: torch.Tensor) -> torch.Ten
         (config for limit, config in _CONFIGS if m <= limit),
         (256, 128, 1, 2),
     )
+    bk = 128 if 512 < m <= 2048 else 256
+    pdl = bk == 128 and splits == 4
     out = torch.empty((m, n), device=x.device, dtype=torch.float32)
     if m == 0 or n == 0:
         return out
@@ -174,15 +182,19 @@ def router_gemm_bf16x3_cutile(x: torch.Tensor, parts: torch.Tensor) -> torch.Ten
                 partial,
                 bm,
                 bn,
+                bk,
                 splits,
                 m <= 64,
+                pdl,
             ),
+            programmatic_dependent_launch=pdl,
         )
         if splits > 1:
             ct.launch(
                 stream,
                 (ct.cdiv(out.numel(), 1024),),
                 _reduce,
-                (partial.view(splits, -1), out.view(-1), splits),
+                (partial.view(splits, -1), out.view(-1), splits, pdl),
+                programmatic_dependent_launch=pdl,
             )
     return out

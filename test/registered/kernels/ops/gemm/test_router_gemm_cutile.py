@@ -70,6 +70,8 @@ def test_checkpoint_shape(m):
         (129, 5120, 160),
         (257, 5128, 160),
         (257, 6144, 128),
+        (513, 5128, 160),
+        (1025, 137, 160),
         (8193, 5120, 256),
     ],
 )
@@ -108,7 +110,7 @@ def test_non_current_device():
     _check(router_gemm_bf16x3_cutile(x, parts), x, w)
 
 
-@pytest.mark.parametrize("m", [1, 2, 8, 16, 32, 128, 512, 16384])
+@pytest.mark.parametrize("m", [1, 2, 8, 16, 32, 128, 512, 1024, 2048, 16384])
 @pytest.mark.parametrize("k,distance", [(512, 256), (5120, 320), (5120, 2560)])
 def test_cancellation(m, k, distance, record_property):
     torch.manual_seed(1)
@@ -135,7 +137,7 @@ def test_cancellation(m, k, distance, record_property):
     assert error.mean().item() < 1e-6
 
 
-@pytest.mark.parametrize("m", [64, 512, 2048, 4096, 8192])
+@pytest.mark.parametrize("m", [64, 512, 1024, 2048, 4096, 8192])
 def test_cuda_graph_replay(m):
     torch.manual_seed(1)
     x = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
@@ -151,6 +153,30 @@ def test_cuda_graph_replay(m):
         split_fp32_to_bf16x3(w, out=parts)
         graph.replay()
         _check(out, x, w)
+
+
+def test_concurrent_graphs():
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    cases = []
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            x = torch.randn(1024, 5120, device="cuda", dtype=torch.bfloat16)
+            w = torch.randn(256, 5120, device="cuda") * 0.02
+            parts = split_fp32_to_bf16x3(w)
+            router_gemm_bf16x3_cutile(x, parts)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = router_gemm_bf16x3_cutile(x, parts)
+        cases.append((graph, x, w, out))
+    for _ in range(3):
+        for stream, (graph, x, _, _) in zip(streams, cases):
+            with torch.cuda.stream(stream):
+                x.normal_()
+                graph.replay()
+        torch.cuda.synchronize()
+        for _, x, w, out in cases:
+            _check(out, x, w)
 
 
 @pytest.mark.parametrize("m", [32, 1024, 8192])
