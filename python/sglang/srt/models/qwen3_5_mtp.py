@@ -148,6 +148,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             )
         else:
             self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self._fc_returns_tuple = isinstance(self.fc, ReplicatedLinear)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -265,7 +266,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
-            if isinstance(self.fc, ReplicatedLinear):
+            if self._fc_returns_tuple:
                 hidden_states, _ = hidden_states
 
             with get_global_expert_distribution_recorder().disable_this_region():
