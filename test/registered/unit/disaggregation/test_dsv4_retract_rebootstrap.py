@@ -1,10 +1,9 @@
-"""A DeepSeek-V4 request retracted on a PD decode server is recomputed by the
-prefill instead of backed up: the pool has no host copy of its KV."""
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.common import backup_kv_cache
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -33,8 +32,7 @@ def _req(multimodal_inputs=None):
 class TestDSV4RetractRebootstrap(CustomTestCase):
     def test_dsv4_backup_decision(self):
         cases = [
-            # cpu_tensor is the resolved default; the pool has no host copy, so
-            # the prefill recomputes the request instead.
+            # The default backend; the pool has no host copy, so the prefill recomputes.
             ("default backend", _req(), "cpu_tensor", True),
             # An explicit none still means abort, not recompute.
             ("none backend", _req(), "none", False),
@@ -50,6 +48,21 @@ class TestDSV4RetractRebootstrap(CustomTestCase):
                     saved,
                 )
                 req.offload_kv_cache.assert_not_called()
+
+    def test_fake_transfer_skips_prefill_recompute(self):
+        # Neither the fake manager nor a fake receiver can dispatch a recompute.
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.kv_manager = MagicMock()
+        for host, submitted in ((FAKE_BOOTSTRAP_HOST, False), ("10.0.0.1", True)):
+            with self.subTest(host=host):
+                queue.kv_manager.reset_mock()
+                req = MagicMock(bootstrap_host=host)
+                queue._submit_prefill_recompute(
+                    DecodeRequest(req=req, kv_receiver=MagicMock())
+                )
+                self.assertEqual(
+                    queue.kv_manager.submit_prefill_recompute.called, submitted
+                )
 
 
 if __name__ == "__main__":

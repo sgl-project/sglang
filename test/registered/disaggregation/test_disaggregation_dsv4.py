@@ -26,8 +26,8 @@ DSV4_FLASH_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
 
-# Decode retracts a request every 20 forward passes; DeepSeek-V4 recovers it by
-# recomputing its prefix on the prefill.
+# Force retraction on decode; the interval of 20 passes is arbitrary, sparse
+# enough to keep the run short.
 DSV4_FLASH_DECODE_ENV = {
     **DSV4_FLASH_ENV,
     "SGLANG_TEST_RETRACT": "1",

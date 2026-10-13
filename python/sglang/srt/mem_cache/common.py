@@ -299,11 +299,10 @@ def _evict_until_allocatable(
 def dsv4_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    """DeepSeek-V4 pools cannot back up a retracted request's KV on the host, so
-    the prefill recomputes it instead."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     pool = token_to_kv_pool_allocator.get_kvcache()
+    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
     return isinstance(pool, DeepSeekV4TokenToKVPool)
 
 
@@ -314,9 +313,8 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when no backup can be taken ('none' backend, a request the
-    prefill cannot recompute, or the host pool cannot hold it); the caller aborts
-    the request."""
+    """Returns False when the request can be neither backed up nor recomputed;
+    the caller aborts it."""
     if backend == "none":
         return False
     if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):

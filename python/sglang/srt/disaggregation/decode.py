@@ -1081,9 +1081,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Deferred allocation cannot precede the recompute that makes its
             # source ready. Keep the existing leader election and error path.
             if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
-                )
+                self._submit_prefill_recompute(decode_req)
+
+    def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
+        # A fake transfer has no prefill to recompute on; its receiver succeeds
+        # on its own once the metadata is sent.
+        if _is_fake_transfer(decode_req.req):
+            return
+        self.kv_manager.submit_prefill_recompute(
+            decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+        )
 
     def _update_handshake_waiters(
         self,
@@ -1799,10 +1806,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
         ):
-            self.kv_manager.submit_prefill_recompute(
-                decode_req.kv_receiver,
-                decode_req.req.build_rebootstrap_payload(),
-            )
+            self._submit_prefill_recompute(decode_req)
         self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
