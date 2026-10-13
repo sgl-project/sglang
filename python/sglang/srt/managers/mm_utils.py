@@ -698,6 +698,13 @@ def _is_releasable_feature(feature) -> bool:
     )
 
 
+def _record_on_current_stream(feature) -> None:
+    tensors = feature if isinstance(feature, (list, tuple)) else [feature]
+    for tensor in tensors:
+        if tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+
+
 def should_release_mm_features(server_args) -> bool:
     """Requires radix caching (retract re-prefill reads the retained prompt
     KV) and pp_size==1 (only the first PP stage releases)."""
@@ -725,6 +732,7 @@ def release_consumed_mm_features(
                 and item.offsets
                 and all(end < chunk_end for _, end in item.offsets)
             ):
+                _record_on_current_stream(item.feature)
                 item.release_feature(consumed=True)
 
 
@@ -818,6 +826,10 @@ def prepare_mm_inputs(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+            if mm_inputs_list and should_release_mm_features(server_args):
+                release_consumed_mm_features(
+                    mm_inputs_list, extend_prefix_lens, extend_seq_lens
+                )
             # Offload GPU features to CPU instead of discarding them to balance memory
             # efficiency and data persistence.
             # In chunked-prefill, a request is processed across multiple batches, and
@@ -857,11 +869,6 @@ def prepare_mm_inputs(
                     if mm_schedule.host_offload_event is None:
                         mm_schedule.host_offload_event = torch.cuda.Event()
                     mm_schedule.host_offload_event.record(stream)
-            # After the offload loop, which pins any CUDA feature to this stream.
-            if mm_inputs_list and should_release_mm_features(server_args):
-                release_consumed_mm_features(
-                    mm_inputs_list, extend_prefix_lens, extend_seq_lens
-                )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()

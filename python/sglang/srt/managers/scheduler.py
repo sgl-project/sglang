@@ -3528,9 +3528,6 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        # Session requests share mm_inputs with later turns; never release those.
-        if req_to_abort.multimodal_inputs is not None and not req_to_abort.session:
-            req_to_abort.multimodal_inputs.release_features()
         return req_to_abort.rid == recv_req.rid
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -3597,8 +3594,6 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.DECODE
         ):
             release_kv_cache(req, self.tree_cache, checkpoint=False)
-        if req.multimodal_inputs is not None and not req.session:
-            req.multimodal_inputs.release_features()
         self.beam_coordinator.retire_group(req)
         message = (
             "Multimodal features for this request were released after prefill "
@@ -5642,8 +5637,6 @@ class Scheduler(
                 DisaggregationMode.DECODE,
             ):
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
-            if req.multimodal_inputs is not None and not req.session:
-                req.multimodal_inputs.release_features()
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:

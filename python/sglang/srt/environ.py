@@ -1508,7 +1508,9 @@ class Envs:
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
     # Opt-in: release image feature tensors once their token spans enter the
-    # KV cache instead of retaining them until request completion.
+    # KV cache instead of retaining them until request completion. Re-prefill
+    # of a released span (retraction, or a session turn whose cached history
+    # was evicted) aborts the request with a retryable 503.
     SGLANG_ENABLE_MM_RELEASE_AT_CONSUMPTION = EnvBool(False)
 
     # ===================================================================
