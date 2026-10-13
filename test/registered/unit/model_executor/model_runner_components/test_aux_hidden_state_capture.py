@@ -73,6 +73,10 @@ def test_cli_parses_method_and_layer_ids():
             dict(aux_hidden_state_capture="eagle3", speculative_algorithm="EAGLE3"),
             "cannot be combined with --speculative-algorithm",
         ),
+        (
+            dict(aux_hidden_state_capture="eagle3", pp_size=2),
+            "only supports pp_size == 1",
+        ),
     ],
 )
 def test_invalid_combinations_are_rejected(fields, match):

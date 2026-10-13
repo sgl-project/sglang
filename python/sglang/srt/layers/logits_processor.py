@@ -230,6 +230,7 @@ class LogitsProcessorOutput:
 
     # Post-norm last-layer hidden states of every token, kept under full capture
     # when `hidden_states` holds the aux hidden states (--aux-hidden-state-capture).
+    # For in-process consumers of this output; not copied into the response path.
     last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler

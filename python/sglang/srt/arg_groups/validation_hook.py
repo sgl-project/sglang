@@ -704,6 +704,11 @@ def validate_aux_hidden_state_capture(server_args: Any):
             "--aux-hidden-state-capture cannot be combined with "
             "--speculative-algorithm: the draft selects the captured target layers."
         )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--aux-hidden-state-capture only supports pp_size == 1: the capture "
+            "hooks only see the layers on the last pipeline rank."
+        )
     if method != "eagle3" and not cfg.aux_hidden_state_layer_ids:
         raise ValueError(
             f"--aux-hidden-state-capture {method} requires "

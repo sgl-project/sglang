@@ -128,9 +128,9 @@ class ExecFeatures(msgspec.Struct):
         Arg(
             help="Capture auxiliary hidden states on the target model without a "
             "speculative draft, through the model's EAGLE3, DFLASH, or DSPARK "
-            "capture hook. Hidden-state capture then stores the concatenated aux "
-            "hidden states, and full capture keeps the post-norm last-layer "
-            "hidden states alongside them. Cannot be combined with "
+            "capture hook. Requests with return_hidden_states then receive the "
+            "concatenated aux hidden states in place of the last-layer hidden "
+            "states. Requires pp_size == 1 and cannot be combined with "
             "--speculative-algorithm.",
             choices=["eagle3", "dflash", "dspark"],
         ),
