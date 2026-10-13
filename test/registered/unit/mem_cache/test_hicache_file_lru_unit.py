@@ -291,7 +291,7 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         # Replicated MLA files are created by rank 0 only.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
-        self.assertTrue(b.set("a", _t(50), pool_name=PoolName.MAMBA))
+        self.assertTrue(b.set("a.mamba", _t(50)))
         self.assertEqual(b._evictor._total_bytes, 50)
 
     def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
@@ -301,10 +301,9 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
             for rank in range(2)
         ]
         for rank, b in enumerate(ranks):
-            self.assertTrue(b.set("a", _t(16, rank + 1), pool_name=PoolName.MAMBA))
+            self.assertTrue(b.set("a.mamba", _t(16, rank + 1)))
         for rank, b in enumerate(ranks):
-            page = b.get("a", _t(16), pool_name=PoolName.MAMBA)
-            self.assertTrue(torch.equal(page, _t(16, rank + 1)))
+            self.assertTrue(torch.equal(b.get("a.mamba", _t(16)), _t(16, rank + 1)))
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.

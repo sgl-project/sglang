@@ -458,16 +458,16 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
-    def _get_suffixed_key(self, key: str, pool_name: Optional[str] = None) -> str:
+    def _get_suffixed_key(self, key: str) -> str:
         # Mamba state is TP-sharded even when the model's MLA KV is replicated.
-        if pool_name == PoolName.MAMBA:
+        if key.endswith(f".{PoolName.MAMBA.value}"):
             return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}", component_name)
+        return self._get_suffixed_key(f"{key}.{component_name}")
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -487,10 +487,8 @@ class HiCacheFile(HiCacheStorage):
         key: str,
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
-        *,
-        pool_name: Optional[str] = None,
     ) -> torch.Tensor | None:
-        suffixed = self._get_component_key(key, pool_name)
+        suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
@@ -527,14 +525,12 @@ class HiCacheFile(HiCacheStorage):
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-        *,
-        pool_name: Optional[str] = None,
     ) -> bool:
-        suffixed = self._get_component_key(key, pool_name)
+        suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
-        if self.exists(key, pool_name=pool_name):
+        if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
             self._evictor.touch(suffixed, tensor_path)
             return True
@@ -581,8 +577,8 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
-    def exists(self, key: str, *, pool_name: Optional[str] = None) -> bool:
-        key = self._get_component_key(key, pool_name)
+    def exists(self, key: str) -> bool:
+        key = self._get_suffixed_key(key)
         if self.metadata_cache is not None and self.metadata_cache.contains(key):
             return True
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
@@ -671,11 +667,13 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
+    def _log_key(self, pool_name: str, key: str) -> str:
+        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        data_page = self.get(
-            key, host_pool.get_dummy_flat_data_page(), pool_name=pool_name
-        )
+        storage_key = self._log_key(pool_name, key)
+        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
         if data_page is None:
             return False
         host_pool.set_from_flat_data_page(page_offset, data_page)
@@ -685,8 +683,9 @@ class HiCacheFile(HiCacheStorage):
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
+        storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(key, data_page, pool_name=pool_name)
+        return self.set(storage_key, data_page)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}
