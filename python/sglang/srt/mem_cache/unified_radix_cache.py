@@ -2676,6 +2676,11 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
+        # Every completed query reports KV, including a real zero-hit miss.
+        # If any rank skipped the query, MIN removes this verdict on all ranks;
+        # its zero usable hit count is not evidence that stored content is absent.
+        if PoolName.KV not in verdicts:
+            return
         folded_pages = operation.storage_hit_count // self.page_size
 
         def verdict(pool: PoolName) -> tuple[int, bool]:

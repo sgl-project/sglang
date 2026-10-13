@@ -49,6 +49,68 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestBufferModeSidecar(unittest.TestCase):
+    def test_cancelled_query_preserves_beliefs_without_rank_agreed_evidence(self):
+        token_ids = list(range(4))
+        chain = get_storage_hash_str(token_ids, page_size=2)
+        for hits, expected in (
+            ((None, None), [True, True]),
+            ((2, None), [True, True]),
+            ((None, 2), [True, True]),
+            ((2, 2), [True, True]),
+            ((2, 1), [True, False]),
+            ((2, 0), [False, False]),
+        ):
+            with self.subTest(hits=hits):
+                ranks, packed = [], []
+                for hit_pages in hits:
+                    operation = PrefetchOperation(
+                        CacheRequestHandle("cancelled", 0), token_ids
+                    )
+                    controller = SimpleNamespace(
+                        page_size=2,
+                        storage_backend=SimpleNamespace(
+                            batch_exists=MagicMock(return_value=hit_pages)
+                        ),
+                        prefetch_hits_sync_groups=[],
+                        _all_reduce=lambda values, *_: packed.append(values.clone()),
+                    )
+                    hit_tokens = 0
+                    if hit_pages is not None:
+                        _, hit_tokens = HybridCacheController._storage_hit_query(
+                            controller, operation
+                        )
+                    # Cancellation before a query carries no evidence; cancellation
+                    # after a successful query must still consume its real verdict.
+                    operation.mark_terminate()
+                    HybridCacheController._sync_prefetch_hit_query(
+                        controller, operation, hit_tokens
+                    )
+                    ranks.append((controller, operation, hit_tokens))
+
+                agreed = torch.stack(packed).amin(dim=0)
+                for controller, operation, hit_tokens in ranks:
+                    controller._all_reduce = lambda values, *_: values.copy_(agreed)
+                    operation.storage_hit_count = (
+                        HybridCacheController._sync_prefetch_hit_query(
+                            controller, operation, hit_tokens
+                        )
+                    )
+                    cache = SimpleNamespace(
+                        host_memory_mode="buffer_only",
+                        page_size=2,
+                        components={},
+                        storage_existence_cache=StorageExistenceCache(),
+                    )
+                    cache._belief_policy = UnifiedRadixCache._belief_policy.__get__(
+                        cache
+                    )
+                    beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+                    beliefs.add(chain)
+                    UnifiedRadixCache._invalidate_absent_from_hit_query(
+                        cache, operation
+                    )
+                    self.assertEqual([beliefs.contains(h) for h in chain], expected)
+
     @staticmethod
     def _swa_component():
         return SimpleNamespace(
