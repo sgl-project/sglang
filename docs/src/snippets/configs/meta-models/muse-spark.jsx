@@ -202,9 +202,9 @@ export const config = {
   ],
 
   modelNames: {
-    nvfp4: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+    nvfp4: "meta-models/Muse-Spark-open-816B-A42B-NVFP4",
     mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
-    bf16: "meta-models/Muse-Spark-Open-816B-A42B",
+    bf16: "meta-models/Muse-Spark-open-816B-A42B",
     int4: "intel-ai/Muse-Spark-1.2-open-816B-A42B-INT4",
   },
   dockerImages: {
@@ -230,7 +230,7 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
   github: {
-    cookbookModel: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+    cookbookModel: "meta-models/Muse-Spark-open-816B-A42B-NVFP4",
   },
 
   // No verification badge is claimed before these recipes are measured.
