@@ -309,6 +309,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
+    _dcp_extend_active = False
     dllm_attention = None
 
     @property
@@ -701,7 +702,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
         # capture keeps one bucket-sized buffer per shape and replay reuses it.
-        self._dcp_extend_active = model_runner.ps.attn_dcp_size > 1 and hasattr(
+        self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
