@@ -253,7 +253,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                 # match was 0; its span must survive as the loss-check boundary.
                 if phase == "hit_commit":
                     self.assertTrue(pipeline.staged_span_covered(_REQ, 8))
-                    self.assertEqual(retries.pop_device_covered_end(req.rid), 8)
+                    self.assertEqual(retries.pop_device_covered_len(req.rid), 8)
                 else:
                     pipeline._resolve_device_covered(req)
                     pipeline.release_staged_hold.assert_called_once_with(
@@ -264,7 +264,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                 for cleanup in (lambda: retries.cancel(req.rid), retries.clear):
                     retries.device_covered(req.rid, 8)
                     cleanup()
-                    self.assertEqual(retries.pop_device_covered_end(req.rid), 0)
+                    self.assertEqual(retries.pop_device_covered_len(req.rid), 0)
 
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):

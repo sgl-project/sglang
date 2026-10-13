@@ -3226,7 +3226,7 @@ class Scheduler(
         if retries is not None:
             req.storage_prefetch_last_match_len = max(
                 req.storage_prefetch_last_match_len or 0,
-                retries.pop_device_covered_end(req.rid),
+                retries.pop_device_covered_len(req.rid),
             )
         previous_match_len = req.storage_prefetch_last_match_len
         buffer_pipeline = self.tree_cache.buffer_pipeline
