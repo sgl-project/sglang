@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CACHE_ROOT="/root/.cache/tests/precise-test"
+# Overridable so jobs without shared-disk access (e.g. hosted ubuntu runners)
+# can stage coverage data locally and ship it to setup-covstub via an artifact.
+CACHE_ROOT="${PRECISE_TEST_CACHE_ROOT:-/root/.cache/tests/precise-test}"
 
 # Per-CI-run, per-attempt unique directory (no cross-run residue, no overwrite on re-run)
 RUN_ID="${GITHUB_RUN_ID:-local}"

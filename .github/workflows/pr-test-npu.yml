@@ -169,23 +169,83 @@ jobs:
           cd test
           python3 run_suite.py --hw npu --suite base-a-test-npu
 
-  # Coverage-mode-only counterpart of the base-a PR gate above: runs the same
-  # CPU unit suite on the 800t coverage pool via run_tests_with_coverage.sh,
-  # so its coverage files land on the shared /root/.cache disk and are merged
-  # into the baseline by setup-covstub. The PR gate stays on ubuntu-latest: a
-  # conditional `container` block cannot be expressed in a single job.
+  # Coverage-mode-only counterpart of the base-a PR gate above. Unlike the
+  # other coverage jobs it stays on ubuntu-latest: the base-a suite is
+  # CPU-only by contract (its UTs mock torch_npu/sgl_kernel_npu and require a
+  # CPU triton), and the NPU image's triton-ascend conflicts with those mocks
+  # at import time (collection error on the 800t pool). The shared
+  # _npu-pr-test-stage.yml template cannot be used because its CANN
+  # `container:` block is unconditional. Coverage data is shipped to
+  # setup-covstub via an artifact (downloaded and merged into the shared-disk
+  # RUN_DIR) instead of being written to the shared disk directly.
   base-a-test-npu-cov:
     needs: [set-image-config]
     if: ${{ inputs.coverage_mode == true }}
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: base-a-test-npu
-      runner_config: linux-aarch64-a3-800t-2
-      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      run_timeout_minutes: '45'
-      use_coverage_runner: true
-      upload_test_logs: false
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA so this job tests the same commit as the rest of the run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_npu.toml'
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        env:
+          # uv pip targets a venv by default; setup-python has no venv.
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          # Same dependency set as the base-a PR gate above (CPU torch + CPU
+          # triton, no Ascend wheels); keep the two blocks in sync.
+          rm -f python/pyproject.toml
+          mv python/pyproject_npu.toml python/pyproject.toml
+          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple/ \
+            --index-strategy unsafe-best-match
+          uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
+          pip install coverage==7.8.*
+
+      - name: Run test with coverage
+        timeout-minutes: 15
+        run: |
+          # Hosted runners cannot write the shared /root/.cache disk; stage
+          # coverage data locally. run_tests_with_coverage.sh derives RUN_DIR
+          # and the date tag from run-level GITHUB_* env vars, so the staged
+          # layout matches the shared-disk layout exactly and setup-covstub
+          # can merge it 1:1 after downloading this artifact.
+          export PRECISE_TEST_CACHE_ROOT=/tmp/precise-test
+          cd test
+          python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite base-a-test-npu \
+            -o /tmp/selected_tests.txt
+          echo "Selected test files:"
+          cat /tmp/selected_tests.txt
+          if [ -s /tmp/selected_tests.txt ]; then
+            bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+          fi
+
+      - name: Upload coverage outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-outputs-base-a-test-npu
+          path: /tmp/precise-test/
+          retention-days: 7
+          if-no-files-found: warn
 
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
@@ -654,6 +714,26 @@ jobs:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Collect base-a coverage artifact
+        # base-a-test-npu-cov runs on ubuntu-latest (its suite mocks the NPU
+        # stack and requires a CPU triton), so its coverage data arrives via
+        # an artifact rather than the shared disk.
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-outputs-base-a-test-npu
+          path: /tmp/base-a-coverage
+
+      - name: Merge base-a coverage into shared run dir
+        run: |
+          # The artifact contains {RUN_DIR}/outputs/... with RUN_DIR derived
+          # from the same run-level GITHUB_RUN_ID/RUN_ATTEMPT as the shared
+          # disk, so it merges 1:1 into the expected layout.
+          CACHE_ROOT="/root/.cache/tests/precise-test"
+          mkdir -p "${CACHE_ROOT}"
+          cp -a /tmp/base-a-coverage/. "${CACHE_ROOT}/"
+          echo "Merged base-a coverage into ${CACHE_ROOT}:"
+          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20
 
       - name: Copy sglang source to covstub
         run: |
