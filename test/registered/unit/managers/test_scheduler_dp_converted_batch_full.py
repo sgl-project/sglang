@@ -17,14 +17,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _RunningBatch:
-    """A full running batch that DP attention converts to extend in place."""
+    """A running batch that DP attention converts to extend in place."""
 
     def __init__(self, num_reqs):
         self.reqs = [SimpleNamespace(finished=False) for _ in range(num_reqs)]
         self.forward_mode = SimpleNamespace(is_extend=lambda: False)
         self.chunked_req = None
         self.is_prefill_only = False
-        self.batch_is_full = True
 
     def convert_decode_to_extend(self):
         self.forward_mode = SimpleNamespace(is_extend=lambda: True)
@@ -70,13 +69,13 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
 
         def get_new_batch_prefill(running_batch):
-            seen.append((running_batch, running_batch.batch_is_full))
+            seen.append(running_batch)
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         s.get_new_batch_prefill = get_new_batch_prefill
         return s
 
-    def test_converted_batch_stays_running_and_reopens_admission(self):
+    def test_converted_batch_stays_running_and_admits_next_step(self):
         seen = []
         s = self._scheduler(seen)
         running = _RunningBatch(num_reqs=3)
@@ -92,10 +91,9 @@ class TestDpConvertedBatchFull(unittest.TestCase):
             running_batch=plan.running_batch, last_batch=plan.batch_to_run
         )
 
-        batch, batch_is_full = seen[-1]
-        self.assertIs(batch, running)
+        self.assertEqual(len(seen), 2)
+        self.assertIs(seen[-1], running)
         self.assertEqual(running.batch_size(), 2)
-        self.assertFalse(batch_is_full)
 
 
 if __name__ == "__main__":

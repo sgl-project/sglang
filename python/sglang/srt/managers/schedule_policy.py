@@ -570,6 +570,13 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+class AdmissionSkipReason(Enum):
+    """Why a step skips admission; each implies that nothing is admissible."""
+
+    NO_WAITING = auto()
+    NO_REQ_SLOT = auto()
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefillAdmission:
     prefix_len: int

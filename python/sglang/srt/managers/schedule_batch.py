@@ -149,6 +149,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.schedule_policy import AdmissionSkipReason
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
@@ -2351,11 +2352,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
-
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
@@ -3972,3 +3968,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class NextBatchPlan(msgspec.Struct):
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
+    # Set when this step skipped the admission pass before it sorted the
+    # waiting queue or touched the cache.
+    admission_skip_reason: Optional[AdmissionSkipReason] = None

@@ -219,6 +219,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    AdmissionSkipReason,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -1291,7 +1292,7 @@ class Scheduler(
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[])
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -3799,8 +3800,6 @@ class Scheduler(
                 else:
                     running_batch.merge_batch(new_batch)
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
-            # Reset batch_is_full so the scheduler can schedule more prefills.
-            running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -3816,10 +3815,7 @@ class Scheduler(
                 reqs_to_exclude.update(last_batch.reqs)
 
             # Filter batch
-            last_bs = last_batch.batch_size()
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
-            if last_batch.batch_size() < last_bs:
-                running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch. A running batch that
             # DP attention converted to extend is last_batch itself: filtered
@@ -3838,11 +3834,10 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if running_batch.is_prefill_only:
             running_batch.filter_batch()
-            if running_batch.is_empty():
-                running_batch.batch_is_full = False
 
-        new_batch, running_batch = self._admit_prefill(running_batch)
-        new_batch, need_mlp_sync = self._gather_admitted(new_batch)
+        admit_plan = self._admit_prefill(running_batch)
+        running_batch = admit_plan.running_batch
+        new_batch, need_mlp_sync = self._gather_admitted(admit_plan.batch_to_run)
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -3856,24 +3851,24 @@ class Scheduler(
         )
         ret = self._finalize_step(ret)
 
-        plan = NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        plan = NextBatchPlan(
+            batch_to_run=ret,
+            running_batch=running_batch,
+            admission_skip_reason=admit_plan.admission_skip_reason,
+        )
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_schedule(plan)
         return plan
 
-    def _admit_prefill(
-        self, running_batch: ScheduleBatch
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    def _admit_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         """Admit this step's prefill batch; a mixed step also takes the decode rows."""
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
         else:
-            prefill_plan = self.get_new_batch_prefill(running_batch)
-            new_batch = prefill_plan.batch_to_run
-            running_batch = prefill_plan.running_batch
-        return new_batch, running_batch
+            return self.get_new_batch_prefill(running_batch)
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
 
     def _gather_admitted(
         self, new_batch: Optional[ScheduleBatch]
@@ -3952,6 +3947,31 @@ class Scheduler(
 
         return res
 
+    def admission_skip_reason(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[AdmissionSkipReason]:
+        """Why this step's admission cannot admit anything, or None to run it.
+
+        Reads only current state. It is checked after ready grammar requests
+        join the waiting queue and before the admission pass sorts that queue
+        or touches the cache.
+        """
+        # A chunked request always continues: under PP it can start in one
+        # micro-batch and end in another, so its slot is not counted here.
+        if self.chunked_req is not None:
+            return None
+        if not self.waiting_queue:
+            return AdmissionSkipReason.NO_WAITING
+        if (
+            not self.enable_priority_preemption
+            and self.get_num_allocatable_reqs(
+                len(running_batch.reqs), running_batch=running_batch
+            )
+            <= 0
+        ):
+            return AdmissionSkipReason.NO_REQ_SLOT
+        return None
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3963,12 +3983,13 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
+        plan = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
         )
 
         if self.prefill_delayer:
+            ret = plan.batch_to_run
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
                 actual_prefill_bs=ret.batch_size() if ret is not None else 0
             )
@@ -3977,31 +3998,25 @@ class Scheduler(
                     observed_prefill_bs
                 )
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return plan
 
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    ) -> NextBatchPlan:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            running_batch.batch_is_full = False
-        if running_batch.is_empty():
-            # An empty batch never reaches select_decode_rows, the only
-            # other place that clears the flag, so admission would stay shut.
-            running_batch.batch_is_full = False
-
-        if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None, running_batch
+        if (skip_reason := self.admission_skip_reason(running_batch)) is not None:
+            return NextBatchPlan(
+                batch_to_run=None,
+                running_batch=running_batch,
+                admission_skip_reason=skip_reason,
+            )
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4015,20 +4030,7 @@ class Scheduler(
                 ),
             )
         ):
-            return None, running_batch
-
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
-            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
-            and self.chunked_req is None
-            and not self.enable_priority_preemption
-        ):
-            running_batch.batch_is_full = True
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # Get priority queue
         self.policy.calc_priority(
@@ -4041,7 +4043,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -4105,6 +4107,8 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # Once set, every later candidate of this pass needs a preemption.
+        rows_full = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4128,14 +4132,14 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
             ):
-                running_batch.batch_is_full = True
+                rows_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
+                    rows_full = True
 
-            if running_batch.batch_is_full:
+            if rows_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -4181,11 +4185,6 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    # Set batch_is_full after making sure there are requests that can be served
-                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                        not running_batch.is_empty()
-                    )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -4213,7 +4212,7 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
@@ -4305,11 +4304,9 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                running_batch = ScheduleBatch(
-                    reqs=[], batch_is_full=running_batch.batch_is_full
-                )
+                running_batch = ScheduleBatch(reqs=[])
 
-        return new_batch, running_batch
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -4368,26 +4365,20 @@ class Scheduler(
         fit the KV pool, retract mode retracts rows; hold mode (a mixed step)
         holds them all back to decode on a later step.
         """
-        initial_bs = batch.batch_size()
-
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
-            batch.batch_is_full = False
             return True
 
         kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
-            batch.batch_is_full = False
             return False
 
         if not retract:
             if kv_full_retract_flag:
                 return False
-            if finishing_reqs:
-                batch.batch_is_full = False
             batch.prepare_for_decode()
             return True
 
@@ -4458,9 +4449,6 @@ class Scheduler(
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
-
-        if batch.batch_size() < initial_bs:
-            batch.batch_is_full = False
 
         if batch.is_empty():
             return True
@@ -5733,7 +5721,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        self.running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.

@@ -562,16 +562,14 @@ class TestAllocationIntegration(CustomTestCase):
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
                         )
-                        running = SimpleNamespace(batch_is_full=True)
                         with patch(
                             "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
                         ):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
-                                scheduler, None, running
+                                scheduler, None
                             )
                         if policy == "prefill_complete":
                             self.assertIs(scheduler.chunked_req, req)
-                            self.assertFalse(running.batch_is_full)
                             scheduler.optimistic_release_and_requeue.assert_not_called()
                         else:
                             self.assertIsNone(scheduler.chunked_req)

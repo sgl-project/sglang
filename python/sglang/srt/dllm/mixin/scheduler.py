@@ -37,10 +37,7 @@ class SchedulerDllmMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.enable_priority_preemption:
-            running_batch.batch_is_full = False
-
-        # Early exit if batch is full or no requests available
+        # Early exit if no request slot is free or no requests available
         if self._should_skip_prefill(running_batch=running_batch):
             return None
 
@@ -233,9 +230,7 @@ class SchedulerDllmMixin:
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
-        if (
-            running_batch.batch_is_full or not self.waiting_queue
-        ) and self.dllm_manager.is_empty():
+        if not self.waiting_queue and self.dllm_manager.is_empty():
             return True
 
         running_bs = len(running_batch.reqs)
@@ -244,7 +239,6 @@ class SchedulerDllmMixin:
             and self.dllm_manager.is_empty()
             and not self.enable_priority_preemption
         ):
-            running_batch.batch_is_full = True
             return True
 
         return False
@@ -372,14 +366,14 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        # Once set, every later request of this pass needs a preemption.
+        rows_full = False
         for req in reqs:
-            # Check if batch is full
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                running_batch.batch_is_full = True
+                rows_full = True
 
-            # Try preemption if batch is full
-            if running_batch.batch_is_full:
+            if rows_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -394,8 +388,6 @@ class SchedulerDllmMixin:
             )
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    running_batch.batch_is_full = True
                 break
 
         return res

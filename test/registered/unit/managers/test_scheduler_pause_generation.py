@@ -80,7 +80,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.running_batch.batch_is_full = False
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
@@ -341,7 +340,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.running_batch = self._make_batch(
             scheduler, reqs=[run_req_a, run_req_b], with_tensors=True
         )
-        scheduler.running_batch.batch_is_full = True
         scheduler.last_batch = self._make_batch(
             scheduler,
             reqs=[last_req],
@@ -362,7 +360,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [1, 1, 1],
         )
         self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
@@ -395,7 +392,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract with empty running batch releases and requeues the last extend reqs."""
         scheduler = self._new_scheduler()
         last_req = self._make_req("last")
-        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = self._make_batch(
             scheduler,
             reqs=[last_req],
@@ -411,7 +408,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertTrue(requeue_log[0]["is_retracted"])
         self.assertEqual(last_req.retraction_count, 1)
         self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
 
     def test_retract_fold_in_releases_via_scheduler_hisparse_coordinator(self):
@@ -419,7 +415,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.hisparse_coordinator = MagicMock()
         last_req = self._make_req("last")
-        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = self._make_batch(
             scheduler,
             reqs=[last_req],
@@ -502,10 +498,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(req_finished.is_retracted)
         self.assertEqual(scheduler.running_batch.reqs, [])
 
-    def test_retract_empty_post_fold_clears_chunked_req_and_batch_is_full(self):
-        """retract with nothing to retract still clears chunked_req and batch_is_full."""
+    def test_retract_empty_post_fold_clears_chunked_req(self):
+        """retract with nothing to retract still clears chunked_req."""
         scheduler = self._new_scheduler()
-        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
@@ -513,7 +509,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual(requeue_log, [])
         self.assertIsNone(scheduler.chunked_req)
-        self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_retract_all_finished_clears_fields_without_requeue(self):
         """retract with only finished reqs clears fields but releases nothing."""
@@ -523,7 +518,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.running_batch = self._make_batch(
             scheduler, reqs=[req_finished_a, req_finished_b]
         )
-        scheduler.running_batch.batch_is_full = True
         scheduler.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
@@ -533,7 +527,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(req_finished_a.retraction_count, 0)
         self.assertEqual(req_finished_b.retraction_count, 0)
         self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
 
     def test_retract_drain_happens_once_before_release(self):

@@ -286,9 +286,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
-                )
+                self.process_prefill_chunk(last_batch=self.last_batch)
                 self._process_hicache_events()
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
@@ -363,8 +361,6 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
                 self.inflight_steps.end_step()
                 release_rids = next_release_rids
-
-                self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -552,8 +548,6 @@ class SchedulerPPMixin:
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
-                self.running_batch.batch_is_full = False
-
             # When the server is idle, self-check and re-init some states
             queue_size = (
                 len(self.waiting_queue)
@@ -579,10 +573,7 @@ class SchedulerPPMixin:
         # launch, just before the step that replans it.
         self.inflight_steps = InflightQueue(depth=self.pp_loop_size - 1, ring=True)
         self.last_mbs = [None] * self.pp_loop_size
-        self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False)
-            for _ in range(self.pp_loop_size)
-        ]
+        self.running_mbs = [ScheduleBatch(reqs=[]) for _ in range(self.pp_loop_size)]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()

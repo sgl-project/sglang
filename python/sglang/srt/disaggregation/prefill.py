@@ -634,17 +634,11 @@ class SchedulerDisaggregationPrefillMixin:
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
 
-        # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
-        # Otherwise, it hangs under high concurrency
-        running_batch.batch_is_full = False
-
         self.resolve_waiting_queue_bootstrap()
 
         # Skip repeated chunk processing while polling a pending batch.
         if last_batch is None or not last_batch.prefill_chunk_processed:
-            self.process_prefill_chunk(
-                last_batch=last_batch, running_batch=running_batch
-            )
+            self.process_prefill_chunk(last_batch=last_batch)
             if last_batch is not None:
                 last_batch.prefill_chunk_processed = True
 
@@ -656,7 +650,11 @@ class SchedulerDisaggregationPrefillMixin:
         if batch:
             set_schedule_time_batch(batch)
 
-        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
+        return NextBatchPlan(
+            batch_to_run=batch,
+            running_batch=running_batch,
+            admission_skip_reason=prefill_plan.admission_skip_reason,
+        )
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -1372,9 +1370,7 @@ class SchedulerDisaggregationPrefillMixin:
         return self.handle_pending_bootstrap(req, polls[0])
 
     def process_prefill_chunk(
-        self: Scheduler,
-        last_batch: Optional[ScheduleBatch],
-        running_batch: ScheduleBatch,
+        self: Scheduler, last_batch: Optional[ScheduleBatch]
     ) -> None:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
@@ -1405,19 +1401,13 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.send_kv_chunk(req)
 
-            if self.chunked_req is not None:
-                running_batch.batch_is_full = False
-
         if last_batch and last_batch.forward_mode.is_extend():
             if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 reqs_to_exclude.add(last_batch.chunked_req)
 
-            last_bs = last_batch.batch_size()
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
-            if last_batch.batch_size() < last_bs:
-                running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():

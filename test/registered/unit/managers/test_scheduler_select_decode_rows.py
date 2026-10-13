@@ -30,7 +30,6 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         batch.batch_size.return_value = 2
         batch.is_empty.return_value = False
         batch.check_decode_mem.return_value = fits
-        batch.batch_is_full = True
         return batch
 
     def test_kv_full_holds_rows_without_retracting(self):
@@ -42,7 +41,6 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         batch.retract_decode.assert_not_called()
         batch.prepare_for_decode.assert_not_called()
         s.new_token_ratio_tracker.decay_step.assert_not_called()
-        self.assertTrue(batch.batch_is_full)
 
     def test_rows_that_fit_are_prepared_without_ratio_decay(self):
         s = self._scheduler()
@@ -68,6 +66,7 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
     def test_kv_full_running_rows_sit_out_without_retracting(self):
         s = MagicMock()
         s.select_decode_rows = MethodType(Scheduler.select_decode_rows, s)
+        s.admission_skip_reason = MethodType(Scheduler.admission_skip_reason, s)
         s._reqs_finishing_inflight.return_value = []
         s.grammar_manager.has_waiting_grammars.return_value = False
         s.enable_priority_preemption = False
@@ -92,7 +91,6 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
 
         running_batch = MagicMock(
             reqs=[SimpleNamespace(beam_group=None)],
-            batch_is_full=False,
             return_logprob=False,
         )
         running_batch.is_empty.return_value = False
@@ -110,12 +108,12 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
                 scheduler_module.ScheduleBatch, "init_new", return_value=new_batch
             ),
         ):
-            ret, ret_running = Scheduler._get_new_batch_prefill_raw(
+            plan = Scheduler._get_new_batch_prefill_raw(
                 s, prefill_delayer_single_pass=None, running_batch=running_batch
             )
 
-        self.assertIs(ret, new_batch)
-        self.assertIs(ret_running, running_batch)
+        self.assertIs(plan.batch_to_run, new_batch)
+        self.assertIs(plan.running_batch, running_batch)
         running_batch.retract_decode.assert_not_called()
         running_batch.prepare_for_decode.assert_not_called()
         new_batch.mix_with_running.assert_not_called()

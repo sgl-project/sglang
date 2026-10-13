@@ -279,11 +279,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         pending = tuple((record.batch, record.result) for record in self.inflight_steps)
         self.paused_states.append((self.last_batch, pending))
 
-    def process_prefill_chunk(self, last_batch, running_batch):
+    def process_prefill_chunk(self, last_batch):
         if last_batch is not None:
             self.chunk_processes[last_batch.forward_iter] += 1
         SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
-            self, last_batch=last_batch, running_batch=running_batch
+            self, last_batch=last_batch
         )
 
     def get_new_batch_prefill(self, running_batch):
