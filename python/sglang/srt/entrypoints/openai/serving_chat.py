@@ -82,6 +82,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     process_spec_tokens_details_from_ret,
+    routed_experts_encoding_label,
     should_include_usage,
     spec_tokens_details_from_meta_info,
     token_id_to_bytes,
@@ -2156,6 +2157,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_full = SglExt(
                 routed_experts=sglext_routed,
+                routed_experts_encoding=routed_experts_encoding_label(sglext_routed),
                 cached_tokens_details=sglext_cached_tokens_details,
                 spec_tokens_details=sglext_spec_tokens_details,
                 input_ids=sglext_input_ids,
@@ -2321,6 +2323,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
+                routed_experts_encoding=routed_experts_encoding_label(routed_experts),
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,

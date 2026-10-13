@@ -1566,11 +1566,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Hidden states
     output_hidden_states: OutputHiddenStates
 
-    # Per-request routed experts (input + output tokens), shape
-    # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
+    # Per-request routed experts (input + output tokens), numpy of shape
+    # (token, layer, top_k). DetokenizerManager encodes them (routed_experts_codec)
+    # into BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
-    routed_experts: Optional[List[Optional[torch.Tensor]]]
+    routed_experts: Optional[List[Optional[np.ndarray]]]
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 

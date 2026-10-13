@@ -1284,8 +1284,8 @@ class Req(ReqDllmMixin):
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
-        self.routed_experts: Optional[torch.Tensor] = (
-            None  # cpu tensor: shape (seqlen, topk)
+        self.routed_experts: Optional[np.ndarray] = (
+            None  # cpu array: shape (seqlen, layers, topk)
         )
 
         self.return_indexer_topk = return_indexer_topk

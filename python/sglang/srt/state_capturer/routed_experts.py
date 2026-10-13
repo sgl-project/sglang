@@ -1,10 +1,10 @@
 from typing import Any, Optional
 
 import numpy as np
-import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_dp_local_slice_cpu,
@@ -20,6 +20,18 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.srt.state_capturer.routed_experts_codec import (
+    BASE64_INT32,
+    ZSTD,
+    decode_routed_experts,
+    host_dtype,
+)
+
+
+def _num_physical_experts() -> Optional[int]:
+    """Exclusive bound on captured ids, logical or (on some backends) physical."""
+    metadata = get_global_expert_location_metadata()
+    return metadata.num_physical_experts if metadata is not None else None
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -68,6 +80,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
+        encoding = get_exec().features.routed_experts_encoding
+        # replay needs only the expert set, and sorted rows compress far better
+        self.sort_rows = encoding == ZSTD
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
@@ -89,6 +104,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            host_dtype=host_dtype(encoding, _num_physical_experts()),
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -113,6 +129,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
         super().capture(layer_id, topk_indices)
+
+    def _canonicalize_rows(self, slice_gpu: torch.Tensor) -> torch.Tensor:
+        if self.sort_rows:
+            slice_gpu = slice_gpu.sort(dim=-1).values
+        return slice_gpu.to(self.host_cache.buffer.dtype)
 
     def _get_local_slice(
         self,
@@ -151,14 +172,16 @@ def destroy_global_experts_capturer():
 
 
 def extract_routed_experts_from_meta_info(data):
-    # To solve the performance issue, we return the experts_ids in base64
-    # We left this function for user to change it back to normal int32
-    # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
-    routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+    """Flat int32 routed experts from a response, whatever its encoding."""
+    meta_info = data["meta_info"]
+    return (
+        decode_routed_experts(
+            meta_info["routed_experts"],
+            meta_info.get("routed_experts_encoding", BASE64_INT32),
+        )
+        .astype(np.int32, copy=False)
+        .reshape(-1)
     )
-    return routed_experts
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:

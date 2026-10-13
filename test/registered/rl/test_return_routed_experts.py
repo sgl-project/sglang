@@ -317,9 +317,10 @@ def extract_routed_experts_from_openai_response(response):
     routed_experts = sglext.get("routed_experts", None)
     if routed_experts is None:
         raise ValueError("OpenAI response sglext missing routed_experts.")
-    return extract_routed_experts_from_meta_info(
-        {"meta_info": {"routed_experts": routed_experts}}
-    )
+    meta_info = {"routed_experts": routed_experts}
+    if encoding := sglext.get("routed_experts_encoding"):
+        meta_info["routed_experts_encoding"] = encoding
+    return extract_routed_experts_from_meta_info({"meta_info": meta_info})
 
 
 def check_all_experts_id_valid(experts: List[List[List[int]]]):
@@ -358,6 +359,7 @@ class TestRoutedExpertsStartLen(CustomTestCase):
     """
 
     MAX_NEW_TOKENS = 8
+    EXTRA_SERVER_ARGS = []
 
     @classmethod
     def setUpClass(cls):
@@ -370,6 +372,7 @@ class TestRoutedExpertsStartLen(CustomTestCase):
                 "--enable-deterministic-inference",
                 "--tp",
                 2,
+                *cls.EXTRA_SERVER_ARGS,
             ],
         )
 
@@ -537,6 +540,12 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         else:
             self.assertGreaterEqual(resp.status_code, 400)
             self.assertIn(expected_substring, resp.text)
+
+
+class TestRoutedExpertsStartLenZstd(TestRoutedExpertsStartLen):
+    """Same start_len contract through the zstd wire encoding (sorted rows)."""
+
+    EXTRA_SERVER_ARGS = ["--routed-experts-encoding", "zstd"]
 
 
 if __name__ == "__main__":

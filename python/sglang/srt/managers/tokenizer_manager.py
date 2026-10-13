@@ -159,6 +159,10 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
+from sglang.srt.state_capturer.routed_experts_codec import (
+    BASE64_INT32,
+    encode_routed_experts,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -2562,9 +2566,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if val is not None:
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    encoding = get_exec().features.routed_experts_encoding
+                    if not isinstance(val, str):
+                        val = encode_routed_experts(val, encoding)
                     meta_info["routed_experts"] = val
+                    if encoding != BASE64_INT32:
+                        meta_info["routed_experts_encoding"] = encoding
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

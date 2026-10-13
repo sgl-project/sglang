@@ -45,12 +45,16 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizer
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_device,
+    get_exec,
     get_model,
     get_observability,
     get_serving,
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts_codec import (
+    encode_routed_experts_per_request,
+)
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
@@ -456,7 +460,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts = encode_routed_experts_per_request(
+            recv_obj.routed_experts, get_exec().features.routed_experts_encoding
+        )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
