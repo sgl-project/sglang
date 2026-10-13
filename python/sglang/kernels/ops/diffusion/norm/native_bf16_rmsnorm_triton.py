@@ -7,14 +7,9 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.fast_launch import (
-    SignatureLaunch,
-    launch_signature,
-)
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 MAX_HIDDEN_SIZE = 8192
-_RMSNORM_SCALE_LAUNCH = SignatureLaunch()
-_RMSNORM_TANH_RESIDUAL_LAUNCH = SignatureLaunch()
 
 
 @triton.jit
@@ -123,6 +118,7 @@ def _can_use_operand(
     )
 
 
+@replay_launches
 def rmsnorm_scale(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -130,13 +126,6 @@ def rmsnorm_scale(
     eps: float,
 ) -> torch.Tensor | None:
     """Apply BF16-native ``RMSNorm(x) * scale`` or return ``None``."""
-    signature = launch_signature(x, weight, scale, eps)
-    launch = _RMSNORM_SCALE_LAUNCH.get(signature)
-    if launch is not None:
-        out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        launch(out, x, weight, scale)
-        return out
-
     if not _can_use_operand(x, weight, scale):
         return None
 
@@ -152,25 +141,24 @@ def rmsnorm_scale(
         return None
 
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
-    grid = (x_rows,)
-    args = (
-        out.reshape(-1, dim),
-        x,
-        weight,
-        scale,
-        x_row_stride,
-        scale_row_stride,
-        x_rows // scale_rows,
-        dim,
-        eps,
-        triton.next_power_of_2(dim),
-    )
     with torch.get_device_module().device(x.device):
-        compiled = _rmsnorm_scale_kernel[grid](*args, num_warps=8)
-        _RMSNORM_SCALE_LAUNCH.record(signature, compiled, grid, args)
+        _rmsnorm_scale_kernel[(x_rows,)](
+            out.reshape(-1, dim),
+            x,
+            weight,
+            scale,
+            x_row_stride,
+            scale_row_stride,
+            x_rows // scale_rows,
+            dim,
+            eps,
+            block_dim=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
     return out
 
 
+@replay_launches
 def rmsnorm_tanh_residual(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -179,13 +167,6 @@ def rmsnorm_tanh_residual(
     eps: float,
 ) -> torch.Tensor | None:
     """Apply BF16-native gated RMSNorm residual fusion or return ``None``."""
-    signature = launch_signature(x, gate, residual, weight, eps)
-    launch = _RMSNORM_TANH_RESIDUAL_LAUNCH.get(signature)
-    if launch is not None:
-        out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        launch(out, x, gate, residual, weight)
-        return out
-
     if not _can_use_operand(x, weight, gate):
         return None
     if (
@@ -209,24 +190,22 @@ def rmsnorm_tanh_residual(
         return None
 
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
-    grid = (x_rows,)
-    args = (
-        out.reshape(-1, dim),
-        x,
-        gate,
-        residual,
-        weight,
-        x_row_stride,
-        gate_row_stride,
-        residual_row_stride,
-        x_rows // gate_rows,
-        dim,
-        eps,
-        triton.next_power_of_2(dim),
-    )
     with torch.get_device_module().device(x.device):
-        compiled = _rmsnorm_tanh_residual_kernel[grid](*args, num_warps=8)
-        _RMSNORM_TANH_RESIDUAL_LAUNCH.record(signature, compiled, grid, args)
+        _rmsnorm_tanh_residual_kernel[(x_rows,)](
+            out.reshape(-1, dim),
+            x,
+            gate,
+            residual,
+            weight,
+            x_row_stride,
+            gate_row_stride,
+            residual_row_stride,
+            x_rows // gate_rows,
+            dim,
+            eps,
+            block_dim=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
     return out
 
 

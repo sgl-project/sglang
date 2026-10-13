@@ -1,23 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Signature-cached launches for small Triton kernels.
+"""Replay a small Triton wrapper's launches for operands it has seen before.
 
 A small kernel's wrapper costs more host time than its GPU time: operand checks,
 stride math, the device guard and Triton's JIT dispatch take ~28 us per call against
-a ~13 us cached launch (rmsnorm_scale, Z-Image 512^2, H200). All of it is fixed by
-the operands' signature, so ``SignatureLaunch`` keeps Triton's compiled launcher and
-the derived scalars per signature and relaunches with the same kernel, grid and
-arguments: results are bit-identical.
+a ~9 us launch (rmsnorm_scale, Z-Image 512^2, H200). All of it is fixed by the
+operands' signature. ``@replay_launches`` runs the wrapper normally the first time it
+sees a signature and records its Triton launches; later calls with that signature
+allocate the outputs and relaunch the recorded compiled kernels on the new tensors.
+Same kernels, grids and arguments, so results are bit-identical.
+
+Contract for a decorated function: its GPU work is Triton launches whose tensor
+arguments are its tensor inputs or the outputs it allocates with ``torch.empty*`` and
+returns (a tensor, a tuple of tensors, or None), and its choices depend only on the
+operands' shapes, strides, dtypes, devices, 16-byte alignment and scalar arguments.
+Recording rejects what it can see breaking that (aten ops other than allocation and
+views, reads of tensor values, launches on other tensors) and leaves such a signature
+on the normal path.
+Launches that bypass Triton's JIT (tvm-ffi, CuTe DSL) are invisible to it.
 
 ``SGLANG_DIFFUSION_TRITON_FAST_LAUNCH=0`` turns it off.
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
-from typing import Any, Callable, Hashable
+import threading
+from typing import Any, Callable
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
+from triton.runtime.jit import JITFunction
 
 logger = logging.getLogger(__name__)
 
@@ -25,94 +41,241 @@ _ENABLED = os.environ.get(
     "SGLANG_DIFFUSION_TRITON_FAST_LAUNCH", "1"
 ).strip().lower() not in {"0", "false", "off", "no"}
 
+_aten = torch.ops.aten
+_ALLOCATIONS = {
+    _aten.empty,
+    _aten.empty_like,
+    _aten.empty_strided,
+    _aten.new_empty,
+    _aten.new_empty_strided,
+}
 
-def launch_signature(*operands: Any) -> tuple | None:
-    """Everything a compiled launch depends on, or None when the fast path is off.
+_SCALARS = (bool, int, float, str, type(None), torch.dtype, torch.device)
+_NORMAL = object()  # this signature always runs the wrapper
+_NONE = object()  # this signature returns None without launching
 
-    Pointer alignment is included because Triton specializes the compiled kernel on
-    ``data_ptr() % 16``. A signature is recorded only after the wrapper validated its
-    operands, so a hit needs no revalidation. Under torch.compile the wrapper must stay
-    traceable, so no signature is taken there (checked first: Dynamo would otherwise
-    guard on ``_ENABLED``).
-    """
-    if torch.compiler.is_compiling() or not _ENABLED:
-        return None
-    return tuple(
-        (
-            (op.shape, op.stride(), op.dtype, op.device, op.data_ptr() % 16)
-            if isinstance(op, torch.Tensor)
-            else op
-        )
-        for op in operands
+
+class _Recording(threading.local):
+    active = False
+
+
+_recording = _Recording()
+_record_lock = threading.Lock()
+
+
+class _LaunchOnly(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.violation: str | None = None
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        # A decorated function may only allocate and take views.
+        if (
+            self.violation is None
+            and func.overloadpacket not in _ALLOCATIONS
+            and not _is_view(func, args, out)
+        ):
+            self.violation = str(func)
+        return out
+
+
+def _is_view(func, args, out) -> bool:
+    """Whether ``func`` mutated nothing and returned only aliases of its inputs."""
+    if func._schema.is_mutable:
+        return False
+    sources = {
+        t.untyped_storage().data_ptr()
+        for t in tree_leaves(args)
+        if isinstance(t, torch.Tensor)
+    }
+    results = [t for t in tree_leaves(out) if isinstance(t, torch.Tensor)]
+    return bool(results) and all(
+        t.untyped_storage().data_ptr() in sources for t in results
     )
 
 
-class SignatureLaunch:
-    """Compiled launches of one Triton kernel, keyed by ``launch_signature``."""
-
-    def __init__(self) -> None:
-        self._plans: dict[Hashable, tuple[Callable[..., None], int]] = {}
-        # Whether this kernel's launcher reproduces the JIT launch; None until checked.
-        self._exact: bool | None = None
-
-    def get(self, signature: tuple | None) -> Callable[..., None] | None:
-        """Launch for ``signature``, called with the kernel's leading tensor arguments."""
-        if signature is None:
-            return None
-        plan = self._plans.get(signature)
-        if plan is None or torch.cuda.current_device() != plan[1]:
-            return None
-        return plan[0]
-
-    def record(
-        self,
-        signature: tuple | None,
-        compiled: Any,
-        grid: tuple[int, ...],
-        args: tuple,
-    ) -> None:
-        """Keep ``compiled``'s launcher for ``signature``.
-
-        ``args`` are all kernel parameters in order, as the JIT launch just received
-        them; the leading tensors are the per-call operands, ``args[0]`` the output.
-        Call under the operands' device. The first record of each kernel checks the
-        launcher's calling convention by relaunching into a scratch output, which
-        syncs, so that check never runs during graph capture.
-        """
-        global _ENABLED
-        if signature is None or signature in self._plans or compiled is None:
-            return
-        if self._exact is False:
-            return
-        num_tensors = next(
-            (i for i, arg in enumerate(args) if not isinstance(arg, torch.Tensor)),
-            len(args),
-        )
-        scalars = args[num_tensors:]
-        try:
-            launcher = compiled[tuple(grid) + (1,) * (3 - len(grid))]
-            if self._exact is None:
-                if torch.cuda.is_current_stream_capturing():
-                    return
-                scratch = torch.empty_like(args[0])
-                launcher(scratch, *args[1:])
-                self._exact = torch.equal(
-                    scratch.view(torch.uint8), args[0].view(torch.uint8)
+def _signature(args: tuple, kwargs: dict) -> tuple[tuple | None, list[torch.Tensor]]:
+    key, tensors = [], []
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, torch.Tensor):
+            tensors.append(value)
+            # Triton specializes the compiled kernel on 16-byte alignment.
+            key.append(
+                (
+                    value.shape,
+                    value.stride(),
+                    value.dtype,
+                    value.device,
+                    value.data_ptr() % 16,
                 )
-        except torch.cuda.OutOfMemoryError:
-            return
-        except (AttributeError, TypeError) as exc:  # Triton's launcher API moved
-            logger.warning(
-                "Triton fast launch disabled (%s: %s); using the JIT path",
-                type(exc).__name__,
-                exc,
             )
-            _ENABLED = False
-            return
-        if not self._exact:
-            return
+        elif type(value) in _SCALARS and value == value:  # NaN never matches its key
+            key.append((type(value), value))
+        else:
+            return None, tensors
+    if kwargs:
+        key.append(tuple(kwargs))
+    return tuple(key), tensors
 
-        def launch(*tensors: torch.Tensor) -> None:
-            launcher(*tensors, *scalars)
 
-        self._plans[signature] = (launch, torch.cuda.current_device())
+class _Plan:
+    """Outputs to allocate and launches to replay for one signature."""
+
+    def __init__(self, outputs: list, result: str, launches: list, device: int):
+        self.outputs = outputs  # (size, stride, dtype, device), or an input index
+        self.result = result  # "none", "tensor" or "tuple"
+        self.launches = launches  # (launcher, constant args, tensor slots)
+        self.device = device
+
+    def replay(self, inputs: list[torch.Tensor]):
+        outs = [
+            (
+                inputs[spec]
+                if isinstance(spec, int)
+                else torch.empty_strided(
+                    spec[0], spec[1], dtype=spec[2], device=spec[3]
+                )
+            )
+            for spec in self.outputs
+        ]
+        sources = (inputs, outs)
+        for launcher, constants, slots in self.launches:
+            values = list(constants)
+            for position, source, index in slots:
+                values[position] = sources[source][index]
+            launcher(*values)
+        if self.result == "tensor":
+            return outs[0]
+        return tuple(outs) if self.result == "tuple" else None
+
+
+def _covers_storage(t: torch.Tensor) -> bool:
+    extent = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return (
+        t.storage_offset() == 0
+        and t.untyped_storage().nbytes() == extent * t.element_size()
+    )
+
+
+def _plan(out: Any, inputs: list[torch.Tensor], launches: list) -> Any:
+    if out is None and not launches:
+        return _NONE
+    if out is None:
+        result, outs = "none", []
+    elif isinstance(out, tuple):
+        result, outs = "tuple", list(out)
+    else:
+        result, outs = "tensor", [out]
+    if not launches or not all(isinstance(o, torch.Tensor) for o in outs):
+        return _NORMAL
+    input_at: dict[int, list[int]] = {}
+    for i, t in enumerate(inputs):
+        input_at.setdefault(t.data_ptr(), []).append(i)
+    output_at, specs = {}, []
+    for j, o in enumerate(outs):
+        aliased = [i for i in input_at.get(o.data_ptr(), ()) if inputs[i] is o]
+        if aliased:
+            specs.append(aliased[0])
+        elif o.data_ptr() in input_at or o.data_ptr() in output_at:
+            return _NORMAL
+        elif not _covers_storage(o):
+            return _NORMAL
+        else:
+            specs.append((o.shape, o.stride(), o.dtype, o.device))
+        output_at[o.data_ptr()] = j
+    devices, replays = set(), []
+    for jit_fn, compiled, grid, args, kwargs, device in launches:
+        names = jit_fn.arg_names
+        values = list(args) + [
+            kwargs[name] if name in kwargs else jit_fn.params[i].default
+            for i, name in enumerate(names[len(args) :], start=len(args))
+        ]
+        # The launcher takes every parameter, constexprs included (Triton >= 3.3).
+        if len(compiled.src.signature) != len(values):
+            return _NORMAL
+        if callable(grid):
+            grid = grid(dict(zip(names, values)))
+        constants, slots = [], []
+        for position, value in enumerate(values):
+            is_tensor = isinstance(value, torch.Tensor)
+            constants.append(None if is_tensor else value)
+            if not is_tensor:
+                continue
+            pointer = value.data_ptr()
+            if pointer in output_at:
+                slots.append((position, 1, output_at[pointer]))
+            elif len(input_at.get(pointer, ())) == 1:
+                slots.append((position, 0, input_at[pointer][0]))
+            else:  # a temporary, or an ambiguous input
+                return _NORMAL
+        launcher = compiled[tuple(grid) + (1,) * (3 - len(grid))]
+        replays.append((launcher, tuple(constants), tuple(slots)))
+        devices.add(device)
+    if len(devices) != 1:
+        return _NORMAL
+    return _Plan(specs, result, replays, devices.pop())
+
+
+def _record(fn: Callable, args: tuple, kwargs: dict, inputs: list[torch.Tensor]):
+    """Run ``fn`` and return its result and a plan, or None while another thread records."""
+    if not _record_lock.acquire(blocking=False):
+        return fn(*args, **kwargs), None
+    launches = []
+    thread = threading.get_ident()
+    jit_run = JITFunction.run
+
+    def run(self, *a, grid, warmup, **kw):
+        compiled = jit_run(self, *a, grid=grid, warmup=warmup, **kw)
+        if not warmup and threading.get_ident() == thread:
+            launches.append(
+                (self, compiled, grid, a, kw, torch.accelerator.current_device_index())
+            )
+        return compiled
+
+    guard = _LaunchOnly()
+    JITFunction.run = run
+    _recording.active = True
+    try:
+        with guard:
+            out = fn(*args, **kwargs)
+    finally:
+        JITFunction.run = jit_run
+        _recording.active = False
+        _record_lock.release()
+    if guard.violation is not None:
+        return out, _NORMAL
+    try:
+        return out, _plan(out, inputs, launches)
+    except (AttributeError, TypeError) as exc:  # Triton's compiled-kernel API moved
+        logger.warning("%s keeps its normal launch path: %s", fn.__qualname__, exc)
+        return out, _NORMAL
+
+
+def replay_launches(fn: Callable) -> Callable:
+    """Decorate a Triton wrapper to replay its launches per operand signature."""
+    plans: dict[tuple, Any] = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Checked first, so Dynamo traces ``fn`` without guarding on ``_ENABLED``.
+        if torch.compiler.is_compiling() or not _ENABLED or _recording.active:
+            return fn(*args, **kwargs)
+        key, inputs = _signature(args, kwargs)
+        if key is None:
+            return fn(*args, **kwargs)
+        plan = plans.get(key)
+        if plan is None:
+            out, plan = _record(fn, args, kwargs, inputs)
+            if plan is not None:
+                plans[key] = plan
+            return out
+        if plan is _NONE:
+            return None
+        if plan is _NORMAL or torch.accelerator.current_device_index() != plan.device:
+            return fn(*args, **kwargs)
+        return plan.replay(inputs)
+
+    # Resolved annotations, so custom-op schema inference does not evaluate them here.
+    wrapper.__signature__ = inspect.signature(fn, eval_str=True)
+    return wrapper
