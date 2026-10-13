@@ -356,7 +356,7 @@ def restore_cache_only_rebootstrap_tokens(
     forced = [
         (i, req.pd_rebootstrap_forced_output_id)
         for i, req in enumerate(batch.reqs)
-        if req.pd_rebootstrap_in_progress
+        if getattr(req, "pd_rebootstrap_in_progress", False)
         and req.pd_rebootstrap_forced_output_id is not None
     ]
     if not forced:
