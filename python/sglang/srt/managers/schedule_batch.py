@@ -904,7 +904,7 @@ class ReqLogprob:
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
     # Flat replacements for the rows above (see
-    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
     # emptied and the arrays ship instead.
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
