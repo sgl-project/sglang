@@ -455,7 +455,7 @@ class MooncakeKVManager(CommonKVManager):
         size = strategy.full_chunk_pages
         return size > 0 and start % size == 0 and 0 < num_pages <= size
 
-    def _ensure_equal_tp_staging_req(self, kv_chunk, req) -> None:
+    def _ensure_equal_tp_staging_req(self, kv_chunk, req) -> bool:
         """Request decode-side staging allocation for a fragmented equal-TP
         chunk (issue #5450). The batch prefetch gate skips equal-TP rooms, so
         the first fragmented chunk must poke the STAGING_REQ itself.
@@ -479,41 +479,40 @@ class MooncakeKVManager(CommonKVManager):
         # Chunk identity = the folded grid index, the same formula
         # PrefillStagingStrategy.check_ready uses, so the STAGING_RSP offset
         # lands exactly where check_ready looks it up. The sender aligns chunk
-        # starts to the staging grid for staged pieces. Later continuations
-        # inside a slot remain direct and cannot reuse this identity.
+        # starts to the staging grid for staged pieces. A later continuation
+        # inside the same grid slot is direct and cannot reuse this identity.
         chunk_idx = kv_chunk.index_slice.start // full_chunk_pages
         stg_key = (kv_chunk.room, chunk_idx, req.mooncake_session_id)
-        if stg_key in self._staging_ctx.prefetch_requested:
-            return
-        self._staging_ctx.prefetch_requested.add(stg_key)
-        try:
-            na = NetworkAddress(req.endpoint, req.dst_port)
-            ep = na.to_tcp()
-            if ep not in self._staging_ctx.prefetch_sockets:
-                sock = zmq.Context().socket(zmq.PUSH)
-                if na.is_ipv6:
-                    sock.setsockopt(zmq.IPV6, 1)
-                sock.connect(ep)
-                self._staging_ctx.prefetch_sockets[ep] = sock
-            self._staging_ctx.prefetch_sockets[ep].send_multipart(
-                [
-                    b"STAGING_REQ",
-                    str(kv_chunk.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    # Same field as the batch prefetch (requester_pp_rank):
-                    # decode filters the STAGING_RSP recipients by it.
-                    str(self.pp_rank).encode("ascii"),
-                ]
-            )
-        except Exception as e:
-            logger.warning(
-                "[Staging] equal-TP staging prefetch failed room=%s chunk=%s: %s",
-                kv_chunk.room,
-                chunk_idx,
-                e,
-            )
+        with self._staging_ctx.request_lock:
+            if stg_key in self._staging_ctx.prefetch_requested:
+                return True
+            self._staging_ctx.prefetch_requested.add(stg_key)
+            try:
+                na = NetworkAddress(req.endpoint, req.dst_port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    [
+                        b"STAGING_REQ",
+                        str(kv_chunk.room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(self.pp_rank).encode("ascii"),
+                    ],
+                    is_ipv6=na.is_ipv6,
+                )
+            except zmq.Again:
+                self._staging_ctx.prefetch_requested.discard(stg_key)
+                logger.warning(
+                    "[Staging] allocation request send timed out room=%s chunk=%s",
+                    kv_chunk.room,
+                    chunk_idx,
+                )
+                return False
+            except Exception:
+                self._staging_ctx.prefetch_requested.discard(stg_key)
+                raise
+            return True
 
     def _do_staging_transfer(
         self,
@@ -576,7 +575,13 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     return (-1, False)
                 with self._staging_ctx.watermark_cv:
-                    self._staging_ctx.watermark_cv.wait(0.01)
+                    ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+                        req,
+                        kv_chunk.index_slice.start,
+                        len(kv_chunk.prefill_kv_indices),
+                    )
+                    if not ready and c_offset != StagingAllocator.ALLOC_OVERSIZED:
+                        self._staging_ctx.watermark_cv.wait(0.01)
             if not ready:
                 # Persistent unreadiness (ring exhausted): re-enqueue, bounded
                 # by the caller's deferral loop, so other rooms still progress.
@@ -1932,17 +1937,22 @@ class MooncakeKVManager(CommonKVManager):
                             # (gather -> 1 bulk -> scatter). Staging allocation
                             # is requested on demand; check_ready spins until
                             # the decode-side STAGING_RSP lands.
-                            self._ensure_equal_tp_staging_req(kv_chunk, req)
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
+                            allocation_sent = self._ensure_equal_tp_staging_req(
+                                kv_chunk, req
                             )
+                            if allocation_sent:
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                    prefill_unique_rank,
+                                )
+                            else:
+                                ret, deferred = -1, False
                             if deferred:
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
@@ -2151,7 +2161,9 @@ class MooncakeKVManager(CommonKVManager):
                         handle_staging_rsp,
                     )
 
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    with self._staging_ctx.watermark_cv:
+                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        self._staging_ctx.watermark_cv.notify_all()
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":

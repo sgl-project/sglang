@@ -61,6 +61,8 @@ class PrefillStagingContext:
     )
     # (room, chunk_idx, session_id) keys for chunks already requested.
     prefetch_requested: set = dataclasses.field(default_factory=set)
+    # Serialize on-demand allocation deduplication and submission.
+    request_lock: object = dataclasses.field(default_factory=threading.Lock)
     # Rooms that have already had their full prefetch fan-out triggered. Used
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
