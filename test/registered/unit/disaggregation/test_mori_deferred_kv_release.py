@@ -397,14 +397,21 @@ class TestMoriFabricStaging(CustomTestCase):
         manager.enable_all_cp_ranks_for_transfer = False
         manager.attn_cp_size = 1
         manager.request_status[11] = KVPoll.WaitingForInput
-        manager.transfer_infos = {11: {
-            "dummy": ns(is_dummy=True),
-            "decode": ns(is_dummy=False, dst_state_indices=[np.arange(128), np.array([5, 6])]),
-        }}
-        manager.decode_kv_args_table = {"decode": ns(
-            dst_staging_size=remote, dst_staging_mem_descs=[object()],
-            requires_dcp_relayout=False,
-        )}
+        manager.transfer_infos = {
+            11: {
+                "dummy": ns(is_dummy=True),
+                "decode": ns(
+                    is_dummy=False, dst_state_indices=[np.arange(128), np.array([5, 6])]
+                ),
+            }
+        }
+        manager.decode_kv_args_table = {
+            "decode": ns(
+                dst_staging_size=remote,
+                dst_staging_mem_descs=[object()],
+                requires_dcp_relayout=False,
+            )
+        }
         return manager
 
     def sender(self, manager, pages):
@@ -429,39 +436,64 @@ class TestMoriFabricStaging(CustomTestCase):
                     sender.init((total + 255) // 256, 3)
                     manager.add_transfer_request = MagicMock()
                     pool = ns(
-                        unified_swa_ring_size=128, unified_swa_window=128,
+                        unified_swa_ring_size=128,
+                        unified_swa_window=128,
                         request_state_transfer_indices=lambda *_: np.array([5, 6]),
                     )
                     req = ns(
-                        rid="prefix", kv=ns(req_pool_idx=0),
-                        origin_input_ids=range(total), extend_end=total,
-                        start_send_idx=0, disagg_decode_prefix_len=0,
-                        disagg_kv_sender=sender, prefix_len=cached,
-                        host_hit_length=0, pending_bootstrap=False,
+                        rid="prefix",
+                        kv=ns(req_pool_idx=0),
+                        origin_input_ids=range(total),
+                        extend_end=total,
+                        start_send_idx=0,
+                        disagg_decode_prefix_len=0,
+                        disagg_kv_sender=sender,
+                        prefix_len=cached,
+                        host_hit_length=0,
+                        pending_bootstrap=False,
                     )
                     scheduler = ns(
-                        enable_staging=False, enable_overlap=False,
+                        enable_staging=False,
+                        enable_overlap=False,
                         token_to_kv_pool_allocator=ns(
-                            page_size=256, translate_kv_indices_for_transfer=lambda x: x,
+                            page_size=256,
+                            translate_kv_indices_for_transfer=lambda x: x,
                             get_kvcache=lambda: pool,
                         ),
-                        req_to_token_pool=ns(req_to_token=torch.arange(total).view(1, -1)),
-                        disagg_metadata_buffers=MagicMock(), kv_checksum_computer=None,
+                        req_to_token_pool=ns(
+                            req_to_token=torch.arange(total).view(1, -1)
+                        ),
+                        disagg_metadata_buffers=MagicMock(),
+                        kv_checksum_computer=None,
                         disagg_prefill_bootstrap_queue=ns(kv_manager=manager),
                         disagg_prefill_pending_chunk_rids=set(),
                     )
                     for name in ("send_kv_chunk", "_send_kv_chunk"):
-                        setattr(scheduler, name, types.MethodType(
-                            getattr(SchedulerDisaggregationPrefillMixin, name), scheduler
-                        ))
-                    with patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=early):
-                        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(scheduler, req)
+                        setattr(
+                            scheduler,
+                            name,
+                            types.MethodType(
+                                getattr(SchedulerDisaggregationPrefillMixin, name),
+                                scheduler,
+                            ),
+                        )
+                    with patch.object(
+                        envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX,
+                        "get",
+                        return_value=early,
+                    ):
+                        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+                            scheduler, req
+                        )
                     scheduler._send_kv_chunk(req, last_chunk=True)
                     calls = manager.add_transfer_request.call_args_list
                     self.assertEqual(len(calls), 5)
-                    self.assertEqual(sum(c.kwargs["num_kv_tokens"] for c in calls), total)
+                    self.assertEqual(
+                        sum(c.kwargs["num_kv_tokens"] for c in calls), total
+                    )
                     np.testing.assert_array_equal(
-                        np.concatenate([c.args[1] for c in calls]), np.arange(sender.num_kv_indices)
+                        np.concatenate([c.args[1] for c in calls]),
+                        np.arange(sender.num_kv_indices),
                     )
                     offset = 0
                     for i, call in enumerate(calls):
@@ -481,7 +513,9 @@ class TestMoriFabricStaging(CustomTestCase):
         for local, remote in ((0, 5000), (5000, 0), (1407, 6500)):
             with self.subTest(local=local, remote=remote):
                 with self.assertRaises(ValueError):
-                    self.sender(self.manager(local, remote), 1).get_max_transfer_tokens()
+                    self.sender(
+                        self.manager(local, remote), 1
+                    ).get_max_transfer_tokens()
         manager = self.manager()
         manager.transfer_infos[11]["decode"].dst_state_indices = []
         with self.assertRaisesRegex(ValueError, "state metadata mismatch"):
@@ -498,20 +532,29 @@ class TestMoriFabricStaging(CustomTestCase):
             (np.arange(20), None, 6500, 5000, "too small"),
             (np.array([-1]), None, 6500, 5000, "negative row"),
             (np.array([64]), None, 6500, 5000, "source overflow"),
-            (np.array([0]), [np.array([128]), np.array([5, 6])], 6500, 5000, "source overflow"),
+            (
+                np.array([0]),
+                [np.array([128]), np.array([5, 6])],
+                6500,
+                5000,
+                "source overflow",
+            ),
         ):
             with self.subTest(error=error, rows=rows):
                 manager = self.manager(local, remote)
                 manager.transfer_infos[11].pop("dummy")
                 storage = torch.full((local + 32,), 165, dtype=torch.uint8)
                 manager._fabric_staging_buffers[0] = types.SimpleNamespace(
-                    get_size=lambda: local, get_ptr=lambda: storage.data_ptr() + 16,
+                    get_size=lambda: local,
+                    get_ptr=lambda: storage.data_ptr() + 16,
                     buffer=storage[16:-16],
                 )
                 chunk = _chunk()
                 chunk.prefill_kv_indices, chunk.state_indices = rows, state
                 chunk.is_last_chunk = state is not None
-                with patch("sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack") as gather:
+                with patch(
+                    "sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack"
+                ) as gather:
                     with self.assertRaisesRegex((ValueError, RuntimeError), error):
                         manager._process_fabric_staging_chunk(chunk, 0)
                     gather.assert_not_called()

@@ -51,7 +51,9 @@ class TestPdDcpGather(CustomTestCase):
         src_rows = torch.tensor([1, 5, 9], dtype=torch.int64, device="cuda")
         dst_rows = torch.tensor([2, 7, 11], dtype=torch.int64, device="cuda")
         prefix = 37
-        pack = torch.zeros(prefix + src_rows.numel() * 12, dtype=torch.uint8, device="cuda")
+        pack = torch.zeros(
+            prefix + src_rows.numel() * 12, dtype=torch.uint8, device="cuda"
+        )
 
         copy_mla_rows_into_pack(
             [src.data_ptr()],
@@ -82,7 +84,10 @@ class TestPdDcpGather(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "overflow before gather"):
             copy_mla_rows_into_pack(
-                [source.data_ptr()], rows, storage[: required - 1], [8],
+                [source.data_ptr()],
+                rows,
+                storage[: required - 1],
+                [8],
                 pack_offset_bytes=4,
             )
         self.assertTrue(torch.all(storage == 165))
@@ -92,7 +97,9 @@ class TestPdDcpGather(CustomTestCase):
         torch.cuda.synchronize()
 
         torch.testing.assert_close(storage[:4], torch.full_like(storage[:4], 165))
-        torch.testing.assert_close(storage[required:], torch.full_like(storage[required:], 165))
+        torch.testing.assert_close(
+            storage[required:], torch.full_like(storage[required:], 165)
+        )
 
     def test_bounded_gather_scatter_preserves_guards(self):
         source = torch.arange(16 * 12, dtype=torch.uint8, device="cuda").view(16, 12)
@@ -114,15 +121,21 @@ class TestPdDcpGather(CustomTestCase):
             copy_mla_rows_into_pack([source.data_ptr()], rows, tx_slot, [12])
             if last:
                 copy_mla_rows_into_pack(
-                    [state.data_ptr()], torch.tensor([1, 3], device="cuda"),
-                    tx_slot, [4], pack_offset_bytes=nbytes,
+                    [state.data_ptr()],
+                    torch.tensor([1, 3], device="cuda"),
+                    tx_slot,
+                    [4],
+                    pack_offset_bytes=nbytes,
                 )
             rx_slot.copy_(tx_slot)
             copy_pack_into_mla_rows(rx_slot, [destination.data_ptr()], targets, [12])
             if last:
                 copy_pack_into_mla_rows(
-                    rx_slot, [state_dst.data_ptr()], torch.tensor([0, 2], device="cuda"),
-                    [4], pack_offset_bytes=nbytes,
+                    rx_slot,
+                    [state_dst.data_ptr()],
+                    torch.tensor([0, 2], device="cuda"),
+                    [4],
+                    pack_offset_bytes=nbytes,
                 )
         torch.cuda.synchronize()
         expected = torch.full_like(source, 165)
