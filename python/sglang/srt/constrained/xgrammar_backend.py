@@ -240,7 +240,6 @@ class TokenizerNotSupportedError(Exception):
 class ThinkingMetadata(msgspec.Struct, frozen=True):
     mask: torch.Tensor
     safe_tokens: bytes
-    think_end_ids: frozenset[int]
     generation_mask_words: tuple[int, ...]
 
 
@@ -248,10 +247,8 @@ class XGrammarThinkingGrammar(XGrammarGrammar):
     def __init__(
         self,
         full: XGrammarGrammar,
-        generation: XGrammarGrammar,
         thinking_mask: torch.Tensor,
         safe_tokens: bytes,
-        think_end_ids: frozenset[int],
         thinking_mask_overrides: tuple[tuple[int, int], ...] = (),
     ):
         super().__init__(
@@ -263,11 +260,8 @@ class XGrammarThinkingGrammar(XGrammarGrammar):
             full.grammar_stats,
             full.batch_matcher,
         )
-        self.full_matcher = full.matcher
-        self.generation = generation
         self.thinking_mask = thinking_mask
         self.safe_tokens = safe_tokens
-        self.think_end_ids = think_end_ids
         self.thinking_mask_overrides = thinking_mask_overrides
         self.phase = "thinking"
         self.accept_modes: List[str] = []
@@ -278,24 +272,17 @@ class XGrammarThinkingGrammar(XGrammarGrammar):
     def accept_token(self, token: int):
         if self.is_terminated():
             return
-        if self.phase == "thinking":
-            if token in self.think_end_ids:
-                self.matcher = self.generation.matcher
-                self.phase = "generation"
-                mode = "boundary"
-            elif 0 <= token < len(self.safe_tokens) and self.safe_tokens[token]:
-                mode = "thinking"
-            else:
-                super().accept_token(token)
-                self.phase = "fallback"
-                self.accept_modes.append("fallback")
-                return
+        if (
+            self.phase == "thinking"
+            and 0 <= token < len(self.safe_tokens)
+            and self.safe_tokens[token]
+        ):
             self.current_token = token
             self.accepted_tokens.append(token)
-            self.accept_modes.append(mode)
         else:
             super().accept_token(token)
-            self.accept_modes.append(self.phase)
+            self.phase = "fallback"
+        self.accept_modes.append(self.phase)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self.phase == "thinking":
@@ -325,29 +312,18 @@ class XGrammarThinkingGrammar(XGrammarGrammar):
             return
         if not 0 <= k <= len(self.accept_modes):
             raise ValueError(f"Cannot roll back {k} of {len(self.accept_modes)} tokens")
-        modes = self.accept_modes[-k:]
-        for matcher, mode in (
-            (self.full_matcher, "fallback"),
-            (self.generation.matcher, "generation"),
-        ):
-            count = modes.count(mode)
-            if count:
-                matcher.rollback(count)
+        count = self.accept_modes[-k:].count("fallback")
+        if count:
+            self.matcher.rollback(count)
         del self.accept_modes[-k:]
         del self.accepted_tokens[-k:]
-        last = self.accept_modes[-1] if self.accept_modes else "thinking"
-        self.phase = "generation" if last == "boundary" else last
-        self.matcher = (
-            self.generation.matcher if self.phase == "generation" else self.full_matcher
-        )
+        self.phase = self.accept_modes[-1] if self.accept_modes else "thinking"
 
     def copy(self):
         return XGrammarThinkingGrammar(
             super().copy(),
-            self.generation.copy(),
             self.thinking_mask,
             self.safe_tokens,
-            self.think_end_ids,
             self.thinking_mask_overrides,
         )
 
@@ -590,8 +566,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             if self._thinking_metadata is None:
                 self._thinking_metadata = self._build_thinking_metadata(grammar)
             metadata = self._thinking_metadata
-        if not metadata.think_end_ids:
-            return grammar
         overrides = ()
         if metadata.generation_mask_words:
             mask = grammar.allocate_vocab_mask(self.vocab_size, 1, "cpu")
@@ -601,19 +575,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 for word in metadata.generation_mask_words
                 if mask[0, word] != metadata.mask[0, word]
             )
-        # Only thinking metadata is shared; generation still encodes the tool schema.
-        ctx = self.grammar_compiler.compile_grammar(
-            key_string, root_rule_name="generation"
-        )
-        generation = self._from_context(
-            ctx, key_string, GrammarStats(dispatch_type="ebnf")
-        )
         return XGrammarThinkingGrammar(
             grammar,
-            generation,
             metadata.mask,
             metadata.safe_tokens,
-            metadata.think_end_ids,
             overrides,
         )
 
@@ -622,7 +587,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         grammar.fill_vocab_mask(mask, 0)
         words = mask[0].tolist()
         safe_tokens = bytearray(self.vocab_size)
-        think_end_ids = set()
         generation_mask_words = set()
         for token_id, value in enumerate(self.tokenizer_info.decoded_vocab):
             if token_id >= self.vocab_size:
@@ -632,8 +596,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 generation_mask_words.add(token_id // 32)
             if not (words[token_id // 32] >> (token_id % 32)) & 1:
                 continue
-            if value == b"</think>":
-                think_end_ids.add(token_id)
             if not value or b"<" in value:
                 continue
             try:
@@ -646,7 +608,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return ThinkingMetadata(
             mask,
             bytes(safe_tokens),
-            frozenset(think_end_ids),
             tuple(sorted(generation_mask_words)),
         )
 
