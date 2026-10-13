@@ -2201,8 +2201,8 @@ def npu_hc_pre(
     # lazily so this kernel module stays free of NPU backend imports elsewhere.
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-    impl = _npu_hc_pre_arch35 if is_npu_arch35() else _npu_hc_pre_custom
-    y, post, comb = impl(
+    hc_pre_impl = _npu_hc_pre_arch35 if is_npu_arch35() else _npu_hc_pre_custom
+    y, post, comb = hc_pre_impl(
         x,
         hc_fn,
         hc_scale,
