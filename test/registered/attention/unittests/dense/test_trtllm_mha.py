@@ -305,9 +305,12 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         )
         # XQA only sees what fmha_v2 left behind through this sharing.
         self.assertIs(decode.backend.workspace_buffer, extend.backend.workspace_buffer)
+        xqa_semaphore = decode.backend.workspace_buffer[:4].view(torch.int32)
+        xqa_semaphore.zero_()
 
         before = run_dense_fixture_eager(decode)
         extended = run_dense_fixture_eager(extend)
+        self.assertEqual(xqa_semaphore.item(), 0)
         after = run_dense_fixture_eager(decode)
 
         for fixture, actual in ((decode, before), (extend, extended)):
