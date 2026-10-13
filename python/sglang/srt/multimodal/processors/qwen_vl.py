@@ -43,6 +43,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.qwen_vl_token_space import (
+    QwenVLMultimodalProcessorOutputBuilder,
+)
 from sglang.srt.multimodal.qwen_vl_media_processing import (
     IMAGE_FACTOR,
     _get_processor_video_config,
@@ -146,6 +149,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.output_builder = QwenVLMultimodalProcessorOutputBuilder(hf_config)
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
