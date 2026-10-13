@@ -150,6 +150,44 @@ struct MockKvcm {
     state: Arc<Mutex<MockState>>,
 }
 
+/// The registration fields KVCM requires of every `RegisterInstance`
+/// (`MetaServiceImpl::RegisterInstance`), so that a registration the mock
+/// accepts is one a real manager accepts too.
+fn validate_registration(request: &RegisterInstanceRequest) -> Option<String> {
+    if request.instance_group.is_empty() {
+        return Some("RegisterInstance without instance_group".into());
+    }
+    if request.instance_id.is_empty() {
+        return Some("RegisterInstance without instance_id".into());
+    }
+    if request.block_size <= 0 {
+        return Some(format!(
+            "RegisterInstance with block_size {}",
+            request.block_size
+        ));
+    }
+    let Some(deployment) = request.model_deployment.as_ref() else {
+        return Some("RegisterInstance without a model_deployment".into());
+    };
+    if deployment.model_name.is_empty() {
+        return Some("model_deployment without model_name".into());
+    }
+    if deployment.dtype.is_empty() {
+        return Some("model_deployment without dtype".into());
+    }
+    if request.location_spec_infos.is_empty() {
+        return Some("RegisterInstance without location_spec_infos".into());
+    }
+    if request
+        .location_spec_infos
+        .iter()
+        .any(|spec| spec.name.is_empty())
+    {
+        return Some("location_spec_infos with an empty name".into());
+    }
+    None
+}
+
 #[tonic::async_trait]
 impl MetaService for MockKvcm {
     async fn register_instance(
@@ -157,14 +195,16 @@ impl MetaService for MockKvcm {
         request: Request<RegisterInstanceRequest>,
     ) -> Result<Response<RegisterInstanceResponse>, Status> {
         let request = request.into_inner();
+        let violation = validate_registration(&request);
         let error = {
             let mut state = MockState::lock(&self.state);
             state.registrations.push(request);
             state.register_error.clone()
         };
-        let header = match error {
-            Some((code, message)) => err_header(code, &message),
-            None => ok_header(),
+        let header = match (error, violation) {
+            (Some((code, message)), _) => err_header(code, &message),
+            (None, None) => ok_header(),
+            (None, Some(reason)) => err_header(ErrorCode::InvalidArgument, &reason),
         };
         Ok(Response::new(RegisterInstanceResponse {
             header: Some(header),
@@ -498,6 +538,8 @@ async fn auto_register_registers_once_with_spec_names() {
     config.auto_register = Some(sgl_kv_indexer::KvcmAutoRegister {
         instance_group: "group-a".into(),
         block_size: 16,
+        model_name: "qwen3-8b".into(),
+        dtype: "FP8".into(),
     });
     let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
 
@@ -534,6 +576,14 @@ async fn auto_register_registers_once_with_spec_names() {
         registration.default_query_type,
         QueryType::QtPrefixMatch as i32
     );
+    // KVCM rejects a registration without a model deployment and a positive
+    // block size, so both must be on the wire.
+    let deployment = registration
+        .model_deployment
+        .as_ref()
+        .expect("registration carries the model deployment KVCM requires");
+    assert_eq!(deployment.model_name, "qwen3-8b");
+    assert_eq!(deployment.dtype, "FP8");
     // Both batches were forwarded after the registration.
     assert_eq!(state.reports.len(), 2);
 }

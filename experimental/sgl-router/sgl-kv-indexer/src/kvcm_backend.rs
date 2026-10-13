@@ -39,7 +39,9 @@
 //! * The instance is not registered by default. Deployments running the KVCM
 //!   connector already registered it with the real model deployment, and
 //!   `RegisterInstance` fails with `DUPLICATE_ENTITY` on any field mismatch.
-//!   Auto-registration is opt-in for routing-only deployments.
+//!   Auto-registration is opt-in for routing-only deployments, and has to
+//!   restate the model name, dtype and block size KVCM requires of every
+//!   registration ([`KvcmAutoRegister`]).
 //! * The reporter→address map is process-local: after an indexer restart,
 //!   prefix answers stay empty until each worker's next batch restates its
 //!   address. KVCM's own placements survive; only the join is lost.
@@ -62,8 +64,8 @@ use crate::kvcm_pb::meta_service_client::MetaServiceClient;
 use crate::kvcm_pb::{
     event_item, BlockAddEventParams, BlockDeleteEventParams, CommonResponseHeader, ErrorCode,
     EventItem, GetHostCacheStateRequest, GetHostCacheStateResponse, HeartbeatEventParams,
-    HostCacheMatch, LocationSpec, LocationSpecInfo, NodeRegisterEventParams, QueryType,
-    RegisterInstanceRequest, ReportEventRequest, ReportEventType, StorageType,
+    HostCacheMatch, LocationSpec, LocationSpecInfo, ModelDeployment, NodeRegisterEventParams,
+    QueryType, RegisterInstanceRequest, ReportEventRequest, ReportEventType, StorageType,
 };
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
@@ -103,6 +105,8 @@ const ENV_REPORT_TIERS: &str = "KV_INDEXER_KVCM_REPORT_TIERS";
 const ENV_AUTO_REGISTER: &str = "KV_INDEXER_KVCM_AUTO_REGISTER";
 const ENV_INSTANCE_GROUP: &str = "KV_INDEXER_KVCM_INSTANCE_GROUP";
 const ENV_BLOCK_SIZE: &str = "KV_INDEXER_KVCM_BLOCK_SIZE";
+const ENV_MODEL_NAME: &str = "KV_INDEXER_KVCM_MODEL_NAME";
+const ENV_MODEL_DTYPE: &str = "KV_INDEXER_KVCM_MODEL_DTYPE";
 const ENV_QUERY_TIMEOUT_MS: &str = "KV_INDEXER_KVCM_QUERY_TIMEOUT_MS";
 const ENV_APPLY_TIMEOUT_MS: &str = "KV_INDEXER_KVCM_APPLY_TIMEOUT_MS";
 const ENV_HEARTBEAT_INTERVAL_MS: &str = "KV_INDEXER_KVCM_HEARTBEAT_INTERVAL_MS";
@@ -146,10 +150,21 @@ impl std::error::Error for KvcmConfigError {}
 /// Instance registration sent once before the first event batch. Only for
 /// routing-only deployments; deployments running the KVCM connector must leave
 /// this off (see module docs).
+///
+/// KVCM refuses a registration that omits the model deployment or a positive
+/// block size (`MetaServiceImpl::RegisterInstance`), so both are required here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvcmAutoRegister {
     pub instance_group: String,
     pub block_size: u32,
+    /// The routed deployment's identity, as a KVCM `ModelDeployment`. The
+    /// indexer only knows the fleet's workers, not the model they serve, so the
+    /// operator states the name and dtype KVCM demands. Every other
+    /// `ModelDeployment` field keeps its KVCM default, which means registering
+    /// on top of a connector-registered instance fails `DUPLICATE_ENTITY`
+    /// unless that deployment matched the defaults too.
+    pub model_name: String,
+    pub dtype: String,
 }
 
 /// KVCM backend configuration.
@@ -213,9 +228,19 @@ impl KvcmBackendConfig {
                 let block_size = parse_u64(ENV_BLOCK_SIZE, 0)?;
                 let block_size = u32::try_from(block_size)
                     .map_err(|_| KvcmConfigError::invalid(ENV_BLOCK_SIZE, "value exceeds u32"))?;
+                if block_size == 0 {
+                    return Err(KvcmConfigError::invalid(
+                        ENV_BLOCK_SIZE,
+                        "must be the fleet's block size; KVCM rejects a missing or zero value",
+                    ));
+                }
                 config.auto_register = Some(KvcmAutoRegister {
                     instance_group,
                     block_size,
+                    model_name: env_nonempty(ENV_MODEL_NAME)
+                        .ok_or(KvcmConfigError::Missing(ENV_MODEL_NAME))?,
+                    dtype: env_nonempty(ENV_MODEL_DTYPE)
+                        .ok_or(KvcmConfigError::Missing(ENV_MODEL_DTYPE))?,
                 });
             } else if flag != "0" && !flag.eq_ignore_ascii_case("false") {
                 return Err(KvcmConfigError::invalid(
@@ -513,6 +538,17 @@ fn carries_node_register(events: &[EventItem]) -> bool {
         .any(|event| event.event_type == ReportEventType::EventNodeRegister as i32)
 }
 
+/// Whether an event list mutates placements. KVCM answers `snapshot_required`
+/// for a reporter with no committed snapshot version, and the request that
+/// creates one is a delta request (see `CacheManager::refresh_snapshot_response`).
+fn carries_delta(events: &[EventItem]) -> bool {
+    events.iter().any(|event| {
+        event.event_type == ReportEventType::EventBlockAdd as i32
+            || event.event_type == ReportEventType::EventBlockDelete as i32
+            || event.event_type == ReportEventType::EventBlockSnapshot as i32
+    })
+}
+
 /// One apply batch, translated. Event order matches action order.
 struct TranslatedBatch {
     events: Vec<EventItem>,
@@ -722,6 +758,7 @@ impl Inner {
         timeout: Duration,
     ) -> Result<(), Status> {
         let registered_node = carries_node_register(&events);
+        let has_delta = carries_delta(&events);
         let mut client = self.client.clone();
         let mut request = Request::new(ReportEventRequest {
             trace_id: self.next_trace("apply"),
@@ -743,10 +780,25 @@ impl Inner {
             self.set_node_registered(host, false);
         }
         if response.snapshot_required {
-            tracing::info!(
-                host,
-                "KVCM requests a reconciliation snapshot; the index under-reports until live blocks are re-reported"
-            );
+            // KVCM asks for a reconciliation snapshot while the reporter has no
+            // committed snapshot version, and the first delta of a lifecycle is
+            // what creates that version — so this marks a lifecycle start, not
+            // a fault. A request that carries deltas is that start; anything
+            // else (a heartbeat, a report that translated to nothing) is a
+            // reporter that never wrote a delta, which is only worth a debug
+            // line: this backend holds no placement state and cannot reconcile
+            // either way.
+            if has_delta {
+                tracing::info!(
+                    host,
+                    "KVCM has no committed snapshot for this reporter; it stays delta-only"
+                );
+            } else {
+                tracing::debug!(
+                    host,
+                    "KVCM still has no committed snapshot for this reporter"
+                );
+            }
         }
         // Header first, then items: one failure, one classification.
         check_header(response.header.as_ref(), "ReportEvent")?;
@@ -826,7 +878,11 @@ impl Inner {
                     size: 0,
                 })
                 .collect(),
-            model_deployment: None,
+            model_deployment: Some(ModelDeployment {
+                model_name: auto.model_name.clone(),
+                dtype: auto.dtype.clone(),
+                ..Default::default()
+            }),
             location_spec_groups: Vec::new(),
             default_query_type: QueryType::QtPrefixMatch as i32,
         });

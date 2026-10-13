@@ -303,9 +303,12 @@ Configuration variables (all under `KV_INDEXER_KVCM_`):
 - `STORAGE_TYPE`: event-report channel, `l1p5` (default) or `l2`, matching what
   the deployment's KVCM admin provisioned
 - `REPORT_TIERS`: tiers whose events are forwarded, default `HBM` (see below)
-- `AUTO_REGISTER` (default `0`), `INSTANCE_GROUP`, `BLOCK_SIZE`: opt-in
-  `RegisterInstance` before the first batch, declaring the `full,swa,mamba`
-  spec names
+- `AUTO_REGISTER` (default `0`) with `INSTANCE_GROUP`, `BLOCK_SIZE`,
+  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` before the first batch.
+  It declares the `full,swa,mamba` spec names, and restates the block size and
+  model deployment KVCM requires of every registration (a registration without
+  a model name/dtype, or with a non-positive block size, is rejected
+  `INVALID_ARGUMENT`).
 - `QUERY_TIMEOUT_MS` (default 50, half the Router-side prefix deadline),
   `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch)
 - `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats)
@@ -315,7 +318,8 @@ instance group listing it as an `event_report_storage_candidates` entry, and a
 registered instance — either by the workers' own KVCM connector (the common
 case; leave `AUTO_REGISTER` off, since `RegisterInstance` fails with
 `DUPLICATE_ENTITY` on any field mismatch) or by `AUTO_REGISTER=1` in
-routing-only deployments.
+routing-only deployments, which then also has to carry the deployment's model
+name, dtype and block size.
 
 Semantics and limitations:
 
@@ -351,9 +355,20 @@ Semantics and limitations:
 - The reporter→address map is process-local: after an indexer restart, prefix
   answers stay empty until each worker's next apply batch restates its
   address. KVCM's own placements survive; only the join is lost.
-- `snapshot_required` is advisory: the backend holds no placement state, so it
-  cannot rebuild a snapshot after KVCM-side cleanup. Until live blocks are
-  re-reported the index under-reports (the safe direction).
+- `snapshot_required` is advisory: KVCM sets it while a reporter has no
+  committed snapshot version, which is the normal state of a delta-only
+  reporter — the request that writes its first delta creates that version — so
+  the backend logs it once per reporter lifecycle and never sends a snapshot.
+  It holds no placement state, so it could not rebuild one after KVCM-side
+  cleanup anyway; until live blocks are re-reported the index under-reports
+  (the safe direction).
+- Reporter liveness is real and destructive: KVCM marks a reporter unavailable
+  after its configured heartbeat timeout and then *deletes* that reporter's
+  placements once the cleanup grace has passed, so a deployment whose KVCM
+  liveness is tighter than `HEARTBEAT_INTERVAL_MS` loses cache affinity for
+  idle workers. After such a cleanup the next plain report fails
+  `NODE_NOT_REGISTERED`; the retry re-registers the reporter, but the reclaimed
+  blocks stay gone until the worker re-reports them.
 - A `NODE_REGISTER` is resent whenever a report fails with
   `NODE_NOT_REGISTERED` (a reporter KVCM forgot) or never succeeded, and each
   heartbeat re-registers in passing. `NODE_NOT_REGISTERED` itself is
@@ -377,3 +392,43 @@ cargo test
 
 `tests/kvcm_contract.rs` runs the KVCM backend against an in-process mock
 MetaService, including one end-to-end pass behind the real `KVIndexer` service.
+
+## Live KVCM integration
+
+`tests/kvcm_live.rs` runs the backend against a real Tair KVCache Manager. It is
+`#[ignore]`d and gated on `KVCM_LIVE_ENDPOINT`, so a normal `cargo test` never
+touches it.
+
+`tests/kvcm_live/setup_kvcm.py` builds the manager's own process and
+configuration: it starts `kv_cache_manager_bin`, provisions two event-report
+storages (L1P5 and L2) and an instance group listing them, and registers an
+instance declaring the `full,swa,mamba` spec names. Everything is one command:
+
+```bash
+# once, in the tair-kvcache checkout
+bazelisk build //kv_cache_manager:kv_cache_manager_bin
+
+# in experimental/sgl-router
+python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live
+source /tmp/kvcm-live/kvcm_live.env
+cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored
+python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
+```
+
+`start` is idempotent (`config` re-applies provisioning, `status` reports the
+process, `stop` kills it), and the workdir keeps the manager's registry, logs and
+a `kvcm_live.env` with the endpoints and instance names the tests read. Pass
+`--kvcm-repo` / `--binary` if the checkout or the binary moved.
+
+The harness provisions deliberately tight liveness (2s heartbeat timeout, 2s
+cleanup grace) so the reclamation tests finish in seconds; production values are
+an order of magnitude larger. That is why every test states its own heartbeat
+interval, and why a deployment should keep `HEARTBEAT_INTERVAL_MS` well below
+whatever the KVCM admin configured.
+
+The suite pins, among others: the `RegisterInstance` fields KVCM requires, the
+`BLOCK_ADD`/`BLOCK_DELETE` spec-name and URI rules, `NODE_REGISTER` resend
+idempotency, reporter liveness and the `NODE_NOT_REGISTERED` self-heal, the
+reported-medium filter, `snapshot_required` semantics, and the raw
+`p2p_host_count = 0` answer (`local`-only, `p2p_1_total_match == local`,
+`p2p_1_fetch == 0`).
