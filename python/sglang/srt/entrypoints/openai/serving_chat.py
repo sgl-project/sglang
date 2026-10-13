@@ -1951,7 +1951,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # media in its messages; the client's ids carry one placeholder per item,
             # which the multimodal processor expands in place (SGLANG_MM_AVOID_RETOKENIZE).
             image_data, video_data, audio_data, modalities = (
-                self._collect_media_for_pretokenized(request) if is_multimodal else ([], [], [], [])
+                self._collect_media_for_pretokenized(request)
+                if is_multimodal
+                else ([], [], [], [])
             )
             result = MessageProcessingResult(
                 prompt="",
