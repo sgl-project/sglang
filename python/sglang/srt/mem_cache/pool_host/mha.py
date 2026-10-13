@@ -142,6 +142,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
     ):
+        for pool in (device_pool, *mtp_draft_device_pools):
+            if pool.store_dtype == torch.uint8 and pool.k_scale_buffer is not None:
+                raise ValueError(
+                    f"{pool_label}: MHA host transfers do not support packed uint8 "
+                    f"KV with separate block scales (pool={type(pool).__name__})."
+                )
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
         # Transfer buffers are captured below. The pool remains available for
