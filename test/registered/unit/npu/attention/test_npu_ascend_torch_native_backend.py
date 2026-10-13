@@ -10,11 +10,27 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
+    reference_swa_decode_mask,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
+
+
+class TestReferenceSWADecodeMask(CustomTestCase):
+    def test_non_aligned_references_suffix_and_padding(self):
+        """References survive past W; holes and graph padding remain invisible."""
+        lengths = torch.tensor([0, 1, 11, 139, 140, 257, 386, 900])
+        references = torch.tensor([0, 1, 11, 11, 11, 257, 257, 257])
+        mask = reference_swa_decode_mask(lengths, references, torch.arange(1024), 128)
+        for row, (length, reference) in enumerate(
+            zip(lengths.tolist(), references.tolist())
+        ):
+            visible = set(range(min(reference, length)))
+            visible.update(range(max(reference, length - 128), length))
+            expected = torch.tensor([pos not in visible for pos in range(1024)])
+            self.assertTrue(torch.equal(mask[row, 0], expected))
 
 
 class TestScaledDotProductAttentionWithSoftcapping(unittest.TestCase):

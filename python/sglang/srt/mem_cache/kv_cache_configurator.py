@@ -2492,6 +2492,20 @@ class KVCacheConfigurator:
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
+                    if (
+                        sizes.full_max_total_num_tokens == 0
+                        and getattr(self.model_config.hf_config, "model_type", None)
+                        == "unlimited-ocr"
+                    ):
+                        token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
+                            sizes.swa_max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
+                        return token_to_kv_pool_allocator
                     if is_dsv4_model:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,

@@ -3947,11 +3947,7 @@ class TestUnlimitedOCRAscendOverrides(CustomTestCase):
                     for _, declaration in declarations
                     for field in declaration.items()
                 )
-                if is_npu:
-                    self.assertTrue(updates["disable_hybrid_swa_memory"])
-                    self.assertTrue(updates["disable_radix_cache"])
-                else:
-                    self.assertEqual(updates, {})
+                self.assertEqual(updates, {})
         self.assertFalse(args.disable_hybrid_swa_memory)
         self.assertFalse(args.disable_radix_cache)
 

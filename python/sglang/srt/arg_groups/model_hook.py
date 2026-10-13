@@ -757,28 +757,6 @@ def handle_model_capability_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
 
-    if get_platform().is_npu and "UnlimitedOCRForCausalLM" in getattr(
-        hf_config, "architectures", []
-    ):
-        # Multi-page OCR can repeat the first image when the prompt is split
-        # across chunks. Serve the reference prompt in one causal prefill.
-        declare_resolution(
-            server_args,
-            "_handle_model_capability_adjustments",
-            chunked_prefill_size=-1,
-        )
-        # Reference SWA compacts a different generated-token suffix per request.
-        # Its eager native path is not graph safe. Graph config is a computed
-        # capability declaration, rather than a publishable model override.
-        for phase in Phase.ALL:
-            declare_resolution(
-                server_args,
-                "_handle_model_capability_adjustments",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
-                ),
-            )
-
     # HRM-Text needs bidirectional prompt attention (prefill), which only
     # the Triton backend honors at the kernel level. Radix/prefix reuse is
     # also unsafe: the recurrent forward writes direction-dependent KV
