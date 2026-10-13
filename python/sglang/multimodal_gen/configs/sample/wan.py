@@ -297,6 +297,12 @@ class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
         ]
     )
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        # Without these the video API has no audio input, so every served S2V
+        # request is rejected. Each takes a local path or an http(s) URL.
+        return frozenset({"audio_path", "pose_video_path", "num_clip"})
+
 
 @dataclass
 class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):
