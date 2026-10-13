@@ -1,5 +1,6 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
+import contextlib
 import itertools
 import math
 import os
@@ -27,7 +28,10 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.beam import (
@@ -39,6 +43,7 @@ from sglang.srt.models.beam import (
     apply_ssmax,
     compute_ssmax_scale,
     depth_scaled_residual,
+    get_beam_quantization,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.hf_transformers import get_context_length
@@ -145,6 +150,12 @@ def stub_beam_model(layers, norm, layers_to_capture):
     return model
 
 
+# MegaMOE requires TP == DP == EP: four attention-DP ranks, experts split four ways.
+_DP4_MEGAMOE_LAYOUT = dict(
+    tp_size=4, attn_tp_size=1, attn_dp_size=4, moe_tp_size=1, moe_ep_size=4
+)
+
+
 class TestBeamConfig(CustomTestCase):
     def test_fully_data_parallel_dense_mlp_fails_before_allocation(self):
         # Dense layers gather attention-DP tokens over the full TP group; a
@@ -176,6 +187,69 @@ class TestBeamConfig(CustomTestCase):
                     self.assertRaisesRegex(ValueError, "auto or triton"),
                 ):
                     BeamMoE(tiny_config(), 1, quant_config=quant)
+
+    def test_megamoe_builds_one_expert_set_with_explicit_routing(self):
+        from sglang.srt.runtime_context import get_flags
+
+        built = []
+
+        def make_experts(**kwargs):
+            built.append(kwargs["prefix"])
+            experts = torch.nn.Module()
+            experts.should_fuse_routed_scaling_factor_in_topk = True
+            return experts
+
+        def megamoe_context(runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE):
+            stack = contextlib.ExitStack()
+            stack.enter_context(get_context().override_server_args())
+            stack.enter_context(
+                get_flags().moe.override(
+                    runner_backend=runner_backend,
+                    a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+                )
+            )
+            stack.enter_context(get_parallel().override(**_DP4_MEGAMOE_LAYOUT))
+            return stack
+
+        nvfp4 = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        with (
+            megamoe_context(),
+            patch(
+                "sglang.srt.models.beam.get_moe_impl_class",
+                return_value=make_experts,
+            ),
+        ):
+            moe = BeamMoE(
+                tiny_config(), 1, prefix="model.layers.1.mlp", quant_config=nvfp4
+            )
+
+        self.assertEqual(built, ["model.layers.1.mlp.experts"])
+        # MegaMOE dispatches on explicit expert ids and weights.
+        self.assertEqual(moe.topk.topk_config.output_format, TopKOutputFormat.STANDARD)
+        self.assertTrue(moe.topk.topk_config.apply_routed_scaling_factor_on_output)
+
+        rejected = {
+            "bf16": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "fp8": (fp8_config(), MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            # Compressed-tensors NVFP4 has no MegaMOE weight preparation.
+            "non_modelopt_nvfp4": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "trtllm_runner": (nvfp4, MoeRunnerBackend.FLASHINFER_TRTLLM),
+        }
+        for case, (quant, runner) in rejected.items():
+            with (
+                self.subTest(case=case),
+                megamoe_context(runner),
+                patch(
+                    "sglang.srt.models.beam.get_beam_quantization",
+                    return_value=(
+                        "nvfp4"
+                        if case == "non_modelopt_nvfp4"
+                        else get_beam_quantization(quant)
+                    ),
+                ),
+                self.assertRaisesRegex(ValueError, "only for ModelOpt NVFP4"),
+            ):
+                BeamMoE(tiny_config(), 1, quant_config=quant)
 
     def test_unsupported_quantization_fails_before_allocation(self):
         # Other FP8 layouts must not pass merely because they use the same exporter.
@@ -533,6 +607,62 @@ class TestBeamNumerics(CustomTestCase):
                 else:
                     topk.forward.assert_not_called()
                     topk.empty_topk_output.assert_called_once()
+
+    def test_megamoe_runs_sparse_layers_on_dp_local_tokens(self):
+        from sglang.srt.runtime_context import get_flags
+
+        with (
+            get_context().override_server_args(),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE,
+                a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+            ),
+            get_parallel().override(**_DP4_MEGAMOE_LAYOUT),
+            patch(
+                "sglang.srt.models.beam.BeamAttention",
+                return_value=torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMLP", return_value=torch.nn.Identity()),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+        ):
+            dense, sparse = (BeamDecoderLayer(tiny_config(), i) for i in (0, 1))
+            # Dense MLPs stay TP-sharded over the gathered tokens.
+            self.assertTrue(dense.gather_mlp_tokens)
+            self.assertFalse(sparse.gather_mlp_tokens)
+
+            # MegaMOE returns complete tokens, so the block owes no all-reduce.
+            moe = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(moe)
+            moe.layer_id, moe.tp_size, moe.ep_size = 1, 1, 4
+            moe.use_fp32_router = moe.refresh_correction_bias = False
+            moe.gate = Mock(return_value=(torch.zeros(2, 8), None))
+            moe.topk = Mock(return_value="routing")
+            moe.topk.empty_topk_output = Mock(return_value="empty routing")
+            moe.experts = Mock(side_effect=lambda hidden, routing: hidden + 6)
+            sparse.mlp = moe
+            with (
+                patch(
+                    "sglang.srt.models.beam.moe_expert_parallel_all_reduce"
+                ) as ep_all_reduce,
+                patch(
+                    "sglang.srt.models.beam.moe_tensor_model_parallel_all_reduce"
+                ) as tp_all_reduce,
+                patch("sglang.srt.models.beam.dp_gather_replicate") as gather,
+            ):
+                local = torch.ones(2, 3)
+                output = sparse._forward_mlp(local, SimpleNamespace())
+                # An idle rank still enters the MegaMOE collective.
+                idle = torch.empty(0, 3)
+                idle_output = sparse._forward_mlp(idle, SimpleNamespace())
+            self.assertEqual(
+                [call.args for call in moe.experts.call_args_list],
+                [(local, "routing"), (idle, "empty routing")],
+            )
+            gather.assert_not_called()
+            ep_all_reduce.assert_not_called()
+            tp_all_reduce.assert_not_called()
+            torch.testing.assert_close(output, torch.full((2, 3), 7.0))
+            self.assertEqual(idle_output.shape, (0, 3))
 
     def _select_beam_experts(self, config, bias, logits):
         # Exercise the TopK constructed by Beam, replacing only the hardware

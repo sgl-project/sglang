@@ -203,13 +203,27 @@ class BeamMoE(nn.Module):
         backend = get_moe_runner_backend()
         quant_scheme = get_beam_quantization(quant_config)
         supported_runners = get_beam_supported_moe_runners(quant_scheme)
-        if (
+        if get_moe_a2a_backend().is_flashinfer_megamoe():
+            # MegaMOE dispatches each DP rank's own tokens and combines them back
+            # complete, so the post-experts all-reduces below are skipped.
+            # Only the ModelOpt NVFP4 MoE method has MegaMOE weight hooks.
+            if (
+                quant_scheme != "nvfp4"
+                or not isinstance(quant_config, ModelOptFp4Config)
+                or not backend.is_flashinfer_megamoe()
+            ):
+                raise ValueError(
+                    "Beam supports the flashinfer_megamoe all-to-all only for "
+                    "ModelOpt NVFP4 with the flashinfer_megamoe runner"
+                )
+        elif (
             backend.value not in supported_runners
             or not get_moe_a2a_backend().is_none()
         ):
             raise ValueError(
                 "Beam supports the auto or triton MoE runner for BF16/FP8 "
-                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all"
+                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all; "
+                "NVFP4 also supports the flashinfer_megamoe all-to-all"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -608,7 +622,12 @@ class BeamDecoderLayer(nn.Module):
         )
         # The MLP is sharded over the full TP group, so attention-DP ranks
         # gather their tokens around it; norms and residuals stay DP-local.
-        self.gather_mlp_tokens = get_parallel().attn_dp_size > 1
+        # The MegaMOE all-to-all instead takes each DP rank's own tokens; every
+        # EP rank enters it on every forward, including ranks with no tokens.
+        self.gather_mlp_tokens = get_parallel().attn_dp_size > 1 and not (
+            config.mlp_layer_types[layer_id] != "dense"
+            and get_moe_a2a_backend().is_flashinfer_megamoe()
+        )
 
     def _forward_mlp(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
