@@ -262,11 +262,14 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
-            dst = cache.conv[i][:, active_slots]
-            val = c[:, ckpt_slots].to(dst.dtype)
-            if dst.shape[-2:] != val.shape[-2:]:
+            val = c[:, ckpt_slots].to(cache.conv[i].dtype)
+            # Compare against the unsliced buffer: [:, idx] only affects dim 1,
+            # so the full buffer's last gtwo dims are the target layout. Assign
+            # with indexed setitem — a getitem copy + in-place write would be
+            # silently discarded.
+            if val.shape[-2:] != cache.conv[i].shape[-2:]:
                 val = val.transpose(-1, -2)
-            dst[:] = val
+            cache.conv[i][:, active_slots] = val
 
     @staticmethod
     def estimate_mem_usage_bytes(
