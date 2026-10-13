@@ -594,6 +594,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.transfer_infos = {}
                 manager._staging_outstanding = {42: outstanding}
                 manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
+                manager._deferred_ack_poisoned_rooms = set()
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:

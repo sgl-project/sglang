@@ -236,6 +236,77 @@ def test_fused_block_expansion(requests, width, dtype, padding, chain_positions)
         torch.testing.assert_close(actual.float(), ref.float(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("width", [1, 4])
+def test_fused_block_expansion_writes_only_visible_pages(width):
+    """With visible_page_size, a row's packed K/V matches the full write up to its
+    valid count rounded up to the page (counts at, below and past page edges),
+    and nothing after that page is written."""
+    torch.manual_seed(7)
+    page, stride = 64, 2112
+    bases = [1, 2, 3, 4, 5, 63, 64, 65, 127, 128, 129, 2047, 2048, 2049, 2052, 8192]
+    requests = len(bases)
+    rows, length = requests * width, 9216
+    mapping = (torch.randperm(requests * length, device="cuda") + 1).view(
+        requests, length
+    )
+    req = torch.arange(requests, device="cuda").repeat_interleave(width).int()
+    lens = torch.tensor(
+        [bases[r // width] + r % width for r in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = lens - 1
+    loc = mapping[req.long(), positions.long()].contiguous()
+    blocks = torch.full((rows, 512), -1, device="cuda", dtype=torch.int32)
+    for row in range(rows):
+        n = int(lens[row]) // 4
+        chosen = torch.randperm(n, device="cuda")[:512]
+        blocks[row, : chosen.numel()] = chosen.int()
+    k = torch.randn(requests * length + 1, 1, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    nk = torch.randn(rows, 1, 256, device="cuda", dtype=torch.bfloat16)
+    nv = torch.randn_like(nk)
+
+    def run(visible_page_size, fill):
+        kc, vc = k.clone(), v.clone()
+        counts = torch.empty(rows, device="cuda", dtype=torch.int32)
+        ok = torch.full(
+            (rows * stride, 1, 256), fill, device="cuda", dtype=torch.bfloat16
+        )
+        ov = torch.full_like(ok, fill)
+        fused_kv_prepare(
+            kc,
+            vc,
+            nk,
+            nv,
+            loc,
+            mapping,
+            req,
+            blocks,
+            lens,
+            counts,
+            ok,
+            ov,
+            width,
+            compress_ratio=4,
+            query_positions=positions,
+            chain_positions=True,
+            visible_page_size=visible_page_size,
+        )
+        return kc, vc, counts, ok.view(rows, stride, -1), ov.view(rows, stride, -1)
+
+    full = run(0, 0.0)
+    paged = run(page, float("nan"))
+    for actual, ref in zip(paged[:3], full[:3]):
+        assert torch.equal(actual, ref)
+    counts = full[2]
+    for row in range(rows):
+        visible = -(-int(counts[row]) // page) * page
+        for actual, ref in zip(paged[3:], full[3:]):
+            assert torch.equal(actual[row, :visible], ref[row, :visible])
+            assert torch.isnan(actual[row, visible:]).all()
+
+
 def test_block_indices_expand_on_attention_fallback(monkeypatch):
     from types import SimpleNamespace
 
