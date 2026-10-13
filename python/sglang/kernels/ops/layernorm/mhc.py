@@ -2126,8 +2126,6 @@ def hc_post(
 
 # Ascend 950 (NPU arch35, SOC 3510) is the only SKU that ships the official
 # torch_npu mHC ops. A2/A3 keep the fused cann-recipes ``custom.npu_hc_pre``.
-# ``inner_precise=1`` runs the Cube in HF32, matching the fused op's to_hf32 GEMM.
-_NPU_MHC_PRE_INNER_PRECISE = 1
 
 
 def _npu_use_torch_npu_mhc() -> bool:
@@ -2161,13 +2159,13 @@ def _npu_hc_pre_arch35(
         norm_eps=rms_norm_eps,
         hc_eps=hc_eps,
         out_flag=0,
-        inner_precise=_NPU_MHC_PRE_INNER_PRECISE,
     )[:3]
+    # num_iters/eps only; out_flag is left at its default (0) because not every
+    # torch_npu build exposes it on the sinkhorn op.
     sink = torch_npu.npu_mhc_sinkhorn(
         h_res,
         eps=hc_eps,
         num_iters=hc_sinkhorn_iters,
-        out_flag=0,
     )
     comb = sink[0] if isinstance(sink, (tuple, list)) else sink
     return h_in, h_post, comb
