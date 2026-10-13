@@ -2230,11 +2230,25 @@ def npu_hc_pre(
     # A2/A3 fall through to the legacy fused kernel.
     if _npu_use_torch_npu_mhc():
         y, post, comb = _npu_hc_pre_arch35(
-            x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, rms_norm_eps, hc_eps
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            hc_mult,
+            hc_sinkhorn_iters,
+            rms_norm_eps,
+            hc_eps,
         )
     else:
         y, post, comb = _npu_hc_pre_custom(
-            x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, rms_norm_eps, hc_eps
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            hc_mult,
+            hc_sinkhorn_iters,
+            rms_norm_eps,
+            hc_eps,
         )
     # Both paths return y in the sinkhorn fp32 dtype; cast back to the input
     # dtype before the downstream aclnnRmsNorm (which has no x=fp32 / gamma=bf16
