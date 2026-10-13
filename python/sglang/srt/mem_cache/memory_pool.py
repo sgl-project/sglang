@@ -1516,6 +1516,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
             mamba_size=mamba_size,
             cache_params=cache_params,
+            conv_shapes=[conv.shape[2:] for conv in self.mamba_pool.mamba_cache.conv],
             mamba_layer_ids=mamba_layer_ids,
             device=device,
         )
