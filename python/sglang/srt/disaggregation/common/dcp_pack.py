@@ -7,7 +7,10 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    copy_mla_rows_into_pack,
+    copy_pack_into_mla_rows,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 
 logger = logging.getLogger(__name__)
@@ -88,6 +91,33 @@ def try_pack_dcp_src(
         packed_ptrs.append(base + offset)
         offset += n * int(item_len)
     return packed_ptrs, np.arange(n, dtype=np.int64)
+
+
+def scatter_dcp_dst(
+    *,
+    pack_buffer: StagingBuffer,
+    kv_data_ptrs: Sequence[int],
+    dst_token_indices: npt.NDArray[np.integer],
+    token_item_lens: Sequence[int],
+    dst_token_item_lens: Optional[Sequence[int]] = None,
+    pack_offset_bytes: int = 0,
+) -> None:
+    if dst_token_indices.size == 0:
+        return
+    row_indices = torch.as_tensor(
+        dst_token_indices, device=pack_buffer.buffer.device, dtype=torch.int64
+    )
+    stream = pack_buffer.get_gather_stream()
+    with torch.cuda.stream(stream):
+        copy_pack_into_mla_rows(
+            pack_buffer.buffer,
+            kv_data_ptrs,
+            row_indices,
+            token_item_lens,
+            dst_token_item_lens,
+            pack_offset_bytes,
+        )
+    stream.synchronize()
 
 
 def init_dcp_pack_buffers(

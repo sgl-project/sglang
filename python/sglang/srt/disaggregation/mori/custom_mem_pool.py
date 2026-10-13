@@ -13,6 +13,7 @@
 # ==============================================================================
 """Mori-specific custom memory pool management."""
 
+import os
 from typing import Any, Optional, Tuple
 
 from sglang.srt.environ import envs
@@ -20,13 +21,7 @@ from sglang.srt.environ import envs
 _MORI_FABRIC_MEM_POOL: Optional[Any] = None
 
 
-def init_mori_custom_mem_pool(
-    device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
-    """Return the process-wide Mori fabric pool when fabric is enabled."""
-    if envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric":
-        return False, None, None
-
+def get_mori_fabric_mem_pool() -> Any:
     global _MORI_FABRIC_MEM_POOL
     if _MORI_FABRIC_MEM_POOL is None:
         try:
@@ -43,5 +38,15 @@ def init_mori_custom_mem_pool(
             raise RuntimeError(
                 "Failed to initialize the Mori fabric memory pool"
             ) from exc
+    return _MORI_FABRIC_MEM_POOL
 
-    return True, _MORI_FABRIC_MEM_POOL, "mori_fabric"
+
+def init_mori_custom_mem_pool(
+    device: str,
+) -> Tuple[bool, Optional[Any], Optional[str]]:
+    """Return the process-wide Mori fabric pool when fabric is enabled."""
+    if envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric":
+        return False, None, None
+    if os.getenv("SGLANG_MORI_FABRIC_STAGING", "0") == "1":
+        return False, None, None
+    return True, get_mori_fabric_mem_pool(), "mori_fabric"

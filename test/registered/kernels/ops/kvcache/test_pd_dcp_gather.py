@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    copy_mla_rows_into_pack,
+    copy_pack_into_mla_rows,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -40,6 +43,35 @@ class TestPdDcpGather(CustomTestCase):
         packed1 = pack[split:].view(torch.float16).view(4, 1, 5)
         torch.testing.assert_close(packed0, kv0[row_indices], rtol=0, atol=0)
         torch.testing.assert_close(packed1, kv1[row_indices], rtol=0, atol=0)
+
+    def test_scatter_round_trip_with_pack_offset(self):
+        src = torch.arange(16 * 12, dtype=torch.uint8, device="cuda").view(16, 12)
+        dst = torch.full_like(src, 0xA5)
+        src_rows = torch.tensor([1, 5, 9], dtype=torch.int64, device="cuda")
+        dst_rows = torch.tensor([2, 7, 11], dtype=torch.int64, device="cuda")
+        prefix = 37
+        pack = torch.zeros(prefix + src_rows.numel() * 12, dtype=torch.uint8, device="cuda")
+
+        copy_mla_rows_into_pack(
+            [src.data_ptr()],
+            src_rows,
+            pack,
+            [12],
+            pack_offset_bytes=prefix,
+        )
+        copy_pack_into_mla_rows(
+            pack,
+            [dst.data_ptr()],
+            dst_rows,
+            [12],
+            pack_offset_bytes=prefix,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(dst[dst_rows], src[src_rows], rtol=0, atol=0)
+        untouched = torch.ones(16, dtype=torch.bool, device="cuda")
+        untouched[dst_rows] = False
+        self.assertTrue(torch.all(dst[untouched] == 0xA5))
 
     def test_packed_tp2_pp2_to_dcp4_preserves_kv(self):
         """Packing must preserve both target rows and draft head shards across PP stages."""
