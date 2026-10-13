@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,6 +28,117 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_visual_metadata_mapping_preserves_checkpoint_and_runtime_aliases(self):
+        mapper = Qwen3VLForConditionalGeneration.hf_to_sglang_mapper
+        original_mappings = (
+            dict(mapper.orig_to_new_substr),
+            dict(mapper.orig_to_new_prefix),
+            dict(mapper.orig_to_new_suffix),
+        )
+        runtime_prefix = "model.visual.blocks.0.attn.qkv_proj"
+        for config_cls, quant_algo in (
+            (ModelOptFp4Config, "NVFP4"),
+            (ModelOptMixedPrecisionConfig, "MIXED_PRECISION"),
+        ):
+            for visual_prefix in ("model.visual", "visual"):
+                for projection in ("qkv", "qkv_proj"):
+                    with self.subTest(
+                        config=config_cls.__name__,
+                        visual_prefix=visual_prefix,
+                        projection=projection,
+                    ):
+                        layer_info = {"quant_algo": "NVFP4", "group_size": 16}
+                        cfg = config_cls.from_config(
+                            {
+                                "quant_algo": quant_algo,
+                                "group_size": 16,
+                                "ignore": [],
+                                "packed_modules_mapping": {},
+                                "quantized_layers": {
+                                    f"{visual_prefix}.blocks.0.attn.{projection}": layer_info
+                                },
+                            }
+                        )
+                        cfg.apply_weight_name_mapper(mapper)
+                        self.assertEqual(
+                            cfg.quantized_layers,
+                            {"visual.blocks.0.attn.qkv_proj": layer_info},
+                        )
+                        if isinstance(cfg, ModelOptMixedPrecisionConfig):
+                            self.assertEqual(
+                                cfg.resolve_quant_algo(runtime_prefix), "NVFP4"
+                            )
+                        layer = ReplicatedLinear(
+                            16,
+                            16,
+                            bias=False,
+                            params_dtype=torch.bfloat16,
+                            quant_config=cfg,
+                            prefix=runtime_prefix,
+                        )
+                        self.assertIsInstance(
+                            layer.quant_method, ModelOptFp4LinearMethod
+                        )
+                        self.assertEqual(layer.weight.dtype, torch.uint8)
+                        self.assertEqual(layer.weight.shape, (16, 8))
+                        self.assertEqual(
+                            original_mappings,
+                            (
+                                mapper.orig_to_new_substr,
+                                mapper.orig_to_new_prefix,
+                                mapper.orig_to_new_suffix,
+                            ),
+                        )
+
+    def test_visual_exclusion_mapping_preserves_checkpoint_and_runtime_aliases(self):
+        mapper = Qwen3VLForConditionalGeneration.hf_to_sglang_mapper
+        runtime_prefix = "model.visual.blocks.0.attn.qkv_proj"
+        for config_cls, quant_algo in (
+            (ModelOptFp4Config, "NVFP4"),
+            (ModelOptMixedPrecisionConfig, "MIXED_PRECISION"),
+        ):
+            for visual_prefix in ("model.visual", "visual"):
+                for projection in ("qkv", "qkv_proj"):
+                    with self.subTest(
+                        config=config_cls.__name__,
+                        visual_prefix=visual_prefix,
+                        projection=projection,
+                    ):
+                        cfg = config_cls.from_config(
+                            {
+                                "quant_algo": quant_algo,
+                                "group_size": 16,
+                                "ignore": [
+                                    f"{visual_prefix}.blocks.0.attn.{projection}"
+                                ],
+                                "packed_modules_mapping": {},
+                                "quantized_layers": {
+                                    "model.visual.blocks.0.attn.qkv": {
+                                        "quant_algo": "NVFP4",
+                                        "group_size": 16,
+                                    }
+                                },
+                            }
+                        )
+                        cfg.apply_weight_name_mapper(mapper)
+                        self.assertEqual(
+                            cfg.exclude_modules, ["visual.blocks.0.attn.qkv_proj"]
+                        )
+                        self.assertTrue(cfg.is_layer_excluded(runtime_prefix))
+                        layer = ReplicatedLinear(
+                            16,
+                            16,
+                            bias=False,
+                            params_dtype=torch.bfloat16,
+                            quant_config=cfg,
+                            prefix=runtime_prefix,
+                        )
+                        self.assertIsInstance(
+                            layer.quant_method, UnquantizedLinearMethod
+                        )
+                        self.assertEqual(layer.weight.dtype, torch.bfloat16)
+                        self.assertEqual(layer.weight.shape, (16, 16))
+
     def test_serialized_fp4_preserves_flat_and_nested_layer_metadata(self):
         layer_map = {"model.visual.blocks.0.mlp.linear_fc1": {"quant_algo": "NVFP4"}}
         for config in (

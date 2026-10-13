@@ -330,6 +330,25 @@ def _visual_layer_prefix_candidates(prefix: str) -> Tuple[str, ...]:
     return tuple(candidates)
 
 
+def _modelopt_layer_name_mapper(hf_to_sglang_mapper: WeightsMapper) -> WeightsMapper:
+    """Preserve runtime vision QKV names while mapping layer metadata."""
+    substr_mapping = hf_to_sglang_mapper.orig_to_new_substr
+    if (
+        substr_mapping.get("attn.qkv") != "attn.qkv_proj"
+        or "attn.qkv_proj" in substr_mapping
+    ):
+        return hf_to_sglang_mapper
+
+    from sglang.srt.models.utils import WeightsMapper
+
+    # WeightsMapper picks the longest matching substring. Keep the runtime
+    # name from matching the shorter checkpoint alias a second time, without
+    # changing the model's mapper or its prefix/suffix mappings.
+    return hf_to_sglang_mapper | WeightsMapper(
+        orig_to_new_substr={"attn.qkv_proj": "attn.qkv_proj"}
+    )
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -384,6 +403,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
         # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
         if self.exclude_modules:
+            hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
             mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
             expanded: List[str] = []
             for name in mapped:
@@ -986,6 +1006,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_sglang_mapper.apply_dict(
@@ -1707,6 +1728,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return quant_config
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_sglang_mapper.apply_dict(
