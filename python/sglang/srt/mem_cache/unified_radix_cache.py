@@ -2676,9 +2676,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
-        # Every completed query reports KV, including a real zero-hit miss.
-        # If any rank skipped the query, MIN removes this verdict on all ranks;
-        # its zero usable hit count is not evidence that stored content is absent.
+        # A missing reduced KV verdict means some rank did not query storage.
         if PoolName.KV not in verdicts:
             return
         folded_pages = operation.storage_hit_count // self.page_size
@@ -3000,8 +2998,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                # Only this rank-synced drain may consume query evidence. Abort
-                # cleanup can run while the worker still holds local verdicts.
+                # Consume query evidence only after rank synchronization.
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
