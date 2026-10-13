@@ -473,6 +473,14 @@ def low_ratio_index_topk_hip_extend(
     groups = _request_groups(extend_lens_cpu, rows_per_chunk)
     for req_lo, req_hi, tok_lo, tok_hi in groups:
         group_is_identity = is_identity[req_lo:req_hi]
+        if tok_hi == tok_lo:
+            # Prefill CP: a group can own no rows on this rank (an extend of one token
+            # lands on one rank). Nothing to score or select, and neither kernel takes
+            # an empty batch: the prefill logits schedule still sends its CTAs to row 0
+            # (of a freshly allocated, null page table) and top-k cannot launch.
+            if publish is not None:
+                publish.extend([None] * (req_hi - req_lo))
+            continue
         if all(group_is_identity):
             fill_identity_requests(req_lo, req_hi, tok_lo)
             continue

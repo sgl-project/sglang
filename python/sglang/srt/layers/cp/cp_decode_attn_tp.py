@@ -156,9 +156,27 @@ class CpDecodeAttnTpContext:
         else:
             return []
 
+        # gfx950 block-fp8-as-MXFP8 linears (DeepSeek-V4.1's 32-wide ue8m0 checkpoint)
+        # are applied from scale copies derived at load time (fp8_hip.process_dense_weights):
+        # weight_scale_mx_e8m0 [ceil(N/32), K/32] on the aiter route, weight_scale_inv_mx
+        # [N, K/32] on dot_scaled, weight_bf16 [N, K] on the dequant fallback. All are
+        # row-major over (N, K) like the weight, so they slice on the same dim; slicing
+        # only weight_scale_inv leaves the GEMM a full-size scale.
+        if getattr(linear_instance, "mxfp8_native_ready", False):
+            raise NotImplementedError(
+                "CP decode attn TP: the gfx950 MXFP8 native route stores the weight in "
+                "scaled-MFMA lane order, which cannot be sliced by row/column narrowing; "
+                "use --fp8-gemm-backend aiter or triton."
+            )
         attrs = [(linear_instance, "weight", dim)]
-        for scale_name in ("weight_scale_inv", "weight_scale"):
-            if getattr(linear_instance, scale_name, None) is not None:
+        for scale_name in (
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_scale_inv_mx",
+            "weight_scale_mx_e8m0",
+            "weight_bf16",
+        ):
+            if isinstance(getattr(linear_instance, scale_name, None), torch.Tensor):
                 attrs.append((linear_instance, scale_name, dim))
         return attrs
 

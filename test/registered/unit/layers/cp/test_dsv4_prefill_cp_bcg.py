@@ -22,8 +22,38 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4PrefillCPBCG(unittest.TestCase):
+    def setUp(self):
+        # The buckets here sit below the HIP small-shard floor; pin the generic rule
+        # so the cases hold on a ROCm host too (the floor is covered below).
+        hip_floor = patch("sglang.srt.layers.cp.interleave._is_hip", False)
+        hip_floor.start()
+        self.addCleanup(hip_floor.stop)
+
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_hip_small_shard_floor_bounds_capture_buckets(self):
+        from sglang.srt.layers.cp.interleave import interleave_cp_min_tokens
+
+        cfg = SimpleNamespace(attn_cp_size=2, cp_strategy="interleave")
+        init_cp_strategy(enable_prefill_cp=True, cp_size=2, cp_strategy="interleave")
+        with (
+            patch("sglang.srt.layers.cp.interleave._is_hip", True),
+            patch("sglang.srt.layers.cp.bcg.resolving_view", return_value=cfg),
+            patch("sglang.srt.layers.cp.bcg.resolved_view", return_value=cfg),
+        ):
+            self.assertEqual(interleave_cp_min_tokens(2), 32)
+            # A capture bucket must be able to activate CP: the strategy and the
+            # capture filter agree on the floor.
+            for seq_len, active in ((16, False), (31, False), (32, True)):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND, extend_seq_lens_cpu=[seq_len]
+                )
+                self.assertEqual(get_cp_strategy().can_apply(seq_len, batch), active)
+            self.assertEqual(
+                filter_prefill_cp_bcg_capture_num_tokens([8, 16, 32, 64], cfg),
+                [32, 64],
+            )
 
     def test_sparse_prefill_never_uses_cp_local_queries(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
