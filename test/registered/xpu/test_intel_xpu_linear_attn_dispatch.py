@@ -6,12 +6,14 @@ behavior from the platform-agnostic linear-attn dispatch tests.
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, sentinel
 
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear.kernels import gdn_xpu
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -37,20 +39,61 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
                     LinearAttnKernelBackend.INTEL_XPU,
                 )
 
-    def test_intel_xpu_uses_triton_as_the_dispatcher_fallback_kernel(self):
-        # The fused SYCL kernel is dispatched outside GDNKernelDispatcher (via
-        # XpuGDNAttnBackend.forward_fused_gdn); the dispatcher itself only
-        # needs a valid fallback kernel for requests that hook declines
-        # (e.g. verify), which is Triton.
+    def test_intel_xpu_selects_standalone_kernels_by_phase(self):
+        with patch.object(gdn_backend, "is_xpu", return_value=True):
+            dispatcher = GDNKernelDispatcher(
+                LinearAttnKernelBackend.INTEL_XPU,
+                LinearAttnKernelBackend.INTEL_XPU,
+                LinearAttnKernelBackend.INTEL_XPU,
+            )
+
+        self.assertIsInstance(dispatcher.decode_kernel, XpuGDNKernel)
+        self.assertIsInstance(dispatcher.extend_kernel, XpuGDNKernel)
+        self.assertIsInstance(dispatcher.verify_kernel, XpuGDNKernel)
+        self.assertIsInstance(dispatcher.tree_verify_kernel, XpuGDNKernel)
+
+    def test_intel_xpu_verify_defaults_to_triton_when_not_selected(self):
         with patch.object(gdn_backend, "is_xpu", return_value=True):
             dispatcher = GDNKernelDispatcher(
                 LinearAttnKernelBackend.INTEL_XPU,
                 LinearAttnKernelBackend.INTEL_XPU,
             )
 
-        self.assertIsInstance(dispatcher.decode_kernel, TritonGDNKernel)
-        self.assertIsInstance(dispatcher.extend_kernel, TritonGDNKernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonGDNKernel)
+
+    def test_conv_verify_adapter_preserves_linear_and_tree_links(self):
+        with patch.object(gdn_xpu, "causal_conv1d_update_verify_xpu") as kernel:
+            for links in (
+                (None, None, None),
+                (sentinel.next_token, sentinel.next_sibling, sentinel.parent_token),
+            ):
+                with self.subTest(links=links):
+                    kernel.reset_mock()
+                    result = gdn_xpu.causal_conv1d_verify_xpu(
+                        sentinel.x,
+                        sentinel.conv_state,
+                        sentinel.weight,
+                        sentinel.bias,
+                        "silu",
+                        conv_state_indices=sentinel.cache_indices,
+                        intermediate_conv_window=sentinel.window,
+                        intermediate_state_indices=sentinel.intermediate_indices,
+                        retrieve_next_token=links[0],
+                        retrieve_next_sibling=links[1],
+                        retrieve_parent_token=links[2],
+                    )
+                    self.assertIs(result, kernel.return_value)
+                    kernel.assert_called_once_with(
+                        sentinel.x,
+                        sentinel.conv_state,
+                        sentinel.weight,
+                        sentinel.window,
+                        sentinel.intermediate_indices,
+                        *links,
+                        bias=sentinel.bias,
+                        activation="silu",
+                        cache_indices=sentinel.cache_indices,
+                    )
 
 
 class TestIntelXpuKDADispatch(CustomTestCase):
