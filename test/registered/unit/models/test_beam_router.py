@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.kernels.ops.gemm.router_gemv import router_gemm_bf16x3
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
@@ -19,8 +20,9 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 pytest.importorskip("cuda.tile")
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Blackwell required",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="Hopper or Blackwell required",
 )
 
 
@@ -98,6 +100,26 @@ def test_router_refresh_and_dispatch(m, nvfp4):
         assert (
             (out.double() - ref).square().mean() / ref.square().mean()
         ).sqrt() < 1e-6
+
+
+@pytest.mark.parametrize("backend", ["cublas", "cutile"])
+def test_backend_dispatch(backend):
+    """Selecting cutile must run cuTile, not fall back to the cuBLAS BF16x3 path."""
+    router = _router(backend)
+    assert router.use_cutile_router == (backend == "cutile")
+    x = torch.randn(64, 5120, device="cuda", dtype=torch.bfloat16)
+    with patch(
+        "sglang.srt.models.beam.router_gemm_bf16x3", wraps=router_gemm_bf16x3
+    ) as cublas:
+        if backend == "cutile":
+            with patch.object(
+                router, "cutile_router_gemm", wraps=router.cutile_router_gemm
+            ) as cutile:
+                router._router_logits(x)
+            assert cutile.call_count == 1
+        else:
+            router._router_logits(x)
+    assert cublas.call_count == int(backend == "cublas")
 
 
 @pytest.mark.parametrize("backend", ["torch", "cublas", "cutile"])

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BF16 router activations times prepared FP32 weights on Blackwell."""
+"""BF16 router activations times prepared FP32 weights on Hopper and Blackwell."""
+
+import functools
 
 import cuda.tile as ct
 import torch
@@ -40,11 +42,7 @@ def _gemm(
         )
         if EXPERT_MAJOR:
             w = ct.load(
-                W,
-                (0, col, k),
-                (4, BN, BK),
-                padding_mode=ct.PaddingMode.ZERO,
-                latency=4,
+                W, (0, col, k), (4, BN, BK), padding_mode=ct.PaddingMode.ZERO, latency=4
             )
             local = ct.mma(
                 ct.reshape(w, (4 * BN, BK)),
@@ -71,11 +69,7 @@ def _gemm(
                 ct.transpose(ct.reshape(w0, (BN, BK))),
                 ct.full((BM, BN), 0, ct.float32),
             )
-            residual = ct.mma(
-                x,
-                ct.transpose(ct.reshape(wr, (2 * BN, BK))),
-                residual,
-            )
+            residual = ct.mma(x, ct.transpose(ct.reshape(wr, (2 * BN, BK))), residual)
         # Round each main-product tile before adding the next tile.
         total = ct.add(total, local, rounding_mode=ct.RoundingMode.RN)
     if EXPERT_MAJOR:
@@ -91,9 +85,7 @@ def _gemm(
         )
     else:
         correction = ct.sum(
-            ct.reshape(residual, (BM, 2, BN)),
-            axis=1,
-            rounding_mode=ct.RoundingMode.RN,
+            ct.reshape(residual, (BM, 2, BN)), axis=1, rounding_mode=ct.RoundingMode.RN
         )
         value = ct.add(total, correction, rounding_mode=ct.RoundingMode.RN)
     ct.store(
@@ -128,22 +120,40 @@ def _reduce(P, Y, SPLIT_K: ct.Constant[int], PDL: ct.Constant[bool] = False):
                 allow_tma=False,
             )
             total = ct.add(
-                total,
-                ct.reshape(value, (1024,)),
-                rounding_mode=ct.RoundingMode.RN,
+                total, ct.reshape(value, (1024,)), rounding_mode=ct.RoundingMode.RN
             )
     ct.store(Y, (ct.bid(0),), total, allow_tma=False)
 
 
 _KERNELS = {1: _gemm, 2: _gemm.replace_hints(num_ctas=2)}
-_CONFIGS = (
-    (64, (32, 16, 4, 1)),
-    (128, (64, 32, 4, 1)),
-    (512, (128, 64, 8, 1)),
-    (1024, (128, 64, 4, 1)),
-    (2048, (128, 64, 2, 1)),
-    (4096, (256, 128, 2, 2)),
+# (max M, (BM, BN, BK, SPLIT_K, CTAS)); larger M uses the fallback in _config.
+_BLACKWELL_CONFIGS = (
+    (64, (32, 16, 256, 4, 1)),
+    (128, (64, 32, 256, 4, 1)),
+    (512, (128, 64, 256, 8, 1)),
+    (1024, (128, 64, 128, 4, 1)),
+    (2048, (128, 64, 128, 2, 1)),
+    (4096, (256, 128, 256, 2, 2)),
 )
+# Use smaller tiles on Hopper to limit register pressure.
+_HOPPER_CONFIGS = (
+    (256, (64, 64, 128, 8, 1)),
+    (512, (64, 64, 128, 4, 1)),
+    (1024, (64, 64, 128, 2, 1)),
+)
+
+
+@functools.cache
+def _is_hopper(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index)[0] == 9
+
+
+def _config(m: int, device: torch.device) -> tuple:
+    if m > 128 and _is_hopper(device.index):
+        configs, fallback = _HOPPER_CONFIGS, (64, 64, 128, 1, 1)
+    else:
+        configs, fallback = _BLACKWELL_CONFIGS, (256, 128, 256, 1, 2)
+    return next((config for limit, config in configs if m <= limit), fallback)
 
 
 def _fake_router_gemm(x: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
@@ -155,11 +165,7 @@ def router_gemm_bf16x3_cutile(x: torch.Tensor, parts: torch.Tensor) -> torch.Ten
     """Multiply BF16 [M, K] by prepared BF16 [3N, K], producing FP32 [M, N]."""
     m, k = x.shape
     n = parts.shape[0] // 3
-    bm, bn, splits, ctas = next(
-        (config for limit, config in _CONFIGS if m <= limit),
-        (256, 128, 1, 2),
-    )
-    bk = 128 if 512 < m <= 2048 else 256
+    bm, bn, bk, splits, ctas = _config(m, x.device)
     pdl = bk == 128 and splits == 4
     out = torch.empty((m, n), device=x.device, dtype=torch.float32)
     if m == 0 or n == 0:

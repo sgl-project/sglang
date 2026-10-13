@@ -17,8 +17,9 @@ from sglang.kernels.ops.gemm.router_gemm_cutile import (  # noqa: E402
 from sglang.kernels.ops.gemm.router_gemv import split_fp32_to_bf16x3  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Blackwell required",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="Hopper or Blackwell required",
 )
 
 

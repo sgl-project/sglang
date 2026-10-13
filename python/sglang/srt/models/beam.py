@@ -373,7 +373,7 @@ class BeamMoE(nn.Module):
         self.use_cutile_router = (
             self.use_fast_router
             and router_backend == "cutile"
-            and torch.cuda.get_device_capability()[0] == 10
+            and torch.cuda.get_device_capability()[0] in (9, 10)
         )
         if self.use_cutile_router:
             from sglang.kernels.ops.gemm.router_gemm_cutile import (

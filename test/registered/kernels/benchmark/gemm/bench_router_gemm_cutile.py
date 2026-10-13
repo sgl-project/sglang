@@ -1,6 +1,6 @@
 """Compare router GEMM latency and mean absolute error against FP64.
 
-Run this file on Blackwell. Weight preparation is outside the timed region;
+Run this file on Hopper or Blackwell. Weight preparation is outside the timed region;
 split-K reduction is included. Latencies use rotating inputs and CUDA graphs.
 All providers use the same random inputs (seed 0, X std 1, W std 0.02).
 """
@@ -82,8 +82,9 @@ def benchmark(batch_sizes, n, k):
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        print("Blackwell required.")
+    major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    if major not in (9, 10):
+        print("Hopper or Blackwell required.")
     else:
         batch_sizes = get_benchmark_range(
             [
