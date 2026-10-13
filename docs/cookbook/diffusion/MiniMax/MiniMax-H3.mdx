@@ -675,6 +675,7 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos \
     "prompt": "Use <Picture 1> as the visual subject and <Audio 1> as the sound reference, with coherent natural motion.",
     "seconds": 5,
     "task": "ref2va",
+    "reference_resize_mode": "diffusers",
     "conditions": [
       {
         "type": "image",
@@ -904,9 +905,14 @@ refiner falls back to dense FA inside the backend, and the text encoder and
 VAEs keep their own backends. Ulysses sequence parallelism is supported. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for
 `VSA_sparsity`, `vsa_mode`, `vsa_dense_first_n_steps`, and
-`vsa_dense_layers`. Every dense backend that runs on base H3 (`fa`,
-`torch_sdpa`, ...) also runs on the FastH3 weights without VSA flags, and
-`sglang generate` takes the same flags as `sglang serve`.
+`vsa_dense_layers`. On CUDA, FastH3 selects VSA-H3 for the transformer when no
+transformer backend is given, unless torch.compile, the breakable CUDA graph or
+ring attention is on (VSA-H3 serves none of them). Every dense backend that
+runs on base H3 also runs on the FastH3 weights, without the compression
+branch: select it with `--component-attention-backends transformer=fa` (or
+`torch_sdpa`, ...). On 4× H200 dense FA is about 25% slower end to end than
+VSA-H3 (12.6 s against 10.0 s). `sglang generate` takes the same flags as
+`sglang serve`.
 
 Measured latencies for the 4× GB300 recipe are in
 [FastH3 on GB300](#fasth3-on-gb300).
