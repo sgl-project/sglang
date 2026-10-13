@@ -378,7 +378,6 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
         self._sum_operators = None
-        self._hc_source_packed = None
         self._sum_weights_dirty = True
         if use_mix and use_combine:
             for parameter in (
@@ -460,7 +459,6 @@ class GatedResidual(HyperConnectionBase):
         # graph recapture, just like conversion of the original parameters.
         result = super()._apply(fn, recurse=recurse)
         self._sum_operators = None
-        self._hc_source_packed = None
         self._sum_weights_dirty = True
         return result
 
@@ -594,8 +592,8 @@ class GatedResidual(HyperConnectionBase):
         Validate readiness when loading ends. Unchanged Up/RMS need not be resent.
         ``force`` handles loaders that copy through
         state_dict instead of weight_loader. Reloading requires graph recapture.
-        Legacy instances keep their existing source/derived-storage behavior.
-        Large-T Up shares its original parameter storage in both cases.
+        Non-packed instances keep the Tensor path and return False.
+        Large-T Up shares its original parameter storage.
         Like the existing HC dispatcher, a layer executes on the worker's
         serialized compute stream; per-call outputs are not cached on it.
         """
@@ -603,86 +601,8 @@ class GatedResidual(HyperConnectionBase):
             if force:
                 self._sum_weights_dirty = True
             return self._prepare_packed_sum_state_weights()
-        from sglang.kernels.ops.elementwise.hc_mix import pad_lowrank
-
-        if not (
-            self.config.hc_per_branch_norm
-            and self.hc_count == 4
-            and 0 < self.hidden_size <= 16384
-            and self.hidden_size % 512 == 0
-            and self.config.hc_lowrank > 0
-            and self.config.hc_lowrank % 8 == 0
-            and self.config.hc_lowrank + 4 <= pad_lowrank(self.config.hc_lowrank)
-            and hasattr(self, "input_mix_weight_down")
-            and hasattr(self, "block_inject_weight")
-            and self.hc_norm.weight.is_cuda
-            and self.hc_norm.weight.dtype in (torch.bfloat16, torch.float16)
-            and torch.cuda.get_device_capability(self.hc_norm.weight.device)[0] == 10
-            and not _deterministic_inference()
-        ):
-            self._sum_operators = None
-            return False
-        from sglang.kernels.ops.elementwise.hc_sum_state import SmallTSumHCShell
-        from sglang.kernels.ops.elementwise.hc_sum_state_large import LargeTSumHCShell
-
-        # One physical checkpoint storage; the old parameter names remain
-        # loader/state_dict/fallback-compatible views. Folded small/large GEMM
-        # layouts below are derived from this storage and the RMS weight.
-        down = self.input_mix_weight_down.weight
-        inject = self.block_inject_weight.weight
-        shape = (self.config.hc_lowrank + 4, 4 * self.hidden_size)
-        if self._hc_source_packed is None:
-            self._hc_source_packed = down.new_empty(shape)
-        packed = self._hc_source_packed
-        if (
-            packed.shape != shape
-            or packed.device != down.device
-            or packed.dtype != down.dtype
-        ):
-            raise RuntimeError("HC checkpoint storage changed; recreate and recapture")
-        packed[: self.config.hc_lowrank].copy_(down)
-        packed[self.config.hc_lowrank :].copy_(inject)
-        down.data = packed[: self.config.hc_lowrank]
-        inject.data = packed[self.config.hc_lowrank :]
-
-        # load_state_dict(assign=True) may replace Parameter objects.
-        for parameter in (
-            self.hc_norm.weight,
-            self.input_mix_weight_down.weight,
-            self.input_mix_weight_up.weight,
-            self.block_inject_weight.weight,
-        ):
-            parameter.weight_loader = self._load_sum_source_weight
-            parameter.hc_weight_loader = self._load_sum_source_weight
-        small = SmallTSumHCShell(self)
-        new = (
-            small,
-            LargeTSumHCShell(self, norm_weight_permuted=small.weights.norm_permuted),
-        )
-        old = self._sum_operators
-        if old is None:
-            self._sum_operators = new
-        else:
-            pairs = [
-                (old[0].weights.down_inject, new[0].weights.down_inject),
-                (old[0].weights.up, new[0].weights.up),
-                (old[0].weights.norm_permuted, new[0].weights.norm_permuted),
-                (old[1].weights.matrix, new[1].weights.matrix),
-            ]
-            if any(
-                a.shape != b.shape or a.dtype != b.dtype or a.device != b.device
-                for a, b in pairs
-            ):
-                raise RuntimeError(
-                    "HC storage metadata changed; move/recreate the module and recapture graphs"
-                )
-            for destination, source in pairs:
-                destination.copy_(source)
-            # Up shares source storage; both paths share the refreshed RMS.
-            old[1].up_weight = new[1].up_weight
-            old[1].norm_weight = old[0].weights.norm_permuted
-        self._sum_weights_dirty = False
-        return True
+        self._sum_operators = None
+        return False
 
     def can_use_sum_state(self, residual):
         if (
