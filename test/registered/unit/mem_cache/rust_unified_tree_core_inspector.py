@@ -83,6 +83,12 @@ class RustUnifiedTreeCoreInspector(
             node_id, int(component_type)
         )
 
+    def is_full_host_duplicate(self, node_id: NodeId) -> bool:
+        return self._binding.inspect_is_full_host_duplicate(node_id)
+
+    def can_reclaim_full_host_duplicate(self, node_id: NodeId) -> bool:
+        return self._binding.inspect_can_reclaim_full_host_duplicate(node_id)
+
     def get_node_hit_count(self, node_id: NodeId) -> int:
         return self._binding.inspect_get_node_hit_count(node_id)
 

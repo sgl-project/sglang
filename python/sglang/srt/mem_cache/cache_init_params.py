@@ -38,9 +38,12 @@ class CacheInitParams:
     # The scheduler holds the same table and adds each adapter when it loads.
     kv_event_lora_names: Optional[LoRANameTable] = None
     enable_session_radix_cache: bool = False
+    allow_subagent_keepalive: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+
+    hicache_serialize_load_back: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1
