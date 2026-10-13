@@ -24,6 +24,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _SupportsDeepStackReplay,
 )
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -122,15 +126,6 @@ class TestPrefillInputBuffersDeepStackField(CustomTestCase):
 
 class TestQwen3VLCapabilityOptIn(CustomTestCase):
     def test_only_deepstack_capable_models_opt_in(self):
-        from sglang.srt.models.qwen2_5_vl import (
-            Qwen2_5_VLForConditionalGeneration,
-        )
-        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-        from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-        from sglang.srt.models.qwen3_vl_moe import (
-            Qwen3VLMoeForConditionalGeneration,
-        )
-
         for cls, expected in [
             (Qwen3VLForConditionalGeneration, True),
             (Qwen3VLMoeForConditionalGeneration, True),
