@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_position,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -188,6 +189,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        load_group = get_pp_stage_load_group()
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -200,6 +202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 draft_worker_cls=draft_worker_cls,
                 random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -313,6 +316,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        # The step's simulated correct length, read by the eager and graph accepts.
+        self._simulated_correct_len = (
+            torch.zeros((1,), dtype=torch.int64, device=self.device)
+            if self._simulate_acc_len > 0
+            else None
+        )
+        self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -320,6 +331,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
+            random_seed=target_worker.random_seed,
+            greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -351,6 +364,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device,
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
+                simulated_correct_len=self._simulated_correct_len,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -365,7 +379,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
 
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         self._simulate_acc_greedy = (
             _is_hip
             and self._simulate_acc_len > 0
@@ -398,6 +411,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
         )
 
@@ -505,9 +519,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler(
-                        available_memory_gb=available_mem
-                    )
+                    self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -517,20 +529,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            noise=self._proposer.noise,
+            greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
-            available_memory_gb=available_memory_gb,
-            confidence_fn=(
-                self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
-                else None
-            ),
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
@@ -886,13 +894,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -926,14 +927,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            and self._simulate_acc_len <= 0
+            # The graph accept is greedy, so a sampled simulated bonus is eager.
+            and simulate_bonus_sampling_info is None
             and not batch.has_grammar
         )
+        self._verify_executor.begin_simulated_step()
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -1060,6 +1063,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_logits=logits_output.next_token_logits,
             layout=layout,
             confidence=confidence,
+            confidence_raw=proposal.confidence_raw,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             draft_block=draft_block,

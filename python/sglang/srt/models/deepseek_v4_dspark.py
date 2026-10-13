@@ -13,13 +13,11 @@ from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inpl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -48,11 +46,11 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
 )
 from sglang.srt.models.dspark import (
+    BaseDSparkMarkovHead,
     DSparkConfidenceHead,
-    StepSampler,
+    VocabShard,
     gather_and_crop_vocab,
     project_through_lm_head,
-    run_markov_block,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -67,16 +65,11 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 _is_npu = is_npu()
 
 
@@ -257,7 +250,9 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _is_npu and forward_batch.forward_mode.is_idle():
+        # Idle ranks have no draft KV rows or attention metadata, but still
+        # participate in the shared MoE forward later in the draft stage.
+        if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -396,9 +391,7 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
     num_embeddings_padded: int
 
 
-class DSparkV4MarkovHead(nn.Module):
-    markov_head_type = "vanilla"
-
+class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     def __init__(
         self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
     ) -> None:
@@ -457,14 +450,14 @@ class DSparkV4MarkovHead(nn.Module):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
-        self._vocab_gather = make_vocab_gather(
+        vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
             prefer_nvlink=self._is_dsv41
             and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
         )
         if shard_group.rank == 0:
-            cls_name = type(self._vocab_gather).__name__
+            cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
@@ -472,6 +465,9 @@ class DSparkV4MarkovHead(nn.Module):
             org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
             num_embeddings_per_partition=per_partition,
             num_embeddings_padded=num_padded,
+        )
+        self.vocab_shard = VocabShard(
+            start=self._tp_shard.org_vocab_start, gather=vocab_gather
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -485,94 +481,35 @@ class DSparkV4MarkovHead(nn.Module):
             return F.linear(latent_states.to(weight.dtype), weight).float()
         return F.linear(latent_states.float(), weight)
 
-    def compute_step_bias(
-        self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
-
-    def apply_step_logits(
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self._tp_shard is not None:
-            return self._apply_step_logits_sharded(
-                base_local=logits, token_ids=token_ids
-            )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def _apply_step_logits_sharded(
-        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del hidden_states
+        latent = self.get_prev_embeddings(prev_tokens)
         shard = self._tp_shard
-        latent = self.get_prev_embeddings(token_ids)
+        if shard is None:
+            return self.project_bias(latent), state
         weight_local = self.markov_w2.weight[
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if self._opt_markov_w2_bf16:
-            bias = F.linear(latent.to(weight_local.dtype), weight_local)
-        else:
-            bias = F.linear(latent.float(), weight_local)
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        full = self._vocab_gather(step_local)
-        return full[..., : self.vocab_size]
+            # Keep the bias in BF16; the step add upcasts it to FP32.
+            return F.linear(latent.to(weight_local.dtype), weight_local), state
+        return F.linear(latent.float(), weight_local), state
 
-    @property
-    def supports_sharded_greedy(self) -> bool:
-        return (
-            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
-        )
-
-    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
-        if not self.supports_sharded_greedy or not base_logits.is_cuda:
-            return None
-        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
-            sharded_greedy_step,
-        )
-
-        shard = self._tp_shard
-        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
-        prev = first_prev_tokens.long()
-        tokens = []
-        for step in range(base_logits.shape[1]):
-            latent = self.get_prev_embeddings(prev)
-            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
-            bias = F.linear(latent.to(weight.dtype), weight)
-            prev = sharded_greedy_step(
-                bias,
-                base_logits[:, step],
-                group=self._shard_group,
-                vocab_start=shard.org_vocab_start,
-                gather=self._vocab_gather.gather_stacked,
-            )
-            tokens.append(prev)
-        return torch.stack(tokens, dim=1)
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias is FP32 or upcast into an FP32 add, sharded or not.
+        del base_dtype
+        return torch.float32
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
         return logits, embed
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
 
 def build_dspark_v4_confidence_head(
@@ -1010,8 +947,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
-        for stage in self.stages:
-            x, pre = stage(positions, x, forward_batch, pre)
+        # Draft MoE layers have no recorder layer index, so keep them out of the stats.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
@@ -1058,25 +997,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self,
         *,
         anchor_tokens: torch.Tensor,
-        sampled_tokens: torch.Tensor,
-        x_post_hc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        confidence_head = self.confidence_head
-        if confidence_head is None:
-            return None
-        bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
-        if confidence_head.with_markov:
-            prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
-            )
-            markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
-        else:
-            markov_embed_stack = None
-        confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
-        confidence = confidence_head.apply_sts(confidence_raw)
-        expect(_CONFIDENCE, confidence)
-        return confidence
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())

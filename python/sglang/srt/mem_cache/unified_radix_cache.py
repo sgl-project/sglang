@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -424,18 +425,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
-            # follow-up to #34798 and #35769.
-            # FULL and FULL+SWA only: Mamba has no state-handoff channel on
-            # the admission-time load-back read path and is not layer-gated.
-            # Lifting the fence also needs the admission charge: a staged
-            # state slot is request-pinned at consumption and must ride
-            # req.mamba_host_hit_length the way the SWA window does.
-            supported = {ComponentType.FULL, ComponentType.SWA}
+            supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA unified trees; got components "
+                    "FULL/SWA/MAMBA unified trees; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -532,13 +526,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
-        # Preserve the SWA host window before device eviction makes it unrecoverable.
-        if (
-            get_memory().enable_unified_memory
-            and self.host_memory_mode == "cache"
-            and self.tree_core.has_swa_host_pool
-        ):
-            self.tree_core.enable_swa_write_back_eviction_barrier()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -805,74 +792,45 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> tuple[Optional[NodeId], bool]:
-        """Advance the walk, completing pending host-backup barriers."""
-        while True:
-            result = self.tree_core.evict_device_next_node(component_type, tracker)
-            if result.mamba_backup_node_id is not None:
-                assert component_type == ComponentType.MAMBA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # Reserve a host state slot and wait for the backup acknowledgment
-                # before freeing device state. If allocation fails, eviction still
-                # proceeds to make room on the device.
-                node_id = result.mamba_backup_node_id
-                mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
-                if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
-                    self.evict_host(1, ComponentType.MAMBA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_mamba_state_eviction(node_id)
-            elif result.swa_backup_node_id is not None:
-                assert component_type == ComponentType.SWA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # The backup can cover several unbacked SWA segments. Reserve host
-                # space for the whole window before copying it, then resume eviction
-                # even if host allocation fails.
-                node_id = result.swa_backup_node_id
-                needed = result.swa_backup_num_tokens
-                swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
-                if (
-                    swa_host_pool is not None
-                    and swa_host_pool.available_size() < needed
-                ):
-                    self.evict_host(needed, ComponentType.SWA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_swa_state_eviction(node_id)
-            self._free_values(result.device_frees, result.host_frees)
-            if self._tracks_write_through_unbacked_evictions():
-                self._record_dropped_tokens(
-                    result.unbacked_tokens,
-                    reason="write_through_unbacked_eviction",
-                )
-            self._accumulate_tracker(tracker, result.tracker)
-            if result.backup_kv is None:
-                return result.node_id, result.made_progress
-
-            assert result.node_id is None
-            assert self.buffer_pipeline is None, (
-                "SWA write-back eviction barriers are cache-mode only"
+        """Advance the eviction walk one node, consuming its step result."""
+        result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            written = self._execute_and_commit_kv_backup(
-                result.backup_kv, write_back=True
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            if written <= 0:
-                node_id = result.backup_kv.node_ids[0]
-                logger.warning(
-                    "write_back: auxiliary backup failed under host pressure "
-                    "(component=%s, node=%d); dropping only the component",
-                    component_type.name,
-                    node_id,
-                )
-                # Match the Python SWA demotion: preserve FULL and descendants;
-                # the resumed native walk tombstones this component after one try.
-                continue
-            self.writing_check(write_back=True)
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
+        self._free_values(result.device_frees, result.host_frees)
+        if self._tracks_write_through_unbacked_evictions():
+            self._record_dropped_tokens(
+                result.unbacked_tokens,
+                reason="write_through_unbacked_eviction",
+            )
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.node_id, result.made_progress
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -3500,20 +3458,41 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return 0, last_best_match_device_node_id
 
+    def load_back_is_cache_owned(self) -> bool:
+        # Linker-loaded slots stay request-owned until the load succeeds.
+        # Keep cache_protected_len unchanged so failed loads can be freed.
+        return self.linker is None
+
+    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+        """Wait for the external-linker loads of the batch that just ran and
+        return the requests whose KV did not land, marked so their output is
+        dropped and their KV never reaches the tree. Their slots are private
+        (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
+        them."""
+        if self.linker is None:
+            return []
+        failed_rids = set(self.linker.finish_loads())
+        failed = [req for req in reqs if req.rid in failed_rids]
+        if failed:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            for req in failed:
+                req.skip_radix_cache_insert = True
+                req.discard_output_reason = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        return failed
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
             finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
+                [self.linker.num_completed_offloads()],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            offload_count = int(finish_counts.item())
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
@@ -3812,6 +3791,16 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.tree_core.node_by_id(node_handle)
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        if self.linker is not None:
+            tail = self.linker.private_load_indices.get(req.rid)
+            if tail is not None:
+                path = torch.cat([path, tail])
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())

@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
-from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -1276,7 +1275,7 @@ class BufferModePipeline:
         return request in self.staged_prefetches
 
     def prepare_staged_prefetch(self, req: Req) -> bool:
-        """Rebuild the admission plan from this pass's joint FULL/SWA match."""
+        """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None
         f = self.staged_prefetches.get(req.cache_request_handle)
         if f is None:
@@ -1316,24 +1315,31 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.SWA and t.host_indices is not None
         )
-        if full_tokens == 0 and swa_tokens == 0:
+        mamba_slots = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.MAMBA and t.host_indices is not None
+        )
+        if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
             self._resolve_device_covered(req)
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
+        req.mamba_host_hit_length = mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
         req.storage_hit_length = f.matched_len + f.num_tokens - joint_len
         req.storage_hit_start = joint_len
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, swa_tokens
+            f.operation_id, key, matched_len, full_tokens, swa_tokens, mamba_slots
         )
         return True
 
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")
 
@@ -1431,6 +1437,39 @@ class BufferModePipeline:
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
         return True
 
+    def defer_staged_admission(self, req: Req, pool: str) -> None:
+        """Retain staging for a bounded number of capacity retries."""
+        request = req.cache_request_handle
+        f = self.staged_prefetches.get(request)
+        if f is None:
+            return
+        cache = self._cache
+        defers = self._staged_admission_defers.get(request, 0) + 1
+        self._staged_admission_defers[request] = defers
+        cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
+        if defers < self.max_staged_admission_defers:
+            logger.warning(
+                "HiCache staged prefetch deferred at admission req=%s "
+                "reason=device_capacity pool=%s tokens=%d defers=%d",
+                req.rid,
+                pool,
+                f.num_tokens,
+                defers,
+            )
+            return
+        # Still unmaterializable: drop the hold so the admission loop stops
+        # breaking on this request, which recomputes on its next pass.
+        logger.warning(
+            "HiCache staged prefetch dropped after %d device_capacity "
+            "deferrals req=%s pool=%s tokens=%d",
+            defers,
+            req.rid,
+            pool,
+            f.num_tokens,
+        )
+        self.release_staged_hold(request, reason="device_capacity")
+        req.staged_prefetch_plan = None
+
     def init_load_back(
         self, params: InitLoadBackParams
     ) -> Optional[tuple[int, NodeId]]:
@@ -1441,10 +1480,10 @@ class BufferModePipeline:
         prefix lock protects allocation-time eviction. None retains staging
         and its anchor for the next admission attempt.
 
-        Ownership contract: cc.load queues the H2D before insert adjudicates
-        ownership, so the prepared boundary must ensure the insert can only
-        ADD nodes — a dedup would free slots the in-flight copy still
-        targets (queued use-after-free)."""
+        cc.load queues H2D before insert. Insert must preserve all FULL
+        destinations queued for H2D; freeing them during dedup would let the
+        pending copy overwrite reused slots. Free redundant auxiliary
+        destinations only after the transfer ack."""
         cache = self._cache
         req = params.req
         assert req is not None
@@ -1459,37 +1498,15 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (req.host_hit_length, req.swa_host_hit_length) == (
+        assert (
+            req.host_hit_length,
+            req.swa_host_hit_length,
+            req.mamba_host_hit_length,
+        ) == (
             plan.full_tokens,
             plan.swa_tokens,
+            plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
-
-        def _defer_for_capacity(pool: str) -> None:
-            defers = self._staged_admission_defers.get(request, 0) + 1
-            self._staged_admission_defers[request] = defers
-            cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
-            if defers < self.max_staged_admission_defers:
-                logger.warning(
-                    "HiCache staged prefetch deferred at admission req=%s "
-                    "reason=device_capacity pool=%s tokens=%d defers=%d",
-                    req.rid,
-                    pool,
-                    f.num_tokens,
-                    defers,
-                )
-                return
-            # Still unmaterializable: drop the hold so the admission loop stops
-            # breaking on this request, which recomputes on its next pass.
-            logger.warning(
-                "HiCache staged prefetch dropped after %d device_capacity "
-                "deferrals req=%s pool=%s tokens=%d",
-                defers,
-                req.rid,
-                pool,
-                f.num_tokens,
-            )
-            self.release_staged_hold(request, reason="device_capacity")
-            req.staged_prefetch_plan = None
 
         splice_base = plan.device_prefix_len
         assert req.prefix_len == splice_base
@@ -1518,7 +1535,7 @@ class BufferModePipeline:
             else:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < load_tokens:
-                return _defer_for_capacity("full")
+                return self.defer_staged_admission(req, "full")
 
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
@@ -1532,61 +1549,30 @@ class BufferModePipeline:
             ),
             0,
         )
-        swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
-        binds_swa_to_full = (
-            swa_entry is not None
-            and swa_entry.device_indices_from_anchor_fn is not None
-        )
-        repair_ranges = []
-        if binds_swa_to_full and staged_swa:
-            window_start = span_end - staged_swa
-            repair_end = min(splice_base, span_end)
-            if window_start < repair_end:
-                repair_ranges = cache.tree_core.swa_tombstone_ranges(
-                    key, window_start, repair_end
+        component_load_contexts = []
+        for component in cache.components.values():
+            load_context = component.prepare_buffer_load_back(req, f.aux_xfers)
+            if load_context is None:
+                for load_context in component_load_contexts:
+                    load_context.finalize_allocation(success=False)
+                return self.defer_staged_admission(
+                    req, component.component_type.name.lower()
                 )
-            # Only missing SWA rows belong to this load. Existing bindings may
-            # be in use by another request and must survive allocation rollback.
-            anchor_parts = []
-            host_parts = []
-            for repair_start, repair_end_ in repair_ranges:
-                anchor_parts.append(prefix_indices[repair_start:repair_end_])
-                host_parts.append(
-                    slice(repair_start - window_start, repair_end_ - window_start)
-                )
-            tail_start = max(splice_base, window_start)
-            if tail_start < span_end:
-                anchor_parts.append(
-                    slice(tail_start - splice_base, span_end - splice_base)
-                )
-                host_parts.append(
-                    slice(tail_start - window_start, span_end - window_start)
-                )
-            for i, transfer in enumerate(load_xfers):
-                if transfer.name != PoolName.SWA:
-                    continue
-                # Keep the original complete host bounce for ack/drop release.
-                load_xfers[i] = replace(
-                    transfer,
-                    host_indices=(
-                        torch.cat([transfer.host_indices[part] for part in host_parts])
-                        if host_parts
-                        else transfer.host_indices[:0]
-                    ),
-                    anchor_index_parts=anchor_parts,
-                )
-            if not anchor_parts:
-                load_xfers = [t for t in load_xfers if t.name != PoolName.SWA]
+            component_load_contexts.append(load_context)
+            # Not staging, so these stay out of the aux_xfers the ack frees.
+            load_xfers.extend(load_context.load_xfers)
 
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
             extra_pools=load_xfers or None,
         )
+        for load_context in component_load_contexts:
+            load_context.finalize_allocation(success=device_indices is not None)
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
-            return _defer_for_capacity("full_or_aux")
+            return self.defer_staged_admission(req, "full_or_aux")
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
@@ -1605,21 +1591,10 @@ class BufferModePipeline:
             None,
         )
         aux_device_releases: list[tuple[PoolName, torch.Tensor]] = []
-        if swa_dev is not None and binds_swa_to_full:
-            # Binding already updated the allocator's virtual-to-physical table.
-            # The tree owns virtual FULL rows, not the H2D kernel-facing IDs.
-            for repair_start, repair_end_ in repair_ranges:
-                for action in cache.tree_core.attach_swa_window(
-                    key,
-                    repair_start,
-                    repair_end_,
-                    prefix_indices[repair_start:repair_end_],
-                ):
-                    cache._apply_cache_action(action)
-        elif swa_dev is not None:
-            # Register the window's FULL->SWA translation now (attention reads
-            # through it). Keep SWA slots another request may still hold; their
-            # redundant H2D destinations are reclaimed at the transfer ack.
+        if swa_dev is not None:
+            # SWA loads into fresh reservations. Register the window's FULL->SWA
+            # translation now (attention reads through it); slots another request
+            # still holds are kept, and their redundant destinations freed at ack.
             full_window = torch.cat([prefix_indices, device_indices])[-len(swa_dev) :]
             allocator = cache.token_to_kv_pool_allocator
             old_swa = allocator.translate_swa_indices_for_transfer(full_window)
@@ -1667,6 +1642,9 @@ class BufferModePipeline:
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
         # prev_prefix_len covers the already-device-resident head.
+        insert_fields = {}
+        for load_context in component_load_contexts:
+            insert_fields.update(load_context.get_insert_fields())
         insert_result = cache.insert(
             InsertParams(
                 key=key,
@@ -1675,8 +1653,13 @@ class BufferModePipeline:
                 component_evicted_seqlens={
                     ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0
                 },
+                **insert_fields,
             )
         )
+        for load_context in component_load_contexts:
+            aux_device_releases.extend(
+                load_context.get_redundant_device_slots(insert_result)
+            )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(
             request=f.request,
             num_tokens=load_tokens,
