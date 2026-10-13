@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
     AscendTorchNativeAttnBackend,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
 
@@ -813,6 +814,52 @@ class TestRunSdpaForwardDecode(unittest.TestCase):
             causal=False,
         )
         self.assertEqual(result.dtype, torch.float32)
+
+
+class TestReferenceSlidingWindowDecode(CustomTestCase):
+    def test_reference_prefix_and_generated_window_against_full_mask(self):
+        generator = torch.Generator().manual_seed(13)
+        backend = AscendTorchNativeAttnBackend()
+        # Request pool slots deliberately differ from batch rows; scattered
+        # cache locations must be gathered in each request's logical order.
+        req_indices = torch.tensor([3, 1])
+        req_to_token = torch.stack(
+            [torch.randperm(1024, generator=generator) for _ in range(4)]
+        )
+        key = torch.randn(1024, 2, 8, generator=generator)
+        value = torch.randn(1024, 2, 8, generator=generator)
+        query = torch.randn(2, 2, 8, generator=generator)
+        reference_lens = torch.tensor([257, 11])
+        for generated in (1, 127, 128, 129, 265):
+            with self.subTest(generated=generated):
+                seq_lens = reference_lens + torch.tensor([generated, generated + 7])
+                actual = torch.empty_like(query)
+                backend.run_sdpa_forward_decode(
+                    query,
+                    actual,
+                    key,
+                    value,
+                    req_to_token,
+                    req_indices,
+                    seq_lens,
+                    sliding_window_size=128,
+                    reference_lens=reference_lens,
+                )
+                for batch_idx, slot in enumerate(req_indices):
+                    length = int(seq_lens[batch_idx])
+                    positions = torch.arange(length)
+                    visible = (positions < reference_lens[batch_idx]) | (
+                        positions >= length - 128
+                    )
+                    cache_locs = req_to_token[slot, :length]
+                    # Independent full-cache attention oracle: no compaction.
+                    q = query[batch_idx].unsqueeze(1)
+                    k = key[cache_locs].transpose(0, 1)
+                    v = value[cache_locs].transpose(0, 1)
+                    scores = (q @ k.transpose(-2, -1)) / math.sqrt(8)
+                    scores = scores.masked_fill(~visible, float("-inf"))
+                    expected = (scores.softmax(-1) @ v).squeeze(1)
+                    torch.testing.assert_close(actual[batch_idx], expected)
 
 
 if __name__ == "__main__":

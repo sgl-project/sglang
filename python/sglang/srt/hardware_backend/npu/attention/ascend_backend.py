@@ -363,6 +363,16 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
+        if self.prefill_aware_swa:
+            if model_runner.is_hybrid_swa or self.use_mla:
+                raise ValueError("Ascend reference SWA requires full MHA KV storage.")
+            self.sliding_window_size = model_runner.sliding_window_size
+            # Slot zero is reserved; slot IDs are not batch-row IDs. This CPU
+            # mirror is consumed by the eager native attention path.
+            self.reference_lens = torch.zeros(
+                model_runner.req_to_token_pool.size + 1, dtype=torch.int32
+            )
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -531,6 +541,12 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if self.prefill_aware_swa and forward_batch.forward_mode.is_extend():
+            # orig_seq_lens retains the full prompt length across prefill
+            # chunks. Refresh reused request slots before their first decode.
+            self.reference_lens[forward_batch.req_pool_indices.cpu().long()] = (
+                forward_batch.orig_seq_lens.cpu().to(torch.int32)
+            )
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -3046,6 +3062,30 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.prefill_aware_swa:
+                query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = q.new_empty(
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_decode(
+                    query,
+                    output,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                    sliding_window_size=self.sliding_window_size,
+                    reference_lens=self.reference_lens[
+                        forward_batch.req_pool_indices.cpu().long()
+                    ],
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
+                )
+                return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
