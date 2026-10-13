@@ -1305,12 +1305,8 @@ class Scheduler(
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
-        # Set by the loops that join a launched step's finished-prefill rows
-        # into the running rows before the next plan and drop finished rows at
-        # commit: the normal and overlap loops at launch, the pipeline loop
-        # when the ring commits the step. The PD decode loops drop finished
-        # rows at commit too; their rows join from the prebuilt batch at the
-        # plan. The MLX loop joins and leaves at the next plan.
+        # Set by the loops that join a launched step's finished prefills into
+        # the running rows before the next plan (see decoding_batch).
         self.rows_join_before_plan = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()

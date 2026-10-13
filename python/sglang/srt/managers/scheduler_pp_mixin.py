@@ -578,12 +578,10 @@ class SchedulerPPMixin:
         """The rows of slot mb_id once the ring commits the step it launched.
 
         The step's output arrives over the relay at this commit and rebinds
-        the step's fields, so the rows take the step here and not at launch:
-        they take back what a decode step copied from them rebound, the rows
-        whose last prefill chunk the step ran join, and the rows the commit
-        finished leave. A request chunked across slots joins the slot that
-        launched its last chunk. HiSparse rows join at the plan, once staged;
-        dLLM rows never decode."""
+        the step's fields, so the rows take the step here, not at launch. A
+        request chunked across slots joins the slot that launched its last
+        chunk. HiSparse rows join at the plan, once staged; dLLM rows never
+        decode."""
         decoding_batch = self.decoding_batches[mb_id]
         decoding_batch.absorb()
         if not self.enable_hisparse and self.dllm_config is None:

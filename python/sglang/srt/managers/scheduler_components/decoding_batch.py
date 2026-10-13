@@ -5,28 +5,17 @@ except PrefillAdder's priority preemption, which filters the rows in place.
 ``join``, ``join_launched`` and ``park_for_mix`` may replace the rows object;
 the other methods keep it, so a reference to ``rows`` stays valid across them.
 
-The rows are never a step, except in pdmux, which still launches the rows
-itself. A decode step is a copy of the rows (``decode_step``), and the rows
-take back the fields it rebound (``absorb``) before the next plan reads them:
-its run's, and its commit's too in the loops that take it back after the
-commit. The pipeline loops take it back at the ring commit of its slot, where
-the output relay rebinds the step's fields; the MLX loop at the top of the
-next plan. The normal and overlap loops, PD decode's included, take it back
-right after its launch, before its commit, so a commit must not rebind a
-field of the step that the rows need.
+A decode step is a copy of the rows (only pdmux still launches the rows), and
+``absorb`` takes back the fields its run, and in some loops its commit,
+rebound. The normal and overlap loops, PD decode's included, absorb right after
+the launch, before the commit, so a commit must not rebind a field the rows
+need.
 
-The normal and overlap loops change the rows at launch and commit: right after
-a step's run the rows absorb it and the rows whose last prefill chunk it ran
-join (``join_launched``); after a commit the rows it finished leave. Between
-steps the rows are then exactly the requests still decoding. The PD decode
-normal and overlap loops do the same, except that their rows join from the
-prebuilt batch at the plan, as those requests prefilled on another server.
-The pipeline loops change a slot's rows when the ring commits the step the
-slot launched, since the step's output reaches it only there: the rows absorb
-it, the rows whose last prefill chunk it ran join, and the rows it finished
-leave. The pipeline PD decode loop's rows join from the prebuilt batch at the
-plan. The MLX loop joins the step it launched last at the top of the next
-plan, and leaves there.
+The normal and overlap loops join a step's finished prefills at its launch and
+drop the rows a commit finished at that commit, so between steps the rows are
+exactly the requests still decoding. The pipeline loops do both at the ring
+commit of the slot's step, where its output arrives; PD decode joins the
+prebuilt batch at the plan; MLX joins and leaves at the next plan.
 """
 
 from __future__ import annotations
