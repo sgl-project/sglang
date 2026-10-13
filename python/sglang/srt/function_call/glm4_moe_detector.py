@@ -237,17 +237,24 @@ class Glm4MoeDetector(BaseFormatDetector):
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
+    # Only the first opener can match (a later one sees a subset of the text), so
+    # anchoring to it keeps a failed search from rescanning from every opener.
     _STREAMING_PARTIAL_PATTERN = re.compile(
-        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+        r"\A(?:(?!<tool_call>).)*<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+        re.DOTALL,
     )
 
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        # An unclosed trailing call matches the second branch and yields "" (skipped
+        # by the caller), so findall does not rescan the tail from every opener.
+        self.func_call_regex = r"(<tool_call>.*?</tool_call>)|<tool_call>.*"
+        # Each split call starts at its opener, and a later opener sees a subset of
+        # the text, so anchoring keeps a failed search from rescanning per opener.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+            r"\A<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",

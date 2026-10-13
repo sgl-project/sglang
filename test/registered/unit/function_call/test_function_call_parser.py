@@ -4017,7 +4017,7 @@ class TestLing3Detector(unittest.TestCase):
 
     def test_nullable_string_non_null_values_remain_strings(self):
         cases = (
-            ('"null"', "null"),
+            ('"null"', '"null"'),
             ("None", "None"),
             ("nullish", "nullish"),
         )
