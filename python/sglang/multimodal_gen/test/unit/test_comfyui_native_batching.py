@@ -19,6 +19,9 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     WorkerOutOfMemoryError,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.qwen_image21 import (
+    QwenImage21Adapter,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
@@ -226,6 +229,47 @@ def test_worker_out_of_memory_error_is_recognised() -> None:
     assert not isinstance(error.value, WorkerOutOfMemoryError)
 
 
+def _flux_rows(ex, guidance):
+    x = torch.zeros(2, 16, 8, 8)
+    timestep = torch.tensor([0.5, 0.5])
+    context = torch.stack([torch.full((7, 4096), 1.0), torch.full((7, 4096), 2.0)])
+    y = torch.stack([torch.full((768,), 3.0), torch.full((768,), 4.0)])
+    return ex(x, timestep, context, y=y, guidance=guidance)
+
+
+class _FluxExecutor(_Executor):
+    def _execute_packed(self, packed, x, timestep):
+        self.sent.append(packed)
+        # Fake noise_pred: each row is filled with its own T5 context mean.
+        rows = packed.prompt_embeds[1].reshape(packed.latents.shape[0], -1).mean(1)
+        noise = rows.view(-1, 1, 1).expand_as(packed.latents).clone()
+        return self.adapter.unpack(noise, packed, x)
+
+
+def test_flux_batch_sends_one_text_length_per_row() -> None:
+    ex = _FluxExecutor(FluxAdapter(), native_batching="full")
+    out = _flux_rows(ex, guidance=torch.tensor([3.5, 3.5]))
+    assert len(ex.sent) == 1
+    packed = ex.sent[0]
+    assert packed.latents.shape == (2, 16, 64)
+    assert packed.prompt_seq_lens == [[1, 1], [7, 7]]
+    assert packed.pooled_embeds[0].shape == (2, 768)
+    assert packed.guidance_scale == 3.5
+    assert out.shape == (2, 16, 8, 8)
+    assert [float(out[i].mean()) for i in range(2)] == [1.0, 2.0]
+
+
+def test_flux_rows_with_different_guidance_are_not_batched() -> None:
+    ex = _FluxExecutor(FluxAdapter(), native_batching="full")
+    with pytest.raises(ValueError, match="different guidance"):
+        _flux_rows(ex, guidance=torch.tensor([3.5, 1.0]))
+    assert ex.sent == []
+    # The default per-row path sends each row's own guidance.
+    ex.native_batching = "off"
+    _flux_rows(ex, guidance=torch.tensor([3.5, 1.0]))
+    assert [p.guidance_scale for p in ex.sent] == [3.5, 1.0]
+
+
 def test_log_suppression_accepts_a_timestep_per_row() -> None:
     assert SGLDiffusionExecutor.should_suppress_logs(torch.tensor([0.5, 0.2]))
     assert not SGLDiffusionExecutor.should_suppress_logs(torch.tensor([1.0, 0.2]))
@@ -254,15 +298,16 @@ def test_worker_rejects_row_timesteps_of_the_wrong_length() -> None:
 
 
 def test_native_batching_is_refused_for_unverified_models() -> None:
-    _check_native_batching("off", FluxAdapter, {"num_gpus": 2})
+    _check_native_batching("off", QwenImage21Adapter, {"num_gpus": 2})
+    _check_native_batching("full", FluxAdapter, {})
     _check_native_batching("cfg_only", ZImageAdapter, {"num_gpus": 1})
     _check_native_batching("full", ZImageAdapter, {})
     with pytest.raises(ValueError, match="must be one of"):
         _check_native_batching(True, ZImageAdapter, {})
     with pytest.raises(
-        ValueError, match=r"only verified for model types \['lumina2'\]"
+        ValueError, match=r"only verified for model types \['flux', 'lumina2'\]"
     ):
-        _check_native_batching("cfg_only", FluxAdapter, {})
+        _check_native_batching("cfg_only", QwenImage21Adapter, {})
     with pytest.raises(ValueError, match="one GPU"):
         _check_native_batching("full", ZImageAdapter(), {"num_gpus": 2})
 
