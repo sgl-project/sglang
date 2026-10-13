@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 FABRIC_CHUNK_READY = b"FABRIC_CHUNK_READY"
 FABRIC_CHUNK_ACK = b"FABRIC_CHUNK_ACK"
+FABRIC_CHUNK_NACK = b"FABRIC_CHUNK_NACK"
 
 
 def _normalize_state_indices_per_component(
@@ -176,6 +177,7 @@ class TransferInfo:
     # populate this field (older receiver or radix-cache feature off) -> treat
     # as 0 (no prefix hit, full send) for backward compatibility.
     decode_prefix_len: Optional[int] = None
+    dst_staging_epoch: bytes = b""
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -226,6 +228,7 @@ class TransferInfo:
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
             decode_prefix_len=decode_prefix_len,
+            dst_staging_epoch=payload[9] if len(payload) > 9 else b"",
         )
 
 
@@ -352,6 +355,17 @@ class TransferTarget:
     peer_info: KVArgsRegisterInfo
 
 
+@dataclasses.dataclass
+class _FabricStagingRoom:
+    kv_indices: np.ndarray
+    state_indices: List
+    senders: set[Tuple[str, int]]
+    epoch: bytes = dataclasses.field(default_factory=lambda: uuid.uuid4().hex.encode())
+    next_index: Dict[Tuple[str, int], Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
 class _MoriTransferSubmissionError(RuntimeError):
     def __init__(self, message: str, statuses: List[TransferStatus]):
         super().__init__(message)
@@ -408,10 +422,14 @@ class MoriKVManager(CommonKVManager):
         self._fabric_staging_descs: List[MemoryDesc] = []
         self._fabric_staging_ack_cv = threading.Condition()
         self._fabric_staging_acks: set[Tuple[int, int, int, int, int]] = set()
+        self._fabric_staging_nacks: Dict[Tuple[int, int, int, int, int], str] = {}
+        self._fabric_staging_pending: Dict[int, set] = {}
         self._fabric_staging_generations = [0] * self._num_shards
-        self._fabric_staging_room_meta: Dict[
-            int, Tuple[np.ndarray, List[np.ndarray]]
-        ] = {}
+        self._fabric_staging_room_meta: Dict[int, _FabricStagingRoom] = {}
+        self._fabric_staging_rx_lock = threading.RLock()
+        self._fabric_staging_rx_generations: Dict[Tuple[str, int, int], int] = {}
+        self._fabric_staging_rx_poisoned: set[int] = set()
+        self._fabric_staging_scattering: Optional[int] = None
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
@@ -824,6 +842,7 @@ class MoriKVManager(CommonKVManager):
             targets = [
                 TransferTarget(info=info, peer_info=self.decode_kv_args_table[engine])
                 for engine, info in infos.items()
+                if not info.is_dummy
             ]
             self.update_status(room, KVPoll.Transferring)
 
@@ -882,7 +901,10 @@ class MoriKVManager(CommonKVManager):
                     f"slots={len(peer.dst_staging_mem_descs)}, need={required}, "
                     f"capacity={peer.dst_staging_size}"
                 )
+            if not target.info.dst_staging_epoch:
+                raise RuntimeError(f"Missing decode staging epoch for room={room}")
 
+        self._release_fabric_staging_slot(worker_index)
         generation = self._fabric_staging_generations[worker_index] + 1
         self._fabric_staging_generations[worker_index] = generation
         start = int(kv_chunk.index_slice.start or 0)
@@ -946,6 +968,12 @@ class MoriKVManager(CommonKVManager):
         )
 
         statuses: List[TransferStatus] = []
+        expected = {
+            (room, worker_index, generation, stop, target.peer_info.decode_tp_rank)
+            for target in targets
+        }
+        with self._fabric_staging_ack_cv:
+            self._fabric_staging_pending[worker_index] = expected
         for target in targets:
             peer = target.peer_info
             uid = self.engine.allocate_transfer_uid()
@@ -993,6 +1021,7 @@ class MoriKVManager(CommonKVManager):
                     str(peer.decode_tp_rank).encode("ascii"),
                     str(worker_index).encode("ascii"),
                     str(generation).encode("ascii"),
+                    info.dst_staging_epoch,
                 ]
             )
         logger.info(
@@ -1006,20 +1035,7 @@ class MoriKVManager(CommonKVManager):
         deadline = time.monotonic() + max(
             300.0, envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get() / 1000.0
         )
-        expected = {
-            (room, worker_index, generation, stop, target.peer_info.decode_tp_rank)
-            for target in targets
-        }
-        with self._fabric_staging_ack_cv:
-            while not expected.issubset(self._fabric_staging_acks):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(
-                        f"Timed out waiting for Fabric staging ACK: room={room}, "
-                        f"slot={worker_index}, generation={generation}, stop={stop}"
-                    )
-                self._fabric_staging_ack_cv.wait(min(remaining, 1.0))
-            self._fabric_staging_acks.difference_update(expected)
+        self._wait_fabric_staging_acks(room, expected, deadline)
         logger.info(
             "Mori fabric staging room=%s slot=%s generation=%s rank=%s "
             "phase=ack_received",
@@ -1045,6 +1061,35 @@ class MoriKVManager(CommonKVManager):
             self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
         return True
 
+    def _release_fabric_staging_slot(self, slot: int) -> None:
+        with self._fabric_staging_ack_cv:
+            pending = self._fabric_staging_pending.get(slot, set())
+            if not pending.issubset(self._fabric_staging_acks):
+                raise RuntimeError(f"Fabric staging slot {slot} is quarantined")
+            self._fabric_staging_acks.difference_update(pending)
+            for key in pending:
+                self._fabric_staging_nacks.pop(key, None)
+            self._fabric_staging_pending.pop(slot, None)
+
+    def _wait_fabric_staging_acks(self, room: int, expected: set, deadline: float):
+        with self._fabric_staging_ack_cv:
+            while True:
+                for key in expected:
+                    if key in self._fabric_staging_nacks:
+                        raise RuntimeError(
+                            f"Fabric staging NACK {key}: {self._fabric_staging_nacks[key]}"
+                        )
+                if self._stopped or self._should_skip_transfer(room):
+                    raise RuntimeError(f"Fabric staging wait cancelled for room={room}")
+                if expected.issubset(self._fabric_staging_acks):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"Timed out waiting for Fabric staging ACK: {expected}"
+                    )
+                self._fabric_staging_ack_cv.wait(min(remaining, 0.1))
+
     def _handle_fabric_chunk_ack(self, msg: List[bytes]) -> None:
         key = (
             int(msg[1].decode("ascii")),
@@ -1054,12 +1099,47 @@ class MoriKVManager(CommonKVManager):
             int(msg[5].decode("ascii")),
         )
         with self._fabric_staging_ack_cv:
-            self._fabric_staging_acks.add(key)
+            if key not in self._fabric_staging_pending.get(key[1], ()):
+                return
+            if msg[0] == FABRIC_CHUNK_NACK:
+                self._fabric_staging_nacks[key] = msg[7].decode(
+                    "utf-8", errors="replace"
+                )
+            if msg[0] == FABRIC_CHUNK_ACK or msg[6] == b"1":
+                self._fabric_staging_acks.add(key)
             self._fabric_staging_ack_cv.notify_all()
 
     def _handle_fabric_chunk_ready(self, msg: List[bytes]) -> None:
+        if len(msg) < 12:
+            raise ValueError("Incomplete Fabric staging READY")
+        reply = [FABRIC_CHUNK_ACK, msg[1], msg[10], msg[11], msg[3], msg[9]]
+        with self._fabric_staging_rx_lock:
+            try:
+                self._scatter_fabric_chunk(msg)
+            except Exception as exc:
+                slot = self._fabric_staging_scattering
+                if slot is not None:
+                    try:
+                        self._fabric_staging_buffers[
+                            slot
+                        ].get_gather_stream().synchronize()
+                    except Exception:
+                        self._fabric_staging_rx_poisoned.add(slot)
+                terminal = int(msg[10]) not in self._fabric_staging_rx_poisoned
+                reply[0] = FABRIC_CHUNK_NACK
+                reply.extend([b"1" if terminal else b"0", str(exc).encode("utf-8")])
+                logger.warning("Fabric staging READY rejected: %s", exc)
+            finally:
+                self._fabric_staging_scattering = None
+        na = NetworkAddress(msg[7].decode("ascii"), int(msg[8]))
+        sock = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
+        sock.send_multipart(reply)
+
+    def _scatter_fabric_chunk(self, msg: List[bytes]) -> None:
         from sglang.srt.disaggregation.common.dcp_pack import scatter_dcp_dst
 
+        if len(msg) != 13:
+            raise ValueError("Missing Fabric staging room epoch")
         room = int(msg[1].decode("ascii"))
         start = int(msg[2].decode("ascii"))
         stop = int(msg[3].decode("ascii"))
@@ -1072,15 +1152,32 @@ class MoriKVManager(CommonKVManager):
         staging_slot = int(msg[10].decode("ascii"))
         generation = int(msg[11].decode("ascii"))
         metadata = self._fabric_staging_room_meta.get(room)
-        if metadata is None:
-            raise RuntimeError(f"Missing Fabric staging metadata for room={room}")
-        dst_kv_indices, dst_state_indices = metadata
-        dst_chunk = dst_kv_indices[start:stop]
-        if staging_slot >= len(self._fabric_staging_buffers):
+        sender = (prefill_ip, prefill_port)
+        if (
+            metadata is None
+            or msg[12] != metadata.epoch
+            or sender not in metadata.senders
+            or self.request_status.get(room) in (None, KVPoll.Failed, KVPoll.Success)
+        ):
+            raise RuntimeError(f"Unknown or terminal Fabric staging room={room}")
+        if not 0 <= staging_slot < len(self._fabric_staging_buffers):
             raise RuntimeError(
                 f"Invalid Fabric staging slot {staging_slot}; "
                 f"available={len(self._fabric_staging_buffers)}"
             )
+        slot_key = (*sender, staging_slot)
+        if (
+            staging_slot in self._fabric_staging_rx_poisoned
+            or generation <= self._fabric_staging_rx_generations.get(slot_key, 0)
+            or decode_rank != self.attn_tp_rank
+            or start != metadata.next_index.get(sender, 0)
+            or not 0 <= start <= stop <= metadata.kv_indices.size
+            or (is_last and stop != metadata.kv_indices.size)
+        ):
+            raise RuntimeError(f"Stale or invalid Fabric staging READY for room={room}")
+        self._fabric_staging_rx_generations[slot_key] = generation
+        dst_state_indices = metadata.state_indices
+        dst_chunk = metadata.kv_indices[start:stop]
         buffer = self._fabric_staging_buffers[staging_slot]
         required = kv_bytes + state_bytes
         capacity = int(buffer.get_size())
@@ -1140,6 +1237,7 @@ class MoriKVManager(CommonKVManager):
             required,
             capacity,
         )
+        self._fabric_staging_scattering = staging_slot
         scatter_dcp_dst(
             pack_buffer=buffer,
             kv_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -1169,18 +1267,7 @@ class MoriKVManager(CommonKVManager):
             self.attn_tp_rank,
             required,
         )
-        na = NetworkAddress(prefill_ip, prefill_port)
-        sock = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
-        sock.send_multipart(
-            [
-                FABRIC_CHUNK_ACK,
-                str(room).encode("ascii"),
-                str(staging_slot).encode("ascii"),
-                str(generation).encode("ascii"),
-                str(stop).encode("ascii"),
-                str(decode_rank).encode("ascii"),
-            ]
-        )
+        metadata.next_index[sender] = None if is_last else stop
 
     def _wait_for_chunk_completion(
         self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
@@ -1499,7 +1586,7 @@ class MoriKVManager(CommonKVManager):
                     if tag == ABORT_TAG:
                         self._handle_abort_message(msg)
                         continue
-                    if tag == FABRIC_CHUNK_ACK:
+                    if tag in (FABRIC_CHUNK_ACK, FABRIC_CHUNK_NACK):
                         self._handle_fabric_chunk_ack(msg)
                         continue
 
@@ -2528,6 +2615,8 @@ class MoriKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time: Optional[float] = None
+        if mgr._fabric_staging:
+            self._lifecycle_lock = mgr._fabric_staging_rx_lock
 
     def init(
         self,
@@ -2608,11 +2697,20 @@ class MoriKVReceiver(CommonKVReceiver):
         )
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
         normalized_state = _normalize_state_indices_per_component(state_indices)
+        staging_epoch = b""
         if self.kv_mgr._fabric_staging:
-            self.kv_mgr._fabric_staging_room_meta[self.bootstrap_room] = (
+            metadata = _FabricStagingRoom(
                 np.asarray(kv_indices, dtype=np.int32).copy(),
                 normalized_state or [],
+                {
+                    (info["rank_ip"], info["rank_port"])
+                    for info in self.bootstrap_infos
+                    if not info.get("is_dummy", False)
+                },
             )
+            with self._lifecycle_lock:
+                self.kv_mgr._fabric_staging_room_meta[self.bootstrap_room] = metadata
+            staging_epoch = metadata.epoch
 
         decode_prefix_bytes = (
             str(int(decode_prefix_len)).encode("ascii")
@@ -2641,6 +2739,7 @@ class MoriKVReceiver(CommonKVReceiver):
                             state_bytes,
                             str(self.required_dst_info_num).encode("ascii"),
                             decode_prefix_bytes,
+                            staging_epoch,
                         ]
                     )
             except zmq.ZMQError:
@@ -2673,7 +2772,10 @@ class MoriKVReceiver(CommonKVReceiver):
     def clear(self) -> None:
         if self.bootstrap_room is None:
             return
-        super().clear()
+        with self._lifecycle_lock:
+            if self.kv_mgr._fabric_staging and self._owns_bootstrap_room:
+                self.kv_mgr._fabric_staging_room_meta.pop(self.bootstrap_room, None)
+            super().clear()
 
     def failure_exception(self):
         if self.conclude_state is None:

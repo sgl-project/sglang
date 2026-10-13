@@ -3,6 +3,7 @@
 import importlib
 import sys
 import threading
+import time
 import types
 import unittest
 from collections import defaultdict
@@ -67,9 +68,14 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
+    FABRIC_CHUNK_ACK,
+    FABRIC_CHUNK_NACK,
+    FABRIC_CHUNK_READY,
     MoriKVManager,
+    MoriKVReceiver,
     MoriKVSender,
     StatusCode,
+    _FabricStagingRoom,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )
@@ -412,6 +418,15 @@ class TestMoriFabricStaging(CustomTestCase):
                 requires_dcp_relayout=False,
             )
         }
+        manager._stopped = False
+        manager._fabric_staging_ack_cv = threading.Condition()
+        manager._fabric_staging_acks = set()
+        manager._fabric_staging_nacks = {}
+        manager._fabric_staging_pending = {}
+        manager._fabric_staging_rx_lock = threading.RLock()
+        manager._fabric_staging_rx_generations = {}
+        manager._fabric_staging_rx_poisoned = set()
+        manager._fabric_staging_scattering = None
         return manager
 
     def sender(self, manager, pages):
@@ -558,7 +573,199 @@ class TestMoriFabricStaging(CustomTestCase):
                     with self.assertRaisesRegex((ValueError, RuntimeError), error):
                         manager._process_fabric_staging_chunk(chunk, 0)
                     gather.assert_not_called()
+                    self.assertTrue(torch.all(storage == 165))
+
+    def ready_fixture(self):
+        manager = self.manager()
+        manager.attn_tp_rank = 0
+        storage = torch.full((6532,), 165, dtype=torch.uint8)
+        manager._fabric_staging_buffers = [
+            types.SimpleNamespace(
+                get_size=lambda: 6500,
+                get_ptr=lambda: storage.data_ptr() + 16,
+                get_gather_stream=MagicMock(),
+                buffer=storage[16:-16],
+            )
+        ]
+        metadata = _FabricStagingRoom(np.arange(6), [], {("10.0.0.1", 6000)})
+        manager._fabric_staging_room_meta = {11: metadata}
+        replies = []
+        manager._connect_threadsafe = lambda *a, **kw: types.SimpleNamespace(
+            send_multipart=replies.append
+        )
+        msg = [
+            FABRIC_CHUNK_READY,
+            b"11",
+            b"0",
+            b"2",
+            b"0",
+            b"512",
+            b"0",
+            b"10.0.0.1",
+            b"6000",
+            b"0",
+            b"0",
+            b"1",
+            metadata.epoch,
+        ]
+        return manager, msg, replies, storage
+
+    def test_ready_rejects_invalid_or_stale_identity_before_scatter(self):
+        for field, value in (
+            (2, b"-1"),
+            (3, b"99"),
+            (5, b"6501"),
+            (9, b"1"),
+            (10, b"-1"),
+            (11, b"0"),
+            (12, b"old"),
+        ):
+            with self.subTest(field=field, value=value):
+                manager, msg, replies, storage = self.ready_fixture()
+                msg[field] = value
+                with patch(
+                    "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst"
+                ) as scatter:
+                    manager._handle_fabric_chunk_ready(msg)
+                self.assertEqual(
+                    replies[0][:6],
+                    [FABRIC_CHUNK_NACK, msg[1], msg[10], msg[11], msg[3], msg[9]],
+                )
+                self.assertEqual(replies[0][6], b"1")
                 self.assertTrue(torch.all(storage == 165))
+                scatter.assert_not_called()
+
+        manager, msg, replies, _ = self.ready_fixture()
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst"
+        ) as scatter:
+            manager._handle_fabric_chunk_ready(msg)
+            manager._handle_fabric_chunk_ready(msg)
+            manager._fabric_staging_room_meta[11] = _FabricStagingRoom(
+                np.arange(6), [], {("10.0.0.1", 6000)}
+            )
+            msg[11] = b"2"
+            manager._handle_fabric_chunk_ready(msg)
+        self.assertEqual(
+            [reply[0] for reply in replies],
+            [FABRIC_CHUNK_ACK, FABRIC_CHUNK_NACK, FABRIC_CHUNK_NACK],
+        )
+        self.assertEqual(scatter.call_count, 1)
+
+        manager, msg, replies, _ = self.ready_fixture()
+        manager._fabric_staging_buffers[
+            0
+        ].get_gather_stream.return_value.synchronize.side_effect = RuntimeError(
+            "stream failed"
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst",
+            side_effect=RuntimeError("copy failed"),
+        ) as scatter:
+            manager._handle_fabric_chunk_ready(msg)
+            msg[11] = b"2"
+            manager._handle_fabric_chunk_ready(msg)
+        self.assertEqual(manager._fabric_staging_rx_poisoned, {0})
+        self.assertEqual([reply[6] for reply in replies], [b"0", b"0"])
+        self.assertEqual(scatter.call_count, 1)
+
+    def test_failed_wait_quarantines_slot_until_terminal_reply(self):
+        manager = self.manager()
+        key = (11, 0, 1, 2, 0)
+        manager._fabric_staging_pending[0] = {key}
+        with self.assertRaisesRegex(RuntimeError, "Timed out"):
+            manager._wait_fabric_staging_acks(11, {key}, time.monotonic() - 1)
+        for state in ("timeout", "abort", "shutdown", "nack"):
+            with self.subTest(state=state):
+                manager.request_status[11] = KVPoll.Transferring
+                manager._stopped = False
+                if state == "abort":
+                    manager.request_status[11] = KVPoll.Failed
+                elif state == "shutdown":
+                    manager._stopped = True
+                elif state == "nack":
+                    manager._handle_fabric_chunk_ack(
+                        [
+                            FABRIC_CHUNK_NACK,
+                            b"11",
+                            b"0",
+                            b"1",
+                            b"2",
+                            b"0",
+                            b"0",
+                            b"scatter failed",
+                        ]
+                    )
+                with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                    manager._release_fabric_staging_slot(0)
+                if state != "timeout":
+                    with self.assertRaises(RuntimeError):
+                        manager._wait_fabric_staging_acks(
+                            11, {key}, time.monotonic() + 300
+                        )
+        manager._handle_fabric_chunk_ack(
+            [FABRIC_CHUNK_ACK, b"11", b"0", b"2", b"2", b"0"]
+        )
+        self.assertFalse(manager._fabric_staging_acks)
+        manager._handle_fabric_chunk_ack(
+            [FABRIC_CHUNK_NACK, b"11", b"0", b"1", b"2", b"0", b"1", b"rejected"]
+        )
+        manager._release_fabric_staging_slot(0)
+        self.assertFalse(manager._fabric_staging_pending)
+        self.assertFalse(manager._fabric_staging_nacks)
+        manager._handle_fabric_chunk_ack(
+            [FABRIC_CHUNK_ACK, b"11", b"0", b"1", b"2", b"0"]
+        )
+        self.assertFalse(manager._fabric_staging_acks)
+
+    def test_clear_waits_for_scatter_and_rejects_late_ready(self):
+        manager, msg, replies, _ = self.ready_fixture()
+        manager.defer_decode_allocation = False
+        manager.required_prefill_response_num_table = {}
+        manager.prefill_response_tracker = {}
+        manager.addr_to_rooms_tracker = defaultdict(set)
+        receiver = MoriKVReceiver.__new__(MoriKVReceiver)
+        receiver.kv_mgr, receiver.bootstrap_room, receiver.bootstrap_addr = (
+            manager,
+            11,
+            "peer",
+        )
+        receiver._lifecycle_lock = manager._fabric_staging_rx_lock
+        entered, finish, clearing, cleared = (threading.Event() for _ in range(4))
+
+        def scatter(**kwargs):
+            entered.set()
+            self.assertTrue(finish.wait(2))
+
+        def clear():
+            clearing.set()
+            receiver.clear()
+            cleared.set()
+
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst",
+            side_effect=scatter,
+        ):
+            worker = threading.Thread(
+                target=manager._handle_fabric_chunk_ready, args=(msg,)
+            )
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            cleanup = threading.Thread(target=clear)
+            cleanup.start()
+            try:
+                self.assertTrue(clearing.wait(1))
+                self.assertFalse(cleared.wait(0.02))
+            finally:
+                finish.set()
+                worker.join(2)
+                cleanup.join(2)
+            self.assertTrue(cleared.is_set())
+            manager._handle_fabric_chunk_ready(msg)
+        self.assertNotIn(11, manager._fabric_staging_room_meta)
+        self.assertEqual(
+            [reply[0] for reply in replies], [FABRIC_CHUNK_ACK, FABRIC_CHUNK_NACK]
+        )
 
 
 if __name__ == "__main__":
