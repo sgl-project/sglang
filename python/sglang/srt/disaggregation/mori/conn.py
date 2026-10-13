@@ -629,6 +629,62 @@ class MoriKVManager(CommonKVManager):
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
 
+    def fabric_staging_max_tokens(self, room: int) -> int:
+        with self.transfer_lock:
+            targets = [
+                (info, self.decode_kv_args_table[engine])
+                for engine, info in self.transfer_infos.get(room, {}).items()
+                if not info.is_dummy
+            ]
+        if not self._fabric_staging_buffers or not targets:
+            raise ValueError(f"Missing Fabric staging capacity for room={room}")
+
+        capacities = [int(buf.get_size()) for buf in self._fabric_staging_buffers]
+        state_bytes = 0
+        for info, peer in targets:
+            if len(peer.dst_staging_mem_descs) < len(self._fabric_staging_buffers):
+                raise ValueError(f"Missing decode staging slots for room={room}")
+            capacities.append(int(peer.dst_staging_size))
+            if len(info.dst_state_indices) != len(self.kv_args.state_item_lens):
+                raise ValueError(f"Fabric staging state metadata mismatch for room={room}")
+            # Bootstrap advertises all terminal rows, including request-scoped rings.
+            state_bytes = max(
+                state_bytes,
+                sum(
+                    np.asarray(indices).size * sum(item_lens)
+                    for indices, item_lens in zip(
+                        info.dst_state_indices, self.kv_args.state_item_lens
+                    )
+                    if indices is not None
+                ),
+            )
+
+        capacity = min(capacities)
+        page_bytes = sum(self.kv_args.kv_item_lens)
+        page_size = self.kv_args.page_size
+        if (
+            capacity <= 0
+            or page_size <= 0
+            or page_bytes <= 0
+            or any(n <= 0 for n in self.kv_args.kv_item_lens)
+            or any(n <= 0 for group in self.kv_args.state_item_lens for n in group)
+        ):
+            raise ValueError(f"Invalid Fabric staging layout for room={room}")
+        pages = (capacity - state_bytes) // page_bytes
+        if pages < 1:
+            raise ValueError(
+                f"Fabric staging slot cannot hold a KV page and terminal state: "
+                f"room={room}, capacity={capacity}, state_bytes={state_bytes}, "
+                f"page_bytes={page_bytes}"
+            )
+        tokens = pages * page_size
+        logger.info(
+            "Mori fabric staging cap: room=%s capacity=%s page_bytes=%s "
+            "state_bytes=%s tokens=%s",
+            room, capacity, page_bytes, state_bytes, tokens,
+        )
+        return tokens
+
     def _transfer_worker(self, queue: FastQueue, worker_index: int) -> None:
         while True:
             kv_chunk = queue.get()
@@ -2327,6 +2383,21 @@ class MoriKVSender(CommonKVSender):
         )
         self.conclude_state: Optional[KVPoll] = None
         self.init_time = time.time()
+        self._fabric_transfer_tokens: Optional[int] = None
+
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        limit = super().get_max_transfer_tokens()
+        if self.kv_mgr._fabric_staging and not self.kv_mgr.is_dummy_cp_rank:
+            if self._fabric_transfer_tokens is None:
+                self._fabric_transfer_tokens = self.kv_mgr.fabric_staging_max_tokens(
+                    self.bootstrap_room
+                )
+            return (
+                min(limit, self._fabric_transfer_tokens)
+                if limit is not None
+                else self._fabric_transfer_tokens
+            )
+        return limit
 
     def send(
         self,
