@@ -108,6 +108,7 @@ rm -rf "$UV_VENV"
                 env = dict(
                     os.environ,
                     GITHUB_ENV=f"{tmp}/env",
+                    GITHUB_PATH=f"{tmp}/path",
                     # The per-job venv lives under /tmp; the persistent one is the
                     # runner's real /opt/sglang-ci-py*, which this test must not touch.
                     USE_VENV="1",

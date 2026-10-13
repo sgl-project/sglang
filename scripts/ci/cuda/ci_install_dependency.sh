@@ -67,12 +67,18 @@ configure_environment() {
     uv --version
 
     # Every job installs into a uv-managed venv, whatever Python the runner image ships.
-    CI_PYTHON_VER="${SGLANG_TEST_CI_PYTHON:-3.12}"
-    echo "SGLANG_TEST_CI_PYTHON=${CI_PYTHON_VER}"
+    # Keep in sync with the python-version matrix in _pr-test-rust-ext-build.yml.
+    CI_PYTHON_VER="3.12"
 
     # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
-    # --upgrade repoints uv's minor-version link at the latest patch; a kept venv follows it.
-    uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+    # The download comes from github.com, which some pools reach slowly enough to time
+    # out this step, so keep the installed build unless it predates os.memfd_create
+    # (python-build-standalone before 20260718). --upgrade repoints uv's minor-version
+    # link at the latest patch; a kept venv follows it.
+    CI_PYTHON_BIN="$(uv python find "$CI_PYTHON_VER" --system --python-preference only-managed 2>/dev/null || true)"
+    if [ -z "$CI_PYTHON_BIN" ] || ! "$CI_PYTHON_BIN" -c 'import os; os.memfd_create' 2>/dev/null; then
+        uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+    fi
 
     UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
@@ -567,7 +573,7 @@ require_prebuilt_rust_exts() {
     # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
-    # silently skipped. A SGLANG_TEST_CI_PYTHON outside the build matrix has no module;
+    # silently skipped. A CI_PYTHON_VER outside the build matrix has no module;
     # build it from source rather than fail.
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')

@@ -169,7 +169,7 @@ jobs:
     timeout-minutes: 60
     name: Build Rust Ext
     # No crate sets abi3, so each interpreter the stages run needs its own leg;
-    # keep this matrix in sync with SGLANG_TEST_CI_PYTHON in ci_install_dependency.sh.
+    # keep this matrix in sync with CI_PYTHON_VER in ci_install_dependency.sh.
     strategy:
       fail-fast: false
       matrix:
