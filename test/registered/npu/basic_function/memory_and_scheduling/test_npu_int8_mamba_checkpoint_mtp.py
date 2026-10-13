@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -99,7 +100,7 @@ def _generate_capacity_request(input_ids):
     return _generate(_capacity_payload(input_ids))
 
 
-def _measure_running_server(int8_enabled, mtp_enabled, plan):
+def _measure_running_server(int8_enabled, mtp_enabled, plan, answer_prompt):
     info_response = requests.get(BASE_URL + "/server_info", timeout=30)
     info_response.raise_for_status()
     server_info = info_response.json()
@@ -110,7 +111,9 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan):
     has_draft_tokens = bool(server_info.get("speculative_num_draft_tokens"))
     assert has_draft_tokens is mtp_enabled
 
-    _check_cached_output_matches_recompute(int8_enabled, mtp_enabled)
+    _check_cached_output_matches_recompute(
+        int8_enabled, mtp_enabled, answer_prompt
+    )
 
     results = {}
     for K, (warm, probe) in plan.items():
@@ -145,25 +148,59 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan):
     return results
 
 
-def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled):
-    """Check a one-token answer after reuse and observe runtime MTP acceptance."""
-    prompt = (
+def _make_answer_prompt(tokenizer):
+    """Create a long, non-thinking chat prompt that should have a cache hit."""
+    context = (
         "\n\n".join(
             [
-                "You are preparing a field guide for a community science team. Explain each observation carefully, distinguish direct evidence from interpretation, and keep the instructions practical. The team records the weather, location, time, and equipment before collecting samples.",
-                "For every sample, write down the label exactly as it appears, use a clean container, and note any unusual color, texture, or odor without guessing at its cause. If a measurement is uncertain, repeat it and record both values.",
-                "At the end of the day, compare the field notes with the instrument log. Preserve the original readings, identify missing entries, and list questions for the next visit. Do not silently replace an observation with an estimate.",
+                "You are preparing a field guide for a community science team. "
+                "Explain each observation carefully, distinguish direct "
+                "evidence from interpretation, and keep the instructions "
+                "practical. The team records the weather, location, time, "
+                "and equipment before collecting samples.",
+                "For every sample, write down the label exactly as it "
+                "appears, use a clean container, and note any unusual color, "
+                "texture, or odor without guessing at its cause. If a "
+                "measurement is uncertain, repeat it and record both values.",
+                "At the end of the day, compare the field notes with the "
+                "instrument log. Preserve the original readings, identify "
+                "missing entries, and list questions for the next visit. "
+                "Do not silently replace an observation with an estimate.",
             ]
-            * 45
         )
-        + "\n\nQuestion: What is 2 + 2? Reply with only one digit.\nAnswer:"
+        * 8
     )
+    messages = [
+        {
+            "role": "system",
+            "content": "Reply with exactly one digit and no explanation.",
+        },
+        {
+            "role": "user",
+            "content": f"{context}\n\nQuestion: What is 2 + 2?",
+        },
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    assert token_count > 256, (
+        f"correctness prompt must exceed the cache page size; got {token_count}"
+    )
+    print(f"[cache-hit answer prompt] token_count={token_count}", flush=True)
+    return prompt
+
+
+def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, prompt):
+    """Check a short answer after reuse and observe runtime MTP acceptance."""
     answer_request = {
         "text": prompt,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 1,
-            "ignore_eos": True,
+            "max_new_tokens": 16,
         },
     }
 
@@ -234,6 +271,8 @@ class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
 
     def test_checkpoint_capacity_and_cache_hit_correctness(self):
         plan = _make_capacity_requests()
+        tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, use_fast=True)
+        answer_prompt = _make_answer_prompt(tokenizer)
         measurements = {}
         for mtp_enabled in (False, True):
             for int8_enabled in (False, True):
@@ -291,7 +330,7 @@ class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
                 )
                 try:
                     measurements[(mtp_enabled, int8_enabled)] = _measure_running_server(
-                        int8_enabled, mtp_enabled, plan
+                        int8_enabled, mtp_enabled, plan, answer_prompt
                     )
                 finally:
                     terminate_and_kill_process_tree(process, terminate_timeout=60)
