@@ -983,6 +983,12 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
+    # Captured with the late layers on a tail block (decoder SWA bounded replay
+    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
+    prefill_graph_tail: bool = False
+    # Captured with the late layers on a tail block (decoder SWA bounded replay
+    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
+    prefill_graph_tail: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1181,6 +1187,16 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Prefill CUDA graph tail block (bounded replay inside the graph): row
+        # capacity, persistent index/location buffers, held metadata per block size.
+        self._bcg_tail_capacity: Optional[int] = None
+        self._bcg_tail_buffers: Optional[tuple] = None
+        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        # Prefill CUDA graph tail block (bounded replay inside the graph): row
+        # capacity, persistent index/location buffers, held metadata per block size.
+        self._bcg_tail_capacity: Optional[int] = None
+        self._bcg_tail_buffers: Optional[tuple] = None
+        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1561,18 +1577,12 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_tail_capacity(self) -> int:
         """Rows the late layers run over inside the prefill CUDA graph: every
         request's SWA_WINDOW tail at the request cap, so one capture fits any batch."""
-        cap = getattr(self, "_bcg_tail_capacity", None)
-        if cap is None:
-            max_reqs = getattr(
-                getattr(self.model_runner, "server_args", None),
-                "max_running_requests",
-                None,
-            )
+        if self._bcg_tail_capacity is None:
+            max_reqs = self.model_runner.server_args.max_running_requests
             if not max_reqs:
                 max_reqs = int(self.model_runner.req_to_token_pool.size)
-            cap = int(max_reqs) * SWA_WINDOW
-            self._bcg_tail_capacity = cap
-        return cap
+            self._bcg_tail_capacity = int(max_reqs) * SWA_WINDOW
+        return self._bcg_tail_capacity
 
     def _prefill_graph_tail_block_rows(self, forward_batch: ForwardBatch) -> int:
         """Tail block rows for the captured shape this batch is padded to: the
@@ -1592,18 +1602,16 @@ class DeepseekV4AttnBackend(
         # row of the block, so the write locations must be persistent buffers of
         # the same capacity: padding rows hold slot 0, the dummy slot that also
         # marks them as padding for the compressors (raw_out_loc == 0).
-        bufs = getattr(self, "_bcg_tail_buffers", None)
-        if bufs is None:
+        if self._bcg_tail_buffers is None:
             cap = self._prefill_graph_tail_capacity()
-            bufs = (
+            self._bcg_tail_buffers = (
                 torch.zeros((cap,), dtype=torch.int64, device=device),
                 torch.zeros((cap,), dtype=pos_dtype, device=device),
                 torch.zeros((cap,), dtype=torch.int64, device=device),
                 torch.zeros((cap,), dtype=torch.int32, device=device),
                 torch.zeros((cap,), dtype=loc_dtype, device=device),
             )
-            self._bcg_tail_buffers = bufs
-        return bufs
+        return self._bcg_tail_buffers
 
     def _build_late_layer_tail_metadata(
         self,
@@ -2783,10 +2791,14 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        with_tail = (
+            self.enable_decoder_swa_bounded_replay
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        self.forward_metadata.prefill_graph_tail = with_tail
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
-            if getattr(self, "enable_decoder_swa_bounded_replay", False)
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            if with_tail
             else None
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
@@ -2848,8 +2860,7 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
-            if getattr(self, "enable_decoder_swa_bounded_replay", False)
-            and metadata_batch.forward_mode.is_extend_without_speculative()
+            if capture_metadata.prefill_graph_tail
             else None
         )
 
@@ -2863,13 +2874,10 @@ class DeepseekV4AttnBackend(
         fresh = self._build_late_layer_tail_metadata(
             forward_batch, for_prefill_graph=True, max_seq_len_override=max_seq_len
         )
-        held_by_rows = getattr(self, "_bcg_tail_metadata", None)
-        if held_by_rows is None:
-            held_by_rows = self._bcg_tail_metadata = {}
         rows = self._prefill_graph_tail_block_rows(forward_batch)
-        held = held_by_rows.get(rows)
+        held = self._bcg_tail_metadata.get(rows)
         if held is None:
-            held_by_rows[rows] = fresh
+            self._bcg_tail_metadata[rows] = fresh
             return fresh
         held.refresh_for_breakable_cuda_graph_replay_(fresh)
         held.core_attn_metadata.swa_out_cache_loc = (
