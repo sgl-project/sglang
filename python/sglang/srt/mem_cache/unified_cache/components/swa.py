@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
     FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
+    RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
@@ -69,12 +70,19 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+        # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
+        # only frees through free_swa_segment / free / free_group_*, which the
+        # HiSparse allocator defines.
         assert isinstance(
-            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            params.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         ), (
-            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+            f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         if params.sliding_window_size is None or params.sliding_window_size <= 0:
             raise ValueError("SWAComponent requires a positive sliding_window_size")
@@ -221,9 +229,14 @@ class SWAComponent(TreeComponent):
                     )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            full_indices
+        swa_indices = (
+            self.cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                full_indices
+            )
         )
+        # Tree component values use int64 indices; normalize transfer ids at the
+        # tree boundary.
+        return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
@@ -293,6 +306,21 @@ class SWAComponent(TreeComponent):
         swa.virtual_to_physical.index_fill_(0, incoming_pages, -1)
         swa.clear_inverse_history()
 
+    def _set_swa(
+        self, kept_full: torch.Tensor, incoming_full: torch.Tensor
+    ) -> torch.Tensor:
+        """Move incoming SWA mappings to kept Full IDs and return SWA indices."""
+        unified = self._unified_allocator()
+        if unified is not None:
+            self._transfer_swa_pages(unified, kept_full, incoming_full)
+            return self._translate_full_to_swa(kept_full)
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        swa_value = self._translate_full_to_swa(incoming_full)
+        allocator.clear_full_to_swa_mapping(incoming_full)
+        allocator.set_full_to_swa_mapping(kept_full, swa_value)
+        return swa_value
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,
@@ -351,7 +379,7 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
-        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+        swa_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable SWA window. The branching
         # point is the last page-aligned position within the Full-KV hit that lies
@@ -843,7 +871,7 @@ class SWAComponent(TreeComponent):
             covered += len(cur.key)
             if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
+                    comp.metadata[uuid_key] = next_component_uuid(ct)
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
@@ -1050,6 +1078,26 @@ class SWAComponent(TreeComponent):
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         return host_indices
 
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        # Buffer mode stages the node's own SWA rows, one key per page from
+        # the chain's tail, so admission needs no transfer (and no device op).
+        if not self.tree_core.is_host_memory_buffer_only:
+            return {}
+        cd = node.component_data[self.component_type]
+        if not self.tree_core.has_swa_host_pool or cd.value is None:
+            return {PoolName.SWA: []}
+        rows = (
+            node.component_data[BASE_COMPONENT_TYPE].value
+            if self._unified_allocator() is not None
+            else cd.value
+        )
+        num_pages = len(rows) // self._swa_kv_pool_host.page_size
+        if num_pages == 0 or num_pages > len(hash_values):
+            return {PoolName.SWA: []}
+        return {PoolName.SWA: list(hash_values[-num_pages:])}
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
@@ -1220,9 +1268,6 @@ class SWAComponent(TreeComponent):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
@@ -1247,12 +1292,6 @@ class SWAComponent(TreeComponent):
                 self.component_type,
                 max(req.kv.get_evicted_seqlen(self.component_type), boundary),
             )
-            return transfer
-
-        assert phase == ExternalLinkerLoadPhase.COMMIT
-        assert insert_result is not None and canonical_full is not None
-        assert len(canonical_full) == len(transfer.device_indices)
-        allocator.set_full_to_swa_mapping(canonical_full, transfer.device_indices)
         return transfer
 
     def commit_hicache_transfer(
@@ -1506,29 +1545,19 @@ class SWAComponent(TreeComponent):
             for full, swa in zip(action.full_indices, action.swa_indices):
                 alloc.set_full_to_swa_mapping(full, swa)
             return
+        if isinstance(action, RecoverEvictedSWA):
+            self._set_swa(action.kept_full, action.incoming_full)
+            return
         if isinstance(action, RecoverSWAWithLockedFull):
             # Keep the locked full; hand the node the INCOMING ids' swa pages,
             # freeing only the incoming full, then store the swa on the node.
+            swa_value = self._set_swa(action.kept_full, action.incoming_full)
             unified = self._unified_allocator()
             if unified is not None:
-                # No `full_to_swa_index_mapping` here: the swa sub-pool's v2p IS
-                # the mapping. Rebind page ownership, then free through the
-                # composite -- its `swa_v2p_pages > 0` filter skips the
-                # just-tombstoned swa side, releasing only the full one.
-                self._transfer_swa_pages(
-                    unified, action.kept_full, action.incoming_full
-                )
+                # The composite skips the detached SWA side and releases Full.
                 unified.free(action.incoming_full)
-                self.tree_core.set_component_device_value(
-                    action.node_id,
-                    self.component_type,
-                    self._translate_full_to_swa(action.kept_full),
-                )
-                return
-            swa_value = self._translate_full_to_swa(action.incoming_full)
-            alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.clear_full_to_swa_mapping(action.incoming_full)
-            alloc.free_full_segment(action.incoming_full, start_pos=0)
+            else:
+                alloc.free_full_segment(action.incoming_full, start_pos=0)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )

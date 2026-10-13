@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -188,7 +189,6 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_parallel().tp_size
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -200,6 +200,7 @@ class PhiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=phimoe_routing_function,
         )
@@ -245,7 +246,6 @@ class PhiMoEAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -278,17 +278,21 @@ class PhiMoEAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(

@@ -19,6 +19,7 @@ from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
@@ -69,8 +70,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -105,7 +105,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 )
 
         if self.has_start_projections:
-            hidden_states = residual_batch.written(hidden_states, forward_batch)
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
 
         hidden_states = super().forward(
             hidden_states=hidden_states,
@@ -115,7 +115,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         if self.has_end_norm:
             hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = residual_batch.written(
+            hidden_states = residual_batch.set_written(
                 self.final_layernorm(hidden_states), forward_batch
             )
 
@@ -151,8 +151,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -187,7 +186,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 )
 
         if self.has_start_projections:
-            hidden_states = residual_batch.written(hidden_states, forward_batch)
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
 
         hidden_states = super().forward(
             hidden_states=hidden_states,
@@ -197,7 +196,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         if self.has_end_norm:
             hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = residual_batch.written(
+            hidden_states = residual_batch.set_written(
                 self.final_layernorm(hidden_states), forward_batch
             )
 
@@ -239,33 +238,36 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
         # Total number of physical layers = num_steps * pattern_len
         total_layers = self.num_mtp_layers * self.pattern_len
-        for i in range(total_layers):
-            step_rel_idx = i % self.pattern_len
+        with layer_stack():
+            for i in range(total_layers):
+                step_rel_idx = i % self.pattern_len
 
-            char = self.pattern_str[step_rel_idx]
+                char = self.pattern_str[step_rel_idx]
 
-            is_start_of_step = step_rel_idx == 0
-            is_end_of_step = step_rel_idx == self.pattern_len - 1
+                is_start_of_step = step_rel_idx == 0
+                is_end_of_step = step_rel_idx == self.pattern_len - 1
 
-            layer_prefix = f"{prefix}.layers.{i}"
+                layer_prefix = f"{prefix}.layers.{i}"
 
-            common_kwargs = dict(
-                config=config,
-                layer_idx=i,
-                quant_config=quant_config,
-                prefix=layer_prefix,
-                has_start_projections=is_start_of_step,
-                has_end_norm=is_end_of_step,
-            )
-
-            if char == "*":
-                self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(**common_kwargs)
-            elif char == "E":
-                self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)
-            else:
-                raise NotImplementedError(
-                    f"Pattern char '{char}' in {self.pattern_str} not implemented"
+                common_kwargs = dict(
+                    config=config,
+                    layer_idx=i,
+                    quant_config=quant_config,
+                    prefix=layer_prefix,
+                    has_start_projections=is_start_of_step,
+                    has_end_norm=is_end_of_step,
                 )
+
+                if char == "*":
+                    self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(
+                        **common_kwargs
+                    )
+                elif char == "E":
+                    self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)
+                else:
+                    raise NotImplementedError(
+                        f"Pattern char '{char}' in {self.pattern_str} not implemented"
+                    )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None, (
