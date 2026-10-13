@@ -21,11 +21,6 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.cp_kv_gather import (
-    CPKVGather,
-    CPKVGatherHandle,
-    build_cp_kv_gather_index,
-)
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -50,6 +45,8 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
+    CPAsyncGather,
+    CPGatherHandle,
     cp_materialize_global_token_order,
     get_cp_strategy,
     is_cp_active,
@@ -57,7 +54,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -277,9 +274,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Prefill-CP K/V gathers started by prefetch_cp_kv, keyed by layer id;
         # the gather index is built once per forward on first use.
-        self._cp_kv_gather: Optional[CPKVGather] = None
+        self._cp_kv_gather: Optional[CPAsyncGather] = None
         self._cp_kv_gather_index: Optional[torch.Tensor] = None
-        self._cp_kv_prefetched: Dict[int, CPKVGatherHandle] = {}
+        self._cp_kv_prefetched: Dict[int, CPGatherHandle] = {}
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1590,13 +1587,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"rows={k.shape[0]}, physical={meta.per_rank_actual_token[0]}"
             )
         if self._cp_kv_gather is None:
-            self._cp_kv_gather = CPKVGather()
+            self._cp_kv_gather = CPAsyncGather(get_stream("qsa_cp_kv"))
         if self._cp_kv_gather_index is None:
-            self._cp_kv_gather_index = build_cp_kv_gather_index(meta, k.device)
+            self._cp_kv_gather_index = get_cp_strategy().build_gather_index(
+                meta, k.device
+            )
         self._cp_kv_prefetched[layer.layer_id] = self._cp_kv_gather.issue(
             _cp_kv_send_rows(k, v),
-            key_width=k.shape[1] * k.shape[2],
             gather_index=self._cp_kv_gather_index,
+            split_sizes=(k.shape[1] * k.shape[2], v.shape[1] * v.shape[2]),
         )
 
     def _forward_extend_cp(

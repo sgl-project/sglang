@@ -1,6 +1,7 @@
-"""CPU checks for QSA's zigzag-only context parallel entrypoints."""
+"""CPU checks for shared CP gathers and QSA's zigzag-only entrypoints."""
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,12 +10,13 @@ import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
 from sglang.srt.layers.attention.qsa import qsa_indexer
-from sglang.srt.layers.attention.qsa.cp_kv_gather import build_cp_kv_gather_index
 from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp import interleave
 from sglang.srt.layers.cp import padding as cp_padding
+from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -365,6 +367,10 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
+@pytest.mark.parametrize(
+    "strategy_cls", [zigzag.ZigzagCPStrategy, interleave.InterleaveCPStrategy]
+)
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("cp_size", [2, 4])
 @pytest.mark.parametrize(
     "extend_lens,prefix_lens",
@@ -375,19 +381,20 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         ([8, 5], [4, 8]),
     ],
 )
-def test_cp_kv_gather_index_restores_global_token_order(
-    monkeypatch, cp_size, extend_lens, prefix_lens
+def test_cp_gather_index_restores_global_token_order(
+    monkeypatch, strategy_cls, padded, cp_size, extend_lens, prefix_lens
 ):
-    """The prefetched K/V gather sends every rank's padded zigzag rows; its index
-    must pick each global token from the right rank and skip the padding."""
+    """Both layouts restore global order across unequal or aligned rank lengths."""
     seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
     num_tokens = sum(extend_lens)
     monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cpu"))
     monkeypatch.setattr(
         cp_padding, "get_parallel", lambda: SimpleNamespace(attn_cp_size=cp_size)
     )
-    monkeypatch.setattr(cp_base, "is_zigzag", lambda: True)
-    strategy = zigzag.ZigzagCPStrategy(cp_size=cp_size)
+    monkeypatch.setattr(
+        cp_base, "is_zigzag", lambda: strategy_cls is zigzag.ZigzagCPStrategy
+    )
+    strategy = strategy_cls(cp_size=cp_size)
     rank_rows, indices = [], []
     for rank in range(cp_size):
         monkeypatch.setattr(
@@ -396,16 +403,71 @@ def test_cp_kv_gather_index_restores_global_token_order(
             lambda rank=rank: SimpleNamespace(attn_cp_rank=rank),
         )
         meta = strategy.build_metadata(num_tokens, seq_lens, extend_lens)
-        cp_padding.pad_logical_token_to_physical(meta)
+        if padded:
+            cp_padding.pad_logical_token_to_physical(meta)
         batch = SimpleNamespace(attn_cp_metadata=meta)
-        rank_rows.append(strategy.shard_hidden_states(torch.arange(num_tokens), batch))
-        indices.append(build_cp_kv_gather_index(meta, torch.device("cpu")))
+        local_rows = strategy.shard_hidden_states(torch.arange(num_tokens), batch)
+        # Equal-size all-gather buffers also pad unequal, unaligned rank lengths.
+        rank_rows.append(
+            torch.nn.functional.pad(
+                local_rows,
+                (0, max(meta.per_rank_actual_token) - len(local_rows)),
+                value=-1,
+            )
+        )
+        indices.append(strategy.build_gather_index(meta, torch.device("cpu")))
     gathered = torch.cat(rank_rows)
     for index in indices:
         torch.testing.assert_close(index, indices[0])
     torch.testing.assert_close(
         gathered.index_select(0, indices[0]), torch.arange(num_tokens)
     )
+
+
+@pytest.mark.parametrize("split_sizes", [None, (2, 5), (1, 4, 2)])
+def test_cp_async_gather_restores_contiguous_payloads(monkeypatch, split_sizes):
+    """One payload, unequal K/V widths, and multiple payloads share the gather."""
+    expected = torch.arange(21).reshape(3, 7)
+    rank_rows = [
+        expected[[0, 2]],
+        torch.cat([expected[[1]], torch.full((1, 7), -1)]),
+    ]
+    gather_index = torch.tensor([0, 2, 1])
+    group = SimpleNamespace(
+        world_size=2,
+        all_gather_into_tensor=Mock(
+            side_effect=lambda output, local: torch.cat(rank_rows, out=output)
+        ),
+    )
+    consumer, stream = Mock(), Mock()
+    monkeypatch.setattr(
+        cp_utils, "get_parallel", lambda: SimpleNamespace(attn_cp_group=group)
+    )
+    monkeypatch.setattr(cp_utils, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(
+        cp_utils, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: consumer)
+    monkeypatch.setattr(torch.cuda, "stream", lambda selected: nullcontext())
+
+    handle = cp_utils.CPAsyncGather(stream).issue(
+        rank_rows[0], gather_index, split_sizes=split_sizes
+    )
+    consumer.wait_event.assert_not_called()
+    actual = handle.wait()
+    consumer.wait_event.assert_called_once_with(handle.done)
+    handle.done.synchronize.assert_not_called()
+    group.all_gather_into_tensor.assert_called_once()
+    assert any(value is rank_rows[0] for value in handle.keepalive)
+    assert any(value is gather_index for value in handle.keepalive)
+    expected_parts = (
+        (expected,) if split_sizes is None else expected.split(split_sizes, dim=1)
+    )
+    assert len(actual) == len(expected_parts)
+    for output, reference in zip(actual, expected_parts):
+        assert output.is_contiguous()
+        torch.testing.assert_close(output, reference)
 
 
 if __name__ == "__main__":

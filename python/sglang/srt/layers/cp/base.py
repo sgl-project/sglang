@@ -149,6 +149,12 @@ class ContextParallelStrategy(ABC):
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
 
+    def build_gather_index(self, metadata: Any, device: Any) -> Any:
+        """Map global token rows to a rank-major gather of equally padded shards."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not support gather indices"
+        )
+
     def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support local q indices"
