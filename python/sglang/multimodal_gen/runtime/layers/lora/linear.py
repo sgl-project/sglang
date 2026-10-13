@@ -189,6 +189,20 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    def _scale_lora_delta(
+        self, delta: torch.Tensor, runtime_lora_scale: float
+    ) -> torch.Tensor:
+        if self.lora_alpha != self.lora_rank:
+            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
+        if _request_allows_lossless():
+            scale = self.strength * runtime_lora_scale
+            return delta if scale == 1.0 else delta * scale
+        if self.strength != 1.0:
+            delta = delta * self.strength
+        if runtime_lora_scale != 1.0:
+            delta = delta * runtime_lora_scale
+        return delta
+
     @staticmethod
     def _runtime_lora_scale() -> float:
         context = get_forward_context_or_none()
@@ -253,13 +267,7 @@ class BaseLayerWithLoRA(nn.Module):
             return _add_lora_delta_in_gemm(out, x_lora, lora_A, lora_B, scale)
 
         delta = _compute_lora_delta(x_lora, lora_A, lora_B)
-        if self.lora_alpha != self.lora_rank:
-            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
-        # x * 1.0 is exact, so skipping a unit scale keeps the reference bits
-        if self.strength != 1.0:
-            delta = delta * self.strength
-        if runtime_lora_scale != 1.0:
-            delta = delta * runtime_lora_scale
+        delta = self._scale_lora_delta(delta, runtime_lora_scale)
         return out + delta.to(dtype=out.dtype)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
