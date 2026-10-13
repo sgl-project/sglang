@@ -383,7 +383,12 @@ def prepare_fused_wo_b(layers) -> None:
             logger.info(
                 "mori fused wo_b: not preparing a second shape (N=%d K=%d "
                 "M<=%d) against the existing window (N=%d K=%d M<=%d)",
-                n, k, m_max, _state.n, _state.k, _state.m_max,
+                n,
+                k,
+                m_max,
+                _state.n,
+                _state.k,
+                _state.m_max,
             )
             return
         for layer in candidates:
@@ -429,6 +434,7 @@ class _FusedWoB:
         import torch.distributed as dist
         from mori.cco import Communicator, UniqueId
         from mori.ops.gemm_ar import GemmAllReduceOp
+
         from sglang.srt.distributed import get_tp_group
 
         tp = get_tp_group()

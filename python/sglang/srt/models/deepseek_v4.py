@@ -5022,9 +5022,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # also has a `wo_b` and calls it directly, and the draft wrapper borrows
         # this method, so a walk over every module with the attribute would
         # prepare copies nothing reads.
-        prepare_fused_wo_b(
-            [m.wo_b for m in self.modules() if isinstance(m, MQALayer)]
-        )
+        prepare_fused_wo_b([m.wo_b for m in self.modules() if isinstance(m, MQALayer)])
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
