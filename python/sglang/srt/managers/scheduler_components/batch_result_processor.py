@@ -1404,7 +1404,6 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            # Persist the decision for both immediate and offloaded release.
             if not self._mamba_can_cache_finished_req(req, result, i):
                 req.skip_radix_cache_insert = True
 
@@ -1455,7 +1454,6 @@ class SchedulerBatchResultProcessor:
         if req.owned_kv_len() != req.kv.kv_committed_len:
             return False
 
-        # Grammar may discard tokens that the live state has already consumed.
         retained = result.grammar_retained_tokens
         if retained is None or retained[i] is None:
             return True
