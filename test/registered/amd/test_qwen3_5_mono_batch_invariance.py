@@ -139,7 +139,7 @@ class K1Test(CustomTestCase):
             if kind == "zero":
                 idx[torch.arange(s, device="cuda") != pos] = -1
             elif kind == "copy":
-                conv[others], state[others] = conv[probe_slot], state[probe_slot]
+                conv[others], state[others] = conv[probe_slot].clone(), state[probe_slot].clone()
             elif kind == "rand1":
                 conv[others] = rnd(len(others), CONV, 3)
                 state[others] = rnd(
