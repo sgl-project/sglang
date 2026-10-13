@@ -398,13 +398,19 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
 class TestSelectMMProcessorPrompt(CustomTestCase):
     def test_tokens_in_prompt_is_list(self):
-        recv_req = SimpleNamespace(input_text=None, input_ids=array("q", [1, 2, 3]))
+        """A tokens-in prompt reaches the processor as list[int], not array("q");
+        HTTP sends input_text=None and the gRPC servicer sends ""."""
         processor = SimpleNamespace(prefer_tokenized_input=False)
+        for input_text in (None, ""):
+            with self.subTest(input_text=input_text):
+                recv_req = SimpleNamespace(
+                    input_text=input_text, input_ids=array("q", [1, 2, 3])
+                )
 
-        prompt = _select_mm_processor_prompt(recv_req, processor)
+                prompt = _select_mm_processor_prompt(recv_req, processor)
 
-        self.assertIsInstance(prompt, list)
-        self.assertEqual(prompt, [1, 2, 3])
+                self.assertIsInstance(prompt, list)
+                self.assertEqual(prompt, [1, 2, 3])
 
 
 if __name__ == "__main__":
