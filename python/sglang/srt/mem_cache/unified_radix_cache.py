@@ -1170,7 +1170,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
-                    priority=insert_params.priority + 1,
+                    priority=min(
+                        insert_params.priority + 1, torch.iinfo(torch.int64).max
+                    ),
                 )
             )
 
