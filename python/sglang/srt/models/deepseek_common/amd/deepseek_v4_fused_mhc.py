@@ -582,12 +582,25 @@ def forward_hc_pre_from_prev_fused_boundary(
     prev_pre: Optional[torch.Tensor],
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
+    mono_route=None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
-    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
+    comb); with defer_post this layer's is returned the same way and hidden_states is None.
+    mono_route (mode, kernel, step) runs everything after attention -- its all-reduce, the FFN
+    seam, the MoE and the MoE all-reduce -- as the mono FFN launch."""
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
+    if mono_route is not None and mono_route.mode.value == "whole":
+        return _mono_whole(
+            layer,
+            mono_route,
+            positions,
+            forward_batch,
+            prev_pre,
+            pending_post,
+            defer_post,
+        )
     residual, x, attn_coefficients = hc_boundary(
         layer,
         *pending_post,
@@ -600,6 +613,18 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
+    if mono_route is not None:
+        return _mono_ffn(
+            layer,
+            mono_route,
+            x,
+            x_quant,
+            residual,
+            attn_coefficients,
+            positions,
+            forward_batch,
+            defer_post,
+        )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
         x = layer.self_attn(
@@ -647,6 +672,135 @@ def forward_hc_pre_from_prev_fused_boundary(
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None
+
+
+def _mono_ffn(
+    layer,
+    mono_route,
+    x,
+    x_quant,
+    residual,
+    attn_coefficients,
+    positions,
+    forward_batch,
+    defer_post: bool,
+):
+    """Attention with its output all-reduce deferred, then the mono FFN launch on the unreduced partial."""
+    from sglang.srt.layers.mono.spec import LayerMode
+
+    mode, kernel, step, _ = mono_route
+    assert mode is LayerMode.FFN, mode
+    with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        x = layer.self_attn(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            x_quant=x_quant,
+            defer_all_reduce=True,
+        )
+    # the step was routed on every rank: a reduce wo_b ran anyway cannot fall back now
+    assert isinstance(x, AttnOutput), (
+        "mono FFN launch needs attention's unreduced output"
+    )
+    m = residual.shape[0]
+    out, res_out, post_out, comb_out, pre_out = kernel.launch(
+        step,
+        layer.layer_id,
+        x.partial.contiguous(),
+        residual,
+        attn_coefficients.post.view(m, -1, 1),
+        attn_coefficients.comb,
+        attn_coefficients.pre,
+    )
+    post_out = post_out.view(m, -1)
+    if defer_post:
+        return None, pre_out, (out, res_out, post_out, comb_out)
+    return layer.hc_post(out, res_out, post_out, comb_out), pre_out, None
+
+
+def _mono_whole(
+    layer,
+    mono_route,
+    positions,
+    forward_batch,
+    prev_pre,
+    pending_post,
+    defer_post: bool,
+):
+    """The whole layer (attention seam .. MoE all-reduce) as the mono K1 + K2 launches; the kernels write the
+    layer's KV themselves. A materialized residual (no pending post) enters as the identity fold: x = 0, post = 0,
+    comb = I."""
+    from sglang.srt.models.deepseek_common.amd.mono.spec import whole_layer_meta
+
+    _, kernel, step, cache = mono_route
+    x, residual, post, comb = pending_post
+    m, hc = residual.shape[0], residual.shape[1]
+    if x is None:
+        x = residual.new_zeros(m, residual.shape[-1])
+        post = torch.zeros(m, hc, dtype=torch.float32, device=residual.device)
+        comb = (
+            torch.eye(hc, dtype=torch.float32, device=residual.device)
+            .expand(m, hc, hc)
+            .contiguous()
+        )
+    if prev_pre is None:
+        # layer 0: SGLang's boundary collapses to stream 0 without a previous pre; a one-hot pre is that, exactly
+        prev_pre = torch.zeros(m, hc, dtype=torch.float32, device=residual.device)
+        prev_pre[:, 0] = 1.0
+    ratio = kernel.packed.weights[layer.layer_id].attn.ratio
+    meta = whole_layer_meta(
+        layer.layer_id,
+        ratio,
+        forward_batch,
+        m,
+        cache,
+        kernel.packed.runner.record,
+        kernel.packed.runner.comp_record,
+        swa_width=kernel.packed.runner.swa_width,
+    )
+    between = None
+    if layer.layer_id in kernel.packed.between:
+        between = _mono_indexer_between(
+            layer, kernel.packed.runner, forward_batch, m, ratio
+        )
+    out, res_out, post_out, comb_out, pre_out = kernel.launch_whole(
+        step,
+        layer.layer_id,
+        x.contiguous(),
+        residual,
+        post.reshape(m, hc, 1).contiguous(),
+        comb.contiguous(),
+        prev_pre.contiguous(),
+        forward_batch.positions[:m].contiguous(),
+        meta,
+        between=between,
+    )
+    post_out = post_out.view(m, -1)
+    if defer_post:
+        return None, pre_out, (out, res_out, post_out, comb_out)
+    return layer.hc_post(out, res_out, post_out, comb_out), pre_out, None
+
+
+def _mono_indexer_between(layer, runner, forward_batch, m: int, ratio: int):
+    """The layer's indexer and compressor between the whole-layer launches, in SGLang's serial order, on the bf16
+    attention input and q_lora K1 exported; returns the fresh top-k the key table is rebuilt from."""
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    attn = layer.self_attn
+
+    def between():
+        backend = get_attn_backend()
+        # V4.1's ratio-1/2 sources: compressor, then indexer (top-k into sparse_raw_indices), SGLang's serial path
+        backend.forward_low_ratio_sources(
+            layer=attn,
+            x=runner.xn[:m],
+            q_lora=runner.ql[:m],
+            positions=forward_batch.positions[:m],
+            forward_batch=forward_batch,
+        )
+        return backend.forward_metadata.core_attn_metadata.sparse_raw_indices(ratio)[:m]
+
+    return between
 
 
 def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):

@@ -233,6 +233,7 @@ def forward_layer_fused_boundary(
     from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
 
     pending = isinstance(state.streams, HcPending)
+    mono = getattr(model, "mono", None)
     hidden_states, prev_pre, pending_post = forward_hc_pre_from_prev_fused_boundary(
         model.layers[i],
         positions=positions,
@@ -243,6 +244,7 @@ def forward_layer_fused_boundary(
         prev_pre=state.pre,
         pending_post=tuple(state.streams) if pending else None,
         defer_post=defer_post,
+        mono_route=None if mono is None else mono.routed(i),
     )
     return HcState(
         hidden_states if pending_post is None else HcPending(*pending_post),

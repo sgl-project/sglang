@@ -191,6 +191,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_server_args,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -4017,6 +4018,8 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
+        self.mono = None  # sglang.srt.layers.mono runtime, attached after weight load
+        self.mono_pending = False
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
         if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
             (
@@ -4119,6 +4122,25 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
                 "set logprob_start_len to the prompt length"
             )
+
+    def _attach_mono(self) -> None:
+        from sglang.srt.layers import mono
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mono: first forward reached inside a CUDA graph capture"
+            )
+        self.mono_pending = False
+        tp = get_parallel().tp_group
+        self.mono = mono.attach(
+            self,
+            server_args=get_server_args(),
+            hf_config=self.config,
+            tp_rank=tp.rank_in_group,
+            tp_size=tp.world_size,
+            cpu_group=tp.cpu_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
 
     def _forward_layers_hc_pre_from_prev(
         self,
@@ -4459,6 +4481,10 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
+        if self.mono_pending:
+            self._attach_mono()
+        if self.mono is not None:
+            self.mono.begin_step(forward_batch)
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
@@ -4959,6 +4985,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        # The loader runs process_weights_after_loading (MoE shuffle / pad) after this hook: attach on the first
+        # forward, an eager step every rank takes together before any graph capture.
+        self.model.mono_pending = bool(
+            getattr(get_server_args(), "enable_mono_kernel", False)
+        )
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
