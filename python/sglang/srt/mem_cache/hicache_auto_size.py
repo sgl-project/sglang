@@ -57,8 +57,7 @@ def _draft_bytes(target, draft) -> int:
         # Match sidecar construction: only SWA drafts follow target SWA slots.
         target, draft = target.swa_kv_pool, draft.swa_kv_pool
         return _pool_bytes(draft) * target.size // draft.size
-    # A sidecar has one host slot per target slot, however few slots the draft has;
-    # under DCP each target row widens into attn_dcp_size slots.
+    # A sidecar has one host slot per target slot, however few slots the draft has.
     target_slots = target.size * get_parallel().attn_dcp_size
     return _pool_bytes(draft) * target_slots // draft.size
 

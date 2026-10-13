@@ -278,7 +278,6 @@ class TestLayerShardedHostTransfers(CustomTestCase):
 
 
 def _fake_dsa_device_pool(size: int = 1024) -> SimpleNamespace:
-    # Index keys stay replicated under DCP: the device buffer spans every widened slot.
     logical = size * DCP_SIZE
     elems = 128 + 128 // 128 * 4
     buffers = [
@@ -307,8 +306,7 @@ def _fake_dsa_device_pool(size: int = 1024) -> SimpleNamespace:
 
 class TestDsaIndexerHostPoolUnderDcp(CustomTestCase):
     def test_host_index_pages_cover_the_replicated_device_index(self):
-        """The index-K host mirror must hold a page for every widened slot, and its
-        transfers must address the replicated device index without rank translation."""
+        """The index-K host mirror holds a page for every widened slot, untranslated."""
         anchor = _make_host_pool(dcp_rank=3)
         self.addCleanup(anchor.destroy)
         pool = _fake_dsa_device_pool()
@@ -321,7 +319,6 @@ class TestDsaIndexerHostPoolUnderDcp(CustomTestCase):
         self.assertGreaterEqual(
             host.indexer_page_num * PHYSICAL_PAGE, anchor.logical_size
         )
-        # The last widened host page, as the controller allocates it.
         last_page = anchor.logical_size - WIDENED_PAGE
         logical = torch.arange(last_page, last_page + WIDENED_PAGE)
         with mock.patch(

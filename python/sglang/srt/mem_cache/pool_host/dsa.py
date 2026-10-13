@@ -173,8 +173,6 @@ class DSAIndexerPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
         self.indexer_dtype = storage_info.dtype
-        # Index keys are replicated across DCP ranks, so the host mirror spans the
-        # anchor's widened slot space rather than its per-rank rows.
         self.size = anchor_host.logical_size
         self.page_num = anchor_host.page_num * anchor_host.dcp_size
 

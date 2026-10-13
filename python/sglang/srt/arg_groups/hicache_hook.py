@@ -153,7 +153,6 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
 
 
 def _is_dsa_mtp(server_args: Any) -> bool:
-    """A DSA model's MTP draft is replicated across DCP ranks and mirrored as a sidecar."""
     from sglang.srt.arg_groups.model_override_base import model_config_of
     from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

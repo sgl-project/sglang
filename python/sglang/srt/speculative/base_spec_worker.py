@@ -279,7 +279,6 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        # Drafts never join the DCP group, so their rows cannot share the sharded host pool.
         can_pack = (
             _can_pack_hicache_mtp(spec_algorithm, draft_runners)
             and not get_parallel().dcp_enabled

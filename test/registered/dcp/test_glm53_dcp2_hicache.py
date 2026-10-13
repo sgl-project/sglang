@@ -26,7 +26,6 @@ class TestGLM53NVFP4DCP2MTPHiCache(DsaMtpServerBase, UnifiedRadixTreeTestMixin):
     tp_size = 4
     mem_fraction_static = 0.8
     gsm8k_threshold = 0.88
-    # DCP2 + MTP replays at KL 0.013-0.016 with or without HiCache (8xB300, bf16 KV).
     kl_threshold = 0.02
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=WIDENED_PAGE)
