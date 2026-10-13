@@ -1,4 +1,4 @@
-"""Regression tests for a dozen ComfyUI_SGLDiffusion bugs found in audit.
+"""Regression tests for ComfyUI_SGLDiffusion integrated-mode bugs found in audit.
 
 Each bug gets a test that fails against the pre-fix code and passes after.
 These stub ComfyUI/ torch-adjacent modules the same way test_h3_request.py
@@ -150,7 +150,14 @@ def _load_plugin():
 
     _load(f"{PKG}.utils", "utils.py")
     nodes = _load(f"{PKG}.nodes", "nodes.py")
-    return server_api, model_patcher, generator, nodes, sys.modules[f"{PKG}.utils"], folder_paths
+    return (
+        server_api,
+        model_patcher,
+        generator,
+        nodes,
+        sys.modules[f"{PKG}.utils"],
+        folder_paths,
+    )
 
 
 SERVER_API, MODEL_PATCHER, GENERATOR, NODES, UTILS, FOLDER_PATHS = _load_plugin()
@@ -243,7 +250,9 @@ def test_minimax_h3_module_importable_without_sglang_runtime():
 
     assert module._H3_RUNTIME_IMPORT_ERROR is not None
     with pytest.raises(RuntimeError, match="failed to import"):
-        module.MiniMaxH3Executor(generator=None, model_path="x", model=None, config=None)
+        module.MiniMaxH3Executor(
+            generator=None, model_path="x", model=None, config=None
+        )
 
 
 # --- Bug 1: any .gguf was treated as MiniMax-H3 for architecture detect ----
@@ -290,9 +299,10 @@ def test_gguf_support_does_not_leak_into_global_folder_registry():
             assert "model.gguf" in names
             # The stock extension set used by every other node (e.g.
             # ComfyUI's own "Load Diffusion Model") must stay untouched.
-            assert ".gguf" not in FOLDER_PATHS.folder_names_and_paths[
-                "diffusion_models"
-            ][1]
+            assert (
+                ".gguf"
+                not in FOLDER_PATHS.folder_names_and_paths["diffusion_models"][1]
+            )
         finally:
             FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
 
@@ -410,5 +420,3 @@ def test_model_size_falls_back_to_table_only_when_size_unknown():
         model_type="flux",
     )
     assert patcher.model_size() == 27 * 1024 * 1024 * 1024
-
-
