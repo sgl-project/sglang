@@ -92,6 +92,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -368,9 +369,10 @@ _EP_FRONT_LOGGED = False
 
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
-    """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
-    optional quant-method capability; only the unquantized method has it."""
-    return getattr(o_proj.quant_method, "apply_into", None) is not None
+    """Whether K3 hands o_proj caller-owned storage for its fused all-reduce.
+    Unquantized only: FP8 also implements ``apply_into``, but the fusion has
+    not been validated end to end for it."""
+    return isinstance(o_proj.quant_method, UnquantizedLinearMethod)
 
 
 def _k3_all_reduce_add(hidden_states, residual, forward_batch):

@@ -1,4 +1,5 @@
-"""Unit tests for srt/models/kimi_k3_rocm_quant and the K3 weight-merge guard."""
+"""Unit tests for srt/models/kimi_k3_rocm_quant, the K3 weight-merge guard and
+the o_proj all-reduce fusion probe."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -9,7 +10,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable, _o_proj_takes_output
 from sglang.srt.models.kimi_k3_rocm_quant import _k3_channel_fp8_to_bf16
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,6 +95,26 @@ class TestMergeDtypeGuard(CustomTestCase):
         check that only asks whether the operands match each other."""
         weights = [torch.zeros(4, 4, dtype=torch.float32) for _ in range(2)]
         self.assertFalse(_is_unquantized_mergeable(weights))
+
+
+class TestOProjAllReduceFusionProbe(CustomTestCase):
+    """Blockwise FP8 implements apply_into for the chunked prefill pipeline;
+    that alone must not turn on K3's fused o_proj all-reduce."""
+
+    def test_blockwise_fp8_keeps_fusion_off(self):
+        method = Fp8LinearMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+        )
+        self.assertTrue(callable(method.apply_into))
+        self.assertFalse(_o_proj_takes_output(SimpleNamespace(quant_method=method)))
+
+    def test_unquantized_keeps_fusion_on(self):
+        o_proj = SimpleNamespace(quant_method=UnquantizedLinearMethod())
+        self.assertTrue(_o_proj_takes_output(o_proj))
 
 
 if __name__ == "__main__":
