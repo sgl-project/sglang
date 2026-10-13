@@ -64,7 +64,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.dp_attn_adapter.maybe_convert_decode_to_extend.side_effect = lambda b: (
             b.convert_decode_to_extend() if b is not None else b
         )
-        s.update_running_batch = Mock(side_effect=lambda b: b)
+        s.select_decode_rows = Mock(return_value=True)
         s._arm_prefill_decode_interval = Mock()
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
