@@ -274,6 +274,8 @@ class TestDSV41MultimodalInputs(CustomTestCase):
     def test_cp_runner_prepares_before_sharding_and_uses_model_ids_for_logits(self):
         normalized = torch.tensor([7, 129264, 129264, 9, 10])
         self.batch.positions = torch.arange(5)
+        cp_metadata = object()
+        self.batch.attn_cp_metadata = cp_metadata
         self.model.prepare_language_model_inputs = lambda ids, batch, emb: (
             DeepseekV4ForCausalLM.prepare_language_model_inputs(
                 self.model, ids, batch, emb
@@ -310,6 +312,7 @@ class TestDSV41MultimodalInputs(CustomTestCase):
             torch.equal(self.model.logits_processor.call_args.args[0], normalized)
         )
         self.assertTrue(torch.equal(self.batch.input_ids, self.original))
+        self.assertIs(self.batch.attn_cp_metadata, cp_metadata)
 
 
 if __name__ == "__main__":
