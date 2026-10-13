@@ -5,7 +5,6 @@ should use that classmethod API; do not import from this module directly.
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
@@ -14,7 +13,6 @@ from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
@@ -113,12 +111,6 @@ class CustomSpecAlgo:
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
-    def can_run_cuda_graph(
-        self, forward_batch: "ForwardBatch", *, is_draft_worker: bool
-    ) -> bool:
-        """Return whether this algorithm permits graph replay for this batch."""
-        return True
-
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
@@ -168,48 +160,6 @@ class CustomSpecAlgo:
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         return num_draft_tokens
-
-    def get_cuda_graph_capture_req_widths(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> tuple[int, ...]:
-        """Return uniform per-request widths to capture for target verify.
-
-        Static algorithms keep one width. Adaptive plugin algorithms may
-        override this and return several positive widths up to the configured
-        maximum.
-        """
-        return (
-            self.get_num_tokens_per_req_for_target_verify(
-                num_draft_tokens, is_draft_worker
-            ),
-        )
-
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
-
-    def create_cuda_graph_verify_input(
-        self,
-        *,
-        custom_mask: torch.Tensor,
-        num_tokens_per_req: int,
-        is_draft_worker: bool,
-    ) -> Optional["SpecInput"]:
-        """Return a plugin-specific dummy verify input for graph capture.
-
-        Returning ``None`` preserves the built-in algorithm dispatch.
-        """
-        return None
 
     def build_disagg_draft_input(
         self,

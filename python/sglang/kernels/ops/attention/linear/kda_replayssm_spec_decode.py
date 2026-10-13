@@ -509,15 +509,16 @@ def commit_kda_replayssm_tree_all_layers(
         )
     block_key = triton.next_power_of_2(key_dim)
     batch_size = accept_lens.shape[0]
+    if batch_size != 1:
+        raise ValueError(
+            f"factorized UBTree commit supports only BS=1, got {batch_size}"
+        )
     if block_value is None:
-        # The tree commit keeps a full [BK, BV] FP32 state tile live across the
-        # accepted-path loop.  On L20X, BV=32 is register/occupancy limited for
-        # K=V=128.  BV=8 wins for BS<=2; once the batch supplies enough CTAs,
-        # BV=16 avoids the excess grid overhead of BV=8.
-        if value_dim == 128:
-            block_value = 8 if batch_size <= 2 else 16
-        else:
-            block_value = min(triton.next_power_of_2(value_dim), 32)
+        # The commit keeps a full [BK, BV] FP32 state tile live across the
+        # accept-path loop. BV=8 avoids register/occupancy pressure for V=128.
+        block_value = (
+            8 if value_dim == 128 else min(triton.next_power_of_2(value_dim), 32)
+        )
     if block_value not in (8, 16, 32):
         raise ValueError(f"unsupported tree commit block_value={block_value}")
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
