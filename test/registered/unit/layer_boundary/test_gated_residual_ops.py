@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import test_declared_decoder_boundary as fixture
 import torch
@@ -9,7 +9,10 @@ from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages
+from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpLayerExtensionMixin,
+    _build_qwen4_exp_stages,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -323,6 +326,122 @@ class TestGatedResidualOps(CustomTestCase):
         ops = _state().residual_ops()
         with self.assertRaises(NotImplementedError):
             ops.attn_update.gather_residual_attn_tp(self.hidden)
+
+    def _sum_context(self, rows=6):
+        from sglang.kernels.ops.elementwise.hc_sum_state import HCSumBuffers, HCSumState
+        from sglang.srt.layers.hyperconnection import _HCSumContext
+
+        residual = torch.arange(rows * WIDE, dtype=torch.float32).view(rows, WIDE)
+        state = HCSumState(residual, torch.ones(rows, 4))
+        buffers = HCSumBuffers(
+            torch.empty(rows, HIDDEN),
+            torch.arange(rows * 4, dtype=torch.float32).view(rows, 4),
+            HCSumState(torch.empty_like(residual), torch.zeros(rows, 4)),
+        )
+        return _HCSumContext(None, state, buffers)
+
+    def test_sum_context_is_owned_by_its_read_and_cleared(self):
+        context = self._sum_context()
+        mix = lambda value: (context.buffers.mixed, context)
+        combine = Mock(return_value=context.buffers.output.residual)
+        state = GatedResidualState(_expand, mix, mix, combine, combine)
+        _, residual = state.read_attn_input(context.state.residual)
+        self.assertIs(state.sum_context, context)
+        self.assertIsNone(state.normed)
+        self.assertIsNone(state.gate_partials)
+        state.residual_ops().ffn_update.update(context.buffers.mixed, residual)
+        combine.assert_called_once_with(context.buffers.mixed, context)
+        self.assertIsNone(state.sum_context)
+
+    def test_sum_context_rejects_a_replaced_residual(self):
+        context = self._sum_context()
+        state = _state()
+        state.sum_context = context
+        with self.assertRaisesRegex(RuntimeError, "no longer matches"):
+            state.apply_attn_combine(self.output, context.state.residual.clone())
+
+    def test_sum_context_row_slice_keeps_alpha_and_next_sum_ownership(self):
+        context = self._sum_context()
+        state = _state()
+        state.sum_context = context
+        with patch(
+            "sglang.srt.layers.layer_boundary.residual.gated.get_parallel",
+            return_value=SimpleNamespace(attn_tp_rank=1, attn_tp_size=2),
+        ):
+            residual = state.slice_residual_attn_tp(context.state.residual)
+        sliced = state.sum_context
+        self.assertTrue(sliced.sliced)
+        self.assertIs(residual, sliced.state.residual)
+        for actual, original in (
+            (residual, context.state.residual),
+            (sliced.state.sum_sq, context.state.sum_sq),
+            (sliced.buffers.alpha, context.buffers.alpha),
+            (sliced.buffers.output.residual, context.buffers.output.residual),
+            (sliced.buffers.output.sum_sq, context.buffers.output.sum_sq),
+        ):
+            self.assertEqual(actual.data_ptr(), original[3:].data_ptr())
+            self.assertEqual(actual.shape, original[3:].shape)
+
+    def test_sum_context_row_slice_rejects_a_replaced_residual(self):
+        context = self._sum_context()
+        state = _state()
+        state.sum_context = context
+        with patch(
+            "sglang.srt.layers.layer_boundary.residual.gated.get_parallel",
+            return_value=SimpleNamespace(attn_tp_rank=1, attn_tp_size=2),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no longer matches"):
+                state.slice_residual_attn_tp(context.state.residual.clone())
+        self.assertIs(state.sum_context, context)
+
+    def test_prepared_sum_reuse_requires_matching_residual_rows(self):
+        from sglang.srt.layers.hyperconnection import GatedResidual
+
+        context = self._sum_context()
+        state = context.state
+        layer = SimpleNamespace(mix=Mock())
+        GatedResidual.mix_prepared(layer, state.residual, state)
+        layer.mix.assert_called_once_with(state)
+        layer.mix.reset_mock()
+        changed = state.residual + 1
+        GatedResidual.mix_prepared(layer, changed, state)
+        layer.mix.assert_called_once_with(changed, use_sum_state=True)
+
+    def test_prepared_sum_odd_slice_preserves_values_when_realigning(self):
+        from sglang.srt.layers.hyperconnection import GatedResidual
+
+        state = self._sum_context().slice_rows(1, 2).state
+        self.assertEqual(state.sum_sq.data_ptr() % 32, 16)
+        layer = SimpleNamespace(mix=Mock())
+        GatedResidual.mix_prepared(layer, state.residual, state)
+        used = layer.mix.call_args.args[0]
+        self.assertIs(used.residual, state.residual)
+        self.assertEqual(used.sum_sq.data_ptr() % 32, 0)
+        torch.testing.assert_close(used.sum_sq, state.sum_sq, rtol=0, atol=0)
+
+    def test_qwen_handoff_is_cleared_after_a_failed_layer(self):
+        layer = Qwen4ExpLayerExtensionMixin()
+        layer.attn_hyper_connection = SimpleNamespace(_packed_sum_weights=True)
+        prepared = self._sum_context().state
+        with self.assertRaisesRegex(RuntimeError, "failed core"):
+            with layer.hc_inputs(prepared, None) as inputs:
+                self.assertIs(layer._hc_inputs, inputs)
+                self.assertIs(inputs.attn_input, prepared)
+                raise RuntimeError("failed core")
+        self.assertIsNone(layer._hc_inputs)
+
+    def test_qwen_ple_invalidates_prepared_statistics(self):
+        layer = Qwen4ExpLayerExtensionMixin()
+        layer.attn_hyper_connection = SimpleNamespace(
+            _packed_sum_weights=True, mix_prepared=Mock()
+        )
+        layer.ple = object()
+        state = self._sum_context().state
+        updated = state.residual + 1
+        layer._add_ple_embedding = Mock(return_value=updated)
+        with layer.hc_inputs(state, None):
+            layer._attn_mix(state.residual)
+        layer.attn_hyper_connection.mix_prepared.assert_called_once_with(updated, None)
 
 
 if __name__ == "__main__":

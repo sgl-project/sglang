@@ -14,13 +14,16 @@
 """Gated-injection hyper-connection residual streams."""
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.hyperconnection import _HCSumContext
 
 
 @dataclass
@@ -30,10 +33,9 @@ class GatedResidualState:
     per-stream gates, and writes its output back scaled by an injection
     coefficient computed from that same normalized residual.
 
-    The read carries its normalized residual to write-back. Decode may also
-    prepare gate partials during the read; otherwise write-back computes the
-    coefficient from that normalized residual. Both follow the residual rows
-    through any slicing and are cleared after the FFN write-back.
+    The read carries either normalization/gate partials or a fused HC context
+    to write-back. Both follow the residual rows through any slicing and are
+    cleared after the FFN write-back.
     Parameters belong to the owning layer's modules.
 
     Args:
@@ -58,15 +60,23 @@ class GatedResidualState:
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
+    sum_context: Optional["_HCSumContext"] = None
 
     def _read(self, mix, residual, out_norm):
+        from sglang.srt.layers.hyperconnection import _HCSumContext
+
         if out_norm is not None:
             raise NotImplementedError(
                 "a gated hyper-connection read with a separate norm; the read "
                 "normalizes the streams itself"
             )
         hidden_states, residuals = mix(residual)
-        residual, self.normed, self.gate_partials = residuals
+        self.clear_coefficients()
+        if isinstance(residuals, _HCSumContext):
+            self.sum_context = residuals
+            residual = residuals.state.residual
+        else:
+            residual, self.normed, self.gate_partials = residuals
         return hidden_states, residual
 
     def read_attn_input(self, residual, out_norm=None):
@@ -77,22 +87,30 @@ class GatedResidualState:
         return self._read(self.ffn_mix, residual, out_norm)
 
     def apply_attn_combine(self, hidden_states, residual):
-        return self.attn_combine(
-            hidden_states, (residual, self.normed, self.gate_partials)
-        )
+        return self.attn_combine(hidden_states, self._combine_inputs(residual))
 
     def apply_ffn_combine(self, hidden_states, residual):
-        return self.ffn_combine(
-            hidden_states, (residual, self.normed, self.gate_partials)
-        )
+        return self.ffn_combine(hidden_states, self._combine_inputs(residual))
+
+    def _combine_inputs(self, residual):
+        if self.sum_context is not None:
+            if residual is not self.sum_context.state.residual:
+                raise RuntimeError("HC Apply residual no longer matches its read")
+            return self.sum_context
+        return residual, self.normed, self.gate_partials
 
     def clear_coefficients(self):
         self.normed = None
         self.gate_partials = None
+        self.sum_context = None
 
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
+        if self.sum_context is not None:
+            context = self._combine_inputs(residual)
+            self.sum_context = context.slice_rows(rank, size)
+            return self.sum_context.state.residual
         self.normed = self.normed.tensor_split(size)[rank]
         if self.gate_partials is not None:
             self.gate_partials = self.gate_partials.tensor_split(size)[rank]

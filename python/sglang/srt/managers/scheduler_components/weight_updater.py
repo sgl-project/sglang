@@ -328,7 +328,28 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         run_post_load = not self._session.loaded_weights
-        for _, runner in self._select_runners(self._session.selector):
+        runners = self._select_runners(self._session.selector)
+        if not run_post_load:
+            # Validate every runner before postprocessing any of them, so a
+            # missing bucket can be supplied and end retried without repacking twice.
+            error = None
+            for role, runner in runners:
+                try:
+                    runner.weight_updater.validate_weight_update()
+                except ValueError as exc:
+                    error = f"{role}: {exc}"
+                    break
+            if torch.distributed.is_initialized():
+                errors = [None] * torch.distributed.get_world_size(
+                    group=self.tp_cpu_group
+                )
+                torch.distributed.all_gather_object(
+                    errors, error, group=self.tp_cpu_group
+                )
+                error = next((message for message in errors if message), None)
+            if error is not None:
+                return EndWeightUpdateReqOutput(success=False, message=error)
+        for _, runner in runners:
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
