@@ -31,7 +31,9 @@ class TestDeterministicBase(CustomTestCase):
     def setUpClass(cls):
         cls.model = cls.get_model()
         cls.base_url = DEFAULT_URL_FOR_TEST
-        if "--attention-backend" not in cls.get_server_args():
+        # Identity, not a probe for --attention-backend: a subclass that
+        # deliberately leaves the backend unspecified is a real test case.
+        if cls is TestDeterministicBase:
             raise unittest.SkipTest("Skip the base test class")
 
         cls.process = popen_launch_server(

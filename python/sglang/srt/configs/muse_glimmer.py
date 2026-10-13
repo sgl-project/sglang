@@ -26,14 +26,13 @@ _ARCH = "muse-glimmer"
 
 
 class MuseGlimmerAssistantConfig(PretrainedConfig):
-
     model_type = "muse_glimmer_assistant"
+    is_causal = False
     # The DFlash draft has no head; draft_worker_common borrows the target's.
     vocab_size = None
 
 
 class MuseGlimmerVisionConfig(PretrainedConfig):
-
     model_type = "muse_glimmer_vision"
 
     def __init__(

@@ -132,6 +132,15 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
+_tokenizer_warnings_filter = TokenizerWarningsFilter()
+
+
+def _install_tokenizer_warnings_filter(tokenizer):
+    logging.getLogger(tokenizer.__class__.__module__).addFilter(
+        _tokenizer_warnings_filter
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers for get_tokenizer
 # ---------------------------------------------------------------------------
@@ -168,9 +177,6 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
-        )
-        logging.getLogger(tokenizer.__class__.__module__).addFilter(
-            TokenizerWarningsFilter()
         )
         return tokenizer
     except TypeError as e:
@@ -419,6 +425,7 @@ def _fix_special_tokens_pattern(tokenizer):
 
 def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     """Apply all post-load patches and return the final tokenizer."""
+    _install_tokenizer_warnings_filter(tokenizer)
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 

@@ -11,15 +11,14 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import (
-        UpdateWeightFromDiskReqInput,
-        UpdateWeightsFromIPCReqInput,
-    )
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import (
+        ModelRunner,
+        SamplingPrewarmResult,
+    )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -95,6 +94,10 @@ class EagleDraftWorkerBase(ABC):
     def weight_load_time(self) -> float:
         return sum(runner.weight_load_time for runner in self.draft_runners)
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        return sum(runner.preloaded_weights_bytes for runner in self.draft_runners)
+
     def alloc_memory_pool(self, **kwargs):
         pass
 
@@ -155,6 +158,13 @@ class BaseSpecWorker(ABC):
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
 
+    def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
+        # NGRAM and UNO have no draft model
+        if self.draft_worker is None:
+            return []
+        return [("draft", runner) for runner in self.draft_worker.draft_runners]
+
     def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
         spec_algorithm = self.target_worker.model_runner.spec_algorithm
         draft_worker = self.draft_worker
@@ -170,8 +180,15 @@ class BaseSpecWorker(ABC):
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
+        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
+
         draft_runners = self._draft_model_runners()
-        return draft_runners[0].token_to_kv_pool if draft_runners else None
+        if not draft_runners:
+            return None
+        pool = draft_runners[0].token_to_kv_pool
+        if fused_draft_host_allocator(pool) is not None:
+            return None
+        return pool
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -211,8 +228,17 @@ class BaseSpecWorker(ABC):
             return 0.0
         return self.draft_worker.weight_load_time
 
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        return self.target_worker.model_runner.prewarm_sampling()
+
     @property
-    def war_fastpath_runner(self):
+    def preloaded_weights_bytes(self) -> int:
+        if self.draft_worker is None:
+            return 0
+        return self.draft_worker.preloaded_weights_bytes
+
+    @property
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # Default is the target runner; override if the last phase runs
@@ -234,27 +260,50 @@ class BaseSpecWorker(ABC):
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
+        target_model_runner.mtp_draft_mamba_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
-        if not self.server_args.enable_hierarchical_cache:
+        if not (
+            get_memory().enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
+            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        ):
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if (
-            "InklingForConditionalGenerationMTP"
-            in draft_runners[0].model_config.hf_config.architectures
-        ):
-            raise NotImplementedError(
-                "HiCache does not support Inkling MTP draft state yet."
-            )
-
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
+            target_mamba_pool = getattr(
+                target_model_runner.req_to_token_pool, "mamba_pool", None
+            )
+            draft_mamba_pools = tuple(
+                getattr(runner.req_to_token_pool, "mamba_pool", None)
+                for runner in draft_runners
+            )
+            # Shared state is already backed up with the target. Separate
+            # draft state follows the target's Mamba slot indices.
+            if any(
+                pool is not None and pool is not target_mamba_pool
+                for pool in draft_mamba_pools
+            ):
+                assert target_mamba_pool is not None, (
+                    "Packed draft state requires target Mamba slot indices"
+                )
+                assert all(
+                    pool is not None and pool is not target_mamba_pool
+                    for pool in draft_mamba_pools
+                ), "Packed MTP requires separate state for every draft layer"
+                target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+            )
+
+        if get_memory().enable_unified_cache_external_linker:
+            raise NotImplementedError(
+                "The external linker only supports packed draft KV caches."
             )
 
         return HiCacheDraftPlan(
@@ -289,24 +338,6 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_disk(
-                recv_req.model_path,
-                recv_req.load_format,
-                recapture_cuda_graph=recv_req.recapture_cuda_graph,
-            )
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

@@ -495,7 +495,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -655,7 +654,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,
@@ -826,6 +824,7 @@ class DsparkStepObservers:
         target_logits: Optional[torch.Tensor],
         layout,
         confidence: Optional[torch.Tensor],
+        confidence_raw: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         draft_block,
@@ -840,20 +839,20 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
     ) -> None:
         planner = self._planner
-        if not proposal_folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
-            self._confidence_probe.maybe_observe(
-                carries_confidence=planner.carries_confidence,
-                is_compact_mode=planner.is_compact_mode,
-                confidence_raw=planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
+        self._maybe_record_sts_collect(
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+        )
+        self._confidence_probe.maybe_observe(
+            carries_confidence=planner.carries_confidence,
+            is_compact_mode=planner.is_compact_mode,
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+        )
         if self._block_accept_recorder is not None and not proposal_folded:
             self._block_accept_recorder.observe_verify_step(
                 forward_ct=forward_ct,
@@ -931,15 +930,13 @@ class DsparkStepObservers:
     def _maybe_record_sts_collect(
         self,
         *,
+        confidence_raw: Optional[torch.Tensor],
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
         bs: int,
     ) -> None:
         if not self._sts_collect_path:
             return
-        if not self._planner.carries_confidence:
-            return
-        confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
         if self._sts_recorder is None:

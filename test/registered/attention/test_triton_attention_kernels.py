@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.decode_attention import (
 )
 from sglang.kernels.ops.attention.extend_attention import (
     _compact_extend_q_tiles_per_head,
+    align_window_kv_to_tiles,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
@@ -25,7 +26,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -152,7 +153,6 @@ def decode_attention_fwd_torch(
 
 
 class TestTritonAttention(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
@@ -326,19 +326,81 @@ class TestTritonAttention(CustomTestCase):
 
         if not ea._is_hip:
             self.skipTest("HIP-only block-size selection")
-        # head_dim <= 128 keeps the default config on all HIP archs
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
-        )
-        # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
+        # head_dim <= 256: tuned tile on gfx95, default elsewhere. 64 is gpt-oss,
+        # 128 is the llama/qwen family, 256 is gemma -- all measured on MI350X.
         expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
-        )
-        # head_dim > 256: falls back to the default on all HIP archs
+        for head_dim in (64, 128, 256):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(head_dim, head_dim)[3:],
+                expected,
+            )
+        # head_dim > 256 falls back to the default unless the automatic
+        # Triton-3.7 gfx950 Lq=576/Lv=512 spill workaround applies.
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
         )
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            expected_spill = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                expected_spill,
+            )
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                (64, 64, 4),
+            )
+
+    def test_extend_attention_triton37_lq576_n32(self):
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not (ea._is_gfx95 and ea._is_triton_ge_37):
+            self.skipTest("Triton >=3.7 gfx950-only spill workaround")
+
+        device = get_device()
+        dtype = torch.bfloat16
+        extend_lens = [32, 23]
+        prefix_lens = [64, 96]
+        h_q, h_kv, l_q, l_v = 12, 1, 576, 512
+        n_ext, n_prefix = sum(extend_lens), sum(prefix_lens)
+
+        q = torch.randn(n_ext, h_q, l_q, dtype=dtype, device=device)
+        k = torch.randn(n_ext, h_kv, l_q, dtype=dtype, device=device)
+        v = torch.randn(n_ext, h_kv, l_v, dtype=dtype, device=device)
+        k_buffer = torch.randn(n_prefix, h_kv, l_q, dtype=dtype, device=device)
+        v_buffer = torch.randn(n_prefix, h_kv, l_v, dtype=dtype, device=device)
+        qo_indptr = torch.tensor([0, 32, 55], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, 64, 160], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(n_prefix, dtype=torch.int64, device=device)
+        reference = torch.empty(n_ext, h_q, l_v, dtype=dtype, device=device)
+        candidate = torch.empty_like(reference)
+
+        def run(output):
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                max(extend_lens),
+                1.0,
+                1.0,
+                sm_scale=1.0 / (l_q**0.5),
+                extend_seq_lens_cpu=extend_lens,
+            )
+
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            run(reference)
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            run(candidate)
+        torch.testing.assert_close(candidate, reference, atol=2e-2, rtol=1e-2)
 
     def test_compact_extend_attention_tile_count(self):
         self.assertEqual(
@@ -1068,6 +1130,51 @@ class TestTritonAttention(CustomTestCase):
             # Check that prefix and extend are concatenated correctly
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
+
+    def test_unified_sliding_window_chunked_matches_unchunked(self):
+        """Deterministic inference: a chunk whose window starts off a tile boundary
+        must match the unchunked prefill bit for bit."""
+        torch.manual_seed(0)
+        device = get_device()
+        seq_len, window, prefix = 3000, 128, 2192  # window starts at 2064
+        q = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        k = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        i32 = lambda *x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+
+        def run(prefix_len):
+            win = min(prefix_len, window)
+            indptr, indices = align_window_kv_to_tiles(
+                i32(0, win),
+                arange(prefix_len - win, prefix_len),
+                i32(prefix_len - win),
+                1,
+            )
+            extend_len = seq_len - prefix_len
+            kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                indptr, indices, i32(0), i32(extend_len), arange(prefix_len, seq_len), 1
+            )
+            o = torch.empty_like(q[prefix_len:])
+            extend_attention_fwd_unified(
+                q[prefix_len:],
+                o,
+                k,
+                v,
+                1.0,
+                1.0,
+                i32(0, extend_len),
+                kv_indptr,
+                kv_indices,
+                kv_prefix_lens.to(torch.int32),
+                extend_len,
+                sm_scale=0.125,
+                sliding_window_size=window,
+                window_start_pos=i32(prefix_len) - (indptr[1:] - indptr[:-1]),
+            )
+            return o
+
+        self.assertTrue(torch.equal(run(prefix), run(0)[prefix:]))
 
 
 if __name__ == "__main__":

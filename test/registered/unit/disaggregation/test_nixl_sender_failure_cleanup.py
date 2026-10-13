@@ -6,7 +6,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestNixlSenderFailureCleanup(unittest.TestCase):
@@ -22,12 +22,21 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             prefetched_rooms={room, 8},
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
         )
+        # This stub mirrors CommonKVManager's field set by hand, so any new
+        # field touched by CommonKVSender.clear() fails here with an
+        # AttributeError instead of a meaningful assertion. If that keeps
+        # happening, spy on clear() here and test its contents where clear()
+        # is tested, or build a real manager instance.
         sender.kv_mgr = SimpleNamespace(
+            deferred_bootstrap=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},
             req_to_decode_prefix_len={room: 3},
             transfer_infos={room: object()},
+            _staging_outstanding={},
+            _deferred_ack_targets={},
+            _maybe_ack_drained_abort=lambda room: None,
             exceptions={room: expected_exc},
             failure_records={room: "transfer failed"},
             failure_lock=threading.Lock(),

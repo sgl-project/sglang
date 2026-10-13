@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class TritonRunnerInput(RunnerInput):
-
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -42,7 +41,6 @@ class TritonRunnerInput(RunnerInput):
 
 @dataclass
 class TritonRunnerOutput(RunnerOutput):
-
     hidden_states: torch.Tensor
 
     @property
@@ -69,10 +67,17 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # w13 rows were permuted to interleave gate/up at load, so the activation
+    # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
+    fuse_swiglu_interleaved: bool = False
+
+
+def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
+    # only expert parallelism can route a token to an expert this rank does not hold
+    return config.num_experts is None or config.num_experts != config.num_local_experts
 
 
 class TritonRunnerCore(MoeRunnerCore):
-
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
@@ -108,6 +113,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
+                sanitize_topk_ids=_topk_ids_may_be_nonlocal(self.config),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -138,6 +144,7 @@ class TritonRunnerCore(MoeRunnerCore):
             running_state["config"],
             running_state.get("down_config"),
             running_state.get("down_moe_use_tma", False),
+            running_state.get("up_moe_use_tma", False),
             b1=quant_info.b13,
             b2=quant_info.b2,
             use_fp8_w8a8=quant_info.use_fp8_w8a8,
@@ -163,6 +170,7 @@ class TritonRunnerCore(MoeRunnerCore):
             filter_expert=filter_expert,
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -206,6 +214,7 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
+            sanitize_topk_ids=_topk_ids_may_be_nonlocal(runner_config),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():
@@ -247,6 +256,7 @@ def fused_experts_none_to_triton(
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
     return StandardCombineInput(
@@ -280,6 +290,7 @@ def pre_permute_standard_to_triton(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -299,6 +310,7 @@ def pre_permute_standard_to_triton(
     running_state["config"] = config
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
 
     return TritonRunnerInput(
         hidden_states=hidden_states,

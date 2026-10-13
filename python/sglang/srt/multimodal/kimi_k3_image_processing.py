@@ -1,12 +1,29 @@
 import functools
 import math
-from typing import Union
+from dataclasses import dataclass
+from typing import Literal, Optional, Union
 
 import numpy as np
 import torch
 from PIL import Image
 
 DEFERRED_PREPROCESSING_KEY = "kimi_k3_deferred_preprocessing"
+
+
+@dataclass(frozen=True)
+class KimiK3DeferredPreprocessing:
+    """Parameters the vision-DP owner needs to finish one deferred image.
+
+    ``backend`` is the producer's decision and cannot be recovered from the
+    item; the feature's own layout stays observable on ``item.feature``, so it
+    is not mirrored here.
+    """
+
+    backend: Literal["gpu", "cpu"]
+    image_mean: list[float]
+    image_std: list[float]
+    transparent_bg_config: Optional[dict]
+    resize_config: dict
 
 
 def prepare_kimi_k3_encoder_inputs(
@@ -29,7 +46,13 @@ def prepare_kimi_k3_encoder_inputs(
         navit_resize_config,
     )
 
-    media_proc_cfg = getattr(image_processor, "media_proc_cfg", None)
+    try:
+        media_proc_cfg = image_processor.media_proc_cfg
+    except AttributeError as exc:
+        raise ValueError(
+            "Kimi-K3 EPD owner-side preprocessing requires "
+            "image_processor.media_proc_cfg"
+        ) from exc
     if not isinstance(media_proc_cfg, dict):
         raise ValueError(
             "Kimi-K3 EPD owner-side preprocessing requires "
@@ -52,26 +75,31 @@ def prepare_kimi_k3_encoder_inputs(
         )
 
     concrete_images = []
+    content_digests = []
     for image in images:
+        content_digest = None
         if isinstance(image, dict):
             if image.get("type") != "image" or "image" not in image:
                 raise ValueError(f"Unsupported Kimi-K3 encoder media item: {image}")
+            content_digest = image.get("content_hash")
             image = image["image"]
         concrete_images.append(image)
+        content_digests.append(content_digest)
 
     patch_size = int(media_proc_cfg["patch_size"])
     merge_kernel_size = int(media_proc_cfg["merge_kernel_size"])
-    common_deferred_config = {
-        "backend": "gpu" if use_gpu_preprocessing else "cpu",
-        "image_mean": list(media_proc_cfg["image_mean"]),
-        "image_std": list(media_proc_cfg["image_std"]),
-        "transparent_bg_config": media_proc_cfg.get("transparent_bg_config"),
-    }
+    deferred_preprocessing = functools.partial(
+        KimiK3DeferredPreprocessing,
+        backend="gpu" if use_gpu_preprocessing else "cpu",
+        image_mean=list(media_proc_cfg["image_mean"]),
+        image_std=list(media_proc_cfg["image_std"]),
+        transparent_bg_config=media_proc_cfg.get("transparent_bg_config"),
+    )
 
     items = []
     grids = []
     original_image_sizes = []
-    for image in concrete_images:
+    for image, content_digest in zip(concrete_images, content_digests):
         width, height = (
             (int(image.shape[-1]), int(image.shape[-2]))
             if isinstance(image, torch.Tensor)
@@ -88,17 +116,18 @@ def prepare_kimi_k3_encoder_inputs(
         )
         grid_thw = _grid_thw_from_resize_config(resize_config, patch_size)
         grid_tensor = torch.tensor([grid_thw], dtype=torch.int64)
+        model_specific_data = {
+            "grid_thws": grid_tensor,
+            DEFERRED_PREPROCESSING_KEY: deferred_preprocessing(
+                resize_config=resize_config
+            ),
+        }
+        if content_digest is not None:
+            model_specific_data["content_digest"] = content_digest
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=to_chw_uint8(image) if use_gpu_preprocessing else image,
-            model_specific_data={
-                "grid_thws": grid_tensor,
-                DEFERRED_PREPROCESSING_KEY: {
-                    **common_deferred_config,
-                    "feature_layout": "chw" if use_gpu_preprocessing else "raw",
-                    "resize_config": resize_config,
-                },
-            },
+            model_specific_data=model_specific_data,
         )
         if not use_gpu_preprocessing:
             item.set_hash(hash_raw_encoder_item(image))
@@ -133,9 +162,6 @@ def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
     medias = []
     for item in items:
         image = item.feature
-        config = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
-        if config["feature_layout"] != "raw":
-            raise ValueError("Kimi-K3 deferred CPU preprocessing expects raw inputs")
         if not isinstance(image, Image.Image):
             if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8:
                 raise TypeError(

@@ -3,21 +3,28 @@
 import dataclasses
 import multiprocessing as mp
 import os
-import signal
 import sys
-import threading
 import time
 
-import psutil
 import uvicorn
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
-from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
-from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
+    SchedulerProcessSpec,
+    ServerArgsPayload,
+    bootstrap_http_server_process,
+    bootstrap_scheduler_process,
+)
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    configure_metrics,
+    start_role_metrics_server,
+)
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -26,8 +33,10 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.multimodal_gen.runtime.utils.process import (
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 
 _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10
@@ -51,45 +60,6 @@ def _find_available_port(
     raise RuntimeError(
         f"No available port found after {max_attempts} attempts (start={start})"
     )
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def _process_names(processes) -> str:
@@ -132,11 +102,6 @@ def _kill_alive_processes(processes, timeout_s: float) -> None:
     _join_processes_with_deadline(alive, timeout_s)
 
 
-def _run_http_server_process(server_args: ServerArgs) -> None:
-    kill_itself_when_parent_died()
-    launch_http_server_only(server_args)
-
-
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
     if server_args.disagg_role != RoleType.MONOLITHIC:
         return
@@ -173,9 +138,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     Args:
         launch_http_server: False for offline local mode
     """
+    apply_plugin_hooks()
     configure_logger(server_args)
 
     # Start a new server with multiple worker processes
+    if server_args.enable_metrics:
+        configure_metrics()
     logger.info("Starting server...")
 
     # num_gpus is the total world size across every node; each node runs
@@ -189,65 +157,31 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     rank_offset = node_rank * local_num_gpus
     processes = []
 
-    # Pipes for master to talk to slaves (local to this node)
-    task_pipes_to_slaves_w = []
-    task_pipes_to_slaves_r = []
-    for _ in range(local_num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        task_pipes_to_slaves_r.append(r)
-        task_pipes_to_slaves_w.append(w)
+    # A local spawn context makes the worker boundary deterministic even when
+    # an embedding application selected a different global start method.
+    worker_context = mp.get_context("spawn")
+    server_args_payload = ServerArgsPayload.capture(server_args)
 
-    # Pipes for slaves to talk to master (local to this node)
-    result_pipes_from_slaves_w = []
-    result_pipes_from_slaves_r = []
-    for _ in range(local_num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        result_pipes_from_slaves_r.append(r)
-        result_pipes_from_slaves_w.append(w)
-
-    # Launch this node's local worker processes
-    master_port = server_args.master_port
+    # Launch this node's local worker processes.
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
     for i in range(local_num_gpus):
         rank = rank_offset + i
-        reader, writer = mp.Pipe(duplex=False)
+        reader, writer = worker_context.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        if i == 0:  # This node's local pipe master
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    rank,
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_w,
-                    result_pipes_from_slaves_r,
-                ),
-                name=f"sglang-diffusionWorker-{rank}",
-                daemon=True,
-            )
-        else:  # Slave workers
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    rank,
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_r[i - 1],
-                    result_pipes_from_slaves_w[i - 1],
-                ),
-                name=f"sglang-diffusionWorker-{rank}",
-                daemon=True,
-            )
+        spec = SchedulerProcessSpec(
+            local_rank=i,
+            rank=rank,
+            server_args=server_args_payload,
+            pipe_writer=writer,
+        )
+        process = worker_context.Process(
+            target=bootstrap_scheduler_process,
+            args=(spec,),
+            name=f"sglang-diffusionWorker-{rank}",
+            daemon=True,
+        )
         scheduler_pipe_readers.append(reader)
         process.start()
         processes.append(process)
@@ -256,16 +190,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_infos = []
     for writer in scheduler_pipe_writers:
         writer.close()
-
-    # Close unused pipe ends in parent process
-    for p in task_pipes_to_slaves_w:
-        p.close()
-    for p in task_pipes_to_slaves_r:
-        p.close()
-    for p in result_pipes_from_slaves_w:
-        p.close()
-    for p in result_pipes_from_slaves_r:
-        p.close()
 
     for i, reader in enumerate(scheduler_pipe_readers):
         try:
@@ -287,6 +211,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader.close()
 
     logger.debug("All workers are ready")
+    logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
 
     if node_rank != 0:
         # The TokenizerManager / HTTP surface lives on the node that owns
@@ -314,9 +239,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
-            http_server_process = mp.Process(
-                target=_run_http_server_process,
-                args=(server_args,),
+            http_server_process = worker_context.Process(
+                target=bootstrap_http_server_process,
+                args=(server_args_payload,),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
@@ -362,6 +287,8 @@ def launch_pool_disagg_server(
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)
+    if server_args.enable_metrics:
+        configure_metrics()
     num_denoisers = len(denoiser_gpus)
     num_decoders = len(decoder_gpus)
     logger.info(
@@ -451,10 +378,12 @@ def launch_pool_disagg_server(
             base_dict = {
                 f.name: getattr(server_args, f.name)
                 for f in dataclasses.fields(server_args)
+                if f.init
             }
             base_dict.update(role_overrides)
             base_dict.pop("pipeline_config", None)
             role_args = ServerArgs.from_kwargs(**base_dict)
+            role_args_payload = ServerArgsPayload.capture(role_args)
 
             pool_ctx = mp.get_context("spawn")
             inst_readers = []
@@ -464,9 +393,18 @@ def launch_pool_disagg_server(
                 reader, writer = pool_ctx.Pipe(duplex=False)
                 gpu_id = gpu_ids[rank_idx]
 
+                # Physical GPU index as local_rank: torch.cuda.set_device() must
+                # not depend on CUDA_VISIBLE_DEVICES remapping, which can be
+                # stale if CUDA was already initialized in the parent.
+                spec = SchedulerProcessSpec(
+                    local_rank=gpu_id,
+                    rank=rank_idx,
+                    server_args=role_args_payload,
+                    pipe_writer=writer,
+                )
                 process = pool_ctx.Process(
-                    target=_run_disagg_role_process,
-                    args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+                    target=bootstrap_scheduler_process,
+                    args=(spec,),
                     name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
                     daemon=True,
                 )
@@ -516,6 +454,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
     )
     diffusion_server.start()
 
@@ -538,35 +477,6 @@ def launch_pool_disagg_server(
     return all_processes
 
 
-def _run_disagg_role_process(
-    gpu_id: int,
-    _local_rank: int,
-    rank: int,
-    server_args: ServerArgs,
-    pipe_writer: mp.connection.Connection,
-    task_pipes: list,
-    result_pipes: list,
-):
-    """Entry point for a disagg role process.
-
-    Uses the physical GPU index (gpu_id) as local_rank so that
-    torch.cuda.set_device(local_rank) selects the correct GPU.
-    This avoids relying on CUDA_VISIBLE_DEVICES remapping, which
-    may not work if CUDA was pre-initialized in the parent process.
-    """
-    run_scheduler_process(
-        local_rank=gpu_id,
-        rank=rank,
-        master_port=server_args.master_port,
-        server_args=server_args,
-        pipe_writer=pipe_writer,
-        task_pipe_r=None,
-        result_pipe_w=None,
-        task_pipes_to_slaves=task_pipes,
-        result_pipes_from_slaves=result_pipes,
-    )
-
-
 def launch_http_server_only(server_args):
     init_diffusion_tracing(server_args, "DiffHTTPServer")
 
@@ -584,12 +494,12 @@ def launch_http_server_only(server_args):
     )
 
 
-def parse_url_string(url_str: str) -> list[str]:
+def parse_url_string(url_str: str | None) -> list[str]:
     """Parse a semicolon-separated URL string into a list.
 
     Example: "tcp://10.0.0.1:35000;tcp://10.0.0.2:35000" -> ["tcp://...", "tcp://..."]
     """
-    return [u.strip() for u in url_str.split(";") if u.strip()]
+    return [u.strip() for u in (url_str or "").split(";") if u.strip()]
 
 
 def launch_disagg_server(server_args: ServerArgs):
@@ -604,12 +514,26 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder result: scheduler_port + 3
     """
     configure_logger(server_args)
+    set_global_server_args(server_args)
 
-    for name, val in [
-        ("--encoder-urls", server_args.encoder_urls),
-        ("--denoiser-urls", server_args.denoiser_urls),
-        ("--decoder-urls", server_args.decoder_urls),
-    ]:
+    if server_args.enable_metrics:
+        configure_metrics()
+
+    glm_distributed_mode_enabled = (
+        type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
+        and server_args.srt_encoder_url is not None
+        and server_args.encoder_urls is None
+        and server_args.decoder_urls is None
+    )
+    required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
+    if not glm_distributed_mode_enabled:
+        required_urls.extend(
+            [
+                ("--encoder-urls", server_args.encoder_urls),
+                ("--decoder-urls", server_args.decoder_urls),
+            ]
+        )
+    for name, val in required_urls:
         if val is None:
             raise ValueError(f"{name} is required for --disagg-role server")
 
@@ -643,6 +567,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
+    denoiser_options = (
+        {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
+    )
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
@@ -653,6 +580,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
+        glm_distributed_mode_enabled=glm_distributed_mode_enabled,
+        **denoiser_options,
     )
     diffusion_server.start()
 
@@ -681,9 +611,11 @@ def launch_disagg_role(server_args: ServerArgs):
     configure_logger(server_args)
 
     role_type = server_args.disagg_role
+    if server_args.enable_metrics:
+        configure_metrics()
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints
@@ -725,13 +657,54 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    role_tp = role_par["tp_size"] or 1
+    role_sp = role_par["sp_degree"] or 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    )
+    cfg_parallel_explicit = server_args.is_arg_explicitly_set(
+        "enable_cfg_parallel"
+    ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
+    required_devices = role_tp * role_sp * cfg_degree * server_args.dp_size
+    if not cfg_parallel_explicit and (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        logger.warning(
+            "Disabling auto-enabled CFG parallel for %s role because tp=%d, "
+            "sp=%d, cfg=%d, dp=%d is incompatible with %d devices",
+            role_type.value,
+            role_tp,
+            role_sp,
+            cfg_degree,
+            server_args.dp_size,
+            server_args.num_gpus,
+        )
+        role_overrides["enable_cfg_parallel"] = False
+        role_overrides["cfg_parallel_degree"] = 1
+        cfg_degree = 1
+        required_devices = role_tp * role_sp * server_args.dp_size
+
+    if (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        raise ValueError(
+            f"Invalid parallelism for {role_type.value} role: "
+            f"tp={role_tp}, sp={role_sp}, cfg={cfg_degree}, "
+            f"dp={server_args.dp_size} requires groups of {required_devices} "
+            f"devices, but num_gpus={server_args.num_gpus}"
+        )
 
     base_dict = {
-        f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)
+        f.name: getattr(server_args, f.name)
+        for f in dataclasses.fields(server_args)
+        if f.init
     }
     base_dict.update(role_overrides)
     base_dict.pop("pipeline_config", None)
     role_args = ServerArgs.from_kwargs(**base_dict)
+    role_args_payload = ServerArgsPayload.capture(role_args)
 
     # Spawn GPU worker processes
     # NOTE: All ranks must be spawned before waiting for ready signals,
@@ -746,9 +719,18 @@ def launch_disagg_role(server_args: ServerArgs):
         reader, writer = pool_ctx.Pipe(duplex=False)
         gpu_id = base_gpu_id + rank_idx
 
+        # Physical GPU index as local_rank: torch.cuda.set_device() must not
+        # depend on CUDA_VISIBLE_DEVICES remapping, which can be stale if CUDA
+        # was already initialized in the parent.
+        spec = SchedulerProcessSpec(
+            local_rank=gpu_id,
+            rank=rank_idx,
+            server_args=role_args_payload,
+            pipe_writer=writer,
+        )
         process = pool_ctx.Process(
-            target=_run_disagg_role_process,
-            args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+            target=bootstrap_scheduler_process,
+            args=(spec,),
             name=f"sglang-{role_type.value}-r{rank_idx}",
             daemon=True,
         )
@@ -782,6 +764,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
     # Block until interrupted
     try:
+        if server_args.enable_metrics:
+            start_role_metrics_server(server_args)
         for p in processes:
             p.join()
     except KeyboardInterrupt:
@@ -792,6 +776,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
+    apply_plugin_hooks()
+
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 
@@ -807,6 +793,7 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    apply_plugin_hooks()
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

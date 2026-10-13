@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _RejectTriton:
@@ -95,7 +95,7 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
 
     def test_short_single_sequence_uses_triton(self):
         kernel, calls = self._make_kernel()
-        kernel._triton.extend = Mock(return_value="triton")
+        kernel._triton.extend = Mock(side_effect=lambda *args, **kwargs: args[4])
         x = self._inputs([5])
         states = torch.zeros(3, 1, 128, 128, dtype=torch.bfloat16)
 
@@ -110,9 +110,10 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
             query_start_loc=x["query_start_loc"],
             extend_seq_lens_cpu=[5],
             A_log=torch.zeros(128, dtype=torch.float32),
+            beta_is_raw=True,
         )
 
-        self.assertEqual(output, "triton")
+        torch.testing.assert_close(output, x["beta"].sigmoid(), atol=0, rtol=0)
         self.assertEqual(calls, [])
         kernel._triton.extend.assert_called_once()
         self.assertTrue(torch.count_nonzero(states).item() == 0)
@@ -136,6 +137,7 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
             query_start_loc=x["query_start_loc"],
             extend_seq_lens_cpu=seq_lens,
             A_log=torch.zeros(128, dtype=torch.float32),
+            beta_is_raw=True,
         )
 
         self.assertEqual(len(calls), 1)
@@ -148,6 +150,12 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
         for row, length in enumerate(seq_lens):
             end = start + length
             self.assertTrue(torch.equal(call["v"][row, :length], x["v"][0, start:end]))
+            torch.testing.assert_close(
+                call["beta"][row, :length],
+                x["beta"][0, start:end].sigmoid().bfloat16(),
+                atol=0,
+                rtol=0,
+            )
             self.assertTrue(torch.count_nonzero(call["q"][row, length:]).item() == 0)
             self.assertTrue(torch.count_nonzero(call["k"][row, length:]).item() == 0)
             self.assertTrue(torch.count_nonzero(call["v"][row, length:]).item() == 0)

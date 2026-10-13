@@ -84,7 +84,7 @@ openai-protocol = { version = "=1.0.0", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.3.2"
 smg-auth = "=1.0.0"
-wfaas = "=1.0.0"
+wfaas = "=1.0.2"
 data-connector = "=1.0.0"
 smg-mcp = "=1.0.0"
 smg-wasm = "=1.0.0"

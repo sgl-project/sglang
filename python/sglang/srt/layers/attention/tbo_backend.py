@@ -4,11 +4,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 from sglang.srt.batch_overlap import two_batch_overlap
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -20,9 +23,18 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.kv_index_translator = primary.kv_index_translator
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
+
+    @property
+    def supports_prefill_cuda_graph_max_context_size(self) -> bool:
+        return self.primary.supports_prefill_cuda_graph_max_context_size
+
+    @property
+    def dllm_attention(self):
+        return self.primary.dllm_attention
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -117,6 +129,11 @@ class TboAttnBackend(AttentionBackend):
                 forward_batch=child_fb_view, in_capture=False
             )
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in (self.primary, *self.children)
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         if not self._children_use_cuda_graph():
@@ -154,6 +171,10 @@ class TboAttnBackend(AttentionBackend):
             return
         for child in self.children:
             child.on_after_cuda_graph_warmup()
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        for backend in (self.primary, *self.children):
+            backend.validate_elastic_cuda_graph_recapture()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
@@ -211,9 +232,9 @@ def _build_tbo_child_replay_fb_view(
     capture-time buffers are sliced per child, spec_info is split, and
     seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
     """
-    assert (
-        getattr(fb_view, "encoder_lens", None) is None
-    ), "TBO replay split does not support encoder_lens yet"
+    assert getattr(fb_view, "encoder_lens", None) is None, (
+        "TBO replay split does not support encoder_lens yet"
+    )
     spec_info = getattr(fb_view, "spec_info", None)
     if spec_info is not None:
         start_seq = seq_slice.start or 0
@@ -230,6 +251,7 @@ def _build_tbo_child_replay_fb_view(
     child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
     parent_input_ids = getattr(fb_view, "input_ids", None)
     parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
+    plan = getattr(fb_view, "kv_loc_plan", None)
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
@@ -249,5 +271,15 @@ def _build_tbo_child_replay_fb_view(
             if parent_out_cache_loc is not None
             else None
         ),
+        # Unified memory refuses two-batch overlap, so the plan's reads stay in
+        # `req_to_token`, which each child indexes at its own rows; each child
+        # writes its own tokens of the plan's window.
+        kv_loc_plan=plan,
+        kv_loc_cols=(
+            None
+            if plan is None
+            else plan.cols_slice(getattr(fb_view, "kv_loc_cols", None), tok_slice)
+        ),
         spec_info=child_spec_info,
+        max_seq_len_override=fb_view.max_seq_len_override,
     )
