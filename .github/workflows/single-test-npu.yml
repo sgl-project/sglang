@@ -79,6 +79,10 @@ jobs:
 
           export SGLANG_TEST_MAX_RETRY=0
           export SGLANG_SET_CPU_AFFINITY=1
+          EAGLE_WEIGHT_DIR="/root/.cache/modelscope/hub/models/sgl-npu/MiniMax-M2.5-eagel-model-0318"
+
+          export PYTHONPATH=${EAGLE_WEIGHT_DIR}:$PYTHONPATH
+          export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
           echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
 
           echo "Use sglang from image"
