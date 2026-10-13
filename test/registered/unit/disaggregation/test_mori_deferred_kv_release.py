@@ -11,6 +11,7 @@ from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 
 
 def _install_mori_stubs() -> None:
@@ -58,7 +59,7 @@ from test_deferred_decode_kv_release import (
     DeferredAbortNotificationScenarios,
 )
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -67,10 +68,13 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
+    MoriKVSender,
     StatusCode,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -370,6 +374,148 @@ class TestMoriBackendOptIn(CustomTestCase):
     def test_mori_opts_into_deferred_release(self):
         # Mori sends the drain ack itself, so the default-on env var applies.
         self.assertTrue(MoriKVManager.supports_deferred_decode_kv_release)
+
+
+class TestMoriFabricStaging(CustomTestCase):
+    def manager(self, local=6500, remote=5000):
+        ns = types.SimpleNamespace
+        manager = _manager()
+        manager.kv_args = ns(
+            page_size=256,
+            kv_item_lens=[192, 64],
+            kv_data_ptrs=[1, 2],
+            kv_data_lens=[192 * 64, 64 * 64],
+            state_types=[StateType.SWA_RING, StateType.DSV4_REQUEST_STATE],
+            state_item_lens=[[3, 5], [48, 16]],
+            state_data_ptrs=[[3, 4], [5, 6]],
+            state_data_lens=[[3 * 128, 5 * 128], [48 * 8, 16 * 8]],
+        )
+        manager._fabric_staging = True
+        manager._fabric_staging_buffers = [ns(get_size=lambda: local)]
+        manager._dcp_pack_max_tokens = None
+        manager.is_dummy_cp_rank = False
+        manager.enable_all_cp_ranks_for_transfer = False
+        manager.attn_cp_size = 1
+        manager.request_status[11] = KVPoll.WaitingForInput
+        manager.transfer_infos = {11: {
+            "dummy": ns(is_dummy=True),
+            "decode": ns(is_dummy=False, dst_state_indices=[np.arange(128), np.array([5, 6])]),
+        }}
+        manager.decode_kv_args_table = {"decode": ns(
+            dst_staging_size=remote, dst_staging_mem_descs=[object()],
+            requires_dcp_relayout=False,
+        )}
+        return manager
+
+    def sender(self, manager, pages):
+        sender = MoriKVSender.__new__(MoriKVSender)
+        sender.kv_mgr, sender.bootstrap_room, sender.curr_idx = manager, 11, 0
+        sender._fabric_transfer_tokens = None
+        sender._transfer_num_kv_indices = sender._transfer_num_state_indices = 0
+        sender.init(pages, 3)
+        return sender
+
+    def test_cached_prefix_is_bounded_and_state_is_terminal(self):
+        """A cached prefix larger than three slots must retain every page and state row."""
+        ns = types.SimpleNamespace
+        for local, remote in ((6500, 5000), (5000, 6500)):
+            for early in (False, True):
+                with self.subTest(local=local, remote=remote, early=early):
+                    manager = self.manager(local, remote)
+                    sender = self.sender(manager, 0)
+                    cap = sender.get_max_transfer_tokens()
+                    self.assertEqual(cap, 15 * 256)
+                    cached, total = 4 * cap, 4 * cap + 519
+                    sender.init((total + 255) // 256, 3)
+                    manager.add_transfer_request = MagicMock()
+                    pool = ns(
+                        unified_swa_ring_size=128, unified_swa_window=128,
+                        request_state_transfer_indices=lambda *_: np.array([5, 6]),
+                    )
+                    req = ns(
+                        rid="prefix", kv=ns(req_pool_idx=0),
+                        origin_input_ids=range(total), extend_end=total,
+                        start_send_idx=0, disagg_decode_prefix_len=0,
+                        disagg_kv_sender=sender, prefix_len=cached,
+                        host_hit_length=0, pending_bootstrap=False,
+                    )
+                    scheduler = ns(
+                        enable_staging=False, enable_overlap=False,
+                        token_to_kv_pool_allocator=ns(
+                            page_size=256, translate_kv_indices_for_transfer=lambda x: x,
+                            get_kvcache=lambda: pool,
+                        ),
+                        req_to_token_pool=ns(req_to_token=torch.arange(total).view(1, -1)),
+                        disagg_metadata_buffers=MagicMock(), kv_checksum_computer=None,
+                        disagg_prefill_bootstrap_queue=ns(kv_manager=manager),
+                        disagg_prefill_pending_chunk_rids=set(),
+                    )
+                    for name in ("send_kv_chunk", "_send_kv_chunk"):
+                        setattr(scheduler, name, types.MethodType(
+                            getattr(SchedulerDisaggregationPrefillMixin, name), scheduler
+                        ))
+                    with patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=early):
+                        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(scheduler, req)
+                    scheduler._send_kv_chunk(req, last_chunk=True)
+                    calls = manager.add_transfer_request.call_args_list
+                    self.assertEqual(len(calls), 5)
+                    self.assertEqual(sum(c.kwargs["num_kv_tokens"] for c in calls), total)
+                    np.testing.assert_array_equal(
+                        np.concatenate([c.args[1] for c in calls]), np.arange(sender.num_kv_indices)
+                    )
+                    offset = 0
+                    for i, call in enumerate(calls):
+                        pages = len(call.args[1])
+                        self.assertEqual(call.args[2], slice(offset, offset + pages))
+                        self.assertEqual(call.args[3], i == len(calls) - 1)
+                        state = call.kwargs.get("state_indices")
+                        self.assertEqual(state is not None, i == len(calls) - 1)
+                        nbytes = pages * 256 + (1152 if state is not None else 0)
+                        self.assertLessEqual(nbytes, min(local, remote))
+                        self.assertLessEqual(call.kwargs["num_kv_tokens"], cap)
+                        offset += pages
+                    self.assertEqual([len(x) for x in state], [128, 2])
+                    self.assertEqual(req.start_send_idx, total)
+
+    def test_capacity_errors_and_non_fabric_fallback(self):
+        for local, remote in ((0, 5000), (5000, 0), (1407, 6500)):
+            with self.subTest(local=local, remote=remote):
+                with self.assertRaises(ValueError):
+                    self.sender(self.manager(local, remote), 1).get_max_transfer_tokens()
+        manager = self.manager()
+        manager.transfer_infos[11]["decode"].dst_state_indices = []
+        with self.assertRaisesRegex(ValueError, "state metadata mismatch"):
+            self.sender(manager, 1).get_max_transfer_tokens()
+        manager._fabric_staging = False
+        self.assertIsNone(self.sender(manager, 1).get_max_transfer_tokens())
+        manager._dcp_pack_max_tokens = 256
+        manager.decode_kv_args_table["decode"].requires_dcp_relayout = True
+        self.assertEqual(self.sender(manager, 1).get_max_transfer_tokens(), 256)
+
+    def test_bad_pack_fails_before_launch_with_guards_intact(self):
+        for rows, state, local, remote, error in (
+            (np.arange(26), None, 6500, 7000, "overflow before gather"),
+            (np.arange(20), None, 6500, 5000, "too small"),
+            (np.array([-1]), None, 6500, 5000, "negative row"),
+            (np.array([64]), None, 6500, 5000, "source overflow"),
+            (np.array([0]), [np.array([128]), np.array([5, 6])], 6500, 5000, "source overflow"),
+        ):
+            with self.subTest(error=error, rows=rows):
+                manager = self.manager(local, remote)
+                manager.transfer_infos[11].pop("dummy")
+                storage = torch.full((local + 32,), 165, dtype=torch.uint8)
+                manager._fabric_staging_buffers[0] = types.SimpleNamespace(
+                    get_size=lambda: local, get_ptr=lambda: storage.data_ptr() + 16,
+                    buffer=storage[16:-16],
+                )
+                chunk = _chunk()
+                chunk.prefill_kv_indices, chunk.state_indices = rows, state
+                chunk.is_last_chunk = state is not None
+                with patch("sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack") as gather:
+                    with self.assertRaisesRegex((ValueError, RuntimeError), error):
+                        manager._process_fabric_staging_chunk(chunk, 0)
+                    gather.assert_not_called()
+                self.assertTrue(torch.all(storage == 165))
 
 
 if __name__ == "__main__":
