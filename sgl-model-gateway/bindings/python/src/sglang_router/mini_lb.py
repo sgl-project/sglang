@@ -111,6 +111,42 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def current_role_and_port(self, worker_url):
+        """Return (role, bootstrap_port) of a registered server, or (None, None)
+        if it is not in either routing list."""
+        if worker_url in self.prefill_urls:
+            return (
+                "prefill",
+                self.prefill_bootstrap_ports[self.prefill_urls.index(worker_url)],
+            )
+        if worker_url in self.decode_urls:
+            return "decode", None
+        return None, None
+
+    def remove_worker(self, worker_url):
+        """Drop a server from both routing lists so no new requests are sent to
+        it (used to quiesce it before a role switch)."""
+        if worker_url in self.decode_urls:
+            self.decode_urls.remove(worker_url)
+        if worker_url in self.prefill_urls:
+            idx = self.prefill_urls.index(worker_url)
+            self.prefill_urls.pop(idx)
+            self.prefill_bootstrap_ports.pop(idx)
+
+    def add_worker(self, worker_url, role, bootstrap_port=None):
+        """Register a server under a role in the routing lists."""
+        if role == "prefill":
+            self.prefill_urls.append(worker_url)
+            self.prefill_bootstrap_ports.append(bootstrap_port or 8998)
+        elif role == "decode":
+            self.decode_urls.append(worker_url)
+
+    def apply_role_switch(self, worker_url, new_role, bootstrap_port=None):
+        """Move a server between the prefill and decode routing lists after its
+        role has been switched on the backend. Idempotent."""
+        self.remove_worker(worker_url)
+        self.add_worker(worker_url, new_role, bootstrap_port)
+
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
@@ -253,6 +289,69 @@ async def health_generate():
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)
+
+
+async def _post_role_switch(worker_url, body):
+    """POST the role switch to a backend server; return (status, json)."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=lb.timeout)
+        ) as session:
+            async with session.post(f"{worker_url}/pd_role_switch", json=body) as resp:
+                return resp.status, await resp.json()
+    except Exception as e:  # transport error -> report as a failure
+        return 502, {"success": False, "message": str(e)}
+
+
+@app.post("/pd_role_switch")
+async def pd_role_switch(request_data: dict):
+    """Switch a running server's PD role (prefill<->decode) at runtime and
+    update the LB's routing lists. Body: {"worker_url", "new_role":
+    "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?,
+    "decode_cuda_graph_memory_gb"?, "drain"?, "drain_timeout_secs"?}.
+
+    The backend rejects a switch unless the instance is idle. To make this
+    safe while serving, by default the LB first removes the server from its
+    routing lists (so no new requests arrive), then retries the switch while
+    the server drains its in-flight requests, and only then registers it
+    under the new role. A failed server is restored only when the backend
+    confirms that no role state changed."""
+    worker_url = request_data.get("worker_url")
+    new_role = request_data.get("new_role")
+    if worker_url is None:
+        raise HTTPException(status_code=400, detail="worker_url is required")
+    if new_role not in ("prefill", "decode"):
+        raise HTTPException(status_code=400, detail=f"invalid new_role={new_role!r}")
+
+    drain = request_data.get("drain", True)
+    drain_timeout = request_data.get("drain_timeout_secs", 300)
+    old_role, old_port = lb.current_role_and_port(worker_url)
+
+    body = {"new_role": new_role}
+    for field in ("decode_cuda_graph_bs", "decode_cuda_graph_memory_gb"):
+        if request_data.get(field) is not None:
+            body[field] = request_data[field]
+
+    # Stop routing new requests to this server so it can drain to idle.
+    if drain and old_role is not None:
+        lb.remove_worker(worker_url)
+
+    deadline = asyncio.get_event_loop().time() + drain_timeout
+    while True:
+        status, result = await _post_role_switch(worker_url, body)
+        if status == 200 and result.get("success", False):
+            break
+        # The backend rejects while not idle; keep retrying as it drains.
+        not_idle = "not idle" in (result.get("message", "") or "").lower()
+        if drain and not_idle and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(1.0)
+            continue
+        if drain and old_role is not None and result.get("safe_to_restore", False):
+            lb.add_worker(worker_url, old_role, old_port)
+        return ORJSONResponse(content=result, status_code=status)
+
+    lb.apply_role_switch(worker_url, new_role, request_data.get("bootstrap_port"))
+    return ORJSONResponse(content=result, status_code=200)
 
 
 @app.post("/flush_cache")

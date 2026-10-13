@@ -25,20 +25,22 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -52,7 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
@@ -95,7 +97,6 @@ class Llama4MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.top_k = config.num_experts_per_tok
         self.device_module = torch.get_device_module()
 
@@ -110,6 +111,7 @@ class Llama4MoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=Llama4MoE.custom_routing_function,
         )
@@ -144,11 +146,6 @@ class Llama4MoE(nn.Module):
         )
 
         out_aD = routed_out + shared_out
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            out_aD = tensor_model_parallel_all_reduce(out_aD)
 
         return out_aD
 
@@ -384,8 +381,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = config.max_position_embeddings
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = Llama4Attention(
             config=config,
@@ -420,25 +415,28 @@ class Llama4DecoderLayer(nn.Module):
                 hidden_act="silu",
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_moe_layer,
-            is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_moe_layer,
-        )
-
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer,
+                    next_layer_sparse=is_next_moe_layer,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
@@ -457,10 +455,10 @@ class Llama4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if hidden_states.shape[0] != 0:
@@ -470,23 +468,14 @@ class Llama4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         # Fully Connected
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.feed_forward(hidden_states, forward_batch)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class Llama4Model(nn.Module):
@@ -530,20 +519,24 @@ class Llama4Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        residual = None
-        aux_hidden_states = []
+        residual_batch.start(forward_batch)
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
+
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -564,6 +557,31 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self, input_ids, positions, forward_batch, split_interval, input_embeds=None
+    ):
+        start, end = split_interval
+        if start == 0:
+            residual_batch.start(forward_batch)
+            forward_batch.hidden_states = (
+                self.model.embed_tokens(input_ids)
+                if input_embeds is None
+                else input_embeds
+            )
+        for layer in self.model.layers[start:end]:
+            forward_batch.hidden_states = layer(
+                positions, forward_batch.hidden_states, forward_batch
+            )
+        if end != self.model.config.num_hidden_layers:
+            return None
+        forward_batch.hidden_states = residual_batch.final_norm(
+            forward_batch.hidden_states, forward_batch, self.model.norm
+        )
+        return self.logits_processor(
+            input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

@@ -49,12 +49,13 @@ Two things intentionally differ from AgentX:
   uses real verification and reports the achieved accept length. Set
   ``AGENTIC_SIMULATE_ACC_LEN`` to restore the AgentX behaviour.
 
-Reference point. AgentX's own sweep of this recipe at this concurrency
-(InferenceX run 33298482346, tp4 + MTP + DRAM HiCache at c48, sglang
-v0.5.18-rocm720-mi35x) measured 1,464 output tok/s at a 17.10 ms median ITL,
-against 1,380 tok/s and 16.93 ms here. The two harnesses disagree by more on
-the prompt side -- AgentX reports a 94.7% prompt-cache read rate against 83.4%
-here -- because it starts each trajectory mid-trace behind a 30-minute warmup
+Reference point. AgentX's own sweep of this recipe at the tp4 + MTP + DRAM
+HiCache c48 point (InferenceX run 33298482346, sglang v0.5.18-rocm720-mi35x)
+measured 1,464 output tok/s at a 17.10 ms median ITL. This test's defaults run
+the same point, which the scheduled tp2 matrix does not, and measured 1,380
+tok/s and 16.93 ms on the 8-GPU MI35x runner. The two harnesses disagree by
+more on the prompt side -- AgentX reports a 94.7% prompt-cache read rate
+against 83.4% in that run -- because it starts each trajectory mid-trace behind a 30-minute warmup
 grace period and measures an hour of steady state, where this run flushes the
 cache and measures the cold prefill burst as well. Decode-side agreement is
 what makes the number worth tracking; the prompt-side gap is the harness.
@@ -409,7 +410,7 @@ class TestQwen35Mxfp4AgenticEvalMI35x(CustomTestCase):
             env=build_server_env(),
         )
         try:
-            requests.get(self.base_url + "/flush_cache")
+            requests.get(self.base_url + "/flush_cache", timeout=60)
             metrics = run_eval(
                 SimpleNamespace(
                     base_url=self.base_url,

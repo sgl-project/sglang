@@ -137,11 +137,11 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            "${ENV_ARGS[@]}" \
             -e AGENTIC_TP=${{ matrix.point.tp }} \
             -e AGENTIC_CONCURRENCY=${{ matrix.point.concurrency }} \
             -e AGENTIC_KV_OFFLOADING=${{ matrix.point.kv_offloading }} \
             -e AGENTIC_MODE=${{ matrix.point.mode }} \
+            "${ENV_ARGS[@]}" \
             python3 run_suite.py --hw amd --suite nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}

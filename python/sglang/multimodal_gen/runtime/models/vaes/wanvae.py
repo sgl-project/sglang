@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -54,7 +55,7 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-if current_platform.is_cuda():
+if current_platform.is_cuda() or current_platform.is_xpu():
     try:
         from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d, dup_up3d_add
     except ImportError:  # pragma: no cover
@@ -74,7 +75,9 @@ first_chunk = contextvars.ContextVar("first_chunk", default=None)
 
 def _channels_last_3d_supported_by_platform() -> bool:
     return hasattr(torch, "channels_last_3d") and (
-        current_platform.is_cuda() or current_platform.is_rocm()
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
     )
 
 
@@ -103,7 +106,7 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
         and x.dim() == 5
-        and x.is_cuda
+        and x.device.type in ("cuda", "xpu")
         and current_platform.is_amp_supported()
         and _conv3d_weight_is_channels_last_3d(conv.weight)
         and not torch.compiler.is_compiling()
@@ -560,8 +563,8 @@ def residual_up_block_forward(self, x):
         if (
             dup_up3d_add is not None
             and type(shortcut) is DupUp3D
-            and x.is_cuda
-            and x_copy.is_cuda
+            and x.device.type in ("cuda", "xpu")
+            and x_copy.device.type in ("cuda", "xpu")
             and x.dtype == x_copy.dtype
             and not torch.compiler.is_compiling()
         ):
@@ -1583,6 +1586,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = True
         return out
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
             self.clear_cache()

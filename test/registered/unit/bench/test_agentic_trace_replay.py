@@ -368,6 +368,18 @@ class _FailingSecondTurnHandler(_ChatHandler):
         )
 
 
+class _UsageReportingHandler(_ChatHandler):
+    """Reports a fixed server-side prompt length when the request asks for usage."""
+
+    prompt_tokens_per_turn = 1000
+
+    def _stream(self, chunks: list):
+        body = self.request_bodies[-1]
+        if (body.get("stream_options") or {}).get("include_usage"):
+            chunks[-1]["usage"]["prompt_tokens"] = self.prompt_tokens_per_turn
+        super()._stream(chunks)
+
+
 @contextlib.contextmanager
 def _mock_chat_server(handler_cls=_ChatHandler):
     class Handler(handler_cls):
@@ -471,6 +483,22 @@ class TestAgenticReplayDriver(CustomTestCase):
 
             with open(output_file, encoding="utf-8") as f:
                 self.assertEqual(json.loads(f.readlines()[-1]), result)
+
+    def test_prompt_side_uses_the_server_reported_length(self):
+        with self._replay(handler_cls=_UsageReportingHandler, max_concurrency=2) as (
+            result,
+            stats,
+            bodies,
+            _,
+        ):
+            self.assertTrue(
+                all(b["stream_options"]["include_usage"] for b in bodies),
+                "every round must ask for the usage block that carries prompt_tokens",
+            )
+            self.assertEqual(
+                result["total_input_tokens"],
+                stats.num_turns * _UsageReportingHandler.prompt_tokens_per_turn,
+            )
 
     def test_a_failed_turn_stops_its_trajectory(self):
         with self._replay(handler_cls=_FailingSecondTurnHandler, max_concurrency=2) as (

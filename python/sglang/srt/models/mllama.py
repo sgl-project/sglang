@@ -20,9 +20,9 @@ from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
 
-import sglang.srt.distributed.parallel_state as ps
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -392,7 +392,7 @@ class MllamaVisionModel(nn.Module):
             pixel_values.to(self.layernorm_pre.weight.dtype)
         )
         hidden_state = patch_embeds
-        hidden_state = ps.get_tp_group().all_gather(hidden_state)
+        hidden_state = get_parallel().tp_group.all_gather(hidden_state)
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape
@@ -726,13 +726,14 @@ class MllamaTextModel(nn.Module):
                         forward_batch=forward_batch,
                     )
             elif isinstance(decoder_layer, LlamaDecoderLayer):
-                hidden_states, residual = decoder_layer(
+                residual_batch.start(forward_batch)
+                hidden_states = decoder_layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=None,
                 )
-                hidden_states = hidden_states + residual
+                hidden_states = residual_batch.fold(hidden_states, forward_batch)
+                hidden_states = residual_batch.take_output(hidden_states, forward_batch)
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
         hidden_states = self.norm(hidden_states)

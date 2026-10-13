@@ -49,6 +49,12 @@ class ComponentUse:
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
     start_at_stage_entry: bool = True
+    # Layerwise components release their resident set when the use ends, which
+    # is right for a DiT (one use spans every denoise step) and buys nothing for
+    # a component used once per forward. Set this when something that knows the
+    # pipeline's per-phase headroom has decided the room is better spent holding
+    # the set until this component runs again.
+    retain_resident_layers: bool = False
 
 
 @dataclass(slots=True)
@@ -243,10 +249,18 @@ class ComponentResidencyManager:
         no declared ``ComponentUse`` would otherwise be accepted but never
         moved to the device before a forward pass.
         """
-        if not isinstance(self.server_args, ServerArgs):
+        if (
+            not isinstance(self.server_args, ServerArgs)
+            or not self.server_args.component_residency
+        ):
             return
 
-        declared_components = {use.component_name for use in self._ordered_uses}
+        # sequential multi-output execution runs subsets of the full pipeline
+        declared_components = {
+            use.component_name
+            for name, stage in self.pipeline._stage_name_mapping.items()
+            for use in stage.component_uses(self.server_args, name)
+        }
         unmanaged_components = sorted(
             component_name
             for component_name, module in self.pipeline.modules.items()
@@ -442,6 +456,14 @@ class ComponentResidencyManager:
         """Prepare a shared component and wait without making it the active use."""
         self._prepare_forward_use(use, module=module)
 
+    def finish_unused_component(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
+        """Release retained weights when conditioning reuse skips their use."""
+        if self._active_use is not None and self._same_use(self._active_use, use):
+            return
+        self._finish_use(use, module=module, keep_on_warmup=False, force=True)
+
     def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
         """Detach NVTX hooks before a component object is deleted or replaced."""
         if module is None:
@@ -617,7 +639,9 @@ class ComponentResidencyManager:
             return
         if not force:
             should_keep = (
-                keep_on_warmup and self.state.batch_is_warmup
+                keep_on_warmup
+                and self.state.batch_is_warmup
+                and self.server_args.explicit_residency_mode(use.component_name) is None
             ) or self._should_keep_after_use(use)
             if should_keep:
                 return
@@ -637,9 +661,15 @@ class ComponentResidencyManager:
                 module = self.get_module(component_name)
             if module is None:
                 continue
-            if self.state.batch_is_warmup and use.keep_ready_after_warmup:
+            # pipeline hints must not override an explicit placement policy
+            explicit_mode = self.server_args.explicit_residency_mode(component_name)
+            preferred = component_name in preferred_uses and explicit_mode is None
+            if (
+                self.state.batch_is_warmup
+                and use.keep_ready_after_warmup
+                and explicit_mode is None
+            ):
                 continue
-            preferred = component_name in preferred_uses
             if is_resident_layerwise_module(module):
                 preferred = False
             keep_single_dit = self._should_keep_single_dit(component_name, module)

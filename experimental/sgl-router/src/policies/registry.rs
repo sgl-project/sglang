@@ -34,7 +34,7 @@
 //!    — only the resolver has the cohort context to tell which is which.
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::workers::{Worker, WorkerRegistry};
+use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 use std::sync::Arc;
 
 /// Multiplier over the median decode-pool load above which a same-host
@@ -154,14 +154,23 @@ impl PdPoolResolver {
     /// Convenience for the prefill dispatch path. Returns the prefill
     /// pool for a PD model, or the full plain pool for a non-PD model.
     /// Errors when the relevant pool is empty.
+    ///
+    /// In PD mode the pool is limited to prefill workers whose version
+    /// group has a healthy decode worker, so a selected prefill always has
+    /// a peer in [`Self::decode_peers`]. When prefill workers exist but no
+    /// group has both roles, returns `NoDecodeWorkersAvailable`.
     pub fn prefill_candidates(&self, model: &ModelId) -> Result<Vec<Arc<Worker>>, PdResolveError> {
         match self.resolve(model)? {
             PdPools::Plain { workers } => Ok(workers),
-            PdPools::Pd { prefill, .. } => {
+            PdPools::Pd { prefill, decode } => {
                 if prefill.is_empty() {
-                    Err(PdResolveError::NoPrefillWorkersAvailable)
+                    return Err(PdResolveError::NoPrefillWorkersAvailable);
+                }
+                let paired = paired_prefills(prefill, &decode);
+                if paired.is_empty() {
+                    Err(PdResolveError::NoDecodeWorkersAvailable)
                 } else {
-                    Ok(prefill)
+                    Ok(paired)
                 }
             }
         }
@@ -179,6 +188,26 @@ impl PdPoolResolver {
                     Ok(decode)
                 }
             }
+        }
+    }
+
+    /// Decode workers that may receive `prefill`'s KV: the model's
+    /// healthy decode pool restricted to `prefill`'s version group.
+    /// Errors with `NoDecodeWorkersAvailable` when that group has none.
+    pub fn decode_peers(
+        &self,
+        model: &ModelId,
+        prefill: &Worker,
+    ) -> Result<Vec<Arc<Worker>>, PdResolveError> {
+        let peers: Vec<_> = self
+            .decode_candidates(model)?
+            .into_iter()
+            .filter(|w| w.version_group() == prefill.version_group())
+            .collect();
+        if peers.is_empty() {
+            Err(PdResolveError::NoDecodeWorkersAvailable)
+        } else {
+            Ok(peers)
         }
     }
 
@@ -211,7 +240,7 @@ impl PdPoolResolver {
 ///
 /// 1. **Same-host preference.** Parse the host portion of both URLs
 ///    (`url::Url::host_str`). If any candidate shares the host AND has
-///    a closed circuit breaker AND has `active_load <=
+///    a closed circuit breaker AND has `router_inflight_load <=
 ///    AFFINITY_LOAD_TOLERANCE × median(decode_pool_load)`, return it.
 /// 2. **Fallback: min-load among closed-breaker candidates.** No
 ///    same-host peer, or the same-host peer was filtered by rule 1's
@@ -257,7 +286,7 @@ pub fn select_decode_with_affinity(
     let load_tolerance = if healthy.is_empty() {
         0
     } else {
-        let mut loads: Vec<usize> = healthy.iter().map(|w| w.active_load()).collect();
+        let mut loads: Vec<usize> = healthy.iter().map(|w| w.router_inflight_load()).collect();
         loads.sort_unstable();
         let median = loads[loads.len() / 2];
         ((median as f64) * AFFINITY_LOAD_TOLERANCE).ceil() as usize
@@ -267,7 +296,7 @@ pub fn select_decode_with_affinity(
     if let Some(host) = prefill_host.as_deref() {
         let affinity_peer = healthy.iter().find(|w| {
             host_of(&w.url).as_deref() == Some(host)
-                && (load_tolerance == 0 || w.active_load() <= load_tolerance)
+                && (load_tolerance == 0 || w.router_inflight_load() <= load_tolerance)
         });
         if let Some(w) = affinity_peer {
             return Some(Arc::clone(w));
@@ -275,14 +304,17 @@ pub fn select_decode_with_affinity(
     }
 
     // Rule 2: min-load among healthy.
-    if let Some(w) = healthy.iter().min_by_key(|w| w.active_load()) {
+    if let Some(w) = healthy.iter().min_by_key(|w| w.router_inflight_load()) {
         return Some(Arc::clone(w));
     }
 
     // Rule 3: last-resort min-load over all candidates (every
     // breaker is open). The caller's dispatch will likely fail and
     // surface `BreakerOpen`, but the selection function stays total.
-    candidates.iter().min_by_key(|w| w.active_load()).cloned()
+    candidates
+        .iter()
+        .min_by_key(|w| w.router_inflight_load())
+        .cloned()
 }
 
 /// Parse the host portion of a worker URL. Returns `None` when the URL
@@ -307,7 +339,8 @@ mod tests {
             url: format!("http://{id}"),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
+            bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+            ..Default::default()
         }
     }
 
@@ -476,6 +509,49 @@ mod tests {
         }
     }
 
+    fn spec_in_group(id: &str, mode: WorkerMode, group: &str) -> WorkerSpec {
+        WorkerSpec {
+            version_group: Some(group.into()),
+            ..spec(id, mode, "m")
+        }
+    }
+
+    fn ids(workers: &[Arc<Worker>]) -> Vec<&str> {
+        let mut ids: Vec<_> = workers.iter().map(|w| w.id.0.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A prefill worker is offered only when its version group has a decode worker,
+    /// and it is paired only with decode workers from that group.
+    #[test]
+    fn pd_pairing_stays_within_version_group() {
+        let r = registry(&[
+            spec_in_group("p-v1", WorkerMode::Prefill, "v1"),
+            spec_in_group("p-v2", WorkerMode::Prefill, "v2"),
+            spec_in_group("p-v3", WorkerMode::Prefill, "v3"),
+            spec_in_group("d-v1a", WorkerMode::Decode, "v1"),
+            spec_in_group("d-v1b", WorkerMode::Decode, "v1"),
+            spec_in_group("d-v2", WorkerMode::Decode, "v2"),
+            spec("p-none", WorkerMode::Prefill, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(r);
+        let model = ModelId("m".into());
+
+        let prefill = resolver.prefill_candidates(&model).unwrap();
+        assert_eq!(ids(&prefill), ["p-v1", "p-v2"]);
+
+        let by_id = |id: &str| prefill.iter().find(|w| w.id.0 == id).unwrap();
+        assert_eq!(
+            ids(&resolver.decode_peers(&model, by_id("p-v1")).unwrap()),
+            ["d-v1a", "d-v1b"]
+        );
+        assert_eq!(
+            ids(&resolver.decode_peers(&model, by_id("p-v2")).unwrap()),
+            ["d-v2"]
+        );
+    }
+
     /// Plain-mode prefill_candidates returns the plain pool (non-PD
     /// shorthand: dispatch helpers Just Work for plain models).
     #[test]
@@ -498,7 +574,7 @@ mod tests {
             url: url.into(),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
+            ..Default::default()
         }
     }
 

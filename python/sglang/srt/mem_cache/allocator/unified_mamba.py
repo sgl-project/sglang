@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
+    install_move_gate,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -124,6 +125,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.min_slot_index,
             self.full_attn_allocator.available_size(),
             self.mamba_allocator.available_size(),
+        )
+
+        # HiCache indexes the full sub-pool's per-layer views with physical IDs.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc
         )
 
     # -- size: dynamic --
@@ -249,20 +255,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> physical TOKEN ids; `-1` passes through as
-        `-1` (padding downstream). ``out=`` supports cuda-graph buffer stability."""
+        """Full-pool virtual TOKEN ids -> physical TOKEN ids; an unmapped or
+        negative id lands on 0, the sink. ``out=`` supports cuda-graph buffer
+        stability."""
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
     @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
-
-    @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
-        build the MLA block table straight from req_to_token gather through this,
-        then scale by `kernel_page_multiplier` to reach the per-page block."""
+        build the MLA block table straight from req_to_token gather through this;
+        an entry is the physical page."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property
@@ -270,24 +273,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
 
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
-
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        """Widened virtual WRITE loc -> physical id; see the sub-allocator's copy."""
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
 
@@ -295,7 +289,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
-        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        The transfer registers page ENVELOPES and addresses them by PHYSICAL id (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`)."""
         # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
         # argument validation, so reaching it means a config path got past that.
@@ -306,15 +300,54 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
-    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Install the PD-disaggregation move gate on both sub-allocators."""
-        assert self.lazy_compaction, (
-            "PD disaggregation with the unified memory pool requires lazy "
-            "compaction (eager free-path compaction moves pages under "
-            "in-flight transfers)."
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Retraction backup for the FULL + mamba pair.
+
+        `Req.offload_kv_cache` hands over `req_to_token` rows, which hold
+        VIRTUAL ids here; both unified full pools index their host copy by
+        PHYSICAL ids. The mamba side is already slot-addressed and is
+        translated by the pool.
+        """
+        return self._kvcache.get_cpu_copy(
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
         )
-        self.full_attn_allocator.disagg_move_gate = gate
-        self.mamba_allocator.disagg_move_gate = gate
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu,
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
+    def _move_gate_targets(self):
+        """Every member a compaction gate must cover. The mamba end is gated
+        even where its state is not itself transferred: the gate is about the
+        MOVER, and the two ends compact as peers."""
+        return (self.full_attn_allocator, self.mamba_allocator)
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="disagg_move_gate",
+            gate=gate,
+            feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
+            lazy_compaction=self.lazy_compaction,
+        )
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)

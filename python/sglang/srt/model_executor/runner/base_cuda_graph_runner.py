@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
@@ -131,6 +131,27 @@ class BaseCudaGraphRunner(BaseRunner):
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
+
+    def cuda_graph_output_rows(self, output: Any) -> Optional[int]:
+        """Rows of graph output that must be preserved for post-replay work.
+
+        The default graph key is a request count, which is also the output row
+        count for ordinary decode. A graph that returns per-token hidden states
+        for an eager tail can instead produce ``requests * tokens_per_request``
+        rows. Such a runner must return that actual row count here. ``None``
+        keeps the backend's default request-count behavior.
+        """
+        return None
+
+    def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
+        """Capacity required by the output buffer shared across graph keys.
+
+        The breakable backend allocates this buffer once, while capturing its
+        first shape. A runner whose output uses token rows rather than request
+        rows must return the largest possible output here so later graph shapes
+        fit. ``None`` uses the current graph key as the capacity.
+        """
+        return None
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

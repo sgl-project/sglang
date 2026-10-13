@@ -10,6 +10,10 @@ VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
 
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
+RID_RELEASE_SETTLE_STEPS: int = 40
+
+DRAIN_RELEASE_STEPS: int = 12
+
 
 def base_engine_kwargs(
     *,
@@ -38,6 +42,24 @@ def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
+
+
+def run_until_finished_then_settle(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
+    yield from run_until_finished(handle, max_steps=max_steps)
+    for _ in range(RID_RELEASE_SETTLE_STEPS):
+        yield
+
+
+def drain_until_released(t, *handles, max_steps: int = DRAIN_RELEASE_STEPS):
+    for _ in range(max_steps):
+        if all(
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.kv.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):

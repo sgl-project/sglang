@@ -8,15 +8,15 @@ use crate::policies::admission::{
     compare_decode_pressure, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
     RoutingStage,
 };
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct DecodeSelectionContext<'a> {
-    load_snapshot: Option<&'a EngineLoadSnapshot>,
+    load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_url: Option<&'a str>,
 }
 
@@ -29,12 +29,12 @@ impl<'a> DecodeSelectionContext<'a> {
     }
 
     /// Engine load snapshot captured at request ingress.
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineReportedLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
 
-    pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&EngineReportedLoadSnapshot> {
         self.load_snapshot
     }
 
@@ -62,7 +62,7 @@ pub fn resolve_decode_with_capacity_fallback(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
-    snapshot: &EngineLoadSnapshot,
+    snapshot: &EngineReportedLoadSnapshot,
 ) -> Option<FinalDecision> {
     if let Some(decision) = resolve_decode(domain, proposal, request_kv_tokens, snapshot) {
         return Some(decision);

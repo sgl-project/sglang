@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
@@ -11,6 +12,7 @@ from transformers import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
 from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -198,6 +200,15 @@ class CLIPAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=parallel.attn_tp_rank,
             tp_size=parallel.attn_tp_size,
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=parallel.attn_tp_size,
+            reduces_over_attn_tp=False,
+            multimodal_encoder=True,
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
@@ -580,7 +591,7 @@ class CLIPModel(nn.Module):
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 

@@ -214,6 +214,17 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # pop HTTP-layer params that aren't SamplingParams fields
     output_quality = kwargs.pop("output_quality", None)
+    request_data_type = kwargs.pop("request_data_type", None)
+    if request_data_type is not None:
+        try:
+            kwargs["task_type"] = server_args.pipeline_config.resolve_task_type(
+                kwargs.get("task_type"),
+                data_type=request_data_type,
+                has_image=bool(kwargs.get("image_path")),
+                has_video=bool(kwargs.get("video_path")),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     has_explicit_compression = kwargs.get("output_compression") is not None
 
@@ -240,12 +251,15 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     kwargs.setdefault("save_output", True)
 
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        request_id=request_id,
-        **kwargs,
-    )
+    try:
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            model_path=server_args.model_path,
+            server_args=server_args,
+            request_id=request_id,
+            **kwargs,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # resolve output_quality → output_compression with the correct data_type.
     # SamplingParams.__post_init__ may have resolved with the wrong data_type

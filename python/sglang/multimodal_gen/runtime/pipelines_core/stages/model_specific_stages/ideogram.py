@@ -117,6 +117,7 @@ class Ideogram4Scheduler:
 
 
 class Ideogram4TextEncodingStage(TextEncodingStage):
+    deduplicated_output_fields = ("prompt_embeds", "prompt_embeds_mask")
     deduplicated_extra_tensor_tree_output_keys = ("ideogram4",)
 
     def __init__(self, text_encoder, tokenizer) -> None:

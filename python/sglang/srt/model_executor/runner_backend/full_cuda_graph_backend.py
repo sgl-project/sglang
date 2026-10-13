@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -91,7 +92,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
@@ -167,6 +168,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = partial(
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # replays read capture-time state from the pool, so a pause must back it up
+                enable_cpu_backup=True,
             )
         else:
             graph_ctx = self._device_module.graph
@@ -209,6 +212,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        for graph in self._graphs.values():
+            graph.reset()
         self._graphs.clear()
         self._outputs.clear()
         self._output_buffer = None

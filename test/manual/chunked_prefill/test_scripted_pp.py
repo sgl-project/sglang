@@ -7,6 +7,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_released,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -28,16 +29,6 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
     return (prompt_len + chunk_size - 1) // chunk_size
 
 
-def _drain_until_released(t, *handles):
-    for _ in range(16):
-        if all(
-            h.kv_pages == 0 and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
-
-
 class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
@@ -49,7 +40,7 @@ class TestPPBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r, max_steps=16)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 

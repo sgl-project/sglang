@@ -24,7 +24,7 @@ The recovery must succeed rather than decline: the TreeCore insert walk counts
 the node in `prefix_len` regardless of component consumption, while the SWA
 match validator rejects a `value is None` node, so a declined recovery reports
 a prefix `match_prefix` cannot honor and trips
-`new_prefix_len <= len(new_indices)` in `cache_unfinished_req`.
+`new_prefix_len <= len(new_indices)` in `checkpoint`.
 """
 
 import unittest
@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import RecoverSWAWithLockedFull
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 

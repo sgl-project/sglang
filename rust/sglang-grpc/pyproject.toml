@@ -1,8 +1,9 @@
 # Standalone dev builds only (`maturin build` / `maturin develop`); the
 # extension ships to users inside the main sglang wheel via setuptools-rust
-# (python/pyproject.toml, target sglang.srt.rust_extensions._grpc). Requires a
-# repo checkout (build.rs reads ../../proto), so this is not publishable as an
-# sdist. protoc is not required: build.rs falls back to a vendored binary.
+# (python/pyproject.toml, target sglang.srt.rust_extensions._grpc). Its shared
+# protocol dependency lives in ../../proto, so standalone builds require a
+# repository checkout. A system protoc is unnecessary; that crate uses a
+# vendored binary.
 [build-system]
 requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"

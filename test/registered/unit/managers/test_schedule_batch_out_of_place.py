@@ -132,7 +132,7 @@ class _FakeReq:
         self.full_untruncated_fill_ids = list(range(origin_len + output_len))
         self.extend_range = None
 
-    def _refresh_fill_ids(self):
+    def refresh_fill_ids(self):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
     @property

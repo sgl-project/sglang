@@ -39,7 +39,7 @@ def create_flashinfer_kv_indices_triton(
     ``ENTRY_PAGE_SIZE == 1`` (default): the source table is token-granular and
     entries are emitted verbatim -- byte-identical to the historical kernel.
     ``ENTRY_PAGE_SIZE == ps``: the source is the translator's PAGE-granular
-    read table (entries already kernel-facing page ids); token ids are rebuilt
+    read table (entries already physical page ids); token ids are rebuilt
     as ``token = entry * ps + pos % ps``, exact because converting an id keeps
     its offset inside the page.
     ``TOKEN_BLOCK_PARALLEL`` (default False): launched on a 2D grid

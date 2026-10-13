@@ -108,7 +108,6 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,

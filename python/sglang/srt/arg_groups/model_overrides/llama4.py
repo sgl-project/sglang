@@ -1,7 +1,4 @@
-"""Config-time override declarations for llama4.
-
-Architectures: Llama4ForCausalLM, Llama4ForConditionalGeneration.
-"""
+"""Config-time override declarations for llama4."""
 
 import logging
 from typing import Any, Dict

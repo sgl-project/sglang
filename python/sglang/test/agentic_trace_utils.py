@@ -83,6 +83,11 @@ DEFAULT_MIN_DELTA_TOKENS = 32
 # for the rest of the trajectory.
 DEFAULT_CONTEXT_RESET_RATIO = 0.10
 
+# Part of the cache key of a converted trace. Converted traces persist on the
+# runners' /sgl-data mount, so bump this whenever a change to the conversion
+# would produce a different document from the same inputs.
+TRACE_FORMAT_VERSION = 1
+
 _DOWNLOAD_TIMEOUT = 60
 _DOWNLOAD_CHUNK_SIZE = 1 << 20
 
@@ -424,6 +429,9 @@ def ensure_agentic_trace_file(
     fingerprint = hashlib.sha256(
         json.dumps(
             {
+                "format_version": TRACE_FORMAT_VERSION,
+                "min_delta_tokens": DEFAULT_MIN_DELTA_TOKENS,
+                "context_reset_ratio": DEFAULT_CONTEXT_RESET_RATIO,
                 "source": source,
                 "tokenizer": getattr(tokenizer, "name_or_path", str(type(tokenizer))),
                 "num_conversations": num_conversations,
@@ -457,8 +465,20 @@ def ensure_agentic_trace_file(
         source=source,
     )
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(document, f)
-    with open(stats_path, "w", encoding="utf-8") as f:
-        json.dump(stats.__dict__, f)
+    # Matrix points with the same workload share a cache file and may run at the
+    # same time on runners that share /sgl-data, so publish each file with an
+    # atomic rename; the stats file goes last because it marks a cache hit.
+    _write_json_atomic(path, document)
+    _write_json_atomic(stats_path, stats.__dict__)
     return path, stats
+
+
+def _write_json_atomic(path: str, payload: Any):
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)

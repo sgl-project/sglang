@@ -66,8 +66,8 @@ class TestZeroMatchResult(unittest.TestCase):
 
     def test_chunk_cache_is_passthrough(self):
         class _StubChunkCache:
-            def is_chunk_cache(self) -> bool:
-                return True
+            def supports_prefix_sharing(self) -> bool:
+                return False
 
         original = MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64),

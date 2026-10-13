@@ -1,6 +1,7 @@
 import unittest
 from typing import Optional
 
+from sglang.srt.utils import is_cuda, is_flashinfer_available, is_hip
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -755,6 +756,7 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
 DETERMINISTIC_ALIGN_SIZE = 4096
 
 
+@unittest.skipUnless(is_flashinfer_available(), "flashinfer is NVIDIA-only")
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DETERMINISTIC_ALIGN_SIZE,
@@ -791,6 +793,7 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         assert saw_chunking, "test must observe the req mid-chunk at least once"
 
 
+@unittest.skipUnless(is_cuda() or is_hip(), "MHA host-pool movers are CUDA/ROCm only")
 class TestSpecialCaseHiCache(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,

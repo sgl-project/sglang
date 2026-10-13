@@ -40,7 +40,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -48,6 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
 from sglang.srt.models.llama_eagle import LlamaForCausalLMEagle
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -65,10 +66,10 @@ class MistralEagleModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        assert get_pp_group().world_size == 1, (
+        assert get_parallel().pp_group.world_size == 1, (
             "MistralForCausalLMEagle currently does not support pipeline parallelism"
         )
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -120,12 +121,11 @@ class MistralEagleModel(nn.Module):
             )
         )
 
-        residual = None
+        residual_batch.start(forward_batch)
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
-        return hidden_states + residual
+            hidden_states = layer(positions, hidden_states, forward_batch)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return residual_batch.take_output(hidden_states, forward_batch)
 
 
 class MistralForCausalLMEagle(LlamaForCausalLMEagle):

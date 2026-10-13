@@ -33,8 +33,8 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
         self.assertEqual(tracker.observe_attempt(10), 10)
 
         delayer = MagicMock()
-        delayer.enable_dp_attention = True
-        delayer.dp_size = 1
+        delayer.attn_dp_enabled = True
+        delayer.num_dp_ranks = 1
         delayer._metrics_collector = None
         delayer._debug_log_enabled = False
         delayer._negotiate_should_allow_prefill.return_value = _NegotiateOutput(
@@ -72,8 +72,8 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
                 self.assertEqual(tracker.observe_attempt(100), 100)
 
                 delayer = MagicMock()
-                delayer.enable_dp_attention = True
-                delayer.dp_size = 1
+                delayer.attn_dp_enabled = True
+                delayer.num_dp_ranks = 1
                 delayer._metrics_collector = None
                 delayer._debug_log_enabled = False
                 delayer._negotiate_should_allow_prefill.return_value = _NegotiateOutput(

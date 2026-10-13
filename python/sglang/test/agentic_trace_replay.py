@@ -134,6 +134,10 @@ def _request_input(
     # for them, which is the same opt-in ``bench_serving`` sends; without it
     # every turn comes back with zero cached tokens.
     extra_request_body = {"return_cached_tokens_details": True} if cache_report else {}
+    # A streamed response carries its usage block only when asked for, and that
+    # block is where the request function takes the server's own prompt length
+    # from; without it every turn reports the planned length instead.
+    extra_request_body["stream_options"] = {"include_usage": True}
     return RequestFuncInput(
         prompt=list(history),
         api_url=api_url,
@@ -252,7 +256,9 @@ async def _replay_all(
 def _server_accept_length(base_url: str) -> Optional[float]:
     """Speculative accept length, the way ``bench_serving`` reads it."""
     try:
-        response = requests.get(base_url + "/server_info", headers=get_auth_headers())
+        response = requests.get(
+            base_url + "/server_info", headers=get_auth_headers(), timeout=30
+        )
         if response.status_code != 200:
             return None
         server_info = response.json()
@@ -388,7 +394,8 @@ def run_agentic_replay(
     )
 
     # calculate_metrics only counts input tokens for single-turn rows, so the
-    # prompt side is summed here from the turns that actually completed.
+    # prompt side is summed here from the turns that actually completed, using
+    # the prompt length each turn's server usage block reported.
     completed_turns = [output for output in outputs if output.success]
     total_input_tokens = sum(output.prompt_len for output in completed_turns)
 

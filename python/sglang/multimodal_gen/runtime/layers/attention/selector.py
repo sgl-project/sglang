@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/attention/selector.py
 
-import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -23,47 +22,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-STR_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
-
-
-def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
-    """
-    Convert a string backend name to a _Backend enum value.
-
-    Returns:
-    * _Backend: enum value if backend_name is a valid in-tree type
-    * None: otherwise it's an invalid in-tree type or an out-of-tree platform is
-            loaded.
-    """
-    assert backend_name is not None
-    return (
-        AttentionBackendEnum[backend_name]
-        if backend_name in AttentionBackendEnum.__members__
-        else None
-    )
-
-
-def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
-    """
-    Get the backend override specified by the sglang-diffusion attention
-    backend environment variable, if one is specified.
-
-    Returns:
-
-    * _Backend enum value if an override is specified
-    * None otherwise
-    """
-    backend_name = os.environ.get(STR_BACKEND_ENV_VAR)
-    return None if backend_name is None else backend_name_to_enum(backend_name)
-
-
 # Global state allows a particular choice of backend
 # to be forced, overriding the logic which auto-selects
 # a backend based on system & workload configuration
 # (default behavior if this variable is None)
-#
-# THIS SELECTION TAKES PRECEDENCE OVER THE
-# FASTVIDEO ATTENTION BACKEND ENVIRONMENT VARIABLE
 forced_attn_backend: AttentionBackendEnum | None = None
 
 
@@ -148,13 +110,6 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
         # unrestricted selection must not be hidden by a later valid fallback
         context.selected_backends[backend_name] = None
     return True
-
-
-def record_component_attn_backend(
-    backend: AttentionBackendEnum, reason: str | None = None
-) -> bool:
-    """Record a component backend selected outside layer construction."""
-    return _record_component_attn_backend(backend.name.lower(), reason)
 
 
 def _log_component_attn_backend_summary(

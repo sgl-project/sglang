@@ -54,8 +54,8 @@ class _FakeTreeCache:
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
 
-    def is_chunk_cache(self):
-        return True
+    def supports_prefix_sharing(self):
+        return False
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):

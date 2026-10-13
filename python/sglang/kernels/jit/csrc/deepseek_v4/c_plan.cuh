@@ -107,20 +107,6 @@ struct DecodeParamsLegacy {
 
 inline constexpr uint32_t kMaxPrefillBatchSize = 1024;
 
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-#ifndef USE_ROCM
-    uint32_t n = __shfl_up_sync(device::kFullMask, val, offset);
-#else
-    uint32_t n = __shfl_up(val, offset, 32);
-#endif
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
 __global__ __launch_bounds__(1024, 1)  //
     void plan_compress_prefill_kernel0(const Prefill0Params params) {
   using namespace device;
@@ -505,10 +491,12 @@ inline PrefillPlan plan_compress_prefill(
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  // ragged_id is a zero-based uint16 index, so a 64K-token batch is valid.
+  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1;
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
   RuntimeCheck(!use_req_ring || compress_ratio == 4);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  // Keep batch_id below 65535: pack_w(65535, 65535, ...) is the invalid sentinel.
+  RuntimeCheck(batch_size < kMaxTokens && batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
   // Write pad: trailing tokens kept resident so a verify batch's committed tail survives
@@ -750,9 +738,9 @@ inline PrefillPlan plan_compress_prefill_legacy(
 
   const auto window_size = compress_ratio * (is_overlap ? 2 : 1);
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1;
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(batch_size < kMaxTokens && batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
 
   uint32_t counter = 0;
   uint32_t counter_c = 0;
