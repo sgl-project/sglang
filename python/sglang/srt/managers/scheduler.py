@@ -68,6 +68,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -384,6 +385,9 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+# Must match CHUNK_SIZE in sglang/kernels/ops/attention/fla/chunk.py.
+_GDN_PREFILL_BLOCK_TOKENS = 64
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1693,6 +1697,12 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        if hybrid_gdn_config(self.model_config) is not None:
+            # Gated DeltaNet prefill sums each chunk in blocks counted from the chunk
+            # start, so a split off this grid changes the result.
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size or 1, _GDN_PREFILL_BLOCK_TOKENS
+            )
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
