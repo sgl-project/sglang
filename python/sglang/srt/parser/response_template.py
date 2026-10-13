@@ -807,7 +807,6 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         return None
 
     def calls_complete(self, text: str) -> bool:
-        """Whether each call in finished `text` closes and parses, with no stray text."""
         field = self._template.fields[_TOOL_FIELD]
         tag = None
         if field.content == "xml-inline":

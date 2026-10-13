@@ -12,6 +12,8 @@
     {%- endif -%}
 {%- endmacro -%}
 
+{#- Property defaults render enum strings bare. Generic `oneOf` variants pass
+   false because the reference renderer quotes them in that path. #}
 {%- macro render_default(schema, bare_enum_string=true) -%}
     {%- set is_enum = schema.get("enum") is sequence and schema.get("enum") is not string and schema.get("enum") -%}
     {%- if schema.default is string and (not is_enum or not bare_enum_string) -%}
@@ -23,6 +25,8 @@
     {%- endif -%}
 {%- endmacro -%}
 
+{#- The reference renderer checks the complete rendered text for `null`, so
+   this intentionally does the same rather than inspecting schema members. #}
 {%- macro render_nullable_type(schema, indent) -%}
     {%- set rendered = json_schema_to_typescript(schema, indent) -%}
     {{- rendered -}}

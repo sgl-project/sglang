@@ -73,21 +73,12 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        config = {
-            "tool_call_parser": None,
-            "reasoning_parser": None,
-            "grammar_backend": "xgrammar",
-            "enable_cache_report": False,
-            "incremental_streaming_output": False,
-        }
         tm = Mock()
-        tm.tokenizer, tm.processor, tm.served_model_name = _tokenizer(), None, "test"
+        tm.tokenizer, tm.processor = _tokenizer(), None
         tm.model_config = Mock(is_multimodal=multimodal, context_len=4096)
         tm.model_config.get_default_sampling_params.return_value = {}
         tm.model_config.hf_config = Mock(architectures=["LlamaForCausalLM"])
-        tm.model_config.hf_config.to_dict.return_value = {}
-        tm.config_value.side_effect = config.__getitem__
-        tm.server_args = Mock(**config)
+        tm.config_value.return_value = None
         templates = TemplateManager()
         templates.initialize_templates(
             tm, model_path="test-model", chat_template=chat_template
@@ -107,7 +98,9 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         for multimodal in (False, True):
             serving = self._serving(multimodal=multimodal)
             for (prompt, special), text in expected.items():
-                body = {"messages": HISTORY, "add_generation_prompt": prompt}
+                body = {"messages": HISTORY}
+                if prompt is not None:
+                    body["add_generation_prompt"] = prompt
                 if special is not None:
                     body["add_special_tokens"] = special
                 with self.subTest(
