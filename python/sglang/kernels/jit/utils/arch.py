@@ -19,6 +19,7 @@ from sglang.kernels.jit.utils.common import (
     is_musa_runtime,
     is_sail_runtime,
 )
+from sglang.srt.utils.common import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +194,6 @@ def is_arch_support_pdl() -> bool:
 
 
 def get_activation_cuda_cflags() -> list[str]:
-    """Match the AOT activation fast-math policy without changing other kernels."""
-    # Blackwell needs precise expf; HIP clang rejects --use_fast_math.
-    if is_hip_runtime() or get_jit_cuda_arch().major >= 10:
-        return []
-    return ["--use_fast_math"]
+    if is_cuda():
+        return ["--use_fast_math"]
+    return []
