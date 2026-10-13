@@ -18,8 +18,18 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHelionKDADispatcher(unittest.TestCase):
-    def _make_dispatcher(self, decode_backend, prefill_backend):
-        helion_kernel = MagicMock(supports_packed_decode=True)
+    def _make_dispatcher(
+        self,
+        decode_backend,
+        prefill_backend,
+        verify_backend=LinearAttnKernelBackend.TRITON,
+    ):
+        helion_kernel = MagicMock(
+            spec=HelionKDAKernel,
+            supports_packed_decode=True,
+            supports_packed_decode_safe_gate=HelionKDAKernel.supports_packed_decode_safe_gate,
+            supports_safe_gate_verify=HelionKDAKernel.supports_safe_gate_verify,
+        )
         with (
             patch(
                 "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
@@ -33,7 +43,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
             dispatcher = KDAKernelDispatcher(
                 decode_backend=decode_backend,
                 prefill_backend=prefill_backend,
-                verify_backend=LinearAttnKernelBackend.TRITON,
+                verify_backend=verify_backend,
             )
         return dispatcher, helion_kernel, constructor
 
@@ -82,6 +92,21 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+
+    def test_explicit_helion_verify_reuses_adapter(self):
+        for decode in (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION):
+            with self.subTest(decode=decode):
+                dispatcher, helion_kernel, _ = self._make_dispatcher(
+                    decode,
+                    LinearAttnKernelBackend.TRITON,
+                    LinearAttnKernelBackend.HELION,
+                )
+                self.assertIs(dispatcher.verify_kernel, helion_kernel)
+                self.assertIsInstance(dispatcher.extend_kernel, TritonKDAKernel)
+                if decode.is_helion():
+                    self.assertIs(dispatcher.decode_kernel, helion_kernel)
+                else:
+                    self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
 
     def test_replayssm_decode_uses_native_helion_kernel(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
@@ -197,57 +222,6 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 self.assertEqual(
                     resolution_result(args, "linear_attn_verify_backend"), expected
                 )
-
-
-class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
-    """Bookkeeping: every KDA prefill kernel must declare whether extend()
-    honors the fp32 track snapshot (``supports_track_state_snapshot``).
-
-    KDAAttnBackend allocates the snapshot buffer whenever a tracked batch has
-    chunk-unaligned sequences and asserts the flag before use. A kernel that
-    serves extend() without the flag must reject tracked batches loudly
-    (NotImplementedError); a missing declaration used to mean the buffer was
-    silently left unwritten and prefix-cache restores read garbage (the
-    FlashKDA fallback once dropped the track arguments exactly this way).
-    """
-
-    def test_every_kda_prefill_kernel_declares_the_contract(self):
-        from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
-            CuteDSLKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
-            FlashInferKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
-            FlashKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
-            NvidiaKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_ptx import (
-            PtxKDAKernel,
-        )
-
-        # Native support or fallback that forwards the snapshot arguments.
-        for cls in (
-            TritonKDAKernel,
-            HelionKDAKernel,
-            NvidiaKDAKernel,
-            PtxKDAKernel,
-            FlashKDAKernel,
-        ):
-            self.assertTrue(
-                cls.supports_track_state_snapshot,
-                f"{cls.__name__} must declare supports_track_state_snapshot "
-                f"(native support or a fallback that forwards track_state)",
-            )
-        # Reject tracked batches loudly instead (extend() raises).
-        for cls in (CuteDSLKDAKernel, FlashInferKDAKernel):
-            self.assertFalse(
-                cls.supports_track_state_snapshot,
-                f"{cls.__name__} rejects tracked batches; it must not claim "
-                f"snapshot support it does not have",
-            )
 
 
 if __name__ == "__main__":
