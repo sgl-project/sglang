@@ -119,6 +119,8 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
 class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     mega: Any
     mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
+    # Same weights and kernel config as ``mega``, on a smaller decode workspace.
+    mega_decode: Any = None
     fc1_alpha: torch.Tensor | None = None
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
@@ -160,6 +162,44 @@ def _resolve_max_tokens_per_rank() -> int:
 
     derived = cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
+
+
+def _resolve_decode_max_tokens_per_rank(max_tokens_per_rank: int) -> int:
+    """Capacity of the optional decode-only workspace; 0 means none."""
+    configured = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
+    if configured <= 0 or configured >= max_tokens_per_rank:
+        return 0
+    return configured
+
+
+def _select_mega_for_forward(quant_info: FlashInferMegaMoeQuantInfo) -> Any:
+    """Pick the decode workspace only when every EP rank's batch fits in it.
+
+    MegaMOE is a lockstep collective, so the choice reads only DP-synchronized
+    state. The token bound also catches prefill-sized forwards that publish
+    extend=False, such as the startup autotune EXTEND dummy pass.
+    """
+    mega_decode = quant_info.mega_decode
+    if mega_decode is None:
+        return quant_info.mega
+
+    from sglang.srt.layers.dp_attention import (
+        get_dp_global_num_tokens,
+        get_is_extend_in_batch,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_is_extend_in_batch():
+        return quant_info.mega
+    global_num_tokens = get_dp_global_num_tokens()
+    # A singleton list under DP holds only this rank's count; it cannot agree.
+    if not global_num_tokens or (
+        len(global_num_tokens) == 1 and get_parallel().dp_size > 1
+    ):
+        return quant_info.mega
+    if max(global_num_tokens) > mega_decode._fleet_params.max_tokens_per_rank:
+        return quant_info.mega
+    return mega_decode
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -241,6 +281,7 @@ def _bind_transformed_weights(
 
 def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
+    layer._flashinfer_megamoe_decode_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
 
@@ -286,36 +327,47 @@ def _ensure_flashinfer_megamoe_layer(
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
+    decode_max_tokens_per_rank = _resolve_decode_max_tokens_per_rank(
+        max_tokens_per_rank
+    )
     logger.debug(
         "FlashInfer MegaMOE layer[%s] build: megakernel_config=%s "
-        "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, hidden_size=%d)",
+        "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, "
+        "decode_max_tokens_per_rank=%d, hidden_size=%d)",
         layer.layer_id,
         _format_megakernel_config(megakernel_config),
         world_size,
         layer.num_experts,
         max_tokens_per_rank,
+        decode_max_tokens_per_rank,
         layer.hidden_size,
     )
 
-    mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(
-            world_size=world_size, rank=rank, device=torch.cuda.current_device()
-        ),
-        fleet_params=FleetParams(
-            num_experts=layer.num_experts,
-            max_tokens_per_rank=max_tokens_per_rank,
-            token_hidden_size=layer.hidden_size,
-        ),
-        # weights already preprocessed in prepare_*; with transformed_weights set
-        # the kernel never reads `weights` (see MoEEpMegaLayer), so pass None.
-        weights=None,
-        backend=MegaConfig(
-            megakernel=megakernel_config,
-            preprocess_weights=False,
-            transformed_weights=transformed_weights,
-        ),
-    )
+    def build(capacity: int) -> Any:
+        return MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(
+                world_size=world_size, rank=rank, device=torch.cuda.current_device()
+            ),
+            fleet_params=FleetParams(
+                num_experts=layer.num_experts,
+                max_tokens_per_rank=capacity,
+                token_hidden_size=layer.hidden_size,
+            ),
+            # weights already preprocessed in prepare_*; with transformed_weights set
+            # the kernel never reads `weights` (see MoEEpMegaLayer), so pass None.
+            weights=None,
+            backend=MegaConfig(
+                megakernel=megakernel_config,
+                preprocess_weights=False,
+                # Held by reference, so a second layer object adds no weight copy.
+                transformed_weights=transformed_weights,
+            ),
+        )
+
+    mega = build(max_tokens_per_rank)
     layer._flashinfer_megamoe_layer = mega
+    if decode_max_tokens_per_rank > 0:
+        layer._flashinfer_megamoe_decode_layer = build(decode_max_tokens_per_rank)
     layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
@@ -609,7 +661,7 @@ def run_flashinfer_megamoe(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
-    mega = quant_info.mega
+    mega = _select_mega_for_forward(quant_info)
     _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
