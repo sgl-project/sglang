@@ -15,22 +15,12 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.decode_stage import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.stages import (
     Kandinsky6SRDecodeStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.denoising_stage import (
     Kandinsky6SRDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.encode_stage import (
     Kandinsky6SREncodeStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.input_stage import (
     Kandinsky6SRInputStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.latent_prep_stage import (
     Kandinsky6SRLatentPrepStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.output_stage import (
     Kandinsky6SROutputStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

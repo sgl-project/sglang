@@ -21,6 +21,8 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -79,6 +81,66 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_prefill_conv_table_covers_only_nonempty_chunks(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.device = "cpu"
+        backend.mis_metadata = None
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 65, 66, 66, 67, 68, 69, 70, 71]),
+            mamba_cache_indices=torch.arange(8),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            tbo_parent_token_range=None,
+            extend_seq_lens_cpu=[65, 1, 0, 1, 1, 1, 1, 1],
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=True),
+            patch.object(gdn_backend, "is_pin_memory_available", return_value=False),
+        ):
+            backend._init_prefill_conv_block_table(batch)
+        torch.testing.assert_close(
+            backend.forward_metadata.conv_block_table,
+            torch.tensor(
+                [[0, i] for i in range(9)] + [[i, 0] for i in (1, 3, 4, 5, 6, 7)],
+                dtype=torch.int32,
+            ),
+        )
+
+    def test_prefill_conv_table_falls_back_and_clears_previous_batch(self):
+        cases = (
+            ("uniform", {"extend_seq_lens_cpu": [7, 8]}, {}),
+            ("mildly_ragged", {}, {}),
+            ("no_cpu_lengths", {"extend_seq_lens_cpu": None}, {}),
+            ("different_batch", {"extend_seq_lens_cpu": [17, 1, 1]}, {}),
+            ("tbo", {"tbo_parent_token_range": (0, 18)}, {}),
+            ("decode", {"forward_mode": ForwardMode.DECODE}, {}),
+            ("verify", {"forward_mode": ForwardMode.TARGET_VERIFY}, {}),
+            ("multi_item_scoring", {}, {"mis_metadata": sentinel.metadata}),
+            ("non_cuda", {}, {"cuda": False}),
+        )
+        for name, batch_fields, options in cases:
+            with self.subTest(name=name):
+                backend = object.__new__(GDNAttnBackend)
+                backend.device = "cpu"
+                backend.mis_metadata = options.get("mis_metadata")
+                backend.forward_metadata = ForwardMetadata(
+                    query_start_loc=torch.tensor([0, 17, 18]),
+                    mamba_cache_indices=torch.arange(2),
+                    conv_block_table=sentinel.previous_batch,
+                )
+                fields = dict(
+                    forward_mode=ForwardMode.EXTEND,
+                    tbo_parent_token_range=None,
+                    extend_seq_lens_cpu=[17, 1],
+                )
+                fields.update(batch_fields)
+                with patch.object(
+                    gdn_backend, "is_cuda", return_value=options.get("cuda", True)
+                ):
+                    backend._init_prefill_conv_block_table(SimpleNamespace(**fields))
+                self.assertIsNone(backend.forward_metadata.conv_block_table)
+
     @staticmethod
     def make_target_verify_routing_backend():
         backend = object.__new__(GDNAttnBackend)
