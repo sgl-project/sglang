@@ -1,8 +1,9 @@
 # DSV4.1 PDMux upstream performance ports
 
-These ports target H100/SM90, TP8/DP8/EP8, DSPARK, HiCache, `dsv4` attention
+These ports target H100/H20-3e (SM90), TP8/DP8/EP8, DSPARK, HiCache, `dsv4` attention
 and `flashinfer_mxfp4` MoE. They retain the existing PDMux lane submission and
-communication order. New SM90 paths are opt-in pending GPU acceptance.
+communication order. The first three kernel ports are opt-in; the #41098
+GEMM tuning tables are selected automatically for matching H20-3e shapes.
 
 ## PR #42365: fused prefill indexer scoring
 
@@ -92,8 +93,92 @@ Tests include request/tail coordinate mapping, empty candidates, causal holes,
 changed-input CUDA graph replay, independent streams sharing a read-only cache,
 and the existing dense path. Full-model PDMux GPU validation is still required.
 
-To enable all three ports, set all three environment variables above to `1`
-before the unchanged serve command. All default to `0` on this branch.
+These three environment variables default to `0`. For the user's H20-3e
+workload, keep #42365 + #40860 enabled and #41294 disabled when evaluating
+#41098: the reported total-throughput gain was 21.1% for that pair, whereas
+enabling all three regressed 18.0% relative to the original baseline.
+
+## PR #41098: H20-3e block-FP8 GEMM tuning tables
+
+Source: [sgl-project/sglang#41098](https://github.com/sgl-project/sglang/pull/41098),
+head `c6bf06b645c58582ac52d8bf314e3e6ca60c6120`.
+
+Adds six byte-identical upstream JSON files under
+`python/sglang/kernels/ops/gemm/configs/`. Upstream used the old
+`kernels/ops/quantization/configs/` directory; the current branch's
+`get_w8a8_block_fp8_configs` reads from `gemm/configs/`, so applying the old
+paths unchanged would silently leave the default configuration active.
+
+The files cover `(N, K)` = `(1792, 5120)`, `(25600, 6144)`, `(4096, 1280)`,
+`(5120, 1024)`, `(5120, 288)` and `(576, 5120)`, all with quantization block
+`[32, 32]`. Each file contains 14 token-count entries, from M=1 to M=8192;
+the existing runtime picks the nearest M. These are GEMM tile choices, not
+DSPARK step sizes or CUDA Graph batch-size tiers.
+
+### What the optimization changes
+
+For `A[M, K] @ B[N, K].T`, M is the number of token rows processed by that
+individual GEMM, not the full conversation length. A 130k cached conversation
+can therefore still execute small-M decode/verify GEMMs. DP8 also distributes
+requests across ranks, so global concurrency is not the local M.
+
+The default kernel uses one generic tile layout. These tables choose tile
+sizes, pipeline stages and existing Hopper options separately for each shape
+and token count:
+
+- `SWAP_AB` computes the transposed product and transposes the result back.
+  This changes the internal tensor-core tile orientation for small-M work.
+- `SPLIT_K` lets multiple GPU programs compute different parts of the K sum,
+  then reduces their FP32 partial results. This can expose more parallel work
+  when the output has too few tiles to occupy the GPU, at the cost of scratch
+  memory and an extra reduction kernel.
+
+The branch already implements both options. Scratch is allocated per call on
+the calling stream; the port only adds tuning data. The tables were not tuned
+for the user's 62-SM prefill stream competing with full-device decode, so
+their end-to-end effect still needs measurement with PDMux running.
+
+### Activation and verification
+
+No new serve argument or environment variable is required. Install this
+revision and restart the server to reload configs and capture graphs. Lookup
+requires the exact device name `NVIDIA H20-3e`, a matching `(N, K)` and block
+`[32, 32]`; plain `NVIDIA H20` and unmatched shapes keep their existing paths.
+The existing `kernels/**/*` package-data rule includes these JSON files.
+
+When a matching Triton FP8 operation executes, startup/warmup logs should show
+`Using configuration from .../gemm/configs/N=...,device_name=NVIDIA_H20-3e,...`
+for `W8A8 Block FP8 kernel`. Confirm the deployed installation's path in that
+message. Shapes that never execute need not produce a lookup message.
+The cached-weight BF16 fast path can bypass these tables for eligible M>=64
+operations; installing a table does not force all linear layers onto FP8.
+
+Keep the existing A+C baseline for the comparison:
+
+```bash
+export SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES=1
+export SGLANG_OPT_USE_DSV41_SM90_CANDIDATES=1
+export SGLANG_OPT_USE_FUSED_DSV41_COMPRESS_SM90=0
+```
+
+Compare the parent revision and this port with identical checkpoints,
+cache warmup/hit rates, request sequence, concurrency and PDMux YAML (62
+prefill SMs, `max_split_forward_layers: 4`). For the user's 130k-history /
+400-output multi-turn workload, measure total throughput after warmup and
+repeat runs; most history is cached, so do not treat all 130k tokens as new
+prefill work. Also verify output quality and DSPARK acceptance: split-K changes
+the accumulation order and can change low BF16 bits. Upstream's eager/graph
+checks cover M=6/12/24 on six shapes, but do not validate this PDMux workload.
+To undo the port, revert its commit and restart the server.
+
+Local validation (2026-10-13, CPU-only): all six files match the pinned
+upstream Git blob hashes. The production loader function, executed with
+mocked device identification, loads all 84 entries unchanged from the new
+paths. All entries match the selected kernel's parameter names (46 Hopper,
+38 generic); JSON structure, scale-block compatibility, split-K constraints,
+device/shape/block fallbacks, compile bypass and package-data inclusion passed.
+This checks configuration integration, not GPU numerical accuracy, graph
+replay, PDMux liveness or throughput.
 
 ## Combination acceptance
 
@@ -105,7 +190,7 @@ to verify the lanes still overlap.
 
 Repeat the historical chunk1024 / `max_split_forward_layers: 2` hang case at
 c10 for at least 30 minutes before c24. The user's current YAML requests 62
-prefill SMs (the driver may round); its omitted layer cap and chunk size are
+prefill SMs (the driver may round) and `max_split_forward_layers: 4`; this is
 not that historical configuration. CPU tests do not verify CUDA numerics,
 multi-rank liveness or throughput.
 
