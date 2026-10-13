@@ -86,6 +86,7 @@ sources = [
     "csrc/elementwise/concat_mla.cu",
     "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/fused_add_rms_norm_kernel.mu",
+    "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_sum.cu",
@@ -113,7 +114,9 @@ sources = [
 ]
 
 cxx_flags = ["force_mcc"]
-libraries = ["c10", "torch", "torch_python"]
+# libmusa provides the driver API (muPointerGetAttribute) used by custom allreduce.
+# Runtime symbols such as musaIpc* come from libmusart via libmusa_python.
+libraries = ["c10", "torch", "torch_python", "musa"]
 extra_link_args = [
     "-Wl,-rpath,$ORIGIN/../../torch/lib",
     f"-L/usr/lib/{arch}-linux-gnu",
@@ -138,12 +141,6 @@ if mtgpu_target not in ["mp_22", "mp_31", "mp_42"]:
     )
     sys.exit(1)
 
-# mp_42 does not currently implement __musa_barrier_slc, which is required by
-# the legacy custom allreduce kernel. Exclude that translation unit and disable
-# its registrations until the vendor toolchain provides the primitive.
-if mtgpu_target == "mp_42":
-    sources.remove("csrc/allreduce/custom_all_reduce.cu")
-
 mcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -163,9 +160,6 @@ mcc_flags = [
     "-DFLASHINFER_ENABLE_F16",
     "-DFLASHINFER_ENABLE_BF16",
 ]
-
-if mtgpu_target == "mp_42":
-    mcc_flags.append("-DSGLANG_MUSA_DISABLE_CUSTOM_AR")
 
 if mtgpu_target == "mp_31":
     mcc_flags.extend(

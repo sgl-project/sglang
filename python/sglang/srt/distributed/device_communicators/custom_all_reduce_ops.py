@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
 import logging
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -14,11 +13,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
-# mp_42 currently lacks __musa_barrier_slc, so AOT custom allreduce can be
-# intentionally omitted from the MUSA kernel build.
-_disable_musa_custom_ar = _is_musa and os.environ.get("SGLANG_MUSA_DISABLE_CUSTOM_AR", "0") == "1"
 
-IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or (_is_musa and not _disable_musa_custom_ar)
+IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or _is_musa
 IS_QUICK_AR_AVAILABLE = _is_hip
 
 try:

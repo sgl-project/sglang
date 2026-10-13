@@ -20,7 +20,6 @@ limitations under the License.
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
-#ifndef SGLANG_MUSA_DISABLE_CUSTOM_AR
   /*
    * From csrc/allreduce
    */
@@ -39,7 +38,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kMUSA, &all_reduce);
-#endif
+
   /*
    * From csrc/attention
    */
@@ -78,6 +77,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kMUSA, &rotary_embedding);
+
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kMUSA, &fast_topk_interface);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kMUSA, &fast_topk_transform_interface);
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kMUSA, &fast_topk_transform_ragged_interface);
 
   /*
    * From csrc/gemm

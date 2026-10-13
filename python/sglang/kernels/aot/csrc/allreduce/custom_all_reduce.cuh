@@ -443,11 +443,16 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
     idx_base += stride;
   } while (idx_base < size);
   // make sure buffer_ptr data ready
+#if (defined(__MUSA_ARCH__) && __MUSA_ARCH__ >= 420)
+  __threadfence_system();
+  __syncthreads_lm();
+#else
   __musa_barrier_slc();
   __syncthreads_lm();
   if (tidx == 0) {
     __threadfence_system_noflush();
   }
+#endif
   buffer_ptr = get_tmp_buf<Vec>(sg.signals[target_rank]);
   // second sync barrier
   if (tidx < nranks) {

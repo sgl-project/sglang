@@ -23,7 +23,6 @@ ARG MATE_MUSA_ARCH=4.2
 
 ENV MUSA_HOME=/usr/local/musa \
     MATE_MUSA_ARCH_LIST=${MATE_MUSA_ARCH} \
-    SGLANG_MUSA_DISABLE_CUSTOM_AR=1 \
     PATH=/usr/local/musa/bin:/usr/local/musa/mudnn/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/musa/lib:/usr/local/musa/mudnn/lib:/usr/local/mtshmem/lib:/usr/local/lib \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
