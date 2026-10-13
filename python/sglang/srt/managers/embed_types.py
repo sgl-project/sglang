@@ -34,9 +34,7 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
     ZMQ serialization overhead.
 
     Attributes:
-        embeds: Stacked tensor of shape [N, hidden_dim] after __post_init__. Between the
-            tokenizer and the scheduler it may instead be a CudaIpcTensorTransportProxy
-            into the tokenizer's CUDA IPC pool, until reconstruct() copies it out.
+        embeds: Stacked tensor of shape [N, hidden_dim] after __post_init__.
         positions: List of positions where embeddings should be injected.
     """
 
@@ -56,7 +54,6 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
             else:
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
-        # A proxy is built from an already-checked tensor; it is not re-checked here.
         if isinstance(self.embeds, torch.Tensor) and self.embeds.shape[0] != len(
             self.positions
         ):

@@ -1,10 +1,4 @@
-"""CUDA IPC transport for positional embedding overrides that are already on the GPU.
-
-Without it, CUDA override embeds are pickled by value: copied to the host in the
-tokenizer and back to the GPU in the scheduler. Here they are copied into a slot of
-a CUDA IPC pool owned by the tokenizer, and each scheduler rank copies them out
-(PositionalEmbeds.reconstruct), so they never leave the device.
-"""
+"""Send CUDA override embeds to the scheduler through a CUDA IPC pool, not by value."""
 
 import logging
 from typing import Iterable, List, Optional
@@ -28,14 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 class PositionalEmbedsTransport:
-    """Tokenizer-owned CUDA IPC transport for override embeds, one per tokenizer worker."""
-
     def __init__(self, base_gpu_id: int, mm_processor) -> None:
         parallel = get_parallel()
-        # Scheduler ranks open the pool by CUDA IPC, which needs a single node. Every
-        # pipeline stage builds the request, and stages after the first would
-        # acknowledge the slot a second time, so pipeline parallelism stays by value.
-        # The msgpack IPC encoder cannot encode the pool proxy, so that stays by value too.
+        # By value otherwise: IPC needs one node, every pipeline stage would ack the
+        # slot, and the msgpack IPC encoder cannot encode the proxy.
         self.enabled = (
             is_cuda()
             and parallel.nnodes == 1
@@ -71,11 +61,7 @@ class PositionalEmbedsTransport:
     def prepare_for_dispatch(
         self, tokenized_objs: Iterable
     ) -> List[CudaIpcTensorTransportProxy]:
-        """Move each request's CUDA override embeds into the pool.
-
-        Returns the proxies to cancel if the requests are not dispatched. A request
-        whose embeds do not fit in the pool keeps its tensor and goes by value.
-        """
+        """Returns the proxies to cancel if dispatch fails; a full pool means by value."""
         if not self.enabled:
             return []
         proxies = []
@@ -94,8 +80,7 @@ class PositionalEmbedsTransport:
                 if proxy is None:
                     continue
                 proxies.append(proxy)
-                # One slot per request: requests may share the caller's PositionalEmbeds,
-                # and every slot is released by the scheduler ranks of one request.
+                # A new object: requests may share the caller's PositionalEmbeds.
                 tokenized_obj.positional_embed_overrides = PositionalEmbeds(
                     embeds=proxy, positions=overrides.positions
                 )

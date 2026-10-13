@@ -485,7 +485,6 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: int,
         position_offset: int = 0,
     ) -> List[int]:
-        """Positions of the placeholder token in token_ids, shifted by position_offset."""
         return [
             idx + position_offset
             for idx, tok in enumerate(token_ids)
@@ -656,11 +655,7 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: int,
         stacked_query_item_embed_overrides: List[Optional[torch.Tensor]],
     ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
-        """_build_token_id_inputs for embeds that are already stacked per sequence.
-
-        Each tensor is used as-is; only the positions it attaches to are computed. On the
-        single-item path each item's tensor holds the query rows too, before its own.
-        """
+        """On the single-item path each item's tensor holds the query rows, then its own."""
         if use_multi_item_scoring:
             delimiter_token_id = MIS_DELIMITER_TOKEN_ID
             combined_input_ids, delimiter_indices = (
@@ -685,7 +680,6 @@ class TokenizerManagerScoreMixin:
             pe = [PositionalEmbeds(embeds=embeds, positions=positions)]
             return None, input_ids, pe, delimiter_indices
 
-        # Single-item scoring: one sequence (query + item) per item.
         input_ids = [query + item for item in items]
         q_positions = self._placeholder_positions(query, embed_override_token_id)
 
@@ -943,11 +937,8 @@ class TokenizerManagerScoreMixin:
         return_pooled_hidden_states is only supported for non-generation models
         (SequenceClassification, RewardModel); raises ValueError for CausalLM.
 
-        stacked_query_item_embed_overrides replaces query_/item_embed_overrides with
-        one [N, hidden] tensor per output sequence (one per item, or one under
-        --enable-mis; None for a sequence without overrides), its rows the query
-        placeholders first, then the item's. The tensors are used as-is, without a
-        restack; CUDA tensors reach the scheduler through a CUDA IPC pool.
+        stacked_query_item_embed_overrides replaces query_/item_embed_overrides with one
+        [N, hidden] tensor per sequence (per item, or one under --enable-mis), query rows first.
         """
         is_generation = self.is_generation
 
@@ -1030,14 +1021,11 @@ class TokenizerManagerScoreMixin:
                 f"must match items length ({len(items)})."
             )
         if stacked_query_item_embed_overrides is not None:
-            # The placeholder token marks where each embed goes, so str inputs, which
-            # have no token IDs yet, are not supported.
             if isinstance(query, str) or isinstance(items, str):
                 raise ValueError(
                     "stacked_query_item_embed_overrides requires token-id query/items, "
                     "not str."
                 )
-            # --enable-mis fuses all items into one sequence.
             expected = 1 if get_exec().features.enable_mis else len(items)
             if len(stacked_query_item_embed_overrides) != expected:
                 raise ValueError(

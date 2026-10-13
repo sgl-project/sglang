@@ -5,16 +5,9 @@ Companion to ``bench_score.py`` (which load-tests the HTTP ``/v1/score`` endpoin
 GPU tensors cannot travel over the HTTP/JSON API, so this benchmark drives the
 in-process ``sglang.Engine`` directly.
 
-What it does
-------------
-1. Launches an ``Engine`` with ``--tp-size``.
-2. Synthesizes (query, items) token sequences with ``--placeholder-token-id``
-   markers where embeddings are injected (seeded; no external dataset).
-3. Scores each sample with ``query_/item_embed_overrides`` (CPU vectors, sent by
-   value) and with ``stacked_query_item_embed_overrides`` (one GPU tensor per
-   sequence, sent through the tokenizer's CUDA IPC pool), and asserts the scores
-   match within --atol/--rtol.
-4. Times both paths over the dataset and prints latency percentiles + throughput.
+Scores synthetic token-id samples with ``query_/item_embed_overrides`` (CPU
+vectors) and ``stacked_query_item_embed_overrides`` (GPU tensors), checks the scores
+match, and times both.
 
 Usage
 -----
@@ -64,7 +57,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override vector dim. Default: read from the model config.",
     )
-    # Synthetic dataset controls.
     p.add_argument(
         "--num-samples", type=int, default=32, help="Number of (query, items) samples."
     )
@@ -83,7 +75,6 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="# override positions per item.",
     )
-    # Benchmark controls.
     p.add_argument(
         "--iters",
         type=int,
@@ -140,7 +131,6 @@ def resolve_vocab_size(engine: "sgl.Engine") -> int:
 
 
 def synth_dataset(args: argparse.Namespace, vocab_size: int) -> List[dict]:
-    """Deterministically build samples with placeholder tokens at fixed positions."""
     g = torch.Generator().manual_seed(args.seed)
     ph = args.placeholder_token_id
 
@@ -168,8 +158,6 @@ def count_placeholders(seq: List[int], ph: int) -> int:
 
 
 class OverrideVectors:
-    """Deterministic per-placeholder override vectors, shared by both paths."""
-
     def __init__(self, hidden: int, seed: int):
         self.hidden = hidden
         self.g = torch.Generator().manual_seed(seed)
@@ -179,7 +167,6 @@ class OverrideVectors:
 
 
 def build_byvalue_inputs(sample: dict, ph: int, ov: OverrideVectors):
-    """Return (query_embed_overrides, item_embed_overrides, masters) for one sample."""
     q_ph = count_placeholders(sample["query"], ph)
     q_master = ov.make(q_ph) if q_ph else torch.empty(0, ov.hidden)
     query_embed_overrides = [q_master[i].clone() for i in range(q_ph)] if q_ph else None
@@ -201,7 +188,6 @@ def build_byvalue_inputs(sample: dict, ph: int, ov: OverrideVectors):
 
 
 def build_stacked_inputs(masters) -> List[Optional[torch.Tensor]]:
-    """One [Q+M_i, hidden] GPU tensor per item, query rows first."""
     q_master, item_masters = masters
     stacked: List[Optional[torch.Tensor]] = []
     for im in item_masters:
@@ -275,7 +261,6 @@ def main() -> int:
                 apply_softmax=False,
             )
 
-        # ---- Equivalence ----
         print("\n[equivalence] comparing by-value vs stacked scores ...")
         n_ok, worst = 0, 0.0
         for idx, (s, qbv, ibv, stacked) in enumerate(prepared):
@@ -294,7 +279,6 @@ def main() -> int:
             f"(max abs diff {worst:.3e}) -> {'PASS' if all_ok else 'FAIL'}"
         )
 
-        # ---- Perf ----
         if not args.skip_perf:
 
             def bench(fn) -> List[float]:

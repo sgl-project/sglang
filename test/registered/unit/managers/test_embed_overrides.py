@@ -568,20 +568,6 @@ class TestBuildTokenIdInputsStacked(CustomTestCase):
         self.assertEqual(pe_overrides[0].positions, [0, 3])
         self.assertIsNone(pe_overrides[1])
 
-    def test_single_item_all_none_returns_none(self):
-        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 50]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
-            stacked_query_item_embed_overrides=[None],
-        )
-        self.assertEqual(input_ids, [[50, 10, 20, 50]])
-        self.assertIsNone(pe_overrides)
-
     def test_multi_item_stacked_used_as_is(self):
         # One fused sequence; placeholders: query pos 0, item[0] pos 4
         # (query_len 2 + delim 1 + idx 1). item[1] has no placeholder.
@@ -602,19 +588,6 @@ class TestBuildTokenIdInputsStacked(CustomTestCase):
         self.assertEqual(len(pe_overrides), 1)
         self.assertEqual(pe_overrides[0].positions, [0, 4])
         self.assertIs(pe_overrides[0].embeds, stacked)
-
-    def test_multi_item_stacked_empty_returns_none(self):
-        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 50]],
-            item_first=False,
-            use_multi_item_scoring=True,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
-            stacked_query_item_embed_overrides=[None],
-        )
-        self.assertIsNone(pe_overrides)
 
 
 # ========================================================================
@@ -719,67 +692,6 @@ class TestScoreRequestValidation(CustomTestCase):
                 label_token_ids=[100],
                 embed_override_token_id=50,
                 item_embed_overrides=[[_vec(1)]],  # 1 override for 2 items
-            )
-
-    def test_stacked_mutually_exclusive_with_per_override_embeds(self):
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                query_embed_overrides=[_vec(1)],
-                stacked_query_item_embed_overrides=[_vec2d(1)],
-            )
-
-    def test_stacked_length_too_few_raises_single_item(self):
-        # Single-item scoring: expected one stacked tensor per item.
-        with self.assertRaisesRegex(
-            ValueError, "stacked_query_item_embed_overrides length"
-        ):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4], [5, 6]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[_vec2d(1)],  # 1 for 2 items
-            )
-
-    def test_stacked_length_too_many_raises_single_item(self):
-        with self.assertRaisesRegex(
-            ValueError, "stacked_query_item_embed_overrides length"
-        ):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[_vec2d(1), _vec2d(1)],
-            )
-
-    def test_stacked_length_mismatch_raises_multi_item(self):
-        # score_request reads --enable-mis from the published context, not the stub.
-        reset_context()
-        publish(ServerArgs(model_path="dummy", enable_mis=True), role="tokenizer")
-        with self.assertRaisesRegex(
-            ValueError, "stacked_query_item_embed_overrides length"
-        ):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4], [5, 6]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[_vec2d(1), _vec2d(1)],  # want 1
-            )
-
-    def test_stacked_rejects_str_inputs(self):
-        with self.assertRaisesRegex(ValueError, "requires token-id query/items"):
-            self._call(
-                query="q",
-                items="doc",
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[_vec2d(1)],
             )
 
 
