@@ -207,7 +207,9 @@ def test_fl2va_maps_keyframes_to_frame_indices():
     assert [c["frame_index"] for c in payload["conditions"]] == [0, -1]
     # Images are embedded inline (data: URI), not as a local file:// path
     # the server may not be able to read.
-    assert all(c["uri"].startswith("data:image/png;base64,") for c in payload["conditions"])
+    assert all(
+        c["uri"].startswith("data:image/png;base64,") for c in payload["conditions"]
+    )
 
 
 def test_ref2va_preserves_modality_order_for_prompt_tags():
