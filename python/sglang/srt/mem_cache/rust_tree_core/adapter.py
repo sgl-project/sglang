@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 from array import array
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import get_eviction_strategy
@@ -95,7 +97,7 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
-def _kv_event_from_tagged(event: tuple):
+def _kv_event_from_tagged(event: tuple, lora_names: LoRANameTable):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
@@ -108,6 +110,7 @@ def _kv_event_from_tagged(event: tuple):
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
             session_id=event[7],
+            lora_name=lora_names.resolve(event[8]),
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -267,7 +270,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
 def _match_result_from_binding(result) -> MatchResult:
     """Build the Python MatchResult for the binding's match result."""
     return MatchResult(
-        device_indices=result.device_indices,
+        device_prefix_len=result.device_prefix_len,
         last_device_node=result.last_device_node_id,
         last_host_node=result.last_host_node_id,
         best_match_node=result.best_match_node_id,
@@ -301,15 +304,21 @@ def _fill_evict_result(binding_result, result):
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
-    def __init__(self, binding, enabled: bool):
+    def __init__(
+        self, binding, enabled: bool, lora_names: Optional[LoRANameTable] = None
+    ):
         self._binding = binding
         self.enabled = enabled
+        self.lora_names = lora_names if lora_names is not None else LoRANameTable()
 
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
 
     def take(self) -> list:
-        return [_kv_event_from_tagged(event) for event in self._binding.take_events()]
+        return [
+            _kv_event_from_tagged(event, self.lora_names)
+            for event in self._binding.take_events()
+        ]
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -371,6 +380,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
+        self._swa_backup_index_mapper: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+        allocator = params.token_to_kv_pool_allocator
+        if allocator is not None and ComponentType.SWA in self.tree_components:
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
+            )
+
+            if isinstance(allocator, UnifiedSWAAllocatorBase):
+                self._swa_backup_index_mapper = (
+                    allocator.translate_swa_indices_for_transfer
+                )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -409,6 +431,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_sliding_window_size=params.sliding_window_size,
                 swa_req_ring=is_swa_req_ring(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
+                dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
                 ),
@@ -421,7 +444,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             [int(component) for component in self.tree_components],
         )
         self.kv_events = _RustKVCacheEventRecorder(
-            self._binding, params.enable_kv_cache_events
+            self._binding,
+            params.enable_kv_cache_events,
+            lora_names=params.kv_event_lora_names,
         )
         # The default-root empty result, prebuilt once from the binding.
         self._empty_match_result = _match_result_from_binding(
@@ -726,7 +751,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
-                chunked=params.chunked,
+                inserted_len=params.inserted_len,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
                 rotation_base=params.rotation_base,
@@ -868,11 +893,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
         if not transfers:
             return
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-        )
-
-        if not isinstance(self._allocator, UnifiedSWAAllocatorBase):
+        if self._swa_backup_index_mapper is None:
             return
         for transfer in transfers:
             if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
@@ -883,7 +904,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 self.get_component_device_value(node_id, ComponentType.FULL)
                 for node_id in transfer.nodes_to_load
             ]
-            transfer.device_indices = self._allocator.translate_loc_from_full_to_swa(
+            transfer.device_indices = self._swa_backup_index_mapper(
                 torch.cat(full_values)
             ).to(torch.int64)
 
@@ -944,33 +965,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
-        if swa_xfers:
-            full_node_ids = kv_xfer.nodes_to_load or []
-            full_load_slices = {}
-            offset = 0
-            for full_node_id, count in zip(
-                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
-            ):
-                full_load_slices[full_node_id] = slice(offset, offset + count)
-                offset += count
-            for transfer in swa_xfers:
-                # SWA may have holes between resident nodes, or reload while
-                # FULL stays resident. Preserve the SWA transfer's node order.
-                transfer.anchor_index_parts = [
-                    (
-                        full_load_slices[nid]
-                        if nid in full_load_slices
-                        else self.get_component_device_value(nid, ComponentType.FULL)
-                    )
-                    for nid in transfer.nodes_to_load or ()
-                ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId
     ) -> tuple[Optional[str], Optional[str]]:
         return self._binding.prefetch_anchor_info(node_id)
+
+    def is_write_through_compatible(self) -> bool:
+        return self._binding.is_write_through_compatible()
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
@@ -1135,6 +1138,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
         return self._binding.write_back_duplicate_reclaim_digest()
+
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        self._binding.adjust_component_size(node_id, int(component_type), delta)
+
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = self._binding.collect_path_info(list(end_node_ids))
+        return tuple(tuple(TreePathNodeInfo(*node) for node in path) for path in paths)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

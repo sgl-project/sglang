@@ -58,9 +58,11 @@ def situ_and_mul(
         out_dtype = torch.bfloat16 if input.dtype == torch.float32 else input.dtype
         out = input.new_empty(*input.shape[:-1], hidden_size, dtype=out_dtype)
 
-    # 2D inputs may be row-strided (e.g. a slice of a fused-GEMM output);
-    # higher-rank inputs keep the dense-view path.
-    if input.dim() == 2 and input.stride(1) == 1:
+    # 2D inputs may be row-strided (e.g. a slice of a fused-GEMM output) when
+    # the row stride is a whole number of the kernel's 32-byte vectors of the
+    # wider dtype; other inputs keep the dense-view path.
+    widest = max(input.element_size(), out.element_size())
+    if input.dim() == 2 and input.stride(1) == 1 and input.stride(0) * widest % 32 == 0:
         input_2d = input
     else:
         input_2d = input.contiguous().view(-1, hidden_size * 2)

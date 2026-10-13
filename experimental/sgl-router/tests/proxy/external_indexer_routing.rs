@@ -97,7 +97,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
                 url: url.clone(),
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId(MODEL.into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .unwrap();
     }

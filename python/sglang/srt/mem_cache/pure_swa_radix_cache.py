@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.utils.common import ceil_align
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +16,8 @@ class PureSWARadixCache(RadixCache):
 
     Extends RadixCache with SWA semantics. Only caches the prefill portion
     [0, evict_floor) on request completion. Window-range KV is freed.
-    No tombstone mechanism needed.
+    No tombstone mechanism needed. With ``params.disable`` it serves
+    ``--disable-radix-cache`` and caches nothing.
     """
 
     def __init__(self, params: CacheInitParams):
@@ -56,23 +52,6 @@ class PureSWARadixCache(RadixCache):
         (with num_tokens=0). Use whichever is non-zero."""
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
         return super().evict(EvictParams(num_tokens=num_tokens))
-
-    def insert_req(self, req: Req, *, up_to: int):
-        """Insert only the prefill portion [0, swa_evict_floor)."""
-        if self.disable:
-            return
-        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
-        swa_evict_floor = req.kv.swa_evict_floor
-        key_limit = (
-            ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
-        )
-        radix_key, _, _ = self._insert_cache(req, token_ids, key_limit=key_limit)
-        req.kv.cache_protected_len = len(radix_key)
-
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
-        has happened yet, so standard RadixCache logic is correct."""
-        super().cache_unfinished_req(req, chunked=chunked)
 
     def available_and_evictable_str(self) -> str:
         allocator = self.token_to_kv_pool_allocator

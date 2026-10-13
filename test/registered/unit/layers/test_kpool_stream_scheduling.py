@@ -224,6 +224,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([8192 + num_tokens]),
             seq_lens_cpu=torch.tensor([8192 + num_tokens]),
         )
         prepare_qk = Mock(return_value=(x, x, None, None))
@@ -670,6 +671,7 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             get_seqlens_expanded=lambda: seqlens_expanded,
             topk_transform_method=TopkTransformMethod.RAGGED,
             attn_metadata=SimpleNamespace(
+                page_size=64,
                 topk_indices_offset=torch.arange(token_nums, dtype=torch.int32) + 100,
             ),
         )
@@ -688,7 +690,8 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             index_kpool=self.POOL,
         )
         with _chunking_patches(
-            rows_per_chunk=rows_per_chunk, kv_pool=SimpleNamespace(page_size=64)
+            rows_per_chunk=rows_per_chunk,
+            kv_pool=SimpleNamespace(page_size=256, index_page_size=64),
         ):
             result = IndexerKPool._get_topk_ragged_kpool(
                 backend,

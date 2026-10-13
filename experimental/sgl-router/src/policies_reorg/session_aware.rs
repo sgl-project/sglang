@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bucket-scoped session placement. Admission rejection preserves the binding
-//! and returns to the bucket loop; it never selects a backup inside the group.
+//! Bucket-scoped session placement with admitted fallback and rebinding.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+
+use crate::config::{AffinityConfig, AffinityMode};
 
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable,
@@ -16,6 +17,7 @@ use crate::state::AffinityStore;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection};
 
@@ -25,18 +27,21 @@ pub struct SessionAwarePolicy {
     engine_load: Arc<EngineReportedLoadTable>,
     fallback: PowerOfTwoPolicy,
     pub admission: Arc<dyn EngineAdmission>,
+    pub config: AffinityConfig,
 }
 
 impl SessionAwarePolicy {
     /// The caller owns the shared store's idle timeout and sweeper lifecycle.
-    /// This policy implements bucket-scoped affinity, without legacy global modes
-    /// or primary/backup pressure escape.
     pub fn new(store: Arc<AffinityStore>, engine_load: Arc<EngineReportedLoadTable>) -> Self {
         Self {
             store,
             fallback: PowerOfTwoPolicy::new(Arc::clone(&engine_load)),
             engine_load,
             admission: Arc::new(AdmissionLimits::default()),
+            config: AffinityConfig {
+                mode: AffinityMode::Prefer,
+                ..Default::default()
+            },
         }
     }
 
@@ -80,11 +85,51 @@ impl Policy for SessionAwarePolicy {
             let key = Self::assignment_key(request);
             if let Some(bound) = key.as_ref().and_then(|key| self.store.bound(key, engines)) {
                 let load = self.engine_load.capture_snapshot(Instant::now());
-                self.check(bound, &load)?;
-                return Ok(Pick {
+                let rejection = match self.check(bound, &load) {
+                    Ok(()) => None,
+                    Err(error @ PickError::AdmissionRejected(_)) => Some(error),
+                    Err(error) => return Err(error),
+                };
+                let primary = Pick {
                     engine: Arc::clone(bound),
                     reason: "session_primary",
-                });
+                };
+                if rejection.is_none() && self.config.mode != AffinityMode::Balanced {
+                    return Ok(primary);
+                }
+                let alternatives: Vec<_> = engines
+                    .iter()
+                    .filter(|e| e.id != bound.id)
+                    .cloned()
+                    .collect();
+                if alternatives.is_empty() {
+                    return rejection.map_or(Ok(primary), Err);
+                }
+                let fallback = async {
+                    let pick = self.pick_fallback(&alternatives, request).await?;
+                    self.check(&pick.engine, &load)?;
+                    Ok::<_, PickError>(pick)
+                }
+                .await;
+                let mut pick = affinity::choose(
+                    &self.config,
+                    rejection.is_none().then_some(primary),
+                    fallback,
+                    &load,
+                    // Without a prefix signal, either engine prefills the whole input.
+                    |_| request.total_input_tokens,
+                )?;
+                if pick.engine.id == bound.id {
+                    return Ok(pick);
+                }
+                // Excluding the old binding lets a concurrent replacement win.
+                let effective = self.store.bind(key.unwrap(), &pick.engine, &alternatives);
+                if !Arc::ptr_eq(effective, &pick.engine) {
+                    self.check(effective, &load)?;
+                }
+                pick.engine = Arc::clone(effective);
+                pick.reason = "session_rebound";
+                return Ok(pick);
             }
 
             // The nested power-of-two policy uses AdmissionLimits::default().
