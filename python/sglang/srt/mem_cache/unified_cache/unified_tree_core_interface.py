@@ -385,6 +385,12 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def reclaim_orphan_full_kv(self, num_tokens: int) -> DropSubtreeNoHostResult:
+        """Reclaim up to ``num_tokens`` of Full KV from maximal subtrees that
+        contain no reusable Mamba state or live runtime/storage dependency."""
+        ...
+
+    @abstractmethod
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""
         ...

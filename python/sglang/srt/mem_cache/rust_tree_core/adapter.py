@@ -1103,6 +1103,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DropSubtreeNoHostResult(is_dropped=binding_result.dropped)
         return _fill_evict_result(binding_result, result)
 
+    def reclaim_orphan_full_kv(self, num_tokens: int) -> DropSubtreeNoHostResult:
+        binding_result = self._binding.reclaim_orphan_full_kv(num_tokens)
+        result = DropSubtreeNoHostResult(is_dropped=binding_result.dropped)
+        return _fill_evict_result(binding_result, result)
+
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId
     ) -> list[NodeId]:

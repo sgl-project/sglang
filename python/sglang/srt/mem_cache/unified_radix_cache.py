@@ -866,6 +866,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self._accumulate_tracker(tracker, result.tracker)
         return result.is_dropped
 
+    def _reclaim_orphan_full_kv(
+        self, num_tokens: int, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Run dependency-safe orphan reclamation and consume its frees."""
+        result = self.tree_core.reclaim_orphan_full_kv(num_tokens)
+        self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.is_dropped
+
     def _evict_components(
         self,
         request_by_type: dict[ComponentType, int],
@@ -916,6 +925,14 @@ class UnifiedRadixCache(BasePrefixCache):
             # on a shared pool, released enough bytes to satisfy its allocation.
             if tracker[ct] >= request_cnt or target_reached(ct):
                 continue
+            if (
+                ct == ComponentType.FULL
+                and self.is_mamba_enabled
+                and envs.SGLANG_OPT_UNIFIED_CACHE_RECLAIM_ORPHAN_FULL_KV.get()
+            ):
+                self._reclaim_orphan_full_kv(request_cnt, tracker)
+                if tracker[ct] >= request_cnt or target_reached(ct):
+                    continue
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while True:

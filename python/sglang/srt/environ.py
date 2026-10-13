@@ -673,6 +673,9 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Reclaim Full-KV-only hybrid subtrees that no longer lead to a reusable
+    # recurrent state. The check runs only under Full-KV allocation pressure.
+    SGLANG_OPT_UNIFIED_CACHE_RECLAIM_ORPHAN_FULL_KV = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
