@@ -1444,7 +1444,11 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         output = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
         if bias is not None:
             output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
+        output = output.view(*input.shape[:-1], weight.shape[0])
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):

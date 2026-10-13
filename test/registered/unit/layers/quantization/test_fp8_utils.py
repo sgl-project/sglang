@@ -136,6 +136,36 @@ class TestPrequantizedBlockFp8Routing(CustomTestCase):
             hopper.assert_not_called()
             deepgemm.assert_called_once()
 
+    def test_hopper_gemv_writes_caller_owned_output(self):
+        """Callers such as apply_into read the out buffer they pass, not the
+        returned tensor, so the GEMV path must fill it."""
+        m, k, n = 4, 256, 128
+        x = torch.randn((m, k), dtype=torch.bfloat16)
+        weight = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones((n // 128, k // 128), dtype=torch.float32)
+        gemv_output = torch.full((m, n), 3.0, dtype=torch.bfloat16)
+        out = torch.zeros((m, n), dtype=torch.bfloat16)
+        with (
+            patch.object(fp8_utils, "_use_fp8_block_gemv", return_value=True),
+            patch.object(
+                fp8_utils,
+                "sglang_per_token_group_quant_fp8",
+                return_value=(
+                    torch.empty((m, k), dtype=torch.float8_e4m3fn),
+                    torch.ones((m, k // 128), dtype=torch.float32),
+                ),
+            ),
+            patch.object(
+                fp8_utils, "hopper_fp8_block_gemv", return_value=gemv_output
+            ) as hopper,
+        ):
+            result = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                x, weight, [128, 128], weight_scale, out=out
+            )
+        hopper.assert_called_once()
+        self.assertIs(result, out)
+        torch.testing.assert_close(out, gemv_output)
+
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
