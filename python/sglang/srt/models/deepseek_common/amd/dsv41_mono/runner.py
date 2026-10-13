@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from .attention.plan import HEAD_DIM, Dims
+from .attention.plan import HEAD_DIM, Q_RANK, Dims
 from .common.plan import BLOCKS
 from .layer import (
     EPOCH_WORDS,
@@ -144,6 +144,15 @@ class DSV41MonoLayer:
         self.post_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.comb_a = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
         self.pre_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
+        # an index source's K1 outputs, the indexer's inputs
+        self.normed = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
+        self.qr = torch.zeros(MAX_TOKENS, Q_RANK, dtype=torch.bfloat16, device=dev)
+        # layer 0's incoming pre-mix: stream 0 of the broadcast embedding
+        self._first_pre = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
+        self._first_pre[:, 0] = 1.0
+        # unread when K1's seam does not fold (the pending x and the comb)
+        self.unread_x = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
+        self.unread_comb = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
         self.peer = PeerBuffer(2 * peer_half_bytes(tp), group, rank, tp, dev)
         self.peer.bytes.zero_()
         self._kernels: dict = {}

@@ -1,4 +1,10 @@
-"""SGLang glue for the DeepSeek-V4.1 gfx950 mono decode launches (FFN launch and K1)."""
+"""SGLang glue for the DeepSeek-V4.1 gfx950 mono decode launches (FFN launch and K1).
+
+K1 covers every backbone layer whose compress ratio is 0, 1, or 2. Layer 0 and an
+Engram layer hand it a residual that is already settled. An index source runs the
+compressor and indexer between K1 and attention, on the normed input and bf16 qr
+K1 stores. A compressor without an indexer stays on the FFN launch only.
+"""
 
 import logging
 import time
@@ -169,13 +175,20 @@ def init_layer(layer) -> None:
     if layer.hc_boundary_fused and not layer.mlp.is_hash:
         layer.mono_ffn = MonoFfn(layer)
         a = layer.self_attn
+        # ratio 0 is layer 0. An index source has an indexer. A compressor
+        # without one has no whole-layer path.
         if (
             envs.SGLANG_ROCM_MONO_K1.get()
-            and a.compress_ratio in (1, 2)
-            and a.compressor is None
-            and a.indexer is None
+            and a.compress_ratio in (0, 1, 2)
+            and not (a.compressor is not None and a.indexer is None)
         ):
-            layer.mono_k1 = MonoK1(layer)
+            layer.mono_k1 = MonoK1(
+                layer,
+                fold=not (
+                    a.layer_id == 0 or getattr(layer, "engram", None) is not None
+                ),
+                index=a.indexer is not None,
+            )
 
 
 def stash_shared_expert(layers, name: str, loaded_weight: torch.Tensor) -> None:
@@ -279,9 +292,10 @@ _k1_kernels: dict = {}
 _k1_tables: list = []
 
 
-def _k1_kernel(rows: int, tp: int):
-    """K1 for ``rows`` rows at TP ``tp``."""
-    k = _k1_kernels.get((rows, tp))
+def _k1_kernel(rows: int, tp: int, fold: bool = True, index: bool = False):
+    """K1 for ``rows`` rows at TP ``tp``. ``fold`` and ``index`` select the build."""
+    key = (rows, tp, fold, index)
+    k = _k1_kernels.get(key)
     if k is None:
         from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import (
             MonoBuild,
@@ -290,8 +304,15 @@ def _k1_kernel(rows: int, tp: int):
         from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import no_capture
 
         no_capture(f"K1 width {rows}")
-        k = _k1_kernels[rows, tp] = build_mono_k1(MonoBuild(rows, tp))
-        logger.info("DeepSeek-V4.1 mono decode: K1 runs steps of %d rows", rows)
+        k = _k1_kernels[key] = build_mono_k1(
+            MonoBuild(rows, tp, fold=fold, index=index)
+        )
+        logger.info(
+            "DeepSeek-V4.1 mono decode: K1 runs steps of %d rows (fold=%s, index=%s)",
+            rows,
+            fold,
+            index,
+        )
     return k
 
 
@@ -320,10 +341,16 @@ def _e8m0(scale: torch.Tensor) -> torch.Tensor:
 
 
 class MonoK1:
-    """One standard layer's K1 launch: the attention mHC seam and the attention front."""
+    """One layer's K1 launch: the attention mHC seam and the attention front.
 
-    def __init__(self, layer):
+    ``fold`` is false when the residual arrives settled (layer 0, after an Engram).
+    ``index`` is true on an index source: K1 also stores the normed input and bf16 qr.
+    """
+
+    def __init__(self, layer, fold: bool = True, index: bool = False):
         self.layer = layer
+        self.fold = fold
+        self.index = index
         self._weights = None
         # (wqkv_a, wq_b) as loaded, from stash_k1_weights
         self.plain = None
@@ -388,7 +415,10 @@ class MonoK1:
         return w
 
     def __call__(self, positions, forward_batch, x, residual, post, comb, pre):
-        """Run K1, store the step's KV rows, and return (q, residual, post, comb, pre)."""
+        """Run K1, store the step's KV rows, and return (q, residual, post, comb, pre, normed, qr).
+
+        ``normed`` and ``qr`` are set on an index source and are None otherwise.
+        """
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -449,7 +479,7 @@ class MonoK1:
             raise RuntimeError(
                 f"K1: SWA cache {swa.dtype} {tuple(swa.shape)} {swa.stride()}, page {block} x 584 B"
             )
-        _k1_kernel(M, r.tp)(
+        _k1_kernel(M, r.tp, self.fold, self.index)(
             residual.data_ptr(),
             x.data_ptr(),
             post.data_ptr(),
@@ -476,11 +506,23 @@ class MonoK1:
             swa.stride(0),
             block,
             r.q.data_ptr(),
+            r.normed.data_ptr(),
+            r.qr.data_ptr(),
             r.scratch(M).data_ptr(),
             r.epoch.data_ptr(),
             stream=torch.cuda.current_stream(),
         )
-        return r.q[:M], r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M]
+        normed = r.normed[:M] if self.index else None
+        qr = r.qr[:M] if self.index else None
+        return (
+            r.q[:M],
+            r.res_mid[:M],
+            r.post_a[:M],
+            r.comb_a[:M],
+            r.pre_a[:M],
+            normed,
+            qr,
+        )
 
 
 def stash_k1_weights(layers) -> None:
@@ -495,14 +537,50 @@ def stash_k1_weights(layers) -> None:
             )
 
 
-def k1_launch(layer, forward_batch, pending_post, prev_pre) -> Optional[MonoK1]:
-    """Return the layer's K1 launch when this step takes it, else None."""
+def k1_arguments(k1, hidden_states, pending_post, prev_pre):
+    """Return ``(x, residual, post, comb, pre)`` for this K1 launch.
+
+    A folding layer uses the previous layer's unapplied FFN post. A settled layer
+    (layer 0, or after an Engram write) uses the residual as it arrives. Layer 0's
+    incoming pre-mix is the identity on stream 0 when none was passed.
+    """
+    if getattr(k1, "fold", True):
+        x, residual, post, comb = pending_post
+        return x, residual, post, comb, prev_pre
+    src = hidden_states if hidden_states is not None else pending_post[1]
+    runner = _get_runner(src.device)
+    if src.dim() == 2:
+        residual = src.unsqueeze(1).expand(-1, 4, -1).contiguous()
+    else:
+        residual = src if src.is_contiguous() else src.contiguous()
+    rows = residual.shape[0]
+    pre = prev_pre if prev_pre is not None else runner._first_pre[:rows]
+    return runner.unread_x[:rows], residual, pre, runner.unread_comb[:rows], pre
+
+
+def k1_launch(
+    layer, forward_batch, pending_post, prev_pre, hidden_states=None
+) -> Optional[MonoK1]:
+    """Return the layer's K1 launch when this step takes it, else None.
+
+    A folding layer needs the previous FFN post. A settled layer needs the residual
+    that arrived (``hidden_states``, or the residual inside ``pending_post``).
+    """
     k1 = getattr(layer, "mono_k1", None)
-    if k1 is None or pending_post is None or prev_pre is None:
+    if k1 is None:
         return None
-    x, residual, post, _ = pending_post
-    if x is None or post is None:
-        return None
-    return (
-        k1 if ffn_launch(layer, forward_batch, residual.shape[0]) is not None else None
-    )
+    if getattr(k1, "fold", True):
+        if pending_post is None or prev_pre is None:
+            return None
+        x, residual, post, _ = pending_post
+        if x is None or post is None:
+            return None
+        rows = residual.shape[0]
+    else:
+        src = hidden_states
+        if src is None and pending_post is not None:
+            src = pending_post[1]
+        if src is None:
+            return None
+        rows = src.shape[0]
+    return k1 if ffn_launch(layer, forward_batch, rows) is not None else None

@@ -187,6 +187,20 @@ def stage_qkv(c, t):
         amax = fx.max(amax, abs(y))
     code = mx_code(butterfly(amax, (1, 2), fx.max))
     mul = mx_mul(code)
+    if const_expr(c.get("index", False)):  # noqa: SIM102
+        # the bf16 qr the indexer reads; its wq_b quantizes this row itself
+        if mine & (tt * 8 < Q_RANK):
+            words = [
+                fx.Vector.from_elements([ys[2 * i], ys[2 * i + 1]], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0]
+                for i in range(4)
+            ]
+            bo.buffer_store(
+                fx.Vector.from_elements(words, fx.Int32),
+                rsrc(a["qr_out"]),
+                t * (Q_RANK // 2) + 4 * tt,
+            )
     if mine & (tt * 8 < Q_RANK):
         w0 = fp8_pack4(*[clamp_fp8(ys[i] * mul) for i in range(4)])
         w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * mul) for i in range(4)])

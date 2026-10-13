@@ -587,12 +587,28 @@ def forward_hc_pre_from_prev_fused_boundary(
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
-    k1 = dsv41_mono_decode.k1_launch(layer, forward_batch, pending_post, prev_pre)
+    k1 = dsv41_mono_decode.k1_launch(
+        layer, forward_batch, pending_post, prev_pre, hidden_states
+    )
     if k1 is not None:
-        # K1 runs this boundary and the attention front; the attention starts from its q
-        q, residual, post, comb, pre = k1(
-            positions, forward_batch, *pending_post, prev_pre
+        # K1 runs this boundary and the attention front; the attention starts from its q.
+        # An index source's compressor and indexer run on K1's normed input and bf16 qr.
+        x_in, residual, post, comb, pre = dsv41_mono_decode.k1_arguments(
+            k1, hidden_states, pending_post, prev_pre
         )
+        q, residual, post, comb, pre, normed, qr = k1(
+            positions, forward_batch, x_in, residual, post, comb, pre
+        )
+        if normed is not None:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            get_attn_backend().forward_low_ratio_sources(
+                layer=layer.self_attn,
+                x=normed,
+                q_lora=qr,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
         mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
         with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = layer.self_attn(

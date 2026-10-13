@@ -41,6 +41,12 @@ EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
 class MonoBuild:
     tokens: int
     tp: int
+    # K1's seam folds the previous layer's output into the residual. Off when
+    # the residual arrives settled: the broadcast embedding, or after an Engram.
+    fold: bool = True
+    # An index source: K1 also writes its normed input and bf16 qr for the
+    # compressor and indexer, which run between K1 and attention.
+    index: bool = False
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
@@ -146,7 +152,9 @@ def build_mono_k1(key: MonoBuild):
         seam: SeamLds
         front: FrontLds  # type: ignore[valid-type]
 
-    name = kernel_symbol("dsv41_mono_k1", s=s, tp=tp)
+    name = kernel_symbol(
+        "dsv41_mono_k1", s=s, tp=tp, f=int(key.fold), i=int(key.index)
+    )
     keyed = key_tuple(key, SOURCES)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -177,6 +185,8 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
+        normed_out: Int64,
+        qr_out: Int64,
         scratch: Int64,
         epoch: Int64,
     ):
@@ -202,9 +212,11 @@ def build_mono_k1(key: MonoBuild):
             "swa_stride": swa_stride,
             "swa_block": swa_block,
             "q": q,
+            "qr_out": qr_out,
         }
         flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
         c = mb_front.front_context(fkey, lds.front.peek(), fargs, scratch, tag, flayout)
+        c["index"] = key.index
         amb = Mailbox(tag)
         tid = fx.thread_idx.x
         ca = {
@@ -238,6 +250,7 @@ def build_mono_k1(key: MonoBuild):
             "d": StageDims(tp),
             # SGLang's Triton boundary + rmsnorm arithmetic (seam.slice_row, stage_norm)
             "sgl": True,
+            "fold": key.fold,
         }
         for region in ("lin", "pmix"):
             ca[region] = sreg(scratch, layout[region][0], region)
@@ -247,9 +260,14 @@ def build_mono_k1(key: MonoBuild):
                 seam.stage_slice(ca, task)
             gpu.barrier()
 
+        def store(*v):
+            store_x8(c, *v)
+            if const_expr(key.index):
+                store_normed(normed_out, *v)
+
         def seam_rest():
             for t in range(first_task(bid, NORM0), s, BLOCKS):
-                seam.stage_norm(ca, t, lambda *v: store_x8(c, *v))
+                seam.stage_norm(ca, t, store)
                 publish_x8(c, t)
             for t in range(first_task(bid, GATE0), s, BLOCKS):
                 seam.stage_gate(ca, t)
@@ -287,6 +305,8 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
+        normed_out: Int64,
+        qr_out: Int64,
         scratch: Int64,
         epoch: Int64,
         stream: fx.Stream = _STREAM,
@@ -319,6 +339,8 @@ def build_mono_k1(key: MonoBuild):
             swa_stride,
             swa_block,
             q,
+            normed_out,
+            qr_out,
             scratch,
             epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
