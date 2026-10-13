@@ -25,11 +25,17 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
 
 logger = logging.getLogger(__name__)
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def gather_and_crop_vocab(
@@ -299,7 +305,6 @@ class DSparkConfidenceHead(nn.Module):
         self.register_buffer(
             "sts_temperatures", torch.ones((), dtype=torch.float32), persistent=False
         )
-        self._last_confidence_raw: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -321,8 +326,29 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(features).squeeze(-1)
 
     def apply_sts(self, confidence_raw: torch.Tensor) -> torch.Tensor:
-        self._last_confidence_raw = confidence_raw
         return torch.sigmoid(confidence_raw.float() / self.sts_temperatures)
+
+    def predict(
+        self,
+        features: torch.Tensor,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        markov_head: BaseDSparkMarkovHead,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The [bs, gamma] confidence of a drafted block and its raw logit."""
+        bs, gamma = draft_tokens.shape
+        if self.with_markov:
+            prev_tokens = torch.cat(
+                [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
+            )
+            markov_embed_stack = markov_head.get_prev_embeddings(prev_tokens)
+        else:
+            markov_embed_stack = None
+        confidence_raw = self(features.view(bs, gamma, -1), markov_embed_stack)
+        confidence = self.apply_sts(confidence_raw)
+        expect(_CONFIDENCE, confidence)
+        return confidence, confidence_raw
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
@@ -399,8 +425,9 @@ class DSparkDraftMixin:
 
     def compute_base_logits(
         self, hidden: torch.Tensor
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Project the draft's raw final hidden through the target lm_head.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project the draft's raw final hidden through the target lm_head;
+        also returns the features the confidence head reads.
 
         muP targets (Inkling) train the draft against a FOLDED head (weights
         pre-divided by logits_mup_width_multiplier) while serving attaches the
@@ -414,11 +441,26 @@ class DSparkDraftMixin:
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
+        confidence_features = hidden
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
-        return base_logits, None
+        return base_logits, confidence_features
+
+    def compute_confidence(
+        self,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []
