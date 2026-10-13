@@ -89,7 +89,6 @@ class Schedule(msgspec.Struct):
                 "fcfs",
                 "dfs-weight",
                 "lof",
-                "priority",
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
