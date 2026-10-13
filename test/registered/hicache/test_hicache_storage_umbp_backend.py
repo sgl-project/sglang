@@ -19,12 +19,13 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_amd_ci(
@@ -39,10 +40,10 @@ DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 3600
 UMBP_SERVER_LAUNCH_TIMEOUT = 60
 UMBP_SERVER_READY_MARKER = (
-    "[StandaloneServer] data plane: serialized reads (SSD medium)"
+    "[StandaloneServer] data plane: concurrent reads (medium=DRAM)"
 )
-UMBP_STORAGE_PAGE_SIZE = 2 * 1024 * 1024
-UMBP_SSD_CAPACITY = 20 * 1024 * 1024 * 1024
+UMBP_DRAM_PAGE_SIZE = 2 * 1024 * 1024
+UMBP_DRAM_CAPACITY = 1 * 1024 * 1024 * 1024
 PAGE_SIZE = 256
 TP_SIZE = 8
 
@@ -54,7 +55,7 @@ TP_SIZE = 8
     "UMBP HiCache E2E only runs in the unified_kv_triton DSV4 nightly leg.",
 )
 class TestHiCacheStorageUMBPBackend(CustomTestCase):
-    """DeepSeek-V4 hybrid HostPoolGroup round trip through UMBP SSD."""
+    """DeepSeek-V4 hybrid HostPoolGroup round trip through UMBP DRAM."""
 
     input_ids = list(range(4000, 5024))
 
@@ -95,8 +96,6 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
             prefix="sglang-umbp-", dir="/tmp"
         )
         root = Path(cls.umbp_temp_dir.name)
-        cls.umbp_ssd_dir = root / "ssd"
-        cls.umbp_ssd_dir.mkdir()
         cls.umbp_address = f"unix://{root}/node.grpc.sock"
         cls.umbp_log_path = root / "umbp-server.log"
 
@@ -109,22 +108,29 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
             "UMBP_IO_ENGINE_PORT",
             "UMBP_PEER_SERVICE_PORT",
             "UMBP_BACKEND_POLICY",
+            "UMBP_DISTRIBUTED_MEDIUM",
+            "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE",
+            "UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES",
             "UMBP_STANDALONE_ADDRESS",
             "UMBP_STANDALONE_AUTO_START",
+            "UMBP_DRAM_CAPACITY",
+            "UMBP_EMBEDDED_DRAM_PAGE_SIZE",
+            "UMBP_SSD_ENABLED",
+            "UMBP_SSD_BACKEND",
+            "UMBP_SSD_DIR",
+            "UMBP_SSD_CAPACITY",
         ):
             server_env.pop(name, None)
+        # Without a distributed-medium selector, the standalone binary owns one
+        # embedded DRAM backend that every TP worker reaches through the UDS.
         server_env.update(
             {
                 "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
                 "UMBP_ROLE": "standalone",
-                "UMBP_DISTRIBUTED_MEDIUM": "SSD",
-                "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE": str(UMBP_STORAGE_PAGE_SIZE),
-                "UMBP_SSD_ENABLED": "1",
-                "UMBP_SSD_BACKEND": "file",
-                "UMBP_SSD_DIR": str(cls.umbp_ssd_dir),
-                "UMBP_SSD_CAPACITY": str(UMBP_SSD_CAPACITY),
+                "UMBP_DRAM_CAPACITY": str(UMBP_DRAM_CAPACITY),
+                "UMBP_EMBEDDED_DRAM_PAGE_SIZE": str(UMBP_DRAM_PAGE_SIZE),
+                "UMBP_SSD_ENABLED": "0",
                 "UMBP_DRAM_USE_HUGEPAGES": "0",
-                "UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES": "0",
                 "MORI_UMBP_LOG_LEVEL": "info",
                 "MORI_GLOBAL_LOG_LEVEL": "info",
             }
@@ -174,10 +180,8 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
     @classmethod
     def _launch_server(cls):
         storage_config = {
-            "dram_capacity_bytes": 1 * 1024 * 1024 * 1024,
-            "ssd_enabled": True,
-            "ssd_storage_dir": str(cls.umbp_ssd_dir),
-            "ssd_capacity_bytes": UMBP_SSD_CAPACITY,
+            "dram_capacity_bytes": UMBP_DRAM_CAPACITY,
+            "ssd_enabled": False,
         }
         other_args = [
             "--trust-remote-code",
@@ -223,7 +227,7 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         ]
 
         env = os.environ.copy()
-        # All TP ranks connect to the same out-of-process SSD backend. This is
+        # All TP ranks connect to the same out-of-process DRAM backend. This is
         # masterless and does not require an RDMA-capable CI runner. Empty
         # values mask stale parent settings when popen_launch_server merges
         # os.environ into this mapping again.
@@ -239,6 +243,7 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
                 "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
                 "UMBP_STANDALONE_AUTO_START": "0",
                 "UMBP_STANDALONE_STARTUP_TIMEOUT_MS": "60000",
+                "UMBP_SSD_ENABLED": "0",
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
@@ -267,11 +272,9 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
             if process is not None and process.poll() is None:
                 # Stop SGLang first so every TP client can deregister its shared
                 # memory before the standalone server exits.
-                process.terminate()
-                try:
-                    process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    kill_process_tree(process.pid)
+                terminate_and_kill_process_tree(
+                    process, terminate_timeout=60, wait_timeout=60
+                )
         finally:
             cls.process = None
             cls._stop_umbp_server()
@@ -281,11 +284,9 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         process = getattr(cls, "umbp_process", None)
         try:
             if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    kill_process_tree(process.pid, wait_timeout=10)
+                terminate_and_kill_process_tree(
+                    process, terminate_timeout=30, wait_timeout=10
+                )
         finally:
             cls.umbp_process = None
             log_handle = getattr(cls, "umbp_log_handle", None)
@@ -339,11 +340,15 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         second = self._generate()
         cached_details = second["meta_info"].get("cached_tokens_details") or {}
         storage_cached_tokens = int(cached_details.get("storage", 0))
+        expected_storage_cached_tokens = (
+            (len(self.input_ids) - 1) // PAGE_SIZE
+        ) * PAGE_SIZE
 
         self.assertGreaterEqual(
             storage_cached_tokens,
-            PAGE_SIZE,
-            "Expected DeepSeek-V4 side-pool KV to load from UMBP storage, "
+            expected_storage_cached_tokens,
+            "Expected the full page-aligned DeepSeek-V4 side-pool prefix to "
+            "load from UMBP storage, "
             f"got {cached_details=}",
         )
         self.assertEqual(cached_details.get("storage_backend"), "UMBPStore")
