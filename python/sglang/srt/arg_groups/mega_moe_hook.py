@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -36,11 +36,15 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
+    if not (
+        (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
+        or platform.is_hip
+    ):
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory."
+            "kernels over CUDA symmetric memory. On ROCm, set "
+            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
         )
 
 
@@ -98,6 +102,8 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
         return
+    if get_platform().is_hip:
+        return
 
     max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -137,11 +143,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size
-    elif cfg.enable_dp_attention:
-        token_partition_size = cfg.dp_size
-        token_partition_name = "dp_size"
+    elif attn_dp_enabled_of(cfg):
+        token_partition_size = cfg.attn_dp_size
+        token_partition_name = "attn_dp_size"
         token_alignment = max(
-            cfg.tp_size // cfg.dp_size // cfg.attn_cp_size,
+            cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size,
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size

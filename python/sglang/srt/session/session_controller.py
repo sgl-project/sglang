@@ -157,7 +157,7 @@ class Session:
             or carry_fill is input_ids_unpadded
         ):
             # Unexpected type or aliased with an origin array (extending it
-            # below would double-append): let _refresh_fill_ids rebuild.
+            # below would double-append): let refresh_fill_ids rebuild.
             carry_fill = None
         else:
             del carry_fill[self.committed_fill_len :]
@@ -423,7 +423,7 @@ class SessionController:
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
+            # reference so release_kv_cache takes the streaming path,
             # and we schedule release_session for after it completes.
             session.close_on_finish = True
             logger.info(
