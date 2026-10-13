@@ -407,3 +407,14 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.fused_kda_output_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.fla.fused_kda_output_quant:fused_kda_output_quant",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)

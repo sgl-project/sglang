@@ -21,6 +21,9 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     moe_sum_reduce_triton,
     support_tensor_descriptor,
 )
+from sglang.kernels.ops.moe.silu_and_mul_block_quant import (
+    silu_and_mul_block_quant_two_group,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -694,11 +697,33 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
+    use_native_fused_fp8_tail = (
+        not is_batch_invariant_mode_enabled()
+        and not fuse_swiglu_interleaved
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and _is_cuda
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and use_fp8_w8a8
+        and block_shape is not None
+        and len(block_shape) == 2
+        and block_shape[1] == 128
+        and a2_scale is None
+        and swiglu_limit is None
+        and hooks is None
+        and 128 < N // 2 < 256
+        and (N // 2) % 16 == 0
+    )
     if not fuse_swiglu_interleaved:
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        intermediate_cache2 = (
+            None
+            if use_native_fused_fp8_tail
+            else torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
     row_filter = _activation_row_filter(
@@ -741,6 +766,18 @@ def _fused_moe_kernel_sequence(
                     gemm1_alpha,
                     gemm1_limit,
                 )
+        elif use_native_fused_fp8_tail:
+            intermediate_cache2, a2_scale = silu_and_mul_block_quant_two_group(
+                intermediate_cache1.view(-1, N),
+                block_shape[1],
+                expert_ids=(
+                    (expert_ids if down_moe_use_tma else topk_ids.view(-1))
+                    if filter_expert
+                    else None
+                ),
+                expert_step=config["BLOCK_SIZE_M"] if down_moe_use_tma else 1,
+                routed_limit=gemm1_limit,
+            )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit

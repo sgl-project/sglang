@@ -31,6 +31,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
@@ -302,5 +313,23 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:silu_and_mul_contig_post_quant",
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_block_quant_two_group",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
+        capabilities=_CUDA,
     )
 )

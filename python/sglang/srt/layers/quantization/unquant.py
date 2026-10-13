@@ -128,6 +128,8 @@ _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
+_hopper_bf16_tiny_gemv = None
+_use_hopper_bf16_tiny_gemv = None
 _splitk_tactic = None
 _run_splitk_dense = None
 _direct_default_tactic = None
@@ -260,6 +262,14 @@ def initialize_bf16_gemm_config() -> None:
             raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        global _hopper_bf16_tiny_gemv, _use_hopper_bf16_tiny_gemv
+        from sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv import (
+            hopper_bf16_tiny_gemv,
+            use_hopper_bf16_tiny_gemv,
+        )
+
+        _hopper_bf16_tiny_gemv = hopper_bf16_tiny_gemv
+        _use_hopper_bf16_tiny_gemv = use_hopper_bf16_tiny_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
             hopper_bf16_gemv,
             use_hopper_bf16_gemv,
@@ -314,6 +324,21 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
+def _use_bf16_tiny_gemv(x: torch.Tensor, weight: torch.Tensor, bias) -> bool:
+    return (
+        get_bf16_gemm_backend().is_gemv()
+        and _use_hopper_bf16_tiny_gemv is not None
+        and bias is None
+        and x.is_cuda
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and _use_hopper_bf16_tiny_gemv(
+            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        )
+    )
+
+
 def _bf16_splitk_gemm_out(
     x_2d: torch.Tensor,
     weight: torch.Tensor,
@@ -357,6 +382,10 @@ def _bf16_gemm_dispatch_impl(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
+    elif _use_bf16_tiny_gemv(x, weight, bias):
+        output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
     elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
@@ -515,6 +544,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        elif _use_bf16_tiny_gemv(x, layer.weight, bias):
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         elif (
             get_bf16_gemm_backend().is_cutedsl()
