@@ -122,7 +122,7 @@ OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. The
 
 ## 2. Configuration Tips
 
-- Every generated command carries `--mamba-radix-cache-strategy extra_buffer`, the radix-cache strategy for the Gated DeltaNet hybrid backbone. The FP8 and INT4 commands also carry `--trust-remote-code` and `--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B` (see the note below).
+- Every generated command carries `--mamba-radix-cache-strategy extra_buffer`, the radix-cache strategy for the Gated DeltaNet hybrid backbone. The FP8 and INT4 commands also carry `--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B` (see the note below).
 - Every recipe runs on one GPU. On H100 the 35B-A3B BF16 checkpoint (about 66 GB of weights) does not fit the default static memory fraction of an 80 GB card; use FP8 or INT4 there.
 - Pick the quantization by platform. On H200, quantization is a speed win: at concurrency 16, INT4 and FP8 reach 15,808 and 15,280 tokens/s per GPU against 12,103 for BF16, and INT4 has the fastest 35B-A3B decode (TPOT 3.47 ms at concurrency 1). On GB300, BF16 and FP8 decode at about the same speed at concurrency 1 (TPOT 4.36 vs 4.44 ms), and FP8 pulls ahead at concurrency 16 (16,059 vs 14,094 tokens/s per GPU). INT4 is slower on GB300 at every concurrency (TPOT 8.56 ms at concurrency 1), so use it there only to save memory.
 - SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
@@ -133,7 +133,7 @@ OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. The
 - Image and video requests need no extra server flags.
 
 <Note>
-  The public FP8 and INT4 repos' `tokenizer_config.json` declares `auto_map.AutoProcessor = processing_minicpmv4_7.MiniCPMV4_7Processor`, but the repos do not ship that file, so loading their processor fails both with and without `--trust-remote-code`. The FP8 and INT4 commands therefore load the tokenizer and processor from the base repo with `--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B`, which has the same `tokenizer.json` and chat template. Keep the flag until OpenBMB updates the FP8 and INT4 repos to ship the file or drop the `auto_map` entry.
+  The public FP8 and INT4 repos' `tokenizer_config.json` declares `auto_map.AutoProcessor = processing_minicpmv4_7.MiniCPMV4_7Processor`, but the repos do not ship that file, so SGLang cannot load their processor. The FP8 and INT4 commands therefore load the tokenizer and processor from the base repo with `--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B`, which has the same `tokenizer.json` and chat template. Keep the flag until OpenBMB updates the FP8 and INT4 repos to ship the file or drop the `auto_map` entry.
 </Note>
 
 ## 3. Advanced Usage

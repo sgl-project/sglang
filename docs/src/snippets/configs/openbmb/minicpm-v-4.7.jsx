@@ -157,7 +157,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -172,7 +171,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -213,7 +211,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -228,7 +225,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -254,7 +250,6 @@ sgl-eval run gsm8k \\
       match: { hw: "h100", variant: "35b-a3b", quant: "fp8", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -268,7 +263,6 @@ sgl-eval run gsm8k \\
       match: { hw: "h100", variant: "35b-a3b", quant: "int4", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
