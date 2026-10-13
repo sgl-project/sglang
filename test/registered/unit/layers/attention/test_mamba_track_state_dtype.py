@@ -113,7 +113,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
             with self.subTest(backend=backend_type.__name__):
                 backend = object.__new__(backend_type)
                 starts = torch.tensor([0, 2, 4])
-                backend.forward_metadata = SimpleNamespace(query_start_loc=starts)
+                backend.forward_metadata = SimpleNamespace(
+                    query_start_loc=starts, conv_block_table=None
+                )
                 with patch.object(
                     module, "causal_conv1d_fn", return_value=qkv.T
                 ) as conv:
