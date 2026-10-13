@@ -3,7 +3,9 @@ payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path'
 
 from __future__ import annotations
 
+import functools
 import itertools
+import logging
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -36,6 +38,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4RowgroupDecodeWorkspace,
     FP4RowgroupPrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
+    aiter_has_fp4_rowgroup,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
     logits_rows_per_chunk,
@@ -64,6 +67,23 @@ if TYPE_CHECKING:
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _fp4_rowgroup_enabled() -> bool:
+    """SGLANG_HIP_FP4_INDEXER_ROWGROUP, off when the installed AITER has no row-group
+    kernel (ROCm/aiter#6145)."""
+    if not envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get():
+        return False
+    if not aiter_has_fp4_rowgroup():
+        logger.warning(
+            "SGLANG_HIP_FP4_INDEXER_ROWGROUP is set but the installed AITER has no "
+            "row-group FP4 MQA logits kernel (#6145); keeping the schedule kernels."
+        )
+        return False
+    return True
 
 
 def _score_requests_page8(
@@ -167,7 +187,7 @@ def build_low_ratio_decode_workspaces(
     requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
     score as one sequence, on a table as wide as ``max_context_len`` needs. A page8 pool
     is read by the row-group kernel only."""
-    rowgroup = envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get()
+    rowgroup = _fp4_rowgroup_enabled()
     workspaces = {}
     for ratio, meta in metadata_by_ratio.items():
         if not (rowgroup or ratio in page8_ratios):
