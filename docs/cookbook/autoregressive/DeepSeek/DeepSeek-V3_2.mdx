@@ -432,7 +432,7 @@ For production deployments (RBG / LWS-based, DeepEP EP parallelism), see [multi_
 Enable prefill context parallelism (CP) on CUDA with `--enable-prefill-cp --cp-strategy interleave` for long-sequence workloads.
 
 <Warning>
-Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for DeepSeek V3.2, GLM-5, GLM-5.1, GLM-5.2, and GLM-5.3. Use `interleave` for these models and keep `--attn-dp-size 1`; interleave DSA CP does not support `--attn-dp-size` greater than 1.
+Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for DeepSeek V3.2, GLM-5, GLM-5.1, GLM-5.2, and GLM-5.3. Use `interleave` for these models. Attention DP is supported, with `tp_size / attn_dp_size` CP ranks in each DP group. Dense FFNs retain their configured TP width; `--moe-dense-tp-size 1` selects local dense computation.
 </Warning>
 
 **Interleave** (`--cp-strategy interleave`): Distributes tokens by `token_idx % cp_size`. It supports fused MoE, FP8 KV cache, and multi-batch prefill.

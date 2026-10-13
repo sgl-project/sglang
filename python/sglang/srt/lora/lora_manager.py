@@ -75,8 +75,6 @@ class LoRAManager:
         dtype: torch.dtype,
         server_args: ServerArgs,
         lora_backend: str = "triton",
-        tp_size: int = 1,
-        tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
@@ -90,8 +88,6 @@ class LoRAManager:
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
-        self.tp_size: int = tp_size
-        self.tp_rank: int = tp_rank
         # Attention projections shard on the attn-TP group; extracted once
         # here (parallel groups are frozen after init_torch_distributed).
         self.attn_tp_size: int = get_parallel().attn_tp_size
@@ -1004,9 +1000,6 @@ class LoRAManager:
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
             dtype=self.dtype,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            attn_tp_size=self.attn_tp_size,
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,

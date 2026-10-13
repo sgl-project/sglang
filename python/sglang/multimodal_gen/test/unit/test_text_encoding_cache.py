@@ -232,6 +232,7 @@ def make_server_args(**kwargs):
         "model_path": "dummy-model",
         "backend": "auto",
         "model_id": None,
+        "explicit_residency_mode": lambda _: None,
         "pipeline_config": SimpleNamespace(text_encoder_configs=[]),
     }
     defaults.update(kwargs)
