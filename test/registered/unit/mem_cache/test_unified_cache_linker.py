@@ -940,6 +940,7 @@ def test_pp_load_uses_normal_request_insert_and_release(
     if holds_row:
         cache.req_to_token_pool.alloc([req])
     available_rows = cache.req_to_token_pool.available_size()
+    watermarks = (req.kv.kv_allocated_len, req.kv.kv_committed_len)
     loaded_len, last_node = cache.linker.load_back(req)
 
     assert loaded_len == 4
@@ -948,6 +949,8 @@ def test_pp_load_uses_normal_request_insert_and_release(
     assert cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len == 0
     assert cache.req_to_token_pool.available_size() == available_rows
     assert req.rid in cache.linker.private_load_indices
+    # The extend allocator owns these clocks, even when PP reuses a row.
+    assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == watermarks
 
     req.prefix_len = loaded_len
     req.extend_end = 5

@@ -455,12 +455,11 @@ class UnifiedCacheLinkerWrapper:
         if cache.pp_size > 1 and req.kv is not None and req.kv.holds_kv:
             # A later PP chunk already owns a row; the extend allocator reads
             # its prefix from that row instead of private_load_indices.
+            # Allocation settles the KV watermarks after consuming this row.
             cache.req_to_token_pool.write(
                 (req.kv.req_pool_idx, slice(device_hit_len, prefix_len)),
                 full_transfer.device_indices,
             )
-            req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, prefix_len)
-            req.kv.kv_committed_len = max(req.kv.kv_committed_len, prefix_len)
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
