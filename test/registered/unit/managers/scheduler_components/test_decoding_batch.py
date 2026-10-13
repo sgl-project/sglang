@@ -57,6 +57,28 @@ def _rids(batch):
     return [r.rid for r in batch.reqs]
 
 
+class _Step(_Batch):
+    """A launched step: its mode, decode-row count and request still chunking."""
+
+    def __init__(self, *rids, mode, num_decode_rows=0, chunked=None, finished=()):
+        super().__init__(*rids, finished=finished)
+        self.forward_mode = mode
+        self.num_decode_rows = num_decode_rows
+        self.chunked_req = next((r for r in self.reqs if r.rid == chunked), None)
+
+    @property
+    def first_decode_row(self):
+        return len(self.reqs) - self.num_decode_rows
+
+    def has_prefill_rows(self):
+        return self.forward_mode.is_extend() and self.num_decode_rows < len(self.reqs)
+
+    def shallow_copy(self):
+        copy = _Batch()
+        copy.reqs = self.reqs[:]
+        return copy
+
+
 class TestDecodingBatch(CustomTestCase):
     def test_join_appends_after_the_rows_and_empty_rows_take_the_batch(self):
         decoding_batch = DecodingBatch(_Batch())
@@ -73,6 +95,42 @@ class TestDecodingBatch(CustomTestCase):
         decoding_batch = DecodingBatch(rows)
         decoding_batch.leave([rows.reqs[0]])
         self.assertEqual(_rids(rows), ["b", "d"])
+
+    def test_launched_prefill_joins_after_the_rows_but_the_chunking_request(self):
+        decoding_batch = DecodingBatch(_Batch("a", "b"))
+        step = _Step("c", "d", "e", mode=ForwardMode.EXTEND, chunked="d")
+        decoding_batch.join_launched(step)
+        self.assertEqual(_rids(decoding_batch.rows), ["a", "b", "c", "e"])
+        # The step keeps its rows: the commit reads them.
+        self.assertEqual(_rids(step), ["c", "d", "e"])
+
+        # The chunk that ends the request: it joins.
+        decoding_batch.join_launched(_Step("d", mode=ForwardMode.EXTEND))
+        self.assertEqual(_rids(decoding_batch.rows), ["a", "b", "c", "e", "d"])
+
+    def test_launched_mixed_step_rows_replace_the_rows_new_first(self):
+        # A mixed step ran the rows as its tail: the rows become its rows,
+        # [new, old], as if they had joined an empty batch.
+        rows = _Batch("a", "b")
+        decoding_batch = DecodingBatch(rows)
+        step = _Step(
+            "c", "d", "a", "b", mode=ForwardMode.MIXED, num_decode_rows=2, chunked="d"
+        )
+        decoding_batch.join_launched(step)
+        self.assertIsNot(decoding_batch.rows, rows)
+        self.assertEqual(_rids(decoding_batch.rows), ["c", "a", "b"])
+
+    def test_launched_decode_step_joins_nothing(self):
+        rows = _Batch("a", "b")
+        decoding_batch = DecodingBatch(rows)
+        for step in (
+            _Step("a", "b", mode=ForwardMode.DECODE),
+            # The DP extend view of a decode step: every row decodes.
+            _Step("a", "b", mode=ForwardMode.EXTEND, num_decode_rows=2),
+        ):
+            decoding_batch.join_launched(step)
+            self.assertIs(decoding_batch.rows, rows)
+            self.assertEqual(_rids(rows), ["a", "b"])
 
     def test_park_for_mix_hands_the_rows_to_the_mixed_step(self):
         rows = _Batch("a", "b")

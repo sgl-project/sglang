@@ -8,6 +8,10 @@ keep it, so a reference to ``rows`` stays valid across them.
 Under get_next_batch_to_run a decode step is a copy of the rows, and ``absorb``
 takes back what its run and commit rebound before the next plan. PD decode and
 pdmux still launch the rows themselves.
+
+The normal and overlap loops join and leave at launch and commit
+(``rows_join_at_launch``), so between their steps the rows are exactly the
+requests still decoding.
 """
 
 from __future__ import annotations
@@ -41,6 +45,25 @@ class DecodingBatch:
             batch.sampling_info.penalizer_orchestrator.batch = batch
         else:
             self.rows.merge_batch(batch)
+
+    def join_launched(self, step: ScheduleBatch) -> None:
+        """Join a copy of the rows whose last prefill chunk step ran: all of
+        its rows but the request still chunking. A mixed step ran the rows as
+        its tail, so its rows, new before old, replace them."""
+        if not step.has_prefill_rows():
+            return
+        still_chunking = [] if step.chunked_req is None else [step.chunked_req]
+        joined = step.shallow_copy()
+        joined.filter_batch(reqs_to_exclude=still_chunking)
+        if step.forward_mode.is_mixed():
+            if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
+                tail = step.reqs[step.first_decode_row :]
+                assert len(tail) == len(self.rows.reqs) and all(
+                    a is b for a, b in zip(tail, self.rows.reqs)
+                ), "a mixed step's decode rows are not the running rows"
+            self.rows = ScheduleBatch(reqs=[])
+        if not joined.is_empty():
+            self.join(joined)
 
     def leave(self, reqs: List[Req]) -> None:
         """Drop reqs and every finished row."""
@@ -105,8 +128,8 @@ class DecodingBatch:
         ), f"decode step came back as {step.forward_mode}"
 
     def park_for_mix(self) -> None:
-        """Hand the rows to a mixed step: they run inside that step's batch,
-        which the next plan joins back."""
+        """Hand the rows to a mixed step, for a loop that joins at the next
+        plan: they run inside that step's batch, which that plan joins back."""
         self.rows = ScheduleBatch(reqs=[])
 
     def clear_for_pause(self) -> None:

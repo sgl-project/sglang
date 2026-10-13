@@ -195,7 +195,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
-        get_last_batch=lambda: None,
+        get_cur_batch=lambda: None,
         get_running_and_inflight_batches=lambda: [],
         scheduler_stage_metrics=None,
     )
@@ -287,7 +287,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         pool_stats_observer=SimpleNamespace(
             session_held_mamba_slots=lambda: 0,
         ),
-        get_last_batch=lambda: None,
+        get_cur_batch=lambda: None,
         get_running_and_inflight_batches=lambda: [],
         scheduler_stage_metrics=None,
     )

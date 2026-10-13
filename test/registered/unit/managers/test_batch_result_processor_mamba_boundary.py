@@ -128,13 +128,15 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler._apply_war_barrier = MagicMock()
                 scheduler.is_generation = False
                 scheduler.last_batch = None
+                scheduler.enable_hisparse = False
+                scheduler.dllm_config = None
                 scheduler.recv_skipper = None
 
                 plan_count = 0
 
-                def get_next_batch_to_run(*, decoding_batch, last_batch):
+                def get_next_batch_to_run(*, decoding_batch):
                     nonlocal plan_count
-                    del decoding_batch, last_batch
+                    del decoding_batch
                     plan_count += 1
                     if plan_count == 1:
                         batch.prepare_for_decode()

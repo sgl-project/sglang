@@ -296,7 +296,7 @@ class _ContextStub:
 
 
 class _SchedulerStub:
-    _collect_inflight_batches = Scheduler._collect_inflight_batches
+    _collect_inflight_req_list = Scheduler._collect_inflight_req_list
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
 
     def __init__(
@@ -313,6 +313,7 @@ class _SchedulerStub:
         self.inflight_steps = InflightQueue(depth=1)
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
+        self.rows_join_at_launch = False
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
