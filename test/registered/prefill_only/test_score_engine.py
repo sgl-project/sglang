@@ -30,6 +30,39 @@ register_cuda_ci(est_time=101, stage="base-b", runner_config="1-gpu-small")
 
 _CAUSAL_LM_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 _SEQCLS_MODEL = os.environ.get("TEST_CLASSIFICATION_BASE_MODEL", "Qwen/Qwen3-0.6B")
+_PLACEHOLDER = 50
+
+
+def _embed_override_case(engine, num_items):
+    """Token-id inputs with placeholders, and their override vectors (CPU)."""
+    hidden = engine.tokenizer_manager.model_config.hidden_size
+    gen = torch.Generator().manual_seed(0)
+    query = [_PLACEHOLDER, 1000, _PLACEHOLDER, 1001]
+    items = [[2000 + i, _PLACEHOLDER, 3000 + i] for i in range(num_items)]
+    query_vecs = 0.02 * torch.randn(2, hidden, generator=gen)
+    item_vecs = [0.02 * torch.randn(1, hidden, generator=gen) for _ in items]
+    return query, items, query_vecs, item_vecs
+
+
+def _assert_stacked_matches_by_value(test, engine, stacked, **kwargs):
+    """Stacked GPU overrides score like per-placeholder CPU vectors, through the pool."""
+    query, items, query_vecs, item_vecs = _embed_override_case(engine, 3)
+    kwargs.update(query=query, items=items, apply_softmax=True)
+    without = engine.score(**kwargs).scores
+    by_value = engine.score(
+        embed_override_token_id=_PLACEHOLDER,
+        query_embed_overrides=list(query_vecs),
+        item_embed_overrides=[list(v) for v in item_vecs],
+        **kwargs,
+    ).scores
+    actual = engine.score(
+        embed_override_token_id=_PLACEHOLDER,
+        stacked_query_item_embed_overrides=stacked(query_vecs, item_vecs),
+        **kwargs,
+    ).scores
+    torch.testing.assert_close(torch.tensor(actual), torch.tensor(by_value))
+    test.assertIsNotNone(engine.tokenizer_manager.positional_embeds_transport._pool)
+    test.assertFalse(torch.allclose(torch.tensor(actual), torch.tensor(without)))
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +312,14 @@ class TestCausalLMScoring(CustomTestCase):
                 torch.tensor(cold), torch.tensor(warm), atol=1e-3, rtol=1e-2
             )
 
+    def test_stacked_embed_overrides_match_by_value(self):
+        _assert_stacked_matches_by_value(
+            self,
+            self.engine,
+            lambda q, its: [torch.cat([q, it]).cuda() for it in its],
+            label_token_ids=[33, 32],
+        )
+
 
 # ---------------------------------------------------------------------------
 # SequenceClassification — single-item mode
@@ -466,6 +507,11 @@ class TestSeqClsMISScoring(CustomTestCase):
         for row in scores:
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
+
+    def test_mis_stacked_embed_overrides_match_by_value(self):
+        _assert_stacked_matches_by_value(
+            self, self.engine, lambda q, its: [torch.cat([q, *its]).cuda()]
+        )
 
 
 # ---------------------------------------------------------------------------

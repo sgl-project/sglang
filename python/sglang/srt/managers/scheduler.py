@@ -2140,6 +2140,13 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            # Before any early exit, so every request releases its CUDA IPC pool slot.
+            for tokenized_req in self._tokenized_requests(recv_req):
+                if tokenized_req.positional_embed_overrides is not None:
+                    tokenized_req.positional_embed_overrides.reconstruct(
+                        get_device().gpu_id
+                    )
+
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)

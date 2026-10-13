@@ -1,23 +1,20 @@
 """
-SGLang Score API — Stacked-Embedding CUDA-IPC Benchmark (Engine API)
+SGLang Score API: stacked GPU embedding overrides vs per-placeholder CPU vectors (Engine API)
 
 Companion to ``bench_score.py`` (which load-tests the HTTP ``/v1/score`` endpoint).
-The zero-copy stacked-embedding transport passes GPU tensor views plus a CUDA IPC
-handle to the scheduler, which cannot travel over the HTTP/JSON API — so this
-benchmark drives the in-process ``sglang.Engine`` directly.
+GPU tensors cannot travel over the HTTP/JSON API, so this benchmark drives the
+in-process ``sglang.Engine`` directly.
 
 What it does
 ------------
-1. Launches a single-process ``Engine`` (tp_size must be 1 for zero-copy IPC).
+1. Launches an ``Engine`` with ``--tp-size``.
 2. Synthesizes (query, items) token sequences with ``--placeholder-token-id``
    markers where embeddings are injected (seeded; no external dataset).
-3. Allocates ONE shared GPU buffer (the "pool"), stacks each sequence's override
-   vectors into a contiguous view, exports the pool's CUDA IPC handle, and scores
-   via the stacked path.
-4. Scores the same inputs via the by-value ``query_/item_embed_overrides`` path and
-   asserts the returned scores match (within --atol/--rtol) -> correctness proof.
-   Both paths inject the SAME vectors, so their values don't matter to the proof.
-5. Times both paths over the dataset and prints latency percentiles + throughput.
+3. Scores each sample with ``query_/item_embed_overrides`` (CPU vectors, sent by
+   value) and with ``stacked_query_item_embed_overrides`` (one GPU tensor per
+   sequence, sent through the tokenizer's CUDA IPC pool), and asserts the scores
+   match within --atol/--rtol.
+4. Times both paths over the dataset and prints latency percentiles + throughput.
 
 Usage
 -----
@@ -109,6 +106,7 @@ def parse_args() -> argparse.Namespace:
         help="Relative tolerance for score equivalence.",
     )
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--tp-size", type=int, default=1)
     p.add_argument("--mem-fraction-static", type=float, default=0.6)
     p.add_argument(
         "--skip-perf", action="store_true", help="Only run the equivalence check."
@@ -202,47 +200,14 @@ def build_byvalue_inputs(sample: dict, ph: int, ov: OverrideVectors):
     return query_embed_overrides, item_embed_overrides, (q_master, item_masters)
 
 
-def pool_rows_needed(sample: dict, ph: int) -> int:
-    q_ph = count_placeholders(sample["query"], ph)
-    total = 0
-    for it in sample["items"]:
-        m = count_placeholders(it, ph)
-        if q_ph + m > 0:
-            total += q_ph + m
-    return total
-
-
-def build_stacked_pool(
-    sample: dict, masters, pool: torch.Tensor
-) -> Tuple[List[Optional[torch.Tensor]], object]:
-    """Pack per-item [Q+M_i, hidden] stacked views into `pool` (one shared buffer).
-
-    Row order per item = query rows first, then that item's rows (matches
-    TokenizerManagerScoreMixin._build_token_id_inputs_stacked). Returns
-    (stacked_list, ipc_handle).
-    """
+def build_stacked_inputs(masters) -> List[Optional[torch.Tensor]]:
+    """One [Q+M_i, hidden] GPU tensor per item, query rows first."""
     q_master, item_masters = masters
-    q_ph = q_master.shape[0]
-
     stacked: List[Optional[torch.Tensor]] = []
-    offset = 0
-    for i in range(len(sample["items"])):
-        m = item_masters[i].shape[0]
-        rows = q_ph + m
-        if rows == 0:
-            stacked.append(None)
-            continue
-        view = pool[offset : offset + rows]  # a view into the single shared buffer
-        if q_ph:
-            view[:q_ph].copy_(q_master.to(pool.device))
-        if m:
-            view[q_ph:].copy_(item_masters[i].to(pool.device))
-        stacked.append(view)
-        offset += rows
-
-    handle = pool.untyped_storage()._share_cuda_()  # ONE handle for the whole pool
-    torch.cuda.synchronize()  # producer-sync contract: writes complete before handoff
-    return stacked, handle
+    for im in item_masters:
+        rows = torch.cat([q_master, im])
+        stacked.append(rows.cuda() if rows.shape[0] else None)
+    return stacked
 
 
 def scores_close(a, b, atol: float, rtol: float) -> Tuple[bool, float]:
@@ -258,10 +223,10 @@ def main() -> int:
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    print(f"[init] launching Engine: {args.model_path} (tp_size=1)")
+    print(f"[init] launching Engine: {args.model_path} (tp_size={args.tp_size})")
     engine = sgl.Engine(
         model_path=args.model_path,
-        tp_size=1,
+        tp_size=args.tp_size,
         mem_fraction_static=args.mem_fraction_static,
         disable_cuda_graph=True,
         disable_radix_cache=True,
@@ -285,17 +250,9 @@ def main() -> int:
         ov = OverrideVectors(hidden, args.seed)
 
         prepared = []
-        max_rows = 1
         for s in samples:
             qbv, ibv, masters = build_byvalue_inputs(s, ph, ov)
-            prepared.append((s, qbv, ibv, masters))
-            max_rows = max(max_rows, pool_rows_needed(s, ph))
-
-        pool = torch.empty(max_rows, hidden, dtype=torch.float32, device="cuda")
-        print(
-            f"[pool] shared GPU buffer [{max_rows}, {hidden}] float32 "
-            f"({pool.numel() * 4 / 1e6:.2f} MB); one CUDA IPC handle reused per call"
-        )
+            prepared.append((s, qbv, ibv, build_stacked_inputs(masters)))
 
         def run_byvalue(s, qbv, ibv):
             return engine.score(
@@ -308,25 +265,25 @@ def main() -> int:
                 apply_softmax=False,
             )
 
-        def run_stacked(s, masters):
-            stacked, handle = build_stacked_pool(s, masters, pool)
+        def run_stacked(s, stacked):
             return engine.score(
                 query=s["query"],
                 items=s["items"],
                 label_token_ids=label_ids,
                 embed_override_token_id=ph,
                 stacked_query_item_embed_overrides=stacked,
-                stacked_query_item_embed_ipc_handle=handle,
                 apply_softmax=False,
             )
 
         # ---- Equivalence ----
-        print("\n[equivalence] comparing by-value vs stacked-IPC scores ...")
+        print("\n[equivalence] comparing by-value vs stacked scores ...")
         n_ok, worst = 0, 0.0
-        for idx, (s, qbv, ibv, masters) in enumerate(prepared):
+        for idx, (s, qbv, ibv, stacked) in enumerate(prepared):
             r_bv = run_byvalue(s, qbv, ibv)
-            r_ipc = run_stacked(s, masters)
-            ok, max_abs = scores_close(r_bv.scores, r_ipc.scores, args.atol, args.rtol)
+            r_stacked = run_stacked(s, stacked)
+            ok, max_abs = scores_close(
+                r_bv.scores, r_stacked.scores, args.atol, args.rtol
+            )
             worst = max(worst, max_abs)
             n_ok += int(ok)
             if not ok:
@@ -342,14 +299,14 @@ def main() -> int:
 
             def bench(fn) -> List[float]:
                 for _ in range(args.warmup):
-                    for s, qbv, ibv, masters in prepared:
-                        fn(s, qbv, ibv, masters)
+                    for s, qbv, ibv, stacked in prepared:
+                        fn(s, qbv, ibv, stacked)
                 torch.cuda.synchronize()
                 out = []
                 for _ in range(args.iters):
                     t0 = time.perf_counter()
-                    for s, qbv, ibv, masters in prepared:
-                        fn(s, qbv, ibv, masters)
+                    for s, qbv, ibv, stacked in prepared:
+                        fn(s, qbv, ibv, stacked)
                     torch.cuda.synchronize()
                     out.append((time.perf_counter() - t0) * 1e3)
                 return out
@@ -358,8 +315,8 @@ def main() -> int:
                 f"\n[perf] warmup={args.warmup} iters={args.iters} "
                 f"({len(prepared)} score calls / iter)"
             )
-            bv_ms = bench(lambda s, qbv, ibv, masters: run_byvalue(s, qbv, ibv))
-            ipc_ms = bench(lambda s, qbv, ibv, masters: run_stacked(s, masters))
+            bv_ms = bench(lambda s, qbv, ibv, stacked: run_byvalue(s, qbv, ibv))
+            stacked_ms = bench(lambda s, qbv, ibv, stacked: run_stacked(s, stacked))
 
             def summarize(name, ms):
                 srt = sorted(ms)
@@ -375,9 +332,9 @@ def main() -> int:
 
             print("[perf] per-iteration wall time over the dataset:")
             m_bv = summarize("by-value", bv_ms)
-            m_ipc = summarize("stacked-ipc", ipc_ms)
-            if m_ipc > 0:
-                print(f"[perf] stacked-ipc speedup vs by-value: {m_bv / m_ipc:.2f}x")
+            m_stacked = summarize("stacked", stacked_ms)
+            if m_stacked > 0:
+                print(f"[perf] stacked speedup vs by-value: {m_bv / m_stacked:.2f}x")
 
         print("\n[result] EQUIVALENCE " + ("PASS" if all_ok else "FAIL"))
         return 0 if all_ok else 1

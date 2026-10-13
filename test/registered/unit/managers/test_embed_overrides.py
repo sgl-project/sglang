@@ -237,16 +237,15 @@ class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
 class _FakeServerArgs:
     """Minimal stub for server_args."""
 
-    def __init__(self, enable_mis=False, tp_size=1):
+    def __init__(self, enable_mis=False):
         self.enable_mis = enable_mis
-        self.tp_size = tp_size
 
 
 class _FakeMixin(TokenizerManagerScoreMixin):
     """Minimal stub to call mixin methods without a full TokenizerManager."""
 
-    def __init__(self, enable_mis=False, tp_size=1):
-        self.server_args = _FakeServerArgs(enable_mis, tp_size)
+    def __init__(self, enable_mis=False):
+        self.server_args = _FakeServerArgs(enable_mis)
         self.tokenizer = None
         self.is_generation = True
 
@@ -544,35 +543,12 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
 
 def _stacked(n_rows: int, val: float = 1.0) -> torch.Tensor:
-    """Create an [n_rows, HIDDEN_DIM] pre-stacked embed tensor."""
     return torch.full((n_rows, HIDDEN_DIM), val, dtype=torch.float32)
 
 
 class TestBuildTokenIdInputsStacked(CustomTestCase):
-    """Cover the stacked path where embeds arrive already stacked per sequence and are
-    used as-is (no restack) while positions are computed from the tokens."""
-
     def setUp(self):
-        self.mixin = _FakeMixin(enable_mis=True)
-
-    def test_single_item_stacked_used_as_is(self):
-        # query placeholder at pos 0; item placeholder at pos 3 (query_len 2 + idx 1).
-        stacked = _stacked(2, 7.0)
-        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 50]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
-            stacked_query_item_embed_overrides=[stacked],
-        )
-        self.assertEqual(input_ids, [[50, 10, 20, 50]])
-        self.assertEqual(len(pe_overrides), 1)
-        self.assertEqual(pe_overrides[0].positions, [0, 3])
-        # Used as-is: the exact tensor is forwarded, not restacked/copied.
-        self.assertIs(pe_overrides[0].embeds, stacked)
+        self.mixin = _FakeMixin()
 
     def test_single_item_stacked_none_slot(self):
         stacked = _stacked(2, 5.0)
@@ -745,16 +721,6 @@ class TestScoreRequestValidation(CustomTestCase):
                 item_embed_overrides=[[_vec(1)]],  # 1 override for 2 items
             )
 
-    def test_embed_override_token_id_required_with_stacked_embeds(self):
-        with self.assertRaisesRegex(ValueError, "embed_override_token_id is required"):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4]],
-                label_token_ids=[100],
-                stacked_query_item_embed_overrides=[_vec2d(1)],
-                embed_override_token_id=None,
-            )
-
     def test_stacked_mutually_exclusive_with_per_override_embeds(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             self._call(
@@ -764,18 +730,6 @@ class TestScoreRequestValidation(CustomTestCase):
                 embed_override_token_id=50,
                 query_embed_overrides=[_vec(1)],
                 stacked_query_item_embed_overrides=[_vec2d(1)],
-            )
-
-    def test_stacked_ipc_handle_requires_stacked_overrides(self):
-        with self.assertRaisesRegex(
-            ValueError, "stacked_query_item_embed_ipc_handle requires"
-        ):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_ipc_handle=("fake-handle",),
             )
 
     def test_stacked_length_too_few_raises_single_item(self):
@@ -800,79 +754,32 @@ class TestScoreRequestValidation(CustomTestCase):
                 items=[[3, 4]],
                 label_token_ids=[100],
                 embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[
-                    _vec2d(1),
-                    _vec2d(1),
-                ],  # 2 for 1 item
+                stacked_query_item_embed_overrides=[_vec2d(1), _vec2d(1)],
             )
 
     def test_stacked_length_mismatch_raises_multi_item(self):
-        # Multi-item scoring: expected exactly one fused stacked tensor.
-        # score_request reads MIS from the published runtime context
-        # (get_exec().features.enable_mis), so publish a MIS-enabled ServerArgs
-        # rather than relying on the mixin's server_args stub.
+        # score_request reads --enable-mis from the published context, not the stub.
         reset_context()
         publish(ServerArgs(model_path="dummy", enable_mis=True), role="tokenizer")
         with self.assertRaisesRegex(
             ValueError, "stacked_query_item_embed_overrides length"
         ):
-            import asyncio
-
-            asyncio.run(
-                self.mixin.score_request(
-                    query=[1, 2],
-                    items=[[3, 4], [5, 6]],
-                    label_token_ids=[100],
-                    embed_override_token_id=50,
-                    stacked_query_item_embed_overrides=[_vec2d(1), _vec2d(1)],  # want 1
-                )
+            self._call(
+                query=[1, 2],
+                items=[[3, 4], [5, 6]],
+                label_token_ids=[100],
+                embed_override_token_id=50,
+                stacked_query_item_embed_overrides=[_vec2d(1), _vec2d(1)],  # want 1
             )
 
-    def test_stacked_str_items_no_spurious_length_error(self):
-        # items='doc' is ONE item (a str), not 3 char-items; one stacked override must
-        # pass the length guard. str + embeds is unsupported downstream, so the call
-        # raises "Invalid combination" — but never a stacked-length mismatch (which is
-        # what a buggy len(str)==3 guard would raise).
-        with self.assertRaises(ValueError) as ctx:
+    def test_stacked_rejects_str_inputs(self):
+        with self.assertRaisesRegex(ValueError, "requires token-id query/items"):
             self._call(
                 query="q",
                 items="doc",
                 label_token_ids=[100],
                 embed_override_token_id=50,
                 stacked_query_item_embed_overrides=[_vec2d(1)],
-            )
-        self.assertNotIn(
-            "stacked_query_item_embed_overrides length", str(ctx.exception)
-        )
-
-    def test_stacked_ipc_handle_rejected_with_tp_gt_1(self):
-        mixin = _FakeMixin(tp_size=2)
-        with self.assertRaisesRegex(ValueError, r"not supported with tp_size>1"):
-            import asyncio
-
-            asyncio.run(
-                mixin.score_request(
-                    query=[1, 2],
-                    items=[[3, 4]],
-                    label_token_ids=[100],
-                    embed_override_token_id=50,
-                    stacked_query_item_embed_overrides=[_vec2d(1)],
-                    stacked_query_item_embed_ipc_handle=("fake-handle",),
-                )
-            )
-
-    def test_stacked_ipc_handle_rejects_non_cuda_override(self):
-        # Provenance guard: a CPU (or otherwise non-view) override with an IPC handle
-        # would read unrelated memory after handle-only pickling — reject up front.
-        # _vec2d builds a CPU tensor, so this fires without needing a GPU.
-        with self.assertRaisesRegex(ValueError, "must be CUDA tensors"):
-            self._call(
-                query=[1, 2],
-                items=[[3, 4]],
-                label_token_ids=[100],
-                embed_override_token_id=50,
-                stacked_query_item_embed_overrides=[_vec2d(1)],
-                stacked_query_item_embed_ipc_handle=("fake-handle",),
             )
 
 
