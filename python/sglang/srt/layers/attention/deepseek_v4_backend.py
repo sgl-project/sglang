@@ -2785,7 +2785,7 @@ class DeepseekV4AttnBackend(
         )
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
-            if self.enable_decoder_swa_bounded_replay
+            if getattr(self, "enable_decoder_swa_bounded_replay", False)
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
@@ -2848,7 +2848,7 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
-            if self.enable_decoder_swa_bounded_replay
+            if getattr(self, "enable_decoder_swa_bounded_replay", False)
             and metadata_batch.forward_mode.is_extend_without_speculative()
             else None
         )
