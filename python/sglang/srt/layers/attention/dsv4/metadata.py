@@ -212,32 +212,15 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_fp4_varlen = (
-                self.compress_ratio in (1, 2)
-                and self.compressed_seq_lens.is_cuda
-                and torch.cuda.get_device_capability(self.compressed_seq_lens.device)[0]
-                == 10
-            )
             use_jit_indexer = (
                 not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                     or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-                ))
-            if use_fp4_varlen:
-
-                def get_paged_mqa_logits_metadata(context_lens, page_size, num_sms):
-                    indices = torch.arange(
-                        context_lens.shape[0],
-                        dtype=torch.int32,
-                        device=context_lens.device,
-                    )
-                    return deep_gemm.get_paged_mqa_logits_metadata(
-                        context_lens, page_size, num_sms, indices=indices
-                    )
-
-            elif use_jit_indexer:
+                )
+            )
+            if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
                     get_paged_mqa_logits_metadata,
                 )
