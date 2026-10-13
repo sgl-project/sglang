@@ -113,7 +113,16 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
 
 
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+    # Without the fused branch the fallback re-materializes the bf16 weight in
+    # fp32 on every call. For the DSv4 compressor wkv_gate (bf16 2048x4096 in
+    # CSA layers) that is a 32 MiB fp32 copy plus a 4x larger weight read, per
+    # layer, per decode step. The pinned torch==2.13.0+xpu registers the XPU
+    # kernel for aten::mm.dtype, so XPU takes the fused branch too.
+    if (
+        (x.is_cuda or x.is_xpu)
+        and x.dtype == torch.bfloat16
+        and y.dtype == torch.bfloat16
+    ):
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 
