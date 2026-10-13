@@ -976,7 +976,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
 
         new_batch = MagicMock()
-        new_batch.is_empty.return_value = False
+        new_batch.dsv41_cache_only_replay = False
         new_batch.is_empty.return_value = False
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
@@ -1027,6 +1027,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
 
         new_batch = MagicMock()
+        new_batch.dsv41_cache_only_replay = False
         new_batch.is_empty.return_value = False
         with patch(
             "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
@@ -1257,6 +1258,7 @@ class TestDecodePrebuilt(unittest.TestCase):
                 ).reshape(1, 512)
 
                 new_batch = MagicMock()
+                new_batch.dsv41_cache_only_replay = False
                 new_batch.is_empty.return_value = False
                 with patch(
                     "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
@@ -1314,6 +1316,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         ).reshape(1, 512)
 
         new_batch = MagicMock()
+        new_batch.dsv41_cache_only_replay = False
         new_batch.is_empty.return_value = False
         with patch(
             "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
@@ -1338,7 +1341,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         call_order = []
         new_batch = MagicMock()
-        new_batch.is_empty.return_value = False
+        new_batch.dsv41_cache_only_replay = False
         new_batch.is_empty.return_value = False
         new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
             "prepare"
