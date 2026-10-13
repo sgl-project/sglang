@@ -638,6 +638,10 @@ def _ensure_shared_workspace(mega: Any) -> None:
     shared = workspaces.get(key)
     if shared is None:
         workspaces[key] = mega._ensure_workspace()
+        logger.info(
+            "FlashInfer MegaMOE: created a workspace for max_tokens_per_rank=%d",
+            fp.max_tokens_per_rank,
+        )
     else:
         mega._workspace = shared
 
