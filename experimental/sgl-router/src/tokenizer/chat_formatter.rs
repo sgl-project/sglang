@@ -263,7 +263,8 @@ impl ChatFormatter {
         }
     }
 
-    /// Kimi-K3 encodes in the checkpoint's chunks, and its OpenAI layer stays on the engine.
+    /// Kimi-K3 encodes in the checkpoint's chunks, and its OpenAI layer applies K3's rules
+    /// (`chat_encoding_spec`).
     pub fn is_kimi_k3(&self) -> bool {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
