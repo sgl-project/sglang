@@ -205,10 +205,14 @@ class TestRunningTimeout(CustomTestCase):
                 s = _scheduler([], last_batch_reqs=[last_req])
                 s.enable_continuous_input_polling = pp_size == 1
                 s.running_mbs = [s.running_batch]
-                s.mbs = [s.last_batch, _batch([older])]
                 if pp_size == 1:
                     s.inflight_steps.push(_batch([older]), None)
                     s.inflight_steps.push(_batch([newer]), None)
+                else:
+                    s.inflight_steps = InflightQueue(depth=1, ring=True)
+                    s.inflight_steps.push(s.last_batch, None)
+                    s.inflight_steps.end_step()
+                    s.inflight_steps.push(_batch([older]), None)
 
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
                     aborts = s._poll_timeout_aborts()
@@ -219,7 +223,7 @@ class TestRunningTimeout(CustomTestCase):
                     [a.rid for a in aborts],
                     ["older", "newer"] if pp_size == 1 else ["newer", "older"],
                 )
-                self.assertEqual(len(s.inflight_steps), 2 if pp_size == 1 else 0)
+                self.assertEqual(len(s.inflight_steps), 2)
 
     def test_unset_forward_entry_time_is_never_emitted(self):
         s = _scheduler([], running_reqs=[_req("unstamped", forward_entry=0.0)])

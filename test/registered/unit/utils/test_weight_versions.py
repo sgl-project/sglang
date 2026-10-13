@@ -378,7 +378,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             SimpleNamespace(reqs=[mb0_req]),
             SimpleNamespace(reqs=[mb1_req]),
         ]
-        scheduler.mbs = [None, SimpleNamespace(reqs=[pending_req])]
+        scheduler.inflight_steps = InflightQueue(depth=1, ring=True)
+        scheduler.inflight_steps.push(None, None)
+        scheduler.inflight_steps.end_step()
+        scheduler.inflight_steps.push(SimpleNamespace(reqs=[pending_req]), None)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
