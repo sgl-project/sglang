@@ -1,13 +1,13 @@
 import sgl_kernel_npu  # noqa: F401
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFABackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
-    AscendFABackend,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
