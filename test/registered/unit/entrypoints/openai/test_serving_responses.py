@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import importlib.util
 import sys
 import unittest
 from contextlib import asynccontextmanager
@@ -1098,6 +1099,99 @@ class OutputItemsTestCase(CustomTestCase):
 
         self.assertEqual(len(output_items), 1)
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+class InklingOutputItemsTestCase(CustomTestCase):
+    """Inkling output items come from sampled token IDs in both response modes."""
+
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.chat_encoding_spec = "inkling"
+        self.serving.reasoning_parser = self.serving.tool_call_parser = "inkling"
+        self.serving._inkling_token_output = True
+        self.request = ResponsesRequest(
+            model="x",
+            input="weather?",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+    @staticmethod
+    def _output_ids() -> list[int]:
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special, text = tokenizer.encode_special, tokenizer.encode_ordinary
+        return [
+            special("message_model"),
+            special("content_thinking"),
+            *text("plan"),
+            special("end_message"),
+            special("message_model"),
+            special("content_text"),
+            *text("see <|end_message|> here"),
+            special("end_message"),
+            special("message_model"),
+            *text("weather"),
+            special("content_invoke_tool_json"),
+            *text('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            special("content_model_end_sampling"),
+        ]
+
+    @staticmethod
+    def _summary(items: list[dict]) -> list[tuple]:
+        summary = []
+        for item in items:
+            if item["type"] == "function_call":
+                summary.append((item["name"], orjson.loads(item["arguments"])))
+            else:
+                summary.append((item["type"], item["content"][0]["text"]))
+        return summary
+
+    def test_stream_and_non_stream_items_match(self):
+        output_ids = self._output_ids()
+        finish = {"type": "stop", "matched": output_ids[-1]}
+        expected = [
+            ("reasoning", "plan"),
+            ("message", "see <|end_message|> here"),
+            ("weather", {"city": "SF"}),
+        ]
+        items = self.serving._make_response_output_items(
+            self.request,
+            "",
+            Mock(),
+            require_reasoning=False,
+            output_ids=output_ids,
+            finish_reason=finish,
+        )
+        self.assertEqual(self._summary([i.model_dump() for i in items]), expected)
+
+        for split in (3, len(output_ids) // 2, len(output_ids) - 2):
+            with self.subTest(split=split):
+                chunks = []
+                for ids, finish_reason in (
+                    (output_ids[:split], None),
+                    (output_ids, finish),
+                ):
+                    chunk = engine_chunk("", len(ids))
+                    chunk["output_ids"] = ids
+                    chunk["meta_info"]["finish_reason"] = finish_reason
+                    chunks.append(chunk)
+                events = StreamFixture(self.serving, self.request).run(chunks)
+                output = event_payloads(events)[-1]["response"]["output"]
+                self.assertEqual(self._summary(output), expected)
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
