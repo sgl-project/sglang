@@ -530,6 +530,7 @@ def _check_dsa_backend_constraints(
     *,
     hip: bool,
     dcp_size: int = 1,
+    attn_cp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -551,6 +552,8 @@ def _check_dsa_backend_constraints(
         )
     if dcp_size > 1:
         raise ValueError("CUDA TileLang FP8 KV does not support --dcp-size > 1.")
+    if attn_cp_size > 1:
+        raise ValueError("CUDA TileLang FP8 KV does not support --attn-cp-size > 1.")
 
     import torch
 
@@ -566,10 +569,16 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
     dcp_size: int = 1,
+    attn_cp_size: int = 1,
 ) -> None:
     """Backward-compatible entry point for the TileLang DSA validation."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
+        kv_cache_dtype,
+        prefill_backend,
+        decode_backend,
+        hip=hip,
+        dcp_size=dcp_size,
+        attn_cp_size=attn_cp_size,
     )
 
 
@@ -675,6 +684,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            attn_cp_size=getattr(view, "attn_cp_size", 1) or 1,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -709,6 +719,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        attn_cp_size=getattr(view, "attn_cp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

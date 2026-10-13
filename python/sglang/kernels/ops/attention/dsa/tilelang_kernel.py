@@ -1372,6 +1372,12 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if is_fp8_kv and kv.shape[-1] != dim:
+        raise ValueError(
+            "TileLang FP8 DSA requires raw KV rows matching the query width"
+        )
+    if not _is_hip and is_fp8_kv and kv.dtype != torch.float8_e4m3fn:
+        raise ValueError("CUDA TileLang FP8 DSA requires float8_e4m3fn")
     if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:

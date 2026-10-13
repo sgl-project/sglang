@@ -1,0 +1,1280 @@
+{
+  "evaluation_date": "2026-10-13",
+  "scope": "single-run sampled accuracy; no paired BF16 KV accuracy control; not a full benchmark score",
+  "unique_scored_samples": 160,
+  "actual_model_requests": 162,
+  "historical_duplicate_requests": 2,
+  "response_selection": "first successful response for the same complete request payload, independent of correctness",
+  "identity_audit": "all selected prompt, request, prediction, review and source-ID hashes verified",
+  "runtime": {
+    "base_commit": "7760d5264ac16b85392aefb1bf5c13ce38d9632e",
+    "validation_patch_commit": "f9c6b44d964504c6ab9e0088c090aa8a10a5ff5e",
+    "hardware": "8 x NVIDIA H20 96GB (SM90)",
+    "torch": "2.14.1+cu130",
+    "cuda": "13.0",
+    "tilelang": "0.1.12",
+    "transformers": "5.19.0",
+    "evalscope": "1.12.0",
+    "model": "GLM-5.3-Flash-FP8",
+    "model_config_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+    "precision": {
+      "weights": "FP8",
+      "activations": "BF16",
+      "kv": "fp8_e4m3",
+      "ssm_state": "FP32"
+    },
+    "model_level_evaluation_rerun_on_current_upstream": false
+  },
+  "generation": {
+    "temperature": 0,
+    "top_p": 1,
+    "seed": 42,
+    "stream": false,
+    "candidates_per_sample": 1,
+    "thinking": "model default",
+    "chat_template": "model native",
+    "concurrency": 8,
+    "max_tokens": {
+      "ifeval": 32768,
+      "ceval": 32768,
+      "gsm8k": 32768,
+      "live_code_bench": 65536
+    },
+    "shots": {
+      "ifeval": 0,
+      "ceval": 5,
+      "gsm8k": 4,
+      "live_code_bench": 0
+    }
+  },
+  "datasets": {
+    "ifeval": {
+      "planned": 40,
+      "scored": 40,
+      "normally_completed": 40,
+      "source_population": 541,
+      "sample_design": "Proportional stratification by instructioncount1/2/3plus; seeded within eachstratum",
+      "primary": {
+        "identity": {
+          "name": "prompt_level_strict",
+          "aggregation": "mean",
+          "dimensions": {}
+        },
+        "num": 40,
+        "correct": 35,
+        "score": 0.875,
+        "official_report_score_rounded": 0.875,
+        "percentage": 87.5
+      },
+      "metrics": [
+        {
+          "identity": {
+            "name": "prompt_level_strict",
+            "aggregation": "mean",
+            "dimensions": {}
+          },
+          "num": 40,
+          "correct": 35,
+          "score": 0.875,
+          "official_report_score_rounded": 0.875,
+          "percentage": 87.5
+        },
+        {
+          "identity": {
+            "name": "inst_level_strict",
+            "aggregation": "weighted_mean",
+            "dimensions": {}
+          },
+          "num": 61,
+          "correct": 56,
+          "score": 0.9180327868852459,
+          "official_report_score_rounded": 0.918,
+          "percentage": 91.80327868852459
+        },
+        {
+          "identity": {
+            "name": "prompt_level_loose",
+            "aggregation": "mean",
+            "dimensions": {}
+          },
+          "num": 40,
+          "correct": 36,
+          "score": 0.9,
+          "official_report_score_rounded": 0.9,
+          "percentage": 90.0
+        },
+        {
+          "identity": {
+            "name": "inst_level_loose",
+            "aggregation": "weighted_mean",
+            "dimensions": {}
+          },
+          "num": 61,
+          "correct": 57,
+          "score": 0.9344262295081968,
+          "official_report_score_rounded": 0.9344,
+          "percentage": 93.44262295081967
+        }
+      ],
+      "dataset_sha256": "d287c05530d9b1a1eed2668ccabbc993b39591a597bf8b7db3c6029be8d11ffe",
+      "input_tps": null,
+      "input_tps_per_gpu": null,
+      "selected_samples": [
+        {
+          "subset": "default",
+          "index": 2,
+          "original_sample_id": 2,
+          "sample_sha256": "fe3deedb88882893e6a7a084297267e3c4e638b0eff240873f9dbda4b31c6beb"
+        },
+        {
+          "subset": "default",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "aafcc4e87cfebce2044cfd3832cb569ece6dc288f0432c338bdefb896f9c2c67"
+        },
+        {
+          "subset": "default",
+          "index": 4,
+          "original_sample_id": 4,
+          "sample_sha256": "8d3084ea01471f40b4f7854a878585bab8360c75c0af2a7bf8354724e443c9be"
+        },
+        {
+          "subset": "default",
+          "index": 17,
+          "original_sample_id": 17,
+          "sample_sha256": "9927904ecc99b3a13ef80c362888085a79490766672f987f4493b5764dd79c6b"
+        },
+        {
+          "subset": "default",
+          "index": 22,
+          "original_sample_id": 22,
+          "sample_sha256": "cbfd85d7d66652a4e0bf0377c75187b2dcacf4c1cf732dee1e441443469abcad"
+        },
+        {
+          "subset": "default",
+          "index": 23,
+          "original_sample_id": 23,
+          "sample_sha256": "a16b64a47481ea0b35ccc91ab5481674ef6b9cb5d28e1bff5fed88b265c9e877"
+        },
+        {
+          "subset": "default",
+          "index": 45,
+          "original_sample_id": 45,
+          "sample_sha256": "2019c2912c3f26c798c0a3f4ec6a729c715e4005820a3877d8d8052eb2305c35"
+        },
+        {
+          "subset": "default",
+          "index": 72,
+          "original_sample_id": 72,
+          "sample_sha256": "270a2f8233969d156c15e622d1ec663a231641ad2bcfa84c2a963f030f7f9f40"
+        },
+        {
+          "subset": "default",
+          "index": 74,
+          "original_sample_id": 74,
+          "sample_sha256": "59e70214cbac575ea66436702ab68d78f8919caed27443968d75ef9d4d70c6f8"
+        },
+        {
+          "subset": "default",
+          "index": 94,
+          "original_sample_id": 94,
+          "sample_sha256": "fcdea3ce6c856ef2bdaae4cb77247d5f6fb21beca9a7b924a48ee2af2922cfba"
+        },
+        {
+          "subset": "default",
+          "index": 110,
+          "original_sample_id": 110,
+          "sample_sha256": "ab634933cce9c37f54a34d88c9750b654963b384d45433013a1ebd55cac3db80"
+        },
+        {
+          "subset": "default",
+          "index": 164,
+          "original_sample_id": 164,
+          "sample_sha256": "64b577ff374898124de2db72dd4ce1a62fffde7a55ebd3038328c9f3928ebc3d"
+        },
+        {
+          "subset": "default",
+          "index": 173,
+          "original_sample_id": 173,
+          "sample_sha256": "8be6bab446cd11e335ca85bc522b10bda7c91067c7999ad5e04cabdd3d6b11d6"
+        },
+        {
+          "subset": "default",
+          "index": 190,
+          "original_sample_id": 190,
+          "sample_sha256": "e25924a7680564151b59d94fa70f6c17ebee6aa6f854622882d85186172f3a92"
+        },
+        {
+          "subset": "default",
+          "index": 213,
+          "original_sample_id": 213,
+          "sample_sha256": "b0ea83e0862b792ea7b9557c961260efdad3ed830f385ace379356fa47e83d62"
+        },
+        {
+          "subset": "default",
+          "index": 215,
+          "original_sample_id": 215,
+          "sample_sha256": "f7926c95c85ab9d9bccccae3bf6d6189fd11d87174d51df0be24a9319d999102"
+        },
+        {
+          "subset": "default",
+          "index": 289,
+          "original_sample_id": 289,
+          "sample_sha256": "be14db2059039dfdf40326baf7c0529cdccb28badb1d04c10c276dc443303f87"
+        },
+        {
+          "subset": "default",
+          "index": 290,
+          "original_sample_id": 290,
+          "sample_sha256": "053d95690d02a34299dd480446d6e3fc3b4a8fc0fd196c1af0ff53f40fbd9931"
+        },
+        {
+          "subset": "default",
+          "index": 301,
+          "original_sample_id": 301,
+          "sample_sha256": "5b33e07c23d5c0879c615b818fa89cb1ebb6ef32b9e7bd9e360ca1108196ea58"
+        },
+        {
+          "subset": "default",
+          "index": 314,
+          "original_sample_id": 314,
+          "sample_sha256": "abc3ebbd43722f7cb8b925f811f4b619ef4e10bfec177ea8158709be0dbdd290"
+        },
+        {
+          "subset": "default",
+          "index": 318,
+          "original_sample_id": 318,
+          "sample_sha256": "40fc5269c2641154c0b7be6ae1b947d5922d00aa797b4cf9c94a1713099a02e5"
+        },
+        {
+          "subset": "default",
+          "index": 334,
+          "original_sample_id": 334,
+          "sample_sha256": "d4a94a14d24f3851c6c59cf58628f027259d18c011e9017d1a6c588d312fa1bb"
+        },
+        {
+          "subset": "default",
+          "index": 347,
+          "original_sample_id": 347,
+          "sample_sha256": "e52e96220fc2c20a7a61463aa4e24908e475bc1b70d64a8fcd25f86a5adfc795"
+        },
+        {
+          "subset": "default",
+          "index": 352,
+          "original_sample_id": 352,
+          "sample_sha256": "455223db75a7286b87ff6b7eaecb459570dde8dc66785f2e31b72bcaa1678ab8"
+        },
+        {
+          "subset": "default",
+          "index": 359,
+          "original_sample_id": 359,
+          "sample_sha256": "37dd4bb2c01c4b96a49acaafd5a750c5ce2809d9aef5df702218a96f0b38a00e"
+        },
+        {
+          "subset": "default",
+          "index": 371,
+          "original_sample_id": 371,
+          "sample_sha256": "862cd56240ee5862ad890815b192dd24157a4853c35c098293fc115754d28e02"
+        },
+        {
+          "subset": "default",
+          "index": 373,
+          "original_sample_id": 373,
+          "sample_sha256": "908d800fd95c7a9ebb7ae765005b29ae41e87ba90897fef184210eda94c589f8"
+        },
+        {
+          "subset": "default",
+          "index": 388,
+          "original_sample_id": 388,
+          "sample_sha256": "93a353dc46da2e06e8c511b995bb55092e798814bc6680dca720ea57abc41216"
+        },
+        {
+          "subset": "default",
+          "index": 425,
+          "original_sample_id": 425,
+          "sample_sha256": "5c0b2d9c86c8746d7cdb750976c48a0ca2ef51d1a37e99d59f86a2e467b0ce5e"
+        },
+        {
+          "subset": "default",
+          "index": 456,
+          "original_sample_id": 456,
+          "sample_sha256": "622ca6e5d39b7ed0f4f9aa352587a6526940a52a10e2575bd4b5d853e17a08c6"
+        },
+        {
+          "subset": "default",
+          "index": 469,
+          "original_sample_id": 469,
+          "sample_sha256": "9227f933e367b05e4563d85b1ca492a1bb33d889085a33fa618b4a9caeb80c25"
+        },
+        {
+          "subset": "default",
+          "index": 485,
+          "original_sample_id": 485,
+          "sample_sha256": "255e9ac8b9f0430a62439495180be9c92d295b0e9014c5b18516ea06c4f64922"
+        },
+        {
+          "subset": "default",
+          "index": 486,
+          "original_sample_id": 486,
+          "sample_sha256": "f4e12dcfb37ff6c0f7a346b1f8bd5b35b9e536347aa92242614ffb9acbe47197"
+        },
+        {
+          "subset": "default",
+          "index": 494,
+          "original_sample_id": 494,
+          "sample_sha256": "f4abca0a66f0afb1bf349f8fbd0c7e327312044b6979028ff41629f36ce34ed1"
+        },
+        {
+          "subset": "default",
+          "index": 507,
+          "original_sample_id": 507,
+          "sample_sha256": "d298d927cc51d302adec396381f487e5f0e1a6120682d2394555e106f387e650"
+        },
+        {
+          "subset": "default",
+          "index": 513,
+          "original_sample_id": 513,
+          "sample_sha256": "f3c6fd37a4efad64118046ffa73cfd8c3f16003a41fbb901ea82c001162c4f3d"
+        },
+        {
+          "subset": "default",
+          "index": 523,
+          "original_sample_id": 523,
+          "sample_sha256": "9f5fe9026a6499f361d9aa9d0c3bbb326c2147afb4aaccd3ef787001e042371f"
+        },
+        {
+          "subset": "default",
+          "index": 535,
+          "original_sample_id": 535,
+          "sample_sha256": "99171ce4efb4200445fa3383404015d09461010aed5364b47eba2c5480e08f28"
+        },
+        {
+          "subset": "default",
+          "index": 536,
+          "original_sample_id": 536,
+          "sample_sha256": "09545de5be845e2ba222fabede730e7acfcfdf59a10231add77466ea90b28095"
+        },
+        {
+          "subset": "default",
+          "index": 537,
+          "original_sample_id": 537,
+          "sample_sha256": "8133d0c2cf56f5c5cdff2002c1ebafc87a5bdd9b43e615df20dc4aef56f175c6"
+        }
+      ]
+    },
+    "ceval": {
+      "planned": 52,
+      "scored": 52,
+      "normally_completed": 51,
+      "source_population": 1346,
+      "sample_design": "One uniform seeded draw per each of52subjects",
+      "primary": {
+        "identity": {
+          "name": "accuracy",
+          "aggregation": "mean",
+          "dimensions": {}
+        },
+        "num": 52,
+        "correct": 50,
+        "score": 0.9615384615384616,
+        "official_report_score_rounded": 0.9615,
+        "percentage": 96.15384615384616
+      },
+      "metrics": [
+        {
+          "identity": {
+            "name": "accuracy",
+            "aggregation": "mean",
+            "dimensions": {}
+          },
+          "num": 52,
+          "correct": 50,
+          "score": 0.9615384615384616,
+          "official_report_score_rounded": 0.9615,
+          "percentage": 96.15384615384616
+        }
+      ],
+      "dataset_sha256": "58c48f6bff7a80e69aeb27a887eb04b580ed088aaca3bf3eb39c1ef74e1e0a49",
+      "input_tps": null,
+      "input_tps_per_gpu": null,
+      "selected_samples": [
+        {
+          "subset": "accountant",
+          "index": 33,
+          "original_sample_id": 33,
+          "sample_sha256": "a46d0a7b290984ef8ba9c4790e9fd2164d0ceb6e525502a48b7aa6e04272372a"
+        },
+        {
+          "subset": "advanced_mathematics",
+          "index": 8,
+          "original_sample_id": 8,
+          "sample_sha256": "480e7fc9092e8a6d6248c9d64e79d4355d3f30f453f4d202dceb77e4ab366d8d"
+        },
+        {
+          "subset": "art_studies",
+          "index": 21,
+          "original_sample_id": 21,
+          "sample_sha256": "d1a985efd194b758ec7a599c32c016e6e18e43045c581a4e9716f9735aa3b5e1"
+        },
+        {
+          "subset": "basic_medicine",
+          "index": 7,
+          "original_sample_id": 7,
+          "sample_sha256": "c92750263ee96cae36404d94dc4b1f6276343a46f59b192fbc86c52a4e795caf"
+        },
+        {
+          "subset": "business_administration",
+          "index": 8,
+          "original_sample_id": 8,
+          "sample_sha256": "629eefd591dc631c29e09d622400d822dfc23ce71082fb1caab1f5c17725a220"
+        },
+        {
+          "subset": "chinese_language_and_literature",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "7a2d6239caed5ea2c03dd1e5e246f1d0ce811f51a241a213e1cb04bf5d2bc84e"
+        },
+        {
+          "subset": "civil_servant",
+          "index": 4,
+          "original_sample_id": 4,
+          "sample_sha256": "60003b45d6bf880deb2ea48c49e228643d959385627b5d463224ddd58af29ef0"
+        },
+        {
+          "subset": "clinical_medicine",
+          "index": 4,
+          "original_sample_id": 4,
+          "sample_sha256": "983fa96211700479e3de47072356f280bf48bd50532f2bfbde1f1ac227d63ffb"
+        },
+        {
+          "subset": "college_chemistry",
+          "index": 19,
+          "original_sample_id": 19,
+          "sample_sha256": "2d026e33583a89005dd630386c40d0efd05f3f42513f0ecf6b19108b2b07b684"
+        },
+        {
+          "subset": "college_economics",
+          "index": 22,
+          "original_sample_id": 22,
+          "sample_sha256": "fa033eb96eebbcb583a6731c9469b99e17d1a4b26ffa3cc0d4bd6071c584a29e"
+        },
+        {
+          "subset": "college_physics",
+          "index": 13,
+          "original_sample_id": 13,
+          "sample_sha256": "3ab32876c572516be829a5ebe8249d7130da85d2be0b32116661b592bac14969"
+        },
+        {
+          "subset": "college_programming",
+          "index": 23,
+          "original_sample_id": 23,
+          "sample_sha256": "fb9b8644fe326868db9638c090980069bc9ef3c2c0dfa97729d614f0006ed1f1"
+        },
+        {
+          "subset": "computer_architecture",
+          "index": 5,
+          "original_sample_id": 5,
+          "sample_sha256": "fe961983bffd3aba3242f85b332cb9d1214c07bc11522c4f7659ae5bc543f530"
+        },
+        {
+          "subset": "computer_network",
+          "index": 18,
+          "original_sample_id": 18,
+          "sample_sha256": "2beaa43036704190eefdfb529c67c5fb6670e3744ed20ae4df8f90cb37d9a6f9"
+        },
+        {
+          "subset": "discrete_mathematics",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "09306f8d3cffae6133fcaf8320141d7803096dc6ae985ba5704166b25eb81f17"
+        },
+        {
+          "subset": "education_science",
+          "index": 23,
+          "original_sample_id": 23,
+          "sample_sha256": "6f8d2bdfe197c53e7907418d9e996b4a6f088544f7b18ab4afdc9fd2c31b7701"
+        },
+        {
+          "subset": "electrical_engineer",
+          "index": 13,
+          "original_sample_id": 13,
+          "sample_sha256": "ba70cc0ec55ecfde01029f389087bf268aac3c46ec5413d2d502e1145cdeb253"
+        },
+        {
+          "subset": "environmental_impact_assessment_engineer",
+          "index": 7,
+          "original_sample_id": 7,
+          "sample_sha256": "3454cd3dc6011084fdff25491783e85abaa66e7f947982fe46469266968b4585"
+        },
+        {
+          "subset": "fire_engineer",
+          "index": 13,
+          "original_sample_id": 13,
+          "sample_sha256": "7f09fe9ed1b7dc1a97ea8df7c0664ad91ab4aa871e416bf4358da6f465c313bb"
+        },
+        {
+          "subset": "high_school_biology",
+          "index": 18,
+          "original_sample_id": 18,
+          "sample_sha256": "a33ad3db2d0d3f430bee0a57211ba872651361f83ae91cb61c7cbe8aca691504"
+        },
+        {
+          "subset": "high_school_chemistry",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "80676818f7a3f5f3af45ed2e0c9804f4bf26ccf86c0f8d91b172108727acb353"
+        },
+        {
+          "subset": "high_school_chinese",
+          "index": 17,
+          "original_sample_id": 17,
+          "sample_sha256": "58f8081fca7ccda2328b2e19f49b7446a6b4994ed3658a0326766aaf95bc51ba"
+        },
+        {
+          "subset": "high_school_geography",
+          "index": 12,
+          "original_sample_id": 12,
+          "sample_sha256": "2e72683ac461e929d53bac61909232bfd33a0b0e2dc58598e85ee909781c45dd"
+        },
+        {
+          "subset": "high_school_history",
+          "index": 1,
+          "original_sample_id": 1,
+          "sample_sha256": "408dcc9049760e850b6684edd90acaf60812d1d647266a9d9df22cee88513ae2"
+        },
+        {
+          "subset": "high_school_mathematics",
+          "index": 6,
+          "original_sample_id": 6,
+          "sample_sha256": "bea583f4e091b2d4a3d404e3ea79f1af186a69f20dc59b18a24f8eef63ad3200"
+        },
+        {
+          "subset": "high_school_physics",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "b649d573e13f32f709e33b2a25da6aac48a923849fad825ef069fa9b81bc33bb"
+        },
+        {
+          "subset": "high_school_politics",
+          "index": 6,
+          "original_sample_id": 6,
+          "sample_sha256": "ff73c8e9ff00401c42ebca0cf6bac3d1bf7e6dae1c289a594fc7eab618f289ea"
+        },
+        {
+          "subset": "ideological_and_moral_cultivation",
+          "index": 13,
+          "original_sample_id": 13,
+          "sample_sha256": "245da900b4094e9833c8d2b0db3f61d24fd8ec2bc83f1684251bb43ab35e3e32"
+        },
+        {
+          "subset": "law",
+          "index": 6,
+          "original_sample_id": 6,
+          "sample_sha256": "a7e723f0b5c5c4013b6fb143fd223bba45d9d762ccd1105361a4e069172a8bee"
+        },
+        {
+          "subset": "legal_professional",
+          "index": 4,
+          "original_sample_id": 4,
+          "sample_sha256": "13b8e4a1e0c55887ec7340135a72ddc98a7b7163041b9d2a6962177536e85631"
+        },
+        {
+          "subset": "logic",
+          "index": 2,
+          "original_sample_id": 2,
+          "sample_sha256": "76dd770ebf8486b8c4b140c3267ac5530faeb42582d6ece5d17de3a0ad696d6d"
+        },
+        {
+          "subset": "mao_zedong_thought",
+          "index": 17,
+          "original_sample_id": 17,
+          "sample_sha256": "7360a1f568765019ff709fac91f97289d60fecced2884be2151303f8e9cf6376"
+        },
+        {
+          "subset": "marxism",
+          "index": 11,
+          "original_sample_id": 11,
+          "sample_sha256": "914e0cdb885914025d908c9c8aae91adc9c9de317c2a99a7fa6b02972592fcaf"
+        },
+        {
+          "subset": "metrology_engineer",
+          "index": 1,
+          "original_sample_id": 1,
+          "sample_sha256": "0f1d173ad555f1e2ac5f8c4bfc63a631f04392c7ec4a0bdb171117272aee4b4d"
+        },
+        {
+          "subset": "middle_school_biology",
+          "index": 4,
+          "original_sample_id": 4,
+          "sample_sha256": "2878bf5ce5aa5d78c2473024799cbef2f2b9c42098d59c9b8ec83f521f059308"
+        },
+        {
+          "subset": "middle_school_chemistry",
+          "index": 9,
+          "original_sample_id": 9,
+          "sample_sha256": "a2010e73e0de90718a02b3c3e18cac9b18bfbff500b64b9552986b0f8d148960"
+        },
+        {
+          "subset": "middle_school_geography",
+          "index": 7,
+          "original_sample_id": 7,
+          "sample_sha256": "05aaae8e7dee6961673af4085937763b5a6311532de33c9c8a366c484d3e4468"
+        },
+        {
+          "subset": "middle_school_history",
+          "index": 6,
+          "original_sample_id": 6,
+          "sample_sha256": "7ce2c75c8da50bd215d1d3f3541f6d3bdc702909a79f9d37d7d0c1b579049f37"
+        },
+        {
+          "subset": "middle_school_mathematics",
+          "index": 17,
+          "original_sample_id": 17,
+          "sample_sha256": "bc22cba13a9905ba4a14f0f4864aebdc094791b859b619ba4a63d24740d40f59"
+        },
+        {
+          "subset": "middle_school_physics",
+          "index": 17,
+          "original_sample_id": 17,
+          "sample_sha256": "8073f211116ce2e14ac41e1ea3eee3a4028f6007f0f4be9165a40fe06f972e70"
+        },
+        {
+          "subset": "middle_school_politics",
+          "index": 0,
+          "original_sample_id": 0,
+          "sample_sha256": "0f3af5d2698d68e099cf3a8c7a6addb85fbec206823f5d53835ab551dd189648"
+        },
+        {
+          "subset": "modern_chinese_history",
+          "index": 12,
+          "original_sample_id": 12,
+          "sample_sha256": "1a6929035b1390f6c5c372af799660a443367e5ef1026cce9b37be94958badc0"
+        },
+        {
+          "subset": "operating_system",
+          "index": 18,
+          "original_sample_id": 18,
+          "sample_sha256": "a873585c0d32a9c61872c8255c8dd28c99eb1a753e9c5d7ac2d2bddda450b4fd"
+        },
+        {
+          "subset": "physician",
+          "index": 16,
+          "original_sample_id": 16,
+          "sample_sha256": "90ea3257107385e7ec653070d3991a55232a2eb092b7613ed104a6dab4da8b2f"
+        },
+        {
+          "subset": "plant_protection",
+          "index": 21,
+          "original_sample_id": 21,
+          "sample_sha256": "b6e0a62c69967af1b893cdd86828d362e9672567b5c918ea3e5354e38e1245b4"
+        },
+        {
+          "subset": "probability_and_statistics",
+          "index": 16,
+          "original_sample_id": 16,
+          "sample_sha256": "a8e82bdef7bfab07932d069d1db312425a3c611a3534565ef74c5c1663b1a3c8"
+        },
+        {
+          "subset": "professional_tour_guide",
+          "index": 12,
+          "original_sample_id": 12,
+          "sample_sha256": "2670cf740db7744b2087cc17afd2f9a6b3a88fb651b72f90ab231613bcb9fac9"
+        },
+        {
+          "subset": "sports_science",
+          "index": 7,
+          "original_sample_id": 7,
+          "sample_sha256": "6796d34c4ddf53cda297990603fe701c385a7d8315a26c68d32126bf6181ee77"
+        },
+        {
+          "subset": "tax_accountant",
+          "index": 31,
+          "original_sample_id": 31,
+          "sample_sha256": "55bf991c89c1e3f0a0281a3037a9d4373e40c20dbc8ff1fecee4c7515668daf3"
+        },
+        {
+          "subset": "teacher_qualification",
+          "index": 25,
+          "original_sample_id": 25,
+          "sample_sha256": "974e9ef62e195658e3cca4a6ec2fe290cdb670f89d469215765165caea8d473b"
+        },
+        {
+          "subset": "urban_and_rural_planner",
+          "index": 16,
+          "original_sample_id": 16,
+          "sample_sha256": "9638209509bddde8d3cfe5869afb2047368e20a1280bec3acc24ce23cc8c8a7d"
+        },
+        {
+          "subset": "veterinary_medicine",
+          "index": 3,
+          "original_sample_id": 3,
+          "sample_sha256": "6ce3cf83d8611b12f874feb3bd04a482dde838ba46b5c69005ab3159c1314eb3"
+        }
+      ]
+    },
+    "gsm8k": {
+      "planned": 50,
+      "scored": 50,
+      "normally_completed": 50,
+      "source_population": 1319,
+      "sample_design": "Uniform seeded sample50withoutreplacement; no observed-answer selection",
+      "primary": {
+        "identity": {
+          "name": "accuracy",
+          "aggregation": "mean",
+          "dimensions": {}
+        },
+        "num": 50,
+        "correct": 48,
+        "score": 0.96,
+        "official_report_score_rounded": 0.96,
+        "percentage": 96.0
+      },
+      "metrics": [
+        {
+          "identity": {
+            "name": "accuracy",
+            "aggregation": "mean",
+            "dimensions": {}
+          },
+          "num": 50,
+          "correct": 48,
+          "score": 0.96,
+          "official_report_score_rounded": 0.96,
+          "percentage": 96.0
+        }
+      ],
+      "dataset_sha256": "5086ec8a4bb8957d99e0d1d2af45db478664a16323186b6c6d67dc0e81593e55",
+      "input_tps": null,
+      "input_tps_per_gpu": null,
+      "selected_samples": [
+        {
+          "subset": "main",
+          "index": 33,
+          "original_sample_id": 33,
+          "sample_sha256": "779f3c8edd6545b456d728ea6d6206a61aa82d781facd9f1f59054ac9a2ad6d6"
+        },
+        {
+          "subset": "main",
+          "index": 35,
+          "original_sample_id": 35,
+          "sample_sha256": "57b7d4ec8dfce15c4e9778460479b92210ad76306c5a0385719e0eab3f5eaa53"
+        },
+        {
+          "subset": "main",
+          "index": 40,
+          "original_sample_id": 40,
+          "sample_sha256": "a36b0196b1c456d5200db3a9f75294b6e6985f6a66feea1daa77ad2d6852029c"
+        },
+        {
+          "subset": "main",
+          "index": 42,
+          "original_sample_id": 42,
+          "sample_sha256": "dce08188ff958cc9e72a211dcb3c8eec8139f16ec72bb026c2e534fdb9f55d11"
+        },
+        {
+          "subset": "main",
+          "index": 64,
+          "original_sample_id": 64,
+          "sample_sha256": "82c6afd923b94a7e627c2c44cd1ec6bd2a5d4fc4d84539fdf6fa70cceec0c8f8"
+        },
+        {
+          "subset": "main",
+          "index": 86,
+          "original_sample_id": 86,
+          "sample_sha256": "6f93a0de073d2038d34bf041e4086718086146ae8b8adfccb056c03aec6664d9"
+        },
+        {
+          "subset": "main",
+          "index": 125,
+          "original_sample_id": 125,
+          "sample_sha256": "6484d2ce809c4e3297e066fc45769f1a60cf453c53cc00f6763c7cf2c48f9abc"
+        },
+        {
+          "subset": "main",
+          "index": 149,
+          "original_sample_id": 149,
+          "sample_sha256": "2bfc760c604c4ce9bcfdbbc44503fa628299cf10257d45c972a2a2ca97f50ce9"
+        },
+        {
+          "subset": "main",
+          "index": 160,
+          "original_sample_id": 160,
+          "sample_sha256": "d0e256cf6fda83b9c472771a30c64a104fb114b0841fb91acd3d481701de0885"
+        },
+        {
+          "subset": "main",
+          "index": 236,
+          "original_sample_id": 236,
+          "sample_sha256": "f8d10706afd6dbd3fef4d14114508cbc5d415e07feb39ddc9b1109cf3dd42c94"
+        },
+        {
+          "subset": "main",
+          "index": 263,
+          "original_sample_id": 263,
+          "sample_sha256": "949c92c22bb51fb021af2fe75902459761b55e110f287957c3174a91efa0c44e"
+        },
+        {
+          "subset": "main",
+          "index": 265,
+          "original_sample_id": 265,
+          "sample_sha256": "6031e72e48c8938007cec3fc46a3c62bc39957107ac2b84834c1ab2890b0b4e1"
+        },
+        {
+          "subset": "main",
+          "index": 288,
+          "original_sample_id": 288,
+          "sample_sha256": "c09c28e54ab2bc0ada9904155989f1d18ce3bbde6c5ef122afec1470b5887105"
+        },
+        {
+          "subset": "main",
+          "index": 301,
+          "original_sample_id": 301,
+          "sample_sha256": "8109e8d8df46032940aeae6597596c1acf7dc56b958ccba89da476211e187e66"
+        },
+        {
+          "subset": "main",
+          "index": 306,
+          "original_sample_id": 306,
+          "sample_sha256": "bd7d70c3f74faff64c08bb434c05696e00d6eac5a747bc49f76e21269d3ee81d"
+        },
+        {
+          "subset": "main",
+          "index": 308,
+          "original_sample_id": 308,
+          "sample_sha256": "f23a53edda44394d2a24092d85c89f8cc3c223fe68c598a2027d539736e1522d"
+        },
+        {
+          "subset": "main",
+          "index": 325,
+          "original_sample_id": 325,
+          "sample_sha256": "5a6b9f3afa8dcd5daadf43c507c03d76eed9d7c272ad8c3338704c56c86d76cb"
+        },
+        {
+          "subset": "main",
+          "index": 360,
+          "original_sample_id": 360,
+          "sample_sha256": "e5dea6e87bbe9bbaebb7db052c28f77ea2b176cde73f996467b58606cbd1adab"
+        },
+        {
+          "subset": "main",
+          "index": 368,
+          "original_sample_id": 368,
+          "sample_sha256": "759c60e6b496c38825687b8804d513e37236c76a31994ee61dc31579a6dffcb5"
+        },
+        {
+          "subset": "main",
+          "index": 391,
+          "original_sample_id": 391,
+          "sample_sha256": "3866ad07f85f5640478eca52878e2ecb1dcc74d1d76e70cafa59204df8c8dc34"
+        },
+        {
+          "subset": "main",
+          "index": 402,
+          "original_sample_id": 402,
+          "sample_sha256": "df543c61e0148f3e52998ab0a499b47565dd5987ceb2c13c9e6e3f8fb78d473b"
+        },
+        {
+          "subset": "main",
+          "index": 429,
+          "original_sample_id": 429,
+          "sample_sha256": "01b48abdd19c4e1f730dfe7a575933c4d216d54dfe903d22cdc76118a01c668d"
+        },
+        {
+          "subset": "main",
+          "index": 480,
+          "original_sample_id": 480,
+          "sample_sha256": "5e47b400b4a61ed5af9ecbb675299980cda58826abb3198c032768064d1d298f"
+        },
+        {
+          "subset": "main",
+          "index": 504,
+          "original_sample_id": 504,
+          "sample_sha256": "ad0f2a19afb1441bb4c6f8a56842a9cf35b9694c495aeaf458b5a582074481b7"
+        },
+        {
+          "subset": "main",
+          "index": 523,
+          "original_sample_id": 523,
+          "sample_sha256": "66a988d7a2f66146a9aa0c5369a8d3fd023c2baa034a5a94408fea998ef29a36"
+        },
+        {
+          "subset": "main",
+          "index": 529,
+          "original_sample_id": 529,
+          "sample_sha256": "6649725d2fb089f0de5ed9b3dffb04edfcfd9a3a70641a87daec42b953daea4f"
+        },
+        {
+          "subset": "main",
+          "index": 535,
+          "original_sample_id": 535,
+          "sample_sha256": "c2db1b74dbb1a03b890ac509f41b384f8538626e2401dc7c439b1cd2f6681426"
+        },
+        {
+          "subset": "main",
+          "index": 536,
+          "original_sample_id": 536,
+          "sample_sha256": "2f053eebeaf71ce7522aed4762bab652bd1c85e3e7b1e223a8d76557391bdb7e"
+        },
+        {
+          "subset": "main",
+          "index": 635,
+          "original_sample_id": 635,
+          "sample_sha256": "4516b4af1c146dc30c6e8c3f0bd85b024fbb24055e42531f0986884d6f052416"
+        },
+        {
+          "subset": "main",
+          "index": 642,
+          "original_sample_id": 642,
+          "sample_sha256": "976e5582f63718cb676c1ecd720a010a19de20d4f7a4d3d8fe7e72c6874a6543"
+        },
+        {
+          "subset": "main",
+          "index": 709,
+          "original_sample_id": 709,
+          "sample_sha256": "03c9a9f0e772d07c3db7a103eac42786cc5162fc1d9672b098b16da8c527b7c4"
+        },
+        {
+          "subset": "main",
+          "index": 744,
+          "original_sample_id": 744,
+          "sample_sha256": "832198e35ca68c2378dbd739200b77465da0f8108bcc7ff4be7928d92c323df3"
+        },
+        {
+          "subset": "main",
+          "index": 797,
+          "original_sample_id": 797,
+          "sample_sha256": "221bf16a58bf5bd779f500cbf819126a173a50c5d99eb90cca540bbcb39a4cea"
+        },
+        {
+          "subset": "main",
+          "index": 851,
+          "original_sample_id": 851,
+          "sample_sha256": "0f13ecffd51af48255ca250780af2d3481f1df70a1a185730155c560788059ba"
+        },
+        {
+          "subset": "main",
+          "index": 910,
+          "original_sample_id": 910,
+          "sample_sha256": "f0ab5b6440dd210b9f44a0a2e27cc96bb836a34a9f1c757773dc41d51b7a2ad0"
+        },
+        {
+          "subset": "main",
+          "index": 926,
+          "original_sample_id": 926,
+          "sample_sha256": "5a4ed658de8f74f8136f37dc6face1ac4ec7084de43053f10053ad43d99230e1"
+        },
+        {
+          "subset": "main",
+          "index": 954,
+          "original_sample_id": 954,
+          "sample_sha256": "b4555cd2638c35b6d73d3bcb62e4dfcd7f3c028fd1820fc8710f9b11eb0b76ad"
+        },
+        {
+          "subset": "main",
+          "index": 973,
+          "original_sample_id": 973,
+          "sample_sha256": "97704eef7f7f78bfb720a7333bb582352cd7e48fa57dcdb7824ea4a5e1f42eb8"
+        },
+        {
+          "subset": "main",
+          "index": 994,
+          "original_sample_id": 994,
+          "sample_sha256": "bc3b1fc7581733816676460807659cd9aa625619776509e2b6c1ab983bf5f83b"
+        },
+        {
+          "subset": "main",
+          "index": 1059,
+          "original_sample_id": 1059,
+          "sample_sha256": "056d49ebe015ba5c01b2873bb3a6d820cd377ec468953943930df3b214bd9e6a"
+        },
+        {
+          "subset": "main",
+          "index": 1060,
+          "original_sample_id": 1060,
+          "sample_sha256": "3cabdd79ca0dd8ef8f2a13758021c3aedc9526e3e841dcc551632244feae8dbf"
+        },
+        {
+          "subset": "main",
+          "index": 1112,
+          "original_sample_id": 1112,
+          "sample_sha256": "b5a011e7f0b70d3c45cebcefd8cc13117ea597bbbf0b5e032780e695c94bc60f"
+        },
+        {
+          "subset": "main",
+          "index": 1140,
+          "original_sample_id": 1140,
+          "sample_sha256": "e1de1bbd39f7f45ed0423eba2b94bce74cd20b68cf25c231ed96942e57090bd3"
+        },
+        {
+          "subset": "main",
+          "index": 1166,
+          "original_sample_id": 1166,
+          "sample_sha256": "6f0acfee5445a4963b19dbf83f19a7ee5c06bcdbdcb464252daad8be92a5cf23"
+        },
+        {
+          "subset": "main",
+          "index": 1180,
+          "original_sample_id": 1180,
+          "sample_sha256": "717d8bd414b725fb35ac5d056ad523cd8995d1192f55524bc2ca032508eac69b"
+        },
+        {
+          "subset": "main",
+          "index": 1190,
+          "original_sample_id": 1190,
+          "sample_sha256": "61a3c0826a897149c8f9878b6b5bc0ce9b2332f56c6302600e7a3151757f43c2"
+        },
+        {
+          "subset": "main",
+          "index": 1191,
+          "original_sample_id": 1191,
+          "sample_sha256": "8eb70cd138cf8cb164d0225b9f9714ed91f5bd0e5207c3010232a3bf56079435"
+        },
+        {
+          "subset": "main",
+          "index": 1267,
+          "original_sample_id": 1267,
+          "sample_sha256": "61dba8e8a3ba81ad97c8bff36c9d8f01428055110d709ac23524ef23567d3941"
+        },
+        {
+          "subset": "main",
+          "index": 1284,
+          "original_sample_id": 1284,
+          "sample_sha256": "8fe3e6196dc4dce7ac1c8ed6fe16d124eab889c7539338f00f70a9ae4f7d414d"
+        },
+        {
+          "subset": "main",
+          "index": 1289,
+          "original_sample_id": 1289,
+          "sample_sha256": "a8ea28a4683edcb802012a7240d36e2769fd0bdc7bc2855c9f31d34020668513"
+        }
+      ]
+    },
+    "live_code_bench": {
+      "planned": 18,
+      "scored": 18,
+      "normally_completed": 17,
+      "source_population": 1055,
+      "sample_design": "Six seeded draws per easy/medium/hard stratum; equal-difficulty sample, not population-weighted official score",
+      "primary": {
+        "identity": {
+          "name": "accuracy",
+          "aggregation": "pass_at_k",
+          "dimensions": {
+            "k": 1
+          }
+        },
+        "num": 18,
+        "correct": 16,
+        "score": 0.8888888888888888,
+        "official_report_score_rounded": 0.8889,
+        "percentage": 88.88888888888889
+      },
+      "metrics": [
+        {
+          "identity": {
+            "name": "accuracy",
+            "aggregation": "mean",
+            "dimensions": {}
+          },
+          "num": 18,
+          "correct": 16,
+          "score": 0.8888888888888888,
+          "official_report_score_rounded": 0.8889,
+          "percentage": 88.88888888888889
+        },
+        {
+          "identity": {
+            "name": "accuracy",
+            "aggregation": "pass_at_k",
+            "dimensions": {
+              "k": 1
+            }
+          },
+          "num": 18,
+          "correct": 16,
+          "score": 0.8888888888888888,
+          "official_report_score_rounded": 0.8889,
+          "percentage": 88.88888888888889
+        }
+      ],
+      "dataset_sha256": "8dcfc662c76e78f22fc23d02594aed3747d9e67a656d0a4c0f5d97ae70d42630",
+      "input_tps": null,
+      "input_tps_per_gpu": null,
+      "selected_samples": [
+        {
+          "subset": "release_v6",
+          "index": 46,
+          "original_sample_id": 46,
+          "sample_sha256": "c1d7e10d0712b6d38aefbd734fbcb9d4346317d52c3d2903cfdb23540b73d1ee"
+        },
+        {
+          "subset": "release_v6",
+          "index": 177,
+          "original_sample_id": 177,
+          "sample_sha256": "a0ac93118b9d3a48899a241affbbdd09a151c1746ed7c74870a2fe90785ba797"
+        },
+        {
+          "subset": "release_v6",
+          "index": 178,
+          "original_sample_id": 178,
+          "sample_sha256": "79c4e321d04c5aab7a1daf02fc5ee2e276a437c8aefbc96e090e11e6e98ac1d2"
+        },
+        {
+          "subset": "release_v6",
+          "index": 301,
+          "original_sample_id": 301,
+          "sample_sha256": "d7803e7a5fc14697e6b5966bd919adb7dbbe1abf1368b8158246e4b8c24ad65d"
+        },
+        {
+          "subset": "release_v6",
+          "index": 335,
+          "original_sample_id": 335,
+          "sample_sha256": "ea46d57f484681e1513c521f6c3a65af821be6a5f11e7a08898049ddfd476e2e"
+        },
+        {
+          "subset": "release_v6",
+          "index": 357,
+          "original_sample_id": 357,
+          "sample_sha256": "9aa561543a5a5141c4fe8184f67103490d424c2036c3f31068d600277bdca46f"
+        },
+        {
+          "subset": "release_v6",
+          "index": 444,
+          "original_sample_id": 444,
+          "sample_sha256": "275dde248d6fcdcf7f63841d64bd5656d5321b7b57fe245a230d8e6ee9877760"
+        },
+        {
+          "subset": "release_v6",
+          "index": 489,
+          "original_sample_id": 489,
+          "sample_sha256": "1f347ed99510308639e28580f124c3e4e99017bb9da584f0c98c76ae5ff7bf92"
+        },
+        {
+          "subset": "release_v6",
+          "index": 549,
+          "original_sample_id": 549,
+          "sample_sha256": "68044fad12da0278a9a00b880b4cbaef0db4b9a183cc892be2d02cac82f338cd"
+        },
+        {
+          "subset": "release_v6",
+          "index": 551,
+          "original_sample_id": 551,
+          "sample_sha256": "8a92ccc7c2b9f21298373aa2ef8b5c84178cbca76df7f91597519be69906216a"
+        },
+        {
+          "subset": "release_v6",
+          "index": 552,
+          "original_sample_id": 552,
+          "sample_sha256": "9d8b47ee6b84ba5de5e59971c3d3865e1a2442977e15c93e44ddd3ba7e878daf"
+        },
+        {
+          "subset": "release_v6",
+          "index": 562,
+          "original_sample_id": 562,
+          "sample_sha256": "cbd6d91ed7bc407201737784916cedf2c38b76c742b34d2ca0ad3a0eed410cb1"
+        },
+        {
+          "subset": "release_v6",
+          "index": 611,
+          "original_sample_id": 611,
+          "sample_sha256": "e8c0f16ba6f7fbcf7b0c1bf83b91e167cb01d5e278bdb95680c91864dee3ac9d"
+        },
+        {
+          "subset": "release_v6",
+          "index": 712,
+          "original_sample_id": 712,
+          "sample_sha256": "6fe01b50463eaec3ad24e23cc7539e59ae76b55c5bea484b0c7e2299ed937d31"
+        },
+        {
+          "subset": "release_v6",
+          "index": 728,
+          "original_sample_id": 728,
+          "sample_sha256": "2e7e22e2b4d0c8efca081c923c2963c094d814c4a97e4cbc07b324224b91401f"
+        },
+        {
+          "subset": "release_v6",
+          "index": 730,
+          "original_sample_id": 730,
+          "sample_sha256": "5d728aecdc9ba1f008cd0e4fd28611eb422e7ea2668536deb44c1585f4cee351"
+        },
+        {
+          "subset": "release_v6",
+          "index": 764,
+          "original_sample_id": 764,
+          "sample_sha256": "55460e0df14401eab1eb6a845d1b27a5b31a715aef4eacbba92d45addb070c68"
+        },
+        {
+          "subset": "release_v6",
+          "index": 965,
+          "original_sample_id": 965,
+          "sample_sha256": "4a8923b75fb2fc4f4874e8d86cb2a5f97d9632152ba79839c1df3cc635bc1f8d"
+        }
+      ]
+    }
+  },
+  "abnormal_rows": [
+    {
+      "dataset": "ceval",
+      "subset": "law",
+      "original_index": 6,
+      "completion_tokens": 32768,
+      "reasoning_tokens": 32768,
+      "finish_reason": "length",
+      "visible_content_characters": 0,
+      "treatment": "Count incorrect in primary all-row score; no regeneration or exclusion",
+      "input_tps": null,
+      "input_tps_per_gpu": null
+    },
+    {
+      "dataset": "live_code_bench",
+      "subset": "release_v6",
+      "original_index": 965,
+      "completion_tokens": 65536,
+      "reasoning_tokens": 65537,
+      "finish_reason": "length",
+      "visible_content_characters": 0,
+      "treatment": "Count incorrect in primary all-row score; no regeneration or exclusion",
+      "input_tps": null,
+      "input_tps_per_gpu": null
+    }
+  ],
+  "live_code_bench_difficulty": {
+    "hard": {
+      "correct": 4,
+      "planned": 6,
+      "score": 0.6666666666666666,
+      "input_tps": null,
+      "input_tps_per_gpu": null
+    },
+    "medium": {
+      "correct": 6,
+      "planned": 6,
+      "score": 1.0,
+      "input_tps": null,
+      "input_tps_per_gpu": null
+    },
+    "easy": {
+      "correct": 6,
+      "planned": 6,
+      "score": 1.0,
+      "input_tps": null,
+      "input_tps_per_gpu": null
+    }
+  },
+  "live_code_bench_sandbox": {
+    "network": false,
+    "cpu_cores": 2,
+    "memory_gib": 4,
+    "pid_limit": 128,
+    "host_mounts": false,
+    "gpu": false,
+    "test_timeout_seconds": 6,
+    "controller_timeout_seconds": 120
+  },
+  "input_tps": null,
+  "input_tps_per_gpu": null,
+  "output_tps": null,
+  "total_tps": null,
+  "tps_unavailable_reason": "accuracy evaluation, not a serving throughput measurement"
+}
