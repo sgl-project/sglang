@@ -229,7 +229,7 @@ impl PrefixIndex for GrpcPrefixIndex {
 /// Validates the endpoint the operator configured. tonic itself only checks URI
 /// syntax, which accepts a host:port with no scheme and then fails on every
 /// connect, so the scheme and host are checked here.
-fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
+pub(crate) fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
     let reject = |reason: &'static str| InvalidEndpoint {
         endpoint: endpoint.to_string(),
         reason,

@@ -7,14 +7,15 @@ use std::{env, io};
 
 use sgl_kv_indexer::{
     server_builder_with_max_concurrent_streams, shutdown_signal, stamp_arrival,
-    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
-    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, KvcmBackendConfig,
+    KvcmIndexerBackend, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
 };
 use tonic::service::interceptor::InterceptedService;
 use tracing::info;
 
 const PREFIX_QUERY_MAX_INFLIGHT_ENV: &str = "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT";
 const MAX_CONCURRENT_STREAMS_ENV: &str = "KV_INDEXER_MAX_CONCURRENT_STREAMS";
+const BACKEND_ENV: &str = "KV_INDEXER_BACKEND";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -29,8 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse::<SocketAddr>()?;
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
     let max_concurrent_streams = max_concurrent_streams_from_env()?;
+    let backend = backend_from_env()?;
 
-    let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
     let service = InterceptedService::new(
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         %addr,
         prefix_query_max_inflight,
         max_concurrent_streams,
-        "starting single-server in-memory SGLang KV Indexer"
+        "starting single-server SGLang KV Indexer"
     );
     server_builder_with_max_concurrent_streams(max_concurrent_streams)
         .add_service(service)
@@ -51,6 +52,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
 
     Ok(())
+}
+
+/// The storage backends this binary can serve from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    /// Process-local soft state (default): no external dependency, lost on
+    /// restart.
+    Memory,
+    /// A Tair KVCache Manager MetaService, configured through
+    /// `KV_INDEXER_KVCM_*` environment variables.
+    Kvcm,
+}
+
+impl BackendKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Kvcm => "kvcm",
+        }
+    }
+}
+
+fn parse_backend_kind(raw: &str) -> Result<BackendKind, String> {
+    match raw.trim() {
+        "" | "memory" => Ok(BackendKind::Memory),
+        "kvcm" => Ok(BackendKind::Kvcm),
+        other => Err(format!(
+            "{BACKEND_ENV} must be `memory` or `kvcm`, got `{other}`"
+        )),
+    }
+}
+
+fn backend_from_env() -> Result<Arc<dyn KvIndexerBackend>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let kind = match env::var(BACKEND_ENV) {
+        Ok(raw) => parse_backend_kind(&raw).map_err(io::Error::other)?,
+        Err(env::VarError::NotPresent) => BackendKind::Memory,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(format!("{BACKEND_ENV} must be valid UTF-8")).into())
+        }
+    };
+    let backend: Arc<dyn KvIndexerBackend> = match kind {
+        BackendKind::Memory => Arc::new(InMemoryKvIndexerBackend::new()),
+        BackendKind::Kvcm => {
+            let config = KvcmBackendConfig::from_env().map_err(io::Error::other)?;
+            Arc::new(KvcmIndexerBackend::new(config).map_err(io::Error::other)?)
+        }
+    };
+    info!(backend = kind.as_str(), "selected KV Indexer backend");
+    Ok(backend)
 }
 
 fn prefix_query_max_inflight_from_env() -> io::Result<usize> {
@@ -110,6 +161,18 @@ fn parse_max_concurrent_streams(raw: &str) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_supported_backends() {
+        assert_eq!(parse_backend_kind(""), Ok(BackendKind::Memory));
+        assert_eq!(parse_backend_kind("memory"), Ok(BackendKind::Memory));
+        assert_eq!(parse_backend_kind(" kvcm "), Ok(BackendKind::Kvcm));
+    }
+
+    #[test]
+    fn rejects_unknown_backend() {
+        assert!(parse_backend_kind("redis").is_err());
+    }
 
     #[test]
     fn parses_positive_prefix_query_limit() {
