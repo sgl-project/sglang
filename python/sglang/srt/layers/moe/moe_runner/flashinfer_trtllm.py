@@ -516,7 +516,7 @@ def _align_fp4_moe_weights(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     is_gated: bool,
-    intermediate_alignment: int,
+    intermediate_alignment: int = 16,
     hidden_alignment: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     """Zero-pad intermediate and hidden sizes to the TRT-LLM FP4 kernel alignments.
@@ -547,16 +547,12 @@ def _align_fp4_moe_weights(
 
     # w13: [E, gate_up, hidden // 2], scale [E, gate_up, hidden // 16]
     padded_w13 = w13.new_zeros((num_experts, padded_gate_up, padded_hidden // 2))
-    padded_w13.view(num_experts, up_mult, padded_intermediate, -1)[
-        :, :, :intermediate, : w13.shape[2]
-    ] = w13.reshape(num_experts, up_mult, intermediate, -1)
+    padded_w13[:, : w13.shape[1], : w13.shape[2]] = w13
 
     padded_w13_scale = w13_scale.new_zeros(
         (num_experts, padded_gate_up, padded_hidden // 16)
     )
-    padded_w13_scale.view(num_experts, up_mult, padded_intermediate, -1)[
-        :, :, :intermediate, : w13_scale.shape[2]
-    ] = w13_scale.reshape(num_experts, up_mult, intermediate, -1)
+    padded_w13_scale[:, : w13_scale.shape[1], : w13_scale.shape[2]] = w13_scale
 
     # w2: [E, hidden, intermediate // 2], scale [E, hidden, intermediate // 16]
     padded_w2 = w2.new_zeros((num_experts, padded_hidden, padded_intermediate // 2))
@@ -601,10 +597,6 @@ def _compute_g1_scale_c(
         return (w2_input_scale_quant * g1_alphas_up).to(torch.float32)
     num_experts = g1_alphas.shape[0]
     return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
-
-
-def trtllm_fp4_intermediate_alignment(is_gated: bool) -> int:
-    return 64 if is_gated else 128
 
 
 def trtllm_nvfp4_hidden_alignment(
@@ -661,7 +653,7 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
         w2_weight,
         w2_weight_scale,
         is_gated=is_gated,
-        intermediate_alignment=trtllm_fp4_intermediate_alignment(is_gated),
+        intermediate_alignment=16 if is_gated else 128,
         hidden_alignment=hidden_alignment,
     )
     layer.trtllm_padded_hidden_size = (
