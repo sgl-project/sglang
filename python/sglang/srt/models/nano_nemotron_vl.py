@@ -147,13 +147,10 @@ class NemotronH_Nano_VL_V2(EVS):
         mm_inputs.mm_items = visual_items + audio_items
         mm_inputs.data_offsets = all_data_offsets
 
-        if audio_items:
-            for item in visual_items:
-                if (
-                    item.is_video()
-                    and "pre_chunked_input_ids" in item.model_specific_data
-                ):
-                    item.set("pre_chunked_input_ids", input_ids)
+        # EVS rebuilds input_ids from this, so other spans must keep their pad values.
+        for item in visual_items:
+            if item.is_video() and "pre_chunked_input_ids" in item.model_specific_data:
+                item.set("pre_chunked_input_ids", input_ids)
 
         return input_ids
 
@@ -283,10 +280,17 @@ class NemotronH_Nano_VL_V2(EVS):
         Returns:
             video_features (`torch.Tensor`): Video feature tensor of shape `(num_videos, video_length, embed_dim)`).
         """
-        pixel_values = torch.cat([item.feature for item in items])
         if getattr(self.config, "video_temporal_patch_size", 1) > 1:
-            num_frames = pixel_values.shape[0]
-            return self.extract_video_feature_temporal(pixel_values, num_frames)
+            return torch.cat(
+                [
+                    self.extract_video_feature_temporal(video, video.shape[0]).flatten(
+                        0, 1
+                    )
+                    for item in items
+                    for video in item.feature.split(item.frames_per_video)
+                ]
+            )
+        pixel_values = torch.cat([item.feature for item in items])
         video_features = self.extract_feature(pixel_values)
         return video_features
 

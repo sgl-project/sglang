@@ -61,9 +61,6 @@ class TestDPAttentionDP2TP2(
                 "--attention-backend",
                 "ascend",
                 "--disable-cuda-graph",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
             ],
         )
 

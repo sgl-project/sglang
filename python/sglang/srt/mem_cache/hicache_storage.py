@@ -115,9 +115,6 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
-    # Full IDs backing a dependent device allocation: resident tensors or
-    # slices of the full rows allocated by this load, in transfer order.
-    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)
@@ -593,12 +590,11 @@ class HiCacheFile(HiCacheStorage):
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
-            existing_files = set()
-            with os.scandir(self.file_path) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name in target_files:
-                        existing_files.add(entry.name)
-            return existing_files
+            return {
+                filename
+                for filename in target_files
+                if os.path.isfile(os.path.join(self.file_path, filename))
+            }
 
         existing_files = set()
         for filename in target_files:
