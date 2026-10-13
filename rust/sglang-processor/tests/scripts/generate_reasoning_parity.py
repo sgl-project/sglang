@@ -22,11 +22,24 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/reasoning_parity"
 
 
-def split(parser, force, stream, chunks):
-    streaming = ReasoningParser(parser, stream_reasoning=stream, force_reasoning=force)
+class Request:
+    """The request fields `ReasoningParser` reads."""
+
+    def __init__(self, nonempty):
+        self.chat_template_kwargs = {"force_nonempty_content": True} if nonempty else {}
+        self.continue_final_message = False
+
+
+def split(parser, force, stream, chunks, nonempty=False):
+    request = Request(nonempty)
+    streaming = ReasoningParser(
+        parser, stream_reasoning=stream, force_reasoning=force, request=request
+    )
     steps = [list(streaming.parse_stream_chunk(chunk)) for chunk in chunks]
     steps.append(list(streaming.parse_stream_end()))
-    unary = ReasoningParser(parser, stream_reasoning=False, force_reasoning=force)
+    unary = ReasoningParser(
+        parser, stream_reasoning=False, force_reasoning=force, request=request
+    )
     whole = unary.parse_non_stream("".join(chunks))
     as_text = lambda pair: [part or "" for part in pair]
     return {"steps": [as_text(step) for step in steps], "unary": as_text(whole)}
@@ -34,15 +47,21 @@ def split(parser, force, stream, chunks):
 
 for path in sorted(FIXTURES.glob("*.json")):
     fixture = json.loads(path.read_text())
+    # `force_nonempty_content` cases only where the fixture asks for them.
+    nonempty_options = (
+        (False, True) if fixture.get("force_nonempty_content") else (False,)
+    )
     fixture["cases"] = [
         {
             "input": index,
             "force": force,
             "stream": stream,
-            **split(fixture["parser"], force, stream, case["chunks"]),
+            **({"nonempty": True} if nonempty else {}),
+            **split(fixture["parser"], force, stream, case["chunks"], nonempty),
         }
         for index, case in enumerate(fixture["inputs"])
         for force in (True, False)
         for stream in (True, False)
+        for nonempty in nonempty_options
     ]
     path.write_text(dump(fixture))
