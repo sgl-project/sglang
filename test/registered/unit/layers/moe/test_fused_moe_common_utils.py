@@ -41,6 +41,10 @@ def test_get_model_config_supports_beam(
         "dtype": torch.bfloat16,
         "block_shape": None,
         "architecture": "BeamForCausalLM",
+        "num_layers": 52,
+        # DeepSeek first_k_dense_replace metadata, absent on Beam; not Beam's dense
+        # layer count, which only the unsupported Beam capture/replay would need.
+        "dense_layers": 0,
     }
 
 

@@ -1278,14 +1278,14 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
-                SWAChunkCapPoolConfigurator,
+                SWARequestCapPoolConfigurator,
                 create_memory_pool_configurator,
             )
 
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=1)
 
-        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         full_tokens = config.full_max_total_num_tokens
         used = full_tokens * (_full_per_token(mr) + draft_kv_per_token)
         used += config.swa_max_total_num_tokens * _swa_per_token(mr)

@@ -12,6 +12,7 @@ the flag, because batch requests derive child rids as ``f"{rid}_{i}"``.
 import asyncio
 import types
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -252,6 +253,11 @@ def _make_scheduler(
     # abort_request collects in-flight reqs from (running_batch, last_batch) on
     # the pp_size == 1 path since the v0.5.16 rebase.
     sched.last_batch = None
+    sched.enable_continuous_input_polling = False
+    sched.result_queue = deque()
+    sched._collect_inflight_batches = types.MethodType(
+        Scheduler._collect_inflight_batches, sched
+    )
     sched.collect_inflight_reqs = types.MethodType(
         Scheduler.collect_inflight_reqs, sched
     )
