@@ -190,6 +190,26 @@ def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "configured, expected",
+    [(None, "c++17"), ("c++17", "c++17"), ("c++20", "c++20")],
+)
+def test_musa_cxx_standard(monkeypatch, configured, expected):
+    if configured is None:
+        monkeypatch.delenv("SGLANG_MUSA_CXX_STANDARD", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_MUSA_CXX_STANDARD", configured)
+
+    assert arch.musa_cxx_standard.__wrapped__() == expected
+
+
+def test_musa_cxx_standard_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("SGLANG_MUSA_CXX_STANDARD", "c++23")
+
+    with pytest.raises(ValueError, match="SGLANG_MUSA_CXX_STANDARD"):
+        arch.musa_cxx_standard.__wrapped__()
+
+
+@pytest.mark.parametrize(
     "backend, capability", [("cuda", (9, 0)), ("hip", (9, 4)), ("musa", (3, 1))]
 )
 def test_arch_query_uses_cuda_api_after_musa_initialization(

@@ -130,7 +130,7 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     elif is_musa_runtime():
-        return ["-DUSE_MUSA", "-std=c++17", "-O3"]
+        return ["-DUSE_MUSA", f"-std={musa_cxx_standard()}", "-O3"]
     else:
         if arch is None:
             arch = get_jit_cuda_arch()
@@ -140,6 +140,15 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+
+
+@cache_once
+def musa_cxx_standard() -> str:
+    """Select the MUSA JIT language standard without changing CUDA/HIP defaults."""
+    standard = os.environ.get("SGLANG_MUSA_CXX_STANDARD", "c++17")
+    if standard not in {"c++17", "c++20"}:
+        raise ValueError("SGLANG_MUSA_CXX_STANDARD must be either 'c++17' or 'c++20'")
+    return standard
 
 
 def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:
