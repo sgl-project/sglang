@@ -222,6 +222,7 @@ class FakeReq:
         self.rid = rid
         self.mamba_pool_idx = None
         self.to_finish = None
+        self.finished_reason = None
         self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self.weight_version_events = []
         self.output_ids = []
@@ -241,6 +242,7 @@ def _make_scheduler(
     sched.chunked_req = FakeReq(chunked_rid) if chunked_rid is not None else None
     sched.waiting_queue = [FakeReq(rid) for rid in waiting_rids]
     sched.enable_hicache_storage = False
+    sched.enable_hisparse = False
     sched.dllm_config = None  # abort_request reads it since the dLLM rework (#27877)
     sched.disaggregation_mode = DisaggregationMode.NULL
     sched.grammar_manager = MagicMock()
