@@ -86,7 +86,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                     MultimodalDataItem(modality=Modality.AUDIO),
                 ]
 
-                processor._mark_cuda_ipc_features_for_deferred_reconstruction(
+                processor.output_builder._mark_cuda_ipc_features_for_deferred_reconstruction(
                     items, processor.keep_mm_features_on_device
                 )
 
@@ -116,7 +116,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             processor.output_builder.model_type = "qwen3_vl"
             item = MultimodalDataItem(modality=Modality.IMAGE)
 
-            processor._mark_cuda_ipc_features_for_deferred_reconstruction(
+            processor.output_builder._mark_cuda_ipc_features_for_deferred_reconstruction(
                 [item], processor.keep_mm_features_on_device
             )
 
@@ -135,7 +135,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
         processor.output_builder.model_type = "qwen3_vl"
         item = MultimodalDataItem(modality=Modality.IMAGE)
 
-        processor._mark_cuda_ipc_features_for_deferred_reconstruction(
+        processor.output_builder._mark_cuda_ipc_features_for_deferred_reconstruction(
             [item], processor.keep_mm_features_on_device
         )
 
