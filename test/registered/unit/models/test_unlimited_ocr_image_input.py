@@ -28,13 +28,15 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
         # encoder; keep production crop assembly and flag handling intact.
         if images_crop.ndim != 6 or images_spatial_crop.ndim != 3:
             raise ValueError("incorrect encoder input rank")
-        if pixel_values.shape[0] != 1:
-            raise ValueError("per-item encoder expected")
-        global_features = pixel_values.mean(dim=(2, 3, 4)).reshape(1, 1)
-        if has_local_crops[0]:
-            local_features = images_crop.mean(dim=(3, 4, 5)).reshape(-1, 1)
-            return [torch.cat((local_features, global_features))]
-        return [global_features]
+        results = []
+        for page in range(pixel_values.shape[0]):
+            global_features = pixel_values[page].mean().reshape(1, 1)
+            if has_local_crops[page]:
+                local_features = images_crop[page].mean(dim=(2, 3, 4)).reshape(-1, 1)
+                results.append(torch.cat((local_features, global_features)))
+            else:
+                results.append(global_features)
+        return results
 
     def test_different_crop_counts_preserve_page_order(self):
         """Stacking 2-crop and 3-crop pages raises before encoding either page."""
@@ -61,6 +63,26 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
         torch.testing.assert_close(
             result, torch.tensor([[1.0], [12.0], [12.0], [12.0], [2.0]])
         )
+
+    def test_bundled_pages_are_encoded_separately(self):
+        """Two pages in one processor item must not reach the formatter as B=2."""
+        first = self._item(1.0, 2, False)
+        second = self._item(2.0, 2, True)
+        bundled = SimpleNamespace(
+            feature=torch.cat((first.feature, second.feature)),
+            images_crop=torch.cat((first.images_crop, second.images_crop)),
+            images_spatial_crop=torch.cat(
+                (first.images_spatial_crop, second.images_spatial_crop)
+            ),
+            has_local_crops=[False, True],
+        )
+        encoder = SimpleNamespace(
+            vision_model=SimpleNamespace(dtype=torch.float32),
+            _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
+            _pixel_values_to_embedding=self._encoder,
+        )
+        result = UnlimitedOCRForCausalLM._process_image_input(encoder, [bundled])
+        torch.testing.assert_close(result, torch.tensor([[1.0], [12.0], [12.0], [2.0]]))
 
 
 if __name__ == "__main__":

@@ -247,28 +247,34 @@ class UnlimitedOCRForCausalLM(nn.Module):
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process multimodal data items into concatenated vision features."""
         target_dtype = self.vision_model.dtype
-        has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
         # Local crop counts vary with each image's aspect ratio.  Keep the
         # per-item encoder inputs separate, as in DeepseekOCRForCausalLM.
         vision_feature_lists: List[torch.Tensor] = []
-        for idx, item in enumerate(mm_items):
-            pixel_values = item.feature.unsqueeze(0).type(target_dtype)
+        for item in mm_items:
+            # A processor item can still bundle several pages. Normalize its
+            # page axis before _pixel_values_to_embedding loops over pages.
+            pixel_values = item.feature.type(target_dtype).reshape(
+                -1, 1, *item.feature.shape[-3:]
+            )
             images_crop = (
-                item.images_crop.unsqueeze(0)
-                .type(target_dtype)
+                item.images_crop.type(target_dtype)
                 .to(device=pixel_values.device)
+                .reshape(-1, 1, *item.images_crop.shape[-4:])
             )
             images_spatial_crop = item.images_spatial_crop.type(torch.long).to(
                 device=pixel_values.device
             )
-            if images_spatial_crop.dim() == 2:
-                images_spatial_crop = images_spatial_crop.unsqueeze(0)
+            images_spatial_crop = images_spatial_crop.reshape(-1, 1, 2)
 
             assert images_crop.dim() == 6
             assert images_spatial_crop.dim() == 3
-            item_has_local_crops = (
-                [has_local_crops[idx]] if has_local_crops is not None else None
-            )
+            num_pages = pixel_values.shape[0]
+            assert images_crop.shape[0] == images_spatial_crop.shape[0] == num_pages
+            item_has_local_crops = self._collect_mm_flag([item], "has_local_crops")
+            if item_has_local_crops is not None:
+                if len(item_has_local_crops) == 1 and num_pages > 1:
+                    item_has_local_crops = item_has_local_crops * num_pages
+                assert len(item_has_local_crops) == num_pages
             vision_feature_lists.extend(
                 self._pixel_values_to_embedding(
                     pixel_values=pixel_values,
