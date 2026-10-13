@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
@@ -460,7 +461,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()
@@ -664,6 +668,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = []
+        for node_id in end_node_ids:
+            node = self.node_by_id(node_id)
+            chain = []
+            while node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            path = []
+            start = 0
+            for node in reversed(chain):
+                end = start + len(node.key)
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                path.append(
+                    TreePathNodeInfo(
+                        node.id,
+                        node.parent.id,
+                        start,
+                        end,
+                        None if value is None else len(value),
+                    )
+                )
+                start = end
+            paths.append(tuple(path))
+        return tuple(paths)
+
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
         node = UnifiedTreeNode(self.component_types, priority=priority)
@@ -696,8 +728,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
-        node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
+        or unanchored one would silently release (or steal) another holder's segment."""
+        assert params.node_id == node.id, (
             f"lock receipt anchored on node {params.node_id} released on node {node.id}"
         )
 
@@ -1496,7 +1528,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
+            BASE_COMPONENT_TYPE
+        ].reclaimable_tokens(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1516,8 +1550,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         assert cd.value is None
-        n = len(fresh_value)
         cd.value = fresh_value.clone()
+        n = self.components_by_type[ct].reclaimable_tokens(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -2492,21 +2526,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
-        # SWA can be evicted independently of FULL, including holes between
-        # resident SWA nodes. Describe precisely which full rows back it.
-        full_load_slices = {}
-        offset = 0
-        for nid in kv_xfer.nodes_to_load or ():
-            count = len(self.node_by_id(nid).key)
-            full_load_slices[nid] = slice(offset, offset + count)
-            offset += count
-        for xfer in comp_xfers.get(ComponentType.SWA, ()):
-            xfer.anchor_index_parts = [
-                full_load_slices[nid]
-                if nid in full_load_slices
-                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
-                for nid in xfer.nodes_to_load or ()
-            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -2862,10 +2881,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
+        ledger = self.components_by_type[component_type].reclaimable_tokens(node)
         if cd.lock_ref > 0:
-            self.component_protected_size_[component_type] += len(value)
+            self.component_protected_size_[component_type] += ledger
         else:
-            self.component_evictable_size_[component_type] += len(value)
+            self.component_evictable_size_[component_type] += ledger
+
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        node = self.node_by_id(node_id)
+        if component_type not in self.components_by_type:
+            raise ValueError(f"component is not enabled: {component_type}")
+        cd = node.component_data[component_type]
+        if node is self.root_node or cd.value is None:
+            return
+        if cd.lock_ref > 0:
+            self.component_protected_size_[component_type] += delta
+        else:
+            self.component_evictable_size_[component_type] += delta
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -3086,7 +3120,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 cd = n.component_data[ct]
                 if cd.value is not None:
-                    toks = len(cd.value)
+                    toks = self.components_by_type[ct].reclaimable_tokens(n)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:

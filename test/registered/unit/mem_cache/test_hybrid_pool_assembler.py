@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
+    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
@@ -747,13 +748,14 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
 
         kv_pool = _dsa_pool_stub(layer_num=3)
         kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
-        mamba_pool = SimpleNamespace(layer_num=2, size=8)
+        mamba_pool = SimpleNamespace(layer_num=2, num_mamba_layers=2, size=8)
         # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
         full_mapping = {0: 0, 2: 1, 4: 2}
         mamba_mapping = {1: 0, 3: 1}
         params = SimpleNamespace(
             page_size=64,
             mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
             token_to_kv_pool_allocator=None,
             tp_cache_group=None,
             attn_cp_cache_group=None,
@@ -797,7 +799,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
             patch.object(
                 hybrid_pool_assembler,
-                "MambaPoolHost",
+                "build_mamba_host_pool",
                 return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
             ),
             patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
@@ -1121,7 +1123,43 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
-    def test_sidecar_read_error_is_only_a_cache_miss_with_unified_memory(self):
+    def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
+        bundle = _build_unified_swa_pool()
+        pool = bundle.token_to_kv_pool
+        for draft_arg in (
+            "mtp_full_device_pools",
+            "mtp_swa_device_pools",
+            "mtp_swa_full_device_pools",
+        ):
+            with (
+                self.subTest(draft_arg=draft_arg),
+                patch(
+                    _ASSEMBLER + "get_memory",
+                    return_value=SimpleNamespace(hicache_host_memory_mode="auto"),
+                ),
+                patch(
+                    _ASSEMBLER + "build_kv_host_pool",
+                    side_effect=NotImplementedError("packed pool reached host factory"),
+                ),
+                patch.object(
+                    UnifiedPageEnvelopeHostPool, "build_hybrid_swa_pool_pair"
+                ) as build_pair,
+            ):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "reached host factory"
+                ):
+                    build_hybrid_swa_group(
+                        page_size=4,
+                        full_kv_pool=pool.full_kv_pool,
+                        swa_kv_pool=pool.swa_kv_pool,
+                        full_layer_mapping={0: 0, 1: 1, 2: 2},
+                        swa_layer_mapping={3: 0},
+                        use_mla=False,
+                        **{draft_arg: (object(),)},
+                    )
+                build_pair.assert_not_called()
+
+    def test_sidecar_read_error_is_a_cache_miss_with_unified_memory(self):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -1133,34 +1171,28 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 raise ValueError("sidecar read failed")
 
         self.addCleanup(reset_context)
-        for unified in (False, True):
-            with self.subTest(unified=unified):
-                reset_context()
-                publish(
-                    ServerArgs(model_path="dummy", enable_unified_memory=unified),
-                    role="tokenizer",
-                )
-                cc = HybridCacheController.__new__(HybridCacheController)
-                cc.storage_backend = FailingStorage()
-                cc.prefetch_sync_queue = Queue()
-                operation = PrefetchOperation(
-                    CacheRequestHandle("r", 0),
-                    [1],
-                    pool_transfers=[PoolTransfer(name=PoolName.SWA)],
-                )
-                operation.hash_value = ["h0"]
-                operation.prefix_keys = ["prefix"]
-                if unified:
-                    with self.assertLogs(level="ERROR"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                    ack = cc.prefetch_sync_queue.get_nowait()
-                    self.assertIs(ack.operation, operation)
-                    self.assertEqual(ack.pool_hits, {})
-                else:
-                    with self.assertRaisesRegex(ValueError, "sidecar read failed"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                self.assertTrue(cc.prefetch_sync_queue.empty())
-        self.assertEqual(seen_prefixes, [["prefix", "h0"], ["prefix", "h0"]])
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", enable_unified_memory=True),
+            role="tokenizer",
+        )
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.storage_backend = FailingStorage()
+        cc.prefetch_sync_queue = Queue()
+        operation = PrefetchOperation(
+            CacheRequestHandle("r", 0),
+            [1],
+            pool_transfers=[PoolTransfer(name=PoolName.SWA)],
+        )
+        operation.hash_value = ["h0"]
+        operation.prefix_keys = ["prefix"]
+        with self.assertLogs(level="ERROR"):
+            cc._page_transfer_sidecar(operation, kv_completed_pages=1)
+        ack = cc.prefetch_sync_queue.get_nowait()
+        self.assertIs(ack.operation, operation)
+        self.assertEqual(ack.pool_hits, {})
+        self.assertTrue(cc.prefetch_sync_queue.empty())
+        self.assertEqual(seen_prefixes, [["prefix", "h0"]])
 
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4
@@ -1243,6 +1275,41 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class TestUnifiedPageEnvelopeSelection(CustomTestCase):
+    """Only no backend and Mori store the complete shared page, so only they
+    keep the page-envelope host arena."""
+
+    def test_only_no_backend_and_mori_select_the_envelope(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        self.addCleanup(reset_context)
+        for backend, expected in (
+            (None, True),
+            ("mori", True),
+            ("mooncake", False),
+            ("dynamic", False),
+        ):
+            with self.subTest(backend=backend):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_unified_memory=True,
+                        hicache_storage_backend=backend,
+                        hicache_mem_layout="layer_first",
+                    ),
+                    role="tokenizer",
+                )
+                self.assertEqual(
+                    _uses_unified_page_envelope_host(
+                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
