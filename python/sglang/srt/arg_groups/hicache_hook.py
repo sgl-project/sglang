@@ -120,11 +120,13 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    if cfg.speculative_algorithm not in (None, "DSPARK") and not _is_dsa_mtp(
+        server_args
+    ):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK and DSA MTP "
+            "speculative decoding; other draft-model host pools have no DCP "
+            "index translation."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(
@@ -147,6 +149,21 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
+    )
+
+
+def _is_dsa_mtp(server_args: Any) -> bool:
+    """A DSA model's MTP draft is replicated across DCP ranks and mirrored as a sidecar."""
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    cfg = resolving_view(server_args)
+    algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    return (
+        algorithm.is_eagle()
+        and not algorithm.is_eagle3()
+        and is_deepseek_dsa(model_config_of(server_args).hf_config)
     )
 
 
