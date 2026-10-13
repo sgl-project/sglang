@@ -1,4 +1,4 @@
-"""Import-only shims for deprecated platform backends awaiting CP refactoring.
+"""Import-only shims for deprecated NPU/MUSA backends awaiting CP refactoring.
 
 The legacy CP algorithms have been removed. These names keep the retained
 NPU/MUSA attention backends importable for non-CP inference; calling them fails.
@@ -7,7 +7,7 @@ NPU/MUSA attention backends importable for non-CP inference; calling them fails.
 
 def _deprecated_platform_cp():
     raise ValueError(
-        "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+        "Prefill CP on NPU/MUSA is deprecated; CP support will be refactored soon."
     )
 
 

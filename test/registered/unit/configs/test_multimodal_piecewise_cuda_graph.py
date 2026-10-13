@@ -10,12 +10,10 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
-    Phase,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -37,6 +35,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def _make_prefill_runner(self, backend):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
@@ -53,6 +53,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=[object()],
+            contains_mm_inputs=lambda: True,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
@@ -61,48 +62,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             extend_prefix_lens_cpu=[0],
         )
 
-    def test_kimi_k25_lm_prefill_is_opted_in(self):
-        self.assertTrue(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["KimiK25ForConditionalGeneration"]
-            )
-        )
-
-    def test_unknown_multimodal_arch_is_not_opted_in(self):
-        self.assertFalse(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["UnknownVisionForConditionalGeneration"]
-            )
-        )
-
-    def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
-        args = ServerArgs(model_path="dummy")
-        args._model_config = SimpleNamespace(
-            is_multimodal_piecewise_cuda_graph_supported=True,
-            is_multimodal_breakable_cuda_graph_supported=False,
-        )
-        args.cuda_graph_config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.BREAKABLE)
-        )
-        args._cuda_graph_config_locked = set()
-
-        args.attention_backend = "fa3"
-
-        with patch(
-            "sglang.srt.arg_groups.cuda_graph_hook"
-            ".disable_tc_piecewise_cudagraph_if_incompatible"
-        ) as disable_if_incompatible:
-            apply_cuda_graph_compatibility(args)
-
-        self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
-            Backend.TC_PIECEWISE,
-        )
-        disable_if_incompatible.assert_called_once()
-
     def test_trtllm_mla_stays_on_breakable(self):
         args = ServerArgs(model_path="dummy")
-        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
+        # trtllm_mla keeps breakable, which
         # now serves MLA by falling back to the flashinfer MLA impl for extend.
         args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
@@ -125,27 +87,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             Backend.BREAKABLE,
         )
 
-    def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
-        args = ServerArgs(model_path="dummy")
-        args.cuda_graph_config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
-        )
-        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
-
-        args.attention_backend = "trtllm_mla"
-
-        apply_cuda_graph_compatibility(args)
-
-        self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
-            Backend.TC_PIECEWISE,
-        )
-
-    def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
-        runner = self._make_prefill_runner(Backend.TC_PIECEWISE)
-
-        self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
-
     def test_multimodal_inputs_keep_breakable_prefill_enabled(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
 
@@ -166,13 +107,14 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
+            joint_head_config=None,
             is_multimodal=False,
             context_len=2048,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
             decode=PhaseConfig(backend=Backend.FULL),
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
+            prefill=PhaseConfig(backend=Backend.FULL),
         )
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
@@ -202,6 +144,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
                 is_embedding_requested=False,
                 is_embedding_gemma=False,
             ),
+            joint_head_config=None,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )

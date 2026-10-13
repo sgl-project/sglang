@@ -18,6 +18,20 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn failover_when_one_worker_dies() {
+    // We expect exactly 1 error — the first call routed to w2 fails and opens
+    // its breaker; subsequent round-robin picks rotate among the 2 healthy
+    // workers since registry.healthy_workers_for filters out the open breaker.
+    assert_eq!(errors_with_one_dead_worker(1).await, 1);
+}
+
+#[tokio::test]
+async fn retry_hides_the_dead_worker_entirely() {
+    // The request that hits w2 is retried on a live worker instead.
+    assert_eq!(errors_with_one_dead_worker(3).await, 0);
+}
+
+/// Client-visible errors across 6 round-robin requests over 3 workers, one of them dead.
+async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
     // Three mock workers. Each advertises served_model_name = "tiny" on
     // /server_info, so the worker manager's introspect step resolves the
     // registry's model_ids without us having to hand-declare them here.
@@ -34,12 +48,15 @@ async fn failover_when_one_worker_dies() {
         observability: Default::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,
@@ -55,7 +72,10 @@ async fn failover_when_one_worker_dies() {
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
-        proxy: ProxyConfig::default(),
+        proxy: ProxyConfig {
+            max_attempts: std::num::NonZeroU32::new(max_attempts).unwrap(),
+            ..Default::default()
+        },
         router_inflight_load: InflightLoadConfig::default(),
     };
 
@@ -144,9 +164,6 @@ async fn failover_when_one_worker_dies() {
             errs += 1;
         }
     }
-    // We expect exactly 1 error — the first call routed to w2 fails and opens
-    // its breaker; subsequent round-robin picks rotate among the 2 healthy
-    // workers since registry.healthy_workers_for filters out the open breaker.
-    assert_eq!(errs, 1, "exactly the first w2 pick should error");
-    assert_eq!(oks, 5, "remaining 5 picks should succeed via filtered RR");
+    assert_eq!(errs + oks, 6);
+    errs
 }

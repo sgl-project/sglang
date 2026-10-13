@@ -153,7 +153,7 @@ class _SWAPathCapFixtureBase:
 
     def _match_len(self, cache, tokens):
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-        return len(match.device_indices), match.full_kv_hit_length
+        return match.device_prefix_len, match.full_kv_hit_length
 
     def test_trims_shallow_window_but_keeps_full_kv_and_tail_match(self):
         cache, allocator, _ = self._build(cap=1)
