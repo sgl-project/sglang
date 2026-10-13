@@ -669,6 +669,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
+        enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
             observe_decode_deferred_kv_release=MagicMock()
@@ -943,6 +944,85 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         # Metadata slot stays owned by the hold until resolve time.
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
         self.assertEqual(q.queue, [])
+
+    def test_hisparse_holds_all_pools_until_every_rank_drains(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        q.scheduler.enable_hisparse = True
+        q.scheduler.hisparse_coordinator = SimpleNamespace(request_finished=MagicMock())
+        q.gloo_group = object()
+        q.deferred_kv_release_timeout = -1
+        entry = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        q.queue = [entry]
+        generation = mgr.register_deferred_abort_room(7)
+        host_release = q.scheduler.hisparse_coordinator.request_finished
+
+        with (
+            patch.object(decode_mod, "prepare_abort"),
+            patch.object(decode_mod, "release_kv_cache") as device_release,
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            q.pop_transferred()
+            host_release.assert_not_called()
+            device_release.assert_not_called()
+            self.assertEqual(q.queue, [])
+            self.assertEqual(len(q._deferred_releases), 1)
+            self.assertEqual(entry.kv_receiver.force_arm_calls, [True])
+
+            # Neither timeout nor a partial/stale ACK permits slot reuse.
+            mgr.note_abort_ack(7, 0, generation)
+            mgr.note_abort_ack(7, 1, generation - 1)
+            q.resolve_deferred_releases()
+            host_release.assert_not_called()
+            device_release.assert_not_called()
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+
+            mgr.note_abort_ack(7, 1, generation)
+            reduce.side_effect = lambda ready, **_: ready.zero_()
+            q.resolve_deferred_releases()
+            host_release.assert_not_called()
+            device_release.assert_not_called()
+
+            # All decode ranks have drained: release host KV before the device
+            # KV/request row (which also owns the hybrid state), exactly once.
+            def release_device(*args, **kwargs):
+                host_release.assert_called_once_with(entry.req)
+
+            device_release.side_effect = release_device
+            reduce.side_effect = None
+            q.resolve_deferred_releases()
+            device_release.assert_called_once_with(
+                entry.req, q.tree_cache, checkpoint=False
+            )
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
+            self.assertIsNone(entry.kv_receiver)
+            self.assertEqual(q._deferred_releases, [])
+            q.resolve_deferred_releases()
+            host_release.assert_called_once_with(entry.req)
+
+            # Reusing the room/metadata slot must not inherit the previous ACKs.
+            next_entry = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+            q.queue = [next_entry]
+            next_generation = mgr.register_deferred_abort_room(7)
+            self.assertNotEqual(generation, next_generation)
+            q.pop_transferred()
+            mgr.note_abort_ack(7, 0, generation)
+            mgr.note_abort_ack(7, 1, generation)
+            q.resolve_deferred_releases()
+            host_release.assert_called_once_with(entry.req)
+            self.assertEqual(len(q._deferred_releases), 1)
+            device_release.side_effect = None
+            mgr.note_abort_ack(7, 0, next_generation)
+            mgr.note_abort_ack(7, 1, next_generation)
+            q.resolve_deferred_releases()
+            self.assertEqual(
+                host_release.call_args_list, [call(entry.req), call(next_entry.req)]
+            )
+            self.assertEqual(device_release.call_count, 2)
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3, 3])
+            self.assertEqual(q._deferred_releases, [])
 
     def test_unnotifiable_failure_releases_immediately(self):
         # Metadata never published: no prefill holds this destination, so no
