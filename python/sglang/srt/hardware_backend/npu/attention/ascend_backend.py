@@ -542,11 +542,12 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         if self.prefill_aware_swa and forward_batch.forward_mode.is_extend():
-            # orig_seq_lens retains the full prompt length across prefill
-            # chunks. Refresh reused request slots before their first decode.
-            self.reference_lens[forward_batch.req_pool_indices.cpu().long()] = (
-                forward_batch.orig_seq_lens.cpu().to(torch.int32)
-            )
+            # Prompt lengths remain stable across chunks and retraction; a
+            # re-prefill may include generated tokens that are not references.
+            prompt_lens = forward_batch.reference_lens_cpu
+            self.reference_lens[
+                forward_batch.req_pool_indices[: len(prompt_lens)].cpu().long()
+            ] = torch.tensor(prompt_lens, dtype=torch.int32)
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -1624,6 +1625,36 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.prefill_aware_swa and any(
+                seq_len > prompt_len
+                for seq_len, prompt_len in zip(
+                    forward_batch.seq_lens_cpu.tolist(),
+                    forward_batch.reference_lens_cpu,
+                )
+            ):
+                query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_extend(
+                    query,
+                    output,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                    sliding_window_size=self.sliding_window_size,
+                    reference_lens=torch.tensor(forward_batch.reference_lens_cpu),
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
+                )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer

@@ -817,6 +817,44 @@ class TestRunSdpaForwardDecode(unittest.TestCase):
 
 
 class TestReferenceSlidingWindowDecode(CustomTestCase):
+    def test_reprefill_generated_tokens_keep_the_original_reference_boundary(self):
+        generator = torch.Generator().manual_seed(17)
+        backend = AscendTorchNativeAttnBackend()
+        prompt_len, total_len = 11, 276
+        key = torch.randn(total_len, 2, 8, generator=generator)
+        value = torch.randn(total_len, 2, 8, generator=generator)
+        for prefix_len in (0, 149):
+            with self.subTest(prefix_len=prefix_len):
+                query = torch.randn(total_len - prefix_len, 2, 8, generator=generator)
+                actual = torch.empty_like(query)
+                backend.run_sdpa_forward_extend(
+                    query,
+                    actual,
+                    key,
+                    value,
+                    torch.arange(total_len).unsqueeze(0),
+                    torch.tensor([0]),
+                    torch.tensor([total_len]),
+                    torch.tensor([prefix_len]),
+                    torch.tensor([total_len - prefix_len]),
+                    causal=True,
+                    sliding_window_size=128,
+                    reference_lens=torch.tensor([prompt_len]),
+                )
+                positions = torch.arange(total_len)
+                for offset, q in enumerate(query):
+                    position = prefix_len + offset
+                    visible = (positions <= position) & (
+                        (positions < prompt_len) | (position - positions < 128)
+                    )
+                    scores = q.unsqueeze(1) @ key.transpose(0, 1).transpose(-2, -1)
+                    scores = scores / math.sqrt(8)
+                    expected = (
+                        scores.masked_fill(~visible, float("-inf")).softmax(-1)
+                        @ value.transpose(0, 1)
+                    ).squeeze(1)
+                    torch.testing.assert_close(actual[offset], expected)
+
     def test_reference_prefix_and_generated_window_against_full_mask(self):
         generator = torch.Generator().manual_seed(13)
         backend = AscendTorchNativeAttnBackend()
