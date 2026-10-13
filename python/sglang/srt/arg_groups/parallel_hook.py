@@ -301,13 +301,39 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
-        _disable_nccl_graph_buffer_registration()
+    if _graph_may_capture_collectives(server_args):
+        _disable_nccl_graph_buffer_registration(
+            "graph-captured collectives run on graph-pool temporaries whose "
+            "addresses the pool also hands to other tensors"
+        )
 
 
-def _disable_nccl_graph_buffer_registration() -> None:
-    """Keep NCCL from registering the buffers of the graph-captured PyNccl
-    all-to-all.
+def _graph_may_capture_collectives(server_args: Any) -> bool:
+    """Whether any captured CUDA graph can hold a cross-rank collective.
+
+    Capture binds a collective's send/recv buffers to graph-pool temporaries,
+    and the pool hands those same addresses to other tensors. Which collective
+    got captured, which phase captured it, and whether the pool is later
+    remapped by torch_memory_saver only change how that aliasing is reached -
+    not whether it exists - so the guard tracks the hazard rather than the
+    feature flags that expose it. A decode-only check would miss a prefill
+    capture into a pausable pool, which the pool guard used to cover.
+
+    Errs toward True. Later passes can still narrow cuda_graph_config, and
+    turning the registration off has no measured throughput cost, so a false
+    positive is cheaper than a missed deployment shape.
+    """
+    view = resolving_view(server_args)
+    if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
+        return False
+    config = getattr(view, "cuda_graph_config", None)
+    if config is None:
+        return True
+    return any(config[phase].backend != Backend.DISABLED for phase in Phase.ALL)
+
+
+def _disable_nccl_graph_buffer_registration(reason: str) -> None:
+    """Keep NCCL from registering the buffers of graph-captured collectives.
 
     NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
     collective captured in a CUDA graph for the lifetime of the graph, and
@@ -319,15 +345,21 @@ def _disable_nccl_graph_buffer_registration() -> None:
     spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
     Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
     deployment; disabling the registration removes the hang while dedicated
-    all-to-all buffers alone do not. Must run before the schedulers create
-    their NCCL communicators, which inherit this environment. An explicit
-    setting wins.
+    all-to-all buffers alone do not.
+
+    A pausable graph pool breaks the registrations too: torch_memory_saver
+    resume keeps the pool's virtual addresses but maps new physical pages,
+    while NCCL's capture-time registrations still point at the released pages,
+    so graph replay can hang (fzyzcjy/torch_memory_saver#88).
+
+    Must run before the schedulers create their NCCL communicators, which
+    inherit this environment. An explicit setting wins.
     """
     if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
         logger.warning(
-            "NCCL_GRAPH_REGISTER=%s was set explicitly; the graph-captured TP "
-            "LM-head all-to-all can deadlock with registered buffers.",
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; %s.",
             os.environ["NCCL_GRAPH_REGISTER"],
+            reason,
         )
 
 
