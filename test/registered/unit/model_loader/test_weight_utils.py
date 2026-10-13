@@ -1,7 +1,10 @@
 """Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
 
+import io
 import json
 import os
+import pickle
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -210,6 +213,19 @@ class _OpenOnUnpickle:
         return (open, (self.marker, "w"))
 
 
+def _write_legacy_tar_checkpoint(path, payload):
+    members = {
+        "storages": pickle.dumps(0) + pickle.dumps([]),
+        "tensors": pickle.dumps(0),
+        "pickle": pickle.dumps(payload),
+    }
+    with tarfile.open(path, "w") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+
 class TestLoadPtFile(CustomTestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -224,11 +240,11 @@ class TestLoadPtFile(CustomTestCase):
         loaded = _load_pt_file(path)
         self.assertTrue(torch.equal(loaded["w"], torch.arange(4)))
 
-    def test_pickle_payload_is_not_executed(self):
+    def test_legacy_tar_pickle_payload_is_not_executed(self):
         marker = os.path.join(self.folder, "pwned")
         path = os.path.join(self.folder, "pytorch_model.bin")
-        torch.save({"w": _OpenOnUnpickle(marker)}, path)
-        with self.assertRaises(Exception):
+        _write_legacy_tar_checkpoint(path, _OpenOnUnpickle(marker))
+        with self.assertRaises(RuntimeError):
             _load_pt_file(path)
         self.assertFalse(os.path.exists(marker))
 
