@@ -904,12 +904,10 @@ class ChatCompletionRequest(PDRoutingFields):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
-    # Return output top logprobs only as flat arrays in choices[].meta_info
-    # (see GenerateReqInput.return_flat_raw_output_top_logprobs); the
-    # choices[].logprobs top_logprobs lists are then left empty. Requires
-    # return_meta_info.
+    # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
+    # choices[].logprobs top_logprobs are then empty.
     return_flat_raw_output_top_logprobs: bool = False
-    # Base64 by default for those arrays; false returns plain JSON lists.
+    # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
     return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,

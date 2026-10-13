@@ -103,7 +103,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
     async_sock_send,
-    build_flat_input_top_logprobs_arrays,
+    build_flat_top_logprobs_arrays,
     flat_top_logprobs_layout,
     sock_send,
     unwrap_from_pickle,
@@ -343,101 +343,71 @@ def _slice_streaming_output_meta_info(
         meta_info[key] = meta_info[key][last_output_offset:]
 
 
-def _build_flat_input_top_logprobs_fields(
-    input_top_logprobs_val: List[Optional[List[float]]],
-    input_top_logprobs_idx: List[Optional[List[int]]],
+def _build_flat_top_logprobs_fields(
+    side: str,
+    top_logprobs_val: List[Optional[List[float]]],
+    top_logprobs_idx: List[Optional[List[int]]],
     top_logprobs_num: int,
     return_b64: bool = False,
 ) -> Dict[str, Any]:
-    """Build the flat raw prompt top logprob response fields.
+    """Build the flat raw top logprob response fields under `{side}_top_logprobs_*`
+    keys, where side is "input" (prompt) or "output".
 
-    `input_top_logprobs_shape` is the literal [rows, k] shape of the flat
+    `{side}_top_logprobs_shape` is the literal [rows, k] shape of the flat
     arrays. The leading null positions (counted by
-    `input_top_logprobs_null_prefix`) precede the arrays, so covered position
+    `{side}_top_logprobs_null_prefix`) precede the arrays, so covered position
     i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
     spans null_prefix + rows positions. With ``return_b64``, the arrays are
     base64 contiguous little-endian binary; the dtype marker fields let the
     widths change later without a wire break.
     """
-    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
-        input_top_logprobs_val, input_top_logprobs_idx, top_logprobs_num
-    )
     if return_b64:
-        return _build_flat_input_top_logprobs_fields_from_arrays(
-            val_arr, idx_arr, null_prefix, return_b64=True
+        val_arr, idx_arr, null_prefix = build_flat_top_logprobs_arrays(
+            top_logprobs_val, top_logprobs_idx, top_logprobs_num
         )
+        return _build_flat_top_logprobs_fields_from_arrays(
+            side, val_arr, idx_arr, null_prefix, return_b64=True
+        )
+    null_prefix, k = flat_top_logprobs_layout(top_logprobs_val, top_logprobs_num)
     # Flatten the original python rows so the JSON numbers keep their full
     # (float64) precision, matching the pre-scheduler-flat output.
     return {
-        "input_top_logprobs_val_flat": [
-            v for row in input_top_logprobs_val[null_prefix:] for v in row
+        f"{side}_top_logprobs_val_flat": [
+            v for row in top_logprobs_val[null_prefix:] for v in row
         ],
-        "input_top_logprobs_idx_flat": [
-            i for row in input_top_logprobs_idx[null_prefix:] for i in row
+        f"{side}_top_logprobs_idx_flat": [
+            i for row in top_logprobs_idx[null_prefix:] for i in row
         ],
-        "input_top_logprobs_shape": [val_arr.shape[0], val_arr.shape[1]],
-        "input_top_logprobs_null_prefix": null_prefix,
+        f"{side}_top_logprobs_shape": [len(top_logprobs_val) - null_prefix, k],
+        f"{side}_top_logprobs_null_prefix": null_prefix,
     }
 
 
-def _build_flat_input_top_logprobs_fields_from_arrays(
+def _build_flat_top_logprobs_fields_from_arrays(
+    side: str,
     val_arr: np.ndarray,
     idx_arr: np.ndarray,
     null_prefix: int,
     return_b64: bool = False,
 ) -> Dict[str, Any]:
-    """Build the flat response fields from scheduler-assembled [rows, k]
-    arrays (see `_build_flat_input_top_logprobs_fields` for the field
-    semantics)."""
+    """Build the flat response fields from [rows, k] arrays (see
+    `_build_flat_top_logprobs_fields` for the field semantics)."""
     fields: Dict[str, Any] = {}
     if return_b64:
-        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+        fields[f"{side}_top_logprobs_val_flat_b64"] = pybase64.b64encode(
             val_arr.tobytes()
         ).decode("utf-8")
-        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+        fields[f"{side}_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
             idx_arr.tobytes()
         ).decode("utf-8")
-        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
-        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
+        fields[f"{side}_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields[f"{side}_top_logprobs_idx_flat_b64_dtype"] = "int32"
     else:
-        fields["input_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
-        fields["input_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
-    fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
-    fields["input_top_logprobs_null_prefix"] = null_prefix
+        fields[f"{side}_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields[f"{side}_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
+    fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
     return fields
-
-
-def _build_flat_output_top_logprobs_fields(
-    output_top_logprobs_val: List[Optional[List[float]]],
-    output_top_logprobs_idx: List[Optional[List[int]]],
-    top_logprobs_num: int,
-    return_b64: bool = False,
-) -> Dict[str, Any]:
-    """Build the flat raw output top logprob response fields.
-
-    Same layout as the prompt fields (see `_build_flat_input_top_logprobs_fields`),
-    under `output_top_logprobs_*` keys. Only base64 packs arrays; plain JSON
-    flattens the original rows.
-    """
-    if return_b64:
-        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
-            output_top_logprobs_val, output_top_logprobs_idx, top_logprobs_num
-        )
-        fields = _build_flat_input_top_logprobs_fields_from_arrays(
-            val_arr, idx_arr, null_prefix, return_b64=True
-        )
-        return {"output" + key[len("input") :]: value for key, value in fields.items()}
-    null_prefix, k = flat_top_logprobs_layout(output_top_logprobs_val, top_logprobs_num)
-    return {
-        "output_top_logprobs_val_flat": [
-            v for row in output_top_logprobs_val[null_prefix:] for v in row
-        ],
-        "output_top_logprobs_idx_flat": [
-            i for row in output_top_logprobs_idx[null_prefix:] for i in row
-        ],
-        "output_top_logprobs_shape": [len(output_top_logprobs_val) - null_prefix, k],
-        "output_top_logprobs_null_prefix": null_prefix,
-    }
 
 
 class InputFormat(Enum):
@@ -2808,7 +2778,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
-        finished: bool = False,
+        finished: bool,
     ):
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
@@ -2846,7 +2816,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.input_top_logprobs_scheduler_flat
                     )
                     state.input_top_logprobs_flat_fields = (
-                        _build_flat_input_top_logprobs_fields_from_arrays(
+                        _build_flat_top_logprobs_fields_from_arrays(
+                            "input",
                             val_arr,
                             idx_arr,
                             null_prefix,
@@ -2861,7 +2832,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     try:
                         state.input_top_logprobs_flat_fields = (
-                            _build_flat_input_top_logprobs_fields(
+                            _build_flat_top_logprobs_fields(
+                                "input",
                                 state.input_top_logprobs_val,
                                 state.input_top_logprobs_idx,
                                 top_logprobs_num,
@@ -2898,30 +2870,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
-            # None selects the nested format below.
-            flat_output_fields = None
-            if state.obj.return_flat_raw_output_top_logprobs:
-                # Built once on the finished response; streaming is rejected and
-                # only that response reaches a non-streaming client.
-                flat_output_fields = {}
-                if finished:
-                    try:
-                        flat_output_fields = _build_flat_output_top_logprobs_fields(
+            use_flat_output = state.obj.return_flat_raw_output_top_logprobs
+            # Built once on the finished response; streaming is rejected and
+            # only that response reaches a non-streaming client.
+            if use_flat_output and finished:
+                try:
+                    meta_info.update(
+                        _build_flat_top_logprobs_fields(
+                            "output",
                             state.output_top_logprobs_val,
                             state.output_top_logprobs_idx,
                             top_logprobs_num,
                             return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                         )
-                    except ValueError as e:
-                        flat_output_fields = None
-                        logger.error(
-                            "Falling back to nested output top logprobs for rid=%s: %s",
-                            meta_info.get("id"),
-                            e,
-                        )
-            if flat_output_fields is not None:
-                meta_info.update(flat_output_fields)
-            else:
+                    )
+                except ValueError as e:
+                    use_flat_output = False
+                    logger.error(
+                        "Falling back to nested output top logprobs for rid=%s: %s",
+                        meta_info.get("id"),
+                        e,
+                    )
+            if not use_flat_output:
                 if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
                     state.output_top_logprobs.extend(
                         self.detokenize_top_logprobs_tokens(
@@ -2979,7 +2949,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOutput,
         recv_obj_index: int,
-        finished: bool = False,
+        finished: bool,
     ):
         if (
             recv_obj.input_token_logprobs_val is not None
