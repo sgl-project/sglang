@@ -112,7 +112,7 @@ sglang serve black-forest-labs/flux-3-action-droid \
 | Field | Type | Description |
 | --- | --- | --- |
 | `input.task` | string | Language instruction. |
-| `input.observation.images` | object | Camera name -> HWC RGB image, uint8 or float in `[0, 1]`. DROID: `wrist`, `left`, `right` (or the LeRobot names `wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`). Alternatively send `composite`: the 540x640 image with the wrist camera on top and the two exterior cameras at half resolution below. |
+| `input.observation.images` | object | Camera name -> HWC RGB image: a base64 PNG or JPEG (`{"b64_json": ...}`), or a pixel array of uint8 or floats in `[0, 1]`. DROID: `wrist`, `left`, `right` (or the LeRobot names `wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`). Alternatively send `composite`: the 540x640 image with the wrist camera on top and the two exterior cameras at half resolution below. |
 | `input.observation.state` | array | Robot state in dataset units. DROID: 7 joint positions (rad) followed by the gripper position. |
 | `parameters.num_inference_steps` | integer, optional | Defaults to the checkpoint recipe. |
 | `parameters.guidance_scale` / `guidance_scale_action` | number, optional | Guidance scale on the video / action stream. Defaults to the checkpoint recipe. |
@@ -127,15 +127,26 @@ The response returns absolute commands of shape `[32, 8]` in the dataset's conve
 ### 4.1 Generic Action HTTP API
 
 ```python Example
+import base64
+import io
+
 import numpy as np
 import requests
+from PIL import Image
+
+
+def png(image: np.ndarray) -> dict:
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, format="PNG")
+    return {"b64_json": base64.b64encode(buffer.getvalue()).decode()}
+
 
 image = np.zeros((360, 640, 3), dtype=np.uint8)
 payload = {
     "input": {
         "task": "put the marker in the cup",
         "observation": {
-            "images": {"wrist": image.tolist(), "left": image.tolist(), "right": image.tolist()},
+            "images": {"wrist": png(image), "left": png(image), "right": png(image)},
             "state": np.zeros(8, dtype=np.float32).tolist(),
         },
     },
@@ -144,6 +155,8 @@ response = requests.post("http://127.0.0.1:30000/v1/actions/generations", json=p
 action = response.json()["data"][0]["action"]
 print(action["shape"])  # [32, 8]
 ```
+
+PNG is lossless. Pixel lists (`image.tolist()`) are accepted too, but three 360x640 cameras become about 11 MB of JSON, and encoding and parsing it adds about 0.3 s per request on top of the base64 PNG payload. For the lowest overhead, use the OpenPI WebSocket below with msgpack numpy arrays.
 
 `GET /v1/actions/metadata` reports the camera keys, action shape and sampler defaults of the served policy.
 

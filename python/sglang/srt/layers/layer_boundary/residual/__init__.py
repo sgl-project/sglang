@@ -31,6 +31,13 @@ class ResidualUpdate(Protocol):
             than leaving the operation for the next prepare.
         outlives_layer: Whether parameters/state remain valid after
             leaving the producer layer, including any offload or state reuse.
+        writes_stream: Whether the producer computes the next stream itself
+            and writes it at its exit, dropping the previous residual: what
+            reaches its exit is already complete.
+        quantized_sum: Whether the sum the contribution owes may be completed
+            by a quantized all-reduce when quantized communication is enabled.
+            This is a numerical policy, separate from being a plain add; full
+            precision is always correct.
 
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim is_plain_add.
@@ -46,6 +53,12 @@ class ResidualUpdate(Protocol):
     # Its parameters and state remain valid after leaving the producer layer.
     # Stateful or offloaded implementations must not opt in without that guarantee.
     outlives_layer: bool
+    # The producer builds the next stream itself and writes it at its exit, so
+    # its exit has no sum left to complete and the previous residual is dropped.
+    # Only an update applied at the exit can, and it is not a plain add.
+    writes_stream: bool
+    # The sum it owes may run as a quantized all-reduce.
+    quantized_sum: bool
 
     def update(self, hidden_states, residual) -> torch.Tensor:
         """Write hidden_states, the producer contribution, into residual.
@@ -70,6 +83,23 @@ class ResidualReadout(Protocol):
         is_plain_norm: Read is normalization/optional quantization without changing
             the residual, allowing compatible fused add+norm implementations.
         reads_before_dp_gather: Preserve this read on source rows before a DP gather.
+        reads_after_attn_tp_gather: The read needs every row of the
+            attention's, so it runs after any gather over attention TP: a
+            producer that would leave its output on this rank's attention-TP
+            slice returns it to the attention's rows instead. False lets it
+            read that slice, its result gathered after it. Not derivable from
+            the rows the stage computes on: a read on the slice followed by a
+            gather and a read after the gather leave the same compute rows.
+        completing_fusions: ReadoutFusion kernels that complete the sum the
+            input owes with the residual add ahead of this read, tried before
+            the boundary's own all-reduce or reduce-scatter. Empty when the
+            read offers none: the boundary's own collective followed by
+            update_and_read is correct for every read.
+        gathering_reads: Callables ``(hidden_states, residual, norm)`` that
+            read the input on this rank's attention-TP slice and gather it over
+            attention TP, returning ``(input, residual)``, or None when they do
+            not take the batch. Empty when the read offers none: it then runs
+            on the slice and the boundary gathers what it read.
 
     init_residual initializes the stack residual. read consumes an
     already-written residual; update_and_read first applies the actual
@@ -84,6 +114,14 @@ class ResidualReadout(Protocol):
     is_plain_norm: bool
     # Preserve the read on the source rows before a DP gather.
     reads_before_dp_gather: bool
+    # The read needs every row of the attention's, not this rank's slice.
+    reads_after_attn_tp_gather: bool
+    # Kernels that complete the sum the input owes with the residual add
+    # ahead of this read; empty when the read offers none.
+    completing_fusions: Tuple
+    # Reads that run on this rank's attention-TP slice and gather what they
+    # read; empty when the read offers none.
+    gathering_reads: Tuple
 
     def init_residual(self, hidden_states) -> torch.Tensor:
         """The residual the layer stack starts from, given its input."""
@@ -127,11 +165,39 @@ class ResidualReadout(Protocol):
             norm: Consumer normalization module.
             quant_format: Requested input quantization format, as in read().
             post_residual_addition: Optional extra added after update, before norm.
+                Each read documents where it applies, rejects or does not
+                apply it. A stream that arrives already written is read with
+                ``read``, which is not given it.
 
         Returns:
             (compute_input, residual). A fused implementation can preserve FP32
             accumulation through norm without materializing a rounded intermediate.
         """
+
+
+class FinalRead(Protocol):
+    """The model's read of the layer stack's output, its final norm.
+
+    Called with the output alone on a stream its producer already wrote, else
+    with the output and the residual, returning ``(normed, residual)``: the
+    residual add followed by the norm, so a pending update must be a plain add.
+
+    Optional, each read where it is used with the default given:
+        attn_tp_gather: Its own gather over attention TP of rows the stack's
+            last stage leaves on this rank's attention-TP slice, returning
+            None when it does not take the batch. Without it the boundary's
+            gather runs, which is always correct.
+        reads_attn_tp_slices: It reads this rank's attention-TP slice of the
+            rows and gathers what it read itself, so the stack's last FFN
+            leaves its output on that slice. False by default: the last FFN
+            returns its output on the attention's rows, which any final read
+            takes.
+        gemma_weight: The gamma a deferred MoE finalize normalizes with, when
+            the model's final norm takes that handoff.
+    """
+
+    def __call__(self, hidden_states, residual=None, **read_kwargs):
+        """The final norm of ``hidden_states``, after adding ``residual``."""
 
 
 class LayerResidualOps(NamedTuple):

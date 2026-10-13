@@ -14,7 +14,7 @@
 //! never a sort.
 
 use crate::config::DEFAULT_MIN_LOAD_CHOICES;
-use crate::policies::admission::{compare_prefill_pressure, queue_gate_admits};
+use crate::policies::admission::{compare_prefill_engines, queue_gate_admits};
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
@@ -128,7 +128,7 @@ fn sample_pool<'w>(
 /// two-worker fleet, so a fixed scan order would pin every fallback
 /// dispatch to the first worker.
 ///
-/// Both tiers scan linearly and never sort. `compare_prefill_pressure`
+/// Both tiers scan linearly and never sort. `compare_prefill_engines`
 /// is only a pairwise comparison: two workers that both publish
 /// `estimated_prefill_queue_ms` are ordered on that estimate, and any
 /// other pair on the waiting-token tuple, so it is not a total order
@@ -164,12 +164,12 @@ fn best_two_of_sample(
         // Only a strict improvement displaces the incumbent, so a tie keeps
         // whichever member the draw presented first.
         if best.is_none_or(|current| {
-            compare_prefill_pressure(&pool[index], &pool[current], snapshot).is_lt()
+            compare_prefill_engines(&pool[index], &pool[current], snapshot).is_lt()
         }) {
             runner_up = best;
             best = Some(index);
         } else if runner_up.is_none_or(|current| {
-            compare_prefill_pressure(&pool[index], &pool[current], snapshot).is_lt()
+            compare_prefill_engines(&pool[index], &pool[current], snapshot).is_lt()
         }) {
             runner_up = Some(index);
         }
@@ -231,7 +231,7 @@ mod tests {
     /// A fleet where only some workers publish `estimated_prefill_queue_ms`.
     /// An idle worker has no throughput delta to derive one from, so this is
     /// the steady state, not an edge case - and it makes
-    /// `compare_prefill_pressure` intransitive: a slow worker with a shallow
+    /// `compare_prefill_engines` intransitive: a slow worker with a shallow
     /// queue loses to a fast worker with a deep one on the estimate, while
     /// both are ordered against an estimate-less worker on waiting tokens.
     fn mixed_estimate_snapshot(workers: &[Arc<Worker>]) -> EngineReportedLoadSnapshot {
@@ -265,7 +265,7 @@ mod tests {
         )
     }
 
-    /// `compare_prefill_pressure` is a pairwise comparison, not a total
+    /// `compare_prefill_engines` is a pairwise comparison, not a total
     /// order, so the k-way minimum must be a linear scan. Sorting a sample
     /// this size panics with "user-provided comparison function does not
     /// correctly implement a total order" - every request that samples a
