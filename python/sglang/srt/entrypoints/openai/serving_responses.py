@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -1465,6 +1466,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
+        if chat_encoding.spec_renders_thinking_parts(self.chat_encoding_spec):
+            messages = [
+                chat_encoding.reasoning_content_to_thinking_part(m)
+                if isinstance(m, dict)
+                else m
+                for m in messages
+            ]
 
         # Preserve the history prefix when a later instruction is appended.
         if self.supports_inline_system:

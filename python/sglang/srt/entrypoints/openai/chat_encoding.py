@@ -224,6 +224,29 @@ def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     return spec is not None
 
 
+def spec_renders_thinking_parts(spec: Optional[str]) -> bool:
+    """Whether the encoder for ``spec`` reads assistant reasoning history only
+    from ``{"type": "thinking"}`` content parts, ignoring ``reasoning_content``."""
+    return spec == "inkling"
+
+
+def reasoning_content_to_thinking_part(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Move an assistant message's ``reasoning_content`` into a leading thinking
+    content part, for encoders where :func:`spec_renders_thinking_parts` holds."""
+    reasoning = message.get("reasoning_content")
+    if message.get("role") != "assistant" or not reasoning:
+        return message
+    parts: List[Any] = [{"type": "thinking", "thinking": reasoning}]
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        parts.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        parts.extend(content)
+    converted = {k: v for k, v in message.items() if k != "reasoning_content"}
+    converted["content"] = parts
+    return converted
+
+
 def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
 

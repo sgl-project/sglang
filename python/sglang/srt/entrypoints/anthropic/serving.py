@@ -43,6 +43,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ToolUseBlock,
     is_server_tool,
 )
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -548,6 +549,14 @@ class AnthropicServing:
                 # see a valid role-alternation sequence.
                 openai_msg["content"] = ""
                 openai_messages.append(openai_msg)
+
+        if chat_encoding.spec_renders_thinking_parts(
+            self.openai_serving_chat.chat_encoding_spec
+        ):
+            openai_messages = [
+                chat_encoding.reasoning_content_to_thinking_part(message)
+                for message in openai_messages
+            ]
 
         # Build ChatCompletionRequest
         request_data = {

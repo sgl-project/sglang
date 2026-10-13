@@ -365,6 +365,38 @@ class InputMessageConstructionTestCase(CustomTestCase):
         except Exception:
             pass
 
+    def test_inkling_reasoning_history_becomes_thinking_part(self):
+        """Bug regression: the Inkling encoder renders prior reasoning only from
+        thinking content parts, so a replayed reasoning item was dropped."""
+        serving = make_serving()
+        serving.chat_encoding_spec = "inkling"
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ponder"}],
+                },
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "call_id": "call_1",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        self.assertNotIn("reasoning_content", assistant)
+        self.assertEqual(
+            assistant["content"], [{"type": "thinking", "thinking": "ponder"}]
+        )
+        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "lookup")
+
 
 class ChatToolForwardingTestCase(CustomTestCase):
     def test_make_request_passes_function_tools_to_chat_processing(self):

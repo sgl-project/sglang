@@ -29,6 +29,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
+    chat_encoding_spec = None
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
@@ -1041,6 +1042,52 @@ class TestAnthropicServing(unittest.TestCase):
         assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
         self.assertEqual(assistant_msg.reasoning_content, "ponder")
         self.assertEqual(assistant_msg.content, "")
+
+    def test_inkling_thinking_history_becomes_thinking_part(self):
+        """Bug regression: the Inkling encoder renders prior thinking only from
+        thinking content parts, so reasoning_content history was dropped."""
+
+        class _InklingOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+            chat_encoding_spec = "inkling"
+
+        serving = AnthropicServing(_InklingOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "lookup",
+                            "input": {},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertIsNone(assistant.reasoning_content)
+        self.assertEqual(
+            [(part.type, part.thinking) for part in assistant.content],
+            [("thinking", "ponder")],
+        )
+        self.assertEqual(assistant.tool_calls[0].function.name, "lookup")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""
