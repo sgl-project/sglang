@@ -181,7 +181,6 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -4767,15 +4766,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if (
-                get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (
-                        _is_cuda
-                        and get_moe_a2a_backend().is_megamoe()
-                        and get_parallel().attn_cp_size == 1
-                    )
+            if get_parallel().pp_group.world_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (
+                    _is_cuda
+                    and get_moe_a2a_backend().is_megamoe()
+                    and get_parallel().attn_cp_size == 1
                 )
             ):
                 raise ValueError(
