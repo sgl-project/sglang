@@ -47,7 +47,7 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
             return
 
-        prefix_length = len(self.prefix_indices)
+        prefix_length = self.prefix_len
         if self.dllm_config.requires_separate_context_encoding:
             self.dllm_phase = (
                 DllmReqPhase.STAGING_PREFILL
@@ -69,12 +69,12 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_incomplete_ids:
-            prefix_len = len(self.prefix_indices)
+            prefix_len = self.prefix_len
             assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size
             self.full_untruncated_fill_ids = (
                 self.full_untruncated_fill_ids[:prefix_len] + self.dllm_incomplete_ids
             )
-            # extend_range is (re)computed by the staging adder
+            # extend_end is (re)computed by the staging adder
             # (add_dllm_staging_req) before this req is scheduled, mirroring the
             # non-incomplete path which also defers it to the adder.
             return
@@ -101,7 +101,7 @@ class ReqDllmMixin:
         self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self):
-        prefix_len = len(self.prefix_indices)
+        prefix_len = self.prefix_len
         if self.dllm_config.requires_separate_context_encoding:
             assert prefix_len <= self.dllm_block_offset
         else:

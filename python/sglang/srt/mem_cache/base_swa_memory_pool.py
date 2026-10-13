@@ -18,6 +18,10 @@ class BaseSWAKVPool(KVCache):
     # Set when SWA KV is a per-request ring of this many tokens (addressed by
     # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
     swa_req_ring_size: Optional[int] = None
+    # Independent draft SWA buffers can consume full-token IDs directly instead
+    # of the target SWA allocator's physical IDs. HiCache must preserve that
+    # index ownership even though both buffers implement sliding attention.
+    swa_uses_full_indices: bool = False
 
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:

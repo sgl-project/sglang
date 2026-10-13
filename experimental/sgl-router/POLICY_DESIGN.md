@@ -581,9 +581,11 @@ capacity can change before dispatch. The handler owns network operations, retry
 rules, and accounting for the engines actually dispatched to.
 
 Selection fallback advances through the ordered compatible buckets before any
-network dispatch. Every PD attempt picks both engines from that bucket. Transport
-retry integration remains separate work; a forwarding failure does not resume
-the bucket loop or silently replace a successful policy pick.
+network dispatch. Every PD attempt picks both engines from that bucket. With
+`--retry-max-attempts` above 1, a dispatch that fails before any response
+reaches the client reruns selection from the first bucket with the failed
+engine excluded (`BucketRequest::excluded`); it never replaces a pick whose
+response the client has started to receive.
 
 For PD, acquire and release accounting for the actual stages and clean up
 partial setup on failure. Policy selection does not own the PD request lifetime.
@@ -647,7 +649,7 @@ Not yet implemented in the reorg path:
 - Power-of-k cache-miss fallback configuration and cache decision metrics.
 - Shared load interpretation, dispatch correction, and policy-specific
   dispatch-timestamp requirements.
-- PD compatibility filtering, retry integration, and legacy-route switchover.
+- PD compatibility filtering and legacy-route switchover.
 
 The preceding policy sections describe target behavior for those follow-ups;
 they do not claim those capabilities are present in this PR.

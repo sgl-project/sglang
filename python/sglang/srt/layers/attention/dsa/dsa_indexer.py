@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -122,6 +123,7 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -167,7 +169,7 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 if _is_cuda or _is_hip:
     # Plain-torch graph helpers: usable wherever the split-op surface is.
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+    from sglang.srt.layers.attention.dsa.head_gate import (
         logits_head_gate_graph,
         scale_head_gate_graph,
     )
@@ -636,7 +638,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         kv_cache = (
             pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            .view(-1, pool.page_size, self.head_dim + 4)
+            .view(-1, pool.index_page_size, self.head_dim + 4)
             .view(fp8_dtype)
         )
 
@@ -737,8 +739,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return None
 
         pool = get_token_to_kv_pool()
-        if pool.page_size != PAGE_SIZE:
-            _decline_fused(f"pool page_size is {pool.page_size}, not {PAGE_SIZE}")
+        if pool.index_page_size != PAGE_SIZE:
+            _decline_fused(f"pool page_size is {pool.index_page_size}, not {PAGE_SIZE}")
             return None
         # DSA cache layer split: the standard path stores index-K per layer, and the
         # fused path addresses the same buffer directly.
@@ -998,7 +1000,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -1197,7 +1199,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().index_page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
@@ -1461,7 +1463,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().index_page_size
         if _is_hip:
             if _use_aiter_preshuffle:
                 assert page_size % 16 == 0, (
@@ -1806,7 +1808,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                pool.index_page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
@@ -1815,7 +1817,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                pool.index_page_size,
             )
             return
 
@@ -1825,7 +1827,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
+            page_size = pool.index_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
@@ -1897,7 +1899,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        if _is_hip:
+        if _is_hip and not _is_gfx1250_supported:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant

@@ -32,7 +32,7 @@ import contextlib
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -216,6 +216,9 @@ class BaseBreakableCudaGraphRunner:
     runner can stand in for the wrapped module ("other functions directly
     pass").
     """
+
+    # Graphs captured in this process across all runners; read after warmup.
+    num_captures: ClassVar[int] = 0
 
     def __init__(
         self,
@@ -562,6 +565,7 @@ class BaseBreakableCudaGraphRunner:
             raise _CaptureRejected(
                 f"{limit_reason}; disabling this BCG runner and using eager"
             )
+        BaseBreakableCudaGraphRunner.num_captures += 1
         return entry
 
 
