@@ -1352,6 +1352,57 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
+    def test_single_request_lora_id_rejects_list(self):
+        """Single generate request must reject a list for lora_id (Issue #41466)."""
+        req = GenerateReqInput(text="hello", lora_id=["adapter"])
+        with self.assertRaisesRegex(ValueError, "lora_id"):
+            req.normalize_batch_and_arguments()
+
+    def test_single_request_lora_id_rejects_non_string(self):
+        """Single generate request must reject non-string types for lora_id (Issue #41466)."""
+        req = GenerateReqInput(text="hello", lora_id=123)
+        with self.assertRaisesRegex(ValueError, "lora_id"):
+            req.normalize_batch_and_arguments()
+
+    def test_batch_request_lora_id_rejects_non_string_elements(self):
+        """Batch generate request must reject non-string elements in lora_id (Issue #41466)."""
+        req = GenerateReqInput(text=["a", "b"], lora_id=[123, "adapter"])
+        with self.assertRaisesRegex(ValueError, "lora_id"):
+            req.normalize_batch_and_arguments()
+
+    def test_positional_embed_overrides_rejects_invalid_types(self):
+        """positional_embed_overrides must be PositionalEmbeds or list thereof, not dict/str (Issue #41466)."""
+        invalid_values = [{"positions": [0]}, "invalid_str", 123, [123]]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                req = GenerateReqInput(text="hello", positional_embed_overrides=val)
+                with self.assertRaisesRegex(ValueError, "positional_embed_overrides"):
+                    req.normalize_batch_and_arguments()
+
+    def test_session_params_rejects_non_dict(self):
+        """session_params must be a dict or None (Issue #41466)."""
+        invalid_values = ["session_id", 123, [1, 2]]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                req = GenerateReqInput(text="hello", session_params=val)
+                with self.assertRaisesRegex(ValueError, "session_params"):
+                    req.normalize_batch_and_arguments()
+
+    def test_session_params_type_validation(self):
+        """session_params fields must conform to expected types (Issue #41466)."""
+        from sglang.srt.managers.io_struct import SessionParams
+        # Verify SessionParams validates its fields
+        invalid_cases = [
+            {"id": 12345},
+            {"offset": "zero"},
+            {"replace": "yes"},
+            {"drop_previous_output": 1},
+        ]
+        for kwargs in invalid_cases:
+            with self.subTest(kwargs=kwargs):
+                sp = SessionParams(**kwargs)
+                with self.assertRaises(ValueError):
+                    sp.verify()
     def test_media_only_flat_list_is_one_request(self):
         """Without text, a flat media list is one request with all items, as in HF."""
         req = EmbeddingReqInput(image_data=["a.jpg", "b.jpg"])
