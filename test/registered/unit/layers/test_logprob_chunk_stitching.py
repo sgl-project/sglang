@@ -193,6 +193,70 @@ class TestLogprobChunkStitching(CustomTestCase):
         self.assertEqual(expected[0][1:], [[], []])
         self.assertEqual(expected[1], [[1, 3], [], []])
 
+    def _check_logprob_row_normalization(self, decode):
+        values = [[-0.5], [-0.25], [], []]
+        indices = [[3], [2], [], []]
+        token_logprobs = [-0.5, -0.25, -0.125, -0.0625]
+        batch = SimpleNamespace(
+            return_logprob=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        )
+        for tensor_rows in (
+            (False, False, False, False),
+            (True, True, True, True),
+            (True, False, True, False),
+        ):
+            with self.subTest(tensor_rows=tensor_rows):
+
+                def make_rows(rows, dtype):
+                    return [
+                        torch.tensor(row, dtype=dtype) if tensor else list(row)
+                        for row, tensor in zip(rows, tensor_rows)
+                    ]
+
+                token_id_indices = [list(row) for row in indices]
+                output = LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_logprobs=torch.tensor(token_logprobs),
+                    next_token_top_logprobs_val=make_rows(values, torch.float32),
+                    next_token_top_logprobs_idx=make_rows(indices, torch.int64),
+                    next_token_token_ids_logprobs_val=make_rows(values, torch.float32),
+                    # In-tree producers already materialize targeted token indices.
+                    next_token_token_ids_logprobs_idx=token_id_indices,
+                )
+                if decode:
+                    next_token_ids, next_token_logprobs = (
+                        SchedulerBatchResultProcessor._normalize_decode_outputs(
+                            None,
+                            batch=batch,
+                            result=SimpleNamespace(),
+                            still_in_batch_rows=[True] * len(values),
+                            logits_output=output,
+                            next_token_ids=[3, 2, 1, 0],
+                        )
+                    )
+                    self.assertEqual(next_token_ids, [[3], [2], [1], [0]])
+                    self.assertEqual(next_token_logprobs, token_logprobs)
+                else:
+                    SchedulerBatchResultProcessor.move_logprobs_to_cpu(
+                        None, batch=batch, logits_output=output
+                    )
+                    self.assertEqual(output.next_token_logprobs, token_logprobs)
+
+                self.assertEqual(output.next_token_top_logprobs_val, values)
+                self.assertEqual(output.next_token_top_logprobs_idx, indices)
+                self.assertEqual(output.next_token_token_ids_logprobs_val, values)
+                self.assertEqual(output.next_token_token_ids_logprobs_idx, indices)
+                self.assertIs(
+                    output.next_token_token_ids_logprobs_idx, token_id_indices
+                )
+
+    def test_move_logprobs_to_cpu_accepts_host_logprob_rows(self):
+        self._check_logprob_row_normalization(decode=False)
+
+    def test_decode_normalization_accepts_host_logprob_rows(self):
+        self._check_logprob_row_normalization(decode=True)
+
 
 if __name__ == "__main__":
     unittest.main()
