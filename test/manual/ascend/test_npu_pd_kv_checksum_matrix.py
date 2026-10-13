@@ -203,4 +203,6 @@ class TestNpuPdKvChecksumMatrix(base.TestNpuPdKvChecksum):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    loader = unittest.TestLoader()
+    loader.testMethodPrefix = "test_matrix_"
+    unittest.main(testLoader=loader)

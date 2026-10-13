@@ -13,6 +13,7 @@ import random
 import shlex
 import shutil
 import tempfile
+import time
 import unittest
 import uuid
 from typing import Dict, Optional
@@ -168,6 +169,46 @@ class TestNpuPdKvChecksum(PDDisaggregationServerBase):
         print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
+
+        # Router health can pass before its PD workers finish registering.
+        # Probe the actual route before testing checksum mismatch rejection.
+        deadline = time.monotonic() + 180
+        last_error = "No readiness response"
+        while time.monotonic() < deadline:
+            for name, process in (
+                ("prefill", cls.process_prefill),
+                ("decode", cls.process_decode),
+                ("router", cls.process_lb),
+            ):
+                if process.poll() is not None:
+                    raise RuntimeError(f"PD {name} exited before route readiness")
+            try:
+                response = requests.post(
+                    cls.lb_url + "/generate",
+                    json={
+                        "text": "PD checksum route readiness",
+                        "rid": f"kv-checksum-ready-{uuid.uuid4().hex}",
+                        "sampling_params": {
+                            "temperature": 0.0,
+                            "max_new_tokens": 1,
+                        },
+                    },
+                    timeout=min(60, max(1, deadline - time.monotonic())),
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+            else:
+                if response.status_code == 200:
+                    print("PD checksum route is ready", flush=True)
+                    return
+                if response.status_code != 503:
+                    raise RuntimeError(
+                        "PD readiness probe failed: "
+                        f"HTTP {response.status_code}: {response.text[:500]}"
+                    )
+                last_error = f"HTTP 503: {response.text[:500]}"
+            time.sleep(1)
+        raise TimeoutError(f"PD route was not ready within 180s: {last_error}")
 
     def gen_prompt(self, token_num: int) -> str:
         all_available_tokens = list(self.tokenizer.get_vocab().values())
