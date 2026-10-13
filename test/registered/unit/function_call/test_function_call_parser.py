@@ -3905,6 +3905,32 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                     with self.subTest(backend=backend, text=text):
                         self.assertEqual(accepts(text), expected)
 
+    def test_complete_zero_key_schemas_reject_argument_pairs(self):
+        """Closed no-argument tools reject pairs; open schemas still accept them."""
+        closed = {"properties": {}, "additionalProperties": False}
+        schemas = [
+            (closed, False),
+            ({"additionalProperties": False}, False),
+            ({"allOf": [closed]}, False),
+            ({}, True),
+            ({"properties": {}}, True),
+            ({"properties": {}, "additionalProperties": True}, True),
+            ({"$ref": "#/$defs/args", "$defs": {"args": closed}}, True),
+            ({"properties": {}, "allOf": [closed]}, True),
+        ]
+        pair = "<arg_key>unknown</arg_key><arg_value>v</arg_value>"
+        for schema, allows_pairs in schemas:
+            ebnf = self._ebnf(schema)
+            grammar = self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+            for backend, accepts in (
+                ("xgrammar", lambda text: self._accepts(grammar, text)),
+                ("llguidance", lambda text: self._llguidance_accepts(ebnf, text)),
+            ):
+                for arguments in ("", pair, pair * 3):
+                    text = f"<tool_call>alpha{arguments}</tool_call>"
+                    with self.subTest(backend=backend, schema=schema, text=text):
+                        self.assertEqual(accepts(text), not arguments or allows_pairs)
+
 
 class TestLing3Detector(unittest.TestCase):
     def setUp(self):

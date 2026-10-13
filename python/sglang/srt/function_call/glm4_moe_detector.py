@@ -981,7 +981,8 @@ def _glm_build_tool_call_rules(
         namehash = _glm_hash_name(func.name + str(function_index))
         params = func.parameters or {}
         properties = get_schema_properties(params)
-        if not _glm_has_complete_properties(params):
+        has_complete_properties = _glm_has_complete_properties(params)
+        if not has_complete_properties:
             properties = {}
 
         prop_kv_pairs = {}
@@ -1013,6 +1014,8 @@ def _glm_build_tool_call_rules(
                 else ""
             )
             arguments_rule = f"( ( {all_choices} ){more_choices} )?"
+        elif has_complete_properties:
+            arguments_rule = '""'
         else:
             arguments_rule = (
                 f'( "{special_tokens.begin_of_key}" text_without_special_tokens '
