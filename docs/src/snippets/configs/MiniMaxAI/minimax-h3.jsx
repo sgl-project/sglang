@@ -527,18 +527,18 @@ return {
       description: "Cumulative reference, fusion-only, or audited Cache-DiT execution.",
       quality: "Sampling policy",
       learnMore: "#choose-the-quality-level",
-      default: "lossless",
+      default: "exact",
       options: [
         {
-          id: "lossless",
-          label: "Lossless",
+          id: "exact",
+          label: "Exact",
           recommended: true,
           description: "Reference-exact denoising without Cache-DiT approximation.",
         },
         {
-          id: "extra-high",
-          label: "Extra high",
-          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
+          id: "lossless",
+          label: "Lossless",
+          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its exact denoise path at this tier.",
         },
         {
           id: "high",
@@ -564,6 +564,33 @@ return {
       unit: "outputs per prompt",
       default: 1,
       options: [],
+    },
+    {
+      id: "reference_resize_mode",
+      title: "Reference image resize",
+      scope: "request",
+      showWhen: (s) => ["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode),
+      description: "Resize Ref2VA image references before encoding; audio, video, and FL2VA keyframes are unaffected.",
+      quality: "Preprocessing policy",
+      default: "diffusers",
+      options: [
+        {
+          id: "diffusers",
+          label: "Diffusers-compatible",
+          recommended: true,
+          description: "Preserve the existing behavior by scaling the reference short edge to 2048 pixels, including upscaling.",
+        },
+        {
+          id: "match",
+          label: "Match target area",
+          description: "Match the target canvas pixel area without upscaling; required by ModelTC Ref2VA Turbo.",
+        },
+        {
+          id: "max",
+          label: "2048 short-edge cap",
+          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
+        },
+      ],
     },
   ],
 
@@ -716,8 +743,8 @@ return {
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified && checkpointVerified;
       const requestCovered = s.hw !== "gb300" || (serveVerified && s.weights === "fl2va"
-        && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
-      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
+        && s.mode === "t2va" && s.quality === "exact" && Number(s.outputs) === 1);
+      const requestVerified = topologyVerified && requestCovered && (["exact", "lossless"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];
@@ -990,6 +1017,10 @@ return {
       request.seed = 3104;
     }
 
+    if (["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode)) {
+      request.reference_resize_mode = s.reference_resize_mode;
+    }
+
     const body = JSON.stringify(request, null, 2).replace(
       /"{{(DURATION_SECONDS|INPUT_VIDEO_START_SECONDS|SECOND_INPUT_VIDEO_START_SECONDS)}}"/g,
       "{{$1}}",
@@ -1001,16 +1032,11 @@ return {
 
   dockerMounts: ["{{MEDIA_DIR}}:/data/minimax-h3:ro"],
 
-  dockerRunCommand: (s) =>
-    ["mi300x", "mi355x"].includes(s.hw)
-      ? `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion_hip]" && exec sglang serve "$@"' --`
-      : `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --`,
-
   // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
     ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
       ? ["python"]
-      : ["python", "docker"],
+      : ["docker", "python"],
 
   dockerImages: {
     b200: "lmsysorg/sglang:dev",

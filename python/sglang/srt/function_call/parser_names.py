@@ -49,4 +49,5 @@ TOOL_CALL_PARSER_NAMES = [
     "gigachat35",
     "gemma4",
     "inkling",
+    "iquest_q1",
 ]
