@@ -82,6 +82,9 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: torch.Tensor  # [rows] req_to_token row of each query row
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
+    # CPU scheduling contract, never inferred from CUDA request IDs/lengths.
+    # >1 only for fixed-width request-major DSPARK target verification.
+    verify_group_size: int = 1
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor

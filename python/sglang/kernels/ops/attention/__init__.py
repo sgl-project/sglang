@@ -338,6 +338,16 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.fp4_index_logits_grouped_sm90",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer:fp4_index_logits_grouped_sm90",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_k_indexer_norm_rope",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",

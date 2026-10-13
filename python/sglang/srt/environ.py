@@ -1744,6 +1744,9 @@ class Envs:
     # Compact candidate scoring on Hopper; set before graph capture. This does
     # not enable extra attention-length graphs or change DSPARK block widths.
     SGLANG_OPT_USE_DSV41_SM90_CANDIDATES = EnvBool(False)
+    # Group fixed-width DSPARK target-verify rows on SM90 to reuse index-K
+    # tiles through FP8 WGMMA. Set before graph capture; H32/H64 only.
+    SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

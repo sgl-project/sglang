@@ -534,18 +534,46 @@ def decode_scores(
         else:
             score_lens = None
             plan = plan_topk_v2(lens) if compute_topk_plan else None
-            scores = fp4_index_logits_paged(
-                q,
-                weights,
-                req,
-                req_to_token,
-                lens,
-                table,
-                table.shape[1] // 68,
-                lmax,
-                ratio,
-                candidate_mask,
-            )
+            if (
+                envs.SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER.get()
+                and inputs.is_verify
+                and 2 <= inputs.verify_group_size <= 6
+                and bs % inputs.verify_group_size == 0
+                and candidate_mask is None
+                and q.is_cuda
+                and q.shape[1] in (32, 64)
+                and q.shape[2] == 128
+                and q.dtype == weights.dtype == torch.bfloat16
+            ):
+                from sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer import (
+                    fp4_index_logits_grouped_sm90,
+                )
+
+                scores = fp4_index_logits_grouped_sm90(
+                    q,
+                    weights,
+                    req_to_token,
+                    req,
+                    lens,
+                    table,
+                    table.shape[1] // 68,
+                    ratio,
+                    lmax,
+                    inputs.verify_group_size,
+                )
+            else:
+                scores = fp4_index_logits_paged(
+                    q,
+                    weights,
+                    req,
+                    req_to_token,
+                    lens,
+                    table,
+                    table.shape[1] // 68,
+                    lmax,
+                    ratio,
+                    candidate_mask,
+                )
         return PagedDecodeScores(
             bs=bs,
             lmax=lmax,
