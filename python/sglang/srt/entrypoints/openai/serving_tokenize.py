@@ -1,27 +1,18 @@
-import json
 import logging
 from http import HTTPStatus
 from typing import List, Optional, Union
 
 from fastapi import Request
-from jsonschema import Draft202012Validator, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatMessage,
     DetokenizeRequest,
     DetokenizeResponse,
     ErrorResponse,
-    FunctionResponse,
-    ParseRequest,
     TokenizeRequest,
     TokenizeResponse,
-    ToolCall,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -217,89 +208,3 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-
-
-class OpenAIServingParse(OpenAIServingBase):
-    def __init__(self, chat_serving: OpenAIServingChat):
-        super().__init__(chat_serving.tokenizer_manager)
-        self.chat_serving = chat_serving
-
-    def _request_id_prefix(self) -> str:
-        return "parse-"
-
-    def _convert_to_internal_request(
-        self, request: ParseRequest, raw_request: Request
-    ) -> tuple[ParseRequest, ParseRequest]:
-        return request, request
-
-    async def _handle_non_streaming_request(
-        self,
-        adapted_request: ParseRequest,
-        request: ParseRequest,
-        raw_request: Request,
-    ) -> ChatMessage:
-        chat = self.chat_serving
-        tokenizer = self.tokenizer_manager.tokenizer
-        tools = request.tools or []
-        parse_tools = bool(tools and chat.tool_call_parser)
-        text = tokenizer.decode(
-            request.tokens,
-            skip_special_tokens=False,
-            spaces_between_special_tokens=False,
-        )
-        reasoning = None
-        if chat.reasoning_parser:
-            reasoning, text = ReasoningParser(
-                model_type=chat.reasoning_parser,
-                stream_reasoning=False,
-                force_reasoning=chat.template_manager.force_reasoning,
-                tokenizer=tokenizer,
-                tool_call_parser_active=parse_tools,
-            ).parse_non_stream(text)
-
-        tool_calls = None
-        if parse_tools:
-            parser = FunctionCallParser(
-                tools, chat.tool_call_parser, tokenizer=tokenizer
-            )
-            if parser.has_tool_call(text):
-                detector = parser.detector
-                complete = not isinstance(
-                    detector, ResponseTemplateToolDetector
-                ) or detector.calls_complete(text)
-                text, calls = parser.parse_non_stream(text)
-                if not complete or not calls:
-                    raise ValueError(
-                        "The output has a malformed or incomplete tool call."
-                    )
-                schemas = {
-                    tool.function.name: tool.function.parameters for tool in tools
-                }
-                for call in calls:
-                    if schemas.get(call.name) is None:
-                        continue
-                    try:
-                        Draft202012Validator(schemas[call.name]).validate(
-                            json.loads(call.parameters)
-                        )
-                    except ValidationError as e:
-                        raise ValueError(
-                            f"Tool call {call.name!r} does not match its schema: "
-                            f"{e.message}"
-                        ) from e
-                tool_calls = [
-                    ToolCall(
-                        index=index,
-                        function=FunctionResponse(
-                            name=call.name, arguments=call.parameters
-                        ),
-                    )
-                    for index, call in enumerate(calls)
-                ]
-
-        return ChatMessage(
-            role="assistant",
-            content=text,
-            reasoning_content=reasoning or None,
-            tool_calls=tool_calls,
-        )

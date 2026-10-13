@@ -22,16 +22,6 @@ class BeamDetector(ResponseTemplateToolDetector):
         tools = [tool.model_dump() for tool in self._tools or ()]
         return supports_tool_call_structural_tag(self._tool_field, tools)
 
-    def _parse_tag_pattern(self, tool_field: dict) -> str | None:
-        framed = r'<rfl:parameter name="(?P<key>[^"]+)">\n(?P<value>.*?)\n'
-        declared = (tool_field.get("content_args") or {}).get("tag_pattern", "")
-        if tool_field.get("content") != "xml-inline" or not declared.startswith(framed):
-            return None
-        return (
-            r'<rfl:parameter name="(?P<key>[^"]+)">(?P<newline>\n)?(?P<value>.*?)'
-            rf"(?(newline)\n{declared[len(framed) :]}|</rfl:parameter>)"
-        )
-
     def get_structural_tag(
         self,
         tools: list[Tool] | None = None,

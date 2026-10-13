@@ -97,7 +97,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
-    ParseRequest,
     ResponsesRequest,
     ScoringRequest,
     TokenizeRequest,
@@ -111,7 +110,6 @@ from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
-    OpenAIServingParse,
     OpenAIServingTokenize,
 )
 from sglang.srt.entrypoints.openai.serving_transcription import (
@@ -345,9 +343,6 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_parse = OpenAIServingParse(
-        fast_api_app.state.openai_serving_chat
     )
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
@@ -1868,17 +1863,6 @@ async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
 async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request):
     """OpenAI-compatible detokenization endpoint."""
     return await raw_request.app.state.openai_serving_detokenize.handle_request(
-        request, raw_request
-    )
-
-
-@app.post(
-    "/v1/parse",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-)
-async def openai_v1_parse(request: ParseRequest, raw_request: Request):
-    return await raw_request.app.state.openai_serving_parse.handle_request(
         request, raw_request
     )
 

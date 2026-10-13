@@ -1735,11 +1735,6 @@ class DetokenizeResponse(BaseModel):
     text: Union[str, List[str]]
 
 
-class ParseRequest(BaseModel):
-    tokens: List[int]
-    tools: Optional[List[Tool]] = None
-
-
 OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
@@ -1750,7 +1745,6 @@ OpenAIServingRequest = Union[
     V1RerankReqInput,
     TokenizeRequest,
     DetokenizeRequest,
-    ParseRequest,
 ]
 
 
