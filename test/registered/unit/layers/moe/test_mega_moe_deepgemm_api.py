@@ -487,6 +487,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
+
     def test_dsv4_weight_prep_preserves_packed_byte_abi(self):
         """DeepGEMM's FP4 payload uses int8, shared with the normal fallback."""
         experts = SimpleNamespace()
