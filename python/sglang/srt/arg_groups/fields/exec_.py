@@ -353,6 +353,11 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_mono_kernel: A[
+        bool,
+        "Run decode steps through the model's mono (persistent fused decode-layer) kernels, when the model declares "
+        "a mono spec. Unsupported deployments are refused at startup with every reason listed.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):
