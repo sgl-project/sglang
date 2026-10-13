@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1100, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=1650, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
@@ -36,6 +36,8 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmlu_num_threads = 64
     mmlu_max_tokens = 4096
 
+    tp_size = 4
+    mem_fraction_static = 0.8
     parallel_args = []
     server_env = {}
 
@@ -50,13 +52,13 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                str(cls.tp_size),
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",
                 "5",
                 "--mem-fraction-static",
-                "0.8",
+                str(cls.mem_fraction_static),
                 "--cuda-graph-max-bs-decode",
                 "64",
                 "--max-running-requests",
@@ -119,6 +121,24 @@ class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "none",
+    ]
+
+
+class TestDSV41FlashDP4EP4BCGBoundedReplay(DSV41FlashAccuracyMixin, CustomTestCase):
+    """DP attention and EP MoE with decoder SWA bounded replay inside the
+    breakable prefill CUDA graph: the late layers gather their tail block."""
+
+    parallel_args = [
+        "--attn-dp-size",
+        "4",
+        "--ep-size",
+        "4",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "megamoe",
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--enable-decoder-swa-bounded-replay",
     ]
 
 
