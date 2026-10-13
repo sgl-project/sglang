@@ -2022,12 +2022,17 @@ class KVCacheConfigurator:
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )
-            PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            pool_kwargs["host_to_device_ratio"] = (
-                parse_hisparse_config().host_to_device_ratio
-            )
+            host_to_device_ratio = parse_hisparse_config().host_to_device_ratio
+            if self.is_draft_worker:
+                # The draft shares logical allocations, not target KV remapping.
+                # Its independent KV must stay resident when target slots move.
+                PoolCls = DSATokenToKVPool
+                max_total_num_tokens *= host_to_device_ratio
+            else:
+                PoolCls = HiSparseDSATokenToKVPool
+                pool_kwargs["host_to_device_ratio"] = host_to_device_ratio
         elif dsa_cp_layer_shard_rank is not None:
             reject_out_of_tree_path(
                 current_platform, subsystem="the CP layer-split DSA KV pool"

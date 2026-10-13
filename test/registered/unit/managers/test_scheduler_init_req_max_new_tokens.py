@@ -58,6 +58,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
+        scheduler.request_token_capacity = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
