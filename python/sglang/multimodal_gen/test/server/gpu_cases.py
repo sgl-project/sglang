@@ -15,6 +15,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_FP8_MODEL,
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
+    S2V_ALT_AUDIO_PATH,
     T2V_PROMPT,
     COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
@@ -40,6 +41,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     T2I_sampling_params,
     T2V_sampling_params,
     WAN_2_2_ANIMATE_2_14B_sampling_params,
+    WAN_S2V_CI_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -66,6 +68,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
+    DEFAULT_WAN_2_2_S2V_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
 )
@@ -1348,6 +1351,35 @@ if not current_platform.is_hip():
                 enable_cache_dit=True,
             ),
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+        )
+    )
+
+# XPU only: the region boxes and bounds exist in intel_xpu_b60.json alone, and
+# get_audio_sensitivity_thresholds refuses to guess them for another platform.
+if current_platform.is_xpu():
+    TWO_GPU_CASES.append(
+        DiffusionTestCase(
+            "wan2_2_s2v_14b_2gpu",
+            DiffusionServerArgs(
+                model_path=DEFAULT_WAN_2_2_S2V_14B_MODEL_NAME_FOR_TEST,
+                # No --enable-sequence-shard: it is a sampling field that
+                # auto-enables for "wan", and `sglang serve` rejects it.
+                extras=[
+                    "--ulysses-degree=2",
+                    "--component-residency",
+                    "dit=layerwise-offload",
+                    "vae=resident",
+                    "audio_encoder=resident",
+                ],
+            ),
+            WAN_S2V_CI_sampling_params,
+            run_audio_sensitivity_check=True,
+            alt_audio_path=S2V_ALT_AUDIO_PATH,
+            run_reference_fidelity_check=True,
+            # S2V is image-conditioned, so the t2v-only rejection check does not apply.
+            run_t2v_input_reference_check=False,
+            # No golden recorded yet; the two differential checks are the accuracy gate.
+            run_consistency_check=False,
         )
     )
 

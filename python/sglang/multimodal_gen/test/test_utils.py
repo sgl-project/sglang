@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import wave
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from urllib.parse import urljoin
 
 import cv2
 import httpx
+import msgspec
 import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -208,6 +210,9 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST = (
     "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
 )
+# Speech-to-video: the only Wan repo here that is not -Diffusers; the S2V stage
+# reads the native layout.
+DEFAULT_WAN_2_2_S2V_14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-S2V-14B"
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
@@ -911,6 +916,21 @@ class AudioConsistencyThresholds:
     duration_diff_threshold: float
 
 
+class AudioSensitivityThresholds(msgspec.Struct, frozen=True):
+    """Bounds for the S2V audio-conditioning and reference-frame checks.
+
+    Regions are (w, h, x, y), as ffmpeg's crop takes them. The separation bound
+    compares two regions of one pair, so it needs no second run to calibrate.
+    """
+
+    audio_region: tuple[int, int, int, int]
+    static_region: tuple[int, int, int, int]
+    region_psnr_separation_min: float
+    static_region_psnr_min: float
+    reference_psnr_min: float
+    reference_ssim_min: float
+
+
 @dataclass(frozen=True)
 class AudioConsistencyResult:
     passed: bool
@@ -971,6 +991,46 @@ def get_consistency_thresholds(
                 "mean_abs_diff_threshold", defaults["mean_abs_diff_threshold"]
             )
         ),
+    )
+
+
+def get_audio_sensitivity_thresholds(
+    case_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> AudioSensitivityThresholds:
+    """Per-case region boxes and bounds for the S2V audio/reference checks.
+
+    Every field is required: the boxes frame one subject at one resolution, so a
+    generic bound would let an uncalibrated case pass on numbers nobody measured.
+    """
+    if metadata is None:
+        metadata = _load_threshold_json()
+    case_meta = metadata.get("cases", {}).get(case_id, {})
+    required = (
+        "audio_region",
+        "static_region",
+        "region_psnr_separation_min",
+        "static_region_psnr_min",
+        "reference_psnr_min",
+        "reference_ssim_min",
+    )
+    missing = [key for key in required if case_meta.get(key) is None]
+    if missing:
+        raise ValueError(
+            f"{case_id}: {', '.join(missing)} must be set in "
+            f"{get_consistency_threshold_path()} for the audio-sensitivity and "
+            "reference-fidelity checks. The regions are [w, h, x, y]: audio_region "
+            "frames the mouth, static_region a part of the frame the audio must not "
+            "move. Measure the bounds on this case's own framing -- see the "
+            "wan2_2_s2v_14b_2gpu entry for what the numbers mean."
+        )
+    return AudioSensitivityThresholds(
+        audio_region=tuple(case_meta["audio_region"]),
+        static_region=tuple(case_meta["static_region"]),
+        region_psnr_separation_min=float(case_meta["region_psnr_separation_min"]),
+        static_region_psnr_min=float(case_meta["static_region_psnr_min"]),
+        reference_psnr_min=float(case_meta["reference_psnr_min"]),
+        reference_ssim_min=float(case_meta["reference_ssim_min"]),
     )
 
 
@@ -1240,6 +1300,34 @@ def compute_psnr(image: np.ndarray, gt_image: np.ndarray) -> float:
             f"Image shape mismatch for PSNR: output={image.shape}, gt={gt_image.shape}"
         )
     return float(peak_signal_noise_ratio(gt_image, image, data_range=255))
+
+
+def crop_region(image: np.ndarray, region: Sequence[int]) -> np.ndarray:
+    """Crop `region` as (w, h, x, y), the ffmpeg crop argument order."""
+    w, h, x, y = region
+    image = _ensure_rgb_uint8_image(image)
+    if y + h > image.shape[0] or x + w > image.shape[1]:
+        raise ValueError(f"Region {tuple(region)} outside frame {image.shape}")
+    return image[y : y + h, x : x + w]
+
+
+def compute_region_psnr(
+    frames: list[np.ndarray],
+    other_frames: list[np.ndarray],
+    region: Sequence[int],
+) -> float:
+    """Mean PSNR over paired frames, restricted to `region`.
+
+    A whole-frame metric averages the response away: the mouth is a small part of
+    the frame, so only a crop separates an audio change from the background.
+    """
+    if len(frames) != len(other_frames):
+        raise ValueError(f"Frame count mismatch: {len(frames)} vs {len(other_frames)}")
+    scores = [
+        compute_psnr(crop_region(a, region), crop_region(b, region))
+        for a, b in zip(frames, other_frames)
+    ]
+    return float(np.mean(scores))
 
 
 def compute_mean_abs_diff(image: np.ndarray, gt_image: np.ndarray) -> float:

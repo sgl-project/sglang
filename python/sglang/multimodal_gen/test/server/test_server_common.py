@@ -13,9 +13,11 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+import cv2
 import numpy as np
 import openai
 import pytest
@@ -56,6 +58,9 @@ from sglang.multimodal_gen.test.test_utils import (
     audio_gt_exists,
     compare_audio_with_gt,
     compare_with_gt,
+    compute_psnr,
+    compute_region_psnr,
+    compute_ssim,
     encode_audio_gt_wav,
     extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
@@ -64,6 +69,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_audio_consistency_gt_candidates,
     get_audio_consistency_gt_remote_files,
     get_audio_consistency_thresholds,
+    get_audio_sensitivity_thresholds,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -953,6 +959,129 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+    def _validate_reference_fidelity(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """Frame 0 of an image-conditioned video must still resemble that image.
+
+        Guards conditioning latents reaching the DiT in the wrong space, which
+        yields a plausible but unrelated video that a golden of itself still passes.
+        """
+        logger.info("[Reference fidelity] %s: start", case.id)
+        thresholds = get_audio_sensitivity_thresholds(case.id)
+        frame_0 = extract_key_frames_from_video(content)[0]
+        reference = self._load_conditioning_image(case, frame_0.shape)
+        psnr = compute_psnr(frame_0, reference)
+        ssim = compute_ssim(frame_0, reference)
+        logger.info(
+            "[Reference fidelity] %s: psnr=%.2f (>=%.2f), ssim=%.4f (>=%.4f)",
+            case.id,
+            psnr,
+            thresholds.reference_psnr_min,
+            ssim,
+            thresholds.reference_ssim_min,
+        )
+        if psnr < thresholds.reference_psnr_min or ssim < thresholds.reference_ssim_min:
+            pytest.fail(
+                f"Reference fidelity failed for {case.id}: frame 0 does not resemble "
+                f"the conditioning image {case.sampling_params.image_path}.\n"
+                f"  psnr={psnr:.2f} (>= {thresholds.reference_psnr_min}), "
+                f"ssim={ssim:.4f} (>= {thresholds.reference_ssim_min})"
+            )
+
+    def _load_conditioning_image(
+        self, case: DiffusionTestCase, frame_shape: tuple[int, ...]
+    ) -> np.ndarray:
+        """The case's conditioning image, resized to the generated frame.
+
+        S2V derives the output size from the image's aspect under its max_area cap.
+        """
+        image_path = case.sampling_params.image_path
+        if image_path is None:
+            raise ValueError(f"{case.id}: reference fidelity needs an image_path")
+        image_path = str(image_path)
+        if image_path.startswith(("http://", "https://")):
+            response = requests.get(image_path, timeout=_CONTROL_API_TIMEOUT_SECS)
+            response.raise_for_status()
+            raw = response.content
+        else:
+            raw = Path(image_path).read_bytes()
+        image = image_bytes_to_numpy(raw)
+        height, width = frame_shape[0], frame_shape[1]
+        return cv2.resize(image, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+    def _validate_audio_sensitivity(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """A second generation with different audio must move the audio-driven region.
+
+        Everything else is held fixed, so a build that drops its audio conditioning
+        yields two near-identical videos and a region separation of ~0 dB.
+        """
+        logger.info(
+            "[Audio sensitivity] %s: start, second generation with %s",
+            case.id,
+            case.alt_audio_path,
+        )
+        thresholds = get_audio_sensitivity_thresholds(case.id)
+        alt_params = replace(
+            case.sampling_params,
+            extras={**case.sampling_params.extras, "audio_path": case.alt_audio_path},
+        )
+        alt_generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=alt_params,
+        )
+        _, alt_content = self._run_generation_with_server_watchdog(
+            ctx, case.id, alt_generate_fn, self._client(ctx)
+        )
+        if not alt_content:
+            pytest.fail(
+                f"[Audio sensitivity] {case.id}: the {case.alt_audio_path} generation "
+                "produced no output"
+            )
+
+        frames = extract_key_frames_from_video(content)
+        alt_frames = extract_key_frames_from_video(alt_content)
+        audio_psnr = compute_region_psnr(frames, alt_frames, thresholds.audio_region)
+        static_psnr = compute_region_psnr(frames, alt_frames, thresholds.static_region)
+        separation = static_psnr - audio_psnr
+        logger.info(
+            "[Audio sensitivity] %s: audio_region psnr=%.2f, static_region psnr=%.2f, "
+            "separation=%.2f (>=%.2f)",
+            case.id,
+            audio_psnr,
+            static_psnr,
+            separation,
+            thresholds.region_psnr_separation_min,
+        )
+        if separation < thresholds.region_psnr_separation_min:
+            pytest.fail(
+                f"Audio sensitivity failed for {case.id}: swapping the audio barely "
+                f"moved the audio-conditioned region, so the audio may not reach the "
+                f"model.\n"
+                f"  audio_region psnr={audio_psnr:.2f} {tuple(thresholds.audio_region)}\n"
+                f"  static_region psnr={static_psnr:.2f} {tuple(thresholds.static_region)}\n"
+                f"  separation={separation:.2f} (>= "
+                f"{thresholds.region_psnr_separation_min})\n"
+                f"  audio: {case.sampling_params.extras.get('audio_path')} vs "
+                f"{case.alt_audio_path}"
+            )
+        if static_psnr < thresholds.static_region_psnr_min:
+            pytest.fail(
+                f"Audio sensitivity failed for {case.id}: the audio swap also changed "
+                f"the region it must not touch, so the two runs differ by more than "
+                f"the audio.\n"
+                f"  static_region psnr={static_psnr:.2f} (>= "
+                f"{thresholds.static_region_psnr_min})"
+            )
+
     def _validate_audio_consistency(
         self,
         case: DiffusionTestCase,
@@ -1753,6 +1882,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             run_case_check(
                 "t2v input_reference rejection",
                 lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
+            )
+
+        if case.run_reference_fidelity_check:
+            run_case_check(
+                "reference fidelity",
+                lambda: self._validate_reference_fidelity(case, content),
+            )
+
+        # Last of the checks: it issues a second generation, so it is the most
+        # expensive one and should not delay a cheaper check's failure.
+        if case.run_audio_sensitivity_check:
+            run_case_check(
+                "audio sensitivity",
+                lambda: self._validate_audio_sensitivity(
+                    diffusion_server, case, content
+                ),
             )
 
         if (
