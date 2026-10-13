@@ -1572,7 +1572,7 @@ class _MimoDetector(Qwen3Detector):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.reasoning_default = None
+        self.reasoning_default = "explicit_enable_thinking"
 
 
 class _PoolsideV1Detector(Qwen3Detector):
@@ -1581,7 +1581,7 @@ class _PoolsideV1Detector(Qwen3Detector):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.reasoning_default = None
+        self.reasoning_default = "explicit_enable_thinking"
 
 
 class Apertus2509Detector(BaseReasoningFormatDetector):
