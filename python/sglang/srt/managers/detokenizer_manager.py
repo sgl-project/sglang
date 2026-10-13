@@ -507,6 +507,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
+            piggyback_load=recv_obj.piggyback_load,
             time_stats=recv_obj.time_stats,
         )
 

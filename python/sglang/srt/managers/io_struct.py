@@ -83,6 +83,37 @@ else:
 logger = logging.getLogger(__name__)
 
 
+class PiggybackLoadInfo(
+    msgspec.Struct,
+    tag=True,
+    kw_only=True,
+    array_like=True,
+    omit_defaults=True,
+):
+    """Lightweight per-DP-rank load snapshot piggybacked on streaming output.
+
+    Carried inside ``BatchTokenIDOutput.piggyback_load`` and
+    ``BatchStrOutput.piggyback_load`` so the HTTP worker always sees the latest
+    scheduler load from each streaming chunk — no separate polling round-trip
+    required, and no extra IPC on the input path (the scheduler already has the
+    numbers from ``load_inquirer.get_loads`` at ``process_batch_result`` time).
+
+    Kept intentionally small (a handful of ints/floats) — the full
+    ``LoadSnapshot`` (with memory/spec/lora/disaggregation sections) stays on
+    the SHM / ZMQ paths used by /v1/loads and DP balancing.
+    """
+
+    dp_rank: int = 0
+    num_running_reqs: int = 0
+    num_waiting_reqs: int = 0
+    num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
+    token_usage: float = 0.0
+    gen_throughput: float = 0.0
+    cache_hit_rate: float = 0.0
+    timestamp: float = 0.0
+
+
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
 
@@ -102,6 +133,9 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     # outputs. Tokenized input batches store routing on batch[i].http_worker_ipc
     # because the scheduler unpacks them into single-request handlers.
     http_worker_ipcs: Optional[List[Optional[str]]] = None
+    # Optional per-DP-rank load snapshot piggybacked on the batch so the HTTP
+    # worker can cache the latest load for /v1/loads and response meta_info.
+    piggyback_load: Optional[PiggybackLoadInfo] = None
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):

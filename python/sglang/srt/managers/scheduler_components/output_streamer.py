@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    PiggybackLoadInfo,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -38,6 +39,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.load_snapshot import LoadSnapshot
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -63,6 +65,11 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    # Lightweight per-DP-rank load snapshot to piggyback on the next streaming
+    # output batch. Set by the scheduler in ``process_batch_result`` right after
+    # ``publish_load_snapshot`` so we reuse the already-computed snapshot — no
+    # extra O(queue) walk at output time.
+    _pending_piggyback_load: Optional[PiggybackLoadInfo] = None
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
@@ -70,6 +77,30 @@ class SchedulerOutputStreamer:
                 "additional customized generation output is not supported by "
                 "Rust egress"
             )
+
+    def set_pending_load_snapshot(
+        self, snapshot: Optional["LoadSnapshot"]
+    ) -> None:
+        """Cache a load snapshot to piggyback on the next streaming batch.
+
+        Call this from the scheduler right after ``publish_load_snapshot``
+        returns, so we reuse the already-computed snapshot instead of walking
+        the queues again at output time. ``None`` clears the pending value.
+        """
+        if snapshot is None:
+            self._pending_piggyback_load = None
+            return
+        self._pending_piggyback_load = PiggybackLoadInfo(
+            dp_rank=int(getattr(snapshot, "dp_rank", get_parallel().dp_rank) or 0),
+            num_running_reqs=snapshot.num_running_reqs,
+            num_waiting_reqs=snapshot.num_waiting_reqs,
+            num_used_tokens=snapshot.num_used_tokens,
+            max_total_num_tokens=snapshot.max_total_num_tokens,
+            token_usage=snapshot.token_usage,
+            gen_throughput=snapshot.gen_throughput,
+            cache_hit_rate=snapshot.cache_hit_rate,
+            timestamp=snapshot.timestamp,
+        )
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -207,10 +238,14 @@ class SchedulerOutputStreamer:
                     )
                 acc.customized_info[key] = values
 
-        # Send to detokenizer
+        # Send to detokenizer.
+        # Consume the pending piggyback load so it only rides the next batch.
+        piggyback_load = self._pending_piggyback_load
+        self._pending_piggyback_load = None
         payload = acc.to_payload(
             dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
+            piggyback_load=piggyback_load,
         )
         if payload is not None:
             if self.rust_server is not None:
@@ -700,7 +735,11 @@ class _GenerationStreamAccumulator:
                 )
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool
+        self,
+        *,
+        dp_rank: int,
+        is_idle_batch: bool,
+        piggyback_load: Optional[PiggybackLoadInfo] = None,
     ) -> Optional[BatchTokenIDOutput]:
         if not (self.rids or is_idle_batch):
             return None
@@ -782,4 +821,5 @@ class _GenerationStreamAccumulator:
                 self.weight_versions if any(self.weight_versions) else None
             ),
             dp_ranks=dp_ranks,
+            piggyback_load=piggyback_load,
         )

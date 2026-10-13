@@ -93,6 +93,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PiggybackLoadInfo,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -671,6 +672,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             port_args,
             caller="TokenizerManager",
         )
+        # Watch-mode cache: latest per-DP-rank load piggybacked from streaming
+        # output batches. /v1/loads still uses the SHM reader when available,
+        # but this dict is updated on every streamed chunk so clients that
+        # consume meta_info always see fresh load hints without polling.
+        self._latest_piggyback_loads: Dict[int, PiggybackLoadInfo] = {}
 
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
@@ -2465,6 +2471,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:
             customized_info = None
+
+        # Watch-mode: always cache the latest piggyback load from streaming
+        # output batches. This keeps the HTTP worker's load hints fresh even
+        # when /v1/loads is not actively polled.
+        piggyback_load = getattr(recv_obj, "piggyback_load", None)
+        if piggyback_load is not None:
+            try:
+                self._latest_piggyback_loads[piggyback_load.dp_rank] = (
+                    piggyback_load
+                )
+            except Exception:
+                # Never let a malformed piggyback struct break output handling.
+                logger.debug("failed to cache piggyback load", exc_info=True)
+
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -2589,6 +2609,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+
+            # Per-request load hints piggybacked from the scheduler. Clients
+            # can use num_running_reqs / num_waiting_reqs for response-based
+            # flow control without polling /v1/loads.
+            recv_obj_piggyback = getattr(recv_obj, "piggyback_load", None)
+            if recv_obj_piggyback is not None:
+                meta_info["num_running_reqs"] = recv_obj_piggyback.num_running_reqs
+                meta_info["num_waiting_reqs"] = (
+                    recv_obj_piggyback.num_waiting_reqs
+                )
+                meta_info["gen_throughput"] = recv_obj_piggyback.gen_throughput
 
             state.finished = recv_obj.finished_reasons[i] is not None
 

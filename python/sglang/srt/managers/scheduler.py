@@ -4920,6 +4920,10 @@ class Scheduler(
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Also stash it on the output streamer so it piggybacks on the next
+        # streaming output batch — the HTTP worker then always sees the latest
+        # scheduler load without a separate polling round-trip.
+        self.output_streamer.set_pending_load_snapshot(snapshot)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
