@@ -402,10 +402,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     """A decode batch votes for the prefill graph, and is converted to its
     1-token extend view after the gather, only when that view can represent
     every row. The vote and the conversion read one predicate, so each
-    ineligibility blocks both. Beam requests, for one, cannot be represented:
-    the converted batch takes the prefill result path, which commits them
-    per-req instead of through the batch decode fold, and member rows carry no
-    req."""
+    ineligibility blocks both."""
 
     # Each case makes the decode batch ineligible for the extend view.
     INELIGIBLE = {
