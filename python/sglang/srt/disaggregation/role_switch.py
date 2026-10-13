@@ -70,7 +70,7 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.is_fully_idle():
+    if not scheduler.is_idle_for_pool_reset():
         return _fail(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
