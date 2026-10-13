@@ -27,12 +27,7 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    is_cuda,
-    is_gfx95_supported,
-    is_gfx1250_supported,
-    is_hip,
-)
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -273,6 +268,61 @@ def _copy_unified_indices_kernel(
 
         vals = tl.load(extend_kv_indices + src_idx, mask=mask, other=0)
         tl.store(unified_kv_indices + dst_idx, vals, mask=mask)
+
+
+@triton.jit
+def _align_window_kv_kernel(
+    window_kv_indptr,
+    window_kv_indices,
+    aligned_kv_indptr,
+    pad,
+    aligned_kv_indices,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    src_start = tl.load(window_kv_indptr + pid)
+    num_keys = tl.load(window_kv_indptr + pid + 1) - src_start
+    dst_start = tl.load(aligned_kv_indptr + pid)
+    cur_pad = tl.load(pad + pid)
+    for off in range(0, num_keys + cur_pad, BLOCK):
+        j = off + tl.arange(0, BLOCK)
+        mask = j < num_keys + cur_pad
+        val = tl.load(
+            window_kv_indices + src_start + tl.maximum(j - cur_pad, 0), mask=mask
+        )
+        tl.store(aligned_kv_indices + dst_start + j, val, mask=mask)
+
+
+def align_window_kv_to_tiles(
+    window_kv_indptr: torch.Tensor,
+    window_kv_indices: torch.Tensor,
+    window_start_pos: torch.Tensor,
+    bs: int,
+    tile: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad each request's window KV list with copies of its first key so the list
+    starts on an absolute multiple of ``tile`` (a multiple of every BLOCK_N). The
+    unified kernel then sums a chunked prefill's keys in the same tiles as an
+    unchunked one; the copies sit before the window and are masked out."""
+    pad = window_start_pos[:bs] % tile
+    lens = window_kv_indptr[1 : bs + 1] - window_kv_indptr[:bs] + pad
+    aligned_kv_indptr = torch.zeros_like(window_kv_indptr[: bs + 1])
+    aligned_kv_indptr[1:] = torch.cumsum(lens, dim=0)
+    # Upper bound on the padded length, so no device-to-host sync is needed.
+    aligned_kv_indices = torch.empty(
+        window_kv_indices.numel() + bs * (tile - 1),
+        dtype=window_kv_indices.dtype,
+        device=window_kv_indices.device,
+    )
+    _align_window_kv_kernel[(bs,)](
+        window_kv_indptr,
+        window_kv_indices,
+        aligned_kv_indptr,
+        pad,
+        aligned_kv_indices,
+        BLOCK=128,
+    )
+    return aligned_kv_indptr, aligned_kv_indices
 
 
 def build_unified_kv_indices(
@@ -703,10 +753,18 @@ def _fwd_kernel(
             final_mask &= mask_non_causal
 
         if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
+            if not IS_CAUSAL:
+                window_mask = (
+                    (cur_block_m * BLOCK_M + offs_m[:, None])
+                    <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+                ) & (
+                    (start_n + offs_n[None, :])
+                    <= (cur_block_m * BLOCK_M + offs_m[:, None] + SLIDING_WINDOW_SIZE)
+                )
+            else:
+                window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                    start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+                )
             final_mask &= window_mask
 
         SKIP_TILE = False
@@ -1257,8 +1315,14 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    start_k, end_k = 0, cur_seq_kv_len
+    if IS_CAUSAL and SLIDING_WINDOW_SIZE > 0 and not USE_CUSTOM_MASK:
+        first_query = cur_block_m * BLOCK_M
+        last_query = tl.minimum(first_query + BLOCK_M, cur_seq_q_len)
+        start_k = tl.maximum(0, cur_seq_prefix_len + first_query - SLIDING_WINDOW_SIZE)
+        start_k = start_k // BLOCK_N * BLOCK_N
+        end_k = tl.minimum(cur_seq_kv_len, cur_seq_prefix_len + last_query)
+    for start_n in range(start_k, end_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
@@ -1311,6 +1375,8 @@ def _fwd_kernel_unified(
 
             # Sliding window: query can attend to keys within window_size
             window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
+            if not IS_CAUSAL:
+                window_mask &= k_abs_pos <= (q_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
 
         # Check if we can skip this tile

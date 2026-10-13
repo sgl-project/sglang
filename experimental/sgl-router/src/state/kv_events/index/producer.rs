@@ -205,9 +205,21 @@ impl KvEventIndex {
                 .filter_map(|(w, seq)| index_of.get(w).map(|&i| (i, *seq)))
                 .collect()
         };
+        // Live ranks the walk found no node for — see `PeerSnapshot::empty_ranks`.
+        // Read after the walk, so a rank whose first node lands mid-walk can be
+        // reported empty. That errs only toward a consumer settling that rank
+        // cold, which is safe, never toward it grafting state that is not here.
+        let empty_ranks: Vec<WireWorker> = self
+            .live_workers
+            .lock()
+            .iter()
+            .filter(|w| !index_of.contains_key(w))
+            .map(WireWorker::from)
+            .collect();
         let has_nodes = !nodes.is_empty();
         let workers = worker_table.iter().map(WireWorker::from).collect();
-        let snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
+        let mut snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
+        snap.empty_ranks = empty_ranks;
         // Encode on the blocking pool for the same reason the walk goes there:
         // serialising and compressing a fleet-sized tree is CPU-bound with no
         // await point, and this runs on the runtime that is also proxying
@@ -270,6 +282,7 @@ impl KvEventIndex {
             workers,
             cursors,
             nodes,
+            empty_ranks: Vec::new(),
         }
     }
 
@@ -301,7 +314,10 @@ impl KvEventIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{batch, worker_id};
     use super::*;
+    use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
+    use crate::state::kv_events::wire::KvCacheEvent;
 
     /// A request's `max_age` is anchored at its arrival. An export sampled
     /// after the request arrived meets any `max_age`, including zero — that is
@@ -345,5 +361,208 @@ mod tests {
         );
         drop(cache);
         index.shutdown().await;
+    }
+
+    /// The producer reuses its cached export only for a caller whose freshness
+    /// requirement it meets; an older export would predate the caller's
+    /// subscription and gap on the watermark.
+    #[tokio::test]
+    async fn producer_reuses_its_export_only_when_it_meets_the_callers_max_age() {
+        let index = KvEventIndex::new();
+        let exported_at = || async {
+            index
+                .snapshot_cache
+                .lock()
+                .await
+                .as_ref()
+                .expect("an entry was cached")
+                .exported_at
+        };
+
+        index.peer_snapshot_body(Duration::from_secs(60)).await;
+        let first = exported_at().await;
+
+        // A caller that can live with a minute-old tree gets the same one back.
+        index.peer_snapshot_body(Duration::from_secs(60)).await;
+        assert_eq!(first, exported_at().await, "a met requirement reuses");
+
+        // A caller that began holding after that export cannot use it.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        index.peer_snapshot_body(Duration::ZERO).await;
+        assert!(
+            exported_at().await > first,
+            "an unmet requirement must rebuild, not serve the stale export",
+        );
+    }
+
+    /// The stamp has to be taken BEFORE the contents are sampled. Stamping
+    /// completion would claim coverage the document does not have — exactly the
+    /// hole the parameter closes — and the walk plus encode of a real tree is
+    /// long enough for that to matter.
+    #[tokio::test]
+    async fn producer_stamps_the_export_before_it_samples() {
+        let index = KvEventIndex::new();
+        let before = Instant::now();
+        index.peer_snapshot_body(Duration::ZERO).await;
+        let after = Instant::now();
+        let exported_at = index
+            .snapshot_cache
+            .lock()
+            .await
+            .as_ref()
+            .expect("an entry was cached")
+            .exported_at;
+        assert!(
+            exported_at >= before && exported_at <= after,
+            "the stamp must sit inside the build, at its start",
+        );
+    }
+
+    /// The evidence a consumer's per-rank settle stands on: every LIVE rank the
+    /// export holds no node for is named — one never applied (what a rank the
+    /// producer is still bootstrapping looks like) and one whose applied stream
+    /// left nothing standing — and a rank that does carry nodes is not.
+    #[tokio::test]
+    async fn snapshot_names_the_live_ranks_it_holds_nothing_for() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let (warm, pending, emptied) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+            worker_id("http://w3:30000", 0),
+        );
+        for w in [&warm, &pending, &emptied] {
+            index.live_workers.lock().insert(w.clone());
+        }
+        index.seed_stored_block_for_test(&warm, 3, 111);
+        index.seed_cursor_only_for_test(&emptied, 2);
+
+        let body = index.peer_snapshot_body(Duration::ZERO).await;
+        let snap: PeerSnapshot = serde_json::from_slice(&body.identity).expect("valid JSON");
+        assert!(
+            snap.wire_cursor_for(&warm.url, 0).is_some(),
+            "the warm rank is covered"
+        );
+        assert!(!snap.holds_nothing_for(&warm.url, 0));
+        assert!(snap.holds_nothing_for(&pending.url, 0));
+        assert!(snap.holds_nothing_for(&emptied.url, 0));
+        assert_eq!(snap.empty_ranks.len(), 2);
+    }
+
+    /// This body answers one integer per rank, so it must carry the cursors
+    /// and NOT the tree. Asserting `nodes` is empty is also
+    /// what keeps the body ungraftable — `from_wire` rejects an empty node list.
+    #[tokio::test]
+    async fn cursors_only_body_carries_cursors_and_no_nodes() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        index.seed_stored_block_for_test(&worker_id("http://w1:30000", 0), 42, 111);
+
+        let body = index.peer_cursors_body();
+        let snap: PeerSnapshot = serde_json::from_slice(&body).expect("valid JSON");
+
+        assert!(snap.nodes.is_empty(), "the tree must not be exported");
+        assert_eq!(
+            snap.wire_cursor_for("http://w1:30000", 0),
+            Some(42),
+            "the per-rank cursor must be answerable from this body",
+        );
+        assert_eq!(snap.block_size, 256);
+        assert!(!snap.is_bigram);
+        assert!(
+            snap.producer_ready,
+            "a settled replica holding nodes is a valid witness",
+        );
+    }
+
+    /// A replica with an empty tree must not claim to be worth believing, for the
+    /// same reason `snapshot_entry` checks it: a replica whose own bootstrap timed
+    /// out is settled while holding nothing.
+    #[tokio::test]
+    async fn cursors_only_body_reports_not_ready_with_an_empty_tree() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+
+        let snap: PeerSnapshot =
+            serde_json::from_slice(&index.peer_cursors_body()).expect("valid JSON");
+        assert!(!snap.producer_ready, "an empty tree is not a source");
+    }
+
+    /// The cost claim, asserted structurally rather than by timing: serving cursors
+    /// must leave the snapshot cache untouched, because populating it is the
+    /// expensive walk this path exists to avoid.
+    #[tokio::test]
+    async fn cursors_only_body_never_populates_the_snapshot_cache() {
+        let index = KvEventIndex::new();
+        index.peer_cursors_body();
+        assert!(
+            index.snapshot_cache.lock().await.is_none(),
+            "cursors-only must not walk or cache the tree",
+        );
+    }
+
+    /// The two producer answers are intentionally NOT set-equal. A rank that
+    /// observed a publisher and then lost the blocks (cleared here) keeps its
+    /// cursor in the cursors-only body — that observation is still a valid
+    /// witness — while the full export drops it, because its cursor table only
+    /// covers ranks carrying tree nodes. The full side uses a SECOND rank that
+    /// still carries a block, so the export is a real one (not the not-ready
+    /// body an empty tree would fetch) and the assertion genuinely pins the
+    /// carrier filtering. See [`KvEventIndex::peer_cursors_body`].
+    #[tokio::test]
+    async fn the_cursors_only_table_keeps_witnesses_the_full_export_loses() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let cleared = worker_id("http://w1:30000", 0);
+        let holding = worker_id("http://w2:30000", 0);
+        index.seed_stored_block_for_test(&holding, 7, 999);
+        index.seed_stored_block_for_test(&cleared, 42, 111);
+        // Observed-then-cleared: the cursor survives where the blocks do not.
+        super::super::apply_batch(
+            &index.tree,
+            &index.cursors,
+            &index.tally,
+            &cleared,
+            43,
+            &batch(vec![KvCacheEvent::AllBlocksCleared]),
+        );
+
+        let thin: PeerSnapshot =
+            serde_json::from_slice(&index.peer_cursors_body()).expect("valid JSON");
+        assert_eq!(
+            thin.wire_cursor_for("http://w1:30000", 0),
+            Some(43),
+            "a cleared rank is still a witness to its publisher's stream",
+        );
+
+        let full: PeerSnapshot =
+            serde_json::from_slice(&index.peer_snapshot_body(Duration::ZERO).await.identity)
+                .expect("valid JSON");
+        assert!(
+            !full.nodes.is_empty(),
+            "the held block keeps this a real export, not the not-ready body",
+        );
+        assert_eq!(
+            full.wire_cursor_for("http://w1:30000", 0),
+            None,
+            "carriers only: the cleared rank's cursor is dropped from the export",
+        );
+        assert_eq!(
+            full.wire_cursor_for("http://w2:30000", 0),
+            Some(7),
+            "the rank still carrying blocks keeps its cursor in the export",
+        );
     }
 }
