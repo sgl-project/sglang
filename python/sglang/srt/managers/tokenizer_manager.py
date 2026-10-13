@@ -3836,7 +3836,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else None
                     ),
                 )
-                for i in range(obj.batch_size)
+                for i in range(len(obj.rid))
             ]
 
         rids = set()
