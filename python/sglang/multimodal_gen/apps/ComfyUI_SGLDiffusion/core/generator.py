@@ -16,6 +16,7 @@ from ..executors.minimax_h3 import (
     VDNH3Executor,
     load_fasth3_release,
 )
+from ..executors.qwen_image21 import QwenImage21Executor
 from ..executors.zimage import ZImageExecutor
 from .preflight import check_sgld_options
 
@@ -184,6 +185,7 @@ def _load_executor_classes():
         FastH3Executor,
         VDNH3Executor,
         LTXAVExecutor,
+        QwenImage21Executor,
     ]
     try:
         from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor

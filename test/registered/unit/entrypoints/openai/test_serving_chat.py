@@ -4345,7 +4345,7 @@ class ServingChatTestCase(CustomTestCase):
                 response = self.chat._build_chat_response(request, [ret], created=123)
                 message = response.model_dump(mode="json")["choices"][0]["message"]
                 self.assertEqual(message["content"], "" if tool_only else "Hello")
-                self.assertEqual(bool(message["tool_calls"]), tool_only)
+                self.assertEqual(bool(message.get("tool_calls")), tool_only)
                 self._assert_empty_reasoning_replays(message)
 
     def test_empty_stream_reasoning_each_choice(self):
