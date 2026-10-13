@@ -381,9 +381,11 @@ class KVCacheConfigurator:
         # The draft shares the target's capacity; one warning is enough.
         if self.is_draft_worker:
             return
-        # Request tokens, not per-rank rows: under DCP they differ by attn_dcp_size.
-        capacity = self.logical_token_capacity(
-            max_total_num_tokens=max_total_num_tokens
+        # Request tokens, not per-rank rows: DCP widens rows by attn_dcp_size,
+        # KV sharding by kv_shard_size.
+        capacity = (
+            self.logical_token_capacity(max_total_num_tokens=max_total_num_tokens)
+            * self.kv_shard_size
         )
         context_len = self.model_config.context_len
         if capacity >= context_len:

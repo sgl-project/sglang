@@ -7,6 +7,7 @@ Without the warning, an undersized pool shows up only as refused or truncated
 requests at serving time. Under DCP the pool's per-rank rows are not its
 capacity: each row widens into attn_dcp_size request tokens, so comparing rows
 to --context-length would warn on a pool that holds 1M tokens comfortably.
+KV sharding widens rows the same way, by kv_shard_size.
 """
 
 import types
@@ -23,12 +24,13 @@ LOGGER = "sglang.srt.mem_cache.kv_cache_configurator"
 CONTEXT_LEN = 1_048_576
 
 
-def _check(*, max_total_num_tokens):
+def _check(*, max_total_num_tokens, kv_shard_size=1):
     # Only the attributes the check and logical_token_capacity read.
     stub = types.SimpleNamespace(
         model_config=types.SimpleNamespace(context_len=CONTEXT_LEN),
         is_draft_worker=False,
         is_hybrid_swa=False,
+        kv_shard_size=kv_shard_size,
     )
     stub.loc_space_scale = KVCacheConfigurator.loc_space_scale.fget(stub)
     stub.logical_token_capacity = types.MethodType(
@@ -52,6 +54,12 @@ class TestPoolContextWarning(CustomTestCase):
         with get_parallel().override(attn_dcp_size=16, attn_dcp_rank=0):
             with self.assertNoLogs(LOGGER, "WARNING"):
                 _check(max_total_num_tokens=114_048)
+
+    def test_kv_sharding_counts_request_tokens_not_rows(self):
+        # 131,072 rows per rank x an 8-rank shard group = exactly CONTEXT_LEN.
+        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+            with self.assertNoLogs(LOGGER, "WARNING"):
+                _check(max_total_num_tokens=131_072, kv_shard_size=8)
 
 
 if __name__ == "__main__":
