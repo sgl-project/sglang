@@ -1545,6 +1545,96 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_prefill_cp_enables_compatible_graph_after_default_disable(self):
+        # Earlier graph/model policy may disable prefill capture before the
+        # attention backend and CP topology have finished resolving.
+        for strategy, backend, cp_size, pp_size, expected in (
+            ("zigzag", "trtllm_mha", 4, 1, Backend.BREAKABLE),
+            ("interleave", "dsv4", 4, 1, Backend.BREAKABLE),
+            ("zigzag", "fa3", 4, 1, Backend.DISABLED),
+            ("interleave", "dsa", 4, 1, Backend.DISABLED),
+            ("zigzag", "trtllm_mha", 2, 1, Backend.DISABLED),
+            ("interleave", "dsv4", 4, 2, Backend.DISABLED),
+        ):
+            with self.subTest(
+                strategy=strategy, backend=backend, cp=cp_size, pp=pp_size
+            ):
+                args = self._new_cp_args(
+                    enable_prefill_cp=True,
+                    cp_strategy=strategy,
+                    prefill_attention_backend=backend,
+                    attn_cp_size=cp_size,
+                    tp_size=4,
+                    pp_size=pp_size,
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=Backend.DISABLED)
+                    ),
+                )
+                args._cuda_graph_config_locked = set()
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[
+                            "DeepseekV4ForCausalLM"
+                            if backend == "dsv4"
+                            else "GptOssForCausalLM"
+                        ]
+                    ),
+                    is_multimodal=False,
+                )
+                handle_context_parallelism(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    expected,
+                )
+
+    def test_prefill_cp_keeps_unrelated_graph_incompatibilities(self):
+        for overrides in (
+            {"enable_two_batch_overlap": True},
+            {"dcp_size": 2},
+            {"disaggregation_mode": "decode"},
+            {"moe_a2a_backend": "mori"},
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._new_cp_args(
+                    enable_prefill_cp=True,
+                    cp_strategy="zigzag",
+                    attention_backend="trtllm_mha",
+                    attn_cp_size=4,
+                    tp_size=4,
+                    cuda_graph_config=CudaGraphConfig(),
+                    **overrides,
+                )
+                args._cuda_graph_config_locked = set()
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+                    is_multimodal=False,
+                )
+                handle_context_parallelism(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    Backend.DISABLED,
+                )
+
+    def test_prefill_cp_preserves_explicit_graph_backend(self):
+        for backend in (Backend.DISABLED, Backend.FULL):
+            with self.subTest(backend=backend):
+                args = self._new_cp_args(
+                    enable_prefill_cp=True,
+                    cp_strategy="interleave",
+                    attention_backend="dsv4",
+                    attn_cp_size=4,
+                    tp_size=4,
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=backend)
+                    ),
+                )
+                args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+                handle_context_parallelism(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    backend,
+                )
+
 
 class TestFlashinferA2ADispatchType(CustomTestCase):
     def setUp(self):
