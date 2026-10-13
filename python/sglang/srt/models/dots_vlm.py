@@ -17,6 +17,7 @@
 # limitations under the License.
 """Inference-only Dots-VL model compatible with HuggingFace weights."""
 
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -132,7 +133,7 @@ class DotsVLMForCausalLM(nn.Module):
     def get_model_config_for_expert_location(cls, config):
         return DeepseekV2ForCausalLM.get_model_config_for_expert_location(config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input_ids with multimodal tokens"""
         # Get image token ID for padding pattern
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

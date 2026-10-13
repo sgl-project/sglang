@@ -39,6 +39,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         top_logprobs_num=0,
         token_ids_logprob=None,
         return_sampling_mask=False,
+        sampling_logprobs_mode="selected",
         require_reasoning=False,
         return_hidden_states=False,
         return_routed_experts=False,
@@ -78,7 +79,7 @@ class TestSessionTokenShare(CustomTestCase):
         if baked is None:
             baked = len(output)
         req.output_ids.extend(output[:baked])
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
 
@@ -114,7 +115,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.session.abort_req()
         self.assertEqual(self.session.committed_origin_len, len(in1))
 
@@ -149,7 +150,7 @@ class TestSessionTokenShare(CustomTestCase):
         # array, then output trimmed to finished_len (like _trim_overshoot)
         # before finish.
         r1.output_ids.extend([1, 2, 3, 4, 5, 6])
-        r1._refresh_fill_ids()
+        r1.refresh_fill_ids()
         del r1.output_ids[4:]
         self.session.finish_req(r1)
         self.assertEqual(
@@ -161,7 +162,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50])
         self.assertEqual(list(r2.origin_input_ids), in1 + [1, 2, 3, 4] + [50])
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
 
 

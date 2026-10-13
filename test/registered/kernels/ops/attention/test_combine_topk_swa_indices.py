@@ -10,6 +10,9 @@ Checks the Triton kernel against a per-row torch reference:
 3. ``test_non_trailing_query_positions``: absolute ``query_pos`` that are not
    the trailing extend tokens, with a cross-chunk ``query_start_loc`` offset.
 4. ``test_swa_only_layer``: ``topk == 0`` writes only the window.
+5. ``test_reused_buffers_are_overwritten_whole``: the kernel is handed
+   uninitialized and already-written buffers, so it must overwrite every row it
+   is given rather than rely on a ``-1`` fill pass.
 """
 
 import pytest
@@ -80,12 +83,15 @@ def _check(**kwargs):
     assert torch.equal(got_idx, ref_idx)
 
 
-def _trailing_case(seq_lens, extend_lens, topk, compress_ratio, seed=0):
-    """Rows are the trailing ``extend_lens[r]`` tokens of request ``r``."""
+def _trailing_case(seq_lens, extend_lens, topk, compress_ratio, seed=0, pad_rows=0):
+    """Rows are the trailing ``extend_lens[r]`` tokens of request ``r``, followed by
+    ``pad_rows`` rows past the last request."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     query_pos = []
     for seq_len, extend_len in zip(seq_lens, extend_lens):
         query_pos.extend(range(seq_len - extend_len, seq_len))
+    # Past the last request, so the kernel never reads these positions.
+    query_pos.extend([0] * pad_rows)
     num_tokens = len(query_pos)
     topk_indices = torch.randint(
         0, 1 << 20, (num_tokens, topk), generator=gen, dtype=torch.int32
@@ -161,6 +167,48 @@ def test_non_trailing_query_positions():
         compress_ratio=4,
         topk=topk,
     )
+
+
+def test_reused_buffers_are_overwritten_whole():
+    """Callers hand the kernel uninitialized or already-written buffers, so every
+    row it is given must be overwritten in full. A row that keeps part of an
+    earlier call's longer selection, or a row past the last request that keeps
+    anything at all, is a stale index attention would read as live."""
+    width = -(-(64 + WINDOW) // TOPK_ALIGNMENT) * TOPK_ALIGNMENT
+    # Long selections first: every row fills 64 + WINDOW entries.
+    wide = _trailing_case([512, 640], [8, 8], topk=64, compress_ratio=4)
+    num_tokens = wide["topk_indices"].shape[0]
+    out_indices = torch.empty((num_tokens, width), dtype=torch.int32, device=DEVICE)
+    out_lens = torch.empty(num_tokens, dtype=torch.int32, device=DEVICE)
+
+    # An uninitialized buffer is poison, not -1.
+    out_indices.fill_(1 << 30)
+    out_lens.fill_(1 << 30)
+    got_idx, got_lens = combine_topk_swa_indices(
+        **wide, out_indices=out_indices, out_lens=out_lens
+    )
+    assert got_idx.data_ptr() == out_indices.data_ptr()
+    ref_idx, ref_lens = _reference(**wide)
+    assert torch.equal(got_lens, ref_lens)
+    assert torch.equal(got_idx, ref_idx)
+    assert int(got_lens[0]) == 64 + WINDOW
+
+    # Same buffers, now holding the first call's output: shorter selections, a
+    # zero-length request, and rows past the last request.
+    narrow = _trailing_case(
+        [20, 36, 48], [2, 0, 3], topk=64, compress_ratio=4, pad_rows=num_tokens - 5
+    )
+    assert narrow["topk_indices"].shape[0] == num_tokens
+    got_idx, got_lens = combine_topk_swa_indices(
+        **narrow, out_indices=out_indices, out_lens=out_lens
+    )
+    ref_idx, ref_lens = _reference(**narrow)
+    assert torch.equal(got_lens, ref_lens), (got_lens.tolist(), ref_lens.tolist())
+    assert torch.equal(got_idx, ref_idx)
+    # The shorter rows and the padding rows must not keep the first call's tails.
+    assert int(got_lens[0]) < 64 + WINDOW
+    assert (got_lens[5:] == 0).all()
+    assert (got_idx[5:] == -1).all()
 
 
 def test_swa_only_layer():

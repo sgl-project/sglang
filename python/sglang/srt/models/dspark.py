@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    MarkovGreedyStep,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -25,10 +25,17 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
 
 logger = logging.getLogger(__name__)
 
-StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def gather_and_crop_vocab(
@@ -48,44 +55,48 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
-def run_markov_block(
-    head: nn.Module,
-    base_logits: torch.Tensor,
-    *,
-    first_prev_tokens: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    sampler: StepSampler,
-    collect_corrected: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    batch_size, proposal_len = base_logits.shape[:2]
-    if proposal_len == 0:
-        empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-        return empty, base_logits
+class VocabShard(msgspec.Struct, frozen=True):
+    """Where a rank's vocab slice starts, and the gather over its group."""
 
-    sampled_tokens = []
-    corrected_logits = []
-    prev_tokens = first_prev_tokens.long()
-    for step_idx in range(proposal_len):
-        step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
-        )
-        next_tokens = sampler(step_logits, step_idx)
-        sampled_tokens.append(next_tokens)
-        if collect_corrected:
-            corrected_logits.append(step_logits.unsqueeze(1))
-        prev_tokens = next_tokens
-    return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-    )
+    start: int
+    gather: VocabGather
 
 
-class VanillaMarkov(nn.Module):
-    markov_head_type = "vanilla"
+class BaseDSparkMarkovHead(nn.Module, ABC):
+    """Corrects a draft block step by step: each step's base logits get a bias
+    computed from the token drafted at the step before."""
 
+    vocab_size: int
+    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
+    vocab_shard: Optional[VocabShard] = None
+
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        del hidden_states
+        return None
+
+    @abstractmethod
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return this step's bias and the state the next step reads."""
+
+    @abstractmethod
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        """The dtype of ``base_logits + bias``."""
+
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        """The w2 weight when the bias is exactly the GEMV of the previous
+        token's embedding, for the fused greedy kernel; otherwise None."""
+        return None
+
+
+class VanillaMarkov(BaseDSparkMarkovHead):
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
@@ -103,85 +114,31 @@ class VanillaMarkov(nn.Module):
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
 
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias comes out in the embedding's dtype.
+        return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
-    def apply_step_logits(
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        return logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if base_logits.size(-2) == 0:
-            return base_logits
-        return base_logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
+        state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
+        del hidden_states
+        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
+
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        return self.markov_w2.weight if self._bias_is_w2_gemv() else None
+
+    def _bias_is_w2_gemv(self) -> bool:
+        # The fused kernel recomputes this class's bias; a subclass that changes
+        # it keeps the shared op.
+        cls = type(self)
+        return (
+            cls.step_bias is VanillaMarkov.step_bias
+            and cls.project_bias is VanillaMarkov.project_bias
         )
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Greedy-only draft-block sampling via the fused per-step
-        [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
-        markov_w2 per step instead of GEMV + add + two-pass argmax, and no
-        full-vocab bias/step-logits materialization.
-
-        Only valid for the vanilla step bias (bias = w2 @ w1[prev]); subclasses
-        whose step bias depends on hidden state override this to return None so
-        the caller falls back to sample_block.
-        """
-        if not base_logits.is_cuda:
-            return None
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            return torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-        sampled_tokens = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_embeds = self.get_prev_embeddings(prev_tokens)
-            prev_tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits[:, step_idx, :],
-                prev_embeds=prev_embeds,
-                w2_weight=self.markov_w2.weight,
-            )
-            sampled_tokens.append(prev_tokens)
-        return torch.stack(sampled_tokens, dim=1)
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -218,8 +175,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-    markov_head_type = "gated"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
@@ -235,31 +190,21 @@ class GatedMarkovHead(VanillaMarkov):
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
 
-    def compute_step_bias(
+    def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
+        *,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        gate = self.compute_gate(token_ids, hidden_states).to(
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        prev_embeddings = self.get_prev_embeddings(prev_tokens)
+        gate = self.compute_gate(prev_tokens, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
-        return self.project_bias(gate * prev_embeddings)
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        # The gated step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
-        return None
+        return self.project_bias(gate * prev_embeddings), state
 
 
 class RNNHead(VanillaMarkov):
-    markov_head_type = "rnn"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.hidden_size = int(hidden_size)
@@ -280,94 +225,28 @@ class RNNHead(VanillaMarkov):
         bias = self.project_bias(torch.tanh(output_raw))
         return new_state, bias
 
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        state = torch.zeros_like(prev_embeddings)
-        _, bias = self._rnn_step(state, prev_embeddings, hidden_states)
-        return bias
-
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        block_size = base_logits.size(-2)
-        if block_size == 0:
-            return base_logits
-        leading_shape = base_logits.shape[:-2]
-        state = torch.zeros(
-            *leading_shape,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        output_logits = []
-        for k in range(block_size):
-            prev_emb = self.get_prev_embeddings(token_ids[..., k])
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[..., k, :])
-            output_logits.append(base_logits[..., k, :] + bias)
-        return torch.stack(output_logits, dim=-2)
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            empty = torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-            return empty, base_logits
-
-        state = torch.zeros(
-            batch_size,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        sampled_tokens = []
-        corrected_logits = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_emb = self.get_prev_embeddings(prev_tokens)
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
-            step_logits = base_logits[:, step_idx, :] + bias
-            next_tokens = sampler(step_logits, step_idx)
-            sampled_tokens.append(next_tokens)
-            if collect_corrected:
-                corrected_logits.append(step_logits.unsqueeze(1))
-            prev_tokens = next_tokens
-        return (
-            torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-        )
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        # The recurrent step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
-        return None
+        if hidden_states is None:
+            raise ValueError("RNNHead requires hidden_states.")
+        return torch.zeros(
+            hidden_states.shape[0],
+            self.markov_rank,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        prev_emb = self.get_prev_embeddings(prev_tokens)
+        state, bias = self._rnn_step(state, prev_emb, hidden_states)
+        return bias, state
 
 
 def build_markov_head(config) -> Optional[nn.Module]:
@@ -426,7 +305,6 @@ class DSparkConfidenceHead(nn.Module):
         self.register_buffer(
             "sts_temperatures", torch.ones((), dtype=torch.float32), persistent=False
         )
-        self._last_confidence_raw: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -448,8 +326,29 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(features).squeeze(-1)
 
     def apply_sts(self, confidence_raw: torch.Tensor) -> torch.Tensor:
-        self._last_confidence_raw = confidence_raw
         return torch.sigmoid(confidence_raw.float() / self.sts_temperatures)
+
+    def predict(
+        self,
+        features: torch.Tensor,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        markov_head: BaseDSparkMarkovHead,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The [bs, gamma] confidence of a drafted block and its raw logit."""
+        bs, gamma = draft_tokens.shape
+        if self.with_markov:
+            prev_tokens = torch.cat(
+                [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
+            )
+            markov_embed_stack = markov_head.get_prev_embeddings(prev_tokens)
+        else:
+            markov_embed_stack = None
+        confidence_raw = self(features.view(bs, gamma, -1), markov_embed_stack)
+        confidence = self.apply_sts(confidence_raw)
+        expect(_CONFIDENCE, confidence)
+        return confidence, confidence_raw
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
@@ -526,8 +425,9 @@ class DSparkDraftMixin:
 
     def compute_base_logits(
         self, hidden: torch.Tensor
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Project the draft's raw final hidden through the target lm_head.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project the draft's raw final hidden through the target lm_head;
+        also returns the features the confidence head reads.
 
         muP targets (Inkling) train the draft against a FOLDED head (weights
         pre-divided by logits_mup_width_multiplier) while serving attaches the
@@ -541,11 +441,26 @@ class DSparkDraftMixin:
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
+        confidence_features = hidden
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
-        return base_logits, None
+        return base_logits, confidence_features
+
+    def compute_confidence(
+        self,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []
@@ -802,9 +717,11 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
                 pool.set_kv_buffer(
                     attn.attn,
-                    cache_loc,
+                    KVWriteLoc(cache_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,

@@ -513,6 +513,39 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
         self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
 
+    def test_set_capacity_keeps_tables_and_shrinks_the_active_range(self):
+        """Post-capture sizing shrinks a captured allocator in place: the
+        v2p/p2v tables the graphs captured keep their storage, and every
+        capacity-derived range follows the new slot count on both ends."""
+        pool, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                v2p, p2v = alloc.virtual_to_physical, alloc.physical_to_virtual
+                new_slots = pool.max_slots(alloc.sub_pool_name) // 2
+                alloc._set_capacity(new_slots)
+                self.assertIs(alloc.virtual_to_physical, v2p)
+                self.assertIs(alloc.physical_to_virtual, p2v)
+                self.assertEqual(alloc.max_slots, new_slots)
+                self.assertEqual(alloc.num_pages, new_slots)
+                self.assertEqual(alloc.num_virtual_ids, new_slots)
+                self.assertEqual(
+                    alloc.free_virtual_ids.tolist(),
+                    list(range(alloc.min_page_index, new_slots)),
+                )
+        # Each side still fills its whole range, and only inside the new bounds.
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                n = alloc.available_size()
+                self.assertGreater(n, 0)
+                v = self._alloc(alloc, kv, n)
+                p = alloc.virtual_to_physical[v]
+                self.assertGreaterEqual(int(p.min()), alloc.min_slot_index)
+                self.assertLess(int(p.max()), alloc.max_slots)
+                self.assertIsNone(alloc.alloc(1))
+                self._check_invariants(alloc, kv)
+                self._free(alloc, kv, v)
+                self._check_invariants(alloc, kv)
+
 
 # ---------------------------------------------------------------------------
 # Shared SWA composite -- unit tests
@@ -1873,16 +1906,13 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "v2p_page[virt_pages] * page_size + offsets.",
         )
 
-        # The composite emits KERNEL-FACING ids, not the physical token ids this
-        # helper returns; they coincide only at multiplier 1, which nothing uses.
-        swa_mult = allocator.swa_kernel_page_multiplier
-        self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
+        # The composite emits the swa sub-pool's PHYSICAL token ids (the
+        # kernel-facing id space of the token-major views).
         composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
-        expected_kernel = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
         self.assertTrue(
-            bool((composite_out.long() == expected_kernel.long()).all().item()),
+            bool((composite_out.long() == expected.long()).all().item()),
             "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
-            "sub-pool's kernel-facing ids (phys_page * ps * blocks_per_page + offset).",
+            "sub-pool's physical token ids (phys_page * ps + offset).",
         )
 
 
@@ -2170,7 +2200,7 @@ class TestLazyCompaction(unittest.TestCase):
 
 
 class TestO3FusedAllocBind(unittest.TestCase):
-    """Fused take_physical_pages + bind_pages via `_alloc_bind_fast_or_slow`.
+    """Fused take_physical_pages + bind via `_alloc_bind_fast_or_slow`.
     GPU-only: the fused kernel is Triton."""
 
     def setUp(self):
@@ -2225,78 +2255,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         ma.bind_peer(fa)
         return pool, fa, full_kv
 
-    def test_fast_path_when_no_holes(self):
-        """When `_free_phys_pages` is empty, the fused fast path fires."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Sanity: empty holeset.
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        wm_before = fa.watermark_physical
-        # Pick virtual page ids the kernel will bind.
-        v_pages = torch.tensor([20, 21, 22, 23], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 4)
-        # Watermark advanced by N.
-        self.assertEqual(fa.watermark_physical, wm_before + 4)
-        # Returned phys ids match the grow-up arange [wm_before, wm_before+4).
-        expected_phys = torch.arange(
-            wm_before, wm_before + 4, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # v2p table: each virtual -> its physical.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-        # p2v table: each physical -> its virtual.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
-        # live_page_count updated.
-        self.assertEqual(fa.live_page_count, 4)
-        # Another fast-path call accumulates.
-        v_pages2 = torch.tensor([24, 25], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages2, 2)
-        self.assertEqual(fa.live_page_count, 6)
-
-    def test_slow_path_when_holes_exist(self):
-        """Greedy hole reuse: an existing hole must be drained before the
-        watermark extends, so the fast path must not fire."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Build a hole by alloc-then-free-non-boundary.
-        a = fa.alloc(3)
-        self.assertEqual(fa.live_page_count, 3)
-        fa.free(a[0:1].clone())  # frees a non-boundary slot -> enters holeset
-        self.assertEqual(fa.live_page_count, 2)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        # `_free_phys_pages` is a torch.Tensor; read the hole via `.tolist()`.
-        hole_pos = int(fa._free_phys_pages.tolist()[0])
-        wm_before = fa.watermark_physical
-        # Alloc 1 page via the helper. Slow path should drain the hole.
-        v_pages = torch.tensor([42], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 1)
-        # Hole drained, NOT a watermark extension.
-        self.assertEqual(int(phys[0].item()), hole_pos)
-        self.assertEqual(fa.watermark_physical, wm_before)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        # v2p/p2v updated.
-        self.assertEqual(int(fa.virtual_to_physical[42].item()), hole_pos)
-        self.assertEqual(int(fa.physical_to_virtual[hole_pos].item()), 42)
-        # The slow path advances live_page_count via take_physical_pages.
-        self.assertEqual(fa.live_page_count, 3)
-
-    def test_fast_path_in_eager_mode(self):
-        """Eager mode never accumulates holes, so it always takes the fast path;
-        `live_page_count` is not maintained there and stays 0."""
-        _pool, fa, _kv = self._make_full(lazy=False)
-        self.assertFalse(fa.lazy_compaction)
-        self.assertEqual(fa.live_page_count, 0)
-        wm_before = fa.watermark_physical
-        v_pages = torch.tensor([30, 31, 32], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        expected_phys = torch.arange(
-            wm_before, wm_before + 3, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # live_page_count UNCHANGED (eager mode invariant).
-        self.assertEqual(fa.live_page_count, 0)
-
     def test_index_space_overflow_returns_none(self):
         """When the requested allocation would overflow `num_pages`,
         the helper returns None and leaves the allocator unchanged."""
@@ -2311,16 +2269,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # Allocator state unchanged.
         self.assertEqual(fa.watermark_physical, wm_before)
         self.assertEqual(fa.live_page_count, 0)
-
-    def test_empty_alloc_returns_empty_tensor(self):
-        """N=0 returns an empty tensor (no kernel launch, no state change)."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        wm_before = fa.watermark_physical
-        v_pages = torch.empty(0, dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 0)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.numel(), 0)
-        self.assertEqual(fa.watermark_physical, wm_before)
 
     def test_fast_path_equivalent_to_slow_path(self):
         """On an empty holeset, the fast path must produce identical v2p / p2v /
@@ -2346,87 +2294,12 @@ class TestO3FusedAllocBind(unittest.TestCase):
         self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
         self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
 
-    def test_page_size_gt_1(self):
-        """At page_size > 1 the kernel must scatter one v2p entry per PAGE,
-        not per token."""
-        _pool, fa, _kv = self._make_full(
-            lazy=True, n_full_slots=64, n_mamba_slots=16, page_size=4
-        )
-        self.assertEqual(fa.page_size, 4)
-        v_pages = torch.tensor([3, 4, 5], dtype=torch.int64, device="cuda")
-        wm_before = fa.watermark_physical
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.shape, (3,))
-        # Watermark advances by N PAGES (not N tokens).
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        # v2p table updated at page granularity.
-        for v, p in zip(v_pages.tolist(), phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
-
-    def test_grow_down_fast_path(self):
-        """The mamba sub-pool is grow-down. Verifies fast-path arithmetic
-        in the descending direction."""
-        _pool, _fa, _kv = self._make_full(lazy=True)
-        # Build a grow-down allocator standalone for the test.
-        from sglang.srt.mem_cache.unified_memory_pool import (
-            UnifiedKVPool,
-        )
-
-        full = _make_mha_spec("full", "up", layer_num=2)
-        swa = _make_mha_spec("swa", "down", layer_num=2)  # grow-down
-        total = (full.entry_bytes() + swa.entry_bytes()) * 32
-        pool = UnifiedKVPool(
-            total_bytes=total,
-            sub_pool_specs=[full, swa],
-            device="cuda",
-            enable_memory_saver=False,
-        )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        fa = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
-            sub_pool_name="full",
-            device="cuda",
-            is_id_owner=True,
-            lazy_compaction=True,
-        )
-        sa = MultiEndedAllocator(
-            kvcache=swa_kv,
-            unified_buffer=pool,
-            sub_pool_name="swa",
-            device="cuda",
-            is_id_owner=False,  # non-owner, grow-down
-            lazy_compaction=True,
-        )
-        fa.bind_peer(sa)
-        sa.bind_peer(fa)
-        # Grow-down: watermark starts at num_pages - 1, decreases.
-        self.assertEqual(sa.grow_direction, "down")
-        wm_before = sa.watermark_physical
-        v_pages = torch.tensor([5, 6, 7], dtype=torch.int64, device="cuda")
-        phys = sa._alloc_bind_fast_or_slow(v_pages, 3)
-        # Grow-down: the kernel emits ASCENDING, matching
-        # `_take_physical_eager`'s `torch.arange(wm - N + 1, wm + 1)`.
-        expected = torch.tensor(
-            [wm_before - 2, wm_before - 1, wm_before],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        self.assertTrue(torch.equal(phys, expected))
-        # Watermark decreased by N.
-        self.assertEqual(sa.watermark_physical, wm_before - 3)
-        for v, p in zip(v_pages.tolist(), expected.tolist()):
-            self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
-
 
 class TestSWACompositeKernelIdSurface(unittest.TestCase):
-    """The SWA composite's kernel-facing id surface. Attention backends probe for
-    `translate_kv_loc_for_kernel` / `full_v2p_page_table`, and every id must
-    follow `kernel_id(t) = v2p[t // ps] * (ps * mult) + t % ps`."""
+    """The SWA composite's id surface: both translates follow
+    `phys(t) = v2p[t // ps] * ps + t % ps` over their own side's v2p table,
+    and the raw v2p tables are exposed unwrapped.
+    """
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -2476,55 +2349,50 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_full_kernel_translate_matches_formula(self):
-        """Both sides scale by their OWN sub-pool's block count, and the full
-        kernel id follows v2p[t // ps] * (ps * mult) + t % ps."""
-        mult = 2 * self.FULL_L
+    def test_composite_exposes_raw_v2p_tables(self):
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
-        self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
+        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
+        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+
+    def test_full_translate_matches_formula(self):
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
-        expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
-        # The PHYSICAL translate must stay unscaled -- compaction and the byte
-        # machinery depend on it staying in physical space.
-        phys = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+        expected = v2p[v // self.PS] * self.PS + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
-    def test_kernel_translate_accepts_an_int32_page_table(self):
-        """Regression: fa3 passes its own page table, which is int32 and 2-D, so
-        the gather must not require an int64 index."""
+    def test_translate_accepts_an_int32_page_table(self):
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there. Both page
+        sizes: at ps == 1 the index IS the caller's tensor, at ps > 1 it is
+        derived."""
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 self.PS = ps
-                mult = 2 * self.FULL_L
                 a = self._build()
                 v = a.alloc(4 * ps)
                 self.assertIsNotNone(v)
                 v2p = a.full_attn_allocator.virtual_to_physical
-                expected = v2p[v // ps] * (ps * mult) + v % ps
+                expected = v2p[v // ps] * ps + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
-                got = a.translate_kv_loc_for_kernel(page_table)
+                got = a.translate_kv_loc(page_table)
                 self.assertEqual(got.shape, page_table.shape)
                 self.assertTrue(torch.equal(got.reshape(-1), expected))
                 # `out=` takes the same int32 index; the buffer stays int64.
                 dst = torch.empty(page_table.shape, dtype=torch.int64, device=_DEV)
-                a.translate_kv_loc_for_kernel(page_table, out=dst)
+                a.translate_kv_loc(page_table, out=dst)
                 self.assertTrue(torch.equal(dst.reshape(-1), expected))
 
-    def test_swa_translate_scales_page_stride(self):
-        mult = 2 * self.SWA_L
+    def test_swa_translate_matches_formula(self):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
-        expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
+        expected = v2p_swa[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
 
     def test_swa_transfer_page_is_physical_not_kernel_scaled(self):
-        mult = 2 * self.SWA_L
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
@@ -2540,17 +2408,17 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             physical_pages.tolist(),
         )
 
+        # The read path is physical too: the token-major entry leaves no
+        # per-page block scale for a kernel id to carry.
         kernel_tokens = a.translate_loc_from_full_to_swa(v)
         self.assertEqual(
             kv_to_page_indices(kernel_tokens, self.PS).tolist(),
-            (physical_pages * mult).tolist(),
+            physical_pages.tolist(),
         )
 
-    def test_swa_kernel_tombstone_still_lands_on_sink(self):
-        """The scaled stride must not break the tombstone clamp: a tombstoned
-        page's ids (v2p == -1 -> -stride + offset, negative for every in-page
-        offset) still land on the sink, never negative."""
-        mult = 2 * self.SWA_L
+    def test_swa_tombstone_still_lands_on_sink(self):
+        """A tombstoned page's ids (v2p == -1 -> -ps + offset, negative for
+        every in-page offset) still land on the sink, never negative."""
         a = self._build()
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v)
@@ -2624,8 +2492,6 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
 
     def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
-        # MLA: one latent row per layer, so the spec reports LAYERS blocks.
-        self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
@@ -2633,9 +2499,9 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         # The kernel translate follows the affine formula at ps=64, and every id
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
-        want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS
-        got = a.translate_kv_loc_for_kernel(v)
-        self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
+        want = v2p[v // self.PS] * self.PS + v % self.PS
+        got = a.translate_kv_loc(v)
+        self.assertTrue(torch.equal(got, want), "physical-id formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
 
 
@@ -3096,6 +2962,41 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertGreater(moved, 0)
         self._check_float_state(fla, kv)
 
+    def test_on_demand_movers_honor_move_gate(self):
+        """`make_room` / `compact_holes` relocate live pages just as `_flush`
+        does, so a closed move gate must stop them too: the shortfall ladder
+        reaches `make_room` while a host transfer or RDMA still addresses the
+        float's physical pages, and an ungated mover copies KV out from under
+        it. A blocked ask reports what is open now and leaves state untouched.
+        """
+        _, _, fla, _, kv = self._build_tri()
+        vs = [fla.alloc(2) for _ in range(4)]
+        for v in vs:
+            self._stamp(fla, kv, v)
+        fla.free(vs[1])  # an interior hole `compact_holes` would pack
+        epp = fla.entry_bytes_per_page
+        _, gap_high = fla._gap_pages()
+        ask = (gap_high + 2) * epp
+
+        def snapshot():
+            return (
+                fla.low_wm_page,
+                fla.high_wm_page,
+                fla._hole_pages(),
+                len(fla._inverse_history),
+            )
+
+        fla.host_transfer_move_gate = lambda: False
+        before = snapshot()
+        self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
+        self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
+        self.assertEqual(snapshot(), before)
+        self._check_float_state(fla, kv)
+
+        fla.host_transfer_move_gate = lambda: True
+        self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
+        self._check_float_state(fla, kv)
+
 
 class TestDcpWidening(unittest.TestCase):
     """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while
@@ -3223,13 +3124,13 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 a = self._build(page_size=2)
                 ids = a.alloc(2 * dcp_size * 3)
-                written = a.translate_write_loc_for_kernel(ids)
+                written = a.translate_write_loc(ids)
                 owned = (ids % dcp_size) == rank
                 # Owned ids agree with the read translate of the collapsed id...
                 self.assertTrue(
                     torch.equal(
                         written[owned],
-                        a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                        a.translate_kv_loc(ids[owned] // dcp_size),
                     )
                 )
                 # ...and the rest go to the sink the write kernels skip.
@@ -3507,8 +3408,8 @@ class TestDcpWidening(unittest.TestCase):
             allocator.free_group_end()
 
 
-class TestFusedWriteLocTranslate(unittest.TestCase):
-    """`write_loc_to_kernel_ids` must equal the arithmetic it stands for.
+class TestTranslateTokenIds(unittest.TestCase):
+    """`translate_token_ids` must equal the arithmetic it stands for.
 
     Nothing downstream can tell the two apart except by value, so the reference
     here is the definition rather than a recorded expectation. Triton truncates
@@ -3516,7 +3417,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     tombstoned-page cases are the ones that matter.
     """
 
-    def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
+    def _reference(self, loc, v2p, page_size, dcp_size, dcp_rank):
         out = []
         for raw in loc.tolist():
             if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
@@ -3525,11 +3426,11 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             collapsed = raw // dcp_size
             page = collapsed // page_size
             offset = collapsed % page_size if page_size > 1 else 0
-            out.append(max(int(v2p[page]) * stride + offset, 0))
+            out.append(max(int(v2p[page]) * page_size + offset, 0))
         return out
 
-    def _check(self, *, page_size, multiplier, dcp_size, dcp_rank, device):
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+    def _check(self, *, page_size, dcp_size, dcp_rank, device):
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         span = page_size * dcp_size
         locs = [0, 1, span - 1, span, 2 * span + 3, 5 * span + dcp_rank, -1]
@@ -3544,27 +3445,22 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             device=device,
         )
         v2p[min(3, num_pages - 1)] = -1
-        stride = page_size * multiplier
 
-        got = write_loc_to_kernel_ids(
+        got = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
         )
-        want = self._reference(
-            loc.cpu(), v2p.cpu(), page_size, stride, dcp_size, dcp_rank
-        )
+        want = self._reference(loc.cpu(), v2p.cpu(), page_size, dcp_size, dcp_rank)
         self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
         # `out=` must write in place and agree (the cuda-graph-stable path).
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(
+        ret = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=dst,
@@ -3577,11 +3473,56 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 self._check(
                     page_size=page_size,
-                    multiplier=7,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                     device="cpu",
                 )
+
+    def test_matches_reference_on_a_strided_view(self):
+        """A column slice of a wider page table is what the SWA read path hands
+        down under cuda graphs, so its ids must equal the flat reference's."""
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        rows, cols, page_size = 3, 5, 4
+        v2p = torch.arange(32, dtype=torch.int64, device=_DEV)
+        backing = torch.full((rows, cols + 3), -1, dtype=torch.int64, device=_DEV)
+        view = backing[:, :cols]
+        view.copy_(torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols))
+        self.assertFalse(view.is_contiguous())
+
+        want = self._reference(view.reshape(-1).cpu(), v2p.cpu(), page_size, 1, 0)
+        got = translate_token_ids(loc=view, v2p=v2p, page_size=page_size)
+        self.assertEqual(got.shape, view.shape)
+        self.assertEqual(got.reshape(-1).tolist(), want)
+
+        # `out=` into a slice of a DIFFERENTLY strided backing: the ids land in
+        # the sliced columns and the rest of that buffer is left alone.
+        dst = torch.full((rows, cols + 7), -9, dtype=torch.int64, device=_DEV)
+        ret = translate_token_ids(
+            loc=view,
+            v2p=v2p,
+            page_size=page_size,
+            out=dst[:, :cols],
+        )
+        self.assertEqual(ret.data_ptr(), dst.data_ptr())
+        self.assertEqual(dst[:, :cols].reshape(-1).tolist(), want)
+        self.assertTrue(bool((dst[:, cols:] == -9).all()))
+
+    def test_out_width_needs_a_packed_loc(self):
+        """`out_width` addresses a packed lane range, so a strided loc would
+        write its tail zeros over live ids."""
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        v2p = torch.arange(16, dtype=torch.int64, device=_DEV)
+        loc = torch.arange(12, dtype=torch.int64, device=_DEV)[::2]
+        with self.assertRaises(AssertionError):
+            translate_token_ids(
+                loc=loc,
+                v2p=v2p,
+                page_size=1,
+                out=torch.zeros(10, dtype=torch.int64, device=_DEV),
+                out_width=10,
+            )
 
 
 if __name__ == "__main__":

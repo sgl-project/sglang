@@ -1034,11 +1034,6 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
             )
         return None
 
-    if kv_cache_dtype == "fp4_e2m1":
-        raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
-            "Use --kv-cache-dtype=fp4_mx_block16."
-        )
     if kv_cache_dtype == "mxfp4":
         raise ValueError(
             "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "

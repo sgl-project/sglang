@@ -19,7 +19,7 @@ fn engine(id: &str, stage: Stage, active: usize) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: stage,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     worker.active_requests.store(active, Ordering::Relaxed);
     worker
