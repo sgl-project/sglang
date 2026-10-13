@@ -35,7 +35,7 @@ use super::pd_routing::PDRoutingFields;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -72,12 +72,8 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if request.model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
-            false,
-        );
+    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);

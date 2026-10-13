@@ -201,6 +201,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
+from sglang.srt.sampling.watermarking.core import WatermarkState
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
@@ -310,6 +311,8 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
+    watermark_state: Optional[WatermarkState] = None
+
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
         return self._sampling_observer
@@ -393,7 +396,9 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        # HiSparse owns target KV only. Draft KV keeps its logical GPU page
+        # space and must not construct a second sparse coordinator.
+        self.enable_hisparse = get_memory().enable_hisparse and not is_draft_worker
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
@@ -613,6 +618,26 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             max_running_requests=self.max_running_requests,
             device=self.device,
+        )
+
+    def maybe_init_watermark_state(self):
+        features = get_exec().features
+        self.watermark_state = (
+            WatermarkState(
+                max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
+                context_window=features.watermark_context_window,
+                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+                vocab_size=self.model_config.vocab_size,
+                key=features.watermark_key,
+                key_b=features.watermark_key_b,
+                mixing_probability=features.watermark_mixing_probability,
+                max_probability=features.watermark_max_probability,
+                device=self.device,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+            )
+            if features.enable_watermark and not self.is_draft_worker
+            else None
         )
 
     def init_kv_cache_configurator(self):
@@ -965,6 +990,7 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
+        self.maybe_init_watermark_state()
 
         self.maybe_init_hisparse_coordinator()
 
@@ -1002,7 +1028,11 @@ class ModelRunner:
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
-                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
+            num_draft_tokens=(
+                0
+                if self.spec_algorithm.is_none()
+                else get_spec().speculative_num_draft_tokens or 0
             ),
         )
 
@@ -2059,6 +2089,32 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
+        watermark_state = self.watermark_state
+        if (
+            watermark_state is not None
+            and forward_batch.sampling_info.has_watermark_candidates
+        ):
+            logprob_logits = (
+                logits_output.next_token_logits.clone()
+                if forward_batch.return_logprob
+                else None
+            )
+            req_pool_indices = forward_batch.req_pool_indices[
+                : logits_output.next_token_logits.shape[0]
+            ]
+            watermark_state.init_from_prompt(
+                req_pool_indices,
+                forward_batch.watermark_prompt_tail_ids,
+                forward_batch.watermark_context_hash_history,
+            )
+            watermark_state.force(
+                logits_output.next_token_logits,
+                req_pool_indices,
+                forward_batch.sampling_info,
+            )
+        else:
+            logprob_logits = None
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2072,6 +2128,9 @@ class ModelRunner:
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            **(
+                {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
+            ),
         )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
@@ -2082,6 +2141,14 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
+        if (
+            watermark_state is not None
+            and forward_batch.sampling_info.has_watermark_candidates
+        ):
+            watermark_state.append(
+                req_pool_indices,
+                next_token_ids,
+            )
         return next_token_ids
 
     def compute_logprobs_only(

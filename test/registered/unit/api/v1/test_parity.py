@@ -83,6 +83,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "use_audio_in_video",
         "video_config",
         "video_max_dynamic_patch",
+        "watermark",
     }
 )
 
@@ -97,6 +98,9 @@ DERIVED_SAMPLING_FIELDS = frozenset(
         "ebnf_full_assistant",
     }
 )
+# Schema-only sampling inputs the Rust server lowers before the scheduler
+# (choice -> regex); Python's SamplingParams never receives them.
+SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
 
 
 def compact(value) -> str:
@@ -149,7 +153,10 @@ class TestRequestFieldParity(CustomTestCase):
             for name in PySamplingParams.__struct_fields__
             if name not in DERIVED_SAMPLING_FIELDS
         ]
-        self.assertEqual(set(python_api), set(SamplingParams.__struct_fields__))
+        self.assertEqual(
+            set(python_api),
+            set(SamplingParams.__struct_fields__) - SCHEMA_ONLY_SAMPLING_FIELDS,
+        )
         self.assertEqual(
             set(PySamplingParams.__struct_fields__) - set(python_api),
             DERIVED_SAMPLING_FIELDS,
