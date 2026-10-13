@@ -220,8 +220,6 @@ class OpenAIServingDetokenize(OpenAIServingBase):
 
 
 class OpenAIServingParse(OpenAIServingBase):
-    """Handler for /v1/parse requests: output token IDs to an assistant message"""
-
     def __init__(self, chat_serving: OpenAIServingChat):
         super().__init__(chat_serving.tokenizer_manager)
         self.chat_serving = chat_serving
@@ -244,7 +242,6 @@ class OpenAIServingParse(OpenAIServingBase):
         tokenizer = self.tokenizer_manager.tokenizer
         tools = request.tools or []
         parse_tools = bool(tools and chat.tool_call_parser)
-        # Parsers read the delimiters that skipping special tokens would drop.
         text = tokenizer.decode(
             request.tokens,
             skip_special_tokens=False,

@@ -803,13 +803,11 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         return None
 
     def _parse_tag_pattern(self, tool_field: dict) -> str | None:
-        """A tag pattern that also reads argument layouts the declared
-        `tool_field` does not write, or None to parse with its own."""
+        """A parse-only tag pattern; grammars keep `tool_field`'s own."""
         return None
 
     def calls_complete(self, text: str) -> bool:
-        """Whether every tool call in the finished output `text` reaches its
-        closer, parses, and has no text outside its argument tags."""
+        """Whether each call in finished `text` closes and parses, with no stray text."""
         field = self._template.fields[_TOOL_FIELD]
         tag = None
         if field.content == "xml-inline":

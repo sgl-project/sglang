@@ -1878,7 +1878,6 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     dependencies=[Depends(validate_json_request)],
 )
 async def openai_v1_parse(request: ParseRequest, raw_request: Request):
-    """Parse output token IDs into an assistant message."""
     return await raw_request.app.state.openai_serving_parse.handle_request(
         request, raw_request
     )

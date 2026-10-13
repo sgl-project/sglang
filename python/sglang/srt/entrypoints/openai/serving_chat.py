@@ -2064,7 +2064,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages.append(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
-            # An explicit /v1/tokenize format keeps a complete final assistant turn.
             add_generation_prompt = request._format_add_generation_prompt
             assistant_prefix = None
             if add_generation_prompt is None or request.continue_final_message:
@@ -2097,46 +2096,42 @@ class OpenAIServingChat(OpenAIServingBase):
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
             # avoid double BOS on tokenizers that would add it.
-            if add_generation_prompt is None:
-                encode_kwargs = (
-                    {"add_special_tokens": False}
-                    if self._tokenizer_auto_adds_specials
-                    else {}
+            add_special_tokens = request._format_add_special_tokens
+            if add_special_tokens and self._prompt_text_round_trip_is_lossy:
+                raise ValueError(
+                    "add_special_tokens is not supported with this tokenizer's "
+                    "chat template"
                 )
-            else:
-                if (
-                    request._format_add_special_tokens
-                    and self._prompt_text_round_trip_is_lossy
-                ):
-                    raise ValueError(
-                        "add_special_tokens is not supported with this tokenizer's "
-                        "chat template"
-                    )
-                encode_kwargs = {
-                    "add_special_tokens": request._format_add_special_tokens
-                }
-            render_kwargs = {
-                "tools": tools,
-                "template_kwargs": extra_template_kwargs,
-                "encode_kwargs": encode_kwargs,
-                "use_cache": is_multimodal,
-                "add_generation_prompt": add_generation_prompt is not False,
-            }
+            encode_kwargs = (
+                {"add_special_tokens": add_special_tokens}
+                if self._tokenizer_auto_adds_specials or add_special_tokens
+                else {}
+            )
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
-                    openai_compatible_messages, **render_kwargs
+                    openai_compatible_messages,
+                    tools=tools,
+                    template_kwargs=extra_template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                    use_cache=is_multimodal,
+                    add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
-                render_kwargs["tools"] = (
+                tools = (
                     [t["function"] if "function" in t else t for t in tools]
                     if tools
                     else None
                 )
                 try:
                     prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
-                        openai_compatible_messages, **render_kwargs
+                        openai_compatible_messages,
+                        tools=tools,
+                        template_kwargs=extra_template_kwargs,
+                        encode_kwargs=encode_kwargs,
+                        use_cache=is_multimodal,
+                        add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)

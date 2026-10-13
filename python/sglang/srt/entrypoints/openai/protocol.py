@@ -868,7 +868,6 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
-    # Set only by /v1/tokenize; None keeps chat-completion rendering.
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
@@ -1695,7 +1694,7 @@ class TokenizeRequest(BaseModel):
 
     def to_chat_completion_request(self) -> ChatCompletionRequest:
         data = self.model_dump(
-            exclude={"prompt", "add_special_tokens", "add_generation_prompt"},
+            exclude={"prompt", "add_special_tokens"},
             exclude_none=True,
         )
         extra = getattr(self, "__pydantic_extra__", None)
@@ -1737,9 +1736,6 @@ class DetokenizeResponse(BaseModel):
 
 
 class ParseRequest(BaseModel):
-    """Request schema for the /v1/parse endpoint."""
-
-    model: str = DEFAULT_MODEL_NAME
     tokens: List[int]
     tools: Optional[List[Tool]] = None
 

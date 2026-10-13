@@ -1,6 +1,3 @@
-"""Chat formatting options on /v1/tokenize through a real tokenizer and template;
-expected IDs come from literal token strings, not from the code under test."""
-
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
@@ -32,7 +29,15 @@ CHAT_TEMPLATE = (
     "{{ m.content }} </s> {% endfor %}"
     "{% if add_generation_prompt %}<assistant> {% endif %}"
 )
-HISTORY = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+CALL = {
+    "id": "c1",
+    "type": "function",
+    "function": {"name": "lookup", "arguments": '{"city": "Paris"}'},
+}
+HISTORY = [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "content": "hello", "tool_calls": [CALL]},
+]
 
 
 def _tokenizer():
@@ -89,19 +94,14 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         )
         return OpenAIServingTokenize(tm, templates)
 
-    def test_omitted_options_render_as_chat(self):
-        # add_special_tokens applies to messages only with add_generation_prompt.
-        self.assertEqual(
-            _tokenize(self._serving(), messages=HISTORY, add_special_tokens=True),
-            (200, _ids("<user> hi </s> <user> hello </s> <assistant>")),
-        )
-
-    def test_supplied_options_render_messages_as_given(self):
+    def test_formatting_options(self):
+        turn = "<user> hi </s> <assistant> call lookup Paris hello </s>"
         expected = {
-            (False, None): "<user> hi </s> <assistant> hello </s>",
-            (True, None): "<user> hi </s> <assistant> hello </s> <assistant>",
-            (False, True): "<bos> <user> hi </s> <assistant> hello </s>",
-            (False, False): "<user> hi </s> <assistant> hello </s>",
+            (None, True): "<user> hi </s> <user> hello </s> <assistant>",
+            (False, None): turn,
+            (True, None): f"{turn} <assistant>",
+            (False, True): f"<bos> {turn}",
+            (False, False): turn,
         }
         # Multimodal renders are cached; the prompt flag must separate their keys.
         for multimodal in (False, True):
@@ -114,21 +114,6 @@ class TestTokenizeFormattingOptions(CustomTestCase):
                     multimodal=multimodal, prompt=prompt, special=special
                 ):
                     self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
-
-    def test_final_tool_call_turn_is_kept(self):
-        call = {"name": "lookup", "arguments": '{"city": "Paris"}'}
-        messages = [
-            {"role": "user", "content": "hi"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c1", "type": "function", "function": call}],
-            },
-        ]
-        self.assertEqual(
-            _tokenize(self._serving(), messages=messages, add_generation_prompt=False),
-            (200, _ids("<user> hi </s> <assistant> call lookup Paris </s>")),
-        )
 
     def test_options_that_cannot_apply_are_rejected(self):
         chatml = self._serving(chat_template="chatml")

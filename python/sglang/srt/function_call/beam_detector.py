@@ -23,8 +23,6 @@ class BeamDetector(ResponseTemplateToolDetector):
         return supports_tool_call_structural_tag(self._tool_field, tools)
 
     def _parse_tag_pattern(self, tool_field: dict) -> str | None:
-        # Beam's newline-framed parameters also parse when written compactly;
-        # any other declared rule, and the grammar, stay as declared.
         framed = r'<rfl:parameter name="(?P<key>[^"]+)">\n(?P<value>.*?)\n'
         declared = (tool_field.get("content_args") or {}).get("tag_pattern", "")
         if tool_field.get("content") != "xml-inline" or not declared.startswith(framed):
