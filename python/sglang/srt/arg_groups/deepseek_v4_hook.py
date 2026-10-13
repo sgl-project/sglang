@@ -138,15 +138,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
+        is_dsv41 = model_config_of(server_args).hf_config.model_type == "deepseek_v41"
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
-            (
-                "DeepSeek-V4.1",
-                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
-            ),
+            # V4.1 carries its own bounded-replay tail layout; V4 has none.
             (
                 "--enable-decoder-swa-bounded-replay",
-                cfg.enable_decoder_swa_bounded_replay,
+                cfg.enable_decoder_swa_bounded_replay and not is_dsv41,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
         )
