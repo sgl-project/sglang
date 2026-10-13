@@ -3,11 +3,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
-from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
-from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+from sglang.kernels.ops.lora.dense.embedding_lora_a import embedding_lora_a_fwd
+from sglang.kernels.ops.lora.dense.gate_up_lora_b import gate_up_lora_b_fwd
+from sglang.kernels.ops.lora.dense.qkv_lora_b import qkv_lora_b_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
