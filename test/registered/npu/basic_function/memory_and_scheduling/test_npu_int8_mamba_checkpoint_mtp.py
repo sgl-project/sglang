@@ -9,8 +9,8 @@ import requests
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=3600, suite="full-2-npu-a3", nightly=True)
 
 MODEL = os.environ.get("SGLANG_TEST_MODEL", "/mnt/paas/weights/Qwen3.6-35B-A3B")
-BASE_URL = DEFAULT_URL_FOR_TEST
+BASE_URL = f"http://127.0.0.1:{find_available_port(10000)}"
 BASE_GPU_ID = os.environ.get("BASE_GPU_ID")
 
 # The checkpoint pool has an explicit size (3x active slots), not the 2x default.
