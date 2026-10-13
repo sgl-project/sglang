@@ -356,7 +356,8 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.assertEqual(req.weight_version_events[0].num_output_tokens, output_len)
 
     def test_records_on_inflight_step_requests_exactly_once(self):
-        """A request in both the running rows and a step in flight is recorded once, and step-only requests are recorded too."""
+        """A request in both the running rows and a step in flight is recorded
+        once, and step-only requests are recorded too."""
         shared_req = _ReqStub(3)
         prefill_req = _ReqStub(1)
         scheduler = self._scheduler(

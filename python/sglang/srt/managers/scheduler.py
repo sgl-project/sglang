@@ -5527,9 +5527,8 @@ class Scheduler(
             # In-place pause: just set the flag and return immediately.
             # All scheduler state (running_batch, chunked_req, inflight_steps)
             # is left untouched. On resume, the event loop handles any
-            # chunked_req cleanup and overlap result processing through the standard code paths. This avoids
-            # duplicating batch manipulation logic and the accounting bugs
-            # that come with it.
+            # chunked_req cleanup and overlap result processing through the
+            # standard code paths, so no batch logic is duplicated here.
             return
 
         if self.enable_overlap and len(self.inflight_steps) > 0:
