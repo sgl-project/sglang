@@ -540,9 +540,7 @@ class QSAIndexer(MultiPlatformOp):
         if group is None:
             return local_indices
         if logical_block_positions is None:
-            raise ValueError(
-                "distributed QSA top-k requires logical block positions"
-            )
+            raise ValueError("distributed QSA top-k requires logical block positions")
         if (
             static_buffers is not None
             and getattr(static_buffers, "candidate_symm_state", None) is not None

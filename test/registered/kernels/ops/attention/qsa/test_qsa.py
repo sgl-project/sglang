@@ -449,20 +449,25 @@ def _run_qsa_multimem_candidate_transport(rank, world_size, port):
     try:
         group = _QSAIntegrationGroup(rank, world_size)
         rows, topk, page_size = 2, 512, 16
-        global_ids = torch.arange(
-            topk * world_size, dtype=torch.int32, device=device
+        global_ids = torch.arange(topk * world_size, dtype=torch.int32, device=device)
+        logical_positions = (
+            global_ids[(global_ids // page_size) % world_size == rank]
+            .unsqueeze(0)
+            .expand(rows, -1)
+            .contiguous()
         )
-        logical_positions = global_ids[
-            (global_ids // page_size) % world_size == rank
-        ].unsqueeze(0).expand(rows, -1).contiguous()
-        local_indices = torch.arange(
-            topk, dtype=torch.int32, device=device
-        ).unsqueeze(0).expand(rows, -1).contiguous()
+        local_indices = (
+            torch.arange(topk, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(rows, -1)
+            .contiguous()
+        )
         row_starts = torch.zeros(rows, dtype=torch.int32, device=device)
         logits = -logical_positions.to(torch.float32)
-        logits = logits + torch.arange(
-            rows, dtype=torch.float32, device=device
-        ).unsqueeze(1) * 0.25
+        logits = (
+            logits
+            + torch.arange(rows, dtype=torch.float32, device=device).unsqueeze(1) * 0.25
+        )
         buffers = QSACacheShardingStaticBuffers(
             max_rows=rows,
             topk=topk,
@@ -510,16 +515,14 @@ def _run_qsa_multimem_candidate_transport(rank, world_size, port):
         dist.barrier(device_ids=[rank])
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_scores, graph_indices = (
-                fused_publish_and_merge_qsa_topk_candidates(
-                    logits,
-                    local_indices,
-                    row_starts,
-                    logical_positions,
-                    group=group,
-                    topk=topk,
-                    static_buffers=buffers,
-                )
+            graph_scores, graph_indices = fused_publish_and_merge_qsa_topk_candidates(
+                logits,
+                local_indices,
+                row_starts,
+                logical_positions,
+                group=group,
+                topk=topk,
+                static_buffers=buffers,
             )
         logits.add_(rank * 4096.0)
         expected_scores, expected_indices = reference()
