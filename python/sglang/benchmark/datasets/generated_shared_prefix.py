@@ -17,7 +17,7 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
     gen_prompt,
-    get_available_tokens,
+    gen_prompt_ids,
 )
 
 
@@ -56,7 +56,10 @@ class GeneratedSharedPrefixDataset(BaseDataset):
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
-        assert not getattr(args, "tokenize_prompt", False)
+        input_ids = getattr(args, "tokenize_prompt", False)
+        num_turns = getattr(args, "gsp_num_turns", 1)
+        if input_ids and num_turns > 1:
+            raise ValueError("--tokenize-prompt requires --gsp-num-turns=1")
         group_distribution = getattr(args, "gsp_group_distribution", "uniform")
         zipf_alpha = getattr(args, "gsp_zipf_alpha", None)
 
@@ -95,11 +98,11 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             seed=args.seed,
             fast_prepare=getattr(args, "gsp_fast_prepare", False),
             send_routing_key=getattr(args, "gsp_send_routing_key", False),
-            num_turns=getattr(args, "gsp_num_turns", 1),
+            num_turns=num_turns,
             ordered=getattr(args, "gsp_ordered", False),
             group_distribution=group_distribution,
             zipf_alpha=zipf_alpha,
-            input_ids=getattr(args, "gsp_input_ids", False),
+            input_ids=input_ids,
         )
 
     def load(
@@ -190,6 +193,9 @@ def sample_generated_shared_prefix_requests(
     Zipf mode is cached on disk under a distinct key per (group_distribution,
     zipf_alpha) value.
     """
+    if input_ids and num_turns > 1:
+        raise ValueError("Token-id prompts require num_turns=1")
+
     cache_path = get_gen_prefix_cache_path(
         seed,
         num_groups,
@@ -247,23 +253,18 @@ def sample_generated_shared_prefix_requests(
     # input_ids emits raw token-id lists so the server receives ids directly and
     # skips tokenization before prefill; the text path decodes ids back to a
     # string that the server then re-encodes.
-    if input_ids:
-        available_tokens = get_available_tokens(tokenizer)
-
-        def _gen(token_num):
-            return random.choices(available_tokens, k=int(token_num))
-
-    else:
-
-        def _gen(token_num):
-            return gen_prompt(tokenizer, int(token_num))
-
-    system_prompts = [_gen(system_prompt_lens[i]) for i in range(num_groups)]
+    generate_prompt = gen_prompt_ids if input_ids else gen_prompt
+    system_prompts = [
+        generate_prompt(tokenizer, int(system_prompt_lens[i])) for i in range(num_groups)
+    ]
 
     # shape: (num_groups, prompts_per_group, num_turns)
     questions = [
         [
-            [_gen(int(question_lens[g, p, t])) for t in range(num_turns)]
+            [
+                generate_prompt(tokenizer, int(question_lens[g, p, t]))
+                for t in range(num_turns)
+            ]
             for p in range(prompts_per_group)
         ]
         for g in range(num_groups)
@@ -339,16 +340,21 @@ def sample_generated_shared_prefix_requests(
     if group_distribution == "zipf":
         print(f"Zipf alpha: {zipf_alpha}")
     print(f"Total prompts: {len(input_requests)}")
-    # input_ids stores raw id lists, so tokenizer.encode() on them is meaningless.
-    if not fast_prepare and not input_ids:
+    if not fast_prepare or input_ids:
+        system_token_lens = [
+            len(sp) if input_ids else len(tokenizer.encode(sp)) for sp in system_prompts
+        ]
+        all_questions = [q for group in questions for conv in group for q in conv]
+        question_token_lens = [
+            len(q) if input_ids else len(tokenizer.encode(q)) for q in all_questions
+        ]
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
         print(
-            f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+            f"Average system prompt length: {sum(system_token_lens) / len(system_prompts):.1f} tokens"
         )
-        all_questions = [q for group in questions for conv in group for q in conv]
         print(
-            f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
+            f"Average question length: {sum(question_token_lens) / len(all_questions):.1f} tokens\n"
         )
 
     if should_cache:

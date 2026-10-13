@@ -2222,13 +2222,20 @@ def _finite_positive_float(value) -> float:
 def _validate_parsed_gsp_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject malformed GSP distribution/alpha combinations at parse time.
+    """Reject unsupported GSP argument combinations at parse time.
 
     Invoked from the CLI entry point right after ``parser.parse_args()`` so
     users see a clear argparse-style error before any server, model, or
     tokenizer setup runs and masks the real cause with an unrelated network
     failure.
     """
+    if (
+        getattr(args, "dataset_name", None) == "generated-shared-prefix"
+        and getattr(args, "tokenize_prompt", False)
+        and getattr(args, "gsp_num_turns", 1) > 1
+    ):
+        parser.error("--tokenize-prompt requires --gsp-num-turns=1")
+
     distribution = getattr(args, "gsp_group_distribution", None)
     alpha = getattr(args, "gsp_zipf_alpha", None)
     if distribution == "zipf" and alpha is None:
@@ -2704,11 +2711,6 @@ def cli_main():
         "--gsp-fast-prepare",
         action="store_true",
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
-    )
-    group.add_argument(
-        "--gsp-input-ids",
-        action="store_true",
-        help="Send raw random token ids as input_ids instead of decoded text, so the server skips tokenization before prefill. Statistics are suppressed like --gsp-fast-prepare; use for pure prefill/decode pressure tests.",
     )
     group.add_argument(
         "--gsp-send-routing-key",
