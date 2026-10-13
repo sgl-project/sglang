@@ -22,12 +22,16 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("packed_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# FP8 packed scratch is used only with an FP8 KV pool.
+@pytest.mark.parametrize(
+    "dtype,packed_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
 def test_strided_gather_zero_fills_tail(dtype, packed_dtype):
-    if dtype == torch.bfloat16 and packed_dtype == torch.float8_e4m3fn:
-        pytest.skip("FP8 packed scratch is used only with an FP8 KV pool")
-
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.manual_seed(0)
