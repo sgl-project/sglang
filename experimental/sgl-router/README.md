@@ -262,9 +262,9 @@ client sent. The router picks the first of these that applies:
 2. The rank with the deepest cached prefix in the local KV tree.
 3. The rank with the fewest requests this router has in flight on it.
 
-In PD mode, decode is ranked by load only. The bootstrap room satisfies
-`room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
-the prefill rank.
+In PD mode, decode is ranked by load only. The decode request names the
+prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+`room % prefill_dp_size == prefill_rank`.
 
 ### Retries
 
