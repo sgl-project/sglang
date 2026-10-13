@@ -376,6 +376,7 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -864,6 +865,17 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
+    # true forces EPv2; false forces EPv1.
+    SGLANG_MORI_EP_V2 = EnvBool(True)
+    SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
+    SGLANG_MORI_COMBINE_DTYPE = EnvStr("auto")
+    SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS = EnvInt(0)
+    # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
+    # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
+    SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
+    SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
     # AMD, ROCm, and AITER
@@ -1588,6 +1600,7 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
@@ -1618,6 +1631,9 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
+    # sizes; decode stays on aiter.
+    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
