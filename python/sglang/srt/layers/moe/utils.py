@@ -485,7 +485,7 @@ def initialize_moe_config():
     )
     moe.speculative_a2a_backend = (
         MoeA2ABackend(spec.speculative_moe_a2a_backend)
-        if spec.speculative_moe_a2a_backend is not None
+        if spec.speculative_moe_a2a_backend not in (None, "none")
         else _default_speculative_a2a_backend(moe.a2a_backend)
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)

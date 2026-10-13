@@ -180,7 +180,13 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
+            help=(
+                "Choose the backend for MoE A2A in speculative decoding. "
+                "If unset or 'none', inherit --moe-a2a-backend, except "
+                "flashinfer_megamoe defaults the draft to none (draft layers "
+                "are typically unquantized, which flashinfer_megamoe's "
+                "global-expert-id dispatch doesn't support)."
+            ),
             choices=[
                 "none",
                 "deepep",

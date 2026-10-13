@@ -52,6 +52,14 @@ class AscendTPDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
+        self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
+        self.num_local_routed_experts = (
+            self.num_local_experts - self.num_local_shared_experts
+        )
+        self.moe_ep_size = get_parallel().moe_ep_size
+        self.moe_ep_rank = get_parallel().moe_ep_rank
+        self.local_expert_mapping = None
         self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
@@ -76,18 +84,21 @@ class AscendTPDispatcher(BaseDispatcher):
     def set_ascend_dispatcher_output_dtype(self) -> None:
         """Choose init & finalize routing kernels based on quant config."""
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
+        # EP filtering produces -1 row indices for nonlocal experts. Mode 3
+        # supports dropped routes in row-major order; mode 2 does not.
+        drop_pad_mode = 3 if self.moe_ep_size > 1 else 2
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             self.init = NPUMoEInitRouting_v2(quant_mode=-1)
-            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=drop_pad_mode)
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
-            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=drop_pad_mode)
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8:
             self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
-            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=drop_pad_mode)
             self.group_list_type = 1
         else:
             raise ValueError(
@@ -102,6 +113,37 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
 
+        if self.moe_ep_size > 1:
+            if self.local_expert_mapping is None:
+                # Unlike the GPU dispatcher, use a nonnegative drop sentinel:
+                # init_routing_v2 filters IDs outside active_expert_range.
+                # The extra entry also maps padding IDs (-1) to that sentinel.
+                self.local_expert_mapping = torch.full(
+                    (self.num_experts + 1,),
+                    self.num_local_experts,
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                start = self.moe_ep_rank * self.num_local_routed_experts
+                self.local_expert_mapping[
+                    start : start + self.num_local_routed_experts
+                ] = torch.arange(
+                    self.num_local_routed_experts,
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                if self.num_local_shared_experts > 0:
+                    self.local_expert_mapping[
+                        self.num_experts
+                        - self.num_local_shared_experts : self.num_experts
+                    ] = torch.arange(
+                        self.num_local_routed_experts,
+                        self.num_local_experts,
+                        dtype=torch.int32,
+                        device=topk_ids.device,
+                    )
+            topk_ids = self.local_expert_mapping[topk_ids]
+
         (
             permuted_hidden_states,
             expanded_row_idx,
@@ -112,6 +154,7 @@ class AscendTPDispatcher(BaseDispatcher):
             topk_ids,
             self.num_experts,
             top_k,
+            active_expert_range=(0, self.num_local_experts),
         )
 
         self._dispatch_output = AscendTPDispatchOutput(
