@@ -745,14 +745,14 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
     ]
 
 
-def _dsv4_low_ratio_entries(
-    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
-):
-    """Mirror each shared source once, in FULL-page units. Prefixes end on an even
-    page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
+def _dsv4_low_ratio_regions(kvcache: Any, page_size: int) -> list:
+    """``(name, device_pool, page_row_buffers, layer_mapping)`` for the ratio-1 / 2
+    (DeepSeek-V4.1) compressed KV and indexer regions: each shared kv_source is
+    mirrored once, one FULL page per buffer row. Shared by HiCache and the direct
+    external linker."""
     import torch
 
-    entries = []
+    regions_out = []
     for ratio, names in (
         (
             1,
@@ -803,25 +803,36 @@ def _dsv4_low_ratio_entries(
                 )
             regions.append((name, index_pool, rows))
         for name, device_pool, buffers in regions:
-            entries.append(
-                build_pool_entry(
-                    name=name,
-                    host_pool=DeepSeekV4PagedHostPool(
-                        pool_name=str(name),
-                        device_buffers=buffers,
-                        item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
-                        num_host_pages=num_host_pages,
-                        slot_page_size=page_size,
-                        layout=get_memory().hicache_mem_layout,
-                        allocator_type=_get_allocator_type(),
-                        page_aligned_only=True,
-                    ),
-                    device_pool=device_pool,
-                    layer_mapping=layer_mapping,
-                    transfer_layer_id_max=transfer_layer_id_max,
-                )
-            )
-    return entries
+            regions_out.append((name, device_pool, buffers, layer_mapping))
+    return regions_out
+
+
+def _dsv4_low_ratio_entries(
+    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
+):
+    """Mirror each shared source once, in FULL-page units. Prefixes end on an even
+    page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
+    return [
+        build_pool_entry(
+            name=name,
+            host_pool=DeepSeekV4PagedHostPool(
+                pool_name=str(name),
+                device_buffers=buffers,
+                item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                page_aligned_only=True,
+            ),
+            device_pool=device_pool,
+            layer_mapping=layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max,
+        )
+        for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+            kvcache, page_size
+        )
+    ]
 
 
 def _dsv4_rope_sibling(
