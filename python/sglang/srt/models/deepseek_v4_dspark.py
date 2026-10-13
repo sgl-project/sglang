@@ -843,6 +843,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.hc_pre_from_prev_sublayer = bool(
             getattr(config, "hc_pre_from_prev_sublayer", False)
         )
+        # the draft stages on the mono kernels (sglang.srt.layers.mono), attached at the first forward
+        self.mono = None
+        self.mono_pending = self._mono_requested()
 
         if self.uses_own_vocab_modules:
             self.embed_tokens = VocabParallelEmbedding(
@@ -923,6 +926,65 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 positions=positions,
             )
 
+    def _mono_requested(self) -> bool:
+        if not self.hc_pre_from_prev_sublayer or _is_npu:
+            return False
+        from sglang.srt.runtime_context import get_server_args
+
+        if not getattr(get_server_args(), "enable_mono_kernel", False):
+            return False
+        from sglang.srt.models.deepseek_common.amd.mono.spec import (
+            draft_layers_enabled,
+        )
+
+        return draft_layers_enabled()
+
+    def _attach_mono(self) -> None:
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+        from sglang.srt.layers.mono.layer import attach_spec
+        from sglang.srt.models.deepseek_common.amd.mono.spec import DRAFT_SPEC
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mono: first draft forward reached inside a CUDA graph capture"
+            )
+        self.mono_pending = False
+        tp = get_parallel().tp_group
+        self.mono = attach_spec(
+            self,
+            DRAFT_SPEC,
+            server_args=get_server_args(),
+            hf_config=self.config,
+            tp_rank=tp.rank_in_group,
+            tp_size=tp.world_size,
+            cpu_group=tp.cpu_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+
+    def _forward_stages_mono(self, x, forward_batch):
+        """Every stage as the whole-layer launches, the FFN post pending between stages (stage 0: identity fold
+        from the embeddings and a one-hot pre, SGLang's copy-0 combine) -> (hidden, last FFN pre)."""
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+            _mono_whole,
+        )
+
+        pending, pre, last = (None, x, None, None), None, len(self.stages) - 1
+        for i, stage in enumerate(self.stages):
+            hidden, pre, out = _mono_whole(
+                stage,
+                self.mono.routed(stage.layer_id),
+                forward_batch.positions,
+                forward_batch,
+                pre,
+                pending,
+                defer_post=i < last,
+            )
+            if out is not None:
+                pending = out
+            else:
+                x = hidden
+        return x, pre
+
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.embed_tokens is None:
             raise ValueError(
@@ -947,10 +1009,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
+        if self.mono_pending:
+            self._attach_mono()
         # Draft MoE layers have no recorder layer index, so keep them out of the stats.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                x, pre = stage(positions, x, forward_batch, pre)
+            if (
+                self.mono is not None
+                and self.mono.begin_step(forward_batch).step is not None
+            ):
+                x, pre = self._forward_stages_mono(x, forward_batch)
+            else:
+                for stage in self.stages:
+                    x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
