@@ -447,6 +447,14 @@ class MooncakeKVManager(CommonKVManager):
             np.count_nonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))
         )
 
+    @staticmethod
+    def _is_first_staging_piece(strategy, start, num_pages):
+        # Only the first piece of a grid slot may stage. Its actual length is
+        # carried by STAGING_REQ and CHUNK_READY. Later pieces start inside
+        # the slot and remain direct, so they never reuse its allocation.
+        size = strategy.full_chunk_pages
+        return size > 0 and start % size == 0 and 0 < num_pages <= size
+
     def _ensure_equal_tp_staging_req(self, kv_chunk, req) -> None:
         """Request decode-side staging allocation for a fragmented equal-TP
         chunk (issue #5450). The batch prefetch gate skips equal-TP rooms, so
@@ -471,8 +479,8 @@ class MooncakeKVManager(CommonKVManager):
         # Chunk identity = the folded grid index, the same formula
         # PrefillStagingStrategy.check_ready uses, so the STAGING_RSP offset
         # lands exactly where check_ready looks it up. The sender aligns chunk
-        # ends to the staging grid (send_kv_chunk), so start // full_chunk_pages
-        # is a stable identity across the chunk queue.
+        # starts to the staging grid for staged pieces. Later continuations
+        # inside a slot remain direct and cannot reuse this identity.
         chunk_idx = kv_chunk.index_slice.start // full_chunk_pages
         stg_key = (kv_chunk.room, chunk_idx, req.mooncake_session_id)
         if stg_key in self._staging_ctx.prefetch_requested:
@@ -1899,7 +1907,13 @@ class MooncakeKVManager(CommonKVManager):
                             and self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                             and self.enable_staging
+                            and self.pp_size == 1
                             and staging_strategy is not None
+                            and self._is_first_staging_piece(
+                                staging_strategy,
+                                kv_chunk.index_slice.start,
+                                len(kv_chunk.prefill_kv_indices),
+                            )
                             and (
                                 target_rank_registration_info.staging_base_ptr != 0
                                 or target_rank_registration_info.staging_total_size != 0
@@ -2398,6 +2412,42 @@ class MooncakeKVManager(CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
+    def should_split_staging(self, page_indices, grid_pages, min_groups):
+        if self.requires_staging_grid_alignment():
+            return True
+        if envs.SGLANG_DISAGG_STAGING_ALWAYS.get():
+            return True
+        # Leave direct sends intact unless a grid-aligned piece, including
+        # a partial final piece, can stage for at least one destination.
+        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        end = self.curr_idx + len(page_indices)
+        first = ((self.curr_idx + grid_pages - 1) // grid_pages) * grid_pages
+        for start in range(first, end, grid_pages):
+            src = page_indices[
+                start - self.curr_idx : start - self.curr_idx + grid_pages
+            ]
+            for info in infos.values():
+                if info.is_dummy:
+                    continue
+                dst = info.dst_kv_indices[start : start + len(src)]
+                if len(dst) != len(src):
+                    return True
+                if self.kv_mgr._fragmented_groups(src, dst) >= min_groups:
+                    return True
+        return False
+
+    def requires_staging_grid_alignment(self):
+        if self.kv_mgr.pp_size != 1:
+            return True
+        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        active = [info for info in infos.values() if not info.is_dummy]
+        if not active:
+            return True
+        for info in active:
+            target = self.kv_mgr.decode_kv_args_table.get(info.mooncake_session_id)
+            if target is None or target.dst_attn_tp_size != self.kv_mgr.attn_tp_size:
+                return True
+        return False
 
     def __init__(
         self,

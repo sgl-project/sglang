@@ -1157,7 +1157,14 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
-            if self.enable_staging:
+            if (
+                self.enable_staging
+                and getattr(
+                    req.disagg_kv_sender,
+                    "requires_staging_grid_alignment",
+                    lambda: True,
+                )()
+            ):
                 # Staging identifies chunks positionally against a uniform
                 # prefetched grid, so non-last sends must end on a grid
                 # boundary; the remainder rides with the next send.
@@ -1281,7 +1288,28 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
-        if self.enable_staging:
+        # Materialize the original send range once. Splitting must not add
+        # extra GPU-to-CPU synchronization to the unfragmented direct path.
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_idx:end_idx
+        ]
+        kv_indices = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+            kv_indices
+        )
+        all_page_indices = kv_to_page_indices(kv_indices, page_size)
+        split_staging = self.enable_staging
+        split_predicate = getattr(req.disagg_kv_sender, "should_split_staging", None)
+        if split_staging and split_predicate is not None:
+            split_staging = split_predicate(
+                all_page_indices,
+                max(
+                    1,
+                    staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)
+                    // page_size,
+                ),
+                envs.SGLANG_DISAGG_STAGING_MIN_GROUPS.get(),
+            )
+        if split_staging:
             # One sender.send per grid slot; the sender's cumulative page
             # counter marks only the final sub-send of the final chunk as
             # is_last, routing aux/state correctly.
@@ -1296,17 +1324,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
-                )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            page_start = (seg_start - start_idx) // page_size
+            page_end = (seg_end - start_idx + page_size - 1) // page_size
+            page_indices = all_page_indices[page_start:page_end]
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
