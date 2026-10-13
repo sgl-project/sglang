@@ -61,9 +61,7 @@ class _RecordingStrategy:
 
 
 def _cp_batch(out_cache_loc):
-    return SimpleNamespace(
-        out_cache_loc=out_cache_loc, encoder_out_cache_loc=None
-    )
+    return SimpleNamespace(out_cache_loc=out_cache_loc, encoder_out_cache_loc=None)
 
 
 def _attn_layer():
