@@ -53,8 +53,8 @@ bucket.
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 30, "nodeSpacing": 30}}}%%
 flowchart TD
     R([Request]) --> B["1. Take next compatible bucket"]
-    B --> S["2. Sample two engines<br/>Pick the less loaded one"]
-    S --> A{"3. Engine admits<br/>the request?"}
+    B --> S["2. Sample engines<br/>Pick the less loaded one"]
+    S --> A{"3. Engine can admit<br/>the request?"}
     A -->|yes| D["4. Dispatch to engine"]
     A -->|no| M{"More buckets?"}
     M -->|no| X(["503 to client"])
@@ -70,52 +70,28 @@ flowchart TD
 
 #### Example cache-aware and session-aware routing
 
-Replace steps **2–3** above with this decision tree. **A** is the admitted
-preferred engine: the best admitted prefix owner for `cache_aware`, or the bound
-engine for `session_aware`. **B** is a `power_of_two` pick from the remaining
-candidates, excluding A and rejected affinity engines.
+These policies replace steps **2–3** above. They split the group's engines in two:
 
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff", "clusterBkg": "#f8fafc", "clusterBorder": "#cbd5e1"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 35, "nodeSpacing": 30, "subGraphTitleMargin": {"top": 10, "bottom": 20}}}}%%
-flowchart TD
-    A[Find and admit preferred engine A]
-    subgraph fallback["No admitted A"]
-        direction TB
-        F["Pick B with power of two<br/>Check admission"] --> FC{B admitted?}
-        FC -->|yes| FB([Use B])
-        FC -->|no| FN[Group rejects request]
-    end
-    subgraph balanced["balanced"]
-        direction TB
-        B["A admitted<br/>Pick and admit alternative B"] --> BC{"B admitted and<br/>both switch tests pass?"}
-        BC -->|yes| BB([Use B])
-        BC -->|no| BA([Keep A])
-    end
-    subgraph prefer["prefer"]
-        direction TB
-        PA(["A admitted<br/>Use A"])
-    end
-    A --> prefer
-    A --> balanced
-    A --> fallback
-    classDef next fill:#fff5e6,stroke:#ac762c,color:#654516;
-    classDef done fill:#e8f5ef,stroke:#46826a,color:#234d3c;
-    class FN next;
-    class FB,PA,BB,BA done;
-```
+- **Preferred engine (A):** for `cache_aware`, the best-ranked prefix owner that
+  passes admission; for `session_aware`, the engine bound to the session.
+- **Normal engines:** the rest of the engine group. When needed, the router picks
+  one of them (**B**) with the load-aware `power_of_two` policy.
 
-The [switch tests](#13-policies-at-a-glance) require both a load ratio and a load
-gap. Missing load data or a missing/rejected B keeps A. B may itself own a cached
-prefix. `session_aware` binds or rebinds to the selected engine when a session ID
-is present.
+A and B are checked against the same group admission limits (for example
+`max_kv_usage` or `max_waiting_requests`; see [configuration](#6-configuration)).
 
-After selection, continue to dispatch. If the group rejects the request, try the
-next bucket; P/D may first try another version group. Invalid policy results
-stop with 500. Failed reselection after a dispatch retry returns the previous error.
-
-The path serves `/v1/chat/completions`, `/v1/completions`, `/generate`,
-`/v1/messages`, `/v1/embeddings`, `/v1/classify`, and `/v1/rerank`.
-The last three require unified engines and return 400 if the model has P/D engines.
+- **`prefer` mode (default):** use A if it passes admission.
+- **`balanced` mode:** also pick an admitted B and compare the loads of A and B.
+  - Switch to B only when it is clearly less loaded:
+    `load(A) > load_factor × load(B)` **and** `load(A) − load(B) > load_gap`.
+    Otherwise, including when either load is unknown, keep A.
+  - `balanced_by` sets the load metric:
+    - **`prefill_tokens` (default):** the engine's reported waiting uncached tokens,
+      plus the tokens this request would prefill on it. For `cache_aware` that
+      subtracts the engine's cached prefix, so A's cache hit counts in its favor.
+    - **`running_requests`:** the engine's reported running requests.
+- **No A, or A fails admission (either mode):** fall back to B. If B also fails
+  admission, the group rejects the request and the router tries the next bucket.
 
 ### 1.3 Policies at a glance
 
