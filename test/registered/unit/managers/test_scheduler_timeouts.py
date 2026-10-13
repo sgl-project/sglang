@@ -36,6 +36,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+    release_mm_prefix_hold = Req.release_mm_prefix_hold
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
@@ -44,6 +45,7 @@ class _FakeReq:
         self.beam_group = None
         self.session = None
         self.multimodal_inputs = None
+        self.mm_prefix_hold = None
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []

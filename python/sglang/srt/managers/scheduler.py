@@ -3480,6 +3480,7 @@ class Scheduler(
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
+        req.release_mm_prefix_hold(self.tree_cache)
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
@@ -4288,6 +4289,9 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        # Admission now protects the prefix these requests matched.
+        for req in can_run_list:
+            req.release_mm_prefix_hold(self.tree_cache)
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.

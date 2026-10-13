@@ -182,3 +182,74 @@ def test_session_turn_with_evicted_released_history_aborts_503() -> None:
         assert retired == [req]
     finally:
         override.restore()
+
+
+def test_retraction_holds_prompt_kv_after_media_release() -> None:
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.schedule_batch import ReqKvInfo, release_req
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        EvictParams,
+        InsertParams,
+        MatchPrefixParams,
+    )
+    from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+    from sglang.srt.runtime_context import get_context
+
+    _, _, _, MultimodalInputs, _ = _types()
+    prompt = array("q", range(10))
+    override = get_context().override_server_args()
+    override.install()
+    try:
+        allocator = MagicMock(device=torch.device("cpu"), page_size=1)
+        tree = RadixCache.create_simulated(mock_allocator=allocator)
+        tree.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros(1, 16, dtype=torch.int64),
+            free=lambda req: setattr(req.kv, "req_pool_idx", None),
+        )
+
+        def retract(released: bool) -> Req:
+            tree.insert(InsertParams(key=RadixKey(prompt), value=torch.arange(10)))
+            node = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(prompt))
+            ).last_device_node
+            req = _req("rid-retract", input_len=10)
+            req.kv = ReqKvInfo(
+                req_pool_idx=0,
+                kv_committed_len=10,
+                kv_allocated_len=10,
+                cache_protected_len=10,
+            )
+            req.lock = tree.lock(node)
+            item = _image_item([(2, 5)], torch.zeros(4, 2))
+            if released:
+                item.release_feature(consumed=True)
+            req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+            assert release_req(
+                req=req,
+                remaing_req_count=0,
+                req_to_token_pool=tree.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                tree_cache=tree,
+                hisparse_coordinator=None,
+                requeue=True,
+            )
+            tree.evict(EvictParams(num_tokens=100))
+            return req
+
+        def cached_len() -> int:
+            match = tree.match_prefix(MatchPrefixParams(key=RadixKey(prompt)))
+            return int(match.device_prefix_len)
+
+        # Released media can only come back from the cached prompt.
+        req = retract(released=True)
+        assert cached_len() == 10
+        req.release_mm_prefix_hold(tree)
+        tree.evict(EvictParams(num_tokens=100))
+        assert cached_len() == 0
+
+        req = retract(released=False)
+        assert req.mm_prefix_hold is None
+        assert cached_len() == 0
+    finally:
+        override.restore()
