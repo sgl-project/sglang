@@ -7,6 +7,7 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
 use super::deepseek_v4::{engine_message, normalize_tools, pydantic_bool, split_continuation};
+use super::glm53::valid_documents;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 /// `apply_chat_template` arguments SGLang passes itself: as kwargs they fail the
@@ -102,12 +103,6 @@ fn template_args(
         Value::Object(kwargs) => kwargs.clone().into_iter().collect(),
         _ => return Err("chat_template_kwargs must be an object".into()),
     };
-    if let Some(key) = RESERVED_KWARGS
-        .iter()
-        .find(|key| kwargs.contains_key(**key))
-    {
-        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
-    }
     // `normalize_reasoning_inputs`.
     if let Some(thinking) = requested_thinking(request) {
         kwargs.entry("thinking".into()).or_insert(thinking.into());
@@ -124,6 +119,16 @@ fn template_args(
     // stands in for a missing one.
     for (key, value) in defaults {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if let Some(key) = RESERVED_KWARGS
+        .iter()
+        .find(|key| kwargs.contains_key(**key))
+    {
+        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
+    }
+    // `render_jinja_template` raises unless `documents` iterates as dicts.
+    if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
+        return Err("chat_template_kwargs.documents must iterate as objects".into());
     }
     let effort = effort.or_else(|| {
         kwargs
@@ -159,6 +164,10 @@ fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
         .map(|(mut dump, tool)| {
             let defer = tool.get("defer_loading").filter(|v| !v.is_null());
             dump["defer_loading"] = defer.map(pydantic_bool).transpose()?.into();
+            // `Tool.type` is any string, dumped as sent.
+            if let Some(kind) = tool.get("type").filter(|kind| kind.is_string()) {
+                dump["type"] = kind.clone();
+            }
             Ok(dump)
         })
         .collect::<Result<Vec<_>, String>>()?;
