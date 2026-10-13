@@ -54,6 +54,14 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
+    uses_expert_remap = (
+        cfg.enable_eplb
+        or cfg.ep_num_redundant_experts > 0
+        or cfg.init_expert_location != "trivial"
+    )
+    if uses_expert_remap:
+        _validate_expert_remap(cfg, hf_config, model_arch)
+
     has_w4a16_moe_layers = False
     if is_modelopt and quantization == "modelopt_mixed":
         has_w4a16_moe_layers = any(
@@ -80,10 +88,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         cfg.moe_runner_backend == "auto"
     ):
         if get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+            # flashinfer_trtllm routes inside the kernel and cannot take the remap.
+            runner = (
+                "flashinfer_trtllm_routed" if uses_expert_remap else "flashinfer_trtllm"
             )
+            overrides["moe_runner_backend"] = runner
+            logger.info(f"Use {runner} as MoE runner backend on sm100 for {model_arch}")
         elif (
             (
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
@@ -127,3 +137,34 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         elif get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
     return overrides
+
+
+def _validate_expert_remap(cfg: Any, hf_config: Any, model_arch: str) -> None:
+    if cfg.moe_runner_backend == "flashinfer_trtllm":
+        raise ValueError(
+            "flashinfer_trtllm routes inside the kernel and does not support EPLB or "
+            "redundant experts on Nemotron-H; use "
+            "--moe-runner-backend flashinfer_trtllm_routed."
+        )
+    if (
+        cfg.enable_eplb
+        and cfg.moe_runner_backend == "flashinfer_cutedsl"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        raise ValueError(
+            "flashinfer_cutedsl without an a2a backend does not migrate its expert "
+            "scales on EPLB rebalance; use --moe-runner-backend "
+            "flashinfer_trtllm_routed or set --moe-a2a-backend."
+        )
+    if model_arch == "NemotronHPuzzleForCausalLM":
+        num_routed_experts = {
+            block["n_routed_experts"]
+            for block in hf_config.block_configs
+            if block["block_type"] == "moe"
+        }
+        if len(num_routed_experts) > 1:
+            raise ValueError(
+                "EPLB and redundant experts need the same routed expert count on "
+                "every MoE layer, got "
+                f"{sorted(num_routed_experts)}."
+            )

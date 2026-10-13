@@ -1290,6 +1290,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=model_config,
             ),
             hf_config,
@@ -1358,6 +1361,25 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_eplb_picks_routed_runner_on_sm100(self):
+        """flashinfer_trtllm cannot take the EPLB remap; with redundant experts it
+        fails its routing shape check at startup."""
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+        server_args.enable_eplb = True
+        server_args.ep_num_redundant_experts = 32
+
+        with (
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
+        ):
+            overrides = _nemotron_h_overrides(server_args, hf_config)
+
+        self.assertEqual(overrides["moe_runner_backend"], "flashinfer_trtllm_routed")
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1525,6 +1547,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
             attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
             _model_config=model_config,
         )
 
@@ -2240,6 +2265,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=mc,
             )
             defaults.update(kw)

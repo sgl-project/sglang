@@ -284,10 +284,7 @@ class TestNemotronHOmniModel(CustomTestCase):
         )
 
     def test_expert_location_config_spans_full_hybrid_stack(self):
-        """EPLB reads the expert-location config off the outer architecture class;
-        without it, startup fails with "ExpertLocationMetadata is required".
-        TopK and the recorder index it by decoder layer id, so it must cover every
-        Mamba/attention/MoE layer, not just the MoE ones."""
+        """The VL wrapper exposes the full-stack expert-location config for EPLB."""
         pattern = "ME*E-E"
         llm_config = NemotronHConfig(
             hybrid_override_pattern=pattern, n_routed_experts=8, n_group=1
@@ -305,8 +302,7 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertEqual(expert_config.num_logical_experts, 8)
 
     def test_routed_expert_weights_come_from_language_model(self):
-        """EPLB migrates the tensors it reads off the outer model. A wrapper that
-        stops exposing them starts up fine and fails at the first rebalance."""
+        """The VL wrapper exposes the language model's expert weights for EPLB."""
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
         weights_of_layer = {1: [torch.ones(1)]}
