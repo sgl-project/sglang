@@ -25,59 +25,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # SECURITY: This workflow runs on issue_comment trigger with elevated permissions
-      # (pull-requests: write, actions: write). For non-fork PRs, we can safely checkout
-      # the PR branch to allow testing changes to this handler. For fork PRs, we MUST
-      # stay on main to prevent untrusted code execution with these elevated permissions.
-      - name: Get PR details
-        id: pr
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName,headRepositoryOwner) || {
-            echo "::error::Failed to fetch PR data"
-            exit 1
-          }
-          # Use 'empty' filter to handle null/missing values (e.g., deleted forks)
-          HEAD_OWNER=$(echo "$PR_DATA" | jq -r '.headRepositoryOwner.login // empty')
-          REPO_OWNER="${{ github.repository_owner }}"
-          # Treat missing/null owner as fork for security (fail-safe)
-          if [[ -z "$HEAD_OWNER" || "$HEAD_OWNER" != "$REPO_OWNER" ]]; then
-            IS_FORK="true"
-          else
-            IS_FORK="false"
-          fi
-          echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
-          echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
-          echo "pr_ref=refs/pull/${{ github.event.issue.number }}/head" >> $GITHUB_OUTPUT
-          echo "PR owner: $HEAD_OWNER, Repo owner: $REPO_OWNER, Is fork: $IS_FORK"
-
-      - name: Check commenter permission for fork PRs
-        id: perm
-        if: steps.pr.outputs.is_fork == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission') || {
-            PERM="none"
-            echo "::warning::Failed to check commenter permission, defaulting to none"
-          }
-          if [[ "$PERM" == "admin" || "$PERM" == "maintain" || "$PERM" == "write" ]]; then
-            echo "safe_to_checkout_pr=true" >> $GITHUB_OUTPUT
-          else
-            echo "safe_to_checkout_pr=false" >> $GITHUB_OUTPUT
-          fi
-          echo "Commenter ${{ github.event.comment.user.login }} permission: $PERM"
-
-      - name: Checkout code
+      # SECURITY: issue_comment runs with pull-requests/actions write access.
+      # Always execute handler code from the trusted default branch; never run
+      # a PR head with this token, including same-repository PR heads.
+      - name: Checkout trusted handler
         uses: actions/checkout@v4
         with:
-          # For non-fork PRs: checkout PR branch by name
-          # For fork PRs with trusted commenter: checkout via refs/pull/N/head
-          # For fork PRs with untrusted commenter: stay on main for security
-          ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || (steps.perm.outputs.safe_to_checkout_pr == 'true' && steps.pr.outputs.pr_ref || '') }}
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
