@@ -152,7 +152,7 @@ class SchedulerBatchResultProcessor:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
-        # numpy, not torch: far cheaper to pickle over the IPC to the detokenizer
+        # numpy, not torch: cheaper to pickle and unpickle over the IPC to the detokenizer
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,

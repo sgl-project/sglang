@@ -20,10 +20,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
-from sglang.srt.state_capturer.routed_experts_codec import (
-    BASE64_INT32,
-    decode_routed_experts,
-)
+from sglang.srt.state_capturer.routed_experts_codec import decode_routed_experts
 
 
 def _host_dtype() -> torch.dtype:
@@ -174,16 +171,9 @@ def destroy_global_experts_capturer():
 
 
 def extract_routed_experts_from_meta_info(data):
-    """Flat int32 routed experts from a response, whatever its encoding."""
-    meta_info = data["meta_info"]
-    return (
-        decode_routed_experts(
-            meta_info["routed_experts"],
-            meta_info.get("routed_experts_encoding", BASE64_INT32),
-        )
-        .astype(np.int32, copy=False)
-        .reshape(-1)
-    )
+    """Flat int32 routed experts from a response."""
+    rows = decode_routed_experts(data["meta_info"]["routed_experts"])
+    return rows.astype(np.int32).reshape(-1)
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:

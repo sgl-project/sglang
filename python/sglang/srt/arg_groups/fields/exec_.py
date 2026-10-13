@@ -85,18 +85,6 @@ class ExecFeatures(msgspec.Struct):
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
-    routed_experts_encoding: A[
-        str,
-        Arg(
-            help="Wire encoding of returned routed experts; rows are sorted ascending "
-            "either way (replay needs only the expert set). `base64_int32`: int32 "
-            "[tokens, layers, topk]. `zstd`: the captured narrow dtype (uint8 up to "
-            "256 experts), laid out [layers, tokens, topk] and zstd-compressed, "
-            "labelled in meta_info.routed_experts_encoding; see "
-            "sglang.srt.state_capturer.routed_experts_codec.",
-            choices=["base64_int32", "zstd"],
-        ),
-    ] = "base64_int32"
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

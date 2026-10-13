@@ -1,15 +1,14 @@
-"""Round trips of the routed-experts wire encodings."""
+"""The routed-experts wire format round-trips exactly and rejects anything malformed."""
 
+import struct
 import unittest
 
 import numpy as np
+import pybase64
 
 from sglang.srt.state_capturer.routed_experts_codec import (
-    BASE64_INT32,
-    ZSTD,
+    RoutedExpertsEncoder,
     decode_routed_experts,
-    encode_routed_experts,
-    encode_routed_experts_per_request,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,57 +24,70 @@ def _routing(num_tokens, num_layers, topk, num_experts, dtype, seed=0):
 
 
 class TestRoutedExpertsCodec(CustomTestCase):
-    def _roundtrip(self, rows, encoding):
-        payload = encode_routed_experts(rows, encoding)
-        return decode_routed_experts(payload, encoding, rows.shape[0], rows.shape[1])
+    encoder = RoutedExpertsEncoder()
 
-    def test_base64_int32_widens_captured_rows(self):
-        for dtype in (np.uint8, np.int16, np.int32):
-            rows = _routing(7, 3, 4, 64, dtype)
-            out = self._roundtrip(rows, BASE64_INT32)
-            self.assertEqual(out.dtype, np.int32)
-            np.testing.assert_array_equal(out, rows)
+    def _roundtrip(self, rows):
+        return decode_routed_experts(self.encoder.encode(rows))
 
-    def test_zstd_keeps_the_captured_width(self):
-        cases = (
-            (128, np.uint8, np.uint8),
-            (384, np.int16, np.uint16),
-            (384, np.int32, np.int32),
-        )
-        for num_experts, dtype, wire_dtype in cases:
+    def test_round_trip_keeps_the_captured_dtype(self):
+        for num_experts, dtype in ((128, np.uint8), (384, np.int16), (384, np.int32)):
             rows = _routing(33, 5, 8, num_experts, dtype)
-            out = self._roundtrip(rows, ZSTD)
-            self.assertEqual(out.dtype, wire_dtype, f"{dtype=}")
-            self.assertTrue(out.flags.c_contiguous)
+            out = self._roundtrip(rows)
+            self.assertEqual(out.dtype, rows.dtype)
+            self.assertTrue(out.flags.c_contiguous and out.flags.writeable)
             np.testing.assert_array_equal(out, rows)
 
-    def test_zstd_multithreaded_frame(self):
+    def test_threaded_frame_and_compressor_reuse(self):
         # large enough to cross the threaded-compression threshold
-        rows = _routing(12000, 48, 8, 128, np.uint8)
-        np.testing.assert_array_equal(self._roundtrip(rows, ZSTD), rows)
+        big = _routing(12000, 48, 8, 128, np.uint8)
+        small = _routing(10, 48, 8, 128, np.uint8, seed=1)
+        for rows in (big, small, big):
+            np.testing.assert_array_equal(self._roundtrip(rows), rows)
 
-    def test_zstd_is_far_smaller_than_base64_int32(self):
+    def test_a_quarter_of_base64_int32_or_less(self):
         rows = _routing(2000, 16, 8, 128, np.uint8)
-        payload = encode_routed_experts(rows, ZSTD)
-        self.assertLess(
-            len(payload), len(encode_routed_experts(rows, BASE64_INT32)) / 4
-        )
+        base64_int32_chars = rows.size * 4 * 4 / 3
+        self.assertLess(len(self.encoder.encode(rows)), base64_int32_chars / 4)
 
     def test_empty(self):
         rows = np.empty((0, 4, 8), dtype=np.uint8)
-        for encoding in (BASE64_INT32, ZSTD):
-            self.assertEqual(self._roundtrip(rows, encoding).shape[:2], (0, 4))
+        self.assertEqual(self._roundtrip(rows).shape, (0, 4, 8))
 
     def test_per_request_keeps_none(self):
-        out = encode_routed_experts_per_request(
-            [_routing(3, 2, 2, 8, np.uint8), None], ZSTD
-        )
+        rows = _routing(3, 2, 2, 8, np.uint8)
+        out = self.encoder.encode_per_request([rows, None])
         self.assertIsNone(out[1])
-        self.assertIsNone(encode_routed_experts_per_request(None, ZSTD))
+        self.assertIsNone(self.encoder.encode_per_request(None))
 
-    def test_unknown_encoding(self):
+    def test_rejects_non_host_dtype(self):
         with self.assertRaises(ValueError):
-            encode_routed_experts(_routing(2, 2, 2, 8, np.uint8), "lz4")
+            self.encoder.encode(_routing(2, 2, 2, 8, np.int64))
+
+    def test_malformed_payloads_raise_value_error(self):
+        rows = _routing(20, 4, 8, 128, np.uint8)
+        data = pybase64.b64decode(self.encoder.encode(rows))
+        header = struct.Struct("<4sB3sIHH")
+        _, version, dtype_str, tokens, layers, topk = header.unpack_from(data)
+        frame = data[header.size :]
+        cases = {
+            "pre-v1 base64 int32": rows.astype(np.int32).tobytes(),
+            "bad magic": b"XXXX" + data[4:],
+            "truncated frame": data[:-5],
+            "header promises more": header.pack(
+                b"SGRE", version, dtype_str, tokens + 1, layers, topk
+            )
+            + frame,
+            "unsupported dtype": header.pack(
+                b"SGRE", version, b"<f8", tokens, layers, topk
+            )
+            + frame,
+            "short header": data[:10],
+        }
+        for name, raw in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                decode_routed_experts(pybase64.b64encode(raw).decode())
+        with self.assertRaises(ValueError):
+            decode_routed_experts("!!!!")
 
 
 if __name__ == "__main__":

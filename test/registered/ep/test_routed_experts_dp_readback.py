@@ -5,11 +5,10 @@ import json
 import os
 import unittest
 
-import numpy as np
-import pybase64
 import requests
 import torch
 
+from sglang.srt.state_capturer.routed_experts_codec import decode_routed_experts
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -117,13 +116,12 @@ class _ReadbackMixin:
         self.assertEqual(resp.status_code, 200)
         meta = resp.json()["meta_info"]
         self.assertIn("routed_experts", meta)
-        arr = np.frombuffer(pybase64.b64decode(meta["routed_experts"]), dtype=np.int32)
+        rows = decode_routed_experts(meta["routed_experts"])
         self.assertEqual(
-            arr.size % (_NUM_LAYERS * _TOPK),
-            0,
-            f"req{i}: payload size {arr.size} not a multiple of layers*topk",
+            rows.shape[1:],
+            (_NUM_LAYERS, _TOPK),
+            f"req{i}: rows {rows.shape} do not match layers x topk",
         )
-        rows = arr.reshape(-1, _NUM_LAYERS, _TOPK)
         self.assertGreater(rows.shape[0], 0)
         self.assertTrue(
             bool(((rows >= 0) & (rows < _NUM_EXPERTS)).all()),

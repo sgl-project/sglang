@@ -1,10 +1,9 @@
-"""Wire encodings of returned routed experts, chosen by ``--routed-experts-encoding``.
+"""The wire format of returned routed experts (``meta_info["routed_experts"]``).
 
-Rows arrive sorted and in the capturer's narrow host dtype. ``base64_int32`` (the
-default, unlabelled) is base64 of them widened to int32 ``[num_tokens, num_layers,
-topk]``. ``zstd`` (labelled in ``meta_info["routed_experts_encoding"]``) is base64 of
-a ``<BIHH`` header (dtype itemsize, num_tokens, num_layers, topk) and one zstd frame
-of the rows as captured, laid out ``[num_layers, num_tokens, topk]``.
+Base64 of a 16-byte header -- magic ``SGRE``, version, numpy dtype string, num_tokens,
+num_layers, topk -- then one zstd frame of the rows laid out ``[num_layers,
+num_tokens, topk]``. Rows come from the capturer sorted and in its narrow host dtype;
+replay needs only each row's expert set, and sorted, layer-major rows compress best.
 """
 
 import struct
@@ -14,15 +13,17 @@ import numpy as np
 import pybase64
 import zstandard
 
-BASE64_INT32 = "base64_int32"
-ZSTD = "zstd"
-
-_ZSTD_LEVEL = 1
+_LEVEL = 1
 # Multi-threaded zstd only pays off once the frame spans several jobs.
-_ZSTD_THREADED_MIN_BYTES = 4 << 20
-_ZSTD_THREADS = 4
+_THREADED_MIN_BYTES = 4 << 20
+_THREADS = 4
 
-_ZSTD_HEADER = struct.Struct("<BIHH")
+_MAGIC = b"SGRE"
+_VERSION = 1
+_HEADER = struct.Struct("<4sB3sIHH")
+# the capturer's host dtypes, as little-endian numpy dtype strings
+_DTYPES = frozenset(("|u1", "<i2", "<i4"))
+
 _ROW_DTYPES = {
     1: np.dtype(np.uint8),
     2: np.dtype(np.uint16),
@@ -30,23 +31,82 @@ _ROW_DTYPES = {
     8: np.dtype(np.uint64),
 }
 _TRANSPOSE_BLOCK = 1024
-_ITEMSIZE_TO_DTYPE = {
-    1: np.dtype(np.uint8),
-    2: np.dtype(np.uint16),
-    4: np.dtype(np.int32),
-}
+
+
+class RoutedExpertsEncoder:
+    """Encodes per-request rows, reusing its zstd compressors; built once per process
+    that serializes responses."""
+
+    def __init__(self):
+        self._compressor = zstandard.ZstdCompressor(level=_LEVEL)
+        self._threaded_compressor = zstandard.ZstdCompressor(
+            level=_LEVEL, threads=_THREADS
+        )
+
+    def encode(self, rows: np.ndarray) -> str:
+        """Encode one request's ``[num_tokens, num_layers, topk]`` rows."""
+        if rows.dtype.str not in _DTYPES:
+            raise ValueError(f"routed experts dtype {rows.dtype} is not a host dtype")
+        layer_major = _swap_leading_axes(np.ascontiguousarray(rows))
+        compressor = (
+            self._threaded_compressor
+            if layer_major.nbytes >= _THREADED_MIN_BYTES
+            else self._compressor
+        )
+        header = _HEADER.pack(
+            _MAGIC, _VERSION, rows.dtype.str.encode("ascii"), *rows.shape
+        )
+        return pybase64.b64encode_as_string(header + compressor.compress(layer_major))
+
+    def encode_per_request(
+        self, rows_list: Optional[List[Optional[np.ndarray]]]
+    ) -> Optional[List[Optional[str]]]:
+        if rows_list is None:
+            return None
+        return [self.encode(rows) if rows is not None else None for rows in rows_list]
+
+
+def decode_routed_experts(payload: str) -> np.ndarray:
+    """Writable ``[num_tokens, num_layers, topk]`` rows in the captured dtype; any
+    malformed payload, including the pre-v1 base64 int32 format, raises ``ValueError``."""
+    data = pybase64.b64decode_as_bytearray(payload, validate=True)
+    if len(data) < _HEADER.size:
+        raise ValueError(f"routed experts payload of {len(data)} bytes has no header")
+    magic, version, dtype_str, num_tokens, num_layers, topk = _HEADER.unpack_from(data)
+    if magic != _MAGIC or version != _VERSION:
+        raise ValueError(
+            f"not a v{_VERSION} routed experts payload (magic {magic!r}, version "
+            f"{version}); is the server's sglang older than this client?"
+        )
+    if dtype_str.decode("ascii", "replace") not in _DTYPES:
+        raise ValueError(f"routed experts payload has unsupported dtype {dtype_str!r}")
+    dtype = np.dtype(dtype_str.decode("ascii"))
+    nbytes = num_tokens * num_layers * topk * dtype.itemsize
+    try:
+        raw = zstandard.ZstdDecompressor().decompress(
+            memoryview(data)[_HEADER.size :], max_output_size=nbytes
+        )
+    except zstandard.ZstdError as exc:
+        raise ValueError(f"corrupt routed experts zstd frame: {exc}") from exc
+    if len(raw) != nbytes:
+        raise ValueError(
+            f"routed experts frame holds {len(raw)} bytes, header promises {nbytes}"
+        )
+    layer_major = np.frombuffer(raw, dtype=dtype).reshape(num_layers, num_tokens, topk)
+    return _swap_leading_axes(layer_major)
 
 
 def _swap_leading_axes(arr: np.ndarray) -> np.ndarray:
-    """C-contiguous ``[a, b, topk]`` -> contiguous ``[b, a, topk]``.
+    """C-contiguous ``[a, b, topk]`` -> new contiguous ``[b, a, topk]``.
 
     Single-threaded, as the detokenizer must not spin a thread pool: each ``topk``
     row moves as one element, a block of the longer axis at a time so both sides
     of the copy stay in cache; several times faster than a plain strided copy.
     """
+    assert arr.flags.c_contiguous, "rows must be C-contiguous to move as elements"
     a, b, topk = arr.shape
     if arr.size == 0:
-        return arr.reshape(b, a, topk)
+        return np.empty((b, a, topk), dtype=arr.dtype)
     row_bytes = topk * arr.itemsize
     rows = arr.view(_ROW_DTYPES.get(row_bytes, np.dtype(f"V{row_bytes}"))).reshape(a, b)
     out = np.empty((b, a), dtype=rows.dtype)
@@ -61,66 +121,3 @@ def _swap_leading_axes(arr: np.ndarray) -> np.ndarray:
                 :, start : start + _TRANSPOSE_BLOCK
             ].T
     return out.view(arr.dtype).reshape(b, a, topk)
-
-
-def encode_routed_experts(arr: np.ndarray, encoding: str) -> str:
-    """Encode one request's ``[num_tokens, num_layers, topk]`` rows."""
-    if encoding == BASE64_INT32:
-        arr = arr.astype(np.int32, copy=False)
-        return pybase64.b64encode(arr.tobytes()).decode("utf-8")
-    if encoding != ZSTD:
-        raise ValueError(f"unknown routed experts encoding {encoding!r}")
-    # captured ids are non-negative, so int16 rows read the same as uint16
-    rows = np.ascontiguousarray(arr.view(np.uint16) if arr.dtype == np.int16 else arr)
-    layer_major = _swap_leading_axes(rows)
-    threads = _ZSTD_THREADS if layer_major.nbytes >= _ZSTD_THREADED_MIN_BYTES else 0
-    frame = zstandard.ZstdCompressor(level=_ZSTD_LEVEL, threads=threads).compress(
-        layer_major.data
-    )
-    header = _ZSTD_HEADER.pack(rows.itemsize, *arr.shape)
-    return pybase64.b64encode(header + frame).decode("utf-8")
-
-
-def encode_routed_experts_per_request(
-    data_list: Optional[List[Optional[np.ndarray]]], encoding: str
-) -> Optional[List[Optional[str]]]:
-    if data_list is None:
-        return None
-    return [
-        encode_routed_experts(item, encoding) if item is not None else None
-        for item in data_list
-    ]
-
-
-def decode_routed_experts(
-    payload: str,
-    encoding: Optional[str],
-    num_tokens: Optional[int] = None,
-    num_layers: Optional[int] = None,
-) -> np.ndarray:
-    """Inverse of ``encode_routed_experts``: ``[num_tokens, num_layers, topk]``,
-    int32 for ``base64_int32`` and the transmitted narrow dtype for ``zstd``.
-
-    ``base64_int32`` carries no shape: without ``num_tokens`` / ``num_layers`` the
-    flat buffer is returned.
-    """
-    data = pybase64.b64decode(payload.encode("ascii"))
-    if encoding in (None, BASE64_INT32):
-        flat = np.frombuffer(data, dtype=np.int32)
-        if num_tokens is None or num_layers is None:
-            return flat
-        if num_tokens == 0:
-            return flat.reshape(0, num_layers, 0)
-        return flat.reshape(num_tokens, num_layers, -1)
-    if encoding != ZSTD:
-        raise ValueError(f"unknown routed experts encoding {encoding!r}")
-    itemsize, tokens, layers, topk = _ZSTD_HEADER.unpack_from(data)
-    raw = (
-        zstandard.ZstdDecompressor()
-        .decompressobj()
-        .decompress(data[_ZSTD_HEADER.size :])
-    )
-    layer_major = np.frombuffer(raw, dtype=_ITEMSIZE_TO_DTYPE[itemsize]).reshape(
-        layers, tokens, topk
-    )
-    return _swap_leading_axes(layer_major)

@@ -443,8 +443,6 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
-    # set unless routed_experts is base64_int32 (see state_capturer/routed_experts_codec.py)
-    routed_experts_encoding: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None

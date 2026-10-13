@@ -27,7 +27,6 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     process_spec_tokens_details_from_ret,
-    routed_experts_encoding_label,
     should_include_usage,
     spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
@@ -468,9 +467,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     model=request.model,
                     sglext=SglExt(
                         routed_experts=sglext_routed,
-                        routed_experts_encoding=routed_experts_encoding_label(
-                            sglext_routed
-                        ),
                         cached_tokens_details=sglext_cached_tokens_details,
                         spec_tokens_details=sglext_spec_tokens_details,
                     ),
@@ -569,7 +565,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
-                routed_experts_encoding=routed_experts_encoding_label(routed_experts),
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
             )

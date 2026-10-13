@@ -45,16 +45,13 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizer
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_device,
-    get_exec,
     get_model,
     get_observability,
     get_serving,
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.state_capturer.routed_experts_codec import (
-    encode_routed_experts_per_request,
-)
+from sglang.srt.state_capturer.routed_experts_codec import RoutedExpertsEncoder
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
@@ -120,6 +117,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
+        self.init_routed_experts_encoder()
+
         # Init dispatcher
         self.init_request_dispatcher()
 
@@ -169,6 +168,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+
+    def init_routed_experts_encoder(self):
+        self.routed_experts_encoder = RoutedExpertsEncoder()
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -460,8 +462,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = encode_routed_experts_per_request(
-            recv_obj.routed_experts, get_exec().features.routed_experts_encoding
+        routed_experts = self.routed_experts_encoder.encode_per_request(
+            recv_obj.routed_experts
         )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(

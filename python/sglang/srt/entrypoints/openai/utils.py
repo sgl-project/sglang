@@ -11,8 +11,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     SpecTokensDetails,
     StreamOptions,
 )
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.state_capturer.routed_experts_codec import BASE64_INT32
 
 logger = logging.getLogger(__name__)
 
@@ -264,14 +262,6 @@ def should_include_usage(
             False,
         )
     return include_usage, continuous_usage_stats
-
-
-def routed_experts_encoding_label(routed_experts) -> str | None:
-    """The sglext label for a routed_experts payload (None means base64_int32)."""
-    encoding = get_exec().features.routed_experts_encoding
-    if not routed_experts or encoding == BASE64_INT32:
-        return None
-    return encoding
 
 
 def process_routed_experts_from_ret(
