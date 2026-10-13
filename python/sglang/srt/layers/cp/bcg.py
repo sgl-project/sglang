@@ -38,6 +38,7 @@ from sglang.srt.layers.cp.utils import (
     cp_interleave_input_ids,
     cp_shard_hidden_states,
     cp_split_before_forward,
+    drop_unconsumed_states_before_norm,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -385,6 +386,11 @@ def execute_prefill_cp_bcg(
                 else hidden_states
             )
 
+        hidden_states = drop_unconsumed_states_before_norm(
+            hidden_states,
+            forward_batch=forward_batch,
+            has_aux_hidden_states=aux_hidden_states is not None,
+        )
         hidden_states = cp_gather_after_forward(
             hidden_states,
             static_forward_batch,

@@ -14,7 +14,10 @@ from sglang.srt.layers.cp.bcg import (
     filter_prefill_cp_bcg_capture_num_tokens,
     supports_prefill_cp_bcg,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -373,56 +376,70 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
 
     def test_logits_tail_gathers_dspark_aux_and_trims_padding(self):
         for capture_aux in (False, True):
-            hidden = torch.arange(8).view(8, 1).float()
-            pre_head = hidden + 100
-            aux = [hidden + 200, hidden + 300]
-            body_output = (
-                ((hidden, pre_head), aux) if capture_aux else (hidden, pre_head)
-            )
-            logits = Mock(return_value="logits")
-            model = SimpleNamespace(
-                capture_aux_hidden_states=capture_aux,
-                pp_group=SimpleNamespace(is_last_rank=True),
-                logits_processor=logits,
-                lm_head=object(),
-            )
-            runner = SimpleNamespace(
-                prefill_cp_bcg_input=SimpleNamespace(live_local_tokens=8),
-                model_runner=SimpleNamespace(model=model),
-                _prefill_forward_context=lambda *args, **kwargs: nullcontext(),
-                backend=SimpleNamespace(replay=lambda *args, **kwargs: body_output),
-            )
-            batch = SimpleNamespace(input_ids=torch.arange(11))
+            for capture_mode in (CaptureHiddenMode.NULL, CaptureHiddenMode.LAST):
+                with self.subTest(capture_aux=capture_aux, capture_mode=capture_mode):
+                    self._check_logits_tail(capture_aux, capture_mode)
 
-            def gather(value, *args):
-                if isinstance(value, tuple):
-                    return tuple(gather(item) for item in value)
-                return value.repeat_interleave(2, dim=0)
+    def _check_logits_tail(self, capture_aux, capture_mode):
+        hidden = torch.arange(8).view(8, 1).float()
+        pre_head = hidden + 100
+        aux = [hidden + 200, hidden + 300]
+        body_output = ((hidden, pre_head), aux) if capture_aux else (hidden, pre_head)
+        logits = Mock(return_value="logits")
+        model = SimpleNamespace(
+            capture_aux_hidden_states=capture_aux,
+            pp_group=SimpleNamespace(is_last_rank=True),
+            logits_processor=logits,
+            lm_head=object(),
+        )
+        runner = SimpleNamespace(
+            prefill_cp_bcg_input=SimpleNamespace(live_local_tokens=8),
+            model_runner=SimpleNamespace(model=model),
+            _prefill_forward_context=lambda *args, **kwargs: nullcontext(),
+            backend=SimpleNamespace(replay=lambda *args, **kwargs: body_output),
+        )
+        batch = SimpleNamespace(
+            input_ids=torch.arange(11), capture_hidden_mode=capture_mode
+        )
+        gathered = []
 
-            with (
-                patch(
-                    "sglang.srt.layers.cp.bcg.cp_gather_after_forward",
-                    side_effect=gather,
-                ),
-                patch(
-                    "sglang.srt.layers.cp.bcg.torch.cuda.current_stream",
-                    return_value=None,
-                ),
-            ):
-                self.assertEqual(
-                    execute_prefill_cp_bcg(runner, batch, batch, 16, 11), "logits"
-                )
-            args, kwargs = logits.call_args
-            torch.testing.assert_close(args[1], gather(hidden)[:11])
-            if capture_aux:
-                self.assertNotIn("hidden_states_before_norm", kwargs)
-                for actual, expected in zip(args[4], aux):
-                    torch.testing.assert_close(actual, gather(expected)[:11])
-            else:
-                self.assertIsNone(args[4])
-                torch.testing.assert_close(
-                    kwargs["hidden_states_before_norm"], gather(pre_head)[:11]
-                )
+        def gather(value, *args):
+            if isinstance(value, tuple):
+                return tuple(gather(item) for item in value)
+            gathered.append(value)
+            return value.repeat_interleave(2, dim=0)
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.bcg.cp_gather_after_forward",
+                side_effect=gather,
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.torch.cuda.current_stream",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                execute_prefill_cp_bcg(runner, batch, batch, 16, 11), "logits"
+            )
+        args, kwargs = logits.call_args
+        # Pre-mHC-head states are gathered only when logits store them (MTP/EAGLE).
+        needs_pre_head = capture_mode.need_capture() and not capture_aux
+        self.assertEqual(
+            any(torch.equal(value, pre_head) for value in gathered), needs_pre_head
+        )
+        torch.testing.assert_close(args[1], gather(hidden)[:11])
+        if capture_aux:
+            for actual, expected in zip(args[4], aux):
+                torch.testing.assert_close(actual, gather(expected)[:11])
+        else:
+            self.assertIsNone(args[4])
+        if needs_pre_head:
+            torch.testing.assert_close(
+                kwargs["hidden_states_before_norm"], gather(pre_head)[:11]
+            )
+        else:
+            self.assertNotIn("hidden_states_before_norm", kwargs)
 
 
 if __name__ == "__main__":
