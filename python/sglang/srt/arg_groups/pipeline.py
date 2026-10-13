@@ -265,7 +265,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
-    run_hook(apply_prefill_cp_cuda_graph_default, server_args)
+    if cfg.enable_prefill_cp:
+        run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.
