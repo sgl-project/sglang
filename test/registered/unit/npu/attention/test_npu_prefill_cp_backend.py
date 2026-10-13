@@ -40,6 +40,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     _cp_allgather_and_save_kv_npu,
 )
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 
 
 class _RecordingPool:
@@ -118,7 +119,13 @@ class TestCPKVWrite(unittest.TestCase):
 
 
 class TestDoCpAttnFia(unittest.TestCase):
-    """`do_cp_attn_fia` must trim and re-append the physical pad rows."""
+    """`do_cp_attn_fia` delegates CP slicing to the strategy and only supplies FIA.
+
+    The ZigzagCPStrategy.run_attention owns prev/next slicing, concatenation and
+    pad-row re-appending; the backend's job is to hand it an FIA computation
+    closure and translate the strategy's cu_seqlens / KV-length tensors into the
+    lists FIA expects.
+    """
 
     PHYSICAL_ROWS = 4
 
@@ -145,51 +152,58 @@ class TestDoCpAttnFia(unittest.TestCase):
             None,
         )
 
-    def _run(self, total_q_prev, total_q_next, prev_len, next_len):
-        cp_meta = SimpleNamespace(
-            total_q_prev_tokens=total_q_prev,
-            total_q_next_tokens=total_q_next,
-            actual_seq_q_prev_list=[prev_len],
-            actual_seq_q_next_list=[next_len],
-            kv_len_prev_list=[prev_len],
-            kv_len_next_list=[total_q_prev + total_q_next],
+    def _meta(self, prev, next_len):
+        # single-batch CP metadata with the tensor fields run_attention reads
+        return SimpleNamespace(
+            total_q_prev_tokens=prev,
+            total_q_next_tokens=next_len,
+            cu_seqlens_q_prev_tensor=torch.tensor([0, prev], dtype=torch.int32),
+            kv_len_prev_tensor=torch.tensor([prev], dtype=torch.int32),
+            max_seqlen_q_prev=prev,
+            cu_seqlens_q_next_tensor=torch.tensor([0, next_len], dtype=torch.int32),
+            kv_len_next_tensor=torch.tensor([prev + next_len], dtype=torch.int32),
+            max_seqlen_q_next=next_len,
         )
-        forward_batch = SimpleNamespace(attn_cp_metadata=cp_meta)
+
+    def _run(self, prev, next_len):
+        forward_batch = SimpleNamespace(attn_cp_metadata=self._meta(prev, next_len))
         fake_ops = SimpleNamespace(
             npu=SimpleNamespace(npu_fused_infer_attention_score=self._fia)
         )
-        with patch.object(torch, "ops", fake_ops):
-            return self.backend.do_cp_attn_fia(
-                self.q, self.k_cache, self.v_cache, self.layer, forward_batch
-            )
+        strategy = ZigzagCPStrategy(cp_size=2)
+        with patch.object(ascend_backend, "get_cp_strategy", return_value=strategy):
+            with patch.object(torch, "ops", fake_ops):
+                return self.backend.do_cp_attn_fia(
+                    self.q, self.k_cache, self.v_cache, self.layer, forward_batch
+                )
 
-    def test_pad_rows_are_trimmed_before_fia(self):
-        # logical tokens are 2 + 1 = 3 of the 4 physical rows
-        self._run(total_q_prev=2, total_q_next=1, prev_len=2, next_len=1)
+    def test_slices_into_prev_and_next_chunks(self):
+        # logical tokens 2 + 1 = 3 of the 4 physical rows; strategy slices them
+        self._run(prev=2, next_len=1)
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.calls[0]["query"].shape[0], 2)
-        self.assertEqual(self.calls[1]["query"].shape[0], 1)
+        self.assertEqual(self.calls[0]["query"].shape[0], 2)  # prev chunk
+        self.assertEqual(self.calls[1]["query"].shape[0], 1)  # next chunk
 
-    def test_query_rows_match_cumulative_actual_seq_lengths(self):
-        self._run(total_q_prev=2, total_q_next=1, prev_len=2, next_len=1)
-        for call in self.calls:
-            self.assertEqual(
-                call["query"].shape[0], sum(call["actual_seq_lengths"])
-            )
+    def test_cu_seqlens_translated_to_fia_actual_seq_lengths(self):
+        self._run(prev=2, next_len=1)
+        # strategy passes cu_seqlens_q [0, prev]; FIA wants cumsum without the
+        # leading zero
+        self.assertEqual(self.calls[0]["actual_seq_lengths"], [2])
+        self.assertEqual(self.calls[1]["actual_seq_lengths"], [1])
 
-    def test_kv_lengths_are_forwarded(self):
-        self._run(total_q_prev=2, total_q_next=1, prev_len=2, next_len=1)
+    def test_kv_lengths_forwarded(self):
+        self._run(prev=2, next_len=1)
         self.assertEqual(self.calls[0]["actual_seq_lengths_kv"], [2])
         self.assertEqual(self.calls[1]["actual_seq_lengths_kv"], [3])
 
     def test_output_keeps_physical_row_count(self):
-        out = self._run(total_q_prev=2, total_q_next=1, prev_len=2, next_len=1)
+        out = self._run(prev=2, next_len=1)
         self.assertEqual(out.shape[0], self.PHYSICAL_ROWS)
         self.assertEqual(out.shape[1], 16 * 128)
 
     def test_no_padding_keeps_all_rows(self):
-        # 2 + 2 == physical rows, so nothing is trimmed
-        self._run(total_q_prev=2, total_q_next=2, prev_len=2, next_len=2)
+        # 2 + 2 == physical rows: strategy does not pad
+        self._run(prev=2, next_len=2)
         self.assertEqual(self.calls[0]["query"].shape[0], 2)
         self.assertEqual(self.calls[1]["query"].shape[0], 2)
 

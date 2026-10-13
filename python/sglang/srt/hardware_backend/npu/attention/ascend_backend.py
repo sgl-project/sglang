@@ -29,7 +29,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
@@ -1271,42 +1271,13 @@ class AscendAttnBackend(AttentionBackend):
         The KV cache must already contain the full gathered sequence
         (written by _cp_allgather_and_save_kv_npu before this call).
 
-        Args:
-            q:            Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
-            k_cache:      Full key cache from token_to_kv_pool
-            v_cache:      Full value cache from token_to_kv_pool
-            layer:        RadixAttention layer
-            forward_batch: ForwardBatch with attn_cp_metadata populated
-
-        Returns:
-            attn_output [total_q_tokens, tp_q_head_num * v_head_dim]
+        Token slicing into the prev/next zigzag chunks, pad-row trimming and
+        pad-row re-appending are owned by the CP-v2 strategy
+        (``ZigzagCPStrategy.run_attention``); this backend only supplies the FIA
+        computation closure. ``attention_backend`` is borrowed from
+        ``CPAttentionBackendKind.FLASH_ATTENTION`` because FIA uses the same
+        two-call (prev + next) dispatch convention.
         """
-        cp_meta = forward_batch.attn_cp_metadata
-
-        # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
-        # total_q_prev_tokens rather than the midpoint to support bs > 1.
-        split = cp_meta.total_q_prev_tokens
-
-        # `q` is the physical CP shard: the model runner pads it up to
-        # per_rank_actual_token[0] rows, so it can hold more rows than this rank
-        # logically owns. FIA derives its tiling from the cumulative
-        # actual_seq_lengths, which only describes logical tokens, so the pad
-        # rows must be dropped here and re-appended on the output.
-        logical_tokens = split + int(cp_meta.total_q_next_tokens)
-        pad_rows = int(q.shape[0]) - logical_tokens
-        assert pad_rows >= 0, (
-            f"CP shard ({q.shape[0]} rows) is smaller than its logical token "
-            f"count ({logical_tokens})"
-        )
-        if pad_rows:
-            q = q[:logical_tokens]
-        q_prev = (
-            q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-        q_next = (
-            q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-
         k_cache_paged = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
         )
@@ -1314,45 +1285,37 @@ class AscendAttnBackend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
         )
 
-        attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_prev,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_prev_list,
-        )
+        def _fia_cp_attn(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
+            # The strategy passes cu_seqlens_q (with a leading 0) and plain KV
+            # lengths as int32 tensors; FIA wants cumulative query lengths
+            # (no leading 0) and KV lengths as Python lists.
+            return torch.ops.npu.npu_fused_infer_attention_score(
+                query=q_chunk.contiguous(),
+                key=k_cache_paged,
+                value=v_cache_paged,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=self.fia_mask,
+                sparse_mode=3,
+                next_tokens=0,
+                scale=layer.scaling,
+                actual_seq_lengths=cu_seqlens_q_cp[1:].tolist(),
+                actual_seq_lengths_kv=cache_seqlens_cp.tolist(),
+            )[0]
 
-        attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_next,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_next_list,
+        cp_strategy = get_cp_strategy()
+        assert cp_strategy is not None
+        q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        attn_out = cp_strategy.run_attention(
+            q_cp,
+            forward_batch,
+            self.device,
+            _fia_cp_attn,
+            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
         )
-
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
-        if pad_rows:
-            attn_out = torch.cat(
-                [attn_out, attn_out.new_zeros(pad_rows, *attn_out.shape[1:])], dim=0
-            )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse(
