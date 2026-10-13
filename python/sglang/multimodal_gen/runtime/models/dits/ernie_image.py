@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -267,6 +268,12 @@ class ErnieImageSelfAttention(nn.Module):
         if qk_layernorm:
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
 
         # The joint [image, text] stream is fully replicated, so the ulysses
         # all-to-all would wrongly treat it as sharded and duplicate it. Skip
@@ -287,6 +294,9 @@ class ErnieImageSelfAttention(nn.Module):
         rope_positions: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -309,6 +319,9 @@ class ErnieImageSelfAttention(nn.Module):
                 rope_sin,
                 rope_cache,
                 rope_positions,
+                rotary_emb=self.rotary_emb,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
             )
         else:
             q = _ernie_rope(q, rope_cos, rope_sin)
@@ -393,6 +406,9 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         gate_mlp: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
         x = _ernie_norm_scale_shift(self.adaLN_sa_ln, x, scale_msa, shift_msa)
@@ -404,6 +420,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             rope_positions,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
+            shared_rope_cos=shared_rope_cos,
+            shared_rope_sin=shared_rope_sin,
         )
         x, residual = _ernie_gated_norm_scale_shift(
             self.adaLN_mlp_ln, residual, attn_out, gate_msa, scale_mlp, shift_mlp
@@ -495,6 +513,22 @@ def _ernie_qknorm_rope_reference(
     return _ernie_rope(q, rope_cos, rope_sin), _ernie_rope(k, rope_cos, rope_sin)
 
 
+def _ernie_qknorm_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    *,
+    rotary_emb: RotaryEmbedding,
+    shared_rope_cos: torch.Tensor,
+    shared_rope_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Non-fused path; the bit-exact oracle stays _ernie_qknorm_rope_reference."""
+    q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+    return rotary_emb(query=q, key=k, cos=shared_rope_cos, sin=shared_rope_sin)
+
+
 def _ernie_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -505,6 +539,10 @@ def _ernie_qknorm_rope(
     rope_sin: torch.Tensor,
     rope_cache: torch.Tensor,
     rope_positions: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
+    shared_rope_cos: torch.Tensor,
+    shared_rope_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse ERNIE's QK RMSNorm and rotate-half RoPE without changing bits."""
     verified = _ERNIE_QKNORM_ROPE.verified
@@ -528,14 +566,15 @@ def _ernie_qknorm_rope(
             )
         except Exception as exc:
             _ERNIE_QKNORM_ROPE.on_exception(exc, logger=logger)
-            return _ernie_qknorm_rope_reference(
+            return _ernie_qknorm_rotary(
                 q_input,
                 k_input,
                 q_norm,
                 k_norm,
                 head_dim,
-                rope_cos,
-                rope_sin,
+                rotary_emb=rotary_emb,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
             )
         else:
             if verified:
@@ -560,8 +599,15 @@ def _ernie_qknorm_rope(
                 ),
             )
 
-    return _ernie_qknorm_rope_reference(
-        q, k, q_norm, k_norm, head_dim, rope_cos, rope_sin
+    return _ernie_qknorm_rotary(
+        q,
+        k,
+        q_norm,
+        k_norm,
+        head_dim,
+        rotary_emb=rotary_emb,
+        shared_rope_cos=shared_rope_cos,
+        shared_rope_sin=shared_rope_sin,
     )
 
 
@@ -780,6 +826,10 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         all_ids = torch.cat([image_ids, text_ids], dim=1)
         rotary_pos_emb = self.pos_embed(all_ids)
         rope_cos, rope_sin = _precompute_rope_cos_sin(rotary_pos_emb, dtype)
+        # ids are expanded over B, so every batch row block is identical; the
+        # first [S, rot] block broadcasts over the batch inside RotaryEmbedding.
+        shared_rope_cos = rope_cos.view(B, -1, rope_cos.shape[-1])[0]
+        shared_rope_sin = rope_sin.view(B, -1, rope_sin.shape[-1])[0]
         rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
         rope_positions = torch.arange(
             rope_cache.shape[0], device=device, dtype=torch.long
@@ -822,6 +872,8 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 gate_mlp,
                 attn_mask=attn_mask,
                 attn_mask_meta=attn_mask_meta,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
