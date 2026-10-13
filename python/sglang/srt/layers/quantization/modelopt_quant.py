@@ -3117,7 +3117,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         assert activation in _SUPPORTED_ACT_STRS or (
-            activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
+            activation == "situ"
+            and (
+                moe_runner_backend.is_flashinfer_trtllm()
+                or self._is_cutedsl_v2_standard
+            )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 
         if moe_runner_backend.is_flashinfer_megamoe():
