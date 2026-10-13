@@ -3215,13 +3215,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = False
 
     def _set_mixed_mamba_track_plan(self):
-        """The mamba track plan of a mixed step, by row role: no row tracks.
-
-        The prefill rows drop the plan prepare_for_extend built for them, and
-        the decode rows the one prepare_for_decode built. A decode row gets a
-        plan again at its next decode-only step. merge_batch already dropped
-        both plans; this is where a mixed step would set one.
-        """
+        """The mamba track plan of a mixed step: no row tracks. A decode row
+        gets a plan again at its next decode-only step."""
         self._clear_mamba_track_plan()
 
     def _clear_mamba_track_plan(self):

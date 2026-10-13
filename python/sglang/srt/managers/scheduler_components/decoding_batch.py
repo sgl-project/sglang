@@ -1,15 +1,12 @@
 """The running rows: requests past prefill that decode one token per step.
 
-``DecodingBatch.rows`` is the running ``ScheduleBatch``; readers use it
-directly. The scheduler changes the rows only through the methods below, with
-one exception: PrefillAdder's priority preemption releases and filters the rows
-object it was given in place. ``join`` and ``park_for_mix`` may replace the
-rows object; the other methods change it in place, so a reference to ``rows``
-stays valid across them.
+The scheduler changes ``DecodingBatch.rows`` only through the methods below,
+except PrefillAdder's priority preemption, which filters the rows in place.
+``join`` and ``park_for_mix`` may replace the rows object; the other methods
+keep it, so a reference to ``rows`` stays valid across them.
 
-Under get_next_batch_to_run the rows are never a step: a decode step is a copy
-of the rows (``decode_step``), and the rows take back the fields its run and
-commit rebound (``absorb``) before the next plan reads them. PD decode and
+Under get_next_batch_to_run a decode step is a copy of the rows, and ``absorb``
+takes back what its run and commit rebound before the next plan. PD decode and
 pdmux still launch the rows themselves.
 """
 
