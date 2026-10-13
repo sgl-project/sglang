@@ -9,12 +9,15 @@ Pipeline:
      a. TIMINGS JSON block (machine-readable, from ci_utils.py)
      b. ci_utils.py "✗ FAILED:" summary section (structured text)
      c. pytest "short test summary info" block (for pytest-style logs)
-  2. Read recommended_pytest_paths.txt
-  3. Match: exact match + file-level match
-  4. Generate a Markdown report
+  2. Collect diffusion consistency failures from diffusion-failures-* artifacts
+     (test_utils.py writes consistency_failures/summary.json per partition).
+  3. Read recommended_pytest_paths.txt
+  4. Match: exact match + file-level match
+  5. Generate a Markdown report
 
 Usage:
-  python analyze_failure_report.py --log-dir LOG_DIR --recommendations-file RECOMMENDED.txt [--output report.md]
+  python analyze_failure_report.py --log-dir LOG_DIR --recommendations-file RECOMMENDED.txt \
+    [--diffusion-dir DIFFUSION_DIR] [--output report.md]
 """
 
 import argparse
@@ -51,8 +54,11 @@ def clean_line(line):
 # ============================================================
 
 
-# Match pytest-style FAILED/ERROR lines with the test/ prefix (sglang convention).
-FAILED_PATTERN = re.compile(r"^(?:FAILED|ERROR)\s+(test/\S+?\.py(?:::\S+?)?)\s")
+# Match pytest-style FAILED/ERROR lines with a repo test path prefix. Diffusion
+# tests live under python/sglang/multimodal_gen/test/, everything else under test/.
+FAILED_PATTERN = re.compile(
+    r"^(?:FAILED|ERROR)\s+((?:test|sglang/multimodal_gen/test)/\S+?\.py(?:::\S+?)?)\s"
+)
 SUMMARY_SEPARATOR_PATTERN = re.compile(r"^=+\s")
 CPU_LOG_PATH_PATTERN = re.compile(r"(?:^|-)cpu-\d+card(?:-|$)", re.IGNORECASE)
 CPU_FAILURE_LABEL = "cpu-ut"
@@ -220,6 +226,71 @@ def extract_failed_from_logs(log_dir):
 
 
 # ============================================================
+#  Step 1b: Extract diffusion consistency failures from
+#  diffusion-failures-* artifacts
+# ============================================================
+
+
+def _dir_has_files(directory):
+    """Return whether a downloaded-artifact directory exists and holds any file."""
+    base = Path(directory)
+    return base.is_dir() and any(item.is_file() for item in base.rglob("*"))
+
+
+def extract_diffusion_failures(diffusion_dir):
+    """Collect consistency failure records from diffusion-failures-* artifacts.
+
+    Artifacts are downloaded without merge-multiple, so every partition keeps
+    its own directory: <diffusion_dir>/<artifact>/consistency_failures/summary.json.
+    Each summary is a list of records written by test_utils.py's
+    save_consistency_failure_artifact().
+
+    Returns a list of {case_id, num_gpus, metrics, thresholds, artifact} dicts,
+    deduplicated by case_id.
+    """
+    base = Path(diffusion_dir)
+    if not base.is_dir():
+        print(f"::notice:: Diffusion artifact directory not found: {diffusion_dir}")
+        return []
+
+    records = []
+    seen = set()
+    for summary_path in sorted(base.rglob("summary.json")):
+        if summary_path.parent.name != "consistency_failures":
+            continue
+        try:
+            entries = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"::warning:: Cannot read {summary_path}: {exc}")
+            continue
+        if not isinstance(entries, list):
+            continue
+        artifact = summary_path.parents[1].name
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("case_id"):
+                continue
+            case_id = entry["case_id"]
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            records.append(
+                {
+                    "case_id": case_id,
+                    "num_gpus": entry.get("num_gpus"),
+                    "metrics": entry.get("metrics", {}),
+                    "thresholds": entry.get("thresholds", {}),
+                    "artifact": artifact,
+                }
+            )
+    return records
+
+
+def diffusion_failure_id(record):
+    """Failed-list identifier for one diffusion consistency failure record."""
+    return f"diffusion-consistency/{record['case_id']}"
+
+
+# ============================================================
 #  Step 2: Read recommendations
 # ============================================================
 
@@ -309,13 +380,30 @@ def match_failed_vs_recommended(failed, recommended):
 # ============================================================
 
 
+def _format_metric(metrics, thresholds, metric_key, threshold_key):
+    """Render one metric as ``value (threshold X)``; n/a when absent."""
+    value = metrics.get(metric_key)
+    if value is None:
+        return "n/a"
+    threshold = thresholds.get(threshold_key)
+    if threshold is None:
+        return f"{value}"
+    return f"{value} (threshold {threshold})"
+
+
 def generate_report(
-    failed, recommended, matched, log_dir, recommendations_source="none"
+    failed,
+    recommended,
+    matched,
+    log_dir,
+    recommendations_source="none",
+    diffusion_records=None,
 ):
     """Produce a Markdown summary table."""
     hit = matched["hit"]
     miss = matched["miss"]
     untested = matched["untested"]
+    diffusion_records = diffusion_records or []
 
     out = []
     out.append("# Test Failure vs Recommendation Report")
@@ -354,6 +442,39 @@ def generate_report(
         out.append("")
     else:
         out.append("> No failed test cases")
+        out.append("")
+
+    # ================================================================
+    #  Section 1b: Diffusion consistency failures
+    # ================================================================
+    if diffusion_records:
+        out.append("---")
+        out.append("")
+        out.append(
+            f"## Diffusion Consistency Failures（ {len(diffusion_records)} total）"
+        )
+        out.append("")
+        out.append(
+            "> From `diffusion-failures-*` artifacts (sglang/multimodal_gen "
+            "consistency checks). These cases are outside the coverage "
+            "recommendation scope."
+        )
+        out.append("")
+        out.append(
+            "| Case | GPUs | min CLIP | min SSIM | min PSNR | max mean abs diff | Artifact |"
+        )
+        out.append("|---|---|---|---|---|---|---|")
+        for record in diffusion_records:
+            metrics = record["metrics"]
+            thresholds = record["thresholds"]
+            out.append(
+                f"| `{record['case_id']}` | {record['num_gpus']} "
+                f"| {_format_metric(metrics, thresholds, 'min_clip_similarity', 'clip_threshold')} "
+                f"| {_format_metric(metrics, thresholds, 'min_ssim', 'ssim_threshold')} "
+                f"| {_format_metric(metrics, thresholds, 'min_psnr', 'psnr_threshold')} "
+                f"| {_format_metric(metrics, thresholds, 'max_mean_abs_diff', 'mean_abs_diff_threshold')} "
+                f"| `{record['artifact']}` |"
+            )
         out.append("")
 
     # ================================================================
@@ -458,6 +579,11 @@ def main():
         "--log-dir", required=True, help="Directory containing CI .log files"
     )
     parser.add_argument(
+        "--diffusion-dir",
+        default=None,
+        help="Directory containing downloaded diffusion-failures-* artifacts",
+    )
+    parser.add_argument(
         "--recommendations-file",
         help="Path to recommended_pytest_paths.txt",
     )
@@ -486,7 +612,35 @@ def main():
     print("Step 1: Extract failed tests from CI logs")
     print("=" * 50)
     failed = extract_failed_from_logs(args.log_dir)
-    print(f"Failed: {len(failed)}")
+    diffusion_records = []
+    if args.diffusion_dir:
+        print()
+        print("=" * 50)
+        print("Step 1b: Extract diffusion consistency failures")
+        print("=" * 50)
+        diffusion_records = extract_diffusion_failures(args.diffusion_dir)
+        print(f"Diffusion consistency failures: {len(diffusion_records)}")
+    for record in diffusion_records:
+        failure_id = diffusion_failure_id(record)
+        if failure_id not in failed:
+            failed.append(failure_id)
+
+    has_log_inputs = _dir_has_files(args.log_dir)
+    has_diffusion_inputs = bool(args.diffusion_dir) and _dir_has_files(
+        args.diffusion_dir
+    )
+    if failed:
+        print(f"Failed: {len(failed)}")
+    elif not has_log_inputs and not has_diffusion_inputs:
+        # Empty result from empty input is not a clean-pass signal; say so
+        # instead of reporting a misleading 0.
+        print("Failed: 0 (no input artifacts found)")
+        print(
+            "::warning::No input artifacts found (no test logs, no diffusion "
+            "failures). This analysis has no data; it does not mean the run passed."
+        )
+    else:
+        print("Failed: 0")
 
     print()
     print("=" * 50)
@@ -505,7 +659,12 @@ def main():
     print(f"Untested (recommended, no failure): {len(matched['untested'])}")
 
     report = generate_report(
-        failed, recommended, matched, args.log_dir, args.recommendations_source
+        failed,
+        recommended,
+        matched,
+        args.log_dir,
+        args.recommendations_source,
+        diffusion_records=diffusion_records,
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
