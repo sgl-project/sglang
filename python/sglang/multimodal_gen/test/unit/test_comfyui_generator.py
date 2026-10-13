@@ -260,3 +260,109 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
+
+
+def test_spawned_workers_do_not_reexecute_launcher_main(monkeypatch) -> None:
+    """Workers must not re-run ComfyUI's main.py; its imports break under spawn."""
+    import multiprocessing.spawn
+    import sys
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _spawn_without_launcher_main,
+    )
+
+    main_dict = vars(sys.modules["__main__"])
+    monkeypatch.setitem(main_dict, "__file__", "/comfy/main.py")
+    with _spawn_without_launcher_main():
+        data = multiprocessing.spawn.get_preparation_data("worker")
+    assert "init_main_from_path" not in data
+    assert "init_main_from_name" not in data
+    assert main_dict["__file__"] == "/comfy/main.py"
+
+
+def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = Mock(side_effect=AssertionError("worker must not start"))
+    return runtime
+
+
+@pytest.mark.parametrize(
+    "key, sgld_options, error",
+    [
+        # A FastH3 file loaded as base H3 died in the worker on to_gate_compress.
+        ("blocks.0.attn.to_gate_compress.weight", {}, "model_type fast_h3"),
+        # The H3 file loader builds no quant config, so this was silently ignored.
+        (
+            "blocks.0.attn.to_q.weight",
+            {"quantization": "convrot_int8"},
+            "cannot be quantized at load time",
+        ),
+    ],
+)
+def test_unservable_h3_file_is_rejected_before_worker_load(
+    tmp_path, key, sgld_options, error
+) -> None:
+    from safetensors.torch import save_file
+
+    path = tmp_path / "h3.safetensors"
+    save_file({key: torch.zeros(1)}, path)
+    with pytest.raises(ValueError, match=error):
+        _h3_runtime_that_must_not_start().load_model(
+            model_path=str(path), sgld_options=sgld_options
+        )
+
+
+def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
+    """The 4-step preview and a raw (unmaterialized) FastH3 V2 download were
+    only rejected by the worker after a full model load."""
+    import json
+
+    release = {
+        "schema_version": 1,
+        "partition": "fl2va",
+        "tasks": ["t2va"],
+        "task_aliases": {},
+        "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+    }
+    (tmp_path / "transformer").mkdir()
+    index = tmp_path / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    runtime = _h3_runtime_that_must_not_start()
+    options = {"model_type": "fast_h3", "runtime_model_path": str(tmp_path)}
+    for dmd, weight_map, message in (
+        (None, {}, "no trained DMD rungs"),
+        ([999, 500], {"blocks.0.x": "a.safetensors"}, "raw FastH3 download"),
+    ):
+        meta = dict(release, **({"dmd_denoising_steps": dmd} if dmd else {}))
+        (tmp_path / "model_index.json").write_text(json.dumps({"_minimax_h3": meta}))
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        with pytest.raises(ValueError, match=message):
+            runtime.load_model(model_path="h3.safetensors", sgld_options=options)
+
+
+@pytest.mark.parametrize(
+    "name, pipeline, config_cls",
+    [
+        ("h3_local.safetensors", "MiniMaxH3Pipeline", "MiniMaxH3PipelineConfig"),
+        ("VDN-H3-8nfe", "VDNH3Pipeline", "VDNH3PipelineConfig"),
+    ],
+)
+def test_renamed_h3_paths_resolve_through_the_plugin_model_id(
+    tmp_path, monkeypatch, name, pipeline, config_cls
+) -> None:
+    """A local H3 file or VDN copy whose path lacks the HF name matched no
+    registry detector or model-id keyed default."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.registry import _get_config_info
+
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    path = str(tmp_path / name)
+    SGLDiffusionGenerator().init_generator(path, pipeline, {})
+    assert seen["warmup_mode"] == "off"
+    info = _get_config_info(path, model_id=seen["model_id"])
+    assert info.pipeline_config_cls.__name__ == config_cls

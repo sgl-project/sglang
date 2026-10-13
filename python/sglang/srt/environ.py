@@ -376,6 +376,7 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -1096,9 +1097,10 @@ class Envs:
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
-    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
-    # region and can win at large batch, but makes the output accumulation order
-    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # cutedsl mega kernels (NVFP4 / MXFP8). Permits in-kernel reduction;
+    # FlashInfer's tuning profile may still select external reduction.
+    # BF16 atomic accumulation is nondeterministic -- keep off for
+    # bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
@@ -1626,6 +1628,9 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
+    # sizes; decode stays on aiter.
+    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
