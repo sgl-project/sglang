@@ -2,7 +2,7 @@
 
 The example assets are organized by purpose:
 
-- `sim_configs/`: standalone AIC SOL, AIC SILICON, ML, and replay simulator configs;
+- `sim_configs/`: standalone AIC SOL, AIC SILICON, ML, replay, and InferCast configs;
 - `assets/`: the small illustrative ML model, replay table, and test tokenizer;
 - `workloads/`: ShareGPT and timestamped simulator/Autobench workload examples;
 
@@ -14,6 +14,14 @@ python3 examples/build_example_assets.py
 ```
 
 Only load pickle/joblib assets from sources you trust.
+
+The InferCast eager example models DeepSeek-R1 on MI355X TP8/EP2 with
+SGLang `0.5.17`, BF16 attention, and FP8 KV cache. Replace `systems_root` and
+`provider_revision` with a complete systems tree and verified installed SDK commit.
+Preserve the pinned model revision and exact context/decode profiles, with matching
+stack metadata, measured rows, and whole-forward anchors. InferCast's checked-in
+baseline PerfDB lacks this example's matching decode calibration. The example
+contains no performance data; see the [InferCast setup](../README.md#infercast-predictor).
 
 For maintained direct-run and serving examples, see
 [`test_simulation_sglang_runner.py`](../test/test_simulation_sglang_runner.py) and

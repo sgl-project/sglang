@@ -21,7 +21,7 @@ checks instead of branching on version numbers.
   same monorepo checkout.
 - A local model directory containing model configuration files. Tokenizer files
   are also required unless tokenizer initialization is disabled.
-- Predictor data for AIConfigurator, ML, or replay mode.
+- Predictor data for AIConfigurator, ML, replay, or InferCast mode.
 
 Use an official SGLang image matching the checkout when validating GPU and
 runtime compatibility.
@@ -217,9 +217,66 @@ Supported predictors:
 | `aiconfigurator` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `infercast` | AMD model-forward estimates from measured InferCast data. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
+
+### InferCast predictor
+
+InferCast is optional. Install a checkout at the exact source revision compatible
+with your measured data; record that full commit as `provider_revision`:
+
+```bash
+pip install "/path/to/InferCast[parquet]"
+```
+
+Start with
+[`infercast_deepseek_r1_mi355x_eager.json`](examples/sim_configs/infercast_deepseek_r1_mi355x_eager.json).
+It models `deepseek-ai/DeepSeek-R1` on MI355X TP8/EP2, SGLang `0.5.17`,
+BF16 attention, FP8 KV cache, and page size 1. Replace `systems_root` and
+`provider_revision`. Use the matching model revision and a complete systems tree
+with exact context/decode profiles, stack metadata, measured rows, and
+whole-forward anchors. InferCast's checked-in baseline PerfDB alone is insufficient:
+it lacks the matching decode calibration required by this example.
+The example contains no performance data. The current provider supports DeepSeek-R1.
+
+The adapter makes one SDK call per prepared `EXTEND`, `MIXED`, or `DECODE` forward,
+preserving ordered extend/prefix lengths and decode histories. InferCast owns
+profile validation, composition, calibration, and supported domains; SGLang owns
+scheduling, cache hits, and chunking. Missing data and incompatible execution
+profiles raise errors without a fallback prediction. Context and decode profiles
+are independent; captured-graph profiles require matching measured coverage.
+
+Use the existing serving entry point on Linux with a compatible SGLang environment
+and a local directory containing the matching model `config.json`:
+
+```bash
+export CUDA_VISIBLE_DEVICES=""
+export SGLANG_USE_CPU_ENGINE=1
+export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
+export SGLANG_SIMULATOR_OUTPUT_DIR=/tmp/infercast-simulator-001
+python3 -m sglang_simulator.simulation.sglang.launch_server \
+  --model-path /path/to/deepseek-r1-config \
+  --sim-config-path /path/to/materialized-infercast-config.json \
+  --skip-tokenizer-init --skip-server-warmup \
+  --max-total-tokens 65536 --page-size 1 --port 30000
+```
+
+This token-ID interface needs no weights or tokenizer. For the benchmark client
+above, supply a tokenizer instead of `--skip-tokenizer-init`. Simulator metrics
+combine SDK forward costs with the simulator's existing serving model. CPU tests
+validate integration semantics; experimental input compositions are not PerfDB
+releases or evidence of silicon prediction accuracy.
+
+Opt-in HTTP tests exercise cold, chunked, prefix-hit, concurrent mixed forwards,
+and consecutive BLOCKING arrivals with a real provider:
+
+```bash
+export INFERCAST_E2E_SYSTEMS_ROOT=/path/to/complete/systems
+export INFERCAST_E2E_MODEL_PATH=/path/to/deepseek-r1-config
+python3 -m pytest -q tools/sglang-simulator/test/test_infercast_e2e.py
+```
 
 ## Workload formats
 
