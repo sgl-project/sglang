@@ -1510,7 +1510,13 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1 and not qkv_pre_all_to_all:
             # -> [B, S, H_local, D]
-            if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
+            # The overlapped exchange (side stream + async work handles) cannot
+            # be traced; compiled graphs take the plain all-to-all.
+            if (
+                self.enable_packed_qkv_input_a2a
+                and q.device.type == "cuda"
+                and not torch.compiler.is_compiling()
+            ):
                 q, k, v = async_a2a_communicate(
                     [q, k, v],
                     sp_size,
@@ -1674,10 +1680,9 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
-        # slicing along dim 1 keeps the original row stride, so the shard is
-        # contiguous only while the batch dim is 1; all_gather_into_tensor
-        # requires a contiguous input, so materialize the shard before the
-        # collective
+        # A dim-1 slice keeps the original row stride, and Flux2 K/V are views
+        # from qkv.chunk, so neither form is contiguous. all_gather_into_tensor
+        # rejects a non-contiguous input, so materialize before the collective.
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
             sharded = tensor[:, num_replicated_prefix:].contiguous()
@@ -1690,7 +1695,7 @@ class USPAttention(nn.Module):
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
-        return sequence_model_parallel_all_gather(tensor, dim=1)
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=1)
 
     def _forward_with_kv_gather(
         self,
@@ -2172,7 +2177,11 @@ class USPAttention(nn.Module):
             return self.attn_impl.forward(q_group, k_group, v_group, ctx_attn_metadata)
 
         def sequential():
-            if q.device.type == "cuda" and get_ulysses_parallel_world_size() > 1:
+            if (
+                q.device.type == "cuda"
+                and get_ulysses_parallel_world_size() > 1
+                and not torch.compiler.is_compiling()
+            ):
                 q_gathered, k_gathered, v_gathered = async_a2a_communicate(
                     [q, k_shard, v_shard],
                     get_ulysses_parallel_world_size(),
