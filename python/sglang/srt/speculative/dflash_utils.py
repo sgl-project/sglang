@@ -1100,7 +1100,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             uniform_top_k_value=uniform_top_k_value,
             use_sparse_topk=use_sparse_topk,
         )
-        draft_probs = torch.zeros_like(target_probs)
+        # NOTE: `draft_probs` is passed as a scratch buffer to the CUDA kernel,
+        # which writes rejected-token probabilities into it. The initial values
+        # are fully overwritten, so `empty_like` avoids the unnecessary zeroing
+        # cost that `zeros_like` would incur on a potentially large tensor.
+        # TODO(yancy): Remove this parameter from the kernel interface
+        # (see sgl-project/sglang#12562).
+        draft_probs = torch.empty_like(target_probs)
         candidates_i64 = (
             candidates
             if candidates.dtype == torch.int64

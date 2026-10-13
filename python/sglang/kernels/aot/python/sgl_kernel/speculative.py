@@ -14,6 +14,9 @@ def tree_speculative_sampling_target_only(
     uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
+    # NOTE: Despite the name, in target-only mode the kernel treats this as
+    # an output scratch buffer (stores rejected-token probabilities).
+    # The initial values are never read. See sgl-project/sglang#12562.
     draft_probs: torch.Tensor,
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,

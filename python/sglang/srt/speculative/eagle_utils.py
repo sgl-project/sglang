@@ -951,11 +951,15 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
+        if use_rejection_sampling:
+            draft_probs = verify_input.draft_probs
+        else:
+            # In tree-verification mode this arg is only a scratch buffer that
+            # the CUDA kernel fully overwrites with rejected-token probs.
+            # `empty_like` avoids the wasteful zeroing that `zeros_like` did.
+            # TODO(yancy): Remove this parameter from the kernel interface
+            # (see sgl-project/sglang#12562).
+            draft_probs = torch.empty_like(target_probs)
         # Defense-in-depth behind the spec_hook startup allowlist: validate
         # the actual kernel inputs before the Triton kernel.
         if use_rejection_sampling and (
