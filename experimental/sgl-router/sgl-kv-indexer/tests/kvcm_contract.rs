@@ -87,6 +87,63 @@ fn err_header(code: ErrorCode, message: &str) -> CommonResponseHeader {
     }
 }
 
+/// The KVCM acceptance rules the backend's generated events must satisfy
+/// (mirrors cache_manager.cc: BLOCK_ADD specs carry a channel-scheme URI,
+/// BLOCK_DELETE names a registered spec, NODE_REGISTER declares mediums).
+/// Returns the first violation's reason.
+fn validate_report_events(request: &ReportEventRequest) -> Option<String> {
+    use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
+    use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
+    let expected_scheme = match StorageType::try_from(request.storage_type) {
+        Ok(StorageType::StEventReportL2) => "vineyard://",
+        _ => "event_report://",
+    };
+    for event in &request.events {
+        match T::try_from(event.event_type) {
+            Ok(T::EventBlockAdd) => {
+                let Some(EventParams::BlockAdd(add)) = event.event_params.as_ref() else {
+                    continue;
+                };
+                if add.specs.is_empty() {
+                    return Some("BLOCK_ADD without specs".into());
+                }
+                for spec in &add.specs {
+                    if !spec.uri.starts_with(expected_scheme) {
+                        return Some(format!(
+                            "BLOCK_ADD spec `{}` URI `{}` lacks channel scheme `{expected_scheme}`",
+                            spec.name, spec.uri
+                        ));
+                    }
+                }
+            }
+            Ok(T::EventBlockDelete) => {
+                let Some(EventParams::BlockDelete(delete)) = event.event_params.as_ref() else {
+                    continue;
+                };
+                if delete.spec_names.is_empty() {
+                    return Some("BLOCK_DELETE without spec_names".into());
+                }
+                const REGISTERED: [&str; 3] = ["full", "swa", "mamba"];
+                for name in &delete.spec_names {
+                    if !REGISTERED.contains(&name.as_str()) {
+                        return Some(format!("BLOCK_DELETE names unregistered spec `{name}`"));
+                    }
+                }
+            }
+            Ok(T::EventNodeRegister) => {
+                let Some(EventParams::NodeRegister(register)) = event.event_params.as_ref() else {
+                    continue;
+                };
+                if register.mediums.is_empty() {
+                    return Some("NODE_REGISTER without mediums".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// An in-process KVCM MetaService that records the three RPCs the backend
 /// uses and refuses everything else.
 struct MockKvcm {
@@ -121,6 +178,10 @@ impl MetaService for MockKvcm {
         request: Request<ReportEventRequest>,
     ) -> Result<Response<ReportEventResponse>, Status> {
         let request = request.into_inner();
+        // KVCM's own acceptance rules, so a regression to structurally
+        // invalid events fails loudly here instead of only against a real
+        // server (see cache_manager.cc ValidateEventLocationSpec).
+        let violation = validate_report_events(&request);
         let error = {
             let mut state = MockState::lock(&self.state);
             state.reports.push(request);
@@ -130,13 +191,24 @@ impl MetaService for MockKvcm {
             Some((code, message)) => err_header(code, &message),
             None => ok_header(),
         };
-        let (item_results, snapshot_required) = {
+        let (mut item_results, snapshot_required) = {
             let mut state = MockState::lock(&self.state);
             (
                 std::mem::take(&mut state.report_item_results),
                 state.report_snapshot_required,
             )
         };
+        if let Some(reason) = violation {
+            item_results = vec![ErrorCode::InvalidArgument as i32];
+            return Ok(Response::new(ReportEventResponse {
+                header: Some(header),
+                item_results,
+                committed_snapshot_version: String::new(),
+                retry_after_ms: 0,
+                snapshot_required,
+                extra_info: reason,
+            }));
+        }
         Ok(Response::new(ReportEventResponse {
             header: Some(header),
             item_results,
@@ -320,6 +392,8 @@ async fn apply_translates_report_revoke_and_registers_node() {
     assert_eq!(add.medium, "hbm");
     assert_eq!(add.specs.len(), 1);
     assert_eq!(add.specs[0].name, "full");
+    // The reporter address authority, with the channel's scheme.
+    assert_eq!(add.specs[0].uri, "event_report://w0:30000/hbm");
 
     let EventParams::BlockAdd(add) = report.events[2].event_params.as_ref().unwrap() else {
         panic!("expected BLOCK_ADD");
@@ -988,6 +1062,61 @@ async fn large_batches_are_chunked_in_order_under_one_budget() {
     assert_eq!(
         keys,
         expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
+/// The spec URI scheme follows the event-report channel (vineyard for l2),
+/// and a worker with no restated address falls back to its id.
+#[tokio::test]
+async fn spec_uris_follow_the_channel_and_reporter_identity() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let mut config = backend_config(addr);
+    config.storage_type = StorageType::StEventReportL2;
+    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+
+    // With an address: vineyard://<authority>/<medium>.
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://10.0.0.1:30000",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &[1])],
+        ))
+        .await
+        .expect("apply succeeds");
+    // Without one: vineyard://<worker id>/<medium>.
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-1",
+            "",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &[1])],
+        ))
+        .await
+        .expect("address-less apply succeeds");
+
+    let reports = MockState::lock(&state).reports.clone();
+    assert_eq!(reports.len(), 2);
+    use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
+    let uris = |report: &ReportEventRequest| {
+        report
+            .events
+            .iter()
+            .filter_map(|event| match event.event_params.as_ref()? {
+                EventParams::BlockAdd(add) => Some(add.specs[0].uri.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(uris(&reports[0]), ["vineyard://10.0.0.1:30000/hbm"]);
+    assert_eq!(uris(&reports[1]), ["vineyard://worker-1/hbm"]);
+    // The mock's channel rule accepted both shapes.
+    assert!(
+        reports
+            .iter()
+            .all(|report| validate_report_events(report).is_none()),
+        "generated events must satisfy KVCM acceptance rules"
     );
 }
 

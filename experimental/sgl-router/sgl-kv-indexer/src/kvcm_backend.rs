@@ -436,7 +436,35 @@ fn node_register_event(mediums: &[String]) -> EventItem {
     }
 }
 
-fn block_add_event(hash: i64, medium: &str, specs: Vec<&'static str>) -> EventItem {
+/// URI scheme KVCM expects for a channel's spec URIs (l1p5 reports as
+/// `event_report://`, l2 as `vineyard://`).
+fn storage_uri_scheme(storage_type: StorageType) -> &'static str {
+    match storage_type {
+        StorageType::StEventReportL2 => "vineyard",
+        _ => "event_report",
+    }
+}
+
+/// The URI authority identifying the reporter: the worker address's
+/// `host:port` when one is restated, else the worker id. KVCM validates spec
+/// URIs structurally (scheme + non-empty rest); the data plane later resolves
+/// the authority when fetching.
+fn reporter_uri_authority<'a>(worker_address: &'a str, worker_id: &'a str) -> &'a str {
+    let Some((scheme, rest)) = worker_address.split_once("://") else {
+        return worker_id;
+    };
+    if scheme.is_empty() {
+        return worker_id;
+    }
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    if authority.is_empty() {
+        worker_id
+    } else {
+        authority
+    }
+}
+
+fn block_add_event(hash: i64, medium: &str, uri: &str, specs: Vec<&'static str>) -> EventItem {
     EventItem {
         event_type: ReportEventType::EventBlockAdd as i32,
         event_params: Some(event_item::EventParams::BlockAdd(BlockAddEventParams {
@@ -447,7 +475,7 @@ fn block_add_event(hash: i64, medium: &str, specs: Vec<&'static str>) -> EventIt
                 .into_iter()
                 .map(|name| LocationSpec {
                     name: name.to_string(),
-                    uri: String::new(),
+                    uri: uri.to_string(),
                 })
                 .collect(),
         })),
@@ -501,6 +529,7 @@ fn translate_batch(
     prepend_node_register: bool,
     report_tiers: &[TierType],
     mediums: &[String],
+    uri_prefix: &str,
 ) -> TranslatedBatch {
     let mut events = Vec::new();
     if prepend_node_register {
@@ -532,7 +561,12 @@ fn translate_batch(
                     if specs.is_empty() {
                         continue;
                     }
-                    events.push(block_add_event(hash, medium, specs));
+                    events.push(block_add_event(
+                        hash,
+                        medium,
+                        &format!("{uri_prefix}/{medium}"),
+                        specs,
+                    ));
                 }
             }
             Ok(ExternalKvActionType::ActionRevoke) => {
@@ -717,10 +751,26 @@ impl Inner {
         // Header first, then items: one failure, one classification.
         check_header(response.header.as_ref(), "ReportEvent")?;
         if !response.item_results.is_empty() {
-            return Err(Status::internal(format!(
-                "KVCM ReportEvent partially failed: item results {:?}",
-                response.item_results
-            )));
+            // A structurally invalid event is a contract violation: report it
+            // as INVALID_ARGUMENT so the bridge exits instead of reconnecting
+            // and re-sending the same bad batch forever.
+            let invalid = response
+                .item_results
+                .contains(&(ErrorCode::InvalidArgument as i32));
+            let status = |code: tonic::Code, what: &str| {
+                Status::new(
+                    code,
+                    format!(
+                        "KVCM ReportEvent partially failed ({what}): item results {:?}",
+                        response.item_results
+                    ),
+                )
+            };
+            return Err(if invalid {
+                status(tonic::Code::InvalidArgument, "invalid event")
+            } else {
+                status(tonic::Code::Internal, "transient")
+            });
         }
         if registered_node {
             self.set_node_registered(host, true);
@@ -949,6 +999,11 @@ impl KvIndexerBackend for KvcmIndexerBackend {
             !node_registered,
             &self.inner.config.report_tiers,
             &self.inner.mediums,
+            &format!(
+                "{}://{}",
+                storage_uri_scheme(self.inner.config.storage_type),
+                reporter_uri_authority(&request.worker_address, &request.worker_id)
+            ),
         );
         if translated.skipped_clears > 0 {
             tracing::warn!(
@@ -1075,6 +1130,28 @@ mod tests {
     }
 
     #[test]
+    fn uri_helpers_pick_scheme_and_authority() {
+        assert_eq!(
+            storage_uri_scheme(StorageType::StEventReportL1p5),
+            "event_report"
+        );
+        assert_eq!(storage_uri_scheme(StorageType::StEventReportL2), "vineyard");
+        // The address authority is preferred; ids, bare hosts, and empty
+        // values fall back to the worker id.
+        assert_eq!(
+            reporter_uri_authority("http://10.0.0.1:30000", "worker-0"),
+            "10.0.0.1:30000"
+        );
+        assert_eq!(
+            reporter_uri_authority("http://h1:1/some/path", "worker-0"),
+            "h1:1"
+        );
+        assert_eq!(reporter_uri_authority("", "worker-0"), "worker-0");
+        assert_eq!(reporter_uri_authority("no-scheme", "worker-0"), "worker-0");
+        assert_eq!(reporter_uri_authority("http://", "worker-0"), "worker-0");
+    }
+
+    #[test]
     fn tier_medium_maps_every_valid_tier() {
         assert_eq!(tier_medium(TierType::TierHbm), Some("hbm"));
         assert_eq!(tier_medium(TierType::TierDram), Some("mem"));
@@ -1131,7 +1208,13 @@ mod tests {
             ],
             None,
         );
-        let translated = translate_batch(&request, true, &[TierType::TierHbm], &["hbm".into()]);
+        let translated = translate_batch(
+            &request,
+            true,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
         assert_eq!(translated.skipped_clears, 0);
         let EventItem {
             event_type,
@@ -1153,6 +1236,8 @@ mod tests {
         assert_eq!(add.medium, "hbm");
         assert_eq!(add.specs.len(), 1);
         assert_eq!(add.specs[0].name, SPEC_FULL);
+        // KVCM rejects spec URIs that are empty or lack the channel's scheme.
+        assert_eq!(add.specs[0].uri, "event_report://worker-0/hbm");
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
@@ -1198,11 +1283,23 @@ mod tests {
         );
         // A pending node registration is still sent: it registers the reporter
         // even when nothing else in the batch is forwardable.
-        let translated = translate_batch(&request, true, &[TierType::TierHbm], &["hbm".into()]);
+        let translated = translate_batch(
+            &request,
+            true,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
         assert_eq!(translated.events.len(), 1);
         assert_eq!(translated.skipped_clears, 1);
         // A later batch with nothing to forward sends nothing.
-        let translated = translate_batch(&request, false, &[TierType::TierHbm], &["hbm".into()]);
+        let translated = translate_batch(
+            &request,
+            false,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
         assert!(translated.events.is_empty());
     }
 
@@ -1214,7 +1311,13 @@ mod tests {
             vec![report_action(hbm(), &[1, 2], &[1 << 3, 0])],
             None,
         );
-        let translated = translate_batch(&request, false, &[TierType::TierHbm], &["hbm".into()]);
+        let translated = translate_batch(
+            &request,
+            false,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
         assert_eq!(translated.events.len(), 1);
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
@@ -1236,7 +1339,13 @@ mod tests {
             vec![report_action(hbm(), &[-1], &[0])],
             None,
         );
-        let translated = translate_batch(&request, false, &[TierType::TierHbm], &["hbm".into()]);
+        let translated = translate_batch(
+            &request,
+            false,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
