@@ -47,6 +47,8 @@ fn sampling_params_to_map(
             }
             if let Some(v) = p.max_new_tokens {
                 map.insert("max_new_tokens".into(), serde_json::json!(v));
+            } else if p.use_remaining_context {
+                map.insert("max_new_tokens".into(), serde_json::Value::Null);
             }
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
@@ -712,6 +714,25 @@ mod tests {
 
         for key in ["image_data", "video_data", "audio_data"] {
             assert!(!mapped.contains_key(key));
+        }
+    }
+
+    #[test]
+    fn use_remaining_context_only_applies_without_an_explicit_limit() {
+        for (max_new_tokens, use_remaining_context, expected) in [
+            (Some(42), false, Some(serde_json::json!(42))),
+            (Some(42), true, Some(serde_json::json!(42))),
+            (None, false, None),
+            (None, true, Some(serde_json::Value::Null)),
+        ] {
+            let mapped = sampling_params_to_map(&Some(proto::SamplingParams {
+                max_new_tokens,
+                use_remaining_context,
+                ..Default::default()
+            }))
+            .unwrap();
+
+            assert_eq!(mapped.get("max_new_tokens").cloned(), expected);
         }
     }
 
