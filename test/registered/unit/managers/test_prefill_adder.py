@@ -343,6 +343,16 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
 
+    def test_continuation_chunk_ends_on_the_alignment_grid(self):
+        # Deterministic chunk alignment is on absolute positions: a continuation
+        # that starts off the grid still ends on it.
+        adder = self.create_shortest_prefill_adder()
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(8192))
+        req.prefix_len = 1000
+        self.assertIs(adder.add_chunked_req(req, truncation_align_size=64), req)
+        self.assertEqual(req.prefix_len + req.extend_len, 5056)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
