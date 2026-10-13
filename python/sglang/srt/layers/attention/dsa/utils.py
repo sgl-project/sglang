@@ -224,9 +224,8 @@ is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 # gfx950 (MI355X) via the same split-op dispatch.
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
-    )
+        is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
+    ) and forward_batch.forward_mode.is_extend_without_speculative()
 
 
 def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
