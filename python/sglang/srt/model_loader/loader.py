@@ -2067,7 +2067,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                 and isinstance(weight, torch.nn.Parameter)
                 and gemma_w.shape == weight.shape
             ):
-                torch.add(weight.data, 1.0, out=gemma_w)
+                torch.add(weight.data.to(gemma_w.device), 1.0, out=gemma_w)
 
             attn = getattr(module, "attn", None)
             conv1d = getattr(module, "conv1d", None)

@@ -108,29 +108,29 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
             and hasattr(owner, "w_vc")
         ):
             resident.update(id(parameter) for parameter in projection.parameters())
-        # KDA caches a storage-sharing view of qkv_conv1d.weight in conv_weights
-        # during construction. Offloading the weight would leave that view stale.
-        projection = getattr(owner, "qkv_conv1d", None)
+        # GDN and KDA cache convolution views outside the registered state.
         attention = getattr(owner, "attn", None)
-        if isinstance(projection, torch.nn.Module) and isinstance(
-            attention, torch.nn.Module
-        ):
-            weight = getattr(projection, "weight", None)
-            cached = getattr(attention, "conv_weights", None)
-            if (
-                isinstance(weight, torch.nn.Parameter)
-                and isinstance(cached, torch.Tensor)
-                and cached.device == weight.device
+        for projection_name in ("qkv_conv1d", "conv1d"):
+            projection = getattr(owner, projection_name, None)
+            if isinstance(projection, torch.nn.Module) and isinstance(
+                attention, torch.nn.Module
             ):
-                weight_storage = weight.untyped_storage()
-                cached_storage = cached.untyped_storage()
+                weight = getattr(projection, "weight", None)
+                cached = getattr(attention, "conv_weights", None)
                 if (
-                    weight_storage.nbytes() > 0
-                    and weight_storage.data_ptr() != 0
-                    and weight_storage.nbytes() == cached_storage.nbytes()
-                    and weight_storage.data_ptr() == cached_storage.data_ptr()
+                    isinstance(weight, torch.nn.Parameter)
+                    and isinstance(cached, torch.Tensor)
+                    and cached.device == weight.device
                 ):
-                    resident.add(id(weight))
+                    weight_storage = weight.untyped_storage()
+                    cached_storage = cached.untyped_storage()
+                    if (
+                        weight_storage.nbytes() > 0
+                        and weight_storage.data_ptr() != 0
+                        and weight_storage.nbytes() == cached_storage.nbytes()
+                        and weight_storage.data_ptr() == cached_storage.data_ptr()
+                    ):
+                        resident.add(id(weight))
     return resident
 
 

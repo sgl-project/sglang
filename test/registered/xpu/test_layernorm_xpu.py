@@ -48,5 +48,27 @@ class TestGemma4RMSNormXPU(CustomTestCase):
         self.assertEqual(out.shape, (0, 128))
 
 
+class TestGemmaRMSNormOffloadedWeightLoadXPU(CustomTestCase):
+    def setUp(self):
+        if not torch.xpu.is_available():
+            self.skipTest("XPU not available")
+
+    def test_cpu_offloaded_weight_fills_device_buffer(self):
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+        norm = GemmaRMSNorm(16).to("xpu")
+        # Mimic OffloaderV1: parameters move to host, buffers stay on device.
+        norm.weight.data = norm.weight.data.cpu()
+        buffer_ptr = norm.gemma_weight.data_ptr()
+        loaded = torch.randn(16)
+
+        norm.weight.weight_loader(norm.weight, loaded)
+
+        self.assertEqual(norm.weight.device.type, "cpu")
+        self.assertEqual(norm.gemma_weight.device.type, "xpu")
+        self.assertEqual(norm.gemma_weight.data_ptr(), buffer_ptr)
+        torch.testing.assert_close(norm.gemma_weight.cpu(), loaded + 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
