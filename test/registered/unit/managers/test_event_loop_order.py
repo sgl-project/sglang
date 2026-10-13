@@ -1,18 +1,10 @@
 """Each CUDA event loop makes the same scheduler calls in the same order.
 
 Drives every flat and pipeline loop a few iterations on a fake scheduler that
-logs each call it receives (with its arguments, rendered when the call is made),
-each write to a loop-owned attribute, each change to the in-flight queue, and
-where each profiler label opens (``label{``) and closes (``}``).
-The expected logs, one ``[scenario]`` block each in the sibling
-event_loop_order_golden.txt, were recorded on the hand-written loops; a change
-to a loop's call order fails here.
-
-Re-recording is legitimate only for an intentional change to a loop's call
-order, reviewed together with the diff of the data file: run this file with
-SGLANG_TEST_REGEN_EVENT_LOOP_ORDER=1, which rewrites the scenarios that ran.
-A change meant to keep the order (a refactor) never re-records; record a new
-scenario on the code before such a change, then check it passes after.
+logs each call, each write to a loop-owned attribute, each in-flight queue
+change and each profiler label span, and compares the log with the sibling
+event_loop_order_golden.txt. Re-record only for an intentional change to a
+loop's call order, never for a refactor meant to keep it.
 """
 
 import unittest
