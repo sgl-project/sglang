@@ -32,6 +32,7 @@ from sglang.kernels.ops.gemm.router_gemv import (
     router_gemm_bf16x3_cublas,
     router_gemv,
     router_gemv_supported,
+    split_fp32_to_bf16x3,
 )
 from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
@@ -74,7 +75,10 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -164,6 +168,14 @@ class BeamUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # The torch-native fallback rounds route weights and omits the runner
         # scale. Keep the CUDA runner, including during single-token compile.
         return None
+
+
+class BeamRouterLinearMethod(UnquantizedLinearMethod):
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        # Refresh in place so captured graphs see updated weights.
+        parts = getattr(layer, "bf16x3_weight", None)
+        parts = split_fp32_to_bf16x3(layer.weight, out=parts)
+        layer.register_buffer("bf16x3_weight", parts, persistent=False)
 
 
 # Token counts per forward where FlashInfer's MNNVL all-reduce beats the best
@@ -345,37 +357,51 @@ class BeamMoE(nn.Module):
             self.topk.topk_config.apply_routed_scaling_factor_on_output = True
         # Offloading replaces parameters, but TopKConfig keeps an alias.
         self.refresh_correction_bias = get_exec().offload.cpu_offload_gb > 0
+        router_backend = envs.SGLANG_BEAM_ROUTER_BACKEND.get()
+        if router_backend not in ("cublas", "cutile", "torch"):
+            raise ValueError(f"Unsupported Beam router backend: {router_backend}")
         # Preserve the normal linear path for offloading, adapters and strict
-        # deterministic inference. Never cache or downcast router weights.
+        # deterministic inference.
         self.use_fast_router = (
             _is_cuda
             and not self.refresh_correction_bias
             and not get_lora().enable_lora
             and not get_exec().deterministic.enable_deterministic_inference
             and get_fused_op_backend() != KernelBackend.TORCH
+            and router_backend != "torch"
         )
+        self.use_cutile_router = (
+            self.use_fast_router
+            and router_backend == "cutile"
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        if self.use_cutile_router:
+            from sglang.kernels.ops.gemm.router_gemm_cutile import (
+                router_gemm_bf16x3_cutile,
+            )
+
+            self.cutile_router_gemm = router_gemm_bf16x3_cutile
+            self.gate.quant_method = BeamRouterLinearMethod()
         # Tiny GEMM up to 16 tokens.
         self.use_fp32_router = (
             self.use_fast_router
-            # Full-model validation covers the BF16 MoE runner.
-            and quant_config is None
+            and (quant_config is None or self.use_cutile_router)
             and config.hidden_size == 5120
             and config.num_experts == 256
             and torch.cuda.get_device_capability()[0] in (9, 10)
         )
 
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # All fast paths read BF16 activations and the live FP32 gate; tiny GEMM and
-        # the GEMV are IEEE FP32, the BF16x3 GEMM accumulates on tensor cores.
         if (
             not self.use_fast_router
-            or torch.compiler.is_compiling()
+            or (torch.compiler.is_compiling() and not self.use_cutile_router)
             or hidden_states.dtype != torch.bfloat16
         ):
             router_logits, _ = self.gate(hidden_states.float())
             return router_logits
         if (
             self.use_fp32_router
+            and not torch.compiler.is_compiling()
             and hidden_states.is_contiguous()
             and hidden_states.data_ptr() % 16 == 0
             # Larger batches win in isolation but did not improve the
@@ -385,6 +411,8 @@ class BeamMoE(nn.Module):
             return tiny_gemm_bf16(
                 hidden_states, self.gate.weight, out_dtype=torch.float32
             )
+        if self.use_cutile_router:
+            return self.cutile_router_gemm(hidden_states, self.gate.bf16x3_weight)
         if router_gemv_supported(hidden_states, self.gate.weight):
             return router_gemv(hidden_states, self.gate.weight)
         return router_gemm_bf16x3_cublas(hidden_states, self.gate.weight)
