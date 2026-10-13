@@ -191,7 +191,7 @@ Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
 bucket is plain or P/D, and each group may set its own engines, policy,
-admission and affinity; see [configuration reference](ARCHITECTURE.md#6-configuration):
+admission and affinity; see [configuration examples](ARCHITECTURE.md#2-configuration-examples):
 
 ```json
 {"buckets": [{
