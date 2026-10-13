@@ -384,4 +384,7 @@ class FastH3Executor(_DistilledH3Executor):
 
 class VDNH3Executor(_DistilledH3Executor):
     adapter_cls = VDNH3Adapter
-    expected_sigmas = distilled_h3_sigmas("vdn_h3")
+    # Without the runtime __init__ raises anyway; keep the import working.
+    expected_sigmas = (
+        distilled_h3_sigmas("vdn_h3") if _H3_RUNTIME_IMPORT_ERROR is None else []
+    )
