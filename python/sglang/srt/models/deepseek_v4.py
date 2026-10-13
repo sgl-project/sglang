@@ -3415,20 +3415,10 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     def write_global_cache_only(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        state: mhc.HcState,
         forward_batch: ForwardBatch,
-        prev_pre: Optional[torch.Tensor],
-        precomputed_attn: Optional[tuple] = None,
-        combined_attn: Optional[torch.Tensor] = None,
-        normalized_attn: Optional[torch.Tensor] = None,
     ) -> None:
-        """Run the canonical attention pre-mix and write this layer's global KV.
-
-        The asymmetric prefill stops here: attention, FFN, later layers and the
-        language-model head are deliberately not evaluated.  The low-ratio
-        compressor write also writes the owner Indexer-K cache; index scoring is
-        decode-local and must not run on the prefill worker.
-        """
+        """Consume the previous mHC state and write only Main-KV/Indexer-K."""
         if self.self_attn.compress_ratio not in (1, 2):
             raise RuntimeError("cache-only boundary must have compression ratio 1/2")
         if (
@@ -3439,16 +3429,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             raise RuntimeError(
                 "cache-only boundary must own both Main-KV and Indexer-K producers"
             )
-        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
-        x = self._hc_combine(
-            hidden_states,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
-            precomputed=precomputed_attn,
-            combined=combined_attn,
-            normalized=normalized_attn,
-        )
+        state = state.materialized(self.hc_cfg)
+        x = mhc.combine_input(self.hc_cfg, self.input_layernorm, state)
         get_attn_backend().forward_low_ratio_sources(
             layer=self.self_attn,
             x=x,
@@ -3670,6 +3652,9 @@ class DeepseekV41EncoderBoundaryAttention(nn.Module):
             persistent=False,
         )
 
+    def accepts_mxfp8_swizzled_input(self) -> bool:
+        return False
+
 
 class DeepseekV41EncoderBoundaryLayer(DeepseekV4DecoderLayer):
     """Minimal final Prefill layer: mHC pre-mix plus Main-KV/Indexer-K write."""
@@ -3701,6 +3686,17 @@ class DeepseekV41EncoderBoundaryLayer(DeepseekV4DecoderLayer):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.engram = None
+        self.attn_hc = None
+        self._next_layer = None
+        self.hc_cfg = mhc.HcConfig(
+            mult=config.hc_mult,
+            sinkhorn_iters=config.hc_sinkhorn_iters,
+            eps=config.hc_eps,
+            rms_eps=config.rms_norm_eps,
+            hidden=config.hidden_size,
+            pre_from_prev=config.hc_pre_from_prev_sublayer,
+            cp_prefill=self.dsa_enable_prefill_cp,
+        )
 
     def refresh_mhc_norm_weight_cache(self) -> None:
         self._input_layernorm_weight_bf16 = (
@@ -4158,12 +4154,8 @@ class DeepseekV4Model(nn.Module):
             if i == self.encoder_only_boundary_layer:
                 self.layers[i].write_global_cache_only(
                     positions=positions,
-                    hidden_states=hidden_states,
+                    state=state,
                     forward_batch=forward_batch,
-                    prev_pre=prev_pre,
-                    precomputed_attn=precomputed_attn,
-                    combined_attn=combined_attn,
-                    normalized_attn=normalized_attn,
                 )
                 return None, None, None
             ctx = (

@@ -442,8 +442,7 @@ class SchedulerBatchResultProcessor:
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
                             store=(
-                                discard_finish_reason is None
-                                and not replayed_boundary
+                                discard_finish_reason is None and not replayed_boundary
                             ),
                         )
 

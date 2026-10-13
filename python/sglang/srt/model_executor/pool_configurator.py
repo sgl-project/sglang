@@ -1346,15 +1346,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
+        if self.encoder_replay and not get_disagg().dsv41_encoder_only_prefill:
+            return self.kv_bytes * self.paged_draft_layers
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        bytes_per_token = self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
-            c4_state_ratio
-            * (c4_state_bytes + c4_indexer_state_bytes)
-            * self.num_layers(4)
+        bytes_per_token = (
+            self._get_paged_kv_bytes_per_token() * self.num_layers_total
+            + (
+                c4_state_ratio
+                * (c4_state_bytes + c4_indexer_state_bytes)
+                * self.num_layers(4)
+            )
         )
         if self.encoder_replay:
             # DSpark's draft pool shares the target allocator's virtual ids but

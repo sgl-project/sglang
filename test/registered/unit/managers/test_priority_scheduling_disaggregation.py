@@ -1039,7 +1039,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         self.assertEqual([req.rid for req in priority_input], ["replay", "normal"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["normal"])
-        replay.set_extend_range.assert_called_once_with(0, 128)
+        self.assertEqual((replay.prefix_len, replay.extend_end), (0, 128))
         new_batch.prepare_for_extend.assert_called_once()
 
     def test_cache_only_replay_suspends_then_restores_running_decode(self):
@@ -1263,7 +1263,7 @@ class TestDecodePrebuilt(unittest.TestCase):
                     )
 
                 start = max(0, prompt_len - 128)
-                req.set_extend_range.assert_called_once_with(start, prompt_len)
+                self.assertEqual((req.prefix_len, req.extend_end), (start, prompt_len))
                 self.assertTrue(
                     torch.equal(
                         req.prefix_indices,
@@ -1318,7 +1318,7 @@ class TestDecodePrebuilt(unittest.TestCase):
             )
 
         start = coverage - 128
-        req.set_extend_range.assert_called_once_with(start, coverage)
+        self.assertEqual((req.prefix_len, req.extend_end), (start, coverage))
         self.assertTrue(
             torch.equal(req.prefix_indices, torch.arange(start, dtype=torch.int32))
         )

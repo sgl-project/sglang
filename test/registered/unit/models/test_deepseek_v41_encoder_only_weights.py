@@ -10,8 +10,10 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Model,
+    DeepseekV41EncoderBoundaryLayer,
     dsv41_encoder_only_prefill_weight_needed,
 )
+from sglang.srt.models.deepseek_v4_mhc import HcConfig, HcNormed, HcState
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -74,8 +76,10 @@ class TestDsv41EncoderOnlyWeights(unittest.TestCase):
     @patch("sglang.srt.models.deepseek_v4._is_cuda", False)
     @patch("sglang.srt.models.deepseek_v4.is_dp_attention_enabled", return_value=False)
     @patch("sglang.srt.models.deepseek_v4.get_parallel")
+    @patch("sglang.srt.utils.common.get_parallel")
     def test_model_materializes_only_encoder_layers_and_boundary(
         self,
+        get_parallel_common,
         get_parallel,
         _is_dp_attention_enabled,
         boundary_layer,
@@ -89,6 +93,7 @@ class TestDsv41EncoderOnlyWeights(unittest.TestCase):
             rank_in_group=0,
             world_size=1,
         )
+        get_parallel_common.return_value = SimpleNamespace(pp_rank=0, pp_size=1)
         embed.side_effect = lambda *_args, **_kwargs: nn.Identity()
         decoder_layer.side_effect = lambda **kw: nn.Identity()
         boundary_layer.side_effect = lambda **kw: nn.Identity()
@@ -119,6 +124,33 @@ class TestDsv41EncoderOnlyWeights(unittest.TestCase):
         self.assertIsInstance(model.layers[21], PPMissingLayer)
         self.assertIsInstance(model.norm, PPMissingLayer)
         self.assertIsNone(model.hc_head_fn)
+
+    @patch("sglang.srt.models.deepseek_v4.get_attn_backend")
+    def test_cache_only_boundary_consumes_current_mhc_state(self, backend):
+        layer = object.__new__(DeepseekV41EncoderBoundaryLayer)
+        nn.Module.__init__(layer)
+        layer.hc_cfg = HcConfig(4, 20, 1e-6, 1e-5, 16, True, False)
+        layer.input_layernorm = nn.Identity()
+        layer.self_attn = SimpleNamespace(
+            compress_ratio=1,
+            compressor=object(),
+            indexer=SimpleNamespace(owns_k=True),
+        )
+        residual = torch.arange(64, dtype=torch.float32).reshape(1, 4, 16)
+        normalized = torch.full((1, 16), 7.0)
+        for state, expected in (
+            (HcState(residual), residual[:, 0, :]),
+            (HcState(residual, input=HcNormed(normalized)), normalized),
+        ):
+            with self.subTest(precomputed=state.input is not None):
+                layer.write_global_cache_only(
+                    torch.zeros(1, dtype=torch.long), state, SimpleNamespace()
+                )
+                call = backend.return_value.forward_low_ratio_sources.call_args
+                self.assertTrue(torch.equal(call.kwargs["x"], expected))
+                self.assertIsNone(call.kwargs["q_lora"])
+                self.assertTrue(call.kwargs["run_compressor"])
+                self.assertFalse(call.kwargs["run_indexer"])
 
     def test_embed_head_access_fails_for_encoder_only_prefill(self):
         model = object.__new__(DeepseekV4ForCausalLM)

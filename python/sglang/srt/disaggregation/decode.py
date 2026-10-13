@@ -3421,7 +3421,8 @@ class SchedulerDisaggregationDecodeMixin:
                     start = max(0, coverage - 128)
                     row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
                     req.prefix_indices = row[:start].clone()
-                    req.set_extend_range(start, end)
+                    req.prefix_len = start
+                    req.extend_end = end
                     continue
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.

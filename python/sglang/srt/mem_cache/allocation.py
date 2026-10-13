@@ -399,15 +399,15 @@ def alloc_for_extend(
         out_cache_loc = torch.cat(
             [
                 batch.req_to_token_pool.req_to_token[
-                    r.kv.req_pool_idx, r.extend_range.start : r.extend_range.end
+                    r.kv.req_pool_idx, r.prefix_len : r.extend_end
                 ]
                 for r in batch.reqs
             ]
         ).long()
         for req in batch.reqs:
-            if req.kv.kv_allocated_len < req.extend_range.end:
+            if req.kv.kv_allocated_len < req.extend_end:
                 raise RuntimeError("cache-only replay is missing preallocated KV slots")
-            req.kv.kv_committed_len = req.extend_range.end
+            req.kv.kv_committed_len = req.extend_end
         return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
     # free out-of-window swa tokens

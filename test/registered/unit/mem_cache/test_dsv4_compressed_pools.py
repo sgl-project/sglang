@@ -378,7 +378,8 @@ class TestDSV41CacheOnlyReplayAllocation(unittest.TestCase):
                 ),
                 kv_committed_len=0,
             ),
-            extend_range=SimpleNamespace(start=replay_start, end=prompt_len),
+            prefix_len=replay_start,
+            extend_end=prompt_len,
         )
         allocator = MagicMock()
         batch = SimpleNamespace(

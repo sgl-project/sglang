@@ -1640,6 +1640,7 @@ class TestSWAPoolFloor(CustomTestCase):
         _publish_config(
             self,
             enable_encoder_swa_bounded_replay=True,
+            dsv41_encoder_only_prefill=True,
             page_size=256,
             max_running_requests=2,
             chunked_prefill_size=256,
@@ -1672,6 +1673,22 @@ class TestSWAPoolFloor(CustomTestCase):
 
         self.assertGreater(sizes.swa_max_total_num_tokens, 0)
         self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+
+    def test_dsv4_trtllm_kv_bytes(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=1, page_size=256)
+        _publish_config(self, dsv4_attn_backend="trtllm", page_size=256)
+        kvc.kv_cache_dtype_str = "fp8_e4m3"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.index_head_dim = 128
+        cfg.compress_ratios = [0]
+        cfg.window_size = 128
+        cfg.hf_config.kv_source_layer_ids = []
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.kv_bytes, 512)
+        self.assertEqual(planner.bytes_per_swa_token, 512)
 
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in

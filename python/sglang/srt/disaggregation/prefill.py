@@ -909,9 +909,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if req.pending_bootstrap and should_force_retry(req):
                         self.optimistic_release_and_requeue(req)
                         continue
-                    coverage = (
-                        req.extend_range.end if req.extend_range is not None else 0
-                    )
+                    coverage = req.extend_end if req.extend_end is not None else 0
                     if coverage != len(req.origin_input_ids):
                         error_message = (
                             "DeepSeek-V4.1 cache-only Prefill finished without "
@@ -938,8 +936,8 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     req.inflight_middle_chunks -= 1
                     still_chunking = self.chunked_req is req or (
-                        req.extend_range is not None
-                        and req.extend_range.end >= len(req.origin_input_ids)
+                        req.extend_end is not None
+                        and req.extend_end >= len(req.origin_input_ids)
                     )
                     if is_aborted(req):
                         if not still_chunking and self._retire_aborted_prefill_result(
