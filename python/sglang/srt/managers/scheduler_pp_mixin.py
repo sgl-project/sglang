@@ -20,6 +20,12 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
+from sglang.srt.managers.scheduler_components.ring_loop import (
+    PP_DISAGG_DECODE_RING,
+    PP_DISAGG_PREFILL_RING,
+    PP_RING,
+    run_ring_loop,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -31,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
@@ -64,22 +70,6 @@ def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     fwd_batch = batch.copy()
     fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
     return fwd_batch
-
-
-def _pp_exchange_outputs_before_forward(
-    cur_batch: Optional[ScheduleBatch],
-    spec_relay: bool,
-    is_last_rank: bool,
-    async_batch_depth: int,
-) -> bool:
-    """Extend microbatches launch first: they need nothing from the relay, and
-    exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
-    must exchange first or the ring deadlocks on its tree rebuild."""
-    if async_batch_depth > 0:
-        return True
-    if not spec_relay or is_last_rank or cur_batch is None:
-        return False
-    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
 
 
 @dataclass
@@ -124,96 +114,7 @@ class SchedulerPPMixin:
 
         ====================================================================
         """
-        self.init_pp_loop_state()
-        self.rows_join_before_plan = True
-        while True:
-            server_is_idle = True
-            for mb_id in range(self.pp_loop_size):
-                self.decoding_batch = self.decoding_batches[mb_id]
-                if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
-                next_first_rank_mb_id = (
-                    mb_id + get_parallel().pp_size
-                ) % self.pp_loop_size
-                next_mb_id = (mb_id + 1) % self.pp_loop_size
-                with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.ingest_requests()
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
-                with torch.profiler.record_function("get_next_batch_to_run"):
-                    plan = self.get_next_batch_to_run(
-                        decoding_batch=self.decoding_batch
-                    )
-                    self._pp_debug_check_slot(mb_id)
-                    self.inflight_steps.push(plan.batch_to_run, None)
-                cur_batch: Optional[ScheduleBatch] = plan.batch_to_run
-                self.cur_batch_for_debug = cur_batch
-                if cur_batch:
-                    server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                next_pp_outputs = None
-                next_batch_result = None
-                d2h_event = None
-                exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
-                    cur_batch=cur_batch,
-                    spec_relay=self._pp_spec_relay,
-                    is_last_rank=self.pp_group.is_last_rank,
-                    async_batch_depth=get_parallel().pp_async_batch_depth,
-                )
-                if exchange_outputs_before_forward:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                self._pp_commit_proxy_send_work()
-                if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-                if not exchange_outputs_before_forward:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                next_batch = self._pp_pop_due_batch()
-                if next_batch is not None:
-                    d2h_event.synchronize()
-                    process_target = next_batch
-                    next_md = self.mb_metadata[next_mb_id]
-                    if next_md is not None and next_md.fwd_batch is not None:
-                        # PP+spec: process against the forward-time snapshot;
-                        # the live mb may have been recomposed since launch.
-                        process_target = next_md.fwd_batch
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            process_target,
-                            next_batch_result,
-                        )
-                    self._pp_update_rows_at_commit(next_mb_id, next_batch)
-                if not self.pp_group.is_last_rank:
-                    if cur_batch:
-                        self._pp_send_proxy_to_next_stage(result)
-
-                self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step()
-
-            # When the server is idle, self-check and re-init some states
-            if server_is_idle:
-                self._sched_idled = True
-                self.on_idle()
+        run_ring_loop(self, PP_RING)
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -248,311 +149,11 @@ class SchedulerPPMixin:
         PPConsensusStore instead of the legacy two-round RID sync.
 
         """
-        self.init_pp_loop_state()
-
-        # PD additional state initialization
-        tmbs = [None] * self.pp_loop_size
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
-        send_transfer_work = []
-        send_release_work = []
-
-        while True:
-            server_is_idle = True
-            for mb_id in range(self.pp_loop_size):
-                self.decoding_batch = self.decoding_batches[mb_id]
-                if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
-                next_first_rank_mb_id = (
-                    mb_id + get_parallel().pp_size
-                ) % self.pp_loop_size
-                next_mb_id = (mb_id + 1) % self.pp_loop_size
-
-                next_pp_outputs = None
-                next_release_rids = None
-                d2h_event = None
-                next_batch_result = None
-
-                recv_reqs = self.ingest_requests()
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-
-                self.process_bootstrapped_queue()
-
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
-                tmbs[mb_id] = transferred_rids
-
-                self.process_prefill_chunk(last_batch=self._pp_slot_last_batch(mb_id))
-                self._process_hicache_events()
-                prefill_plan = self.get_new_batch_prefill(self.decoding_batch)
-                batch = prefill_plan.batch_to_run
-                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-                self._pp_debug_check_slot(mb_id)
-                self.inflight_steps.push(batch, None)
-
-                cur_batch: Optional[ScheduleBatch] = batch
-                self.cur_batch_for_debug = cur_batch
-                if cur_batch:
-                    server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-
-                if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                self._pp_commit_proxy_send_work()
-                if cur_batch:
-                    if self.enable_staging:
-                        self.maybe_prefetch_staging_for_batch(cur_batch)
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-                if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
-                # post-process the coming microbatch
-                next_batch = self._pp_pop_due_batch()
-                if next_batch is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        next_batch,
-                        next_batch_result,
-                    )
-
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch:
-                        self._pp_send_proxy_to_next_stage(result)
-
-                self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step()
-                release_rids = next_release_rids
-
-            # When the server is idle, self-check and re-init some states
-            if server_is_idle:
-                self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
-                    self.on_idle()
+        run_ring_loop(self, PP_DISAGG_PREFILL_RING)
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
-        self.init_pp_loop_state()
-
-        # PD additional state initialization
-        rmbs = [None] * self.pp_loop_size
-        pmbs = [None] * self.pp_loop_size
-        tmbs = [None] * self.pp_loop_size
-        consensus_retract_rids: Optional[List[str]] = None
-        consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
-        send_retract_work = []
-        send_prealloc_work = []
-        send_transfer_work = []
-        send_consensus_retract_work = []
-        send_consensus_prealloc_work = []
-        send_release_work = []
-
-        while True:
-            server_is_idle = True
-            for mb_id in range(self.pp_loop_size):
-                self.decoding_batch = self.decoding_batches[mb_id]
-                if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
-                next_first_rank_mb_id = (
-                    mb_id + get_parallel().pp_size
-                ) % self.pp_loop_size
-                next_mb_id = (mb_id + 1) % self.pp_loop_size
-
-                next_pp_outputs = None
-                next_consensus_retract_rids = None
-                next_consensus_prealloc_rids = None
-                next_release_rids = None
-                d2h_event = None
-                next_batch_result = None
-
-                recv_reqs = self.ingest_requests()
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-
-                # reaching consensus through PP ranks
-                retract_rids = self._pp_pd_get_retract_ids(mb_id)
-                rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
-
-                prealloc_rids = self._pp_pd_get_prealloc_ids()
-                pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
-
-                transferred_rids = self._pp_pd_get_decode_transferred_ids()
-                tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
-
-                # get batch to run and proxy tensors if needed
-                plan = self.get_next_disagg_decode_batch_to_run(
-                    decoding_batch=self.decoding_batch
-                )
-                batch = plan.batch_to_run
-                self._pp_debug_check_slot(mb_id)
-                self.inflight_steps.push(batch, None)
-
-                cur_batch: Optional[ScheduleBatch] = batch
-                self.cur_batch_for_debug = cur_batch
-                if cur_batch:
-                    server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-
-                # early send output if possible
-                if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                self._pp_commit_proxy_send_work()
-
-                if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-
-                if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-
-                # reach consensus on last rank and send to PP=0
-                # otherwise, just pass along previous consensus
-                send_consensus_retract_work, consensus_retract_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        rmbs,
-                        next_first_rank_mb_id,
-                        consensus_retract_rids,
-                        retract_rids,
-                    )
-                )
-
-                send_consensus_prealloc_work, consensus_prealloc_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        pmbs,
-                        next_first_rank_mb_id,
-                        consensus_prealloc_rids,
-                        prealloc_rids,
-                    )
-                )
-
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
-
-                if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                    self.decode_offload_manager.check_offload_progress()
-
-                if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids = self.process_retract_queue(
-                        next_consensus_retract_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_retract_work)
-
-                if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_decode_transfer_queue(
-                        next_release_rids
-                    )
-                self._pp_commit_comm_work(send_release_work)
-
-                # post-process the coming microbatch
-                next_batch = self._pp_pop_due_batch()
-                if next_batch is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        next_batch,
-                        next_batch_result,
-                    )
-                    self._pp_update_rows_at_commit(next_mb_id, next_batch)
-
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch:
-                        self._pp_send_proxy_to_next_stage(result)
-
-                self.pp_outputs = next_pp_outputs
-                self.inflight_steps.end_step()
-                release_rids = next_release_rids
-                consensus_retract_rids = next_consensus_retract_rids
-                consensus_prealloc_rids = next_consensus_prealloc_rids
-
-            # When the server is idle, self-check and re-init some states
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            if server_is_idle:
-                self._sched_idled = True
-                if queue_size == 0:
-                    self.on_idle()
+        run_ring_loop(self, PP_DISAGG_DECODE_RING)
 
     # A read alias of each slot's running rows, set up by the pipeline loops.
     # The loops change the rows through decoding_batches, except PrefillAdder's

@@ -17,10 +17,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
-    SchedulerPPMixin,
+from sglang.srt.managers.scheduler_components.ring_loop import (  # noqa: E402
     _pp_exchange_outputs_before_forward,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
