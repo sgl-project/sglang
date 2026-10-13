@@ -132,9 +132,9 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
 
                 plan_count = 0
 
-                def get_next_batch_to_run(*, running_batch, last_batch):
+                def get_next_batch_to_run(*, decoding_batch, last_batch):
                     nonlocal plan_count
-                    del running_batch, last_batch
+                    del decoding_batch, last_batch
                     plan_count += 1
                     if plan_count == 1:
                         batch.prepare_for_decode()

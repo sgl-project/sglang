@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -241,7 +242,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         scheduler.ipc_channels = MagicMock()
         scheduler.beam_coordinator = MagicMock()
-        scheduler.update_running_batch(batch)
+        scheduler.update_running_batch(DecodingBatch(batch))
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""

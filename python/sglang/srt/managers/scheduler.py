@@ -229,6 +229,7 @@ from sglang.srt.managers.scheduler_components._req_scan import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -1292,7 +1293,7 @@ class Scheduler(
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[])
+        self.decoding_batch = DecodingBatch(ScheduleBatch(reqs=[]))
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1315,6 +1316,16 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._deferred_input_requests: List = []
+
+    # A read alias of the running rows. The event loops change the rows only
+    # through decoding_batch; assigning here gives the rows a new owner.
+    @property
+    def running_batch(self) -> ScheduleBatch:
+        return self.decoding_batch.rows
+
+    @running_batch.setter
+    def running_batch(self, rows: ScheduleBatch) -> None:
+        self.decoding_batch = DecodingBatch(rows)
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -1955,9 +1966,8 @@ class Scheduler(
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
             )
-            self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
@@ -1997,9 +2007,8 @@ class Scheduler(
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
             )
-            self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
@@ -3762,7 +3771,7 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+        self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
         self._process_hicache_events()
@@ -3795,11 +3804,8 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
-                if running_batch.is_empty():
-                    running_batch = new_batch
-                else:
-                    running_batch.merge_batch(new_batch)
-                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                decoding_batch.join(new_batch)
+                decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
         if (
             not self.enable_hisparse
@@ -3820,30 +3826,25 @@ class Scheduler(
             # Merge the new batch into the running batch. A running batch that
             # DP attention converted to extend is last_batch itself: filtered
             # in place above, nothing to merge.
-            if not last_batch.is_empty() and last_batch is not running_batch:
-                if running_batch.is_empty():
-                    running_batch = last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    running_batch.merge_batch(last_batch)
+            if not last_batch.is_empty() and last_batch is not decoding_batch.rows:
+                decoding_batch.join(last_batch)
 
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
         # live rows. Runs after the last_batch join and outside it, so finished
         # rows leave even when no new batch arrives (e.g. traffic stops).
-        self.leave_finished_rows(running_batch)
+        self.leave_finished_rows(decoding_batch)
         if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.on_plan_start(running_batch)
+            self.scripted_scheduler_hook.on_plan_start(decoding_batch.rows)
 
-        admit_plan = self._admit_prefill(running_batch)
-        running_batch = admit_plan.running_batch
+        admit_plan = self._admit_prefill(decoding_batch)
         new_batch, need_mlp_sync = self._gather_admitted(admit_plan.batch_to_run)
 
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
         else:
-            ret = self._select_decode(running_batch)
+            ret = self._select_decode(decoding_batch)
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
@@ -3853,22 +3854,22 @@ class Scheduler(
 
         plan = NextBatchPlan(
             batch_to_run=ret,
-            running_batch=running_batch,
+            running_batch=decoding_batch.rows,
             admission_skip_reason=admit_plan.admission_skip_reason,
         )
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_schedule(plan)
         return plan
 
-    def _admit_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+    def _admit_prefill(self, decoding_batch: DecodingBatch) -> NextBatchPlan:
         """Admit this step's prefill batch; a mixed step also takes the decode rows."""
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(running_batch)
+            new_batch = self.get_new_batch_dllm(decoding_batch.rows)
         elif self._should_defer_prefill():
             new_batch = None
         else:
-            return self.get_new_batch_prefill(running_batch)
-        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
+            return self.get_new_batch_prefill(decoding_batch)
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=decoding_batch.rows)
 
     def _gather_admitted(
         self, new_batch: Optional[ScheduleBatch]
@@ -3896,16 +3897,16 @@ class Scheduler(
             need_mlp_sync = new_batch is None
         return new_batch, need_mlp_sync
 
-    def _select_decode(self, running_batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def _select_decode(self, decoding_batch: DecodingBatch) -> Optional[ScheduleBatch]:
         """Select the running batch's rows that decode this step; None skips decode."""
         # Run decode (skip for prefill-only batches)
         if (
-            not running_batch.is_empty()
-            and not running_batch.is_prefill_only
-            and self.select_decode_rows(running_batch, retract=True)
-            and not running_batch.is_empty()
+            not decoding_batch.rows.is_empty()
+            and not decoding_batch.rows.is_prefill_only
+            and self.select_decode_rows(decoding_batch, retract=True)
+            and not decoding_batch.rows.is_empty()
         ):
-            return running_batch
+            return decoding_batch.rows
         return None
 
     def _finalize_step(self, ret: Optional[ScheduleBatch]) -> Optional[ScheduleBatch]:
@@ -3972,7 +3973,7 @@ class Scheduler(
             return AdmissionSkipReason.NO_REQ_SLOT
         return None
 
-    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+    def get_new_batch_prefill(self, decoding_batch: DecodingBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3985,7 +3986,7 @@ class Scheduler(
 
         plan = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
+            decoding_batch=decoding_batch,
         )
 
         if self.prefill_delayer:
@@ -4003,8 +4004,10 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
-        running_batch: ScheduleBatch,
+        decoding_batch: DecodingBatch,
     ) -> NextBatchPlan:
+        # The rows object; a mixed step parks the rows only after its last read.
+        running_batch = decoding_batch.rows
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4289,7 +4292,7 @@ class Scheduler(
             # rows. They then sit out this step and decode on the next decode
             # step, which fits them; a mixed step does not retract them.
             if (
-                self.select_decode_rows(running_batch, retract=False)
+                self.select_decode_rows(decoding_batch, retract=False)
                 and not running_batch.is_empty()
             ):
                 new_batch.mix_with_running(running_batch)
@@ -4304,9 +4307,9 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                running_batch = ScheduleBatch(reqs=[])
+                decoding_batch.park_for_mix()
 
-        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=decoding_batch.rows)
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -4351,30 +4354,31 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
-    def leave_finished_rows(self, running_batch: ScheduleBatch) -> None:
-        """Drop the running rows whose finish a commit already observed.
+    def leave_finished_rows(self, decoding_batch: DecodingBatch) -> None:
+        """Drop the running rows whose finish a commit already observed."""
+        decoding_batch.leave_finished()
 
-        An empty batch has no rows to drop and is left untouched.
-        """
-        if not running_batch.is_empty():
-            running_batch.filter_batch()
-
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def update_running_batch(
+        self, decoding_batch: DecodingBatch
+    ) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
-        if not self.select_decode_rows(batch, retract=True):
+        if not self.select_decode_rows(decoding_batch, retract=True):
             return None
-        return batch
+        return decoding_batch.rows
 
-    def select_decode_rows(self, batch: ScheduleBatch, *, retract: bool) -> bool:
-        """Keep in batch the rows that decode this step and prepare them for
+    def select_decode_rows(
+        self, decoding_batch: DecodingBatch, *, retract: bool
+    ) -> bool:
+        """Keep the running rows that decode this step and prepare them for
         decode; False skips decode this step.
 
         Drops rows whose last output is already in flight. When the rest do not
         fit the KV pool, retract mode retracts rows; hold mode (a mixed step)
         holds them all back to decode on a later step.
         """
+        batch = decoding_batch.rows
         finishing_reqs = self._reqs_finishing_inflight(batch)
-        batch.filter_batch(reqs_to_exclude=finishing_reqs)
+        decoding_batch.leave(finishing_reqs)
         if batch.is_empty():
             return True
 
@@ -4387,7 +4391,7 @@ class Scheduler(
         if not retract:
             if kv_full_retract_flag:
                 return False
-            batch.prepare_for_decode()
+            decoding_batch.advance()
             return True
 
         # Check if decode out of memory
@@ -4407,7 +4411,7 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = decoding_batch.retract()
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -4462,7 +4466,7 @@ class Scheduler(
             return True
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        decoding_batch.advance()
         return True
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -5719,7 +5723,7 @@ class Scheduler(
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
             )
-        self.running_batch.reqs = []
+        self.decoding_batch.clear_for_pause()
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:

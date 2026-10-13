@@ -83,8 +83,8 @@ class SchedulingTraceWriter:
     def observe_readers(self, scheduler: Scheduler) -> None:
         """Snapshot reader values at the top of an iteration for the next record.
 
-        Not taken in record_schedule: mid-planning, scheduler.running_batch is
-        not yet the plan's running batch, a state no reader sees.
+        Not taken in record_schedule: readers run between plans, and a recorded
+        plan has already changed what they read (the running rows, last_batch).
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {

@@ -347,6 +347,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         )
         from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.decoding_batch import (
+            DecodingBatch,
+        )
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
@@ -383,8 +386,10 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         batch.forward_mode.is_extend.return_value = False
         batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
         scheduler.running_batch = batch
+        scheduler.decoding_batch = DecodingBatch(batch)
 
-        def get_next_batch_to_run(running_batch, last_batch):
+        def get_next_batch_to_run(decoding_batch, last_batch):
+            running_batch = decoding_batch.rows
             plan = MagicMock()
             plan.running_batch = running_batch
             plan.batch_to_run = running_batch if running_batch.reqs else None

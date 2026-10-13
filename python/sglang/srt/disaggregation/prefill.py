@@ -99,6 +99,7 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -625,7 +626,7 @@ class SchedulerDisaggregationPrefillMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
-        running_batch: ScheduleBatch,
+        decoding_batch: DecodingBatch,
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
@@ -642,9 +643,8 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch is not None:
                 last_batch.prefill_chunk_processed = True
 
-        prefill_plan = self.get_new_batch_prefill(running_batch)
+        prefill_plan = self.get_new_batch_prefill(decoding_batch)
         batch = prefill_plan.batch_to_run
-        running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -652,7 +652,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         return NextBatchPlan(
             batch_to_run=batch,
-            running_batch=running_batch,
+            running_batch=decoding_batch.rows,
             admission_skip_reason=prefill_plan.admission_skip_reason,
         )
 
@@ -675,9 +675,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+                decoding_batch=self.decoding_batch, last_batch=self.last_batch
             )
-            self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
@@ -779,12 +778,11 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 # Get the next batch to run
                 plan = self.get_next_disagg_prefill_batch_to_run(
-                    running_batch=self.running_batch,
+                    decoding_batch=self.decoding_batch,
                     last_batch=self.last_batch,
                     # Storage retry deadlines count scheduling steps, not copy polls.
                     should_retry_storage_prefetch=not waiting_for_batch_result,
                 )
-                self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
                 batch = self.ngram_embedding_manager.prepare_for_forward(
                     batch, chunked_req=self.chunked_req

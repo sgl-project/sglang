@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -80,9 +81,11 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
         s.seen = []
 
-        def get_new_batch_prefill(running_batch):
-            s.seen.append(_rids(running_batch))
-            return NextBatchPlan(batch_to_run=admitted, running_batch=running_batch)
+        def get_new_batch_prefill(decoding_batch):
+            s.seen.append(_rids(decoding_batch.rows))
+            return NextBatchPlan(
+                batch_to_run=admitted, running_batch=decoding_batch.rows
+            )
 
         s.get_new_batch_prefill = get_new_batch_prefill
         return s
@@ -95,7 +98,9 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
             [_Req("a"), _Req("b", True), _Req("c"), _Req("d", True), _Req("e")]
         )
 
-        plan = s.get_next_batch_to_run(running_batch=running, last_batch=None)
+        plan = s.get_next_batch_to_run(
+            decoding_batch=DecodingBatch(running), last_batch=None
+        )
 
         self.assertEqual(s.seen, [["a", "c", "e"]])
         self.assertEqual(_rids(plan.running_batch), ["a", "c", "e"])
@@ -108,7 +113,9 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         running = _Batch([_Req("a", True), _Req("b")])
         last = _Batch([_Req("c"), _Req("d")], extend=True)
 
-        plan = s.get_next_batch_to_run(running_batch=running, last_batch=last)
+        plan = s.get_next_batch_to_run(
+            decoding_batch=DecodingBatch(running), last_batch=last
+        )
 
         self.assertEqual(s.seen, [["b", "c", "d"]])
         self.assertIs(plan.batch_to_run, running)
@@ -116,7 +123,9 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         # The join sees the old rows before they leave: a batch whose rows all
         # finished takes the new rows in, it is not replaced at this plan.
         running = _Batch([_Req("a", True)])
-        plan = s.get_next_batch_to_run(running_batch=running, last_batch=last)
+        plan = s.get_next_batch_to_run(
+            decoding_batch=DecodingBatch(running), last_batch=last
+        )
         self.assertIs(plan.running_batch, running)
         self.assertEqual(_rids(running), ["c", "d"])
 
@@ -125,16 +134,16 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         # next plan adopts the joining batch instead of merging into it.
         new = _Batch([_Req("new")], extend=True)
         s = self._scheduler(admitted=new)
-        running = _Batch([_Req("a", True), _Req("b", True)])
+        decoding_batch = DecodingBatch(_Batch([_Req("a", True), _Req("b", True)]))
 
-        plan = s.get_next_batch_to_run(running_batch=running, last_batch=None)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=None)
         self.assertEqual(s.seen, [[]])
         self.assertIs(plan.batch_to_run, new)
 
-        s.get_new_batch_prefill = lambda rb: NextBatchPlan(
-            batch_to_run=None, running_batch=rb
+        s.get_new_batch_prefill = lambda db: NextBatchPlan(
+            batch_to_run=None, running_batch=db.rows
         )
-        plan = s.get_next_batch_to_run(running_batch=plan.running_batch, last_batch=new)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=new)
         self.assertIs(plan.running_batch, new)
         self.assertEqual(_rids(plan.running_batch), ["new"])
 
@@ -146,18 +155,20 @@ class TestLeaveBeforeDecodePrealloc(unittest.TestCase):
         s.gracefully_exit = False
         s._engine_paused = False
         s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
-        s.running_batch = _Batch([_Req("a"), _Req("b", True), _Req("c")])
+        s.decoding_batch = DecodingBatch(
+            _Batch([_Req("a"), _Req("b", True), _Req("c")])
+        )
         s.is_disable_overlap_for_batch.return_value = False
         s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
         seen = []
 
         def process_decode_queue():
-            seen.append(_rids(s.running_batch))
+            seen.append(_rids(s.decoding_batch.rows))
             s.gracefully_exit = True
 
         s.process_decode_queue.side_effect = process_decode_queue
-        s.get_next_disagg_decode_batch_to_run.side_effect = lambda running_batch: (
-            NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+        s.get_next_disagg_decode_batch_to_run.side_effect = lambda decoding_batch: (
+            NextBatchPlan(batch_to_run=None, running_batch=decoding_batch.rows)
         )
         event_loop(s)
         return seen
@@ -176,12 +187,14 @@ class TestLeaveBeforeDecodePrealloc(unittest.TestCase):
         s = MagicMock()
         s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
         s.pp_loop_size = 1
-        s.running_mbs = [_Batch([_Req("a"), _Req("b", True), _Req("c")])]
+        s.decoding_batches = [
+            DecodingBatch(_Batch([_Req("a"), _Req("b", True), _Req("c")]))
+        ]
         s.last_mbs = [None]
         seen = []
 
-        def get_next_disagg_decode_batch_to_run(running_batch):
-            seen.append(_rids(running_batch))
+        def get_next_disagg_decode_batch_to_run(decoding_batch):
+            seen.append(_rids(decoding_batch.rows))
             raise _StopLoop
 
         s.get_next_disagg_decode_batch_to_run.side_effect = (

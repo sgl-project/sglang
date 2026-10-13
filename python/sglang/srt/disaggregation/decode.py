@@ -133,6 +133,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
@@ -3010,14 +3011,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             # Finished rows leave before preallocation and the prebuilt join
             # size their budgets from the running batch.
-            self.leave_finished_rows(self.running_batch)
+            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                decoding_batch=self.decoding_batch
             )
-            self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
@@ -3062,14 +3062,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             # Finished rows leave before preallocation and the prebuilt join
             # size their budgets from the running batch.
-            self.leave_finished_rows(self.running_batch)
+            self.leave_finished_rows(self.decoding_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                decoding_batch=self.decoding_batch
             )
-            self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
@@ -3113,11 +3112,11 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, decoding_batch: DecodingBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch = self.get_new_prebuilt_batch(decoding_batch.rows)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -3125,24 +3124,22 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        running_batch.hisparse_coordinator = self.hisparse_coordinator
-                else:
-                    running_batch.merge_batch(new_prebuilt_batch)
+                # Rows adopted from a prebuilt batch take the HiSparse coordinator.
+                if self.enable_hisparse and decoding_batch.rows.is_empty():
+                    new_prebuilt_batch.hisparse_coordinator = self.hisparse_coordinator
+                decoding_batch.join(new_prebuilt_batch)
 
         # Schedule decode batch
-        if running_batch.is_empty():
+        if decoding_batch.rows.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
+            running_batch = self.update_running_batch(decoding_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return NextBatchPlan(batch_to_run=ret, running_batch=decoding_batch.rows)
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch

@@ -122,7 +122,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s, req = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
         Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
+            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
         )
 
         self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
@@ -134,7 +134,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s, req = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
         Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
+            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
         )
 
         self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
@@ -149,7 +149,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
         Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
+            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
         cache.checkpoint.assert_not_called()

@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -127,7 +128,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.decoding_batch = self.decoding_batches[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 if self.recv_skipper is not None:
                     self.recv_skipper.on_launch(self.last_batch)
@@ -146,12 +147,10 @@ class SchedulerPPMixin:
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
-                        running_batch=self.running_batch, last_batch=self.last_batch
+                        decoding_batch=self.decoding_batch, last_batch=self.last_batch
                     )
-                    self.running_batch = plan.running_batch
                     self._pp_debug_check_slot(mb_id)
                     self.inflight_steps.push(plan.batch_to_run, None)
-                self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = plan.batch_to_run
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
@@ -261,7 +260,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.decoding_batch = self.decoding_batches[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 if self.recv_skipper is not None:
                     self.recv_skipper.on_launch(self.last_batch)
@@ -288,13 +287,11 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk(last_batch=self.last_batch)
                 self._process_hicache_events()
-                prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                prefill_plan = self.get_new_batch_prefill(self.decoding_batch)
                 batch = prefill_plan.batch_to_run
-                self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self._pp_debug_check_slot(mb_id)
                 self.inflight_steps.push(batch, None)
-                self.running_mbs[mb_id] = self.running_batch
 
                 cur_batch: Optional[ScheduleBatch] = batch
                 self.cur_batch_for_debug = cur_batch
@@ -389,7 +386,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.decoding_batch = self.decoding_batches[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 if self.recv_skipper is not None:
                     self.recv_skipper.on_launch(self.last_batch)
@@ -424,16 +421,14 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
 
                 # Finished rows leave before the prebuilt join sizes its budget.
-                self.leave_finished_rows(self.running_batch)
+                self.leave_finished_rows(self.decoding_batch)
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
-                    running_batch=self.running_batch
+                    decoding_batch=self.decoding_batch
                 )
-                self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
                 self._pp_debug_check_slot(mb_id)
                 self.inflight_steps.push(batch, None)
-                self.running_mbs[mb_id] = self.running_batch
 
                 cur_batch: Optional[ScheduleBatch] = batch
                 self.cur_batch_for_debug = cur_batch
@@ -564,6 +559,17 @@ class SchedulerPPMixin:
                 if queue_size == 0:
                     self.on_idle()
 
+    # A read alias of each slot's running rows, set up by the pipeline loops.
+    # The loops change the rows only through decoding_batches; assigning here
+    # gives every slot's rows a new owner.
+    @property
+    def running_mbs(self: Scheduler) -> List[ScheduleBatch]:
+        return [decoding_batch.rows for decoding_batch in self.decoding_batches]
+
+    @running_mbs.setter
+    def running_mbs(self: Scheduler, rows_per_slot: List[ScheduleBatch]) -> None:
+        self.decoding_batches = [DecodingBatch(rows) for rows in rows_per_slot]
+
     def init_pp_loop_state(self: Scheduler):
         # In-flight readers gated on overlap expect non-ring records; server
         # args force overlap off under PP.
@@ -575,7 +581,9 @@ class SchedulerPPMixin:
         # launch, just before the step that replans it.
         self.inflight_steps = InflightQueue(depth=self.pp_loop_size - 1, ring=True)
         self.last_mbs = [None] * self.pp_loop_size
-        self.running_mbs = [ScheduleBatch(reqs=[]) for _ in range(self.pp_loop_size)]
+        self.decoding_batches = [
+            DecodingBatch(ScheduleBatch(reqs=[])) for _ in range(self.pp_loop_size)
+        ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
