@@ -286,24 +286,30 @@ class LoRAAdapter(nn.Module):
                 v_name = weight_name.replace("q_proj", "v_proj")
                 qkv_name = weight_name.replace("q_proj", "qkv_proj")
 
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
-                )
+                # k_proj / v_proj presence is checked per layer, not per
+                # adapter: a layer can lack one of them even when the adapter
+                # targets it elsewhere (e.g. Gemma 4 `attention_k_eq_v` layers
+                # have no v_proj). A missing branch is zero-filled from the
+                # other, which has the same shape for both lora_A and lora_B.
+                k_proj_weight = weights.pop(k_name, None)
+                v_proj_weight = weights.pop(v_name, None)
+                if k_proj_weight is None and v_proj_weight is None:
+                    raise ValueError(
+                        f"LoRA weight {q_name} has neither a k_proj nor a v_proj "
+                        "counterpart; at least one is required to build qkv_proj."
+                    )
+                if k_proj_weight is None:
+                    k_proj_weight = torch.zeros_like(v_proj_weight)
+                if v_proj_weight is None:
+                    v_proj_weight = torch.zeros_like(k_proj_weight)
                 weights[qkv_name] = torch.cat(
                     (
-                        weights[q_name],
+                        weights.pop(q_name),
                         k_proj_weight,
-                        weights[v_name],
+                        v_proj_weight,
                     ),
                     0,
                 )
-                weights.pop(q_name)
-                if "k_proj" in target_module:
-                    weights.pop(k_name)
-                weights.pop(v_name)
             elif "qkv_proj" in weight_name:
                 # If qkv_proj is already stacked, we normalize it following the SGL convention.
                 qkv_name = weight_name
