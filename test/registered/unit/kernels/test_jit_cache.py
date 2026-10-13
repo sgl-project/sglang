@@ -223,13 +223,47 @@ def test_arch_query_uses_cuda_api_after_musa_initialization(
     assert calls == (["torchada", "query"] if backend == "musa" else ["query"])
 
 
-def test_musa_target_flags_use_cxx20_without_changing_cuda(monkeypatch):
+@pytest.mark.parametrize("standard", ["c++17", "c++20"])
+def test_musa_target_flags_use_detected_standard_without_changing_cuda(
+    monkeypatch, standard
+):
     monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
-    assert "-std=c++20" in arch.get_default_target_flags()
+    monkeypatch.setattr(arch, "musa_cxx_standard", lambda: standard)
+    assert f"-std={standard}" in arch.get_default_target_flags()
 
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: False)
     assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
+
+
+@pytest.mark.parametrize(
+    "compiler_output, expected",
+    [
+        ("mcc: clang version 20.1.8\n", "c++20"),
+        ("mcc: clang version 14.0.0\n", "c++17"),
+        ("mcc legacy wrapper\n", "c++17"),
+    ],
+)
+def test_musa_cxx_standard_detects_compiler_capability(
+    monkeypatch, compiler_output, expected
+):
+    monkeypatch.setattr(toolchain, "device_compiler_path", lambda: "/opt/musa/bin/mcc")
+    monkeypatch.setattr(
+        arch.subprocess,
+        "check_output",
+        lambda command, **kwargs: compiler_output,
+    )
+    assert arch.musa_cxx_standard.__wrapped__() == expected
+
+
+def test_musa_cxx_standard_falls_back_when_compiler_probe_fails(monkeypatch):
+    monkeypatch.setattr(toolchain, "device_compiler_path", lambda: "/opt/musa/bin/mcc")
+
+    def fail_probe(*args, **kwargs):
+        raise OSError("compiler unavailable")
+
+    monkeypatch.setattr(arch.subprocess, "check_output", fail_probe)
+    assert arch.musa_cxx_standard.__wrapped__() == "c++17"
 
 
 @pytest.mark.parametrize("backend", ["cuda", "hip", "musa"])

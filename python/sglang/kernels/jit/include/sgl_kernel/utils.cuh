@@ -17,12 +17,15 @@
 #pragma once
 
 #include <sgl_kernel/bits.h>
+#include <sgl_kernel/cxx_compat.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#if SGL_USE_CONCEPTS
 #include <concepts>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -166,7 +169,17 @@ inline constexpr uint32_t kWarpThreads = 32u;
 /// \brief Most implementations prefer this name; keep the alias for them.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
+#if SGL_USE_TYPE_IDENTITY
 using std::type_identity_t;
+#else
+template <typename T>
+struct TypeIdentity {
+  using type = T;
+};
+
+template <typename T>
+using type_identity_t = typename TypeIdentity<T>::type;
+#endif
 
 /**
  * \brief This thread's index within its logical `kNumThreads` group.
@@ -262,7 +275,11 @@ SGL_DEVICE void PDLTriggerSecondary() {
 #endif
 }
 
+#if SGL_USE_CONCEPTS
 template <std::integral T, std::integral U>
+#else
+template <typename T, typename U, std::enable_if_t<std::is_integral_v<T> && std::is_integral_v<U>, int> = 0>
+#endif
 SGL_DEVICE constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -297,12 +314,20 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }
@@ -585,8 +610,9 @@ struct LaunchKernel {
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
 #define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
-  } else                                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) SGL_LIKELY { \
+    }                                                                 \
+  else                                                                \
     host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
