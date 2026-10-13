@@ -504,7 +504,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.rows_join_before_plan = False
-        scheduler.disagg_decode_launches_copy = False
         scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.recv_skipper = None
         scheduler.chunked_req = None

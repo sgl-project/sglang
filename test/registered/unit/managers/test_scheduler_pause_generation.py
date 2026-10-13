@@ -76,7 +76,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.rows_join_before_plan = False
-        scheduler.disagg_decode_launches_copy = False
         scheduler.recv_skipper = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -394,7 +393,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.last_batch.num_decode_rows = 1 if mixed else 0
                 scheduler.chunked_req = chunk
                 scheduler.rows_join_before_plan = True
-                scheduler.disagg_decode_launches_copy = False
                 requeue_log = self._spy_requeue(scheduler)
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))

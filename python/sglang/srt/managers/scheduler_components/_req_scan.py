@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
@@ -36,6 +38,10 @@ def running_and_inflight_batches(
 
 def rows_hold_launched(scheduler: Scheduler) -> bool:
     """Whether the rows hold every unfinished request of the steps launched,
-    except the steps in flight and the request still chunking: the loops that
-    join at launch, and the PD decode loops, whose step is a copy of the rows."""
-    return scheduler.rows_join_before_plan or scheduler.disagg_decode_launches_copy
+    except the steps in flight and the request still chunking: the normal and
+    overlap loops, which join before the plan, and the PD decode loops, whose
+    step is a copy of the rows. Not the pipeline loops."""
+    return (
+        scheduler.rows_join_before_plan
+        or scheduler.disaggregation_mode == DisaggregationMode.DECODE
+    ) and not scheduler.inflight_steps.ring

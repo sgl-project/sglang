@@ -5250,10 +5250,11 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (not self.enable_overlap or len(self.inflight_steps) == 0)
             and self._pp_microbatches_drained()
-            # Under a loop that joins at launch, a just-prefilled HiSparse request
+            # Under the normal and overlap loops, a just-prefilled HiSparse request
             # waits in staging, not in the rows, until the next plan.
             and not (
                 self.rows_join_before_plan
+                and not self.inflight_steps.ring
                 and self.hisparse_coordinator is not None
                 and len(self.hisparse_coordinator.ack_staging_queue) > 0
             )

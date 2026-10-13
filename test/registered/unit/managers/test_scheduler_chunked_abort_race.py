@@ -51,7 +51,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
     sched.rows_join_before_plan = False
-    sched.disagg_decode_launches_copy = False
     return sched
 
 
