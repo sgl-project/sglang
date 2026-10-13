@@ -144,7 +144,19 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    # Dots SWA uses FlashInfer even with a non-FlashInfer MoE/GEMM backend.
+    # The adapter is prepared before Graph capture and participates in the
+    # existing dummy-forward autotune context; no new serving option is needed.
+    attn_backend = getattr(mr, "attn_backend", None)
+    attn_backend = getattr(attn_backend, "primary", attn_backend)
+    swa_backend = getattr(attn_backend, "swa_backend", attn_backend)
+    mla_swa_needs_autotune = getattr(swa_backend, "_mla_swa", None) is not None
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or mla_swa_needs_autotune
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:

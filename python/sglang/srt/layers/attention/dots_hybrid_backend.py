@@ -145,6 +145,22 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
 
+        self._mla_swa = None
+        # Only the Dots SWA wrapper prepares this optional native path. TP8
+        # (Hq8), other devices, and older FlashInfer versions retain fallback.
+        native_backend = (
+            backend.decode_backend
+            if isinstance(backend, HybridAttnBackend)
+            else backend
+        )
+        if (
+            getattr(native_backend, "num_attention_heads", None) == 64
+            and getattr(native_backend, "attn_cp_size", 1) == 1
+        ):
+            from sglang.srt.layers.attention.swa_mla import FlashInferMLASWA
+
+            self._mla_swa = FlashInferMLASWA.create(native_backend.device)
+
     @property
     def forward_metadata(self):
         return self._active_backend.forward_metadata
@@ -384,7 +400,13 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         )
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        output = forward_dense_kvlora_swa_torch_fallback(
+        native = getattr(self, "_mla_swa", None)
+        forward = (
+            native.forward
+            if native is not None
+            else forward_dense_kvlora_swa_torch_fallback
+        )
+        output = forward(
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
