@@ -581,6 +581,11 @@ def fused_sigmoid_gating_delta_rule_update(
             "match_cutedsl_decode is defined for the KDA softplus gate only "
             "(is_kda=True, lower_bound=None)."
         )
+    if match_cutedsl_decode and not is_cuda():
+        raise ValueError(
+            "match_cutedsl_decode requires NVIDIA CUDA because it copies "
+            "NVIDIA CuTe DSL decode instructions."
+        )
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]

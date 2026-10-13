@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.common import get_device, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -790,6 +790,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         )
         return decode_output, decode_state, verify_output, verify_state[slots]
 
+    @unittest.skipIf(is_hip(), "CuTe DSL decode parity requires NVIDIA CUDA")
     def test_bf16_state_verify_matches_single_token_launches(self):
         for K in (128, 64):
             with self.subTest(head_dim=K):
@@ -818,6 +819,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
             verify_output.float(), decode_output.float(), atol=2e-2, rtol=1e-2
         )
 
+    @unittest.skipIf(is_hip(), "CuTe DSL decode parity requires NVIDIA CUDA")
     def test_fp32_state_pool_is_not_rounded(self):
         _, decode_state, _, verify_state = self._run_decode_loop_and_verify(
             B=2, T=16, H=4, K=128, state_dtype=torch.float32, match_decode=True
@@ -825,6 +827,18 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         self.assertTrue(torch.equal(verify_state, decode_state))
         rounded = verify_state.to(torch.bfloat16).to(torch.float32)
         self.assertFalse(torch.equal(verify_state, rounded))
+
+    @unittest.skipUnless(is_hip(), "Test requires ROCm")
+    def test_cutedsl_decode_mode_is_rejected_on_rocm(self):
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            self._run_decode_loop_and_verify(
+                B=1,
+                T=1,
+                H=1,
+                K=64,
+                state_dtype=torch.bfloat16,
+                match_decode=True,
+            )
 
 
 if __name__ == "__main__":
