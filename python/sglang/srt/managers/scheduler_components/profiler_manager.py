@@ -18,11 +18,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    resolve_torch_profiler_activities,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -167,24 +169,7 @@ class SchedulerProfilerManager:
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
 
-        activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
-        }
-
-        if current_platform.is_out_of_tree():
-            if hasattr(
-                torch.profiler.ProfilerActivity,
-                current_platform.get_torch_profiler_activity_str(),
-            ):
-                activity_map[current_platform.get_torch_profiler_activity_str()] = (
-                    current_platform.get_torch_profiler_activity()
-                )
-        if hasattr(torch.profiler.ProfilerActivity, "XPU"):
-            activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
-        torchprof_activities = [
-            activity_map[a] for a in activities if a in activity_map
-        ]
+        torchprof_activities = resolve_torch_profiler_activities(activities)
 
         if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
