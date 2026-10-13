@@ -533,14 +533,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
-
     def _explicit_dit_layerwise_offload(self) -> bool:
         """True when the user asked for layerwise DiT residency, not a compile-only window."""
         args = self.server_args
         if args.dit_layerwise_offload:
             return True
         return bool(getattr(args, "is_dit_layerwise_offload_selected", False))
-
 
     def _maybe_torch_compile(self, module: object) -> None:
         """
