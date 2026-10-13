@@ -65,6 +65,45 @@ class TestSchedulingTraceWriter(CustomTestCase):
         self.assertEqual([r["retracted"] for r in records[1:]], [[], ["r0"], []])
         self.assertEqual(records[1]["admission_skip_reason"], "NO_WAITING")
 
+    def test_mixed_step_records_its_decode_rows_as_running(self):
+        # A mixed step empties the plan's running batch for the step; its
+        # decode rows sit past first_decode_row in the batch.
+        prefill, *decode = [
+            SimpleNamespace(rid=rid, retraction_count=0) for rid in "abc"
+        ]
+        scheduler = SimpleNamespace(
+            chunked_req=None,
+            waiting_queue=[],
+            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
+            tree_cache=SimpleNamespace(evictable_size=lambda: 0),
+            new_token_ratio_tracker=SimpleNamespace(current=0.5),
+        )
+        batch = SimpleNamespace(
+            reqs=[prefill, *decode],
+            first_decode_row=1,
+            forward_mode=ForwardMode.MIXED,
+            extend_lens=[4, 1, 1],
+            prefix_lens=[0, 7, 9],
+        )
+        plan = SimpleNamespace(
+            batch_to_run=batch,
+            running_batch=SimpleNamespace(reqs=[]),
+            admission_skip_reason=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "t.jsonl")
+            writer = SchedulingTraceWriter(path, {})
+            writer.observe_plan_start(SimpleNamespace(reqs=decode))
+            writer.record_schedule(scheduler, plan)
+            writer.record_schedule(scheduler, plan)
+            writer.close()
+            records = load_trace(path)
+
+        self.assertEqual(records[1]["running"], ["r1", "r2"])
+        self.assertEqual(records[1]["plan_start_running"], 2)
+        # Each plan reports its own start; a record without one says so.
+        self.assertIsNone(records[2]["plan_start_running"])
+
     def test_paused_iterations_record_reader_values(self):
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(

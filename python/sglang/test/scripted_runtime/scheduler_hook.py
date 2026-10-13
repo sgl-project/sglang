@@ -215,6 +215,10 @@ class ScriptedSchedulerHook:
             )
         )
 
+    def on_plan_start(self, running_batch: ScheduleBatch) -> None:
+        if self._trace is not None:
+            self._trace.observe_plan_start(running_batch)
+
     def on_schedule(self, plan: NextBatchPlan) -> None:
         if self._trace is not None:
             self._trace.record_schedule(self.scheduler, plan)
