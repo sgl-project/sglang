@@ -1109,8 +1109,21 @@ async def get_request(
 
             yield request
     else:
-        input_requests_iter = iter(input_requests)
-        for request in input_requests_iter:
+        # Use absolute target arrival times so that the scheduling drift
+        # caused by asyncio.sleep's inherent latency (e.g. EpollSelector
+        # rounding up to whole milliseconds) does not accumulate across
+        # requests. Each gap is still drawn from the same exponential
+        # distribution in the same order, so with a fixed --seed the
+        # schedule is identical to before, but the achieved request rate
+        # no longer falls further behind with every request.
+        # See https://github.com/sgl-project/sglang/issues/43930
+        start = time.perf_counter()
+        next_arrival = 0.0
+        for request in input_requests:
+            delay = start + next_arrival - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
             yield request
 
             if request_rate == float("inf"):
@@ -1118,9 +1131,7 @@ async def get_request(
                 continue
 
             # Sample the request interval from the exponential distribution.
-            interval = np.random.exponential(1.0 / request_rate)
-            # The next request will be sent after the interval.
-            await asyncio.sleep(interval)
+            next_arrival += np.random.exponential(1.0 / request_rate)
 
 
 def calculate_metrics(
