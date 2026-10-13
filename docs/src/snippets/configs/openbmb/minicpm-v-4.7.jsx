@@ -5,8 +5,9 @@
 // hybrid backbone. FP8 / INT4 are 35B-A3B checkpoints only. Every recipe is
 // single-GPU. H100 has no 35B-A3B BF16 cell: its ~66 GB of weights exceed the
 // default static memory fraction of an 80 GB card, so the server cannot start.
-// DSpark is an overlay; its draft path follows the variant. Only the FP8 / INT4
-// cells carry --trust-remote-code: those repos declare custom processor code.
+// DSpark is an overlay; its draft path follows the variant. FP8 / INT4 cells
+// load the tokenizer from the base repo: their tokenizer_config auto_map names
+// processing_minicpmv4_7.py, which those repos do not ship.
 
 export const config = {
   modelName: "MiniCPM-V 4.7",
@@ -158,6 +159,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -172,6 +174,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -212,6 +215,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -226,6 +230,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -251,6 +256,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -264,6 +270,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path openbmb/MiniCPM-V-4.7-35B-A3B",
         "--mamba-radix-cache-strategy extra_buffer",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
