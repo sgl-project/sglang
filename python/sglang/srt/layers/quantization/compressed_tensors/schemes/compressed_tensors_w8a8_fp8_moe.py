@@ -26,7 +26,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu, set_weight_attrs
 
 if TYPE_CHECKING:
