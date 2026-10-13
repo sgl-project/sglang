@@ -116,8 +116,9 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
 
         # Update last_batch
         self.last_batch = batch
-        self.inflight_steps.end_step(batch)
-        self._debug_check_last_launched()
+        if self.recv_skipper is not None:
+            self.recv_skipper.on_launch(batch)
+        self.inflight_steps.end_step()
 
         if (
             spec.strict_mem_check
@@ -173,6 +174,8 @@ def _enter_pd(self: Scheduler) -> None:
 def _enter_pd_decode_overlap(self: Scheduler) -> None:
     self.inflight_steps = InflightQueue(depth=1)
     self.last_batch: Optional[ScheduleBatch] = None
+    if self.recv_skipper is not None:
+        self.recv_skipper.on_launch(None)
 
 
 # PD queues: the requests they have ready after intake.
@@ -190,9 +193,7 @@ def _process_decode_queue(self: Scheduler) -> None:
 
 
 def _plan(self: Scheduler) -> Optional[ScheduleBatch]:
-    plan = self.get_next_batch_to_run(
-        decoding_batch=self.decoding_batch, last_batch=self.last_batch
-    )
+    plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
     return plan.batch_to_run
 
 
@@ -218,8 +219,10 @@ def _plan_pd_decode(self: Scheduler) -> Optional[ScheduleBatch]:
 
 
 def _commit_if_overlap_disabled(self: Scheduler, batch: ScheduleBatch) -> bool:
+    # The step in flight is the one launched last.
+    inflight = self.inflight_steps.newest()
     disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-        batch, last_batch=self.last_batch
+        batch, last_batch=None if inflight is None else inflight.batch
     )
 
     # If we do not need to overlap the current batch with the last batch,
@@ -241,8 +244,10 @@ def _commit_if_overlap_disabled_pd_decode(
     self: Scheduler, batch: ScheduleBatch
 ) -> bool:
     # overlap + spec + grammar is unsupported (would desync DP ranks).
+    # The step in flight is the one launched last.
+    inflight = self.inflight_steps.newest()
     disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-        batch, last_batch=self.last_batch
+        batch, last_batch=None if inflight is None else inflight.batch
     )
 
     if disable_overlap_for_batch and self.inflight_steps.has_due():
