@@ -28,7 +28,19 @@ def _outputs(batch, heads, nodes, dim, device):
 
 @pytest.mark.parametrize("batch", [1, 4, 8])
 @pytest.mark.parametrize(
-    "nodes,cache_nodes", [(31, 31), (31, 49), (33, 33), (49, 49), (65, 65)]
+    "nodes,cache_nodes",
+    [
+        (25, 25),
+        (27, 27),
+        (29, 29),
+        (31, 31),
+        (31, 49),
+        (32, 32),
+        (32, 49),
+        (33, 33),
+        (49, 49),
+        (65, 65),
+    ],
 )
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 def test_fused_conv_tree_transform_matches_reference(

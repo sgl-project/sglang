@@ -1259,7 +1259,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tree_factorized_on = (
             tree_rawv is not None
             and retrieve_parent_token is not None
-            and retrieve_parent_token.shape[1] in (17, 31, 33, 49, 65)
+            and retrieve_parent_token.shape[1] in (17, 25, 27, 29, 31, 32, 33, 49, 65)
             and fm.tree_max_depth > 0
         )
         if intermediate_state_cache is None and not replayssm_on and not tree_factorized_on:
@@ -1421,7 +1421,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tree_transforms = None
         use_fused_tree_conv = (
             tree_factorized_on
-            and draft_token_num in (17, 31, 33, 49, 65)
+            and draft_token_num in (17, 25, 27, 29, 31, 32, 33, 49, 65)
             and fm.has_direct_parent
             and isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
             and mixed_qkv_reshaped.dtype == torch.bfloat16

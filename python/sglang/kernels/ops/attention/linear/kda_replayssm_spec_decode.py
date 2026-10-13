@@ -492,8 +492,14 @@ def commit_kda_replayssm_tree_all_layers(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    block_value: int | None = None,
+    num_stages: int = 3,
 ) -> None:
-    """Commit sampled UBTree paths for every KDA layer in one launch."""
+    """Commit sampled UBTree paths for every KDA layer in one launch.
+
+    ``block_value`` and ``num_stages`` are exposed for shape-specific tuning;
+    the defaults preserve the bit-exact production configuration.
+    """
     num_layers, _, num_value_heads, value_dim, key_dim = checkpoint_state.shape
     num_key_heads = rawk_cache.shape[2]
     cache_tree_width = rawv_cache.shape[-2]
@@ -502,8 +508,18 @@ def commit_kda_replayssm_tree_all_layers(
             f"logical tree width {tree_width} exceeds cache width {cache_tree_width}"
         )
     block_key = triton.next_power_of_2(key_dim)
-    block_value = min(triton.next_power_of_2(value_dim), 32)
     batch_size = accept_lens.shape[0]
+    if block_value is None:
+        # The tree commit keeps a full [BK, BV] FP32 state tile live across the
+        # accepted-path loop.  On L20X, BV=32 is register/occupancy limited for
+        # K=V=128.  BV=8 wins for BS<=2; once the batch supplies enough CTAs,
+        # BV=16 avoids the excess grid overhead of BV=8.
+        if value_dim == 128:
+            block_value = 8 if batch_size <= 2 else 16
+        else:
+            block_value = min(triton.next_power_of_2(value_dim), 32)
+    if block_value not in (8, 16, 32):
+        raise ValueError(f"unsupported tree commit block_value={block_value}")
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     track_indices = mamba_track_indices if has_track else ssm_state_indices
     track_steps = mamba_steps_to_track if has_track else accept_lens
@@ -549,7 +565,7 @@ def commit_kda_replayssm_tree_all_layers(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         num_warps=1,
-        num_stages=3,
+        num_stages=num_stages,
     )
 
 

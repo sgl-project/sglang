@@ -1,7 +1,7 @@
 """Experimental fused UBTree causal-conv and KDA node transform.
 
 The kernel is deliberately shape-restricted to the production factorized
-UBTree contract (31/33/49/65 nodes, conv width 4, H == HV, K == V). It supports
+UBTree contract (25/27/29/31/32/33/49/65 nodes, conv width 4, H == HV, K == V). It supports
 multiple batches through an explicit batch program axis. It
 replaces the tree causal-conv launch plus
 ``fused_sigmoid_gating_delta_rule_tree_transform_kernel`` while preserving the
@@ -269,8 +269,8 @@ def fused_kda_conv_tree_transform(
     if x.ndim != 3:
         raise ValueError("x must be [batch, 3 * HV * K, tree_width]")
     batch, dim, tree_width = x.shape
-    if tree_width not in (17, 31, 33, 49, 65):
-        raise ValueError(f"tree_width must be 17, 31, 33, 49, or 65, got {tree_width}")
+    if tree_width not in (17, 25, 27, 29, 31, 32, 33, 49, 65):
+        raise ValueError(f"tree_width must be 17, 25, 27, 29, 31, 32, 33, 49, or 65, got {tree_width}")
     hv, key_dim = processed_beta.shape[1], processed_k.shape[-1]
     if dim != 3 * hv * key_dim or processed_k.shape != (batch, hv, tree_width, key_dim):
         raise ValueError("only equal Q/K/V head geometry is supported")

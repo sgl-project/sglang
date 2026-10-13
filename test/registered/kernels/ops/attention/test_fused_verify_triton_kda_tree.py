@@ -18,7 +18,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
-@pytest.mark.parametrize("width", [31, 33, 49, 65])
+@pytest.mark.parametrize("width", [25, 27, 29, 31, 32, 33, 49, 65])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 @pytest.mark.parametrize("factor_dtype", [torch.float32, torch.bfloat16])
 def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_dtype):
@@ -454,11 +454,11 @@ def test_tree_conv_raw_commit_matches_full_window(
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
-def test_factorized_65_node_cuda_graph_replay_reads_new_inputs():
-    """The 65-node factor path must remain address-stable and replay-safe."""
-    torch.manual_seed(65049)
+@pytest.mark.parametrize("width", [32, 65])
+def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
+    """Factorized tree paths must remain address-stable and replay-safe."""
+    torch.manual_seed(width * 1000 + 49)
     device = "cuda"
-    width = 65
     batch_size = 1
     num_heads = 4
     dim = 32
@@ -471,7 +471,7 @@ def test_factorized_65_node_cuda_graph_replay_reads_new_inputs():
         depth_values.extend([depth] * wave_width)
 
     parents = torch.tensor([parent_values[:width]], dtype=torch.int32, device=device)
-    depths = torch.tensor([depth_values], dtype=torch.int32, device=device)
+    depths = torch.tensor([depth_values[:width]], dtype=torch.int32, device=device)
     cu_seqlens = torch.tensor([0, width], dtype=torch.int32, device=device)
     indices = torch.zeros(batch_size, dtype=torch.int32, device=device)
     A_log = torch.randn(num_heads, dtype=torch.float32, device=device)
