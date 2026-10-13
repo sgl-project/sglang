@@ -9,6 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
@@ -57,6 +58,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -618,15 +620,46 @@ class ComposedPipelineBase(ABC):
             [spec.module_name for spec in component_load_specs],
         )
 
-        for spec in tqdm(
-            iterable=component_load_specs, desc="Loading required modules"
-        ):
+        # Split specs into serial (small helpers) and parallel (heavy models).
+        # Only transformer/text_encoder families are the launch bottleneck;
+        # loading the rest serially keeps the change small and safe.
+        parallel_specs: list[ComponentLoadSpec] = []
+        serial_specs: list[ComponentLoadSpec] = []
+        _PARALLEL_COMPONENT_KEYWORDS = ("transformer", "text_encoder")
+        for spec in component_load_specs:
+            name = spec.load_module_name or spec.module_name
+            if any(kw in name for kw in _PARALLEL_COMPONENT_KEYWORDS):
+                parallel_specs.append(spec)
+            else:
+                serial_specs.append(spec)
+
+        if parallel_specs:
+            logger.info(
+                "Parallel-load candidates (%d): %s; serial (%d): %s",
+                len(parallel_specs),
+                [s.module_name for s in parallel_specs],
+                len(serial_specs),
+                [s.module_name for s in serial_specs],
+            )
+
+        def _resolve_and_load(spec: ComponentLoadSpec) -> tuple[str, Any, float]:
+            """Resolve loader args and load one component. Thread-safe: the
+            worker explicitly pins the correct CUDA device for this rank
+            because CUDA's current_device is thread-local and workers do not
+            inherit the main thread's selection."""
+            # Pin thread-local device so model.to(device) below lands on the
+            # intended GPU even when this worker runs on a different thread.
+            if current_platform.is_cuda() or current_platform.is_rocm():
+                torch.cuda.set_device(torch.device(f"cuda:{envs.LOCAL_RANK}"))
+            elif current_platform.is_npu():
+                torch.npu.set_device(torch.device(f"npu:{envs.LOCAL_RANK}"))
+            elif current_platform.is_xpu():
+                torch.xpu.set_device(torch.device(f"xpu:{envs.LOCAL_RANK}"))
+            elif current_platform.is_musa():
+                torch.musa.set_device(torch.device(f"musa:{envs.LOCAL_RANK}"))
+
             module_name: str = spec.module_name
             load_module_name: str = spec.load_module_name
-            transformers_or_diffusers: str = spec.transformers_or_diffusers
-            architecture: str = spec.architecture
-            component_model_path: str = spec.component_model_path
-
             attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(
                     module_name, load_module_name
@@ -645,17 +678,48 @@ class ComposedPipelineBase(ABC):
                 component_name=module_name,
                 component_type=load_module_name,
                 loader_cls=self.component_loaders.get(module_name),
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
+                component_model_path=spec.component_model_path,
+                transformers_or_diffusers=spec.transformers_or_diffusers,
                 server_args=server_args,
-                component_architecture=architecture,
+                component_architecture=spec.architecture,
                 component_attn_backend=attn_backend,
                 component_attn_name=matched_backend_key or module_name,
                 component_backend_by_role=backend_by_role,
             )
+            return module_name, module, memory_usage
 
+        # 1) Serial small components first (tokenizer, scheduler, vae, ...).
+        for spec in tqdm(
+            iterable=serial_specs,
+            desc="Loading small components",
+        ):
+            module_name, module, memory_usage = _resolve_and_load(spec)
             self.memory_usages[module_name] = memory_usage
+            if module_name in loaded_components:
+                logger.warning("Overwriting module %s", module_name)
+            loaded_components[module_name] = module
 
+        # 2) Parallel heavy components (transformer + text_encoder together).
+        if len(parallel_specs) >= 2:
+            logger.info(
+                "Loading %d heavy components in parallel via ThreadPoolExecutor...",
+                len(parallel_specs),
+            )
+            with ThreadPoolExecutor(max_workers=min(2, len(parallel_specs))) as pool:
+                futures = [pool.submit(_resolve_and_load, s) for s in parallel_specs]
+                for future in tqdm(
+                    futures, desc="Loading heavy components (parallel)"
+                ):
+                    module_name, module, memory_usage = future.result()
+                    self.memory_usages[module_name] = memory_usage
+                    if module_name in loaded_components:
+                        logger.warning("Overwriting module %s", module_name)
+                    loaded_components[module_name] = module
+        elif len(parallel_specs) == 1:
+            # Single heavy component: serial path is simpler and avoids pool overhead.
+            spec = parallel_specs[0]
+            module_name, module, memory_usage = _resolve_and_load(spec)
+            self.memory_usages[module_name] = memory_usage
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
             loaded_components[module_name] = module
