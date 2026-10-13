@@ -23,6 +23,7 @@ def _scheduler_for_typed_config():
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
+        get_init_info=lambda: {},
         rust_server_tokenizer_path=lambda: "tokenizer",
         max_total_num_tokens=1024,
     )
