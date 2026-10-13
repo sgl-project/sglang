@@ -1459,9 +1459,30 @@ class OpenAIServingChat(OpenAIServingBase):
                 # legacy tags ignore at_least_one and allow free text. Otherwise
                 # the one-tool prompt is the only thing that selects the tool.
                 grammar_backend = get_exec().kernel.grammar_backend
+                response_format = request.response_format
+                has_output_constraint = (
+                    request.regex
+                    or request.ebnf
+                    or (
+                        response_format is not None
+                        and (
+                            response_format.type in ("json_object", "structural_tag")
+                            or (
+                                response_format.type == "json_schema"
+                                and (
+                                    response_format.json_schema.strict is not False
+                                    or self.chat_encoding_spec != "kimi_k3"
+                                )
+                            )
+                        )
+                    )
+                )
                 keep_tools = (
                     envs.SGLANG_NAMED_TOOL_CHOICE_KEEPS_TOOLS.get()
                     and tool_call_constraint is not None
+                    # Explicit output constraints take precedence over the
+                    # full-assistant tool grammar in to_sampling_params.
+                    and not has_output_constraint
                     and grammar_backend in ("xgrammar", "llguidance", "outlines")
                     and (
                         tool_call_constraint[0] != "structural_tag"
