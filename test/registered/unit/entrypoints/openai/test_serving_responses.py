@@ -1188,6 +1188,52 @@ class InklingOutputItemsTestCase(CustomTestCase):
                 output = event_payloads(events)[-1]["response"]["output"]
                 self.assertEqual(self._summary(output), expected)
 
+    def test_required_tool_choice_parses_json_array_without_native_parser(self):
+        """With only the Inkling reasoning parser, required/named tool output is
+        the generic JSON array and must still become function_call items."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        self.serving.tool_call_parser = None
+        tokenizer = load_tml_renderers().tokenizer
+        special, text = tokenizer.encode_special, tokenizer.encode_ordinary
+        output_ids = [
+            special("message_model"),
+            special("content_thinking"),
+            *text("plan"),
+            special("end_message"),
+            *text('[{"name": "weather", "parameters": {"city": "SF"}}]'),
+            special("content_model_end_sampling"),
+        ]
+        finish = {"type": "stop", "matched": output_ids[-1]}
+        expected = [("reasoning", "plan"), ("weather", {"city": "SF"})]
+
+        for tool_choice in ("required", {"type": "function", "name": "weather"}):
+            request = self.request.model_copy(update={"tool_choice": tool_choice})
+            with self.subTest(tool_choice=tool_choice, stream=False):
+                items = self.serving._make_response_output_items(
+                    request,
+                    "",
+                    Mock(),
+                    require_reasoning=False,
+                    output_ids=output_ids,
+                    finish_reason=finish,
+                )
+                self.assertEqual(
+                    self._summary([i.model_dump() for i in items]), expected
+                )
+            with self.subTest(tool_choice=tool_choice, stream=True):
+                chunks = []
+                for end in range(1, len(output_ids) + 1):
+                    chunk = engine_chunk("", end)
+                    chunk["output_ids"] = output_ids[:end]
+                    chunk["meta_info"]["finish_reason"] = (
+                        finish if end == len(output_ids) else None
+                    )
+                    chunks.append(chunk)
+                events = StreamFixture(self.serving, request).run(chunks)
+                output = event_payloads(events)[-1]["response"]["output"]
+                self.assertEqual(self._summary(output), expected)
+
 
 class HarmonyResponsesTestCase(CustomTestCase):
     def test_developer_message_skips_unsupported_tool_types(self):

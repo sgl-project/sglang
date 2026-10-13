@@ -1032,17 +1032,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         if self._inkling_token_output:
+            required_json = self._uses_required_tool_json(request, chat_tools)
             parsed = serving_inkling.parse_responses_output(
                 output_ids=output_ids or [],
                 finish_reason=finish_reason,
                 separate_reasoning=bool(self.reasoning_parser),
-                parse_tool_calls=self._tool_call_parsing_enabled(request, chat_tools),
+                parse_tool_calls=(
+                    self._tool_call_parsing_enabled(request, chat_tools)
+                    and not required_json
+                ),
             )
             reasoning_content, content = parsed.reasoning, parsed.content
-            tool_call_items = [
-                self._make_tool_call_item(call.name, call.arguments, custom_names)
-                for call in parsed.tool_calls
-            ]
+            if required_json and content:
+                content, tool_call_items = self._parse_required_tool_json(
+                    content, custom_names
+                )
+            else:
+                tool_call_items = [
+                    self._make_tool_call_item(call.name, call.arguments, custom_names)
+                    for call in parsed.tool_calls
+                ]
         else:
             reasoning_content, content, tool_call_items = self._parse_text_output(
                 request,
@@ -1160,26 +1169,33 @@ class OpenAIServingResponses(OpenAIServingChat):
             and not parsed_via_native
             and not detector_owns_format
         ):
-            try:
-                tool_call_data = orjson.loads(content)
-                if isinstance(tool_call_data, dict):
-                    tool_call_data = [tool_call_data]
-                if isinstance(tool_call_data, list):
-                    for tool in tool_call_data:
-                        if not isinstance(tool, dict) or "name" not in tool:
-                            continue
-                        arguments = json.dumps(
-                            tool.get("parameters", {}), ensure_ascii=False
-                        )
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
-                            )
-                        )
-                    content = ""
-            except Exception as e:
-                logger.error("Required tool JSON parse error: %s", e)
+            content, json_items = self._parse_required_tool_json(content, custom_names)
+            tool_call_items.extend(json_items)
         return reasoning_content, content, tool_call_items
+
+    def _parse_required_tool_json(
+        self, content: str, custom_names: set[str]
+    ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
+        """Parse required/named tool output constrained to the generic JSON array."""
+        tool_call_items = []
+        try:
+            tool_call_data = orjson.loads(content)
+            if isinstance(tool_call_data, dict):
+                tool_call_data = [tool_call_data]
+            if isinstance(tool_call_data, list):
+                for tool in tool_call_data:
+                    if not isinstance(tool, dict) or "name" not in tool:
+                        continue
+                    arguments = json.dumps(
+                        tool.get("parameters", {}), ensure_ascii=False
+                    )
+                    tool_call_items.append(
+                        self._make_tool_call_item(tool["name"], arguments, custom_names)
+                    )
+                content = ""
+        except Exception as e:
+            logger.error("Required tool JSON parse error: %s", e)
+        return content, tool_call_items
 
     def _make_response_output_items_with_harmony(
         self,
@@ -1209,6 +1225,26 @@ class OpenAIServingResponses(OpenAIServingChat):
     @staticmethod
     def _tool_parser_owns_format(parser: FunctionCallParser) -> bool:
         return parser.owns_tool_format()
+
+    def _uses_required_tool_json(
+        self, request: ResponsesRequest, chat_tools: list[Tool]
+    ) -> bool:
+        """Whether required/named tool output is constrained to the generic JSON
+        array, rather than to the configured detector's native framing."""
+        tool_choice = request.effective_tool_choice()
+        if not chat_tools or not (
+            tool_choice == "required" or isinstance(tool_choice, dict)
+        ):
+            return False
+        if not self.tool_call_parser:
+            return True
+        probe = FunctionCallParser(
+            chat_tools,
+            self.tool_call_parser,
+            tokenizer=self.tokenizer_manager.tokenizer,
+            tool_choice=tool_choice,
+        )
+        return not self._tool_parser_owns_format(probe)
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
@@ -2052,35 +2088,30 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         tool_choice = request.effective_tool_choice()
-        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
+        required_json = self._uses_required_tool_json(request, chat_tools)
         inkling_stream = (
             serving_inkling.InklingResponsesStream(
                 separate_reasoning=bool(self.reasoning_parser),
-                parse_tool_calls=self._tool_call_parsing_enabled(request, chat_tools),
+                parse_tool_calls=(
+                    self._tool_call_parsing_enabled(request, chat_tools)
+                    and not required_json
+                ),
             )
             if self._inkling_token_output
             else None
         )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
-        if inkling_stream is None and chat_tools and request.tool_choice != "none":
-            detector_owns_format = False
-            if self.tool_call_parser:
-                probe = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                )
-                detector_owns_format = self._tool_parser_owns_format(probe)
-            if is_required and not detector_owns_format:
-                tool_parser = JsonArrayParser()
-            elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                )
+        if required_json:
+            tool_parser = JsonArrayParser()
+        elif inkling_stream is None and self._tool_call_parsing_enabled(
+            request, chat_tools
+        ):
+            tool_parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
+            )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if inkling_stream is None and self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -2486,11 +2517,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not delta and not flush and not inkling_calls:
                     continue
 
-                if inkling_stream is not None:
-                    normal_text, tool_calls = delta, inkling_calls
-                elif isinstance(tool_parser, JsonArrayParser):
+                if isinstance(tool_parser, JsonArrayParser):
                     sp = tool_parser.parse_streaming_increment(delta, chat_tools)
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
+                elif inkling_stream is not None:
+                    normal_text, tool_calls = delta, inkling_calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                     if flush:
