@@ -31,6 +31,15 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
     task_type: ModelTaskType = ModelTaskType.T2V
 
     def _validate_history_settings(self, manifest: CosmosDreamsManifest) -> None:
+        if (
+            self.kv_cache_inference_size is not None
+            or self.attention_sink_size is not None
+        ):
+            raise ValueError(
+                "Cosmos-Dreams-Transfer reads its K/V window from the export's training "
+                "config; kv_cache_inference_size/attention_sink_size overrides apply to "
+                "the action pipelines only."
+            )
         self.transfer_history_profile(manifest)
 
     # "auto" follows the export's training config: the reference slides only when

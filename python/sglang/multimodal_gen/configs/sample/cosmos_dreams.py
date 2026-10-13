@@ -13,6 +13,8 @@ generated, so the output size is the fitted image rounded down to the VAE
 stride (for example 768x480 for a 16:10 image on the 832x480 canvas).
 """
 
+import json
+import os
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
@@ -57,6 +59,13 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
     # the request-level default. A sidecar dict passed as ``action`` may carry it.
     domain_names: list[str] | None = None
 
+    # Camera-frustum K/V retrieval for offline rollouts with full history: a JSON
+    # object with ``c2w`` RGB poses or ``pose_source`` (poses recovered from the
+    # unified rows' ego slots), ``image_size`` [width, height], ``near``/``far``,
+    # ``intrinsics`` or ``horizontal_fov_degrees``, optional ``fps`` and
+    # ``sink_size``/``retrieved_size``/``recent_size`` (default 8/32/32).
+    frustum_geometry: dict | None = None
+
     @property
     def actions_pre_normalized(self) -> bool:
         return str(self.action_normalization).strip().lower() == "none"
@@ -73,7 +82,7 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
         return super().video_request_extra_fields() | frozenset(
-            {"format_prompt_as_json", "domain_names"}
+            {"format_prompt_as_json", "domain_names", "frustum_geometry"}
         )
 
     def _validate(self) -> None:
@@ -103,6 +112,19 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
             raise ValueError(
                 "Cosmos-Dreams action_normalization must be 'contract' (raw rows) or "
                 f"'none' (pre-normalized rows), got {self.action_normalization!r}."
+            )
+        if isinstance(self.frustum_geometry, str):
+            text = self.frustum_geometry.strip()
+            if os.path.isfile(text) and text.endswith(".json"):
+                with open(text, encoding="utf-8") as handle:
+                    self.frustum_geometry = json.load(handle)
+            else:
+                self.frustum_geometry = json.loads(text)
+        if self.frustum_geometry is not None and not isinstance(
+            self.frustum_geometry, dict
+        ):
+            raise ValueError(
+                "Cosmos-Dreams frustum_geometry must be a JSON object (or a path to one)."
             )
         if self.domain_names is not None:
             if isinstance(self.domain_names, str):

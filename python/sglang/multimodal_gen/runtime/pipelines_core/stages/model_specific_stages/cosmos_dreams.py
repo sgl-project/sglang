@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
+    HISTORY_MODE_FULL,
     TEXT_TOKENS_TRAINING_MAX,
     UNIFIED_ACTION_DIM,
     UNIFIED_ACTION_SPACE,
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsInferenceProfile,
     CosmosDreamsManifest,
     CosmosDreamsUnifiedActionContract,
+    load_unified_normalizer,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -37,6 +39,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsTransformer,
+    HistoryKV,
     KVPair,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -51,6 +54,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     VIDEO_RES_SIZE_INFO,
     VIEWPOINT_TEMPLATES,
     canonical_aspect_ratio,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_frustum import (
+    FrustumHistorySelector,
+    SelectedHistory,
+    describe_selection,
+    resolve_frustum_selector,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -81,6 +90,8 @@ EXTRA_ACTION_DOMAIN_IDS = "cosmos_dreams_action_domain_ids"
 # (the Cosmos3 stage already honours this key for pre-decoded output).
 EXTRA_DECODED_OUTPUT = "transfer_decoded_output"
 EXTRA_TARGET_LATENT_FRAMES = "cosmos_dreams_target_latent_frames"
+# FrustumHistorySelector of the request, None without retrieval.
+EXTRA_FRUSTUM_SELECTOR = "cosmos_dreams_frustum_selector"
 # (content_height, content_width) of the conditioning image inside the canvas.
 EXTRA_CONTENT_SIZE = "cosmos_dreams_content_size"
 
@@ -874,13 +885,22 @@ class CosmosDreamsPrepareStage(PipelineStage):
     parallelism_type = StageParallelismType.REPLICATED
 
     def __init__(
-        self, *, vae, tokenizer, manifest: CosmosDreamsManifest, max_pixels: int
+        self,
+        *,
+        vae,
+        tokenizer,
+        manifest: CosmosDreamsManifest,
+        max_pixels: int,
+        profile: CosmosDreamsInferenceProfile | None = None,
+        model_path: str | None = None,
     ) -> None:
         super().__init__()
         self.vae = vae
         self.tokenizer = tokenizer
         self.manifest = manifest
         self.max_pixels = max_pixels
+        self.profile = profile
+        self.normalizer_stats = unified_normalizer_stats(manifest, model_path)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -1040,6 +1060,12 @@ class CosmosDreamsPrepareStage(PipelineStage):
         batch.extra[EXTRA_ACTION_DOMAIN_IDS] = row_domains
         batch.extra[EXTRA_DOMAIN_ID] = prepared.domain_id
         batch.extra[EXTRA_TARGET_LATENT_FRAMES] = target_frame
+        batch.extra[EXTRA_FRUSTUM_SELECTOR] = self._frustum_selector(
+            batch,
+            rows=rows,
+            target_frame=target_frame,
+            has_image=prepared.image_latent is not None,
+        )
         batch.raw_latent_shape = (
             1,
             self.vae.config.z_dim,
@@ -1055,6 +1081,66 @@ class CosmosDreamsPrepareStage(PipelineStage):
             f"{prepared.text_ids.shape[1]} text tokens, image={'yes' if batch.image_latent is not None else 'no'}"
         )
         return batch
+
+    def _frustum_selector(
+        self,
+        batch: Req,
+        *,
+        rows: torch.Tensor | None,
+        target_frame: int,
+        has_image: bool,
+    ) -> FrustumHistorySelector | None:
+        geometry = batch.sampling_params.frustum_geometry
+        if geometry is None:
+            return None
+        if self.profile is None or self.profile.history_mode != HISTORY_MODE_FULL:
+            raise ValueError(
+                "Cosmos-Dreams frustum_geometry needs history_mode='full' without "
+                "kv_cache_inference_size/attention_sink_size: retrieval reads the "
+                "complete committed archive."
+            )
+        if not has_image:
+            raise ValueError(
+                "Cosmos-Dreams frustum_geometry needs a conditioning image."
+            )
+        if target_frame - 1 > self.profile.sink_frames + self.profile.window_frames:
+            raise ValueError(
+                "Cosmos-Dreams frustum_geometry needs the whole rollout in the archive; "
+                f"raise history_max_frames to cover {batch.num_frames} pixel frames."
+            )
+        selector = resolve_frustum_selector(
+            geometry,
+            rows=None if rows is None else rows.detach().to("cpu"),
+            normalizer_stats=self.normalizer_stats,
+            num_latent_frames=target_frame,
+            temporal_compression_factor=self.manifest.temporal_compression_factor,
+            fps=float(batch.fps),
+        )
+        sinks, retrieved, recent = selector.sizes
+        self.log_info(
+            f"Frustum K/V retrieval: {sinks} sinks + {retrieved} retrieved + {recent} recent "
+            f"past latent frames over {target_frame}; poses "
+            + (
+                "recovered from the unified rows"
+                if "pose_source" in geometry
+                else "from c2w"
+            )
+        )
+        return selector
+
+
+def unified_normalizer_stats(
+    manifest: CosmosDreamsManifest, model_path: str | None
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    """``(offset, scale)`` of the schema-5 normalizer; None for native contracts or
+    when the export path is unknown."""
+    contract = manifest.conditioning
+    if model_path is None or not isinstance(
+        contract, CosmosDreamsUnifiedActionContract
+    ):
+        return None
+    normalizer = load_unified_normalizer(model_path, contract)
+    return tuple(normalizer.offset), tuple(normalizer.scale)
 
 
 def validate_fixed_step_scheduler(
@@ -1140,6 +1226,22 @@ def run_fixed_step_sde(
     return latents.to(dtype)
 
 
+def _history_view(
+    archive: list[KVPair] | None,
+    frame_ids: list[int] | None,
+    tokens_per_frame: int,
+) -> HistoryKV | None:
+    """What a forward pass attends to: the archive itself without retrieval,
+    otherwise the selected frames (None when nothing is selected yet)."""
+    if frame_ids is None:
+        return archive
+    if archive is None or not frame_ids:
+        return None
+    return SelectedHistory(
+        archive, frame_ids=frame_ids, tokens_per_frame=tokens_per_frame
+    )
+
+
 def commit_clean_kv(
     transformer: CosmosDreamsTransformer,
     latent: torch.Tensor,
@@ -1149,14 +1251,19 @@ def commit_clean_kv(
     tokens_per_frame: int,
     sink_frames: int,
     window_frames: int | None,
+    read_history: HistoryKV | None = None,
     **forward_kwargs: Any,
 ) -> list[KVPair]:
-    """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V."""
+    """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V.
+
+    The pass attends to ``history`` unless ``read_history`` narrows it (frustum
+    retrieval); the new K/V is always appended to ``history``.
+    """
     with set_forward_context(current_timestep=0, attn_metadata=None):
         output = transformer(
             latent.to(dtype),
             torch.zeros(1, device=latent.device, dtype=torch.float32),
-            history_kv=history,
+            history_kv=history if read_history is None else read_history,
             condition_vision=True,
             **forward_kwargs,
         )
@@ -1299,12 +1406,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 f"Cosmos-Dreams requires a single integer seed, got {seed!r}."
             )
 
-        if target_frame - 1 > self.profile.window_frames:
+        if target_frame - 1 > self.profile.sink_frames + self.profile.window_frames:
             self.log_info(
-                f"Rollout of {target_frame} latent frames exceeds the {self.profile.history_mode} "
-                f"history of {self.profile.window_frames} frames; the oldest committed frames "
-                "are evicted from the K/V history once it fills."
+                f"Rollout of {target_frame} latent frames exceeds the {self.profile.describe()}; "
+                "the oldest committed frames are evicted from the K/V history once it fills."
             )
+        selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
         decode_queue = self._decode_queue(device)
@@ -1355,11 +1462,15 @@ class CosmosDreamsRolloutStage(PipelineStage):
             chunk_domains = context.chunk_domain_ids(
                 chunk_start, chunk_end, action_count
             )
+            # One retrieval per chunk, shared by every denoising step and refresh.
+            selected = (
+                None if selector is None else selector.select(chunk_start, chunk_end)
+            )
             clean_chunk = self._denoise_chunk(
                 context,
                 noise,
                 seed=seed,
-                history=history,
+                history=_history_view(history, selected, context.tokens_per_frame),
                 frame_start=chunk_start,
                 action=action,
                 null_indexes=null_indexes,
@@ -1368,6 +1479,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
             for local_idx, frame_idx in iter_clean_commit_frames(
                 chunk_start, chunk_end, target_frame=target_frame
             ):
+                # The framewise refresh also sees the chunk's already-committed frames.
+                read_history = (
+                    None
+                    if selected is None
+                    else _history_view(
+                        history,
+                        selected + list(range(chunk_start, frame_idx)),
+                        context.tokens_per_frame,
+                    )
+                )
                 history = self._commit_clean_frame(
                     context,
                     history,
@@ -1378,13 +1499,20 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     ],
                     null_action=local_idx in null_indexes,
                     domain_ids=frame_domain_ids(chunk_domains, local_idx, action_count),
+                    read_history=read_history,
                 )
             latents.append(clean_chunk)
             if decode_queue is not None:
                 decode_queue.submit(clean_chunk)
+            retrieval = (
+                ""
+                if selected is None
+                else "; frustum history "
+                + describe_selection(selector, chunk_start, selected)
+            )
             self.log_info(
                 f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
-                f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps)"
+                f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieval}"
             )
         if decode_queue is not None:
             batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
@@ -1416,7 +1544,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         initial_noise: torch.Tensor,
         *,
         seed: int,
-        history: list[KVPair] | None,
+        history: HistoryKV | None,
         frame_start: int,
         action: torch.Tensor,
         null_indexes: tuple[int, ...],
@@ -1449,6 +1577,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         action: torch.Tensor,
         null_action: bool,
         domain_ids: torch.Tensor | None = None,
+        read_history: HistoryKV | None = None,
     ) -> list[KVPair]:
         """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
         return commit_clean_kv(
@@ -1459,6 +1588,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             tokens_per_frame=context.tokens_per_frame,
             sink_frames=self.profile.sink_frames,
             window_frames=self.profile.window_frames,
+            read_history=read_history,
             text_kv=context.text_kv,
             frame_start=frame_idx,
             fps=context.fps,

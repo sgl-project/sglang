@@ -39,6 +39,8 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
+# Per-layer history: a list, or a view that gathers one layer at a time.
+HistoryKV = Sequence[KVPair]
 logger = init_logger(__name__)
 
 
@@ -401,7 +403,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         fps: float,
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
-        history_kv: list[KVPair] | None = None,
+        history_kv: HistoryKV | None = None,
         condition_vision: bool = False,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> CosmosDreamsForwardOutput:
@@ -495,7 +497,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         timestep: torch.Tensor,
         *,
         text_kv: list[KVPair],
-        history_kv: list[KVPair] | None,
+        history_kv: HistoryKV | None,
     ) -> None:
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(

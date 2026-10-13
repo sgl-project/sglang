@@ -1079,7 +1079,11 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
         for frame in (1, 2, 3, 225):
             self.assertEqual(profile.sigmas_for_frame(frame), (1.0, 0.8333333333333334))
         self.assertEqual(profile.max_steps, 4)
-        self.assertEqual(profile.window_frames, MANIFEST.window_frames)
+        # The artifact window is the reference cache size (sinks + recent + current).
+        self.assertEqual(profile.cache_size, MANIFEST.window_frames)
+        self.assertEqual(
+            profile.window_frames, MANIFEST.window_frames - MANIFEST.sink_frames - 1
+        )
         self.assertEqual(profile.history_mode, "sliding")
         with self.assertRaises(ValueError):
             profile.sigmas_for_frame(-1)
@@ -1125,7 +1129,99 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
         profile = resolve_inference_profile(
             MANIFEST, history_mode="sliding", history_max_frames=900
         )
-        self.assertEqual(profile.window_frames, MANIFEST.window_frames)
+        self.assertEqual(profile.cache_size, MANIFEST.window_frames)
+
+    def test_deploy_cache_override_follows_the_reference_arithmetic(self):
+        """kv_cache_inference_size counts sinks, recent frames and the current frame,
+        like imaginaire4's finite cache: 64/8 keeps 8 sinks + 55 recent frames."""
+        config = CosmosDreamsConfig()
+        config.update_pipeline_config(
+            {
+                "history_mode": "sliding",
+                "kv_cache_inference_size": 64,
+                "attention_sink_size": 8,
+            }
+        )
+        profile = config.inference_profile(UNIFIED_MANIFEST)
+        self.assertEqual(
+            (profile.cache_size, profile.sink_frames, profile.window_frames),
+            (64, 8, 55),
+        )
+        self.assertEqual(
+            profile.describe(),
+            "sliding history, 64-frame cache = 8 sinks + 55 recent + current",
+        )
+        # Sinks default to the artifact's when only the cache size is overridden.
+        profile = resolve_inference_profile(
+            UNIFIED_MANIFEST,
+            history_mode="sliding",
+            history_max_frames=901,
+            kv_cache_inference_size=16,
+        )
+        self.assertEqual((profile.sink_frames, profile.window_frames), (0, 15))
+        # The full-history default is untouched by the new fields.
+        profile = CosmosDreamsConfig().inference_profile(UNIFIED_MANIFEST)
+        self.assertEqual((profile.history_mode, profile.cache_size), ("full", None))
+        self.assertEqual(profile.describe(), "full history of 226 latent frames")
+
+    def test_deploy_cache_override_rejections(self):
+        # The unified export declares no window: sliding needs the override.
+        with self.assertRaisesRegex(ValueError, "kv_cache_inference_size"):
+            resolve_inference_profile(
+                UNIFIED_MANIFEST, history_mode="sliding", history_max_frames=901
+            )
+        # Full history keeps everything; a cache there would be silently ignored.
+        with self.assertRaisesRegex(ValueError, "history_mode='sliding'"):
+            resolve_inference_profile(
+                UNIFIED_MANIFEST, history_max_frames=901, kv_cache_inference_size=64
+            )
+        bad = [
+            dict(attention_sink_size=8),
+            dict(kv_cache_inference_size=1),
+            dict(kv_cache_inference_size=True),
+            dict(kv_cache_inference_size=64, attention_sink_size=63),
+            dict(kv_cache_inference_size=64, attention_sink_size=-1),
+            dict(kv_cache_inference_size=64, attention_sink_size=2.0),
+        ]
+        for overrides in bad:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                resolve_inference_profile(
+                    UNIFIED_MANIFEST,
+                    history_mode="sliding",
+                    history_max_frames=901,
+                    **overrides,
+                )
+
+    def test_sliding_commits_keep_the_reference_frames(self):
+        """After every commit the archive holds exactly the frames imaginaire4's
+        finite cache would read for the next frame: sinks [0, S) + the last C-S-1."""
+        cache_size, sinks, tokens = 12, 3, 2
+        profile = resolve_inference_profile(
+            UNIFIED_MANIFEST,
+            history_mode="sliding",
+            history_max_frames=901,
+            kv_cache_inference_size=cache_size,
+            attention_sink_size=sinks,
+        )
+        history = None
+        for frame in range(40):
+            block = torch.full((1, tokens, 1, 1), float(frame))
+            history = append_kv_history(
+                history,
+                [(block, block)],
+                tokens_per_frame=tokens,
+                sink_frames=profile.sink_frames,
+                window_frames=profile.window_frames,
+            )
+            kept = history[0][0][0, ::tokens, 0, 0].tolist()
+            current = frame + 1
+            rolling_start = max(sinks, current - (cache_size - sinks - 1))
+            expected = list(range(min(sinks, current))) + list(
+                range(rolling_start, current)
+            )
+            self.assertEqual(
+                kept, [float(index) for index in expected], msg=f"frame {frame}"
+            )
 
 
 class TestCosmosDreamsRegistry(unittest.TestCase):
@@ -1197,6 +1293,25 @@ class TestCosmosDreamsSamplingParams(unittest.TestCase):
         self.assertTrue(params.format_prompt_as_json)
         self.assertFalse(params.canvas_from_image)
         self.assertEqual(CosmosDreamsConfig().canvas_tier, "480")
+
+    def test_frustum_geometry_accepts_json_text_and_rejects_other_shapes(self):
+        """Multipart requests deliver frustum_geometry as text; it must become the dict
+        the prepare stage reads, and anything but an object is rejected up front."""
+        geometry = {
+            "pose_source": "agibot_unified_v1_chunk16",
+            "image_size": [640, 360],
+        }
+        params = CosmosDreamsSamplingParams(
+            prompt="x", frustum_geometry=json.dumps(geometry)
+        )
+        self.assertEqual(params.frustum_geometry, geometry)
+        self.assertIn(
+            "frustum_geometry", CosmosDreamsSamplingParams.video_request_extra_fields()
+        )
+        self.assertIsNone(CosmosDreamsSamplingParams(prompt="x").frustum_geometry)
+        for bad in ([1, 2], "[1, 2]", "not json"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                CosmosDreamsSamplingParams(prompt="x", frustum_geometry=bad)
 
     def test_distilled_checkpoints_never_use_cfg_parallel(self):
         deployment = CosmosDreamsConfig().get_model_deployment_config()

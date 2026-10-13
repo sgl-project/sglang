@@ -930,6 +930,17 @@ class CosmosDreamsInferenceProfile(msgspec.Struct, frozen=True):
     window_frames: int
     sink_frames: int
     history_mode: str
+    # Sliding mode: the training config's kv_cache_inference_size, which counts
+    # the sinks, the recent frames and the frame being generated.
+    cache_size: int | None = None
+
+    def describe(self) -> str:
+        if self.cache_size is None:
+            return f"{self.history_mode} history of {self.window_frames} latent frames"
+        return (
+            f"sliding history, {self.cache_size}-frame cache = {self.sink_frames} sinks + "
+            f"{self.window_frames} recent + current"
+        )
 
     def sigmas_for_frame(self, frame_idx: int) -> tuple[float, ...]:
         if frame_idx < 0:
@@ -996,10 +1007,15 @@ def resolve_inference_profile(
     frame_sigma_schedules: Any = None,
     history_mode: str = HISTORY_MODE_FULL,
     history_max_frames: int,
+    kv_cache_inference_size: int | None = None,
+    attention_sink_size: int | None = None,
 ) -> CosmosDreamsInferenceProfile:
     """Resolve ``frame_sigma_schedules`` (None: the step42 budget derived from the artifact's
-    t_list) and the history length (``full``: the first ``history_max_frames`` pixel frames;
-    ``sliding``: the artifact's ``window_frames``) into one validated profile."""
+    t_list) and the history length into one validated profile: ``full`` keeps the first
+    ``history_max_frames`` pixel frames; ``sliding`` keeps a cache of ``kv_cache_inference_size``
+    frames (default: the artifact's ``window_frames``) with ``attention_sink_size`` pinned
+    frames (default: the artifact's ``sink_frames``), in the reference's units where the cache
+    counts the sinks, the recent frames and the frame being generated."""
     if frame_sigma_schedules is None:
         schedules = default_frame_sigma_schedules(manifest.t_list)
     else:
@@ -1019,6 +1035,12 @@ def resolve_inference_profile(
             f"Cosmos-Dreams history_mode must be one of {HISTORY_MODES}, got {history_mode!r}."
         )
     if history_mode == HISTORY_MODE_FULL:
+        if kv_cache_inference_size is not None or attention_sink_size is not None:
+            raise ValueError(
+                "Cosmos-Dreams kv_cache_inference_size/attention_sink_size bound the K/V "
+                "history; set history_mode='sliding' to use them (history_mode='full' keeps "
+                "every committed frame)."
+            )
         factor = manifest.temporal_compression_factor
         if (
             isinstance(history_max_frames, bool)
@@ -1030,20 +1052,69 @@ def resolve_inference_profile(
                 "Cosmos-Dreams history_max_frames must be 1 + "
                 f"{factor} * N pixel frames, got {history_max_frames!r}."
             )
-        window_frames = (history_max_frames - 1) // factor + 1
-    else:
+        return CosmosDreamsInferenceProfile(
+            frame_sigma_schedules=schedules,
+            window_frames=(history_max_frames - 1) // factor + 1,
+            sink_frames=manifest.sink_frames,
+            history_mode=history_mode,
+        )
+    cache_size, sink_frames = resolve_sliding_cache(
+        manifest,
+        kv_cache_inference_size=kv_cache_inference_size,
+        attention_sink_size=attention_sink_size,
+    )
+    return CosmosDreamsInferenceProfile(
+        frame_sigma_schedules=schedules,
+        window_frames=cache_size - sink_frames - 1,
+        sink_frames=sink_frames,
+        history_mode=history_mode,
+        cache_size=cache_size,
+    )
+
+
+def resolve_sliding_cache(
+    manifest: CosmosDreamsManifest,
+    *,
+    kv_cache_inference_size: int | None,
+    attention_sink_size: int | None,
+) -> tuple[int, int]:
+    """``(cache_size, sink_frames)`` of a sliding history: deploy overrides first,
+    then the artifact; the cache must leave at least one recent past frame."""
+    if attention_sink_size is not None and kv_cache_inference_size is None:
+        raise ValueError(
+            "Cosmos-Dreams attention_sink_size needs kv_cache_inference_size."
+        )
+    if kv_cache_inference_size is None:
         if manifest.window_frames is None:
             raise ValueError(
                 "Cosmos-Dreams history_mode='sliding' needs a K/V window, but the "
-                f"artifact {manifest.checkpoint_id} declares window_frames=None."
+                f"artifact {manifest.checkpoint_id} declares window_frames=None; set "
+                "kv_cache_inference_size (and attention_sink_size) in the pipeline config."
             )
-        window_frames = manifest.window_frames
-    return CosmosDreamsInferenceProfile(
-        frame_sigma_schedules=schedules,
-        window_frames=window_frames,
-        sink_frames=manifest.sink_frames,
-        history_mode=history_mode,
+        cache_size = manifest.window_frames
+    else:
+        cache_size = kv_cache_inference_size
+    sink_frames = (
+        manifest.sink_frames if attention_sink_size is None else attention_sink_size
     )
+    if (
+        isinstance(cache_size, bool)
+        or not isinstance(cache_size, int)
+        or cache_size < 2
+    ):
+        raise ValueError(
+            f"Cosmos-Dreams kv_cache_inference_size must be an integer >= 2, got {cache_size!r}."
+        )
+    if (
+        isinstance(sink_frames, bool)
+        or not isinstance(sink_frames, int)
+        or not 0 <= sink_frames <= cache_size - 2
+    ):
+        raise ValueError(
+            "Cosmos-Dreams attention_sink_size must leave at least one recent past frame "
+            f"in the cache, got sink {sink_frames!r} for cache {cache_size}."
+        )
+    return cache_size, sink_frames
 
 
 class CosmosDreamsTransferHistoryProfile(msgspec.Struct, frozen=True):

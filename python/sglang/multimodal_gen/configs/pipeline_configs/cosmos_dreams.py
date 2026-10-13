@@ -82,6 +82,12 @@ class CosmosDreamsConfig(Cosmos3Config):
     # config defaults to "auto" and follows the training config instead.
     history_mode: str = HISTORY_MODE_FULL
     history_max_frames: int = COSMOS_DREAMS_HISTORY_MAX_FRAMES
+    # Deploy-time K/V cache for history_mode "sliding", in the training config's units:
+    # kv_cache_inference_size counts the pinned sink frames, the recent frames and the
+    # frame being generated, so 64/8 keeps 8 sinks + 55 recent frames. Unset, sliding
+    # uses the artifact's window_frames/sink_frames; "full" rejects them.
+    kv_cache_inference_size: int | None = None
+    attention_sink_size: int | None = None
 
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
@@ -106,6 +112,8 @@ class CosmosDreamsConfig(Cosmos3Config):
             frame_sigma_schedules=self.frame_sigma_schedules,
             history_mode=self.history_mode,
             history_max_frames=self.history_max_frames,
+            kv_cache_inference_size=self.kv_cache_inference_size,
+            attention_sink_size=self.attention_sink_size,
         )
 
     def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:

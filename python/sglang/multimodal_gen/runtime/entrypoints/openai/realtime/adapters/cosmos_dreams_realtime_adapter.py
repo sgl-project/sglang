@@ -299,6 +299,11 @@ class CosmosDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
                 )
             )
         extra = request.model_extra or {}
+        if extra.get("frustum_geometry") is not None:
+            raise ValueError(
+                "Cosmos-Dreams frustum K/V retrieval is offline-only; realtime sessions "
+                "do not accept frustum_geometry."
+            )
         state.extra_sampling_fields = {
             name: extra[name]
             for name in COSMOS_DREAMS_REALTIME_EXTRA_FIELDS
