@@ -3131,6 +3131,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _requires_host_drain(self, decode_req: DecodeRequest) -> bool:
+        # HiSparse receives KV directly into its own host pool, independently
+        # of the HiCache host-staging path.
+        return self.scheduler.enable_hisparse or (
+            self.enable_host_receive and decode_req.host_staged
+        )
+
     def _release_request(self, decode_req: DecodeRequest) -> None:
         # HiSparse host pages are the transfer destination; free them with the KV.
         if self.scheduler.enable_hisparse:
@@ -3262,7 +3269,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                requires_host_drain = self._is_host_destination(decode_req)
+                requires_host_drain = self._requires_host_drain(decode_req)
                 deferred_release_enabled = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
@@ -3282,6 +3289,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     # already hold destinations; this path always reaches
                     # _do_release, which clears the tracker.
                     decode_req.kv_receiver.ensure_abort_notified(force_arm=True)
+                if self.scheduler.enable_hisparse and deferred_release_enabled:
+                    # No notified peer means metadata was never published; no
+                    # remote write can still reference these host pages.
+                    requires_host_drain = decode_req.kv_receiver.abort_notified
                 failed.append(
                     (
                         i,
@@ -3458,9 +3469,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ready = []
         releases = list(self._deferred_releases.items())
         for decode_req, _, deadline, _, required_acks in releases:
-            if self._is_host_destination(decode_req):
+            if self._requires_host_drain(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
-                is_drained = decode_req.kv_receiver.is_abort_release_safe()
+                is_drained = (
+                    decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                        decode_req.req.bootstrap_room, required_acks
+                    )
+                    if self.scheduler.enable_hisparse
+                    else decode_req.kv_receiver.is_abort_release_safe()
+                )
                 is_ready = is_drained
             else:
                 is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
