@@ -641,6 +641,7 @@ class TestBeamNumerics(CustomTestCase):
             torch.nn.Module.__init__(moe)
             moe.layer_id, moe.tp_size, moe.ep_size = 1, 1, 4
             moe.use_fp32_router = moe.refresh_correction_bias = False
+            moe.use_fast_router = False
             moe.gate = Mock(return_value=(torch.zeros(2, 8), None))
             moe.topk = Mock(return_value="routing")
             moe.topk.empty_topk_output = Mock(return_value="empty routing")
