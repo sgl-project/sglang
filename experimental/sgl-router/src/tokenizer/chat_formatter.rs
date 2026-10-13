@@ -261,6 +261,13 @@ impl ChatFormatter {
             .is_some_and(ProcessorFormatter::always_thinks)
     }
 
+    /// The template's reasoning toggle kwarg and default, which SGLang's OpenAI layer reads.
+    pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
+        self.processor
+            .as_ref()
+            .and_then(ProcessorFormatter::reasoning_toggle)
+    }
+
     /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 are fixture-verified against SGLang
     /// for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {

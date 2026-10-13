@@ -511,9 +511,9 @@ reported them, `--completion-template`, `return_hidden_states` and other
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
 `AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
+(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
-parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`); `required`, named and strict
+parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`, `qwen3_coder`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine
 (`kimi_k3`'s `auto` tag is reproduced).
 With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
@@ -603,8 +603,8 @@ through `rust/sglang-processor`, which picks it by its template and builds the
 template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
 Media, a `chat_template` key in `chat_template_kwargs`, and text or tool numbers
 Python's `trim` or `json.dumps` treat unlike Dynamo's (such as `1e-06`) render on the
-worker. The processor does not reproduce the `qwen3` reasoning and `qwen3_coder`
-tool parsers, so with them (the cookbook's flags) chats take the engine's own OpenAI route.
+worker. With the cookbook's `qwen3` and `qwen3_coder` parsers, text chats are served
+through `/generate`; thinking follows the template's `enable_thinking` (on by default).
 
 ## Kimi-K3
 

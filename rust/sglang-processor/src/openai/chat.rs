@@ -32,6 +32,10 @@ pub struct ChatModel {
     /// reasoning config to `special_case="always"`.
     #[serde(default)]
     pub always_thinks: bool,
+    /// The kwarg that turns the chat template's reasoning on and off, with its
+    /// default: `template_detection`'s `toggle_param` and `default_enabled`.
+    #[serde(default)]
+    pub reasoning_toggle: Option<ReasoningToggle>,
     /// `chat_encoding_spec`, the encoder SGLang renders the model with; the
     /// OpenAI layer special-cases `"kimi_k3"`.
     #[serde(default)]
@@ -41,6 +45,24 @@ pub struct ChatModel {
 impl ChatModel {
     fn is_kimi_k3(&self) -> bool {
         self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+}
+
+/// A chat template's reasoning toggle (`ReasoningToggleConfig`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReasoningToggle {
+    pub toggle_param: String,
+    pub default_enabled: bool,
+}
+
+impl ReasoningToggle {
+    /// `_get_reasoning_from_request` for this config.
+    fn enabled(&self, kwargs: &Map<String, Value>) -> bool {
+        let value = kwargs.get(&self.toggle_param);
+        match self.default_enabled {
+            true => value != Some(&Value::Bool(false)),
+            false => value == Some(&Value::Bool(true)),
+        }
     }
 }
 
@@ -209,10 +231,14 @@ pub fn lower_chat(
     let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
-    let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
-        (Some(parser), Some(names)) => {
-            tool_detector(parser, names.clone()).ok_or(Unsupported("tool_parser"))?;
-            Some((parser.to_owned(), names.clone()))
+    let tool_parsing = match (
+        settings.tool_call_parser.as_deref(),
+        &tools,
+        &tool_definitions,
+    ) {
+        (Some(parser), Some(_), Some(definitions)) => {
+            tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
+            Some((parser.to_owned(), definitions.clone()))
         }
         _ => None,
     };
@@ -254,7 +280,12 @@ pub fn lower_chat(
         Some(thinking) => thinking,
         None => {
             parser.is_some()
-                && (model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true)))
+                && match &model.reasoning_toggle {
+                    Some(toggle) => toggle.enabled(&kwargs),
+                    None => {
+                        model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
+                    }
+                }
         }
     };
     // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
@@ -267,7 +298,7 @@ pub fn lower_chat(
         request.skip_special_tokens = false;
     }
     // K3 also stops on its tool parser's `eot_token`.
-    let tool_call_stop = match &tool_names {
+    let tool_call_stop = match &tool_parsing {
         Some((parser, _)) if kimi_k3 => match parser.as_str() {
             "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
             _ => return Err(Unsupported("tool_parser")),
@@ -298,7 +329,7 @@ pub fn lower_chat(
     // its structural tag, unless the request is already constrained; Python
     // tests the constraints by truthiness, so empty strings are unset.
     let sampling = &mut lowered["sampling_params"];
-    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_names, &tool_definitions)
+    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
         && ["regex", "ebnf", "json_schema"]
             .iter()
@@ -361,7 +392,7 @@ pub fn lower_chat(
         n: request.n as usize,
         logprobs: request.logprobs,
         reasoning,
-        tools: tool_names,
+        tools: tool_parsing,
         include_usage,
         continuous_usage_stats,
         settings: settings.clone(),
@@ -783,8 +814,8 @@ pub struct ChatResponder {
     n: usize,
     logprobs: bool,
     reasoning: Option<ReasoningConfig>,
-    /// The tool parser and tool names when the output is parsed for tool calls.
-    tools: Option<(String, Vec<String>)>,
+    /// The tool parser and request tools when the output is parsed for tool calls.
+    tools: Option<(String, Vec<Value>)>,
     include_usage: bool,
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
@@ -824,8 +855,8 @@ impl ChatResponder {
             // `_process_tool_calls`.
             let mut finish_reason = meta["finish_reason"].clone();
             let mut tool_calls = Value::Null;
-            if let Some((parser, names)) = &self.tools
-                && let Some(detector) = tool_detector(parser, names.clone())
+            if let Some((parser, tools)) = &self.tools
+                && let Some(detector) = tool_detector(parser, tools)
                 && detector.has_tool_call(&text)
             {
                 let (normal, calls) = detector.parse_non_stream(&text);
@@ -984,7 +1015,7 @@ impl ChatResponder {
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
             let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
-                tool_detector(&tools.0, tools.1.clone()).expect("checked when lowering")
+                tool_detector(&tools.0, &tools.1).expect("checked when lowering")
             });
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);

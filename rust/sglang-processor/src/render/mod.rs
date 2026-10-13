@@ -194,6 +194,12 @@ impl ChatFormatter {
         matches!(self, ChatFormatter::Glm53(_))
     }
 
+    /// The template's reasoning toggle kwarg and its default, as
+    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`).
+    pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
+        matches!(self, ChatFormatter::Qwen38 { .. }).then_some(("enable_thinking", true))
+    }
+
     /// Resolve the template's effective thinking mode and materialize its
     /// default under the exact kwarg the template consumes.
     pub fn resolve_thinking(

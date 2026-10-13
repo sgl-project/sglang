@@ -149,7 +149,8 @@ needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
 `FunctionCallParser`. To port another model, add `think/models/<model>.rs` or
 `tool_call/models/<model>.rs` and its names in that `models/mod.rs`. A detector
 that overrides the base splitting, as Kimi-K3's does, is its own `ThinkConfig`
-variant. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
+variant. Tool detectors get the request's tools: Qwen3-Coder's types argument
+values by their schemas. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
 `tests/fixtures/openai_parity/kimi-k3.json` checks it byte for byte.
 
 Pass-through for parsing:
