@@ -169,6 +169,24 @@ jobs:
           cd test
           python3 run_suite.py --hw npu --suite base-a-test-npu
 
+  # Coverage-mode-only counterpart of the base-a PR gate above: runs the same
+  # CPU unit suite on the 800t coverage pool via run_tests_with_coverage.sh,
+  # so its coverage files land on the shared /root/.cache disk and are merged
+  # into the baseline by setup-covstub. The PR gate stays on ubuntu-latest: a
+  # conditional `container` block cannot be expressed in a single job.
+  base-a-test-npu-cov:
+    needs: [set-image-config]
+    if: ${{ inputs.coverage_mode == true }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-a-test-npu
+      runner_config: linux-aarch64-a3-800t-2
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '45'
+      use_coverage_runner: true
+      upload_test_logs: false
+    secrets: inherit
+
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
@@ -242,7 +260,7 @@ jobs:
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -290,7 +308,10 @@ jobs:
         run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
 
       - name: Run test
-        timeout-minutes: 60
+        # Coverage mode: round-robin sharding is less balanced than PR-mode
+        # LPT (heavier part gets 4 targets incl. server starts per target),
+        # so widen the cap.
+        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -300,6 +321,23 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
+          # Coverage mode: enumerate case-level pytest node ids and run each
+          # through run_tests_with_coverage.sh (per-target coverage dirs on
+          # the 800t shared disk). PR mode below stays unchanged.
+          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-1-npu-a3 \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size 2 \
+              -o /tmp/selected_tests.txt
+            echo "Selected test targets:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              mapfile -t targets < /tmp/selected_tests.txt
+              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
+            fi
+            exit 0
+          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-npu \
@@ -317,7 +355,7 @@ jobs:
 
   multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -360,7 +398,10 @@ jobs:
           python3 scripts/ci/utils/diffusion/prefetch_consistency_gt.py
 
       - name: Run test
-        timeout-minutes: 60
+        # Coverage mode: round-robin sharding is less balanced than PR-mode
+        # LPT (heavier part gets 4 targets incl. server starts per target),
+        # so widen the cap.
+        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -370,6 +411,23 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
+          # Coverage mode: enumerate case-level pytest node ids and run each
+          # through run_tests_with_coverage.sh (per-target coverage dirs on
+          # the 800t shared disk). PR mode below stays unchanged.
+          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-4-npu-a3 \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size 2 \
+              -o /tmp/selected_tests.txt
+            echo "Selected test targets:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              mapfile -t targets < /tmp/selected_tests.txt
+              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
+            fi
+            exit 0
+          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-npu \
@@ -572,11 +630,14 @@ jobs:
     needs:
       [
         set-image-config,
+        base-a-test-npu-cov,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
         base-b-test-8-npu-a3,
         base-b-test-16-npu-a3,
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
         base-c-test-acc-2-npu-a3,
         base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,
@@ -706,6 +767,7 @@ jobs:
         check-changes,
 
         base-a-test-npu,
+        base-a-test-npu-cov,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,

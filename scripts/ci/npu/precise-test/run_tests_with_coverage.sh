@@ -36,15 +36,18 @@ results=()
 # Derive a filesystem-safe directory name from a test target:
 #   1. strip the trailing ".py"
 #   2. flatten path separators:  /  ->  __
-#   3. flatten pytest separators: ::  ->  --
+#   3. flatten pytest separators:  ::  ->  --
 #   4. replace any remaining unsafe character with "_"
+#      (keep "[" and "]" so parametrized pytest node ids
+#       ...::test_x[case_id] stay reversible: "]"+first / "["+in-class
+#       / "-"-last are all literals inside the bracket expression)
 # Each test gets its own COVERAGE_FILE so results never collide.
 setup_coverage() {
   local target="$1"
   local name="${target%.py}"
   name="${name//\//__}"
   name="${name//::/--}"
-  name="${name//[^a-zA-Z0-9_.-]/_}"
+  name="${name//[^]a-zA-Z0-9_.[-]/_}"
   local covdir="${COV_ROOT}/${name}"
   mkdir -p "${covdir}"
   export COVERAGE_FILE="${covdir}/coverage"
