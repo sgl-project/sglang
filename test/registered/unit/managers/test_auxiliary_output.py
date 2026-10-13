@@ -15,6 +15,7 @@ from sglang.srt.managers.auxiliary_output import (
     CompositeDeviceAuxiliaryOutput,
     append_auxiliary_output,
 )
+from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -26,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -915,6 +917,146 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
 
 
 class TestCacheOnlyWorkerOutput(CustomTestCase):
+    def test_rebootstrap_boundary_reaches_relay_and_dspark_bonus(self):
+        """The next forward must consume the emitted boundary, not a resampled token."""
+        for overlap, dspark, delayed in (
+            (False, False, False),
+            (True, False, False),
+            (True, False, True),
+            (False, True, False),
+            (True, True, False),
+        ):
+            for cache_only in (False, True):
+                with (
+                    self.subTest(
+                        overlap=overlap,
+                        dspark=dspark,
+                        delayed=delayed,
+                        cache_only=cache_only,
+                    ),
+                    get_context().override_server_args(
+                        dsv41_encoder_only_prefill=cache_only,
+                        disaggregation_mode="decode",
+                        speculative_algorithm="DSPARK" if dspark else None,
+                        disable_overlap_schedule=not overlap,
+                    ),
+                ):
+                    reqs = [
+                        SimpleNamespace(
+                            pd_rebootstrap_in_progress=active,
+                            pd_rebootstrap_forced_output_id=token,
+                            beam_group=None,
+                        )
+                        for active, token in (
+                            (True, 12),
+                            (True, None),
+                            (False, 55),
+                            (True, 0),
+                        )
+                    ]
+                    algo = (
+                        SpeculativeAlgorithm.DSPARK
+                        if dspark
+                        else SpeculativeAlgorithm.NONE
+                    )
+                    batch = SimpleNamespace(
+                        reqs=reqs,
+                        dsv41_cache_only_replay=cache_only,
+                        hicache_consumer_index=0,
+                        beam_tail=None,
+                        forward_mode=ForwardMode.EXTEND,
+                        enable_overlap=overlap,
+                        req_pool_indices=torch.arange(4),
+                        seq_lens=torch.full((4,), 128),
+                        extend_lens=[1] * 4,
+                        prefix_lens=[127] * 4,
+                        out_cache_loc=torch.arange(4),
+                        device="cpu",
+                        spec_algorithm=algo,
+                    )
+                    logits = LogitsProcessorOutput(
+                        next_token_logits=torch.zeros(4, 8),
+                        hidden_states=torch.zeros(4, 2),
+                    )
+                    sampled = torch.tensor([999, 998, 997, 996])
+                    fb = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        sampling_info=SimpleNamespace(grammars=[] if delayed else None),
+                        is_prefill_only=False,
+                        kv_loc_plan=object(),
+                        apply_deprecated_skip_attn_backend_init=lambda _: None,
+                    )
+                    target = object.__new__(TpModelWorker)
+                    target.pp_group = SimpleNamespace(is_last_rank=True)
+                    target.enable_overlap, target.enable_spec = overlap, dspark
+                    target.is_dllm = lambda: False
+                    target.set_hicache_consumer = lambda _: None
+                    target._maybe_finalize_elastic_cuda_graph_scale = lambda: None
+                    target._model_runner = Mock()
+                    target.model_runner.forward.return_value = SimpleNamespace(
+                        logits_output=logits,
+                        can_run_graph=False,
+                        expert_distribution_metrics=None,
+                        routed_experts_output=None,
+                        indexer_topk_output=None,
+                    )
+                    target.model_runner.sample.return_value = sampled
+                    with patch(
+                        "sglang.srt.managers.tp_worker.ForwardBatch.init_new",
+                        return_value=fb,
+                    ):
+                        if dspark:
+                            worker = object.__new__(DSparkWorkerV2)
+                            worker._target_worker = target
+                            worker._target_hidden_projection_enabled = False
+                            worker._tp_sync = Mock()
+                            worker._kv_injector = Mock()
+                            worker._kv_injector.ids_for.return_value = torch.arange(4)
+                            worker.model_runner = SimpleNamespace(
+                                prefill_attention_backend_str="triton"
+                            )
+                            with patch(
+                                "sglang.srt.speculative.dspark_components.dspark_worker_v2.compute_position",
+                                return_value=(torch.arange(4), None),
+                            ):
+                                result = worker._forward_prefill(batch, on_publish=None)
+                        else:
+                            result = target.forward_batch_generation(batch)
+                            if delayed:
+                                self.assertIsNotNone(result.delay_sample_func)
+                                result.delay_sample_func()
+                    expected = [12, 998, 997, 0] if cache_only else sampled.tolist()
+                    self.assertEqual(result.next_token_ids.tolist(), expected)
+                    # CUDA graph/sampler buffers must not be overwritten by recovery.
+                    self.assertEqual(sampled.tolist(), [999, 998, 997, 996])
+                    self.assertEqual(reqs[0].pd_rebootstrap_forced_output_id, 12)
+                    self.assertTrue(reqs[0].pd_rebootstrap_in_progress)
+                    if dspark:
+                        self.assertEqual(
+                            result.next_draft_input.bonus_tokens.tolist(), expected
+                        )
+                    future = FutureMap(
+                        torch.device("cpu"),
+                        algo,
+                        SimpleNamespace(req_to_token=torch.zeros(4, 128)),
+                    )
+                    scheduler = SimpleNamespace(
+                        spec_algorithm=algo,
+                        future_map=future,
+                        beam_coordinator=SimpleNamespace(
+                            maybe_select_and_relay=lambda *_, **__: None
+                        ),
+                        chunked_req=None,
+                    )
+                    Scheduler._relay_forward_payload(
+                        scheduler, batch, batch.req_pool_indices, result
+                    )
+                    self.assertEqual(future.output_tokens_buf.tolist(), expected)
+                    if not dspark:
+                        batch.prefill_input_ids_cpu = batch.input_ids = None
+                        resolve_forward_inputs(batch, future)
+                        self.assertEqual(batch.input_ids.tolist(), expected)
+
     def test_missing_logits_only_marks_encoder_only_prefill_extend(self):
         """A missing generation result must not authorize a normal PD handoff."""
         for enabled, role, mode, allowed in (
