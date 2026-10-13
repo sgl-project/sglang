@@ -573,8 +573,8 @@ class AddReqResult(Enum):
 class AdmissionSkipReason(Enum):
     """Why a step skips admission; each implies that nothing is admissible."""
 
-    NO_WAITING = auto()  # No request is waiting
-    NO_REQ_SLOT = auto()  # No request slot is free
+    NO_WAITING = auto()
+    NO_REQ_SLOT = auto()
 
 
 @dataclass(frozen=True, slots=True)
