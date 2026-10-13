@@ -360,7 +360,7 @@ class SGLDiffusionGenerator:
         """Rebuild the worker if this cached executor no longer owns it."""
         if self._owns_live(executor):
             return
-        reload = getattr(executor, "_sgld_reload", None)
+        reload = executor._sgld_reload
         if not reload:
             raise RuntimeError(
                 "SGLD worker is down and this executor has no reload spec"
@@ -371,7 +371,7 @@ class SGLDiffusionGenerator:
         )
         self.load_model(**reload)
         executor.generator = self.generator
-        lora = getattr(executor, "_lora_input", None)
+        lora = executor._lora_input
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
         # The new worker's session cache starts empty, so conditioning the

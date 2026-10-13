@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import importlib
 import sys
 import types
 from types import SimpleNamespace
@@ -8,27 +9,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
-if "comfy" not in sys.modules:
-    # The plugin only ever runs inside ComfyUI; stub the bit of
-    # comfy.ldm.common_dit the Qwen-Image adapter imports at module scope so
-    # this contract is testable without a ComfyUI install or a GPU. Mirrors
-    # the stubbing convention in
-    # apps/ComfyUI_SGLDiffusion/test/test_h3_request.py.
-    comfy = types.ModuleType("comfy")
-    comfy_ldm = types.ModuleType("comfy.ldm")
-    comfy_ldm_common_dit = types.ModuleType("comfy.ldm.common_dit")
-
-    def _pad_to_patch_size(x, patch_size):
-        return x
-
-    comfy_ldm_common_dit.pad_to_patch_size = _pad_to_patch_size
-    comfy_ldm.common_dit = comfy_ldm_common_dit
-    comfy.ldm = comfy_ldm
-
-    sys.modules["comfy"] = comfy
-    sys.modules["comfy.ldm"] = comfy_ldm
-    sys.modules["comfy.ldm.common_dit"] = comfy_ldm_common_dit
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     ComfyUIModelAdapter,
@@ -42,9 +22,6 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
     FluxAdapter,
     FluxExecutor,
-)
-from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.qwen_image import (
-    QwenImageEditAdapter,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
@@ -260,8 +237,23 @@ def test_comfyui_weight_access_gets_a_clear_error() -> None:
         base.state_dict()
 
 
+def _qwen_image_edit_adapter():
+    """Import the Qwen adapters with the one ComfyUI helper they use stubbed."""
+    common_dit = types.ModuleType("comfy.ldm.common_dit")
+    common_dit.pad_to_patch_size = lambda x, patch_size: x
+    comfy, comfy_ldm = types.ModuleType("comfy"), types.ModuleType("comfy.ldm")
+    comfy.ldm, comfy_ldm.common_dit = comfy_ldm, common_dit
+    stubs = {"comfy": comfy, "comfy.ldm": comfy_ldm, "comfy.ldm.common_dit": common_dit}
+    with patch.dict(sys.modules, stubs):
+        module = importlib.import_module(
+            "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.qwen_image"
+        )
+    return module.QwenImageEditAdapter()
+
+
 def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
-    adapter = QwenImageEditAdapter()
+    """Qwen-Image-Edit packed only the first of several reference images."""
+    adapter = _qwen_image_edit_adapter()
     x = torch.ones(1, 16, 1, 90, 160)
     timestep = torch.tensor([1.0])
     context = torch.ones(1, 19, 2560)
