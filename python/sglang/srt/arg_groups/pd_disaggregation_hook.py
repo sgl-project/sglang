@@ -85,12 +85,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "mori",
             "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, mori, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
