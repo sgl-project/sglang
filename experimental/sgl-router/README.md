@@ -49,7 +49,7 @@ replicas. Each one rebuilds its routing state (engine load, KV prefix tree,
 in-flight counts) from the engines' own reports, so you scale a large deployment
 by running more router replicas behind a load balancer. A new replica can copy
 the KV tree from a warm sibling at startup
-([peer bootstrap](#peer-bootstrap-kubernetes)). Session bindings stay in each
+([peer bootstrap](#kv-cache-signals)). Session bindings stay in each
 replica's memory, so with `session_aware` and several replicas, route a session's
 requests to the same replica (for example, a load balancer sticky on the session
 header).
@@ -102,7 +102,8 @@ every flag.
 | `GET /healthz`, `/readyz` | Liveness and readiness |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-Both edges speak cleartext HTTP/2 where the peer does; see [HTTP/2](#http2).
+Both edges speak cleartext HTTP/2 where the peer does; see
+[operations](#operations).
 
 ### Key flags
 
@@ -251,216 +252,66 @@ admission and fallback fit together.
 
 ### Native `/generate`
 
-`/generate` (`POST` or `PUT`) takes the engine's `GenerateReqInput` body and
-returns the same response, buffered or SSE. Worker selection, P/D dispatch and
-abort-on-disconnect are shared with chat completions. With a tokenizer loaded,
-the router tokenizes `text` (with the special tokens SGLang adds) and forwards
-`input_ids`, so routing sees the engine's exact tokens. Multimodal requests,
-`--disable-input-ids-forwarding`, and tokenizers the router cannot reproduce keep
-`text`. A batch goes to one worker. Prompts without a `rid` get one minted.
+Same body and response as the engine's `/generate`, buffered or SSE. With a
+tokenizer loaded, `text` is forwarded as `input_ids` so routing sees the
+engine's exact tokens (`--disable-input-ids-forwarding` turns this off).
 
 ### OpenAI over /generate
 
-`/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
-but the router runs SGLang's OpenAI layer itself (`sglang-processor`): it lowers
-the request to `GenerateReqInput`, sends it to `/generate`, and builds the OpenAI
-response. Requests it cannot reproduce exactly go to the engine's own route
-unchanged, for example: workers disagreeing on server args, `sglext` outputs,
-`logprobs` without a tokenizer, unverified chat renderers, media, or `required` /
-named / strict tools. Point `--tokenizer-path` into the model directory so
-`config.json` and `generation_config.json` are read as the engine reads them.
-`sgl_router_openai_route_total` counts each outcome.
-
-### Embeddings, classify and rerank
-
-These take the engine's request bodies and return its responses, routed on load.
-A P/D fleet answers 400 to all three.
-
-- `/v1/embeddings` (OpenAI `EmbeddingRequest`; `model` must name the served
-  model): text input is tokenized and forwarded as token IDs, and a list is one
-  batch for one worker.
-- `/v1/classify` (`ClassifyRequest`): served like embeddings, except a batch of
-  text stays text.
-- `/v1/rerank` (`POST` or `PUT`, `V1RerankReqInput`): forwarded as sent.
+For `/v1/chat/completions` and `/v1/completions`, the router runs SGLang's
+OpenAI layer itself: it sends the request to `/generate` and builds the OpenAI
+response. Requests it cannot reproduce exactly (for example media or strict
+tools) go to the engine's own route unchanged.
 
 ### Anthropic Messages
 
-`/v1/messages` converts each request to a chat completion, routes it like
-`/v1/chat/completions`, and converts the reply or stream back. Errors use the
-Anthropic envelope. `/v1/messages/count_tokens` is answered by the router from
-the chat template without calling an engine (image tokens are not counted).
-`thinking` maps to the `thinking` / `enable_thinking` template kwargs; for
-models whose reasoning parser needs more, use `output_config.effort` or
-`chat_template_kwargs`.
+`/v1/messages` is converted to a chat completion and back.
+`/v1/messages/count_tokens` is answered by the router from the chat template.
 
-### Bucket file membership
+### Embeddings, classify and rerank
 
-`--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
-group can set its engines, `policy` (`power_of_two` or the `--policy` value),
-`admission` and `affinity`; unset fields inherit the CLI flags.
+Engine request and response bodies, routed on load. Not available on P/D fleets.
 
-- `"worker_services": ["namespace/name"]` matches Kubernetes Services via the
-  `kubernetes.io/service-name` EndpointSlice label; replacement pods join
-  automatically. Discovery selectors must already include those EndpointSlices.
-- `"worker_ids": ["http://worker:30000"]` names static worker URLs.
-- Set at most one of them; omit both for every engine of the group's role.
-- `"affinity": {"mode", "balanced_by", "load_factor", "load_gap"}`; the balanced
-  fields require `"mode": "balanced"`, and `power_of_two` groups take none.
+### Bucket file
 
-Unsupported legacy options (pressure guards, cache switch margins,
-queue/saturation gates) fail at startup under reorg.
+`--bucket-config` defines buckets whose groups set `worker_services`
+(`namespace/name`) or `worker_ids`, plus `policy`, `admission` and `affinity`;
+unset fields inherit the CLI flags. See
+[ARCHITECTURE.md](ARCHITECTURE.md#2-configuration-examples).
 
-### Optional tokenizer for load-only routing
+### KV cache signals
 
-`--no-tokenizer` skips loading a tokenizer for load-only policies
-(`power_of_two`, `session_aware`). Workers tokenize the original messages, and
-`/v1/tokenize` / `/v1/detokenize` are unavailable. Cache-aware routing and
-buckets with token-length or context limits need a tokenizer.
-
-### External KV indexer
-
-Use an external indexer instead of the router-local radix tree as the
-cache-aware prefix source:
-
-```bash
-sgl-router --model-id qwen3 --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
-  --policy cache_aware --cache-prefix-provider indexer \
-  --kv-indexer-endpoint http://10.0.0.10:50051
-```
-
-`--kv-indexer-query-timeout-ms` (default 100) and
-`--kv-indexer-query-max-inflight` (default 32) bound queries. See
-[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md).
-
-### KV-event gap replay
-
-ZMQ can drop KV events, leaving the router crediting blocks a worker no longer
-holds. Give each engine a replay socket and the router re-fetches skipped
-batches:
-
-```bash
-python -m sglang.launch_server ... \
-  --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}'
-```
-
-Rank r uses port base + r, so with `dp_size > 1` keep the replay base at least
-`dp_size` ports past the publish base. The engine keeps the last `buffer_steps`
-batches (default 10000). `sgl_router_kv_event_replays_total{outcome}` counts
-attempts.
-
-### Pending prefixes
-
-`--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
-long after routing it there, before its KV events arrive, so bursts sharing a
-cold prefix (parallel sampling, RL rollouts, agent fan-out) stay on one worker.
-Off by default; needs `--policy cache_aware` with the router-local radix tree.
-`sgl_router_cache_pending_prefix_hits_total` counts matches.
-
-### Peer bootstrap (Kubernetes)
-
-A router replica that starts mid-fleet cannot see KV already cached in the
-engines. With `--kv-peer-selector`, it pulls a tree snapshot from a warm sibling
-over `/internal/kv_snapshot`, and `/readyz` stays 503 until that settles.
-Requires `--policy cache_aware` with the local radix tree and
-`--service-discovery`.
-
-```bash
-sgl-router --model-id qwen3 --policy cache_aware \
-  --service-discovery --service-discovery-namespace prod \
-  --selector app=engines-qwen3 \
-  --kv-peer-selector kubernetes.io/service-name=sgl-router
-```
-
-- The selector matches EndpointSlice labels (not pod labels), so use
-  `kubernetes.io/service-name=<router-service>`.
-- `--kv-bootstrap-timeout-ms` (default 600000) bounds the bootstrap; readiness
-  probes must tolerate it. `--kv-bootstrap-fetch-timeout-cap-ms` (default
-  300000) caps one fetch. `--kv-bootstrap-seed-required` keeps the replica
-  unready if siblings exist but the snapshot fails.
-- Grant `get`/`list`/`watch` on `endpointslices`, wire `POD_NAME`,
-  `POD_NAMESPACE` and `POD_IP` from the downward API, and roll out with
-  `maxUnavailable: 0`. See
+- **External KV indexer**: `--cache-prefix-provider indexer
+  --kv-indexer-endpoint <url>`; see [sgl-kv-indexer](sgl-kv-indexer/README.md).
+- **KV-event gap replay**: add `"replay_endpoint"` to the engine's
+  `--kv-events-config` so the router can re-fetch dropped KV events.
+- **Pending prefixes**: `--cache-pending-prefix-ttl-ms` keeps bursts that share
+  a cold prefix on one worker until its KV events arrive.
+- **Peer bootstrap (Kubernetes)**: `--kv-peer-selector
+  kubernetes.io/service-name=<router-service>` makes a new replica copy the KV
+  tree from a sibling before `/readyz` passes. Example manifest:
   `tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml`.
 
-### PD version groups
+### Operations
 
-`--pd-version-group-label <key>` pairs a prefill worker only with decode
-workers that have the same value for that EndpointSlice label, so KV never
-crosses engine versions during a rollout. Use one Service per role and version.
-Unlabeled workers form their own group.
-
-### DP-rank routing
-
-With `--dp-aware`, for engines running several DP ranks (`--dp-size` /
-`--attn-dp-size`), the router also picks the rank and sends it as
-`X-Data-Parallel-Rank`. It uses, in order: a hash of the routing key or session
-id, the rank with the deepest cached prefix, then the rank with the fewest
-in-flight requests. Decode ranks by load only.
-
-### Retries
-
-`--retry-max-attempts N` (default 1, no retries; 3 is typical) resends a request
-that failed before any response reached the client to an untried worker.
-Failures are transport errors, open circuit breakers, 5xx, 429 and timeouts.
-`--request-timeout-secs` bounds a non-streaming response, or a stream until its
-headers (for SGLang chat, the first token). Streams that started, 2xx and 4xx
-are never retried. Backoff is jittered exponential from
-`--retry-initial-backoff-ms` (default 50) up to `--retry-max-backoff-ms`
-(default 2000), within `--stale-request-timeout-secs`.
-`sgl_router_retries_total` counts retries.
-
-### Engines with `--api-key`
-
-The router reads each worker's `/server_info` and `/model_info`. If engines run
-with `--api-key`, pass the same key as `--worker-api-key`. Chat requests and
-`/flush_cache` forward the caller's `Authorization` header instead.
-
-### Fleet-wide sampling contract
-
-`--override-sampling-params` fixes sampling parameters for every client:
-
-```bash
-sgl-router --model-id qwen3 --worker-urls http://10.0.0.1:30000 \
-  --override-sampling-params '{"temperature": 1, "top_p": 0.95, "n": 1}' \
-  --sampling-param-conflict reject
-```
-
-- A configured value is injected when the request omits the field (or sends
-  `null`).
-- When the request sends a different value, `reject` (default) returns 400 with
-  `x-router-error-code: sampling_contract_violation`, and `allow` forwards it.
-  `sgl_router_sampling_contract_rejections_total{param}` counts rejections.
-- A value may be a band `{"min": LO, "max": HI}`, which only rejects; it cannot
-  be combined with `allow`.
-- Supported keys and ranges, checked at startup: `temperature` [0, 2], `top_p`
-  (0, 1], `top_k` >= 1 or -1, `min_p` [0, 1], `repetition_penalty` (0, 2],
-  `frequency_penalty` / `presence_penalty` [-2, 2], `n` [1, 128].
-
-### Chat rendering
-
-The router renders chats with dynamo-render, using the model's HF Jinja template
-or a native encoder for models that have one. Cache-aware routing hashes the
-rendered tokens. Renderers verified against SGLang forward the tokens to the
-engine as `input_ids` for every non-multimodal chat; unverified ones forward
-only plain-text chats and log `UNVERIFIED` at startup.
-
-- Use the same model files on router and workers, and the same
-  `--default-chat-template-kwargs` and rendering-related `SGLANG_*` environment
-  variables.
-- Set `--disable-input-ids-forwarding` when worker rendering may differ (worker
-  template or parser overrides, array-only templates, templates with stop
-  strings). Caller-supplied `input_ids` always pass through.
-- `--tokenizer-backend fast` encodes with fastokens, and
-  `--tokenizer-l1-cache-mb N` caches multi-turn prefixes, both to cut
-  tokenization latency.
-
-### HTTP/2
-
-Nothing to configure. Inbound, the listener accepts cleartext HTTP/2 (h2c) and
-HTTP/1.1 on the same port. Outbound, the router uses h2c to a worker only when
-its `/server_info` reports `enable_http2: true` and the URL is `http://`;
-`https://` workers negotiate by ALPN, and everything else uses HTTP/1.1. The
-protocol is read once per worker at registration.
+- **No tokenizer**: `--no-tokenizer` for load-only policies (`power_of_two`,
+  `session_aware`).
+- **Retries**: `--retry-max-attempts N` resends a request that failed before
+  any response to another worker.
+- **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
+  engines.
+- **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
+  decode only within the same engine version.
+- **Engine API key**: `--worker-api-key` for engines launched with `--api-key`.
+- **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
+  parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
+  happens to requests that differ.
+- **Chat rendering**: use the same model files and chat-template settings on
+  router and workers, or set `--disable-input-ids-forwarding`.
+  `--tokenizer-backend fast` and `--tokenizer-l1-cache-mb N` speed up
+  tokenization.
+- **HTTP/2**: no configuration. h2c is used inbound when the client speaks it,
+  and outbound to workers that report `enable_http2`.
 
 ## License
 
