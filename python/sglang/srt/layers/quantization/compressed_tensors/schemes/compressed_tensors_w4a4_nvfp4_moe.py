@@ -10,6 +10,9 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
@@ -18,6 +21,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils.common import get_device_capability, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -32,24 +36,32 @@ if TYPE_CHECKING:
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     def __init__(self):
-        if not get_platform().is_blackwell:
+        moe_runner_backend = get_moe_runner_backend()
+        # Marlin runs the NVFP4 weights with BF16/FP16 activations (W4A16): the default
+        # on SM80-SM90, and opt-in on Blackwell with --moe-runner-backend marlin.
+        if moe_runner_backend.is_auto() and is_cuda():
+            self.use_marlin = (8, 0) <= get_device_capability() < (10, 0)
+        else:
+            self.use_marlin = moe_runner_backend.is_marlin()
+        if not get_platform().is_blackwell and not self.use_marlin:
             raise ValueError(
-                "Current platform does not support NVFP4"
-                " quantization. Please use Blackwell and"
-                " above."
+                "Current platform does not support NVFP4 quantization with the"
+                " selected MoE backend. Please use Blackwell and above, or use"
+                " moe_runner_backend=marlin on SM80+."
             )
         self.group_size = 16
-        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.use_flashinfer_trtllm = moe_runner_backend.is_flashinfer_trtllm()
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        """Load W13 as ``[up; gate]`` for CUTLASS; TRT-LLM reorders post-load."""
-        return not self.use_flashinfer_trtllm
+        """Load W13 as ``[up; gate]`` for CUTLASS; TRT-LLM reorders post-load and
+        Marlin takes ``[gate; up]``."""
+        return not self.use_flashinfer_trtllm and not self.use_marlin
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Requires sm100(blackwell) architecture
-        return 100
+        # SM80+ through Marlin; FP4 activations need SM100+ (checked in __init__).
+        return 80
 
     def create_weights(
         self,
@@ -198,6 +210,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             1 / layer.w2_weight_global_scale.data, requires_grad=False
         )
 
+        if self.use_marlin:
+            prepare_moe_nvfp4_layer_for_marlin(layer)
+            return
+
         # w13
         if self.use_flashinfer_trtllm:
             w13_input_global_scale = (
@@ -291,7 +307,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm:
+        if self.use_marlin:
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        elif self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401 – triggers @register_fused_func
 
             self.runner = MoeRunner(
@@ -304,6 +322,21 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
             )
 
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
+            weight_bits=4,
+            w13_global_scale=layer.w13_weight_scale_2,
+            w2_global_scale=layer.w2_weight_scale_2,
+        )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -311,6 +344,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         x = dispatch_output.hidden_states
+
+        if self.use_marlin:
+            return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
 
         if self.use_flashinfer_trtllm:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
