@@ -232,13 +232,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         config = model_runner.model_config
 
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
+        # Note: self.max_context_len and self.page_size are set by the parent
+        # FlashInferAttnBackend.__init__() with the same values, so we don't
+        # re-assign them here. See issue #28808.
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
