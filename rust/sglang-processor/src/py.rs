@@ -116,6 +116,212 @@ fn python_float(f: f64) -> String {
     format!("{sign}{int}.{frac}")
 }
 
+/// `json.dumps(json.loads(text), ensure_ascii=False)`, or `None` where
+/// `json.loads` raises. Integers keep their digits, as Python's `int` does; a
+/// duplicate key keeps its first position and last value. Lone surrogates,
+/// which Python keeps, have no Rust `char` and also give `None`.
+pub(crate) fn python_json_reencode(text: &str) -> Option<String> {
+    let mut scanner = PyJsonScanner { text, pos: 0 };
+    scanner.skip_ws();
+    let out = scanner.value()?;
+    scanner.skip_ws();
+    (scanner.pos == text.len()).then_some(out)
+}
+
+/// `json.dumps(dict(pairs), ensure_ascii=False)` over values already dumped: a
+/// repeated key keeps its first position and last value.
+pub(crate) fn python_dict(pairs: impl IntoIterator<Item = (String, String)>) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (key, value) in pairs {
+        match entries.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => entries.push((key, value)),
+        }
+    }
+    let mut out = String::from("{");
+    for (i, (key, value)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_python_str(key, false, &mut out);
+        out.push_str(": ");
+        out.push_str(value);
+    }
+    out.push('}');
+    out
+}
+
+/// The scanner of Python's `json` module (`_json.c`), re-encoding as it reads.
+struct PyJsonScanner<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl PyJsonScanner<'_> {
+    fn rest(&self) -> &str {
+        &self.text[self.pos..]
+    }
+
+    fn skip_ws(&mut self) {
+        let rest = self.rest();
+        self.pos += rest.len() - rest.trim_start_matches([' ', '\t', '\n', '\r']).len();
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let found = self.rest().starts_with(token);
+        if found {
+            self.pos += token.len();
+        }
+        found
+    }
+
+    fn value(&mut self) -> Option<String> {
+        for token in ["null", "true", "false", "NaN", "Infinity", "-Infinity"] {
+            if self.eat(token) {
+                return Some(token.into());
+            }
+        }
+        match self.rest().bytes().next()? {
+            b'"' => {
+                let mut out = String::new();
+                write_python_str(&self.string()?, false, &mut out);
+                Some(out)
+            }
+            b'[' => Some(format!("[{}]", self.items(b']', Self::value)?.join(", "))),
+            b'{' => {
+                let pairs = self.items(b'}', |s| {
+                    let key = s.rest().starts_with('"').then(|| s.string())??;
+                    s.skip_ws();
+                    s.eat(":").then_some(())?;
+                    s.skip_ws();
+                    Some((key, s.value()?))
+                })?;
+                Some(python_dict(pairs))
+            }
+            _ => self.number(),
+        }
+    }
+
+    /// After the opening bracket: `,`-separated items up to `close`.
+    fn items<T>(
+        &mut self,
+        close: u8,
+        mut item: impl FnMut(&mut Self) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        self.pos += 1;
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.rest().bytes().next() == Some(close) {
+            self.pos += 1;
+            return Some(items);
+        }
+        loop {
+            self.skip_ws();
+            items.push(item(self)?);
+            self.skip_ws();
+            match self.rest().bytes().next()? {
+                b',' => self.pos += 1,
+                c if c == close => {
+                    self.pos += 1;
+                    return Some(items);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?`: an `int` without a
+    /// fraction or exponent, else a `float`.
+    fn number(&mut self) -> Option<String> {
+        let bytes = self.rest().as_bytes();
+        let digits = |from: usize| {
+            bytes
+                .get(from..)
+                .map_or(0, |b| b.iter().take_while(|b| b.is_ascii_digit()).count())
+        };
+        let mut end = usize::from(bytes.first() == Some(&b'-'));
+        end += match bytes.get(end) {
+            Some(b'0') => 1,
+            Some(b'1'..=b'9') => digits(end),
+            _ => return None,
+        };
+        let int_end = end;
+        if bytes.get(end) == Some(&b'.') && digits(end + 1) > 0 {
+            end += 1 + digits(end + 1);
+        }
+        if matches!(bytes.get(end), Some(b'e' | b'E')) {
+            let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+            let exponent = digits(end + 1 + sign);
+            if exponent > 0 {
+                end += 1 + sign + exponent;
+            }
+        }
+        let literal = &self.text[self.pos..self.pos + end];
+        self.pos += end;
+        match end == int_end {
+            // `int("-0")` is 0.
+            true if literal == "-0" => Some("0".into()),
+            true => Some(literal.into()),
+            false => Some(python_float(literal.parse().ok()?)),
+        }
+    }
+
+    /// A string literal, as `scanstring` decodes it: raw control characters
+    /// are rejected and `\u` escapes pair surrogates.
+    fn string(&mut self) -> Option<String> {
+        let mut chars = self.rest()[1..].char_indices();
+        let mut out = String::new();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => {
+                    self.pos += i + 2;
+                    return Some(out);
+                }
+                '\\' => out.push(match chars.next()?.1 {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => {
+                        let unit = hex4(&mut chars)?;
+                        let code = match unit {
+                            0xd800..=0xdbff => {
+                                let escape = [chars.next()?.1, chars.next()?.1];
+                                let low =
+                                    hex4(&mut chars).filter(|u| (0xdc00..=0xdfff).contains(u));
+                                match (escape, low) {
+                                    (['\\', 'u'], Some(low)) => {
+                                        0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00)
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                            unit => unit,
+                        };
+                        char::from_u32(code)?
+                    }
+                    _ => return None,
+                }),
+                c if c < ' ' => return None,
+                c => out.push(c),
+            }
+        }
+        None
+    }
+}
+
+/// Four hex digits of a `\u` escape.
+fn hex4(chars: &mut std::str::CharIndices<'_>) -> Option<u32> {
+    let digits: String = (0..4)
+        .map(|_| chars.next().map(|(_, c)| c).filter(char::is_ascii_hexdigit))
+        .collect::<Option<_>>()?;
+    u32::from_str_radix(&digits, 16).ok()
+}
+
 /// Python's `str.isspace`, which also counts the ASCII separators U+001C..U+001F.
 fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)

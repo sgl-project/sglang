@@ -2,21 +2,20 @@
 //! `kimik3_format.py`), with `FunctionCallParser`'s wrapping.
 //!
 //! Calls are numbered in output order and kept whatever their tool name. Typed
-//! argument values round-trip as Python's `json.loads` would, except integers
-//! beyond 64 bits, `-0`, `NaN`/`Infinity` and lone surrogates, which serde_json
-//! parses differently or rejects. `_ATTR_RE`'s `\w` is the regex crate's, which
-//! differs from Python's only outside ASCII.
+//! argument values go through `json.loads` and `json.dumps` as in Python
+//! (`python_json_reencode`), except lone surrogates. `_ATTR_RE`'s `\w` is the
+//! regex crate's, which differs from Python's only outside ASCII.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::kimi_k3_format::{
     CALL_CLOSE, CALL_OPEN, MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
     partial_suffix_len, strip_partial_marker_suffix, strip_response_wrappers,
 };
-use crate::py::python_json;
+use crate::py::{python_dict, python_json, python_json_reencode};
 use crate::tool_call::{Parsed, ToolCallItem, ToolDetector};
 
 const SEP: &str = "<|sep|>";
@@ -144,16 +143,18 @@ fn decode_call(attrs: &str, body: &str) -> Option<(String, String)> {
     if name.is_empty() {
         return None;
     }
-    let mut arguments = Map::new();
-    for (arg_attrs, raw) in blocks(body, ARGUMENT_OPEN, ARGUMENT_CLOSE) {
-        let key = attr(arg_attrs, "key").unwrap_or_default();
-        let value = match attr(arg_attrs, "type").as_deref().unwrap_or("string") {
-            "string" => Value::String(raw.to_owned()),
-            _ => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
-        };
-        arguments.insert(key, value);
-    }
-    Some((name, python_json(&Value::Object(arguments), false)))
+    let arguments =
+        blocks(body, ARGUMENT_OPEN, ARGUMENT_CLOSE)
+            .into_iter()
+            .map(|(arg_attrs, raw)| {
+                let value = match attr(arg_attrs, "type").as_deref().unwrap_or("string") {
+                    "string" => None,
+                    _ => python_json_reencode(raw),
+                };
+                let value = value.unwrap_or_else(|| python_json(&Value::String(raw.into()), false));
+                (attr(arg_attrs, "key").unwrap_or_default(), value)
+            });
+    Some((name, python_dict(arguments)))
 }
 
 /// `(attrs, body)` of each `_CALL_RE` / `_ARG_RE` match: `open`, whitespace,

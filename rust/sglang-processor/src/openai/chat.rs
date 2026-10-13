@@ -295,13 +295,14 @@ pub fn lower_chat(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     );
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
-    // its structural tag, unless the request is already constrained.
+    // its structural tag, unless the request is already constrained; Python
+    // tests the constraints by truthiness, so empty strings are unset.
     let sampling = &mut lowered["sampling_params"];
     if let (Some((tool_parser, _)), Some(definitions)) = (&tool_names, &tool_definitions)
         && tool_parser == "kimi_k3"
         && ["regex", "ebnf", "json_schema"]
             .iter()
-            .all(|key| sampling[*key].is_null())
+            .all(|key| sampling[*key].as_str().is_none_or(str::is_empty))
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
