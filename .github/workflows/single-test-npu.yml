@@ -41,7 +41,6 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            
             #"test/registered/npu/accuracy/qwen3_5_397b/test_npu_qwen3_5_397b_8p_gpqa.py"
             #"test/registered/npu/accuracy/deepseek_v3_2/test_npu_deepseek_v3_2_8p_aime25.py"
             #"test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_deepep_low_latency_qwen3_480b.py"
