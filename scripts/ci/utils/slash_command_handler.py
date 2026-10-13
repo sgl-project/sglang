@@ -27,6 +27,7 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+_TAG_RUN_CI_REPOSITORY_PERMISSIONS = {"write", "maintain", "admin"}
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -285,6 +286,28 @@ def load_permissions(user_login):
     except Exception as e:
         print(f"Failed to load or parse permissions file: {e}")
         sys.exit(1)
+
+
+def resolve_tag_run_ci_permissions(gh_repo, user_login, user_perms):
+    """Merge explicit tag permission with the user's repository role."""
+    effective_permissions = dict(user_perms or {})
+    if effective_permissions.get("can_tag_run_ci_label", False):
+        return effective_permissions
+
+    try:
+        repository_permission = gh_repo.get_collaborator_permission(user_login)
+    except Exception as e:
+        print(
+            "Failed to query repository permission for "
+            f"{user_login}: {e}. Tag permission remains denied."
+        )
+        return effective_permissions
+
+    print(f"User {user_login} repository permission: {repository_permission}")
+    if repository_permission in _TAG_RUN_CI_REPOSITORY_PERMISSIONS:
+        effective_permissions["can_tag_run_ci_label"] = True
+
+    return effective_permissions
 
 
 def has_sgl_kernel_changes(pr):
@@ -1308,6 +1331,7 @@ def main():
     comment_id = int(get_env_var("COMMENT_ID"))
     comment_body = _strip_format_chars(get_env_var("COMMENT_BODY")).strip()
     user_login = get_env_var("USER_LOGIN")
+    first_line = comment_body.split("\n")[0].strip()
 
     # 2. Load Permissions (local file check first to avoid unnecessary API calls)
     user_perms = load_permissions(user_login)
@@ -1320,9 +1344,13 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
+    if first_line.startswith(("/tag-run-ci-label", "/tag-and-rerun-ci")):
+        user_perms = resolve_tag_run_ci_permissions(repo, user_login, user_perms)
+
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
+    # Note: /tag-run-ci-label requires either explicit configuration or repository
+    # write, maintain, or admin permission.
     # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -1343,7 +1371,6 @@ def main():
         return
 
     # 4. Parse Command and Execute
-    first_line = comment_body.split("\n")[0].strip()
     # `extra` argument opts in to also tagging `run-ci-extra`. Both
     # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
     # parser so the surface is symmetric.
