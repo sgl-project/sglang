@@ -2459,6 +2459,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "fa3",
                 },
             )
+            for field, dtype, error in (
+                ("dsa_prefill_backend", "bfloat16", None),
+                ("dsa_prefill_backend", "fp8_e4m3", "prefill=flashmla_sparse_q8"),
+                ("dsa_decode_backend", "bfloat16", "decode=flashmla_sparse_q8"),
+            ):
+                with self.subTest(field=field, dtype=dtype):
+                    view = _view(
+                        arch=kpool_arch,
+                        index_kpool=4,
+                        kv_cache_dtype=dtype,
+                        **{field: "flashmla_sparse_q8"},
+                    )
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            _dsa_split_backend_resolution(view)
+                    else:
+                        self.assertEqual(
+                            _dsa_split_backend_resolution(view),
+                            {"dsa_decode_backend": "fa3"},
+                        )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
