@@ -16,7 +16,12 @@ import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    PREFILL_ROWS_KEY,
+    Modality,
+    MultimodalDataItem,
+)
+from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -480,6 +485,606 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
         == embeddings.untyped_storage().data_ptr()
     )
     concat.assert_called_once()
+
+
+# One video: four 4-token frames with separators; the chunks split frames 2 and 4.
+VIDEO_RUNS = [(2, 5), (7, 10), (12, 15), (17, 20)]
+VIDEO_LEN = 24
+VIDEO_CHUNKS = [(0, 9), (9, 9), (18, 6)]
+VIDEO_TOKENS = sum(end - start + 1 for start, end in VIDEO_RUNS)
+
+
+def _video_item(hash_=77):
+    return MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=hash_,
+        feature=torch.zeros(1),
+        offsets=list(VIDEO_RUNS),
+    )
+
+
+def _video_embedding(item):
+    return torch.randn(
+        VIDEO_TOKENS, HIDDEN, generator=torch.Generator().manual_seed(item.hash)
+    )
+
+
+def _video_encoder():
+    return Mock(
+        side_effect=lambda items: torch.cat([_video_embedding(i) for i in items])
+    )
+
+
+def _prefill_chunk(encoder, item, prefix_len, extend_len):
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item],
+        [0, 1],
+        [prefix_len],
+        [extend_len],
+        [item.offsets],
+        torch.zeros(VIDEO_LEN, dtype=torch.long),
+    )
+    return chunk
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 8 * HIDDEN * 4, 1 << 30])
+def test_multi_run_item_is_encoded_once_per_request(cache_bytes):
+    # The cache cannot hold the entry in the first two cases.
+    mm_schedule.init_mm_embedding_cache(cache_bytes)
+    item = _video_item()
+    encoder = _video_encoder()
+
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    encoder.assert_called_once()
+    assert [chunk.shape[0] for chunk in chunks] == [6, 7, 3]
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+def test_prefill_embedding_is_kept_only_while_a_later_chunk_needs_it():
+    mm_schedule.init_mm_embedding_cache(0)
+    encoder = _video_encoder()
+
+    one_chunk = _video_item()
+    _prefill_chunk(encoder, one_chunk, 0, VIDEO_LEN)
+    assert PREFILL_ROWS_KEY not in one_chunk.model_specific_data
+
+    # The video ends inside the first chunk of a longer prompt.
+    ends_early = _video_item()
+    _prefill_chunk(encoder, ends_early, 0, 21)
+    assert PREFILL_ROWS_KEY not in ends_early.model_specific_data
+    assert _prefill_chunk(encoder, ends_early, 21, 3) is None
+
+    split = _video_item()
+    _prefill_chunk(encoder, split, 0, 9)
+    assert PREFILL_ROWS_KEY in split.model_specific_data
+    assert encoder.call_count == 3
+
+
+@pytest.mark.parametrize("second_hash", [77, 78])
+def test_two_requests_keep_their_own_embedding(second_hash):
+    # The same video in both requests, and two different videos.
+    mm_schedule.init_mm_embedding_cache(0)
+    first, second = _video_item(), _video_item(second_hash)
+    encoder = _video_encoder()
+
+    chunks = {id(first): [], id(second): []}
+    for prefix_len, extend_len in VIDEO_CHUNKS:
+        for item in (first, second):
+            chunks[id(item)].append(
+                _prefill_chunk(encoder, item, prefix_len, extend_len)
+            )
+
+    assert encoder.call_count == 2
+    for item in (first, second):
+        assert torch.equal(torch.cat(chunks[id(item)]), _video_embedding(item))
+        assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+def test_pruned_video_is_encoded_once_per_request():
+    mm_schedule.init_mm_embedding_cache(0)
+    prompt = [1, 0, 0, 4, 5, 0, 0, 0, 9, 10, 0, 0, 12, 13]
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=5,
+        pad_value=0,
+        feature=torch.zeros(1),
+        offsets=[(1, 2), (5, 7), (10, 11)],
+        model_specific_data={"pre_chunked_input_ids": prompt},
+    )
+    rows = torch.arange(7 * HIDDEN, dtype=torch.float32).reshape(7, HIDDEN)
+    encoder = Mock(
+        return_value=EVSEmbeddingResult(embedding=rows, num_tokens_per_frame=[1, 4, 2])
+    )
+
+    outs = []
+    for prefix_len, extend_len in ((0, 4), (4, 5), (9, 5)):
+        outs.append(
+            mm_schedule._get_chunked_embedding_full(
+                encoder,
+                [item],
+                item.offsets,
+                prefix_len,
+                extend_len,
+                torch.tensor(prompt[prefix_len : prefix_len + extend_len]),
+                _CPU,
+            )
+        )
+
+    encoder.assert_called_once()
+    assert [chunk.shape[0] for chunk, _ in outs] == [1, 4, 2]
+    assert torch.equal(torch.cat([chunk for chunk, _ in outs]), rows)
+    # Pruning moved the placeholders: [1, 0, 4, 5, 0, 0, 0, 0, 9, 10, 0, 0, 12, 13].
+    assert outs[0][1].tolist() == [1, 0, 4, 5]
+    assert outs[1][1].tolist() == [0, 0, 0, 0, 9]
+    assert outs[2][1].tolist() == [10, 0, 0, 12, 13]
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+def _run_item(hash_=88, modality=Modality.VIDEO, offsets=((3, 18),)):
+    return MultimodalDataItem(
+        modality=modality, hash=hash_, feature=torch.zeros(1), offsets=list(offsets)
+    )
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+@pytest.mark.parametrize("cache_bytes", [0, 8 * HIDDEN * 4, 1 << 30])
+def test_single_run_item_is_encoded_once_per_request(
+    monkeypatch, per_request, cache_bytes
+):
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(cache_bytes)
+    item = _run_item()
+    encoder = _video_encoder()
+
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    encoder.assert_called_once()
+    assert [chunk.shape[0] for chunk in chunks] == [6, 9, 1]
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+def test_multi_run_audio_item_is_encoded_once_per_request(monkeypatch, per_request):
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _run_item(modality=Modality.AUDIO, offsets=VIDEO_RUNS)
+    encoder = _video_encoder()
+
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+def test_kept_item_does_not_serve_another_request_in_the_batch():
+    # A new request with the same image must encode it for itself.
+    mm_schedule.init_mm_embedding_cache(0)
+    continuing, new = _run_item(), _run_item()
+    encoder = _video_encoder()
+    _prefill_chunk(encoder, continuing, 0, 9)
+
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [continuing, new],
+        [0, 1, 2],
+        [9, 0],
+        [9, VIDEO_LEN],
+        [continuing.offsets, new.offsets],
+        torch.zeros(1, dtype=torch.long),
+    )
+
+    assert encoder.call_count == 2
+    expected = _video_embedding(new)
+    assert torch.equal(chunk, torch.cat([expected[6:15], expected]))
+    assert PREFILL_ROWS_KEY in continuing.model_specific_data
+    assert PREFILL_ROWS_KEY not in new.model_specific_data
+
+
+def test_several_multi_run_items_are_encoded_once_per_request():
+    # The fallback path keeps the rows of both videos on the first item.
+    mm_schedule.init_mm_embedding_cache(0)
+    first = _video_item(71)
+    second = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=72,
+        feature=torch.zeros(1),
+        offsets=[(start + 22, end + 22) for start, end in VIDEO_RUNS],
+    )
+    items = [first, second]
+    offsets = first.offsets + second.offsets
+    encoder = _video_encoder()
+    expected = torch.cat([_video_embedding(first), _video_embedding(second)])
+
+    chunks = []
+    for prefix_len in range(0, 44, 11):
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 2],
+            [prefix_len],
+            [11],
+            [offsets],
+            torch.zeros(1, dtype=torch.long),
+        )
+        chunks.append(chunk)
+        assert PREFILL_ROWS_KEY not in second.model_specific_data
+        assert (PREFILL_ROWS_KEY in first.model_specific_data) == (prefix_len < 33)
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), expected)
+
+
+def test_three_dimensional_encoder_output_is_kept_as_rows():
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _video_item()
+    encoder = Mock(
+        side_effect=lambda items: _video_embedding(items[0]).reshape(4, 4, HIDDEN)
+    )
+
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+def test_item_shared_by_two_requests_in_one_batch(monkeypatch, per_request):
+    # Session requests share item objects and may read the same kept rows.
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _run_item()
+    encoder = _video_encoder()
+    _prefill_chunk(encoder, item, 0, 9)
+
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item, item],
+        [0, 1, 2],
+        [9, 9],
+        [VIDEO_LEN - 9, VIDEO_LEN - 9],
+        [item.offsets, item.offsets],
+        torch.zeros(1, dtype=torch.long),
+    )
+
+    unread = _video_embedding(item)[6:]
+    assert torch.equal(chunk, torch.cat([unread, unread]))
+    assert encoder.call_count == (2 if per_request else 1)
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+def test_kept_rows_are_not_served_to_a_request_with_other_items():
+    # Two requests share their first item but carry different clips after it.
+    mm_schedule.init_mm_embedding_cache(0)
+    shared_offsets, clip_offsets = [(2, 5), (7, 10)], [(12, 15), (17, 20)]
+
+    def item(hash_, offsets):
+        return MultimodalDataItem(
+            modality=Modality.VIDEO,
+            hash=hash_,
+            feature=torch.zeros(1),
+            offsets=offsets,
+        )
+
+    def rows(item):
+        gen = torch.Generator().manual_seed(item.hash)
+        return torch.randn(8, HIDDEN, generator=gen)
+
+    encoder = Mock(side_effect=lambda items: torch.cat([rows(i) for i in items]))
+    shared, clip_a, clip_b = (
+        item(1, shared_offsets),
+        item(2, clip_offsets),
+        item(3, clip_offsets),
+    )
+
+    def prefill(items, prefix_len, extend_len):
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 2],
+            [prefix_len],
+            [extend_len],
+            [shared_offsets + clip_offsets],
+            torch.zeros(1, dtype=torch.long),
+        )
+        return chunk
+
+    first = prefill([shared, clip_a], 0, 14)
+    other = prefill([shared, clip_b], 14, 10)
+    last = prefill([shared, clip_a], 14, 10)
+
+    assert encoder.call_count == 2
+    assert torch.equal(other, rows(clip_b)[2:])
+    assert torch.equal(
+        torch.cat([first, last]), torch.cat([rows(shared), rows(clip_a)])
+    )
+    assert PREFILL_ROWS_KEY not in shared.model_specific_data
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+@pytest.mark.parametrize("per_request", [False, True])
+def test_only_the_unread_rows_are_kept(monkeypatch, make_item, per_request):
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(0)
+    item = make_item()
+
+    encoder = _video_encoder()
+
+    read = 0
+    for prefix_len, extend_len in VIDEO_CHUNKS[:2]:
+        read += _prefill_chunk(encoder, item, prefix_len, extend_len).shape[0]
+        kept = item.model_specific_data[PREFILL_ROWS_KEY]
+        assert (kept.first_row, kept.next_token) == (read, prefix_len + extend_len)
+        rows = kept.result.embedding
+        assert torch.equal(rows, _video_embedding(item)[read:])
+        unread_bytes = (VIDEO_TOKENS - read) * HIDDEN * rows.element_size()
+        assert rows.untyped_storage().nbytes() == unread_bytes
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+def test_cached_embedding_is_kept_without_a_copy(make_item):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = make_item()
+
+    _prefill_chunk(_video_encoder(), item, 0, 9)
+
+    kept = item.model_specific_data[PREFILL_ROWS_KEY]
+    cache = mm_schedule.embedding_cache
+    cached = cache.get([item.hash]) or cache.get_single(item.hash)
+    assert kept.first_row == 0
+    assert kept.result.embedding is cached.embedding
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+def test_embedding_evicted_between_chunks_is_not_encoded_again(make_item):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = make_item()
+    encoder = _video_encoder()
+
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
+    mm_schedule.embedding_cache.clear()
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+def test_request_that_starts_over_is_encoded_again(make_item):
+    # The dropped rows are gone, so a prefill restarted at token 0 re-encodes.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = make_item()
+    kept_during_encode = []
+
+    def encode(items):
+        kept_during_encode.append(PREFILL_ROWS_KEY in item.model_specific_data)
+        return torch.cat([_video_embedding(i) for i in items])
+
+    encoder = Mock(side_effect=encode)
+
+    _prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    assert encoder.call_count == 2
+    assert kept_during_encode == [False, False]
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+@pytest.mark.parametrize("chunk_len", [1, 2, 3, 5])
+def test_kept_rows_are_copied_again_only_after_half_were_read(make_item, chunk_len):
+    # Kept rows stay within 2x the unread ones; copies within 2x the output.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = make_item()
+    encoder = _video_encoder()
+    last_token = item.offsets[-1][1]
+
+    chunks, read, copied, kept_before = [], 0, 0, None
+    for prefix_len in range(0, VIDEO_LEN, chunk_len):
+        chunk = _prefill_chunk(encoder, item, prefix_len, chunk_len)
+        if chunk is not None:
+            chunks.append(chunk)
+            read += chunk.shape[0]
+        kept = item.model_specific_data.get(PREFILL_ROWS_KEY)
+        # Nothing is kept past the last token or before the item is encoded.
+        if prefix_len + chunk_len > last_token or not encoder.called:
+            assert kept is None
+            continue
+        rows = kept.result.embedding
+        assert rows.shape[0] <= 2 * (VIDEO_TOKENS - read)
+        assert torch.equal(rows, _video_embedding(item)[kept.first_row :])
+        if kept_before is None or rows is not kept_before:
+            copied += rows.shape[0]
+        kept_before = rows
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert copied <= 2 * VIDEO_TOKENS
+
+
+def test_chunks_without_placeholders_do_not_copy_the_kept_rows_again():
+    # The fallback path encodes in the first chunk even if the video starts later.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=77,
+        feature=torch.zeros(1),
+        offsets=[(start + 6, end + 6) for start, end in VIDEO_RUNS],
+    )
+    encoder = _video_encoder()
+
+    kept = []
+    for prefix_len in (0, 2, 4):
+        assert _prefill_chunk(encoder, item, prefix_len, 2).shape[0] == 0
+        kept.append(item.model_specific_data[PREFILL_ROWS_KEY])
+
+    encoder.assert_called_once()
+    assert [entry.first_row for entry in kept] == [0, 0, 0]
+    assert [entry.next_token for entry in kept] == [2, 4, 6]
+    assert kept[1].result.embedding is kept[0].result.embedding
+    assert kept[2].result.embedding is kept[0].result.embedding
+    assert torch.equal(kept[0].result.embedding, _video_embedding(item))
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+def test_keeping_rows_leaves_the_cache_order_alone(monkeypatch, per_request):
+    # Keeping the first item's rows must not move it in the cache's LRU order.
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        MultimodalDataItem(
+            modality=Modality.AUDIO, hash=hash_, feature=torch.zeros(1), offsets=offsets
+        )
+        for hash_, offsets in ((11, [(2, 3), (10, 11)]), (12, [(6, 7)]))
+    ]
+
+    def encode(batch):
+        return [
+            torch.ones(sum(e - s + 1 for s, e in item.offsets), HIDDEN)
+            for item in batch
+        ]
+
+    mm_schedule._get_chunked_prefill_embedding(
+        encode,
+        items,
+        [0, 2],
+        [0],
+        [9],
+        [[(2, 3), (6, 7), (10, 11)]],
+        torch.zeros(1, dtype=torch.long),
+    )
+
+    assert list(mm_schedule.embedding_cache.mm_cache) == [11, 12]
+    assert PREFILL_ROWS_KEY in items[0].model_specific_data
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+@pytest.mark.parametrize("per_request", [False, True])
+def test_rows_in_a_buffer_the_encoder_reuses_are_copied(
+    monkeypatch, make_item, per_request
+):
+    # The cache holds a clone; the next encoder call overwrites the encoder's slice.
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    buffer = torch.empty(2 * VIDEO_TOKENS, HIDDEN)
+
+    def encode(items):
+        buffer[:VIDEO_TOKENS] = _video_embedding(items[0])
+        return buffer[:VIDEO_TOKENS]
+
+    item, other = make_item(), make_item(78)
+    chunks = [_prefill_chunk(encode, item, *VIDEO_CHUNKS[0]).clone()]
+    _prefill_chunk(encode, other, 0, VIDEO_LEN)
+    chunks += [
+        _prefill_chunk(encode, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+
+
+@pytest.mark.parametrize("make_item", [_video_item, _run_item])
+@pytest.mark.parametrize("per_request", [False, True])
+def test_kept_rows_are_read_before_the_cache(monkeypatch, make_item, per_request):
+    # A colliding cache entry appears between two chunks; the kept rows still serve.
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = make_item()
+    encoder = _video_encoder()
+    cache = mm_schedule.embedding_cache
+
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
+    (cache_hash,) = cache.mm_cache
+    cache.clear()
+    cache.set(cache_hash, mm_schedule.EmbeddingResult(embedding=torch.zeros(3, HIDDEN)))
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert PREFILL_ROWS_KEY not in item.model_specific_data
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+def test_request_reads_the_rows_of_one_encoder_pass(monkeypatch, per_request):
+    # Kept rows win over a new request's encoder pass in the same batch.
+    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    mm_schedule.init_mm_embedding_cache(0)
+    continuing, new = _run_item(), _run_item()
+    passes = []
+
+    def encode(items):
+        rows = torch.cat([_video_embedding(item) for item in items])
+        passes.append(rows + len(passes))
+        return passes[-1]
+
+    first = _prefill_chunk(encode, continuing, 0, 9)
+    rest, _ = mm_schedule._get_chunked_prefill_embedding(
+        encode,
+        [continuing, new],
+        [0, 1, 2],
+        [9, 0],
+        [VIDEO_LEN - 9, VIDEO_LEN],
+        [continuing.offsets, new.offsets],
+        torch.zeros(1, dtype=torch.long),
+    )
+
+    assert len(passes) == 2
+    assert torch.equal(torch.cat([first, rest]), torch.cat(passes))
+
+
+def test_kept_rows_are_not_served_to_a_request_with_another_layout():
+    # The same clip at another position: rows one dropped are unread for the other.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _video_item()
+    shifted = [(start + 3, end + 3) for start, end in VIDEO_RUNS]
+    encoder = _video_encoder()
+    expected = _video_embedding(item)
+
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
+    other, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item],
+        [0, 1],
+        [9],
+        [VIDEO_LEN + 3 - 9],
+        [shifted],
+        torch.zeros(1, dtype=torch.long),
+    )
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    assert encoder.call_count == 2
+    assert torch.equal(other, expected[4:])
+    assert torch.equal(torch.cat(chunks), expected)
 
 
 if __name__ == "__main__":

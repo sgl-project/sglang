@@ -1,11 +1,12 @@
 """Multimodal embedding scheduling and cache coordination."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import PREFILL_ROWS_KEY, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
@@ -32,6 +33,7 @@ def get_embedding_chunk(
     extend_prefix_len: int,
     extend_seq_len: int,
     items_offset: List[Tuple[int, int]],
+    first_row: int = 0,
 ) -> Tuple[torch.Tensor, int, int]:
     """
     Extract a chunk of embeddings based on the specified prefix length, sequence length, and offset ranges.
@@ -41,6 +43,7 @@ def get_embedding_chunk(
         extend_prefix_len: The starting position (prefix length) for extraction
         extend_seq_len: The number of tokens to extract
         items_offset: List of [start, end] offset ranges for multimodal items in the input sequence
+        first_row: Index of the first row that `embedding` still holds
 
     Returns:
         A tuple containing:
@@ -68,7 +71,7 @@ def get_embedding_chunk(
             end_index += end - start + 1
     # some models' embedding is 3-dim, reshape it to 2-dim
     embedding = embedding.reshape(-1, embedding.shape[-1])
-    embedding_chunk = embedding[start_index:end_index]
+    embedding_chunk = embedding[start_index - first_row : end_index - first_row]
     return embedding_chunk, start_index, end_index
 
 
@@ -256,13 +259,126 @@ def _item_overlap(
 
 
 def _slice_item_chunk(
-    emb: torch.Tensor, item: MultimodalDataItem, chunk_start: int, chunk_len: int
-) -> torch.Tensor:
+    emb: torch.Tensor,
+    item: MultimodalDataItem,
+    chunk_start: int,
+    chunk_len: int,
+    first_row: int = 0,
+) -> Tuple[torch.Tensor, int]:
+    """Return the item's rows for the chunk and the row index where the chunk ends."""
     if len(item.offsets) == 1:
         start, end = item.offsets[0]
         local_start = max(start, chunk_start) - start
-        return emb[local_start : min(end + 1, chunk_start + chunk_len) - start]
-    return get_embedding_chunk(emb, chunk_start, chunk_len, item.offsets)[0]
+        local_end = min(end + 1, chunk_start + chunk_len) - start
+        return emb[local_start - first_row : local_end - first_row], local_end
+    chunk, _, end_row = get_embedding_chunk(
+        embedding=emb,
+        extend_prefix_len=chunk_start,
+        extend_seq_len=chunk_len,
+        items_offset=item.offsets,
+        first_row=first_row,
+    )
+    return chunk, end_row
+
+
+class _PrefillRows(msgspec.Struct, frozen=True):
+    """Encoder rows a request keeps on an item between two prefill chunks."""
+
+    key: object  # session requests share items; a request takes only its own rows
+    result: EmbeddingResult  # the rows from first_row on
+    first_row: int = 0
+    next_token: int = 0  # first prompt position these rows can still serve
+    is_copy: bool = False  # owned by the request, not by the encoder or the cache
+
+
+def _find_prefill_rows(
+    item: MultimodalDataItem, key: object, chunk_start: int
+) -> Optional[_PrefillRows]:
+    """Return the rows an earlier chunk of this request kept, if they still apply."""
+    kept = item.model_specific_data.get(PREFILL_ROWS_KEY)
+    if kept is None or kept.key != key:
+        return None
+    if kept.next_token > chunk_start:
+        # Prefill restarted; the rows it needs were already dropped.
+        del item.model_specific_data[PREFILL_ROWS_KEY]
+        return None
+    return kept
+
+
+def _keep_prefill_rows(
+    item: MultimodalDataItem,
+    rows: _PrefillRows,
+    end_row: int,
+    chunk_end: int,
+    last_token: int,
+    cache_hash: Optional[int],
+) -> None:
+    """Keep the rows that later prefill chunks of the request still read.
+
+    The embedding cache may be disabled, too small, or evict the entry between
+    chunks, which would rerun the encoder for every chunk. `rows` served the
+    chunk ending at `chunk_end` and was read up to `end_row`.
+    """
+    data = item.model_specific_data
+    if last_token < chunk_end:
+        kept = data.get(PREFILL_ROWS_KEY)
+        if kept is not None and kept.key == rows.key:
+            del data[PREFILL_ROWS_KEY]
+        return
+    result, first_row, is_copy = rows.result, rows.first_row, rows.is_copy
+    read = end_row - first_row
+    if is_copy:
+        # Re-copy once half is read, so kept rows stay within 2x the unread ones.
+        renew = 2 * read >= _embedding_token_count(result.embedding)
+    else:
+        # Only the cache's own tensor is safe to keep by reference.
+        cached = embedding_cache.mm_cache.get(cache_hash)
+        renew = cached is None or cached.embedding is not result.embedding
+    if renew:
+        flat = result.embedding.reshape(-1, result.embedding.shape[-1])
+        result = replace(result, embedding=flat[read:].clone())
+        first_row, is_copy = end_row, True
+    data[PREFILL_ROWS_KEY] = _PrefillRows(
+        key=rows.key,
+        result=result,
+        first_row=first_row,
+        next_token=chunk_end,
+        is_copy=is_copy,
+    )
+
+
+def _item_prefill_chunk(
+    item: MultimodalDataItem,
+    kept: Optional[_PrefillRows],
+    emb: Optional[torch.Tensor],
+    chunk_start: int,
+    chunk_len: int,
+) -> torch.Tensor:
+    """Slice an item's rows for a chunk from its kept rows, else from `emb`."""
+    chunk_end = chunk_start + chunk_len
+    last_token = item.offsets[-1][1]
+    if kept is not None:
+        rows = kept
+    elif last_token < chunk_end:
+        return _slice_item_chunk(emb, item, chunk_start, chunk_len)[0]
+    else:
+        rows = _PrefillRows(key=item.hash, result=EmbeddingResult(embedding=emb))
+    chunk, end_row = _slice_item_chunk(
+        emb=rows.result.embedding,
+        item=item,
+        chunk_start=chunk_start,
+        chunk_len=chunk_len,
+        first_row=rows.first_row,
+    )
+    _keep_prefill_rows(
+        item=item,
+        rows=rows,
+        end_row=end_row,
+        chunk_end=chunk_end,
+        last_token=last_token,
+        cache_hash=item.hash,
+    )
+    return chunk
 
 
 def _get_chunked_embedding_full(
@@ -297,6 +413,15 @@ def _get_chunked_embedding_full(
             )
             embedding_per_req = None
 
+    # All items' rows are kept on the first item, so the key also covers the
+    # other items and the layout.
+    rows_key = (embedding_items_hash, tuple(items_offset))
+    rows = _find_prefill_rows(
+        item=embedding_items_per_req[0], key=rows_key, chunk_start=extend_prefix_len
+    )
+    if rows is not None:
+        embedding_per_req = rows.result
+
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
         embedding = data_embedding_func(embedding_items_per_req)
@@ -313,6 +438,9 @@ def _get_chunked_embedding_full(
 
     # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
+    if rows is None:
+        rows = _PrefillRows(key=rows_key, result=embedding_per_req)
+
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
         input_ids, items_offset = (
@@ -325,11 +453,20 @@ def _get_chunked_embedding_full(
             )
         )
 
-    embedding_per_req_chunk, _, _ = get_embedding_chunk(
+    embedding_per_req_chunk, _, end_row = get_embedding_chunk(
         embedding=embedding_per_req.embedding,
         extend_prefix_len=extend_prefix_len,
         extend_seq_len=extend_seq_len,
         items_offset=items_offset,
+        first_row=rows.first_row,
+    )
+    _keep_prefill_rows(
+        item=embedding_items_per_req[0],
+        rows=rows,
+        end_row=end_row,
+        chunk_end=extend_prefix_len + extend_seq_len,
+        last_token=max(end for _, end in items_offset),
+        cache_hash=embedding_items_hash,
     )
     return embedding_per_req_chunk, input_ids
 
@@ -344,6 +481,7 @@ class PerImageRequestInfo:
     extend_prefix_len: int
     extend_seq_len: int
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
+    kept_rows: Dict[int, _PrefillRows] = field(default_factory=dict)
 
 
 def _batch_encode_per_image_misses(
@@ -376,7 +514,12 @@ def _batch_encode_per_image_misses(
                     overlapping.append((idx, item, token_count))
         req_info.overlapping = overlapping
 
-        for _idx, item, expected_token_count in overlapping:
+        for idx, item, expected_token_count in overlapping:
+            kept = _find_prefill_rows(item=item, key=item.hash, chunk_start=chunk_start)
+            if kept is not None:
+                # Take it now; a request sharing the item may drop it later.
+                req_info.kept_rows[idx] = kept
+                continue
             cache_key = (item.hash, expected_token_count)
             if cache_key in hash_to_embedding:
                 continue
@@ -464,8 +607,13 @@ def _get_chunked_embedding_by_item(
         return []
 
     cached_embeddings = {}
+    kept_rows = {}
     miss_items = []
     for idx, item, expected_token_count in overlapping:
+        kept = _find_prefill_rows(item=item, key=item.hash, chunk_start=chunk_start)
+        if kept is not None:
+            kept_rows[idx] = kept
+            continue
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embedding = cached.embedding
@@ -512,7 +660,13 @@ def _get_chunked_embedding_by_item(
             cached_embeddings[idx] = emb
 
     return [
-        _slice_item_chunk(cached_embeddings[idx], item, chunk_start, extend_seq_len)
+        _item_prefill_chunk(
+            item=item,
+            kept=kept_rows.get(idx),
+            emb=cached_embeddings.get(idx),
+            chunk_start=chunk_start,
+            chunk_len=extend_seq_len,
+        )
         for idx, item, _ in overlapping
     ]
 
@@ -522,19 +676,23 @@ def _assemble_per_image_chunk(
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor],
     extend_prefix_len: int,
     extend_seq_len: int,
+    kept_rows: Optional[Dict[int, _PrefillRows]] = None,
 ) -> List[torch.Tensor]:
     """
     Return ordered item slices for one request from pre-computed embeddings.
-    All overlapping items must already have their embeddings in hash_to_embedding.
+    All overlapping items must already have their embeddings in hash_to_embedding
+    or their kept rows in kept_rows.
     """
+    kept_rows = kept_rows or {}
     return [
-        _slice_item_chunk(
-            hash_to_embedding[(item.hash, token_count)],
-            item,
-            extend_prefix_len,
-            extend_seq_len,
+        _item_prefill_chunk(
+            item=item,
+            kept=kept_rows.get(idx),
+            emb=hash_to_embedding.get((item.hash, token_count)),
+            chunk_start=extend_prefix_len,
+            chunk_len=extend_seq_len,
         )
-        for _idx, item, token_count in overlapping
+        for idx, item, token_count in overlapping
     ]
 
 
@@ -621,6 +779,7 @@ def _get_chunked_prefill_embedding(
             hash_to_embedding,
             req_info.extend_prefix_len,
             req_info.extend_seq_len,
+            req_info.kept_rows,
         )
         all_chunks.extend((req_info.req_idx, chunk) for chunk in chunk_slices)
 
