@@ -481,6 +481,10 @@ class GroupCoordinator:
 
         # Fallback.
         all_gather_single(output_tensor, input_, group=self.device_group)
+        else:
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
+            all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
