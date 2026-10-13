@@ -154,6 +154,7 @@ impl TokenizerRegistry {
                 .unwrap_or_default(),
             // Read from the chat formatter below.
             always_thinks: false,
+            chat_encoding_spec: None,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -168,6 +169,9 @@ impl TokenizerRegistry {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.chat_model.always_thinks = formatter.always_thinks();
+                if formatter.is_kimi_k3() {
+                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
+                }
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
@@ -240,12 +244,6 @@ impl TokenizerRegistry {
         self.formatters
             .get(model_id)
             .map_or(ForwardingScope::Never, |e| e.formatter.forwarding_scope())
-    }
-
-    pub fn is_kimi_k3(&self, model_id: &str) -> bool {
-        self.formatters
-            .get(model_id)
-            .is_some_and(|e| e.formatter.is_kimi_k3())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.

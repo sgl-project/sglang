@@ -509,13 +509,16 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope, DeepSeek-V4, V4.1 and GLM-5.3 today; Kimi-K3 chats keep the
-engine's route, whose OpenAI layer special-cases K3), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`, `deepseek-v41`, `glm45`) or none, and no media yet. Tools are served with `tool_choice`
+(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
-parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
+parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine.
+`kimi_k3`'s `auto` structural tag is reproduced, as are K3's own OpenAI-layer rules:
+special tokens kept, the tools close as a stop string, `name:N` tool-call ids,
+non-strict `json_schema` left unconstrained, and the three-token generation stub
+left out of reported prompt tokens.
 With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
 grammar needs `ebnf_full_assistant`, which `/generate` does not accept.
 The router reads the model's `config.json` and `generation_config.json` beside
@@ -609,7 +612,9 @@ explicit null `thinking_effort` with thinking enabled, whitespace-only
 reasoning history, tool-call arguments that are not a JSON object, numbers
 serde_json prints unlike Python (`1e-06`, integers beyond 64 bits, `-0`),
 tokenizer arguments in `chat_template_kwargs`, and tool declarations Dynamo
-rejects.
+rejects. With the cookbook's `kimi_k3` reasoning and tool parsers, text chats,
+`tool_choice` `auto` and `none` included, are served through `/generate`, so the
+router also splits reasoning and parses tool calls.
 
 ## HTTP/2
 
