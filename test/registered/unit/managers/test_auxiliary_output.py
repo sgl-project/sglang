@@ -1,3 +1,4 @@
+from array import array
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -6,6 +7,7 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import restore_cache_only_rebootstrap_tokens
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -16,6 +18,7 @@ from sglang.srt.managers.auxiliary_output import (
     append_auxiliary_output,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -26,6 +29,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -917,6 +921,21 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
 
 
 class TestCacheOnlyWorkerOutput(CustomTestCase):
+    def test_fresh_cache_only_req_keeps_sampled_token(self):
+        """An ordinary first handoff has no optional rebootstrap marker."""
+        with get_context().override_server_args():
+            req = Req(
+                rid="fresh",
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2]),
+                sampling_params=SamplingParams(max_new_tokens=16),
+            )
+            batch = SimpleNamespace(dsv41_cache_only_replay=True, reqs=[req])
+            sampled = torch.tensor([999])
+            restored = restore_cache_only_rebootstrap_tokens(batch, sampled)
+            self.assertIs(restored, sampled)
+            self.assertEqual(restored.tolist(), [999])
+
     def test_rebootstrap_boundary_reaches_relay_and_dspark_bonus(self):
         """The next forward must consume the emitted boundary, not a resampled token."""
         for overlap, dspark, delayed in (
@@ -941,19 +960,20 @@ class TestCacheOnlyWorkerOutput(CustomTestCase):
                         disable_overlap_schedule=not overlap,
                     ),
                 ):
-                    reqs = [
-                        SimpleNamespace(
-                            pd_rebootstrap_in_progress=active,
-                            pd_rebootstrap_forced_output_id=token,
-                            beam_group=None,
+                    reqs = []
+                    for i, (active, token) in enumerate(
+                        ((True, 12), (True, None), (False, 55), (True, 0), (None, None))
+                    ):
+                        req = Req(
+                            rid=f"relay-{i}",
+                            origin_input_text="",
+                            origin_input_ids=array("q", [1, 2]),
+                            sampling_params=SamplingParams(max_new_tokens=16),
                         )
-                        for active, token in (
-                            (True, 12),
-                            (True, None),
-                            (False, 55),
-                            (True, 0),
-                        )
-                    ]
+                        if active is not None:
+                            req.pd_rebootstrap_in_progress = active
+                            req.pd_rebootstrap_forced_output_id = token
+                        reqs.append(req)
                     algo = (
                         SpeculativeAlgorithm.DSPARK
                         if dspark
@@ -966,19 +986,19 @@ class TestCacheOnlyWorkerOutput(CustomTestCase):
                         beam_tail=None,
                         forward_mode=ForwardMode.EXTEND,
                         enable_overlap=overlap,
-                        req_pool_indices=torch.arange(4),
-                        seq_lens=torch.full((4,), 128),
-                        extend_lens=[1] * 4,
-                        prefix_lens=[127] * 4,
-                        out_cache_loc=torch.arange(4),
+                        req_pool_indices=torch.arange(5),
+                        seq_lens=torch.full((5,), 128),
+                        extend_lens=[1] * 5,
+                        prefix_lens=[127] * 5,
+                        out_cache_loc=torch.arange(5),
                         device="cpu",
                         spec_algorithm=algo,
                     )
                     logits = LogitsProcessorOutput(
-                        next_token_logits=torch.zeros(4, 8),
-                        hidden_states=torch.zeros(4, 2),
+                        next_token_logits=torch.zeros(5, 1024),
+                        hidden_states=torch.zeros(5, 2),
                     )
-                    sampled = torch.tensor([999, 998, 997, 996])
+                    sampled = torch.tensor([999, 998, 997, 996, 995])
                     fb = SimpleNamespace(
                         forward_mode=ForwardMode.EXTEND,
                         sampling_info=SimpleNamespace(grammars=[] if delayed else None),
@@ -1011,13 +1031,13 @@ class TestCacheOnlyWorkerOutput(CustomTestCase):
                             worker._target_hidden_projection_enabled = False
                             worker._tp_sync = Mock()
                             worker._kv_injector = Mock()
-                            worker._kv_injector.ids_for.return_value = torch.arange(4)
+                            worker._kv_injector.ids_for.return_value = torch.arange(5)
                             worker.model_runner = SimpleNamespace(
                                 prefill_attention_backend_str="triton"
                             )
                             with patch(
                                 "sglang.srt.speculative.dspark_components.dspark_worker_v2.compute_position",
-                                return_value=(torch.arange(4), None),
+                                return_value=(torch.arange(5), None),
                             ):
                                 result = worker._forward_prefill(batch, on_publish=None)
                         else:
@@ -1025,10 +1045,12 @@ class TestCacheOnlyWorkerOutput(CustomTestCase):
                             if delayed:
                                 self.assertIsNotNone(result.delay_sample_func)
                                 result.delay_sample_func()
-                    expected = [12, 998, 997, 0] if cache_only else sampled.tolist()
+                    expected = (
+                        [12, 998, 997, 0, 995] if cache_only else sampled.tolist()
+                    )
                     self.assertEqual(result.next_token_ids.tolist(), expected)
                     # CUDA graph/sampler buffers must not be overwritten by recovery.
-                    self.assertEqual(sampled.tolist(), [999, 998, 997, 996])
+                    self.assertEqual(sampled.tolist(), [999, 998, 997, 996, 995])
                     self.assertEqual(reqs[0].pd_rebootstrap_forced_output_id, 12)
                     self.assertTrue(reqs[0].pd_rebootstrap_in_progress)
                     if dspark:
@@ -1038,7 +1060,7 @@ class TestCacheOnlyWorkerOutput(CustomTestCase):
                     future = FutureMap(
                         torch.device("cpu"),
                         algo,
-                        SimpleNamespace(req_to_token=torch.zeros(4, 128)),
+                        SimpleNamespace(req_to_token=torch.zeros(5, 128)),
                     )
                     scheduler = SimpleNamespace(
                         spec_algorithm=algo,
