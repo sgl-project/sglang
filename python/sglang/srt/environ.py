@@ -1256,7 +1256,10 @@ class Envs:
     # that select a kernel in production live with their own feature instead.
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
-    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # JIT kernel build cache. Defaults to $SGLANG_CACHE_DIR/jit so it stays
+    # colocated with the other caches (triton, inductor, deep_gemm, cute_aot).
+    # Set to an explicit path to override.
+    SGLANG_JIT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("jit"))
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
