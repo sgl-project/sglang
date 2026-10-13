@@ -261,6 +261,9 @@ def handle_load_format(server_args: Any):
             ),
         )
 
+    if cfg.remote_instance_weight_loader_start_seed_via_nixl:
+        _assert_nixl_seed_usable(cfg)
+
     # "ipc_cache" is an internal-only load format: ModelRunner sets it
     # automatically when the weight cache is enabled, and it is not a public
     # --load-format choice. Setting it directly is always wrong (no daemon is
@@ -305,6 +308,24 @@ def validate_transfer_engine(server_args: Any):
         return False
     else:
         return True
+
+
+def _assert_nixl_seed_usable(cfg: Any) -> None:
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        raise ValueError(
+            "--remote-instance-weight-loader-start-seed-via-nixl and "
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine each publish the weights for one "
+            "transport; set only one"
+        )
+    if importlib.util.find_spec("nixl") is None:
+        raise ValueError(
+            "--remote-instance-weight-loader-start-seed-via-nixl needs the nixl package"
+        )
+    if cfg.enable_memory_saver:
+        raise ValueError(
+            "--remote-instance-weight-loader-start-seed-via-nixl cannot run with --enable-memory-saver: "
+            "the memory saver releases the weight memory NIXL registered"
+        )
 
 
 def is_mistral_native_format(server_args: Any) -> bool:

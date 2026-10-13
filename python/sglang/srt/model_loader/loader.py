@@ -3389,15 +3389,21 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, transfer_engine, seed_url, tp_rank, role
     ) -> bool:
         # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank, role)
+        seed_transfer_engine_info = get_remote_instance_transfer_engine_info_per_rank(
+            seed_url, tp_rank, role
         )
-        if (
-            seed_transfer_engine_session_id is None
-            or seed_transfer_engine_weight_info is None
-        ):
+        if seed_transfer_engine_info is None:
             logger.error("Cannot get transfer engine session or weight info.")
             return False
+        if seed_transfer_engine_info["transport"] != "mooncake":
+            raise NotImplementedError(
+                f"loading from a seed over {seed_transfer_engine_info['transport']} is not supported; "
+                "start the seed with --remote-instance-weight-loader-start-seed-via-transfer-engine"
+            )
+        seed_transfer_engine_session_id = seed_transfer_engine_info["session_id"]
+        seed_transfer_engine_weight_info = seed_transfer_engine_info[
+            "weights_info_dict"
+        ]
 
         # prepare local/remote RDMA keys
         seed_ptr_list = []
