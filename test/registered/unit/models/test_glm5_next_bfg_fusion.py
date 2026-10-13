@@ -9,10 +9,12 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
     _model_load_weights_direct,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models import glm5_next
+from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -160,7 +162,6 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                             (f"{PREFIX}.{name}", param)
                             for name, param in attention.named_parameters()
                         ),
-                        modules=lambda: iter((attention,)),
                     )
                     with patch.object(
                         glm5_next.DeepseekV2WeightLoaderMixin, "post_load_weights"
@@ -259,25 +260,45 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
 
 
 class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
-    @staticmethod
-    def make_attention(raw, gate, norm):
-        _, tokens, heads, head_dim = raw.shape
-        attention = glm5_next.Glm5NextLinearAttention.__new__(
-            glm5_next.Glm5NextLinearAttention
+    def setUp(self):
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        override = get_context().override_server_args(
+            device="cpu", enable_lora=False, lora_paths=None
         )
-        torch.nn.Module.__init__(attention)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_attention(self, raw, gate):
+        _, tokens, heads, head_dim = raw.shape
+        attention = glm5_next.Glm5NextLinearAttention(
+            layer_idx=0,
+            hidden_size=heads * head_dim,
+            config=SimpleNamespace(
+                linear_attn_config={
+                    "head_dim": head_dim,
+                    "num_heads": heads,
+                    "short_conv_kernel_size": 4,
+                }
+            ),
+            prefix=PREFIX,
+        )
         attention.do_fuse_qkvbfg = False
-        attention.head_dim = head_dim
         attention.forward_qkvbfg = lambda *_: (
             torch.zeros(tokens, 3 * heads * head_dim),
             torch.zeros(tokens, heads),
             torch.zeros(tokens, heads * head_dim),
             gate,
         )
-        attention.o_norm = norm
-        attention.o_proj = lambda value: (value, None)
-        attention.attn = Mock(_k3_onorm_gate=None, _k3_fused_decode_args=None)
-        return attention, attention.attn
+        attention.o_proj.forward = lambda value: (value, None)
+        backend = Mock(return_value=raw)
+        attention.attn.forward = backend
+        attention.o_norm.forward = lambda value, gate: (
+            F.rms_norm(
+                value, (head_dim,), attention.o_norm.weight, attention.o_norm.eps
+            )
+            * torch.sigmoid(gate)
+        )
+        return attention, backend
 
     @torch.no_grad()
     def test_weight_reload_updates_fused_norm_without_replacing_storage(self):
@@ -291,48 +312,58 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
         gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
         hidden = torch.zeros(tokens, heads * head_dim)
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            for route in ("checkpoint", "direct", "post_load", "quantized_rl"):
+            torch.set_default_dtype(dtype)
+            for route in (
+                "checkpoint",
+                "nextn",
+                "direct",
+                "custom",
+                "post_load",
+                "quantized_rl",
+            ):
                 with self.subTest(dtype=dtype, route=route):
-                    attention, attn = self.make_attention(
-                        raw,
-                        gate,
-                        glm5_next.FusedRMSNormGated(
-                            head_dim, eps=1e-6, activation="sigmoid", dtype=dtype
-                        ),
-                    )
+                    attention, backend_mock = self.make_attention(raw, gate)
+                    self.assertEqual(attention.o_norm.weight.dtype, torch.float32)
                     attention.o_norm.weight.fill_(1)
 
-                    model = glm5_next.Glm5NextForConditionalGeneration.__new__(
-                        glm5_next.Glm5NextForConditionalGeneration
+                    model_class = (
+                        Glm5NextForConditionalGenerationNextN
+                        if route == "nextn"
+                        else glm5_next.Glm5NextForConditionalGeneration
                     )
+                    model = model_class.__new__(model_class)
                     torch.nn.Module.__init__(model)
-                    model.config = SimpleNamespace(n_routed_experts=0)
+                    model.config = SimpleNamespace(
+                        n_routed_experts=0,
+                        num_hidden_layers=2,
+                        num_nextn_predict_layers=1,
+                    )
                     model.num_fused_shared_experts = 0
                     model.quant_config = None
                     model.encoder_only = False
                     model.model = torch.nn.Module()
                     layer = torch.nn.Module()
                     layer.self_attn = attention
-                    model.model.layers = torch.nn.ModuleList([layer])
-                    model.model.start_layer = 0
-                    model.model.end_layer = 1
+                    if route == "nextn":
+                        model.model.decoder = layer
+                    else:
+                        model.model.layers = torch.nn.ModuleList([layer])
+                        model.model.start_layer = 0
+                        model.model.end_layer = 1
 
-                    def normalize(value, gate, weight):
-                        return F.rms_norm(
-                            value, (head_dim,), weight.float(), attention.o_norm.eps
-                        ) * torch.sigmoid(gate)
-
-                    def backend(batch, **kwargs):
+                    def run_backend(batch, **kwargs):
                         if batch.forward_mode.is_target_verify():
+                            attn = attention.attn
                             attn._k3_onorm_consumed = True
-                            return normalize(
-                                raw,
-                                attn._k3_onorm_gate.unflatten(-1, (-1, head_dim)),
-                                attn._k3_fused_decode_args[5],
+                            weight, eps = attn._k3_onorm_args
+                            return F.rms_norm(
+                                raw, (head_dim,), weight, eps
+                            ) * torch.sigmoid(
+                                attn._k3_onorm_gate.unflatten(-1, (-1, head_dim))
                             )
                         return raw
 
-                    attn.side_effect = backend
+                    backend_mock.side_effect = run_backend
 
                     def forward(mode):
                         return attention(
@@ -340,58 +371,66 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
                             SimpleNamespace(forward_mode=mode, attn_cp_metadata=None),
                         )
 
-                    with patch.object(
-                        attention.o_norm,
-                        "forward",
-                        side_effect=lambda value, gate: normalize(
-                            value, gate, attention.o_norm.weight
-                        ),
-                    ):
-                        original = forward(ForwardMode.DECODE)
-                        norm_storage = attention._fused_onorm_args[5].data_ptr()
-                        source_storage = attention.o_norm.weight.data_ptr()
-                        weights = [
-                            (f"{PREFIX}.o_norm.weight", torch.full((head_dim,), 2.0))
-                        ]
-                        with torch.enable_grad():
-                            if route == "checkpoint":
-                                model.load_weights(weights)
+                    original = forward(ForwardMode.TARGET_VERIFY)
+                    source_storage = attention.o_norm.weight.data_ptr()
+                    prefix = "model.layers.2.self_attn" if route == "nextn" else PREFIX
+                    weights = [
+                        (f"{prefix}.o_norm.weight", torch.full((head_dim,), 2.0))
+                    ]
+                    with torch.enable_grad():
+                        if route in ("checkpoint", "nextn"):
+                            model.load_weights(weights)
+                        elif route == "custom":
+                            updater = WeightUpdater(
+                                tp_rank=0,
+                                device="cpu",
+                                gpu_id=0,
+                                model_config=None,
+                                custom_weight_loaders={"test_loader": None},
+                                get_model=lambda: model,
+                                update_model_fields=None,
+                                recapture_cuda_graph=None,
+                                get_model_runner=None,
+                            )
+                            with (
+                                get_parallel().override(tp_rank=0),
+                                patch(
+                                    "sglang.srt.model_executor.model_runner_components.weight_updater.dynamic_import",
+                                    return_value=_model_load_weights_direct,
+                                ),
+                            ):
+                                success, _ = updater.update_weights_from_tensor(
+                                    weights, load_format="test_loader"
+                                )
+                            self.assertTrue(success)
+                        else:
+                            _model_load_weights_direct(model, weights)
+                            if route == "post_load":
+                                model.post_load_weights()
                             else:
-                                _model_load_weights_direct(model, weights)
-                                if route == "post_load":
-                                    model.post_load_weights()
-                                else:
-                                    if route == "quantized_rl":
-                                        model.original_weights_rebuild_keys = {}
-                                        model.recorded_loader = {}
-                                        model.flash_rl_initial_load_complete = True
-                                    DefaultModelLoader.postprocess_weights(
-                                        model, torch.device("cpu")
-                                    )
-                        self.assertEqual(
-                            attention.o_norm.weight.data_ptr(), source_storage
-                        )
-                        self.assertEqual(
-                            attention._fused_onorm_args[5].data_ptr(), norm_storage
-                        )
-                        self.assertFalse(attention._fused_onorm_args[5].requires_grad)
-                        self.assertIsNone(attention._fused_onorm_args[5].grad_fn)
-                        fallback = forward(ForwardMode.EXTEND)
-                        torch.testing.assert_close(fallback, original * 2)
-                        torch.testing.assert_close(
-                            forward(ForwardMode.TARGET_VERIFY), fallback
-                        )
+                                if route == "quantized_rl":
+                                    model.original_weights_rebuild_keys = {}
+                                    model.recorded_loader = {}
+                                    model.flash_rl_initial_load_complete = True
+                                DefaultModelLoader.postprocess_weights(
+                                    model, torch.device("cpu")
+                                )
+                    self.assertEqual(attention.o_norm.weight.data_ptr(), source_storage)
+                    fallback = forward(ForwardMode.EXTEND)
+                    torch.testing.assert_close(fallback, original * 2)
+                    torch.testing.assert_close(
+                        forward(ForwardMode.TARGET_VERIFY), fallback
+                    )
 
     def test_output_norm_handoff_and_fallback(self):
+        torch.set_default_dtype(torch.float32)
         tokens, heads, head_dim = 3, 2, 4
         raw = torch.arange(tokens * heads * head_dim, dtype=torch.float32).reshape(
             1, tokens, heads, head_dim
         )
         gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
-        norm = Mock(side_effect=lambda value, gate: value + 3)
-        norm.weight = torch.nn.Parameter(torch.linspace(0.5, 1.25, head_dim).half())
-        norm.eps = 1e-6
-        attention, attn = self.make_attention(raw, gate, norm)
+        attention, backend = self.make_attention(raw, gate)
+        attention.o_norm.forward = Mock(side_effect=lambda value, gate: value + 3)
         hidden = torch.zeros(tokens, heads * head_dim)
         for mode, consume in (
             (ForwardMode.TARGET_VERIFY, True),
@@ -400,37 +439,112 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
             (ForwardMode.EXTEND, False),
         ):
             with self.subTest(mode=mode, consume=consume):
+                norm = attention.o_norm.forward
                 norm.reset_mock()
                 verify = mode == ForwardMode.TARGET_VERIFY
 
-                def backend(batch, **kwargs):
+                def run_backend(batch, **kwargs):
+                    attn = attention.attn
                     if verify:
                         self.assertIs(attn._k3_onorm_gate, gate)
-                        args = attn._k3_fused_decode_args
-                        self.assertEqual(args[5].dtype, torch.float32)
-                        torch.testing.assert_close(args[5], norm.weight.float())
-                        self.assertEqual(args[6], norm.eps)
+                        weight, eps = attn._k3_onorm_args
+                        self.assertIs(weight, attention.o_norm.weight)
+                        self.assertEqual(eps, attention.o_norm.eps)
                         self.assertFalse(attn._k3_onorm_consumed)
                         attn._k3_onorm_consumed = consume
                     else:
                         self.assertIsNone(attn._k3_onorm_gate)
-                        self.assertIsNone(attn._k3_fused_decode_args)
+                        self.assertIsNone(attn._k3_onorm_args)
                     return raw + 11 if consume else raw
 
-                attn.side_effect = backend
+                backend.side_effect = run_backend
                 batch = SimpleNamespace(forward_mode=mode, attn_cp_metadata=None)
-                actual = glm5_next.Glm5NextLinearAttention.forward(
-                    attention, hidden, batch
-                )
+                actual = attention(hidden, batch)
                 expected = (raw + (11 if consume else 3)).squeeze(0).flatten(-2)
                 torch.testing.assert_close(actual, expected)
-                self.assertEqual(norm.call_count, 0 if consume else 1)
                 if not consume:
                     torch.testing.assert_close(
                         norm.call_args.args[1], gate.unflatten(-1, (-1, head_dim))
                     )
-                self.assertIsNone(attn._k3_onorm_gate)
-                self.assertIsNone(attn._k3_fused_decode_args)
+                self.assertIsNone(attention.attn._k3_onorm_gate)
+                self.assertIsNone(attention.attn._k3_onorm_args)
+
+        backend.side_effect = RuntimeError("verify failed")
+        with self.assertRaisesRegex(RuntimeError, "verify failed"):
+            attention(
+                hidden,
+                SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY, attn_cp_metadata=None
+                ),
+            )
+        self.assertIsNone(attention.attn._k3_onorm_gate)
+        self.assertIsNone(attention.attn._k3_onorm_args)
+
+    def test_verify_adapter_accepts_compact_and_k3_norm_arguments(self):
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+        tokens, heads, head_dim = 3, 2, 4
+        raw = (
+            torch.arange(1, tokens * heads * head_dim + 1)
+            .float()
+            .reshape(1, tokens, heads, head_dim)
+        )
+        gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
+        attention, _ = self.make_attention(raw, gate)
+        layer = attention.attn
+        layer.lower_bound = -5.0
+        norm_weight = torch.full((head_dim,), 1.25, dtype=torch.float32)
+        args = (norm_weight, attention.o_norm.eps)
+
+        def kernel(*, onorm_gate, onorm_weight, onorm_eps, **kwargs):
+            if onorm_weight is None:
+                return raw
+            return F.rms_norm(
+                raw, (head_dim,), onorm_weight, onorm_eps
+            ) * torch.sigmoid(onorm_gate)
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.kernels.ops.attention.kda_decode_mtp": SimpleNamespace(
+                    fused_kda_decode_mtp_dspark=kernel
+                )
+            },
+        ):
+            for handoff in ("compact", "k3", "none"):
+                with self.subTest(handoff=handoff):
+                    layer._k3_onorm_gate = gate
+                    layer._k3_onorm_args = args if handoff == "compact" else None
+                    layer._k3_fused_decode_args = (
+                        (torch.empty(0),) * 5 + args if handoff == "k3" else None
+                    )
+                    layer._k3_onorm_consumed = False
+                    output = KDAAttnBackend._run_dspark_cutedsl_mtp(
+                        layer=layer,
+                        mixed_qkv=torch.zeros(tokens, 3 * heads * head_dim),
+                        a=torch.zeros(1, tokens, heads * head_dim),
+                        b=torch.zeros(1, tokens, heads),
+                        conv_states=torch.zeros(1, 3, 3 * heads * head_dim),
+                        ssm_states=torch.zeros(1, heads, head_dim, head_dim),
+                        intermediate_state_cache=torch.zeros(
+                            1, tokens, heads, head_dim, head_dim
+                        ),
+                        intermediate_conv_window_cache=torch.zeros(
+                            1, tokens, 3, 3 * heads * head_dim
+                        ),
+                        intermediate_state_indices=torch.zeros(1, dtype=torch.int32),
+                        cache_indices=torch.zeros(1, dtype=torch.int32),
+                        query_start_loc=torch.tensor([0, tokens], dtype=torch.int32),
+                    )
+                    expected = raw
+                    if handoff != "none":
+                        expected = kernel(
+                            onorm_gate=gate.unflatten(-1, (-1, head_dim)).unsqueeze(0),
+                            onorm_weight=norm_weight,
+                            onorm_eps=attention.o_norm.eps,
+                        )
+                    torch.testing.assert_close(output, expected)
+                    self.assertEqual(layer._k3_onorm_consumed, handoff != "none")
 
 
 if __name__ == "__main__":

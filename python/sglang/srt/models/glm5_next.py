@@ -566,7 +566,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.o_norm = FusedRMSNormGated(
-            self.head_dim, eps=rms_norm_eps, activation="sigmoid"
+            self.head_dim, eps=rms_norm_eps, activation="sigmoid", dtype=torch.float32
         )
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -596,12 +596,9 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
-
-    def refresh_derived_weights(self) -> None:
-        fused_onorm_args = getattr(self, "_fused_onorm_args", None)
-        if fused_onorm_args is not None:
-            # Captured graphs retain this fp32 buffer; refresh its contents in place.
-            fused_onorm_args[5].copy_(self.o_norm.weight.data)
+        self.attn._k3_onorm_args = None
+        self.attn._k3_onorm_gate = None
+        self.attn._k3_onorm_consumed = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -672,34 +669,25 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        # Fused output norm (attempt-and-verify, as in Kimi K3): in target verify,
-        # offer the output-norm gate so the nv_cutedsl verify kernel can fold the
-        # gated RMSNorm into the recurrence. If the backend leaves the gate
-        # unconsumed (another verify backend or an uncovered shape), apply o_norm
-        # here as before.
-        if getattr(self, "_fused_onorm_args", None) is None:
-            # Built on the first (eager) forward, never inside a graph capture. The
-            # verify kernel reads the fp32 weight and eps at positions 5 and 6.
-            self._fused_onorm_args = (None,) * 5 + (
-                self.o_norm.weight.data.float().contiguous(),
-                float(self.o_norm.eps),
-            )
         fused_onorm = forward_batch.forward_mode.is_target_verify()
         if fused_onorm:
-            self.attn._k3_fused_decode_args = self._fused_onorm_args
+            self.attn._k3_onorm_args = (self.o_norm.weight, self.o_norm.eps)
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
 
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=forget_gate,
-            b=beta,
-        )
+        try:
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta,
+            )
+        finally:
+            if fused_onorm:
+                self.attn._k3_onorm_args = None
+                self.attn._k3_onorm_gate = None
 
         if fused_onorm:
-            self.attn._k3_fused_decode_args = None
-            self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
@@ -1959,13 +1947,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
-        # The NextN model also borrows this loader without inheriting this class.
-        Glm5NextForConditionalGeneration.refresh_derived_weights(self)
-
-    def refresh_derived_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, Glm5NextLinearAttention):
-                module.refresh_derived_weights()
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -1973,7 +1954,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
-        self.refresh_derived_weights()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:
