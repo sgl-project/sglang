@@ -77,33 +77,37 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
             .as_str()
             .unwrap_or("null")
             .to_owned(),
-        disaggregation_bootstrap_port: deployment_info.disaggregation_bootstrap_port.map(u32::from),
-        node_rank: deployment_info.node_rank,
-        nnodes: deployment_info.nnodes,
-        dp_size: deployment_info.dp_size,
-        dp_rank: deployment_info.dp_rank,
-        dist_init_addr: deployment_info.dist_init_addr,
-        base_gpu_id: deployment_info.base_gpu_id,
-        page_size: deployment_info.page_size,
-        dcp_size: deployment_info.dcp_size,
-        max_running_requests: deployment_info.max_running_requests,
-        max_prefill_tokens: deployment_info.max_prefill_tokens,
-        enable_dp_attention: deployment_info.enable_dp_attention,
-        speculative_algorithm: deployment_info.speculative_algorithm,
-        enable_hierarchical_cache: deployment_info.enable_hierarchical_cache,
-        hicache_ratio: deployment_info.hicache_ratio,
-        hicache_size: deployment_info.hicache_size,
-        hicache_write_policy: deployment_info.hicache_write_policy,
-        hicache_host_total_tokens: deployment_info.hicache_host_total_tokens,
-        kv_event_sources: deployment_info
-            .kv_event_sources
-            .into_iter()
-            .map(|source| api::KvEventSource {
-                dp_rank: source.dp_rank,
-                endpoint: source.endpoint,
-                topic: source.topic,
-                block_size: source.block_size,
-            })
-            .collect(),
+        deployment_info: Some(api::DeploymentInfo {
+            disaggregation_bootstrap_port: deployment_info
+                .disaggregation_bootstrap_port
+                .map(u32::from),
+            node_rank: deployment_info.node_rank,
+            nnodes: deployment_info.nnodes,
+            dp_size: deployment_info.dp_size,
+            dp_rank: deployment_info.dp_rank,
+            dist_init_addr: deployment_info.dist_init_addr,
+            base_gpu_id: deployment_info.base_gpu_id,
+            page_size: deployment_info.page_size,
+            dcp_size: deployment_info.dcp_size,
+            max_running_requests: deployment_info.max_running_requests,
+            max_prefill_tokens: deployment_info.max_prefill_tokens,
+            enable_dp_attention: deployment_info.enable_dp_attention,
+            speculative_algorithm: deployment_info.speculative_algorithm,
+            enable_hierarchical_cache: deployment_info.enable_hierarchical_cache,
+            hicache_ratio: deployment_info.hicache_ratio,
+            hicache_size: deployment_info.hicache_size,
+            hicache_write_policy: deployment_info.hicache_write_policy,
+            hicache_host_total_tokens: deployment_info.hicache_host_total_tokens,
+            kv_event_sources: deployment_info
+                .kv_event_sources
+                .into_iter()
+                .map(|source| api::KvEventSource {
+                    dp_rank: source.dp_rank,
+                    endpoint: source.endpoint,
+                    topic: source.topic,
+                    block_size: source.block_size,
+                })
+                .collect(),
+        }),
     })
 }

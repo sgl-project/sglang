@@ -757,7 +757,7 @@ pub struct GetServerInfoResponse {
     /// passes them through verbatim.
     #[prost(string, repeated, tag = "7")]
     pub internal_states: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Deployment/discovery metadata required by out-of-process orchestrators.
+    /// Public serving endpoint configuration.
     #[prost(string, tag = "8")]
     pub host: ::prost::alloc::string::String,
     #[prost(uint32, tag = "9")]
@@ -766,43 +766,53 @@ pub struct GetServerInfoResponse {
     pub incremental_streaming_output: bool,
     #[prost(string, tag = "11")]
     pub disaggregation_mode: ::prost::alloc::string::String,
-    #[prost(uint32, optional, tag = "12")]
+    /// Distributed deployment metadata required by out-of-process orchestrators.
+    #[prost(message, optional, tag = "12")]
+    pub deployment_info: ::core::option::Option<DeploymentInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeploymentInfo {
+    /// Distributed process topology.
+    #[prost(uint32, optional, tag = "1")]
     pub disaggregation_bootstrap_port: ::core::option::Option<u32>,
-    #[prost(uint32, tag = "13")]
+    #[prost(uint32, tag = "2")]
     pub node_rank: u32,
-    #[prost(uint32, tag = "14")]
+    #[prost(uint32, tag = "3")]
     pub nnodes: u32,
-    #[prost(uint32, tag = "15")]
+    #[prost(uint32, tag = "4")]
     pub dp_size: u32,
-    #[prost(uint32, optional, tag = "16")]
+    #[prost(uint32, optional, tag = "5")]
     pub dp_rank: ::core::option::Option<u32>,
-    #[prost(string, optional, tag = "17")]
+    #[prost(string, optional, tag = "6")]
     pub dist_init_addr: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(uint32, tag = "18")]
+    #[prost(uint32, tag = "7")]
     pub base_gpu_id: u32,
-    #[prost(uint32, optional, tag = "19")]
+    #[prost(uint32, optional, tag = "8")]
     pub page_size: ::core::option::Option<u32>,
-    #[prost(uint32, tag = "20")]
+    #[prost(uint32, tag = "9")]
     pub dcp_size: u32,
-    #[prost(uint64, optional, tag = "21")]
+    /// Request scheduling and execution limits.
+    #[prost(uint64, optional, tag = "10")]
     pub max_running_requests: ::core::option::Option<u64>,
-    #[prost(uint64, tag = "22")]
+    #[prost(uint64, tag = "11")]
     pub max_prefill_tokens: u64,
-    #[prost(bool, tag = "23")]
+    #[prost(bool, tag = "12")]
     pub enable_dp_attention: bool,
-    #[prost(string, optional, tag = "24")]
+    #[prost(string, optional, tag = "13")]
     pub speculative_algorithm: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bool, tag = "25")]
+    /// Hierarchical KV-cache configuration.
+    #[prost(bool, tag = "14")]
     pub enable_hierarchical_cache: bool,
-    #[prost(double, optional, tag = "26")]
+    #[prost(double, optional, tag = "15")]
     pub hicache_ratio: ::core::option::Option<f64>,
-    #[prost(uint64, tag = "27")]
+    #[prost(uint64, tag = "16")]
     pub hicache_size: u64,
-    #[prost(string, optional, tag = "28")]
+    #[prost(string, optional, tag = "17")]
     pub hicache_write_policy: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(uint64, optional, tag = "29")]
+    #[prost(uint64, optional, tag = "18")]
     pub hicache_host_total_tokens: ::core::option::Option<u64>,
-    #[prost(message, repeated, tag = "30")]
+    /// KV-cache event streams published by this deployment.
+    #[prost(message, repeated, tag = "19")]
     pub kv_event_sources: ::prost::alloc::vec::Vec<KvEventSource>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

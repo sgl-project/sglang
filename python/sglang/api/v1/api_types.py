@@ -597,6 +597,21 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     port: int = 0
     incremental_streaming_output: bool = False
     disaggregation_mode: str = ""
+    deployment_info: Optional[DeploymentInfo] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetServerInfoResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetServerInfoResponse(self)
+
+
+class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DeploymentInfo: JSON object (unknown keys ignored)."""
+
     disaggregation_bootstrap_port: Optional[int] = None
     node_rank: int = 0
     nnodes: int = 0
@@ -618,13 +633,13 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     kv_event_sources: List[KvEventSource] = []
 
     @classmethod
-    def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
+    def from_json_value(cls, value: Any) -> "DeploymentInfo":
         """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
-        return decode_GetServerInfoResponse(value)
+        return decode_DeploymentInfo(value)
 
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
-        return encode_GetServerInfoResponse(self)
+        return encode_DeploymentInfo(self)
 
 
 class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
@@ -1920,7 +1935,36 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["incremental_streaming_output"] = _expect_bool(x, expected="a boolean")
         elif key == "disaggregation_mode":
             kw["disaggregation_mode"] = _expect_str(x, expected="a string")
-        elif key == "disaggregation_bootstrap_port":
+        elif key == "deployment_info":
+            kw["deployment_info"] = None if x is None else decode_DeploymentInfo(x)
+    return GetServerInfoResponse(**kw)
+
+
+def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model_path"] = v.model_path
+    d["served_model_name"] = v.served_model_name
+    d["tokenizer_path"] = v.tokenizer_path
+    d["max_context_length"] = v.max_context_length
+    if v.max_total_num_tokens is not None:
+        d["max_total_num_tokens"] = v.max_total_num_tokens
+    d["version"] = v.version
+    if v.internal_states:
+        d["internal_states"] = list(v.internal_states)
+    d["host"] = v.host
+    d["port"] = v.port
+    d["incremental_streaming_output"] = v.incremental_streaming_output
+    d["disaggregation_mode"] = v.disaggregation_mode
+    if v.deployment_info is not None:
+        d["deployment_info"] = encode_DeploymentInfo(v.deployment_info)
+    return d
+
+
+def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
+    m = _expect_map(value, expected="struct DeploymentInfo")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "disaggregation_bootstrap_port":
             kw["disaggregation_bootstrap_port"] = None if x is None else _expect_uint(x, expected="u32")
         elif key == "node_rank":
             kw["node_rank"] = _expect_uint(x, expected="u32")
@@ -1958,24 +2002,11 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_event_sources":
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
-    return GetServerInfoResponse(**kw)
+    return DeploymentInfo(**kw)
 
 
-def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
+def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
-    d["model_path"] = v.model_path
-    d["served_model_name"] = v.served_model_name
-    d["tokenizer_path"] = v.tokenizer_path
-    d["max_context_length"] = v.max_context_length
-    if v.max_total_num_tokens is not None:
-        d["max_total_num_tokens"] = v.max_total_num_tokens
-    d["version"] = v.version
-    if v.internal_states:
-        d["internal_states"] = list(v.internal_states)
-    d["host"] = v.host
-    d["port"] = v.port
-    d["incremental_streaming_output"] = v.incremental_streaming_output
-    d["disaggregation_mode"] = v.disaggregation_mode
     if v.disaggregation_bootstrap_port is not None:
         d["disaggregation_bootstrap_port"] = v.disaggregation_bootstrap_port
     d["node_rank"] = v.node_rank

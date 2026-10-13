@@ -3652,64 +3652,8 @@ impl ::serde::Serialize for GetServerInfoResponse {
             "disaggregation_mode",
             &self.disaggregation_mode,
         )?;
-        if let Some(v) = &self.disaggregation_bootstrap_port {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "disaggregation_bootstrap_port",
-                v,
-            )?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "node_rank", &self.node_rank)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "nnodes", &self.nnodes)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_size", &self.dp_size)?;
-        if let Some(v) = &self.dp_rank {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", v)?;
-        }
-        if let Some(v) = &self.dist_init_addr {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dist_init_addr", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "base_gpu_id", &self.base_gpu_id)?;
-        if let Some(v) = &self.page_size {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "page_size", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dcp_size", &self.dcp_size)?;
-        if let Some(v) = &self.max_running_requests {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_running_requests", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "max_prefill_tokens",
-            &self.max_prefill_tokens,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "enable_dp_attention",
-            &self.enable_dp_attention,
-        )?;
-        if let Some(v) = &self.speculative_algorithm {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "speculative_algorithm", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "enable_hierarchical_cache",
-            &self.enable_hierarchical_cache,
-        )?;
-        if let Some(v) = &self.hicache_ratio {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_ratio", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_size", &self.hicache_size)?;
-        if let Some(v) = &self.hicache_write_policy {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_write_policy", v)?;
-        }
-        if let Some(v) = &self.hicache_host_total_tokens {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_host_total_tokens", v)?;
-        }
-        if !self.kv_event_sources.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "kv_event_sources",
-                &self.kv_event_sources,
-            )?;
+        if let Some(v) = &self.deployment_info {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "deployment_info", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -3738,25 +3682,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_port = None;
                 let mut f_incremental_streaming_output = None;
                 let mut f_disaggregation_mode = None;
-                let mut f_disaggregation_bootstrap_port = None;
-                let mut f_node_rank = None;
-                let mut f_nnodes = None;
-                let mut f_dp_size = None;
-                let mut f_dp_rank = None;
-                let mut f_dist_init_addr = None;
-                let mut f_base_gpu_id = None;
-                let mut f_page_size = None;
-                let mut f_dcp_size = None;
-                let mut f_max_running_requests = None;
-                let mut f_max_prefill_tokens = None;
-                let mut f_enable_dp_attention = None;
-                let mut f_speculative_algorithm = None;
-                let mut f_enable_hierarchical_cache = None;
-                let mut f_hicache_ratio = None;
-                let mut f_hicache_size = None;
-                let mut f_hicache_write_policy = None;
-                let mut f_hicache_host_total_tokens = None;
-                let mut f_kv_event_sources = None;
+                let mut f_deployment_info = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -3845,6 +3771,137 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             f_disaggregation_mode =
                                 Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
+                        "deployment_info" => {
+                            if f_deployment_info.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("deployment_info"));
+                            }
+                            f_deployment_info = Some(map.next_value::<Option<DeploymentInfo>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GetServerInfoResponse {
+                    model_path: f_model_path.unwrap_or_default(),
+                    served_model_name: f_served_model_name.unwrap_or_default(),
+                    tokenizer_path: f_tokenizer_path.unwrap_or_default(),
+                    max_context_length: f_max_context_length.unwrap_or_default(),
+                    max_total_num_tokens: f_max_total_num_tokens.flatten(),
+                    version: f_version.unwrap_or_default(),
+                    internal_states: f_internal_states.unwrap_or_default(),
+                    host: f_host.unwrap_or_default(),
+                    port: f_port.unwrap_or_default(),
+                    incremental_streaming_output: f_incremental_streaming_output
+                        .unwrap_or_default(),
+                    disaggregation_mode: f_disaggregation_mode.unwrap_or_default(),
+                    deployment_info: f_deployment_info.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DeploymentInfo {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.disaggregation_bootstrap_port {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "disaggregation_bootstrap_port",
+                v,
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "node_rank", &self.node_rank)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "nnodes", &self.nnodes)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_size", &self.dp_size)?;
+        if let Some(v) = &self.dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", v)?;
+        }
+        if let Some(v) = &self.dist_init_addr {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dist_init_addr", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "base_gpu_id", &self.base_gpu_id)?;
+        if let Some(v) = &self.page_size {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "page_size", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dcp_size", &self.dcp_size)?;
+        if let Some(v) = &self.max_running_requests {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_running_requests", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_prefill_tokens",
+            &self.max_prefill_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "enable_dp_attention",
+            &self.enable_dp_attention,
+        )?;
+        if let Some(v) = &self.speculative_algorithm {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "speculative_algorithm", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "enable_hierarchical_cache",
+            &self.enable_hierarchical_cache,
+        )?;
+        if let Some(v) = &self.hicache_ratio {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_ratio", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_size", &self.hicache_size)?;
+        if let Some(v) = &self.hicache_write_policy {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_write_policy", v)?;
+        }
+        if let Some(v) = &self.hicache_host_total_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_host_total_tokens", v)?;
+        }
+        if !self.kv_event_sources.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "kv_event_sources",
+                &self.kv_event_sources,
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DeploymentInfo;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DeploymentInfo")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_disaggregation_bootstrap_port = None;
+                let mut f_node_rank = None;
+                let mut f_nnodes = None;
+                let mut f_dp_size = None;
+                let mut f_dp_rank = None;
+                let mut f_dist_init_addr = None;
+                let mut f_base_gpu_id = None;
+                let mut f_page_size = None;
+                let mut f_dcp_size = None;
+                let mut f_max_running_requests = None;
+                let mut f_max_prefill_tokens = None;
+                let mut f_enable_dp_attention = None;
+                let mut f_speculative_algorithm = None;
+                let mut f_enable_hierarchical_cache = None;
+                let mut f_hicache_ratio = None;
+                let mut f_hicache_size = None;
+                let mut f_hicache_write_policy = None;
+                let mut f_hicache_host_total_tokens = None;
+                let mut f_kv_event_sources = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
                         "disaggregation_bootstrap_port" => {
                             if f_disaggregation_bootstrap_port.is_some() {
                                 return Err(::serde::de::Error::duplicate_field(
@@ -3989,19 +4046,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                         }
                     }
                 }
-                Ok(GetServerInfoResponse {
-                    model_path: f_model_path.unwrap_or_default(),
-                    served_model_name: f_served_model_name.unwrap_or_default(),
-                    tokenizer_path: f_tokenizer_path.unwrap_or_default(),
-                    max_context_length: f_max_context_length.unwrap_or_default(),
-                    max_total_num_tokens: f_max_total_num_tokens.flatten(),
-                    version: f_version.unwrap_or_default(),
-                    internal_states: f_internal_states.unwrap_or_default(),
-                    host: f_host.unwrap_or_default(),
-                    port: f_port.unwrap_or_default(),
-                    incremental_streaming_output: f_incremental_streaming_output
-                        .unwrap_or_default(),
-                    disaggregation_mode: f_disaggregation_mode.unwrap_or_default(),
+                Ok(DeploymentInfo {
                     disaggregation_bootstrap_port: f_disaggregation_bootstrap_port.flatten(),
                     node_rank: f_node_rank.unwrap_or_default(),
                     nnodes: f_nnodes.unwrap_or_default(),

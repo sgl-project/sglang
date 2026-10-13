@@ -121,30 +121,43 @@ message GetServerInfoResponse {
   // passes them through verbatim.
   repeated string internal_states = 7 [(sglang.json.v1.field_json).raw_json = true];
 
-  // Deployment/discovery metadata required by out-of-process orchestrators.
+  // Public serving endpoint configuration.
   string host = 8;
   uint32 port = 9;
   bool incremental_streaming_output = 10;
   string disaggregation_mode = 11;
-  optional uint32 disaggregation_bootstrap_port = 12;
-  uint32 node_rank = 13;
-  uint32 nnodes = 14;
-  uint32 dp_size = 15;
-  optional uint32 dp_rank = 16;
-  optional string dist_init_addr = 17;
-  uint32 base_gpu_id = 18;
-  optional uint32 page_size = 19;
-  uint32 dcp_size = 20;
-  optional uint64 max_running_requests = 21;
-  uint64 max_prefill_tokens = 22;
-  bool enable_dp_attention = 23;
-  optional string speculative_algorithm = 24;
-  bool enable_hierarchical_cache = 25;
-  optional double hicache_ratio = 26;
-  uint64 hicache_size = 27;
-  optional string hicache_write_policy = 28;
-  optional uint64 hicache_host_total_tokens = 29;
-  repeated KvEventSource kv_event_sources = 30;
+
+  // Distributed deployment metadata required by out-of-process orchestrators.
+  DeploymentInfo deployment_info = 12;
+}
+
+message DeploymentInfo {
+  // Distributed process topology.
+  optional uint32 disaggregation_bootstrap_port = 1;
+  uint32 node_rank = 2;
+  uint32 nnodes = 3;
+  uint32 dp_size = 4;
+  optional uint32 dp_rank = 5;
+  optional string dist_init_addr = 6;
+  uint32 base_gpu_id = 7;
+  optional uint32 page_size = 8;
+  uint32 dcp_size = 9;
+
+  // Request scheduling and execution limits.
+  optional uint64 max_running_requests = 10;
+  uint64 max_prefill_tokens = 11;
+  bool enable_dp_attention = 12;
+  optional string speculative_algorithm = 13;
+
+  // Hierarchical KV-cache configuration.
+  bool enable_hierarchical_cache = 14;
+  optional double hicache_ratio = 15;
+  uint64 hicache_size = 16;
+  optional string hicache_write_policy = 17;
+  optional uint64 hicache_host_total_tokens = 18;
+
+  // KV-cache event streams published by this deployment.
+  repeated KvEventSource kv_event_sources = 19;
 }
 
 message KvEventSource {
