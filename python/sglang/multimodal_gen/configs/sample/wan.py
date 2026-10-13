@@ -397,6 +397,11 @@ class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
             )
         super().__post_init__()
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        # The audio and pose inputs; each is a local path or an http(s) URL.
+        return frozenset({"audio_path", "pose_video_path"})
+
 
 @dataclass
 class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):
