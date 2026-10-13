@@ -348,9 +348,9 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
 
 def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
-    if not config.is_gated or config.activation not in ("silu", "situ"):
-        raise ValueError("FlashInfer NVFP4 MegaMOE only supports gated SiLU or SiTU.")
-    if config.activation == "situ":
+    if config.is_gated and config.activation == "silu":
+        return {"activation": "swiglu", "gate_up_clamp": config.swiglu_limit}
+    if config.is_gated and config.activation == "situ":
         # Kimi K3 stores SiTU's tanh constants in the existing GEMM1 fields.
         # The up-branch tanh scale is not a SwiGLU hard-clamp limit.
         return {
@@ -359,7 +359,7 @@ def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
             "situ_linear_beta": config.gemm1_clamp_limit,
             "gate_up_clamp": None,
         }
-    return {"activation": "swiglu", "gate_up_clamp": config.swiglu_limit}
+    raise ValueError("FlashInfer NVFP4 MegaMOE only supports gated SiLU or SiTU.")
 
 
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
@@ -371,40 +371,33 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
-        return _ensure_flashinfer_megamoe_layer(
-            layer,
-            megakernel_config=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=layer.intermediate_size_per_partition,
-                top_k=layer.top_k,
-                enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
-                **activation_kwargs,
-            ),
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+        megakernel_config = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            **activation_kwargs,
         )
+    else:
+        from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
 
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
-
-    input_norm_const = layer._flashinfer_megamoe_input_norm_const
-    if input_norm_const is None:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "FlashInfer NVFP4 MegaMOE layer must be initialized before "
-                "CUDA graph capture."
+        input_norm_const = layer._flashinfer_megamoe_input_norm_const
+        if input_norm_const is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FlashInfer NVFP4 MegaMOE layer must be initialized before "
+                    "CUDA graph capture."
+                )
+            logger.warning(
+                "FlashInfer NVFP4 MegaMOE layer[%s]: input_norm_const was not "
+                "precomputed at weight-load time; computing it lazily now via a "
+                "blocking device sync. This should only happen once per layer, "
+                "but if it happens during warmup it will look like a stall.",
+                layer.layer_id,
             )
-        logger.warning(
-            "FlashInfer NVFP4 MegaMOE layer[%s]: input_norm_const was not "
-            "precomputed at weight-load time; computing it lazily now via a "
-            "blocking device sync. This should only happen once per layer, "
-            "but if it happens during warmup it will look like a stall.",
-            layer.layer_id,
-        )
-        input_norm_const = _scalar_float(layer.w13_input_scale_quant)
-        layer._flashinfer_megamoe_input_norm_const = input_norm_const
+            input_norm_const = _scalar_float(layer.w13_input_scale_quant)
+            layer._flashinfer_megamoe_input_norm_const = input_norm_const
 
-    return _ensure_flashinfer_megamoe_layer(
-        layer,
-        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+        megakernel_config = Nvfp4CutedslMegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             apply_topk_in_fc1=True,
@@ -412,7 +405,11 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
             **activation_kwargs,
-        ),
+        )
+
+    return _ensure_flashinfer_megamoe_layer(
+        layer,
+        megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
     )
@@ -499,18 +496,17 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
     use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    if use_w4a16:
-        # Reload preserves the transformed-weight storage and kernel geometry.
-        # Keep the live layer and its pooled workspace reference for CUDA graphs.
-        _get_or_init_flashinfer_megamoe_layer_state(layer)
-    else:
-        _init_flashinfer_megamoe_layer_state(layer)
+    # Both NVFP4 modes reload into the same prepared allocations. Preserve the
+    # live layer, tuned profiles and pooled workspace owner for CUDA graphs.
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import MoEWeightPack
 
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
-    if use_w4a16 and layer.moe_runner_config.apply_router_weight_on_input:
-        raise ValueError("FlashInfer W4A16 MegaMOE applies routing weights after FC2.")
+    if layer.moe_runner_config.apply_router_weight_on_input:
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE does not support routing weights on input."
+        )
 
     hidden_alignment = 32 if use_w4a16 else 128
     intermediate_alignment = 64 if use_w4a16 else 128
@@ -538,6 +534,12 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         )
 
     _validate_nvfp4_fc1_alpha(layer)
+    weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
+    if weight_views is None:
+        load_layouts = {}
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            param = getattr(layer, name)
+            load_layouts[name] = (param.shape, param.stride(), param.dtype)
     weights = MoEWeightPack(
         w13=layer.w13_weight.data,
         w2=layer.w2_weight.data,
@@ -547,10 +549,6 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     if use_w4a16:
         from flashinfer.moe_ep import preprocess_bf16_nvfp4_cutedsl_mega_weights
 
-        load_layouts = {}
-        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
-            param = getattr(layer, name)
-            load_layouts[name] = (param.shape, param.stride(), param.dtype)
         transformed_weights = preprocess_bf16_nvfp4_cutedsl_mega_weights(
             weights,
             intermediate_size=layer.intermediate_size_per_partition,
@@ -559,9 +557,18 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     else:
         from flashinfer.moe_ep import preprocess_nvfp4_cutedsl_mega_weights
 
-        layer._flashinfer_megamoe_input_norm_const = _scalar_float(
-            layer.w13_input_scale_quant
-        )
+        input_norm_const = _scalar_float(layer.w13_input_scale_quant)
+        if (
+            mega is not None
+            and input_norm_const != layer._flashinfer_megamoe_input_norm_const
+        ):
+            # FlashInfer captures this scalar by value; updating Python config
+            # would leave existing CUDA graphs using the old normalization.
+            raise ValueError(
+                "FlashInfer NVFP4 W4A4 MegaMOE weight reload requires an unchanged "
+                "input activation scale. Restart the server to change it."
+            )
+        layer._flashinfer_megamoe_input_norm_const = input_norm_const
         transformed_weights = preprocess_nvfp4_cutedsl_mega_weights(
             weights,
             intermediate_size=layer.intermediate_size_per_partition,
@@ -569,18 +576,16 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             gate_up_clamp=activation_kwargs["gate_up_clamp"],
             activation_clamp=None,
         )
-    if use_w4a16:
-        weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
-        if weight_views is not None:
-            for name, (_, prepared_view) in weight_views.items():
-                getattr(layer, name).data = prepared_view
+    if weight_views is not None:
+        for name, (_, prepared_view) in weight_views.items():
+            getattr(layer, name).data = prepared_view
     _bind_transformed_weights(
         layer,
         transformed_weights,
         w13_scale_name="w13_weight_scale",
         w2_scale_name="w2_weight_scale",
     )
-    if use_w4a16 and weight_views is None:
+    if weight_views is None:
         # Padded scale storage can exceed the canonical load shape. as_strided
         # exposes only the original extent without allocating another copy.
         layer._flashinfer_megamoe_weight_views = {}

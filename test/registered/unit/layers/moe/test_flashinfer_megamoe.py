@@ -623,6 +623,8 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
     for scale in (2.0, 3.0):
         layer.g1_alphas.fill_(scale)
         layer.g2_alphas.fill_(scale + 1)
+        if not use_w4a16:
+            layer.w2_input_scale_quant.fill_(scale + 2)
         module.run_flashinfer_megamoe(
             dispatch_output,
             quant_info,
@@ -634,6 +636,9 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
             assert mega.tensors.fc1_norm_const is None
         else:
             assert mega.tensors.fc1_norm_const is layer.w2_input_scale_quant
+            torch.testing.assert_close(
+                mega.tensors.fc1_norm_const, torch.full((2,), scale + 2)
+            )
         assert mega.tensors.topk_weights is dispatch_output.topk_output.topk_weights
         torch.testing.assert_close(mega.tensors.fc1_alpha, torch.full((2,), scale))
         torch.testing.assert_close(mega.tensors.fc2_alpha, torch.full((2,), scale + 1))
@@ -642,12 +647,13 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
 @pytest.mark.parametrize(
     "activation,situ_linear_beta", [("silu", None), ("situ", 25.0), ("situ", None)]
 )
-def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
-    monkeypatch, activation, situ_linear_beta
+@pytest.mark.parametrize("use_w4a16", [False, True])
+def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
+    monkeypatch, activation, situ_linear_beta, use_w4a16
 ):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
-        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
     )
     # Import the real parameter-binding helper without the full runtime.
     spec = importlib.util.spec_from_file_location(
@@ -657,13 +663,13 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
     common = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, common)
     spec.loader.exec_module(common)
-    hidden, intermediate = 32, 64
+    hidden, intermediate = (32, 64) if use_w4a16 else (128, 128)
     layer = torch.nn.Module()
     layer.hidden_size = hidden
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = layer.num_experts = 2
     layer.moe_ep_size = 1
-    layer.quant_config = types.SimpleNamespace(use_per_token_activation=True)
+    layer.quant_config = types.SimpleNamespace(use_per_token_activation=use_w4a16)
     layer.moe_runner_config = types.SimpleNamespace(
         is_gated=True,
         activation=activation,
@@ -673,7 +679,9 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
         apply_router_weight_on_input=False,
     )
     layer.g1_alphas = layer.g1_alphas_up = torch.ones(2)
-    layer.g2_alphas = layer.w13_input_scale_quant = torch.ones(2)
+    layer.g2_alphas = torch.ones(2)
+    layer.w13_input_scale_quant = torch.tensor(1.0)
+    layer.w2_input_scale_quant = torch.ones(2)
     for prefix, rows, columns in (
         ("w13", 2 * intermediate, hidden),
         ("w2", hidden, intermediate),
@@ -691,22 +699,36 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
             )
     canonical = {name: (p.shape, p.dtype) for name, p in layer.named_parameters()}
 
-    def preprocess(weights, *, intermediate_size, hidden_size):
+    def preprocess(
+        weights,
+        *,
+        intermediate_size,
+        hidden_size,
+        gate_up_clamp=None,
+        activation_clamp=None,
+    ):
         assert (intermediate_size, hidden_size) == (intermediate, hidden)
         result = []
         for weight, scale in (
             (weights.w13, weights.w13_scale),
             (weights.w2, weights.w2_scale),
         ):
-            # Model the prepared ABI: transposed FP4 bytes and padded flat scales.
+            # W4A4 exposes the prepared FP4 and FP8 planes as uint8 bytes;
+            # W4A16 exposes FP4 weights and FP8 scales with their typed views.
             padded = torch.zeros(
                 2, ((scale[0].numel() + 511) // 512) * 512, dtype=scale.dtype
             )
             padded[:, : scale[0].numel()].copy_(scale.flatten(1))
+            weight_dtype = torch.float4_e2m1fn_x2 if use_w4a16 else torch.uint8
+            scale_dtype = torch.float8_e4m3fn if use_w4a16 else torch.uint8
+            # W4A4 FC2 preprocessing returns a view of the canonical bytes.
+            prepared_weight = (
+                weight if not use_w4a16 and weight is weights.w2 else weight.clone()
+            )
             result.append(
                 (
-                    weight.clone().view(torch.float4_e2m1fn_x2).transpose(1, 2),
-                    padded,
+                    prepared_weight.view(weight_dtype).transpose(1, 2),
+                    padded.view(scale_dtype),
                 )
             )
         return tuple(result)
@@ -719,6 +741,7 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
     fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
     fake_moe_ep.MoEWeightPack = make_weight_pack
     fake_moe_ep.preprocess_bf16_nvfp4_cutedsl_mega_weights = preprocess
+    fake_moe_ep.preprocess_nvfp4_cutedsl_mega_weights = preprocess
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
     module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
     prepared = {
@@ -749,10 +772,21 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
             assert (p.shape, p.stride(), p.dtype, p.data_ptr()) == prepared[name]
             # Views held by the live backend and captured graphs see new bytes.
             p = mega._transformed_weights[name]
-            if p.dtype == torch.float4_e2m1fn_x2:
+            if name.endswith("_weight"):
                 assert (p.view(torch.uint8) == value).all()
             else:
-                assert (p.float()[:, : canonical[name][0].numel() // 2] == value).all()
+                scale = p.view(torch.float8_e4m3fn).float()
+                assert (scale[:, : canonical[name][0].numel() // 2] == value).all()
+
+    if not use_w4a16:
+        # FlashInfer 0.7.1 embeds this scalar in the live kernel configuration;
+        # accepting a changed scalar would keep a stale captured quantizer.
+        layer.w13_input_scale_quant.fill_(2.0)
+        with pytest.raises(ValueError, match="input activation scale"):
+            module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+        assert layer._flashinfer_megamoe_layer is mega
+        assert layer._flashinfer_megamoe_forward is forward
+        assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
 if __name__ == "__main__":

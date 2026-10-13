@@ -332,5 +332,20 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
     )
 
 
+class TestServerUpdateWeightsFromDiskNVFP4W4A4MegaMoE(
+    TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE
+):
+    launch_env = {
+        **TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE.launch_env,
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "0",
+    }
+    backend_test_suites = (
+        {
+            **TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE.backend_test_suites[0],
+            "name": "flashinfer_megamoe_nvfp4_w4a4",
+        },
+    )
+
+
 if __name__ == "__main__":
     unittest.main()
