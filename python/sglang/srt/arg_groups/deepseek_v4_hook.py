@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -233,7 +233,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # Only the CUDA backend folds the replay into the extend; a separate
+            # replay forward would run its MLP sync on the hitting DP ranks alone.
+            (
+                "DP attention other than CUDA with attention TP 1 and MoE backend none",
+                attn_dp_enabled_of(cfg)
+                and (
+                    not get_platform().is_cuda
+                    or cfg.tp_size != cfg.attn_dp_size
+                    or cfg.moe_a2a_backend != "none"
+                ),
+            ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
@@ -343,13 +353,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
-            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            # The late layers resize every rank's MoE gather to its tail rows: from the
+            # scheduler's trim counts on CUDA, from an eager count gather on ROCm.
             (
-                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                "DP attention other than TP MoE with attention TP 1 on CUDA or ROCm",
                 attn_dp_enabled_of(cfg)
                 and not (
-                    is_hip()
+                    (get_platform().is_cuda or get_platform().is_hip)
                     and cfg.moe_a2a_backend == "none"
                     and cfg.attn_dp_size == cfg.tp_size
                 ),

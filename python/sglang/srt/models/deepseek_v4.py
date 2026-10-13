@@ -3873,6 +3873,18 @@ def _late_layer_dp_counts(
     return None if counts == list(early) else counts
 
 
+def _late_layer_dp_counts_from_trims(forward_batch: ForwardBatch) -> List[int]:
+    # The scheduler's DP all-gather already carries every rank's trimmed rows,
+    # so no collective or device-to-host read is needed here.
+    # MAX_LEN pads every rank to one width; only SUM_LEN slots can shrink per rank.
+    assert not forward_batch.dp_padding_mode.is_max_len()
+    full = forward_batch.global_num_tokens_padded_cpu
+    trims = forward_batch.global_decoder_trim_rows_cpu
+    late = [n - t for n, t in zip(full, trims, strict=True)]
+    assert min(late) >= 0, (full, trims)
+    return late
+
+
 def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:
     fb = forward_batch
     saved = (
@@ -3886,8 +3898,9 @@ def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tupl
         fb.dp_local_num_tokens,
     )
     fb.global_num_tokens_cpu = counts
-    fb.global_num_tokens_gpu = torch.tensor(
-        counts, dtype=torch.int64, device=fb.global_num_tokens_gpu.device
+    # A blocking host-to-device copy here would synchronize the stream mid-forward.
+    fb.global_num_tokens_gpu = torch.tensor(counts, dtype=torch.int64).to(
+        fb.global_num_tokens_gpu.device, non_blocking=True
     )
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
@@ -4058,6 +4071,8 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+            # Under DP attention the late layers' gather carries no token ids.
+            assert self.late_layer_start >= getattr(config, "num_hash_layers", 0)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4181,6 +4196,8 @@ class DeepseekV4Model(nn.Module):
                     else hidden_states.shape[0]
                 ),
             )
+        elif forward_batch.global_decoder_trim_rows_cpu is not None:
+            late_dp_counts = _late_layer_dp_counts_from_trims(forward_batch)
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4199,7 +4216,6 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-            # late_dp_counts is only not None on hip
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = _enter_late_layer_dp(forward_batch, late_dp_counts)
                 # Gathered over the full extend; no late layer is hash-routed.
@@ -4258,7 +4274,6 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        # saved_dp is only not None on hip
         if saved_dp is not None:
             _exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
