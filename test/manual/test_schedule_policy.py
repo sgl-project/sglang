@@ -40,6 +40,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         self.assertEqual(policy.policy, CacheAwarePolicy.LPM)
 
@@ -50,6 +52,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
@@ -61,6 +65,8 @@ class TestSchedulePolicy(CustomTestCase):
                 enable_hierarchical_cache=True,
                 enable_priority_scheduling=False,
                 schedule_low_priority_values_first=False,
+                chunked_prefill_size=None,
+                max_prefill_tokens=16384,
             )
 
     def test_init_with_disabled_cache(self):
@@ -71,6 +77,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
@@ -88,6 +96,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
         # Check if FCFS keeps the original order
@@ -112,6 +122,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
 
@@ -139,6 +151,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=True,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
@@ -161,6 +175,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
@@ -185,6 +201,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
@@ -211,6 +229,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=True,
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=True,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
@@ -241,6 +261,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue, running_batch)
 
@@ -269,6 +291,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue, running_batch)
 
@@ -298,6 +322,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue, running_batch)
 
@@ -323,6 +349,8 @@ class TestSchedulePolicy(CustomTestCase):
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
         )
         policy.calc_priority(waiting_queue, running_batch)
 

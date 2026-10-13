@@ -219,6 +219,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -1397,6 +1398,8 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            self.chunked_prefill_size,
+            self.max_prefill_tokens,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -2574,6 +2577,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            policy=self.policy,
         )
 
     def init_internal_state(self) -> None:
@@ -4002,12 +4006,15 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
-        # Get priority queue
-        self.policy.calc_priority(
-            self.waiting_queue,
-            running_batch,
-            processed_tokens=self.processed_tokens_counter,
-        )
+        # PrefixWeave needs the post-chunk admission budget. Other policies run
+        # here so shortest-prefill can size the active chunk from fresh matches.
+        is_prefix_weave = self.policy.policy == CacheAwarePolicy.PREFIX_WEAVE
+        if not is_prefix_weave:
+            self.policy.calc_priority(
+                self.waiting_queue,
+                running_batch,
+                processed_tokens=self.processed_tokens_counter,
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4059,6 +4066,26 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        if is_prefix_weave:
+            max_req_num = self.get_num_allocatable_reqs(
+                running_bs, running_batch=running_batch
+            ) - len(adder.can_run_list)
+            token_budget = min(
+                adder.rem_input_tokens,
+                adder.rem_total_tokens,
+                adder.cur_rem_tokens,
+            )
+            if adder.rem_chunk_tokens is not None:
+                token_budget = min(token_budget, adder.rem_chunk_tokens)
+
+            self.policy.calc_priority(
+                self.waiting_queue,
+                running_batch,
+                max_req_num=max_req_num,
+                token_budget=token_budget,
+                processed_tokens=self.processed_tokens_counter,
+            )
 
         if self.enable_lora:
             running_loras = {
@@ -4186,6 +4213,8 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
             return None, running_batch
+
+        self.policy.update_classified_reqs(can_run_list)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
