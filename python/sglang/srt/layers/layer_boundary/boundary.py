@@ -55,7 +55,6 @@ from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
-    _dispatch_by_update,
     _dp_gather_sum_read,
     _move_before_read,
     _reduce_update_read,
@@ -116,6 +115,26 @@ class ExitMove(NamedTuple):
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
     returns_over_dp: bool = False
+    # Whether output_move gathers the rows back over attention TP.
+    gathers_attn_tp: bool = False
+
+
+class EntryStep(NamedTuple):
+    """The steps chosen into a stage, with what they do that binding and
+    capture rely on."""
+
+    step: Callable
+    # Moves the input onto the stage's rows after the step, or None.
+    input_move: Optional[Callable] = None
+    # input_move gathers over attention TP with the stage's own gather.
+    input_gather_declared: bool = False
+    # input_move returns storage of its own on every path it takes, which a
+    # capture may keep without copying: the boundary's gather does; a stage's
+    # own gather may return a buffer it reuses.
+    input_retainable: bool = False
+    # The kernels the step tries for the sum over attention TP it completes
+    # without moving the residual.
+    ffn_fusions: Tuple[FfnInputFusion, ...] = ()
 
 
 def input_rows(edge: EdgeContract) -> Layout:
@@ -147,10 +166,18 @@ class _TransformedRead:
     transform: OutputTransform
 
     is_plain_norm = False
+    # The inner read's kernels read the stream directly and would skip the
+    # transform, so none is offered.
+    completing_fusions = ()
+    gathering_reads = ()
 
     @property
     def reads_before_dp_gather(self):
         return self.inner.reads_before_dp_gather
+
+    @property
+    def reads_after_attn_tp_gather(self):
+        return self.inner.reads_after_attn_tp_gather
 
     def init_residual(self, hidden_states):
         return self.inner.init_residual(hidden_states)
@@ -203,8 +230,6 @@ def bind_entry(
 
     Returns:
         An EntryPath whose prepare accepts the actual update from the stream.
-        Multiple update capabilities select among preconstructed paths; a single
-        capability needs no runtime dispatcher.
     """
     if edge.produced.transform is not None:
         # An attention's transform, run once its sum is complete.
@@ -216,41 +241,20 @@ def bind_entry(
             ),
             residual_joins_sum=False,
         )
-    capabilities = edge.arriving_plain_add
-    if not capabilities:
+    is_plain_add = edge.arriving_plain_add
+    if is_plain_add is None:
         if edge.produced.update is None:
-            raise ValueError("an arrival must declare its update capabilities")
-        capabilities = (edge.produced.update.is_plain_add,)
-    gather_input = (
-        attn_tp_gather_input
-        if attn_tp_gather is None
-        else partial(attn_tp_gather_input, gather=attn_tp_gather)
-    )
-    paths = {
-        capability: _bind_entry_path(
-            edge,
-            is_plain_add=capability,
-            fusions=fusions,
-            carried_fusions=carried_fusions,
-            cp_moves=cp_moves,
-            enters_stack=enters_stack,
-            attn_input_adapter=attn_input_adapter,
-            gather_input=gather_input,
-        )
-        for capability in capabilities
-    }
-    first = next(iter(paths.values()))
-    if len(paths) == 1:
-        return first
-    if any(path.input_move != first.input_move for path in paths.values()):
-        raise NotImplementedError("update capabilities require different input moves")
-    return msgspec.structs.replace(
-        first,
-        preserves_residual=None,
-        prepare=partial(
-            _dispatch_by_update,
-            paths={capability: path.prepare for capability, path in paths.items()},
-        ),
+            raise ValueError("an arrival must declare its update capability")
+        is_plain_add = edge.produced.update.is_plain_add
+    return _bind_entry_path(
+        edge,
+        is_plain_add=is_plain_add,
+        fusions=fusions,
+        carried_fusions=carried_fusions,
+        cp_moves=cp_moves,
+        enters_stack=enters_stack,
+        attn_input_adapter=attn_input_adapter,
+        attn_tp_gather=attn_tp_gather,
     )
 
 
@@ -263,7 +267,7 @@ def _bind_entry_path(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
     attn_input_adapter: Optional[Callable] = None,
-    gather_input: Callable = attn_tp_gather_input,
+    attn_tp_gather: Optional[Callable] = None,
 ) -> EntryPath:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
@@ -277,7 +281,7 @@ def _bind_entry_path(
     producer chose for a batch."""
     # A fused kernel runs the add and the norm itself.
     plain = is_plain_add and edge.need.read.is_plain_norm
-    step, input_move = _select_entry_step(
+    entry = _select_entry_step(
         edge.produced,
         residual=edge.residual,
         residual_to=edge.residual_to,
@@ -287,12 +291,12 @@ def _bind_entry_path(
         residual_joins_sum=edge.residual_joins_sum,
         cp_moves=cp_moves,
         enters_stack=enters_stack,
-        gather_input=gather_input,
+        attn_tp_gather=attn_tp_gather,
         arrives_written=edge.arrives_written,
     )
     completed_step = None
     if edge.produced.always_partial:
-        completed_step, _ = _select_entry_step(
+        completed_step = _select_entry_step(
             msgspec.structs.replace(edge.produced, always_partial=False),
             residual=edge.residual,
             residual_to=edge.residual_to,
@@ -302,12 +306,12 @@ def _bind_entry_path(
             residual_joins_sum=False,
             cp_moves=cp_moves,
             enters_stack=enters_stack,
-        )
+        ).step
     # A written stream entering the first physical layer must not run enter
     # again (e.g. MHC expansion). Both alternatives are bound at construction.
     written_step = None
     if enters_stack:
-        written_step, _ = _select_entry_step(
+        written_step = _select_entry_step(
             edge.produced,
             residual=edge.residual,
             residual_to=edge.residual_to,
@@ -317,28 +321,22 @@ def _bind_entry_path(
             residual_joins_sum=edge.residual_joins_sum,
             cp_moves=cp_moves,
             enters_stack=False,
-        )
+        ).step
     preserves_residual = None
     if (
         edge.produced.always_partial
         and edge.produced.group is SumGroup.ATTN_TP
-        and isinstance(step, partial)
-        and step.func is _reduce_update_read
-        and not step.keywords["gathers_residual"]
+        and entry.ffn_fusions
     ):
-        selected = step.keywords["fusions"]
-        if selected:
-            # Only the first reachable candidate can certify ownership; an
-            # earlier custom candidate could otherwise mutate the residual.
-            preserves_residual = next(
-                f.preserves_residual for f in fusions if f.run == selected[0]
-            )
+        # Only the first reachable candidate can certify ownership; an
+        # earlier custom candidate could otherwise mutate the residual.
+        preserves_residual = entry.ffn_fusions[0].preserves_residual
     declared_sum = edge.produced.group if edge.produced.always_partial else None
     capture_move, capture_move_allocates = _capture_move(edge)
     return EntryPath(
         prepare=partial(
             _run_entry,
-            step=step,
+            step=entry.step,
             is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
             expected_sum=declared_sum,
@@ -346,7 +344,9 @@ def _bind_entry_path(
             written_step=written_step,
         ),
         input_rows=input_rows(edge),
-        input_move=input_move,
+        input_move=entry.input_move,
+        input_gather_declared=entry.input_gather_declared,
+        input_retainable=entry.input_retainable,
         attn_input_adapter=attn_input_adapter,
         capture_move=capture_move,
         capture_move_allocates=capture_move_allocates,
@@ -376,8 +376,8 @@ def bind_exit(
         transport. The receiver binds its read independently.
     """
     update = edge.produced.update
-    if not getattr(update, "applied_at_exit", False):
-        if not getattr(update, "outlives_layer", False):
+    if not update.applied_at_exit:
+        if not update.outlives_layer:
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
@@ -404,7 +404,7 @@ def _read_fusions(read, owes, is_plain_add, *, scatters):
         return ()
     return tuple(
         f
-        for f in getattr(read, "completing_fusions", ())
+        for f in read.completing_fusions
         if f.completes is owes and f.scatters == scatters
     )
 
@@ -420,9 +420,9 @@ def _select_entry_step(
     residual_joins_sum: bool,
     cp_moves: Optional[CpMoves],
     enters_stack: bool,
-    gather_input: Callable = attn_tp_gather_input,
+    attn_tp_gather: Optional[Callable] = None,
     arrives_written: bool = False,
-) -> Tuple[Callable, Optional[Callable]]:
+) -> EntryStep:
     """The steps into a stage for a value that is complete or owes the sum its
     producer always leaves, the fused kernels they try first, and the move
     after them: complete that sum, move the residual to the rows it has while
@@ -454,7 +454,7 @@ def _select_entry_step(
         local = msgspec.structs.replace(
             produced, layout=residual_to, group=None, always_partial=False
         )
-        read_local, input_move = _select_entry_step(
+        inner = _select_entry_step(
             local,
             residual=residual,
             residual_to=residual_to,
@@ -465,11 +465,15 @@ def _select_entry_step(
             cp_moves=cp_moves,
             enters_stack=enters_stack,
         )
-        return partial(
-            _move_before_read,
-            move=cp_moves.reduce_scatter if owes is not None else cp_moves.take_back,
-            read=read_local,
-        ), input_move
+        return inner._replace(
+            step=partial(
+                _move_before_read,
+                move=cp_moves.reduce_scatter
+                if owes is not None
+                else cp_moves.take_back,
+                read=inner.step,
+            )
+        )
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
         # completes the attention-TP sum and slices in one collective; a
@@ -489,9 +493,8 @@ def _select_entry_step(
             )
         else:
             step = _attn_tp_slice_update_read
-        return (
-            partial(step, scatters_residual=residual != residual_to, read=read),
-            None,
+        return EntryStep(
+            partial(step, scatters_residual=residual != residual_to, read=read)
         )
     if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP}:
         if residual == residual_to:
@@ -499,13 +502,20 @@ def _select_entry_step(
             # rows around it (MHC on an input-scattered batch).
             if gathered or owes not in (None, SumGroup.ATTN_TP):
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
-            return (
+            parallel = get_parallel()
+            if parallel.attn_tp_size != parallel.tp_size:
+                # The step reduce-scatters over the full TP group.
+                raise NotImplementedError(
+                    "a residual kept on each rank's attention-TP slice while "
+                    "the stage takes the full rows needs attention TP to span "
+                    "the TP group"
+                )
+            return EntryStep(
                 partial(
                     _tp_reduce_scatter_update_read_gather,
                     read=read,
                     reduces=owes is not None,
-                ),
-                None,
+                )
             )
         # A reduce-scatter completes the TP sum onto each rank's slice, which
         # the stage takes: its group is the TP group without attention DP or CP.
@@ -516,20 +526,19 @@ def _select_entry_step(
             or residual_to.sharded != {TokenAxis.ATTN_TP}
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
-        return (
+        return EntryStep(
             partial(
                 _update_read,
                 pre_move=tp_reduce_scatter if owes is not None else tp_slice,
                 enters_stack=enters_stack,
                 read=read,
-            ),
-            None,
+            )
         )
     if gathered == {TokenAxis.ATTN_CP}:
         # Each CP rank completes its own chunk, then the CP moves gather them.
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {need=}")
-        on_chunk, _ = _select_entry_step(
+        on_chunk = _select_entry_step(
             produced,
             residual=residual,
             residual_to=residual_to,
@@ -539,8 +548,8 @@ def _select_entry_step(
             residual_joins_sum=residual_joins_sum,
             cp_moves=cp_moves,
             enters_stack=enters_stack,
-        )
-        return (partial(cp_moves.gather, gather=on_chunk), None)
+        ).step
+        return EntryStep(partial(cp_moves.gather, gather=on_chunk))
     if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP
         # once it is read, unless one of the read's own kernels gathers it.
@@ -550,19 +559,23 @@ def _select_entry_step(
             or residual_to != produced.layout
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
-        return (
+        return EntryStep(
             partial(
                 _update_read,
                 pre_move=None,
                 enters_stack=enters_stack,
                 read=read,
                 read_gathers=(
-                    getattr(read, "gathering_reads", ())
-                    if is_plain_add or arrives_written
-                    else ()
+                    read.gathering_reads if is_plain_add or arrives_written else ()
                 ),
             ),
-            gather_input,
+            input_move=(
+                attn_tp_gather_input
+                if attn_tp_gather is None
+                else partial(attn_tp_gather_input, gather=attn_tp_gather)
+            ),
+            input_gather_declared=attn_tp_gather is not None,
+            input_retainable=attn_tp_gather is None,
         )
     if (
         residual_to != produced.layout
@@ -581,31 +594,29 @@ def _select_entry_step(
     if not gathered:
         if owes is None:
             if gathers_residual:
-                return (
+                return EntryStep(
                     partial(
                         _reduce_update_read,
                         gathers_residual=True,
                         fusions=(),
                         group=None,
                         read=read,
-                    ),
-                    None,
+                    )
                 )
-            return (
+            return EntryStep(
                 partial(
                     _update_read,
                     pre_move=None,
                     enters_stack=enters_stack,
                     read=read,
-                ),
-                None,
+                )
             )
         if gathers_residual and residual_joins_sum:
             # Each rank adds its slice of the residual into its share of the
             # sum, so the all-reduce also brings the residual back to every row.
             if owes is not SumGroup.ATTN_TP or not is_plain_add:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
-            return (partial(_tp_sum_with_residual_read, read=read), None)
+            return EntryStep(partial(_tp_sum_with_residual_read, read=read))
         # A sum over TP completes only on rows every TP rank holds: the TP group
         # spans attention DP and CP.
         if owes not in (SumGroup.ATTN_TP, SumGroup.ATTN_CP) and (
@@ -614,7 +625,7 @@ def _select_entry_step(
             raise NotImplementedError(f"{produced=} {need=}")
         fused = tuple(f for f in fusions if f.completes is owes)
         read_fused = _read_fusions(read, owes, is_plain_add, scatters=False)
-        return (
+        return EntryStep(
             partial(
                 _reduce_update_read,
                 gathers_residual=gathers_residual,
@@ -623,7 +634,7 @@ def _select_entry_step(
                 group=owes,
                 read=read,
             ),
-            None,
+            ffn_fusions=() if gathers_residual else fused,
         )
     if owes not in (None, SumGroup.ATTN_TP, SumGroup.ATTN_CP):
         raise NotImplementedError(f"{produced=} {need=}")
@@ -640,16 +651,15 @@ def _select_entry_step(
         and is_plain_add
         and read.is_plain_norm
     ):
-        return (
+        return EntryStep(
             partial(
                 _dp_gather_sum_read,
                 gathers_residual=gathers_residual,
                 places_cp_shards=places_cp_shards,
                 read=read,
-            ),
-            None,
+            )
         )
-    return (
+    return EntryStep(
         partial(
             _reduce_update_read_dp_gather,
             gathers_residual=gathers_residual,
@@ -657,8 +667,7 @@ def _select_entry_step(
             group=owes,
             places_cp_shards=places_cp_shards,
             read=read,
-        ),
-        None,
+        )
     )
 
 
@@ -687,7 +696,8 @@ def _select_exit_move(
                     update_attn_tp_gather_output,
                     update=update,
                     gather=attn_tp_gather,
-                )
+                ),
+                gathers_attn_tp=True,
             )
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
