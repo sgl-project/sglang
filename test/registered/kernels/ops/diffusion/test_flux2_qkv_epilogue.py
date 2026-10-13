@@ -104,48 +104,20 @@ def test_flux2_qkv_epilogue_is_bit_exact(
     )
 
 
-def test_flux2_qkv_epilogue_rejects_compile() -> None:
+@pytest.mark.parametrize(
+    "guard",
+    ["torch.compiler.is_compiling", "torch.cuda.is_current_stream_capturing"],
+    ids=["compile", "capture"],
+)
+def test_flux2_qkv_epilogue_rejects_unsafe_execution(guard) -> None:
     tensor = torch.empty((1, 1, 1, HEAD_DIM), device=DEVICE, dtype=DTYPE)
     weight = torch.empty((HEAD_DIM,), device=DEVICE, dtype=DTYPE)
     cache = torch.empty((2, HEAD_DIM), device=DEVICE, dtype=torch.float32)
-    with patch("torch.compiler.is_compiling", return_value=True):
+    with patch(guard, return_value=True):
         assert (
             try_fused_flux2_qkv_epilogue(
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                weight,
-                weight,
-                weight,
-                weight,
-                cache,
-                1e-6,
-                1e-6,
-            )
-            is None
-        )
-
-
-def test_flux2_qkv_epilogue_rejects_cuda_graph_capture() -> None:
-    tensor = torch.empty((1, 1, 1, HEAD_DIM), device=DEVICE, dtype=DTYPE)
-    weight = torch.empty((HEAD_DIM,), device=DEVICE, dtype=DTYPE)
-    cache = torch.empty((2, HEAD_DIM), device=DEVICE, dtype=torch.float32)
-    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
-        assert (
-            try_fused_flux2_qkv_epilogue(
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                tensor,
-                weight,
-                weight,
-                weight,
-                weight,
+                *([tensor] * 6),
+                *([weight] * 4),
                 cache,
                 1e-6,
                 1e-6,

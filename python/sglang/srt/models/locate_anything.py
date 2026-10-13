@@ -19,6 +19,7 @@ pattern.
 """
 
 import logging
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -132,7 +133,7 @@ class LocateAnythingForConditionalGeneration(nn.Module):
         assert isinstance(image_features, list)
         return self.multi_modal_projector(torch.cat(image_features))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -199,6 +200,12 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             )
 
             if is_vision_weight:
+                # Map names from wqkv/wo -> attn.qkv_proj/attn.proj
+                # according to wrapped MoonVit's attention (VisionAttention)
+                # in python/sglang/srt/models/kimi_vl.py
+                name = name.replace("wqkv.", "attn.qkv_proj.").replace(
+                    "wo.", "attn.proj."
+                )
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:

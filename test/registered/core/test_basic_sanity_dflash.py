@@ -11,6 +11,7 @@ from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectness
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from sglang.test.kits.spec_server_kits import SpecSamplingMaskKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -29,6 +30,7 @@ class TestBasicSanityDFlash(
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
     MMLUSanityMixin,
+    SpecSamplingMaskKit,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_DFLASH

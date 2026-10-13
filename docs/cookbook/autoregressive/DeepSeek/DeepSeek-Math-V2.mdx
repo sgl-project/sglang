@@ -52,7 +52,7 @@ This section provides deployment configurations optimized for different hardware
 **DP Attention:**
 
 - Enable DP attention for high-throughput scenarios
-- The `--dp` value commonly matches the `--tp` value
+- The `--attn-dp-size` value commonly matches the `--tp` value
 - Trade-off: Higher throughput at the cost of slightly increased latency
 
 ## 4. Model Invocation
@@ -388,8 +388,13 @@ Thus for all positive \(a,b,c\) with \(abc=1\),
 **Benchmark Command:**
 
 ```shell Command
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 200 --port 30000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 

@@ -23,8 +23,10 @@ def is_longcat_image_transformer(current_model: Any, call_kwargs: dict) -> bool:
 def keep_longcat_prompt_shape(
     call_kwargs: dict, _current_model: Any, _buckets: tuple[int, ...]
 ) -> dict:
-    # LongCat always supplies the complete 512-token prompt body to its DiT.
-    # Generic bucket padding would only create larger, unused graph signatures.
+    # LongCat supplies the complete 512-token prompt body to its DiT. Editing
+    # also prepends VL image tokens, whose count depends on the input shape.
+    # Preserve this exact sequence and the corresponding txt_ids; padding
+    # would change the attention/RoPE semantics for the unmasked joint sequence.
     return call_kwargs
 
 

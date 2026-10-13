@@ -56,7 +56,7 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 
 **Additional multimodal server parameters:**
-- `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid device-to-host memory copies, improving performance for high-frequency inference.
+- `--mm-feature-transport=cuda_ipc`: Keep multimodal feature tensors in a bounded GPU pool shared over CUDA IPC to avoid device-to-host memory copies, improving performance for high-frequency inference.
 
 **Example with full multimodal optimizations:**
 ```bash Command
