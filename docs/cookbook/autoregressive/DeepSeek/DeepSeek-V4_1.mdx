@@ -329,3 +329,5 @@ sglang serve \
   --tool-call-parser auto \
   --watchdog-timeout 3600
 ```
+
+Front the server with `sglang_router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix.
