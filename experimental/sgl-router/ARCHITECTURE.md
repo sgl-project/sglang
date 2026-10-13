@@ -15,43 +15,33 @@ and routing policies. The default legacy path is outside its scope.
 
 ## 1. Overview
 
-### 1.1 Deployment
+### 1.1 Deployment Architecture
 
-The deployment has a **router** and **buckets of SGLang engines**. A bucket is a
-logical group configured in the router. It contains either one **unified**
-engine group (`plain` in configuration) or separate **prefill and decode (P/D)**
-groups. An engine is called a *worker* in configuration and code.
+A deployment consists of a **router** and **buckets of SGLang engines**. A bucket
+is a logical group defined in the router configuration. It contains either a
+**unified engine group**, where each engine handles both prefill and decode,
+or separate **prefill and decode (P/D) groups**.
 
-The example below has short-context and long-context buckets, each with prefill
-and decode engines. Each engine publishes its own load and KV events.
+The example below shows short-context and long-context buckets, each with prefill
+and decode engines.
 
 ![Router deployment with short-context and long-context P/D engine buckets](./assets/architecture-deployment.png)
 
-Solid lines carry requests, responses, or KV transfers. Dashed lines carry
-engine state back to the router.
+Each engine publishes load reports and KV events, which the router uses for
+routing. An optional [external KV indexer](sgl-kv-indexer/README.md) can supply
+prefix matches. The router also maintains session bindings and in-flight request
+counts.
 
-The router chooses a bucket, selects engines within it, and forwards the request.
-A unified engine handles both prefill and decode. In P/D, the router sends to
-both engines; prefill transfers KV directly to decode, which supplies the response.
+To serve a request, the router chooses a bucket, selects engines within it, and
+forwards the request. In P/D, it sends the request to both the prefill and decode
+engines; the prefill engine transfers KV directly to the decode engine.
 
-Engines publish two kinds of routing state:
+### 1.2 Request routing lifecycle
+Routing of a request typically goes through: preprocessing (render/tokenizing), picking a bucket, get candidate engine "scores" (load/prefix-matching or session affinity), choose engine(s), forward requests, and handle output tokens (e.g. tool parsing).
 
-| State | Communication | Router uses it for |
-| --- | --- | --- |
-| Load reports | Engine → router, ZMQ | Load ranking, admission caps, affinity balancing |
-| KV events | Engine → router, ZMQ | Tracking cached prefixes for `cache_aware` selection |
+It also considers other factors like: admission control, failure, retry etc.
 
-KV events feed a router-local prefix index. An optional
-[external KV indexer](sgl-kv-indexer/README.md) can supply prefix matches instead.
-Session bindings and in-flight request counts are maintained by the router.
-
-### 1.2 Request lifecycle
-
-Both flows use the same [bucket order](#3-buckets) and dispatch rules. The first figure shows
-a unified bucket. In P/D, select and admit both prefill and decode before dispatch
-([pairing details](#4-engine-groups)).
-
-#### Power of two
+#### Example load-aware routing
 
 Follow the main path from top to bottom. Rejection moves to the next bucket;
 a dispatch retry starts bucket selection again.
@@ -59,16 +49,17 @@ a dispatch retry starts bucket selection again.
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 30, "nodeSpacing": 30}}}%%
 flowchart TD
-    R([Request]) --> B["1. Try next compatible bucket<br/>Skip empty engine groups"]
-    B --> S["2. Sample two engines<br/>Choose the lower load"]
+    R([Request]) --> B["1. Try next compatible bucket"]
+    B --> S["2. Sample engines<br/>Choose the lower load"]
     S --> A{"3. Admission passes?"}
     A -->|yes| D["4. Dispatch<br/>Send request"]
     D -->|response or final error| E([Return to client])
-    A -->|no| N["Next bucket<br/>Repeat step 1"]
-    D -->|retry allowed| T["Exclude failed engine<br/>Restart bucket selection"]
+    A -->|no: next bucket| B
+    D -->|retry allowed| T["Exclude failed engine"]
+    T -->|restart from first bucket| B
     classDef next fill:#fff5e6,stroke:#ac762c,color:#654516;
     classDef done fill:#e8f5ef,stroke:#46826a,color:#234d3c;
-    class N,T next;
+    class T next;
     class E done;
 ```
 
@@ -78,7 +69,7 @@ error. A dispatch retry excludes the failed engine and restarts from the first
 bucket; it requires a retryable failure, remaining budget, and no response started
 ([retry details](#7-failures-and-retries)).
 
-#### Cache-aware and session-aware
+#### Example cache-aware and session-aware routing
 
 Replace steps **2–3** above with this decision tree. **A** is the admitted
 preferred engine: the best admitted prefix owner for `cache_aware`, or the bound
