@@ -1,7 +1,7 @@
 """CPU contracts shared by the full and breakable prefill attention paths."""
 
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
+from sglang.srt.model_executor.runner_utils import prefill_graph
 from sglang.srt.model_executor.runner_utils.forward_batch import (
     get_forward_batch,
     set_forward_batch,
@@ -297,6 +298,33 @@ def test_decode_bcg_without_prefill_scope_uses_backend(mode_name, sparse):
         kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
         assert layer(q, q, q, batch, **kwargs) is result
         eager.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY])
+@pytest.mark.parametrize("forbid_context_read", [False, True])
+def test_compiled_forward_without_prefill_scope_does_not_read_context(
+    mode, forbid_context_read
+):
+    class Backend:
+        def forward(self, q, k, v, layer, batch, save_kv_cache, **kwargs):
+            return q + k + v
+
+    class UnreadableContext:
+        def get(self):
+            raise AssertionError("compiled dispatch must not read prefill ContextVar")
+
+    layer = RadixAttention(1, 2, 1.0, 1, 0)
+    batch = make_batch(tokens=4)
+    batch.forward_mode = mode
+    q = torch.ones(4, 1, 2)
+    with (
+        forward_context(ForwardContext(Backend())),
+        patch.object(prefill_graph, "_current", UnreadableContext())
+        if forbid_context_read
+        else nullcontext(),
+    ):
+        compiled = torch.compile(layer, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(q, q, q, batch), q * 3)
 
 
 if __name__ == "__main__":
