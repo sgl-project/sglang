@@ -7,6 +7,15 @@
       "psnr_threshold": 15.7,
       "mean_abs_diff_threshold": 17.2
     },
+    "wan2_2_s2v_14b_2gpu": {
+      "_comment": "S2V is gated by the two differential checks, not a golden. Regions are [w, h, x, y] for the 1280x704 frame rendered from the 16:9 portrait: audio_region is the mouth and jaw, static_region the defocused street the audio must not touch. Regions are frame geometry, so they carry across hardware; the bounds do not. Measured on 4x B60 (SP=4, 4 steps, 2026-10-12) over the three key frames with only the audio swapped: audio_region 27.52 dB mean (27.41/29.71/25.44), static_region 39.94 (37.71/46.81/35.31), separation 12.42 dB and 9.90 at its worst frame; the bound is half that. frame 0 vs the conditioning image measured 23.21/22.60 dB and ssim 0.825/0.810 at 4 steps, 21.41-22.30 and 0.78-0.80 at 40.",
+      "audio_region": [260, 160, 560, 350],
+      "static_region": [420, 704, 0, 0],
+      "region_psnr_separation_min": 6.0,
+      "static_region_psnr_min": 30.0,
+      "reference_psnr_min": 18.0,
+      "reference_ssim_min": 0.60
+    },
     "fsdp-inference": {
       "clip_threshold": 0.97,
       "ssim_threshold": 0.6,
