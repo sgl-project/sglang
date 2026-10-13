@@ -14,6 +14,8 @@ register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
 causal_conv1d_weight_pack = torch.ops.sgl_kernel.causal_conv1d_weight_pack
 causal_conv1d_fwd = torch.ops.sgl_kernel.causal_conv1d_fwd_cpu
 causal_conv1d_update = torch.ops.sgl_kernel.causal_conv1d_update_cpu
+causal_conv1d_fwd_unpacked = torch.ops.sgl_kernel.causal_conv1d_fwd_unpacked_cpu
+causal_conv1d_update_unpacked = torch.ops.sgl_kernel.causal_conv1d_update_unpacked_cpu
 
 
 torch.manual_seed(1234)
@@ -323,6 +325,154 @@ class TestCausalConv1d(CustomTestCase):
         torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(
             conv_state_ref, conv_state[conv_state_indices, :], atol=atol, rtol=rtol
+        )
+
+
+def make_conv_states(num_slots, dim, width, dtype, dim_contiguous):
+    if dim_contiguous:
+        # the layout the CPU AMX mamba pool allocates
+        return torch.randn(num_slots, width - 1, dim, dtype=dtype).transpose(1, 2)
+    return torch.randn(num_slots, dim, width - 1, dtype=dtype)
+
+
+class TestCausalConv1dUnpacked(CustomTestCase):
+    @parametrize(
+        width=[2, 3, 4],
+        dim=[64, 80],
+        dtype=[torch.bfloat16, torch.float32],
+        has_bias=[True, False],
+        silu=[True, False],
+        dim_contiguous=[True, False],
+    )
+    def test_fwd_varlen(self, width, dim, dtype, has_bias, silu, dim_contiguous):
+        """Chunk boundaries, initial states (incl. seqlen < width - 1), pad slots and dim tails."""
+        seqlens = [1, 70, 2, 130, 5]
+        slots = [3, 0, PAD_SLOT_ID, 5, 1]
+        use_init = [True, True, True, False, True]
+        query_start_loc = torch.tensor(
+            [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.int32
+        )
+        x = torch.randn(sum(seqlens), dim, dtype=dtype).t()
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype) if has_bias else None
+        states = make_conv_states(7, dim, width, dtype, dim_contiguous)
+        states_before = states.clone()
+
+        out = causal_conv1d_fwd_unpacked(
+            x,
+            weight,
+            bias,
+            states,
+            query_start_loc,
+            torch.tensor(slots, dtype=torch.int32),
+            torch.tensor(use_init),
+            silu,
+            PAD_SLOT_ID,
+        )
+
+        # fast_silu is accurate to ~3e-5 relative, looser than the fp32 default
+        atol = rtol = max(precision[dtype], 1e-4)
+        activation = "silu" if silu else None
+        for i, slot in enumerate(slots):
+            if slot == PAD_SLOT_ID:
+                continue
+            start, end = query_start_loc[i].item(), query_start_loc[i + 1].item()
+            out_ref, state_ref = causal_conv1d_ref(
+                x[:, start:end].unsqueeze(0),
+                weight,
+                bias,
+                initial_states=(
+                    states_before[slot].unsqueeze(0) if use_init[i] else None
+                ),
+                return_final_states=True,
+                activation=activation,
+            )
+            torch.testing.assert_close(
+                out[:, start:end], out_ref.squeeze(0), atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(states[slot], state_ref.squeeze(0))
+
+        for slot in (2, 4, 6):
+            torch.testing.assert_close(states[slot], states_before[slot])
+
+    @parametrize(
+        width=[2, 3, 4],
+        dim=[64, 80],
+        has_bias=[True, False],
+        dim_contiguous=[True, False],
+    )
+    def test_update(self, width, dim, has_bias, dim_contiguous, dtype=torch.bfloat16):
+        slots = [4, PAD_SLOT_ID, 0, 2]
+        x = torch.randn(len(slots), dim, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype) if has_bias else None
+        states = make_conv_states(6, dim, width, dtype, dim_contiguous)
+        states_before = states.clone()
+
+        out = causal_conv1d_update_unpacked(
+            x,
+            states,
+            weight,
+            bias,
+            True,
+            torch.tensor(slots, dtype=torch.int32),
+            PAD_SLOT_ID,
+        )
+
+        atol = rtol = precision[dtype]
+        for i, slot in enumerate(slots):
+            if slot == PAD_SLOT_ID:
+                self.assertEqual(out[i].abs().max().item(), 0.0)
+                continue
+            state_ref = states_before[slot].clone().unsqueeze(0)
+            out_ref = causal_conv1d_update_ref(
+                x[i : i + 1], state_ref, weight, bias, activation="silu"
+            )
+            torch.testing.assert_close(out[i], out_ref[0], atol=atol, rtol=rtol)
+            torch.testing.assert_close(states[slot], state_ref[0])
+
+        for slot in (1, 3, 5):
+            torch.testing.assert_close(states[slot], states_before[slot])
+
+    def test_prefill_then_decode_matches_full_sequence(
+        self, width=3, dim=64, seqlen=37, n_decode=4, dtype=torch.bfloat16
+    ):
+        """Prefill then token-by-token decode must equal one full-sequence conv."""
+        x_full = torch.randn(seqlen + n_decode, dim, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        states = make_conv_states(2, dim, width, dtype, dim_contiguous=True)
+        slot = torch.tensor([1], dtype=torch.int32)
+
+        outs = [
+            causal_conv1d_fwd_unpacked(
+                x_full[:seqlen].t(),
+                weight,
+                None,
+                states,
+                torch.tensor([0, seqlen], dtype=torch.int32),
+                slot,
+                torch.tensor([False]),
+                False,
+                PAD_SLOT_ID,
+            ).t()
+        ]
+        for t in range(seqlen, seqlen + n_decode):
+            outs.append(
+                causal_conv1d_update_unpacked(
+                    x_full[t : t + 1].contiguous(),
+                    states,
+                    weight,
+                    None,
+                    False,
+                    slot,
+                    PAD_SLOT_ID,
+                )
+            )
+
+        out_ref, _ = causal_conv1d_ref(x_full.t().unsqueeze(0), weight, activation=None)
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(
+            torch.cat(outs), out_ref.squeeze(0).t(), atol=atol, rtol=rtol
         )
 
 

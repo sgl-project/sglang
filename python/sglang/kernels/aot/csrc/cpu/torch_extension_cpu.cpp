@@ -488,6 +488,17 @@ at::Tensor causal_conv1d_fwd_cpu(
     int64_t pad_slot_id,
     bool is_vnni);
 
+at::Tensor causal_conv1d_fwd_unpacked_cpu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const at::Tensor& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
 at::Tensor causal_conv1d_update_cpu(
     const at::Tensor& x,
     const at::Tensor& conv_states,
@@ -498,6 +509,15 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+at::Tensor causal_conv1d_update_unpacked_cpu(
+    const at::Tensor& x,
+    const at::Tensor& conv_states,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id);
 #endif
 
 // conv3d fast path for patch embedding
@@ -937,9 +957,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
 
   m.def(
+      "causal_conv1d_fwd_unpacked_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor(a!)? conv_states, "
+      "Tensor query_start_loc, Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, "
+      "int pad_slot_id) -> Tensor");
+  m.impl("causal_conv1d_fwd_unpacked_cpu", torch::kCPU, &causal_conv1d_fwd_unpacked_cpu);
+
+  m.def(
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  m.def(
+      "causal_conv1d_update_unpacked_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, "
+      "bool silu_activation, Tensor? conv_state_indices, int pad_slot_id) -> Tensor");
+  m.impl("causal_conv1d_update_unpacked_cpu", torch::kCPU, &causal_conv1d_update_unpacked_cpu);
 #endif
 
   // conv3d fast path for patch embedding
