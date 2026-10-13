@@ -714,6 +714,9 @@ class QSAIndexer(MultiPlatformOp):
         static_buffers=None,
     ) -> torch.Tensor:
         row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
+        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without
+        # reading their scores, and never reads past a row's length.
+        use_fast_topk = q.is_cuda and self.block_topk == 512
         with torch.profiler.record_function("qsa.local_scan"):
             logits = qsa_mqa_decode(
                 q,
@@ -721,8 +724,9 @@ class QSAIndexer(MultiPlatformOp):
                 compressed_page_table,
                 compressed_lengths,
                 max_model_len,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
             )
-        if logits.is_cuda and self.block_topk == 512:
+        if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk

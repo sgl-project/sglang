@@ -7,7 +7,9 @@ import torch
 
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
+    DraftParams,
     draft_markov_block,
+    resolve_draft_params,
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
@@ -29,7 +31,6 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
-        confidence_fn=None,
         out=None,
     ):
         self.model = model
@@ -46,55 +47,47 @@ class DsparkDraftSampler:
             self.out = torch.empty(
                 (self.max_bs * self.gamma,), dtype=torch.int64, device=device
             )
-        self.confidence_fn = confidence_fn
-        self.confidence_out = (
-            torch.empty((self.max_bs, self.gamma), dtype=torch.float32, device=device)
-            if confidence_fn is not None
-            else None
-        )
+        confidence_head = model.confidence_head
+        if confidence_head is None:
+            self.confidence_out = self.confidence_raw_out = None
+        else:
+            self.confidence_out = torch.empty(
+                (self.max_bs, self.gamma), dtype=torch.float32, device=device
+            )
+            self.confidence_raw_out = torch.empty(
+                (self.max_bs, self.gamma),
+                dtype=confidence_head.proj.weight.dtype,
+                device=device,
+            )
         self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
-        # Staged before each replay; step_temperatures is 0 on argmax rows.
-        self.temperatures = torch.ones(
-            (self.max_bs,), dtype=torch.float32, device=device
+        # Staged before each replay.
+        self.params = DraftParams(
+            temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
+            greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),
+            step_temperatures=torch.zeros(
+                (self.max_bs,), dtype=torch.float32, device=device
+            ),
         )
-        self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
-        self.step_temperatures = torch.zeros(
-            (self.max_bs,), dtype=torch.float32, device=device
-        )
-        self._zero = torch.zeros((), dtype=torch.float32, device=device)
-        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
-        # draft keeps none.
-        self.step_logits = (
-            None
-            if greedy_draft
-            else torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(model)),
-                dtype=_step_logits_dtype(model),
-                device=device,
+        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
+        # the first call; a greedy draft keeps none.
+        self.step_logits: Optional[torch.Tensor] = None
+
+    def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
+        if self.step_logits is None:
+            # The runner's warmup calls the tail eagerly before capture.
+            assert not torch.cuda.is_current_stream_capturing()
+            self.step_logits = torch.empty(
+                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
+                device=base_logits.device,
             )
-        )
+        return self.step_logits
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
-        if sampling_info is None:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            self.step_temperatures[:bs].zero_()
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
-        torch.where(
-            self.greedy_mask[:bs],
-            self._zero,
-            self.temperatures[:bs],
-            out=self.step_temperatures[:bs],
-        )
+        resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -107,7 +100,7 @@ class DsparkDraftSampler:
                 bs=bs,
                 gamma=self.gamma,
             )
-        base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
+        base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
@@ -116,36 +109,28 @@ class DsparkDraftSampler:
             base_logits=base_logits,
             anchor_tokens=anchor,
             draft_hidden=sample_hidden,
-            step_temperatures=self.step_temperatures[:bs],
+            step_temperatures=self.params.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            logits_out=None if self.greedy_draft else self.step_logits[:bs],
+            logits_out=None
+            if self.greedy_draft
+            else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
-            confidence = self.confidence_fn(
-                draft_hidden=sample_hidden,
+            confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
-                confidence_tap=confidence_tap,
+                confidence_features=confidence_features,
             )
             self.confidence_out[:bs].copy_(confidence)
+            self.confidence_raw_out[:bs].copy_(confidence_raw)
 
 
 def _step_logits_width(model) -> int:
     # Unsharded base logits span the cropped vocab.
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
-
-
-def _step_logits_dtype(model) -> torch.dtype:
-    # A quantized head's packed weight has no logits dtype; it emits the draft's.
-    weight = model.lm_head.weight
-    if weight.is_floating_point():
-        base_dtype = weight.dtype
-    else:
-        base_dtype = next(model.markov_head.parameters()).dtype
-    return model.markov_head.step_logits_dtype(base_dtype)
 
 
 def maybe_build_draft_sampler(
@@ -158,7 +143,6 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
-    confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -186,6 +170,5 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
-        confidence_fn=confidence_fn,
         out=out,
     )

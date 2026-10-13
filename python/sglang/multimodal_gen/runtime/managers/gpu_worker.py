@@ -189,7 +189,9 @@ def _bind_worker_to_gpu_numa_node(
         numa_bind_to_node,
     )
 
-    numa_node = get_numa_node_if_available(server_args, local_rank)
+    # Pods without SYS_NICE cannot set memory policy; CPU affinity alone still
+    # removes the cross-socket drift (FLUX.1 TP2 on GB300: spread 26-60% -> 6-8%).
+    numa_node = get_numa_node_if_available(server_args, local_rank, cpu_only_ok=True)
     if numa_node is not None:
         numa_bind_to_node(numa_node)
         logger.info("GPU %d worker bound to NUMA node %d", local_rank, numa_node)

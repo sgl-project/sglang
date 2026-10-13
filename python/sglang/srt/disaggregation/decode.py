@@ -90,7 +90,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     discard_kv_cache_backup,
-    dsv41_dspark_needs_rebootstrap,
+    dsv4_needs_rebootstrap,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
@@ -800,9 +800,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
-        if is_retracted and dsv41_dspark_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
-        ):
+        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             if req.output_ids:
                 req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
             req.pd_rebootstrap_in_progress = True
@@ -1083,9 +1081,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Deferred allocation cannot precede the recompute that makes its
             # source ready. Keep the existing leader election and error path.
             if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
-                )
+                self._submit_prefill_recompute(decode_req)
+
+    def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
+        # A fake transfer has no prefill; its receiver completes once metadata is sent.
+        if _is_fake_transfer(decode_req.req):
+            return
+        self.kv_manager.submit_prefill_recompute(
+            decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+        )
 
     def _update_handshake_waiters(
         self,
@@ -1801,10 +1805,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
         ):
-            self.kv_manager.submit_prefill_recompute(
-                decode_req.kv_receiver,
-                decode_req.req.build_rebootstrap_payload(),
-            )
+            self._submit_prefill_recompute(decode_req)
         self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
