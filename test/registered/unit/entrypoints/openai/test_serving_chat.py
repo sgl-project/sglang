@@ -14,6 +14,7 @@ import asyncio
 import copy
 import gc
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
@@ -42,7 +43,11 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    neutralize_legacy_image_sentinel,
+    neutralize_legacy_image_sentinel_in_messages,
+    neutralize_legacy_image_sentinel_value,
     normalize_tool_content,
+    processor_counts_legacy_image_sentinel,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -6186,6 +6191,152 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class _MmTokens:
+    """Minimal stand-in for MultimodalSpecialTokens (built from a real processor)."""
+
+    def __init__(self, image_token, image_token_regex):
+        self.image_token = image_token
+        self.image_token_regex = image_token_regex
+
+
+class _MmProcessor:
+    def __init__(self, mm_tokens=None):
+        self.mm_tokens = mm_tokens
+
+
+class TestNeutralizeLegacyImageSentinel(unittest.TestCase):
+    """Unit tests for the legacy "<image>" sentinel neutralization.
+
+    A bare "<image>" in message text must not reach the chat template when the
+    multimodal processor counts it as a placeholder while splitting the rendered prompt,
+    so a literal occurrence would be counted against the real media and fail the request
+    with "Mismatch: More 'IMAGE' tokens found than corresponding data provided".
+    """
+
+    NATIVE_QWEN = "<|vision_start|><|image_pad|><|vision_end|>"
+    # The image_token_regex of QwenVLImageProcessor (multimodal/processors/qwen_vl.py).
+    QWEN_REGEX = re.compile(
+        r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+    )
+
+    def _qwen_processor(self):
+        return _MmProcessor(_MmTokens(self.NATIVE_QWEN, self.QWEN_REGEX))
+
+    def test_gate_follows_the_processor_not_a_model_type(self):
+        self.assertTrue(processor_counts_legacy_image_sentinel(self._qwen_processor()))
+        # Subclasses of QwenVLImageProcessor inherit this regex, whatever their model
+        # type; so does a processor that registers the sentinel itself.
+        self.assertTrue(
+            processor_counts_legacy_image_sentinel(
+                _MmProcessor(_MmTokens("native", re.compile(r"native|<image>")))
+            )
+        )
+
+    def test_llava_style_processor_is_not_gated(self):
+        # There "<image>" is the native placeholder and the client-facing contract: real
+        # media renders as "<image>" too, so rewriting the text would drop media.
+        processor = _MmProcessor(_MmTokens("<image>", re.compile(re.escape("<image>"))))
+        self.assertFalse(processor_counts_legacy_image_sentinel(processor))
+        processor = _MmProcessor(_MmTokens(["<image>"], re.compile(r"<image>")))
+        self.assertFalse(processor_counts_legacy_image_sentinel(processor))
+
+    def test_processor_without_the_sentinel_is_not_gated(self):
+        # PaddleOCR-VL overrides mm_tokens with its own placeholder only.
+        processor = _MmProcessor(
+            _MmTokens(
+                "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
+                re.compile(r"<\|IMAGE_START\|><\|IMAGE_PLACEHOLDER\|><\|IMAGE_END\|>"),
+            )
+        )
+        self.assertFalse(processor_counts_legacy_image_sentinel(processor))
+
+    def test_missing_processor_data_is_not_gated(self):
+        for processor in (
+            None,
+            object(),
+            _MmProcessor(),
+            _MmProcessor(_MmTokens("x", None)),
+        ):
+            with self.subTest(processor=processor):
+                self.assertFalse(processor_counts_legacy_image_sentinel(processor))
+
+    def test_neutralized_sentinel_no_longer_matches(self):
+        text = "see <image> here"
+        self.assertIsNotNone(self.QWEN_REGEX.search(text))
+        self.assertIsNone(
+            self.QWEN_REGEX.search(neutralize_legacy_image_sentinel(text))
+        )
+
+    def test_text_replacement(self):
+        self.assertEqual(
+            neutralize_legacy_image_sentinel("see <image> here"), "see < image > here"
+        )
+        self.assertEqual(neutralize_legacy_image_sentinel("plain text"), "plain text")
+
+    def test_native_placeholder_untouched(self):
+        self.assertEqual(
+            neutralize_legacy_image_sentinel(self.NATIVE_QWEN), self.NATIVE_QWEN
+        )
+
+    def test_string_content_neutralized_without_mutating_input(self):
+        messages = [{"role": "user", "content": "a <image> b"}]
+        out = neutralize_legacy_image_sentinel_in_messages(messages)
+        self.assertEqual(out[0]["content"], "a < image > b")
+        self.assertEqual(messages[0]["content"], "a <image> b")
+
+    def test_text_parts_neutralized_media_parts_preserved(self):
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "look at <image>"}, image_part],
+            }
+        ]
+        out = neutralize_legacy_image_sentinel_in_messages(messages)
+        content = out[0]["content"]
+        self.assertEqual(content[0]["text"], "look at < image >")
+        self.assertEqual(content[1], image_part)
+
+    def test_reasoning_content_neutralized(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "reasoning_content": "about <image>",
+            }
+        ]
+        out = neutralize_legacy_image_sentinel_in_messages(messages)
+        self.assertEqual(out[0]["reasoning_content"], "about < image >")
+
+    def test_tool_call_arguments_neutralized_without_mutating_input(self):
+        tool_call = {
+            "id": "c1",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"content": "page says <image>"}',
+            },
+        }
+        messages = [{"role": "assistant", "content": "", "tool_calls": [tool_call]}]
+        out = neutralize_legacy_image_sentinel_in_messages(messages)
+        arguments = out[0]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(json.loads(arguments), {"content": "page says < image >"})
+        self.assertEqual(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            '{"content": "page says <image>"}',
+        )
+
+    def test_value_helper_walks_nested_structures(self):
+        value = {"a": ["<image>", {"b": "<image>"}]}
+        self.assertEqual(
+            neutralize_legacy_image_sentinel_value(value),
+            {"a": ["< image >", {"b": "< image >"}]},
+        )
 
 
 if __name__ == "__main__":

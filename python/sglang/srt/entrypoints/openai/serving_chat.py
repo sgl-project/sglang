@@ -401,6 +401,109 @@ def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     request.chat_template_kwargs = template_kwargs
 
 
+# The legacy sglang /generate sentinel. Some multimodal processors register it as an
+# alternative inside `image_token_regex` next to the native placeholder their chat
+# template emits (QwenVLImageProcessor and the processors deriving from it), and the
+# processor reuses that regex to split and count the rendered prompt. The chat template
+# only ever emits the native "<|vision_start|><|image_pad|><|vision_end|>" placeholder,
+# so in the chat path a bare "<image>" in message text (e.g. fetched web content; GitHub
+# renders screenshots as "<image>") is counted as an extra image placeholder and aborts
+# the request with "Mismatch: More 'IMAGE' tokens found than corresponding data
+# provided" (HTTP 500). Neutralize it in message text before rendering, like the Kimi K3
+# handling above.
+LEGACY_IMAGE_SENTINEL = "<image>"
+LEGACY_IMAGE_SENTINEL_NEUTRALIZED = "< image >"
+
+
+def processor_counts_legacy_image_sentinel(mm_processor: Any) -> bool:
+    """Whether `mm_processor` counts a bare "<image>" in the rendered prompt as media.
+
+    Read from the processor rather than a model-type list: the processors that inherit
+    QwenVLImageProcessor (InternS1.1, POINTS-v1.5, ...) reuse its regex and keep their
+    own model types, and new ones keep appearing. Processors whose native placeholder is
+    itself "<image>" (LLaVA-style) are excluded, because there the sentinel is the
+    client-facing contract and the template emits it for real media too.
+    """
+    mm_tokens = getattr(mm_processor, "mm_tokens", None)
+    image_token_regex = getattr(mm_tokens, "image_token_regex", None)
+    if image_token_regex is None:
+        return False
+    native = getattr(mm_tokens, "image_token", None)
+    if native == LEGACY_IMAGE_SENTINEL or (
+        isinstance(native, (list, tuple)) and LEGACY_IMAGE_SENTINEL in native
+    ):
+        return False
+    return image_token_regex.fullmatch(LEGACY_IMAGE_SENTINEL) is not None
+
+
+def neutralize_legacy_image_sentinel(text: str) -> str:
+    return text.replace(LEGACY_IMAGE_SENTINEL, LEGACY_IMAGE_SENTINEL_NEUTRALIZED)
+
+
+def neutralize_legacy_image_sentinel_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return neutralize_legacy_image_sentinel(value)
+    if isinstance(value, list):
+        return [neutralize_legacy_image_sentinel_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: neutralize_legacy_image_sentinel_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def neutralize_legacy_image_sentinel_in_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Neutralize the bare legacy "<image>" sentinel in message *text* only.
+
+    Structured media parts (``{"type": "image_url", ...}``) are left untouched, so real
+    media still renders as the template's native placeholder and pairing is unaffected.
+    """
+    neutralized: list[dict[str, Any]] = []
+    for message in messages:
+        message = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = neutralize_legacy_image_sentinel(content)
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "text",
+                    "input_text",
+                ):
+                    part = dict(part)
+                    if isinstance(part.get("text"), str):
+                        part["text"] = neutralize_legacy_image_sentinel(part["text"])
+                parts.append(part)
+            message["content"] = parts
+        for key in ("reasoning_content", "reasoning"):
+            if key in message:
+                message[key] = neutralize_legacy_image_sentinel_value(message[key])
+        # Tool-call arguments are rendered into the prompt as text as well; agent
+        # clients put fetched page content there too.
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            copied_calls = []
+            for tool_call in tool_calls:
+                if isinstance(tool_call, dict):
+                    tool_call = dict(tool_call)
+                    function = tool_call.get("function")
+                    if isinstance(function, dict):
+                        function = dict(function)
+                        if isinstance(function.get("arguments"), str):
+                            function["arguments"] = neutralize_legacy_image_sentinel(
+                                function["arguments"]
+                            )
+                        tool_call["function"] = function
+                copied_calls.append(tool_call)
+            message["tool_calls"] = copied_calls
+        neutralized.append(message)
+    return neutralized
+
+
 def _extract_video_question(request: ChatCompletionRequest) -> str | None:
     """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
@@ -502,6 +605,12 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type
             == "minimax_m3_vl"
+        )
+        # A literal "<image>" in message text must be neutralized before the chat
+        # template is rendered when the multimodal processor would count it as an image
+        # placeholder (see processor_counts_legacy_image_sentinel).
+        self.neutralizes_legacy_image_sentinel = processor_counts_legacy_image_sentinel(
+            getattr(self.tokenizer_manager, "mm_processor", None)
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
@@ -2133,6 +2242,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 normalize_assistant_tool_call_arguments(
                     message, strict=strict_tool_call_arguments
                 )
+
+        # Only when the multimodal processor counts a bare "<image>" in the rendered
+        # prompt as media: a literal occurrence in message text would then be miscounted
+        # against the real media and fail the request. Text and structured media parts
+        # are still unambiguous here, so neutralize text only.
+        if self.neutralizes_legacy_image_sentinel:
+            messages = neutralize_legacy_image_sentinel_in_messages(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
