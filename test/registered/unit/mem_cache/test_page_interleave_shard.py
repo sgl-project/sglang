@@ -1741,7 +1741,7 @@ def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
 
 def _run_zero_sm_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
-    assert pool._zero_sm_gather and pool._scratch_window_registered
+    assert pool._use_symmetric_scratch and pool._scratch_window_registered
 
     # NCCL picks copy engines per collective, so a windowed gather can still
     # land on ring or symmetric SM kernels; only the launched work tells.
@@ -1778,7 +1778,7 @@ def _run_cross_node_mla(rank, world, port):
         lambda pg, source_rank: [r == source_rank for r in range(world)],
     ):
         pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
-    assert not pool._zero_sm_gather and not pool._scratch_window_registered
+    assert not pool._use_symmetric_scratch and not pool._scratch_window_registered
     activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     assert any("nccl" in name.lower() for name in activity)
 
@@ -1793,9 +1793,10 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         the pool and every scratch view are gone."""
         if torch.cuda.nccl.version() < (2, 28, 0):
             self.skipTest("copy-engine collectives need NCCL >= 2.28")
-        # Without cuMem NCCL returns a NULL window; the ranks inherit both.
+        # Fresh workers inherit the policy before NCCL initializes, and cuMem
+        # enables symmetric window registration.
         with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1"),
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY="2"),
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
         ):
             mp.spawn(
@@ -1809,7 +1810,7 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         """A shard group spanning nodes keeps the torch scratch and the SM
         allgather, even with cuMem on."""
         with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1"),
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY="2"),
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
         ):
             mp.spawn(

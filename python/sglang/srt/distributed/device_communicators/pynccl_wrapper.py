@@ -88,9 +88,6 @@ NCCL_API_MAGIC = 0xCAFEBEEF
 # from nccl.h.in.
 NCCL_CONFIG_VERSION = 23000  # NCCL_VERSION(2, 30, 0)
 
-# ncclConfig_t.CTAPolicy: run eligible collectives without SMs (copy engines).
-NCCL_CTA_POLICY_ZERO = 0x02
-
 
 class ncclConfig_t(ctypes.Structure):
     """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.

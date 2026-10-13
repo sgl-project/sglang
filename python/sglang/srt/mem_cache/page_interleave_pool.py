@@ -30,12 +30,13 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   rank sends its own prefix pages in local-page order, padded to
   ``ceil(prefix_pages / N)`` pages with the (never referenced) trash page —
   a *regular* in-place allgather, owner-major output, no reorder pass.
-- Zero-SM gather (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``, single-node shard
-  groups): the communicator runs with ``NCCL_CTA_POLICY_ZERO`` and both slots
-  are carved out of one ``ncclMemAlloc`` buffer registered as a symmetric
-  window, so NCCL runs the allgather on copy engines. Every rank carves the
-  same offsets, because CE addresses a peer's buffer by the local offset into
-  the window.
+- Symmetric gather scratch (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``,
+  single-node shard groups): both slots are carved out of one ``ncclMemAlloc``
+  buffer registered as a symmetric window. Every rank carves the same offsets,
+  because CE addresses a peer's buffer by the local offset into the window.
+  Set ``NCCL_CTA_POLICY=2`` before launching SGLang to request copy engines
+  (zero SMs) for eligible collectives on all NCCL communicators, including
+  the dedicated gather communicator.
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
   write; MLA latent is replicated across the shard group at write time).
@@ -70,10 +71,7 @@ from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicato
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
-    NCCL_CTA_POLICY_ZERO,
-    NCCLLibrary,
-)
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
@@ -104,11 +102,11 @@ _TensorSpec = Tuple[Tuple[int, ...], torch.dtype]
 _NUM_SCRATCH_SLOTS = 2
 # NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h; every slot tensor starts on it.
 _SCRATCH_ALIGN_BYTES = 4096
-# NCCL 2.28 added copy-engine collectives (NCCL_CTA_POLICY_ZERO).
+# NCCL 2.28 added copy-engine collectives.
 _NCCL_CE_COLLECTIVES_MIN_VERSION = 22800
 
 
-def _zero_sm_gather_supported(
+def _symmetric_scratch_supported(
     *, memory_saver_enabled: bool, custom_mem_pool, shard_group: GroupCoordinator
 ) -> bool:
     """Collective over ``shard_group``: every rank returns the same verdict."""
@@ -200,7 +198,7 @@ class PageInterleaveKVPoolMixin:
         self.shard_size = spec.shard_size
         self.device_module = torch.get_device_module(self.device)
 
-        self._zero_sm_gather = _zero_sm_gather_supported(
+        self._use_symmetric_scratch = _symmetric_scratch_supported(
             memory_saver_enabled=self.memory_saver_adapter.enabled,
             custom_mem_pool=self.custom_mem_pool,
             shard_group=shard_group,
@@ -208,9 +206,7 @@ class PageInterleaveKVPoolMixin:
         # Dedicated communicator + stream so the layer-ahead gathers never
         # interleave with the group's main collectives.
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
-            group=shard_group.cpu_group,
-            device=shard_group.device,
-            cta_policy=NCCL_CTA_POLICY_ZERO if self._zero_sm_gather else None,
+            group=shard_group.cpu_group, device=shard_group.device
         )
         self.kv_gather_stream = self.device_module.Stream()
 
@@ -258,7 +254,7 @@ class PageInterleaveKVPoolMixin:
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
             "page_size=%d prefix_tokens=%d chunk_tokens=%d scratch_rows=%d x2 "
             "(%.2f MiB per rank, charged against the KV budget), "
-            "prefix gather on %s. "
+            "NCCL symmetric scratch=%s. "
             "Batch admission is limited by this scratch capacity.",
             self.shard_rank,
             self.shard_size,
@@ -267,7 +263,7 @@ class PageInterleaveKVPoolMixin:
             spec.chunk_tokens,
             scratch_rows,
             scratch_bytes / (1024 * 1024),
-            "copy engines" if self._scratch_window_registered else "SM kernels",
+            self._scratch_window_registered,
         )
 
     @contextmanager
@@ -283,7 +279,7 @@ class PageInterleaveKVPoolMixin:
     def _alloc_scratch(self, rows: int) -> Tuple[List[Dict[str, torch.Tensor]], bool]:
         """Every slot's tensors, and whether they sit in a symmetric window."""
         specs = self._scratch_tensor_specs(rows)
-        if self._zero_sm_gather:
+        if self._use_symmetric_scratch:
             return self._alloc_symmetric_scratch(specs)
         with self._torch_alloc_context():
             slots = [

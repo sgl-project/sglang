@@ -2799,7 +2799,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-kv-cache-sharding`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shard at-rest KV cache storage at page granularity across the group that currently replicates it (attention-CP ranks for GQA models under prefill CP; attention-TP ranks for MLA models), multiplying the group's unique KV capacity. Prefill workers of PD disaggregation only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shard at-rest KV cache storage at page granularity across the group that currently replicates it (attention-CP ranks for GQA models under prefill CP; attention-TP ranks for MLA models), multiplying the group's unique KV capacity. Prefill workers of PD disaggregation only. With NCCL 2.28 or newer and supported NVIDIA CUDA hardware, set <code>NCCL_CTA_POLICY=2</code> at launch to request copy-engine prefix all-gather for eligible single-node shard groups. This policy applies to all NCCL communicators in the process.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
