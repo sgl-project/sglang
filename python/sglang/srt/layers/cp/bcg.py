@@ -53,7 +53,6 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
     tuple[ContextParallelStrategyKind, CPAttentionBackendKind]
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
-    (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSV4),
 }
 
 
