@@ -17,6 +17,7 @@ import asyncio
 import pickle
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -30,7 +31,12 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,6 +69,28 @@ class TestMmHashesContract(CustomTestCase):
         for req in (single, batch):
             with self.assertRaises(ValueError):
                 req.normalize_batch_and_arguments()
+
+    def test_tokenized_request_carries_mm_hashes_to_scheduler(self):
+        """With zmq_to_scheduler or mooncake the scheduler builds mm_inputs, so
+        the tokenized request must carry mm_hashes to it."""
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=32)
+        req = GenerateReqInput(text="one", image_data=["a"], mm_hashes=["00c0ffee"])
+        req.normalize_batch_and_arguments()
+        manager.rid_to_state = {
+            req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+        }
+
+        tokenized = manager._create_tokenized_object(
+            obj=req, input_text="one", input_ids=[1, 2]
+        )
+
+        self.assertEqual(tokenized.mm_hashes, ["00c0ffee"])
 
     def test_set_pad_value_honors_preset_hash(self):
         """set_pad_value() must use a pre-set hash without recomputing."""

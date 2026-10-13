@@ -957,13 +957,8 @@ def hash_feature(f):
 def apply_caller_mm_hashes(
     mm_inputs: MultimodalProcessorOutput, mm_hashes: Optional[List[str]]
 ) -> None:
-    """Seed item hashes from caller-supplied hex hashes, one per item.
-
-    External KV routers hash each image before dispatch. A preset hash skips
-    hash_feature() in set_pad_value(), so the pad value, and with it the
-    prefix-cache key, follows the router's hash. On a length mismatch or a
-    non-hex entry the item keeps hash_feature().
-    """
+    """Seed item.hash from caller hex hashes so set_pad_value() derives pad_value
+    from them. A length mismatch or a non-hex entry keeps hash_feature()."""
     mm_items = mm_inputs.mm_items
     if not mm_hashes or not mm_items:
         return

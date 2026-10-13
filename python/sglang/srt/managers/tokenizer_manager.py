@@ -1241,7 +1241,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
             if mm_inputs and isinstance(obj, GenerateReqInput):
-                apply_caller_mm_hashes(mm_inputs, obj.mm_hashes)
+                apply_caller_mm_hashes(mm_inputs=mm_inputs, mm_hashes=obj.mm_hashes)
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
