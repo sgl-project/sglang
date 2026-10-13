@@ -216,6 +216,7 @@ python3 -m sglang.bench_serving \
 - `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
+- `--insecure`: disable TLS certificate verification (for servers with self-signed certificates or an internal CA)
 
 ### Authentication
 
@@ -473,6 +474,7 @@ The `--fake-prefill` flag automatically injects special sentinel values into eac
 - Token counts look odd: prefer chat/instruct models with proper chat templates; otherwise tokenization of gibberish may be inconsistent.
 - Image/MMMU datasets: ensure you installed extra deps (`pillow`, `datasets`, `pybase64`).
 - Authentication errors (401/403): set `OPENAI_API_KEY` or disable auth on your server.
+- SSL certificate verification errors (e.g., self-signed certificates or internal CA): use `--insecure` to disable SSL verification, or set the `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` environment variable to your custom CA bundle.
 
 ### Notes
 

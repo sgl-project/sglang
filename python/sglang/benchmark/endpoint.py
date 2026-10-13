@@ -26,14 +26,19 @@ DEFAULT_TIMEOUT = 600
 _SERVER_ARGS_DEFAULTS = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
 
 
-def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
+def server_is_up(
+    base_url: str, timeout: float = DEFAULT_TIMEOUT, verify_ssl: bool = True
+) -> bool:
     """Return True if a server answers /v1/models with 200 at base_url."""
     try:
         headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
         response = requests.get(
-            f"{base_url}/v1/models", headers=headers, timeout=timeout
+            f"{base_url}/v1/models",
+            headers=headers,
+            timeout=timeout,
+            verify=verify_ssl,
         )
         return response.status_code == 200
     except requests.RequestException:
@@ -49,7 +54,9 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
         kill_process_tree(os.getpid(), include_parent=False)
 
 
-def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
+def launch_or_reuse_server(
+    launch_server_func: Callable, server_args: ServerArgs, verify_ssl: bool = True
+):
     # Resolving probes the device: the default attention backend reads the CUDA
     # capability, and XPU reads mem_get_info. This process owns a live context after.
     server_args.resolve_once()
@@ -58,7 +65,7 @@ def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs
 
     # Reuse an already-running server instead of launching a second one onto the
     # occupied port, where it would orphan, compete for the GPU, and OOM.
-    if server_is_up(base_url, timeout=5):
+    if server_is_up(base_url, timeout=5, verify_ssl=verify_ssl):
         print(
             f"WARNING: reusing the server already running at {base_url} "
             f"(--model and server-launch args ignored). Pass --base-url to silence."
@@ -84,7 +91,7 @@ def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs
                 f"Server process exited during startup (exit code "
                 f"{proc.exitcode}); see the traceback above for the cause."
             )
-        if server_is_up(base_url):
+        if server_is_up(base_url, verify_ssl=verify_ssl):
             return proc, base_url
         time.sleep(10)
 
@@ -113,6 +120,7 @@ def acquire_endpoint(
     server_args: ServerArgs,
     base_url: str = "",
     launch_server_func: Callable = launch_server,
+    verify_ssl: bool = True,
 ) -> BenchEndpoint:
     """Resolve the benchmark target -- the single launch-vs-connect decision.
 
@@ -132,5 +140,7 @@ def acquire_endpoint(
             )
         return BenchEndpoint(base_url=base_url)
 
-    proc, url = launch_or_reuse_server(launch_server_func, server_args)
+    proc, url = launch_or_reuse_server(
+        launch_server_func, server_args, verify_ssl=verify_ssl
+    )
     return BenchEndpoint(base_url=url, _proc=proc)
