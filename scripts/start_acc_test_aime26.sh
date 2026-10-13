@@ -28,7 +28,7 @@ evalscope eval \
     --datasets aime26 \
     --dataset-hub local \
     --dataset-args '{
-        "aime26": { "local_path": "/home/datasets/aime26}}' \
-    --eval-batch-size 30 \
-    --limit 30 \
+        "aime26": { "local_path": "/home/datasets/aime26"}}' \
+    --eval-batch-size 16 \
+    --limit 16 \
     --ignore-error

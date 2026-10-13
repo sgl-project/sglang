@@ -256,16 +256,17 @@ class MarkovSampleStep:
     #     if inputs_on_cuda(**kwargs):
     #         return cls.triton(**kwargs)
     #     return cls.torch(**kwargs)
-    
+
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
-        # Use the Torch implementation explicitly on NPU.
+        # NPU_LEGACY_TRITON_ADAPTER_V1
         if kwargs["base_logits"].device.type == "npu":
-            return cls.torch(**kwargs)
-
+            from sglang.kernels.ops.speculative.dspark.markov_sample_npu_legacy import (
+                sample_markov_step_npu,
+            )
+            return sample_markov_step_npu(**kwargs)
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
-
         return cls.torch(**kwargs)
 
 

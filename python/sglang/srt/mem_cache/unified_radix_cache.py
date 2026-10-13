@@ -1183,8 +1183,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
         # The tree's own walk: a session slot must not answer for the insert.
-        match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
-        new_last_node = match_result.last_device_node
+        if is_finished:
+            new_last_node = result.last_device_node
+        else:
+            match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
+            new_last_node = match_result.last_device_node
+        # match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
+        # new_last_node = match_result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
