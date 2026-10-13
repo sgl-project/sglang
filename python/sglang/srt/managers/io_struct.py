@@ -247,8 +247,7 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Return output top logprobs the same way, on the finished response only,
-    # which also skips detokenizing every candidate. Not supported with stream.
+    # Return output top logprobs the same way, on the finished response only.
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False

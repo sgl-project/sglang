@@ -370,7 +370,7 @@ def _build_flat_top_logprobs_fields(
         )
     null_prefix, k = flat_top_logprobs_layout(top_logprobs_val, top_logprobs_num)
     # Flatten the original python rows so the JSON numbers keep their full
-    # (float64) precision, matching the pre-scheduler-flat output.
+    # (float64) precision.
     return {
         f"{side}_top_logprobs_val_flat": [
             v for row in top_logprobs_val[null_prefix:] for v in row

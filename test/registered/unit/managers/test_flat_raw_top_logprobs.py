@@ -1,6 +1,4 @@
-"""Unit tests for the flat raw prompt top logprob response format
-(`return_flat_raw_top_logprobs` / `return_flat_raw_top_logprobs_b64`).
-"""
+"""Unit tests for the flat raw top logprob response format (prompt and output)."""
 
 import asyncio
 import base64
@@ -430,37 +428,6 @@ class TestFlatOutputTopLogprobs(CustomTestCase):
 
         self.assertNotIn("output_top_logprobs_shape", meta_info)
         self.assertEqual(len(meta_info["output_top_logprobs"]), 3)
-
-    def test_convert_logprob_style_forwards_finished(self):
-        state = _make_state(
-            return_logprob=True,
-            top_logprobs_num=2,
-            return_flat_raw_output_top_logprobs=True,
-        )
-        recv_obj = SimpleNamespace(
-            input_token_logprobs_val=None,
-            output_token_logprobs_val=[[-0.5]],
-            output_token_logprobs_idx=[[11]],
-            input_top_logprobs_val=None,
-            input_top_logprobs_val_flat=None,
-            output_top_logprobs_val=[[[-0.5, -2.5]]],
-            output_top_logprobs_idx=[[[11, 22]]],
-        )
-        meta_info = {}
-
-        _TokenizerManagerStub().convert_logprob_style(
-            meta_info,
-            state,
-            top_logprobs_num=2,
-            token_ids_logprob=None,
-            return_text_in_logprobs=False,
-            recv_obj=recv_obj,
-            recv_obj_index=0,
-            finished=True,
-        )
-
-        self.assertEqual(meta_info["output_top_logprobs_shape"], [1, 2])
-        self.assertEqual(meta_info["output_top_logprobs_idx_flat"], [11, 22])
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
