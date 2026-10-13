@@ -1084,8 +1084,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._submit_prefill_recompute(decode_req)
 
     def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
-        # A fake transfer has no prefill to recompute on; its receiver succeeds
-        # on its own once the metadata is sent.
+        # A fake transfer has no prefill; its receiver completes once metadata is sent.
         if _is_fake_transfer(decode_req.req):
             return
         self.kv_manager.submit_prefill_recompute(

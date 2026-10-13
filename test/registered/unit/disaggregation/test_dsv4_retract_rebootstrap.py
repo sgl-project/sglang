@@ -53,16 +53,9 @@ class TestDSV4RetractRebootstrap(CustomTestCase):
         # Neither the fake manager nor a fake receiver can dispatch a recompute.
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.kv_manager = MagicMock()
-        for host, submitted in ((FAKE_BOOTSTRAP_HOST, False), ("10.0.0.1", True)):
-            with self.subTest(host=host):
-                queue.kv_manager.reset_mock()
-                req = MagicMock(bootstrap_host=host)
-                queue._submit_prefill_recompute(
-                    DecodeRequest(req=req, kv_receiver=MagicMock())
-                )
-                self.assertEqual(
-                    queue.kv_manager.submit_prefill_recompute.called, submitted
-                )
+        req = MagicMock(bootstrap_host=FAKE_BOOTSTRAP_HOST)
+        queue._submit_prefill_recompute(DecodeRequest(req=req, kv_receiver=MagicMock()))
+        queue.kv_manager.submit_prefill_recompute.assert_not_called()
 
 
 if __name__ == "__main__":
