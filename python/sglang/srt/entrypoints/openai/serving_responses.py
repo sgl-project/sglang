@@ -60,7 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
-from sglang.srt.entrypoints.openai import chat_encoding, serving_inkling
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -1031,9 +1031,10 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
-        if self._inkling_token_output:
+        spec_output = self._spec_output()
+        if spec_output is not None:
             required_json = self._uses_required_tool_json(request, chat_tools)
-            parsed = serving_inkling.parse_responses_output(
+            reasoning_content, content, calls = spec_output.parse_responses_output(
                 output_ids=output_ids or [],
                 finish_reason=finish_reason,
                 separate_reasoning=bool(self.reasoning_parser),
@@ -1042,15 +1043,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and not required_json
                 ),
             )
-            reasoning_content, content = parsed.reasoning, parsed.content
             if required_json and content:
                 content, tool_call_items = self._parse_required_tool_json(
                     content, custom_names
                 )
             else:
                 tool_call_items = [
-                    self._make_tool_call_item(call.name, call.arguments, custom_names)
-                    for call in parsed.tool_calls
+                    self._make_tool_call_item(call.name, call.parameters, custom_names)
+                    for call in calls
                 ]
         else:
             reasoning_content, content, tool_call_items = self._parse_text_output(
@@ -2103,21 +2103,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         custom_names = custom_tool_names(request.tools)
         tool_choice = request.effective_tool_choice()
         required_json = self._uses_required_tool_json(request, chat_tools)
-        inkling_stream = (
-            serving_inkling.InklingResponsesStream(
+        spec_output = self._spec_output()
+        token_stream = (
+            spec_output.new_responses_stream(
                 separate_reasoning=bool(self.reasoning_parser),
                 parse_tool_calls=(
                     self._tool_call_parsing_enabled(request, chat_tools)
                     and not required_json
                 ),
             )
-            if self._inkling_token_output
+            if spec_output is not None
             else None
         )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if required_json:
             tool_parser = JsonArrayParser()
-        elif inkling_stream is None and self._tool_call_parsing_enabled(
+        elif token_stream is None and self._tool_call_parsing_enabled(
             request, chat_tools
         ):
             tool_parser = FunctionCallParser(
@@ -2127,7 +2128,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tool_choice=tool_choice,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
-        if inkling_stream is None and self.reasoning_parser:
+        if token_stream is None and self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
@@ -2415,9 +2416,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 finish_reason = meta.get("finish_reason") or finish_reason
 
-                inkling_calls: list[ToolCallItem] = []
-                if inkling_stream is not None:
-                    reasoning_chunk, delta, inkling_calls = inkling_stream.step(
+                token_calls: list[ToolCallItem] = []
+                if token_stream is not None:
+                    reasoning_chunk, delta, token_calls = token_stream.step(
                         chunk, finish_reason
                     )
                     flush = False
@@ -2528,15 +2529,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                if not delta and not flush and not inkling_calls:
+                if not delta and not flush and not token_calls:
                     continue
 
                 if isinstance(tool_parser, JsonArrayParser):
                     normal_text, tool_calls = self._drain_json_array(
                         tool_parser, delta, chat_tools
                     )
-                elif inkling_stream is not None:
-                    normal_text, tool_calls = delta, inkling_calls
+                elif token_stream is not None:
+                    normal_text, tool_calls = delta, token_calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                     if flush:

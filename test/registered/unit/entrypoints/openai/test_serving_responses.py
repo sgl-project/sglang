@@ -1107,7 +1107,7 @@ class InklingOutputItemsTestCase(CustomTestCase):
         self.serving = make_serving()
         self.serving.chat_encoding_spec = "inkling"
         self.serving.reasoning_parser = self.serving.tool_call_parser = "inkling"
-        self.serving._inkling_token_output = True
+        self.serving._spec_adapter = self.serving._build_spec_adapter()
         self.request = ResponsesRequest(
             model="x",
             input="weather?",
@@ -1194,6 +1194,7 @@ class InklingOutputItemsTestCase(CustomTestCase):
         from sglang.srt.parser.inkling_renderer import load_tml_renderers
 
         self.serving.tool_call_parser = None
+        self.serving._spec_adapter = self.serving._build_spec_adapter()
         tokenizer = load_tml_renderers().tokenizer
         special, text = tokenizer.encode_special, tokenizer.encode_ordinary
         output_ids = [
@@ -1248,6 +1249,62 @@ class InklingOutputItemsTestCase(CustomTestCase):
                     events = StreamFixture(self.serving, request).run(chunks)
                     output = event_payloads(events)[-1]["response"]["output"]
                     self.assertEqual(self._summary(output), expected)
+
+
+class SpecAdapterDispatchTestCase(CustomTestCase):
+    @staticmethod
+    def _hooks():
+        from sglang.srt.entrypoints.openai import spec_adapters
+
+        return spec_adapters.ChatOutputHooks(
+            tool_call_parsing_active=Mock(),
+            history_tool_calls_count=Mock(),
+            tool_call_id=Mock(),
+        )
+
+    def test_only_a_selected_inkling_spec_requires_tml_renderers(self):
+        """Serving another model must not need tml-renderers, while selecting
+        Inkling must still fail at construction when it is missing."""
+        from sglang.srt.entrypoints.openai import spec_adapters
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        load_tml_renderers.cache_clear()
+        self.addCleanup(load_tml_renderers.cache_clear)
+        kwargs = dict(
+            tokenizer=None,
+            reasoning_parser="inkling",
+            tool_call_parser="inkling",
+            chat_hooks=self._hooks(),
+        )
+        with patch.dict(sys.modules, {"tml_renderers": None}):
+            for spec in (None, "kimi_k3", "dsv4", "dsv41", "dsv32"):
+                with self.subTest(spec=spec):
+                    self.assertIsNone(spec_adapters.build_spec_adapter(spec, **kwargs))
+            with self.assertRaises(ImportError):
+                spec_adapters.build_spec_adapter("inkling", **kwargs)
+
+    def test_responses_handler_builds_one_adapter_bound_to_itself(self):
+        """The Responses handler reuses the adapter from its base init; its
+        chat hooks must belong to that handler, not to another instance."""
+        from sglang.srt.entrypoints.openai import spec_adapters
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        with (
+            patch.object(
+                OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
+            ),
+            patch.object(
+                spec_adapters,
+                "build_spec_adapter",
+                wraps=spec_adapters.build_spec_adapter,
+            ) as build,
+        ):
+            serving = make_serving()
+
+        build.assert_called_once()
+        hooks = build.call_args.kwargs["chat_hooks"]
+        self.assertIs(hooks.tool_call_id.__self__, serving)
+        self.assertIsNotNone(serving._spec_adapter)
 
 
 class HarmonyResponsesTestCase(CustomTestCase):

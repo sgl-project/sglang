@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -29,27 +29,34 @@ from sglang.srt.parser.inkling_renderer import (
 )
 from sglang.srt.runtime_context import get_serving
 
+if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.spec_adapters import ChatOutputHooks
 
-class InklingChatAdapter:
+
+class InklingSpecAdapter:
+    """Renders Inkling prompts and, when an Inkling parser is configured,
+    parses output from token IDs (the ``SpecAdapter`` and ``SpecOutputAdapter``
+    protocols in ``spec_adapters``)."""
+
     def __init__(
         self,
         *,
         reasoning_parser: str | None,
         tool_call_parser: str | None,
-        tool_call_parsing_active: Callable[[ChatCompletionRequest], bool],
-        history_tool_calls_cnt: Callable[[ChatCompletionRequest], int],
-        tool_call_id: Callable[[ToolCallItem, int], str],
+        chat_hooks: ChatOutputHooks,
     ):
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
         # fail at boot, not 400 every request.
         self._default_reasoning_effort = get_default_reasoning_effort()
         load_tml_renderers()
-        self.token_output = "inkling" in (reasoning_parser, tool_call_parser)
+        self._token_output = "inkling" in (reasoning_parser, tool_call_parser)
         self._separate_reasoning = bool(reasoning_parser)
-        self._tool_call_parsing_active = tool_call_parsing_active
-        self._history_tool_calls_cnt = history_tool_calls_cnt
-        self._tool_call_id = tool_call_id
+        self._hooks = chat_hooks
+
+    @property
+    def output(self) -> Optional[InklingSpecAdapter]:
+        return self if self._token_output else None
 
     def encode_messages(
         self,
@@ -69,7 +76,7 @@ class InklingChatAdapter:
             prompt_ids += render_inkling_assistant_prefix(assistant_prefix)
         return prompt_ids
 
-    def parse_response(
+    def parse_chat_response(
         self,
         *,
         request: ChatCompletionRequest,
@@ -83,7 +90,7 @@ class InklingChatAdapter:
         )
         if not parsed.tool_calls:
             return parsed.reasoning or None, parsed.content, None, finish_reason
-        history_tool_calls_cnt = self._history_tool_calls_cnt(request)
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
         tool_calls = [
             self._tool_call(call, history_tool_calls_cnt) for call in parsed.tool_calls
         ]
@@ -91,7 +98,7 @@ class InklingChatAdapter:
             finish_reason = {**finish_reason, "type": "tool_calls", "matched": None}
         return parsed.reasoning or None, parsed.content, tool_calls, finish_reason
 
-    def stream_chunks(
+    def stream_chat_chunks(
         self,
         *,
         content: dict[str, Any],
@@ -148,7 +155,7 @@ class InklingChatAdapter:
                 )
             )
             remaining_logprobs = None
-        history_tool_calls_cnt = self._history_tool_calls_cnt(request)
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
         for call in delta.tool_calls:
             has_tool_calls[index] = True
             tool_call_chunk = ChatCompletionStreamResponse(
@@ -173,10 +180,35 @@ class InklingChatAdapter:
             )
         return chunks
 
+    def parse_responses_output(
+        self,
+        *,
+        output_ids: list[int],
+        finish_reason: dict[str, Any] | None,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
+    ) -> tuple[str, str, list[ToolCallItem]]:
+        parser = InklingOutputParser(
+            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+        )
+        delta = parser.finish(
+            output_ids,
+            matched_stop=(finish_reason or {}).get("matched"),
+            keep_matched_stop=False,
+        )
+        return delta.reasoning, delta.content, _tool_call_items(delta)
+
+    def new_responses_stream(
+        self, *, separate_reasoning: bool, parse_tool_calls: bool
+    ) -> InklingResponsesStream:
+        return InklingResponsesStream(
+            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+        )
+
     def _new_output_parser(self, request: ChatCompletionRequest) -> InklingOutputParser:
         return InklingOutputParser(
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
-            parse_tool_calls=self._tool_call_parsing_active(request),
+            parse_tool_calls=self._hooks.tool_call_parsing_active(request),
             stream_reasoning=request.stream_reasoning,
             continues_text_block=bool(
                 request.continue_final_message
@@ -192,27 +224,10 @@ class InklingChatAdapter:
             tool_index=call.index, name=call.name, parameters=call.arguments
         )
         return ToolCall(
-            id=self._tool_call_id(call_item, history_tool_calls_cnt),
+            id=self._hooks.tool_call_id(call_item, history_tool_calls_cnt),
             index=call.index,
             function=FunctionResponse(name=call.name, arguments=call.arguments),
         )
-
-
-def parse_responses_output(
-    *,
-    output_ids: list[int],
-    finish_reason: dict[str, Any] | None,
-    separate_reasoning: bool,
-    parse_tool_calls: bool,
-) -> InklingOutputDelta:
-    parser = InklingOutputParser(
-        separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
-    )
-    return parser.finish(
-        output_ids,
-        matched_stop=(finish_reason or {}).get("matched"),
-        keep_matched_stop=False,
-    )
 
 
 class InklingResponsesStream:
@@ -250,13 +265,14 @@ class InklingResponsesStream:
                 matched_stop=finish_reason.get("matched"),
                 keep_matched_stop=False,
             )
-        calls = [
-            ToolCallItem(
-                tool_index=call.index, name=call.name, parameters=call.arguments
-            )
-            for call in delta.tool_calls
-        ]
-        return delta.reasoning, delta.content, calls
+        return delta.reasoning, delta.content, _tool_call_items(delta)
+
+
+def _tool_call_items(delta: InklingOutputDelta) -> list[ToolCallItem]:
+    return [
+        ToolCallItem(tool_index=call.index, name=call.name, parameters=call.arguments)
+        for call in delta.tool_calls
+    ]
 
 
 def select_new_output_ids(

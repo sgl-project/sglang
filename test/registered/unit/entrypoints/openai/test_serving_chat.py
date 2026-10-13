@@ -4859,13 +4859,8 @@ def _inkling_serving() -> OpenAIServingChat:
     serving.chat_encoding_spec = "inkling"
     serving.reasoning_parser = "inkling"
     serving.tool_call_parser = "inkling"
-    serving._inkling = serving_inkling.InklingChatAdapter(
-        reasoning_parser=serving.reasoning_parser,
-        tool_call_parser=serving.tool_call_parser,
-        tool_call_parsing_active=serving._tool_call_parsing_active,
-        history_tool_calls_cnt=serving._get_history_tool_calls_cnt,
-        tool_call_id=serving._process_tool_call_id,
-    )
+    serving.tokenizer_manager = Mock(tokenizer=None)
+    serving._spec_adapter = serving._build_spec_adapter()
     return serving
 
 
@@ -5032,7 +5027,7 @@ class InklingTokenOutputTest(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        self.inkling = _inkling_serving()._inkling
+        self.inkling = _inkling_serving()._spec_adapter
         self.request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "weather?"}],
@@ -5064,10 +5059,12 @@ class InklingTokenOutputTest(CustomTestCase):
         ]
 
     def test_non_stream_maps_calls_and_finish_reason(self):
-        reasoning, content, tool_calls, finish_reason = self.inkling.parse_response(
-            request=self.request,
-            output_ids=self._output_ids(),
-            finish_reason={"type": "stop", "matched": 200006},
+        reasoning, content, tool_calls, finish_reason = (
+            self.inkling.parse_chat_response(
+                request=self.request,
+                output_ids=self._output_ids(),
+                finish_reason={"type": "stop", "matched": 200006},
+            )
         )
         self.assertEqual(reasoning, "plan")
         self.assertEqual(content, "")
@@ -5098,7 +5095,7 @@ class InklingTokenOutputTest(CustomTestCase):
             tokenizer.encode_special("end_message"),
             tokenizer.encode_special("content_model_end_sampling"),
         ]
-        _, content, tool_calls, _ = self.inkling.parse_response(
+        _, content, tool_calls, _ = self.inkling.parse_chat_response(
             request=request,
             output_ids=output_ids,
             finish_reason={"type": "stop", "matched": 200006},
@@ -5161,7 +5158,7 @@ class InklingTokenOutputTest(CustomTestCase):
             incremental_streaming_output=incremental
         ):
             for ids, finish in steps:
-                chunks += self.inkling.stream_chunks(
+                chunks += self.inkling.stream_chat_chunks(
                     content={
                         "output_ids": ids,
                         "meta_info": {
@@ -5186,7 +5183,7 @@ class InklingTokenOutputTest(CustomTestCase):
     def _reasoning_and_content(
         self, request, output_ids, finish_reason, *, split=2
     ) -> dict:
-        reasoning, content, _, _ = self.inkling.parse_response(
+        reasoning, content, _, _ = self.inkling.parse_chat_response(
             request=request,
             output_ids=output_ids,
             finish_reason=finish_reason,
@@ -5444,7 +5441,7 @@ class InklingTokenOutputTest(CustomTestCase):
             special("end_message"),
             eos,
         ]
-        _, _, tool_calls, finish_reason = self.inkling.parse_response(
+        _, _, tool_calls, finish_reason = self.inkling.parse_chat_response(
             request=self.request,
             output_ids=call,
             finish_reason={"type": "stop", "matched": eos},

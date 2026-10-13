@@ -247,6 +247,12 @@ def reasoning_content_to_thinking_part(message: Dict[str, Any]) -> Dict[str, Any
     return converted
 
 
+def spec_collects_openai_media(spec: Optional[str]) -> bool:
+    """Whether media is extracted from the original OpenAI messages after the
+    encoder for ``spec`` has rendered prompt ids (dsv41 returns its own)."""
+    return spec in ("inkling", "kimi_k3")
+
+
 def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
 
