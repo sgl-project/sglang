@@ -10,15 +10,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import sys
+import threading
 import unittest
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
 from sglang.srt.model_executor.model_runner_components import weight_updater
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import CustomTestCase
@@ -126,6 +131,35 @@ class _FakeModel(torch.nn.Module):
                 param.data.copy_(tensor)
 
 
+class _ParallelExpertModel(_FakeModel):
+    def __init__(self, layer: _FakeMoELayer) -> None:
+        super().__init__(layer)
+        self.thread_state = threading.local()
+        self.expert_zero_written = threading.Event()
+
+    def _load_expert(self, name: str, tensor: torch.Tensor) -> None:
+        self.thread_state.expert = int(name.rsplit(".", 1)[1])
+        try:
+            super().load_weights([(name, tensor)])
+        finally:
+            if self.thread_state.expert == 0:
+                self.expert_zero_written.set()
+
+    def load_weights(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
+        self.expert_zero_written.clear()
+        remaining = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            for name, tensor in named_tensors:
+                if name.startswith("w13_weight."):
+                    futures.append(executor.submit(self._load_expert, name, tensor))
+                else:
+                    remaining.append((name, tensor))
+            for future in futures:
+                future.result()
+        super().load_weights(remaining)
+
+
 def _weights(layer):
     return (("w13_weight", layer.w13_weight), ("w2_weight", layer.w2_weight))
 
@@ -135,10 +169,12 @@ def _make_updater(model):
         tp_rank=0,
         device="cpu",
         gpu_id=0,
-        model_config=SimpleNamespace(),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16, revision=None, model_path="original"
+        ),
         custom_weight_loaders={},
         get_model=lambda: model,
-        update_model_fields=lambda **kwargs: None,
+        update_model_fields=lambda model, **kwargs: None,
         recapture_cuda_graph=lambda: None,
         get_model_runner=lambda: SimpleNamespace(server_args=get_server_args()),
     )
@@ -172,6 +208,97 @@ def _canonical_shapes():
 
 
 class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
+    def test_parallel_disk_reload_restores_before_expert_copies(self) -> None:
+        """Parallel disk loads and fallback loads must preserve every expert's bytes."""
+        for fail_post_load in (False, True):
+            with self.subTest(fail_post_load=fail_post_load):
+                method, layer = self._cold_load(seed=0)
+                model = _ParallelExpertModel(layer)
+                updater = _make_updater(model)
+                loader = DefaultModelLoader(LoadConfig(load_format="auto"))
+                source = _FakeMoELayer(method, seed=1)
+                fallback = _FakeMoELayer(method, seed=0)
+                _, reference = self._cold_load(seed=0 if fail_post_load else 1)
+                pointers = {name: param.data_ptr() for name, param in _weights(layer)}
+                barrier = threading.Barrier(2)
+                main_thread = threading.current_thread()
+                original_restore = method._restore_trtllm_bf16_canonical_layout
+                original_post_load = method.process_weights_after_loading
+                post_load_count = 0
+
+                def interleaved_restore(
+                    layer: _FakeMoELayer, param: torch.nn.Parameter, param_name: str
+                ) -> None:
+                    if (
+                        threading.current_thread() is not main_thread
+                        and param_name == "w13_weight"
+                    ):
+                        barrier.wait(timeout=5)
+                        if model.thread_state.expert == 1:
+                            if not model.expert_zero_written.wait(timeout=5):
+                                raise RuntimeError("First expert copy did not finish")
+                    original_restore(layer, param, param_name)
+
+                def post_load(layer: _FakeMoELayer) -> None:
+                    nonlocal post_load_count
+                    original_post_load(layer)
+                    post_load_count += 1
+                    if fail_post_load and post_load_count == 1:
+                        raise RuntimeError("Injected post-load failure")
+
+                def checkpoint(
+                    layer: _FakeMoELayer,
+                ) -> Iterable[tuple[str, torch.Tensor]]:
+                    return iter(
+                        [
+                            ("w13_weight.0", layer.w13_weight.data[0]),
+                            ("w13_weight.1", layer.w13_weight.data[1]),
+                            ("w2_weight", layer.w2_weight.data),
+                        ]
+                    )
+
+                with (
+                    _mock_flashinfer(),
+                    get_context().override_server_args(weight_cache_mode="off"),
+                    get_parallel().override(tp_rank=0),
+                    patch.object(
+                        weight_updater, "get_model_loader", return_value=loader
+                    ),
+                    patch.object(
+                        weight_updater, "get_available_gpu_memory", return_value=0
+                    ),
+                    patch(
+                        "sglang.srt.model_loader.loader.is_cuda_alike",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        loader,
+                        "_get_weights_iterator",
+                        side_effect=[checkpoint(source), checkpoint(fallback)],
+                    ),
+                    patch.object(
+                        method,
+                        "_restore_trtllm_bf16_canonical_layout",
+                        side_effect=interleaved_restore,
+                    ),
+                    patch.object(
+                        method, "process_weights_after_loading", side_effect=post_load
+                    ),
+                ):
+                    success, message = updater.update_weights_from_disk(
+                        "updated", "auto"
+                    )
+                if fail_post_load:
+                    self.assertFalse(success)
+                    self.assertIn("Injected post-load failure", message)
+                else:
+                    self.assertTrue(success, message)
+                for (name, param), (_, expected) in zip(
+                    _weights(layer), _weights(reference)
+                ):
+                    self.assertTrue(torch.equal(param.data, expected.data), name)
+                    self.assertEqual(param.data_ptr(), pointers[name])
+
     def _cold_load(self, seed: int):
         """A layer loaded from disk and post-processed, i.e. in kernel layout."""
         method = _make_method()
