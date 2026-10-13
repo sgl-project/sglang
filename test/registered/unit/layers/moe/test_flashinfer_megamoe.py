@@ -713,13 +713,12 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
             (weights.w13, weights.w13_scale),
             (weights.w2, weights.w2_scale),
         ):
-            # W4A4 exposes the prepared FP4 and FP8 planes as uint8 bytes;
-            # W4A16 exposes FP4 weights and FP8 scales with their typed views.
+            # Both modes expose FP4 weights with their typed view. W4A4
+            # exposes prepared FP8 scales as bytes; W4A16 keeps their FP8 view.
             padded = torch.zeros(
                 2, ((scale[0].numel() + 511) // 512) * 512, dtype=scale.dtype
             )
             padded[:, : scale[0].numel()].copy_(scale.flatten(1))
-            weight_dtype = torch.float4_e2m1fn_x2 if use_w4a16 else torch.uint8
             scale_dtype = torch.float8_e4m3fn if use_w4a16 else torch.uint8
             # W4A4 FC2 preprocessing returns a view of the canonical bytes.
             prepared_weight = (
@@ -727,7 +726,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
             )
             result.append(
                 (
-                    prepared_weight.view(weight_dtype).transpose(1, 2),
+                    prepared_weight.view(torch.float4_e2m1fn_x2).transpose(1, 2),
                     padded.view(scale_dtype),
                 )
             )
