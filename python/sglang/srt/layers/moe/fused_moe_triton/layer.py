@@ -478,8 +478,8 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
-        # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
-        # Pad the intermediate_size_per_partition if necessary
+        # flashinfer_trtllm pads intermediate_size to a multiple of 128 here, except
+        # NVFP4 which aligns it in create_weights
         if (
             self.use_flashinfer_trtllm_moe
             and not isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)

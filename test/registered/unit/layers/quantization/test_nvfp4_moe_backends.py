@@ -12,7 +12,7 @@ import torch
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import get_device_sm, round_up
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.quant_ref_utils import (
@@ -107,7 +107,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                     refs[shard_id][e] = w_dequant
             layer.quant_method.process_weights_after_loading(layer)
             if backend == "flashinfer_trtllm":
-                expected_intermediate = (intermediate_size + 63) // 64 * 64
+                expected_intermediate = round_up(intermediate_size, 64)
                 self.assertEqual(
                     layer.intermediate_size_per_partition, expected_intermediate
                 )

@@ -2430,10 +2430,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         if self.enable_flashinfer_trtllm_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                trtllm_fp4_intermediate_alignment,
+            )
+
             alignment = (
-                64
-                if layer.moe_runner_config.is_gated
-                and self.use_flashinfer_trtllm_weight_layout
+                trtllm_fp4_intermediate_alignment(layer.moe_runner_config.is_gated)
+                if self.use_flashinfer_trtllm_weight_layout
                 else 128
             )
             intermediate_size_per_partition = round_up(

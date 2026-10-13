@@ -422,19 +422,31 @@ class TestAlignFp4MoeWeights(CustomTestCase):
             self.assertEqual(padded.dtype, original.dtype)
             self.assertEqual(_byte_sum(padded), _byte_sum(original))
 
-    def test_gated_pads_only_intermediate_by_default(self):
-        num_experts, hidden, inter = 2, 2688, 1000
+    def test_gated_pads_each_half_of_intermediate(self):
+        num_experts, hidden, inter, padded_inter = 2, 2688, 1000, 1024
         w13, w13_scale, w2, w2_scale = _generate_fp4_moe_weights(
             num_experts, hidden, inter, is_gated=True
         )
 
-        p_w13, _, p_w2, _, out_inter, out_hidden = _align_fp4_moe_weights(
-            w13, w13_scale, w2, w2_scale, is_gated=True, intermediate_alignment=16
+        p_w13, p_w13_scale, p_w2, p_w2_scale, out_inter, out_hidden = (
+            _align_fp4_moe_weights(
+                w13, w13_scale, w2, w2_scale, is_gated=True, intermediate_alignment=64
+            )
         )
 
-        self.assertEqual((out_inter, out_hidden), (1008, hidden))
-        self.assertEqual(p_w13.shape, (num_experts, 2 * 1008, hidden // 2))
-        self.assertEqual(p_w2.shape, (num_experts, hidden, 1008 // 2))
+        self.assertEqual((out_inter, out_hidden), (padded_inter, hidden))
+        self.assertEqual(p_w13.shape, (num_experts, 2 * padded_inter, hidden // 2))
+        self.assertEqual(p_w2.shape, (num_experts, hidden, padded_inter // 2))
+        for padded, original in [(p_w13, w13), (p_w13_scale, w13_scale)]:
+            padded, original = padded.view(torch.uint8), original.view(torch.uint8)
+            for half in range(2):
+                torch.testing.assert_close(
+                    padded[:, half * padded_inter : half * padded_inter + inter],
+                    original[:, half * inter : (half + 1) * inter],
+                )
+            self.assertEqual(_byte_sum(padded), _byte_sum(original))
+        torch.testing.assert_close(p_w2[:, :, : inter // 2], w2)
+        self.assertEqual(_byte_sum(p_w2_scale), _byte_sum(w2_scale))
 
 
 if __name__ == "__main__":
