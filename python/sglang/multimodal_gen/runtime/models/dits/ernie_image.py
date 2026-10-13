@@ -22,21 +22,15 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from sglang.kernels.ops.activation.activation import (
     gelu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    flashinfer_rmsnorm_diagnostic_hint,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
     can_use_fused_rmsnorm_scale_shift,
-    can_use_fused_scale_residual_rmsnorm_scale_shift,
+    flashinfer_rmsnorm_diagnostic_hint,
     fused_rmsnorm_scale_shift_bitexact,
-    fused_scale_residual_rmsnorm_scale_shift_bitexact,
-)
-from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
-    can_use_fused_rope_rotate_half,
     fused_rope_rotate_half_bitexact,
+    fused_scale_residual_rmsnorm_scale_shift_bitexact,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
@@ -96,8 +90,9 @@ def _ernie_norm_scale_shift(
     verified = _ERNIE_NORM.verified
     if (
         not _ERNIE_NORM.disabled
+        and x.is_cuda
         and norm.variance_size_override is None
-        and can_use_fused_rmsnorm_scale_shift(x, norm.weight, scale, shift)
+        and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
         and (verified or _ERNIE_NORM.can_attempt_once())
     ):
         try:
@@ -140,10 +135,9 @@ def _ernie_gated_norm_scale_shift(
     verified = _ERNIE_GATED_NORM.verified
     if (
         not _ERNIE_GATED_NORM.disabled
+        and residual.is_cuda
         and norm.variance_size_override is None
-        and can_use_fused_scale_residual_rmsnorm_scale_shift(
-            residual, update, gate, norm.weight, scale, shift
-        )
+        and can_use_fused_rmsnorm_scale_shift(residual.dtype, residual.shape[-1])
         and (verified or _ERNIE_GATED_NORM.can_attempt_once())
     ):
         try:
@@ -232,9 +226,9 @@ class ErnieImageSelfAttention(nn.Module):
 
         tp_size = get_tp_world_size()
         self.num_local_heads = num_heads // tp_size
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_heads % tp_size == 0, (
+            f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        )
 
         self.to_q = ColumnParallelLinear(
             hidden_size,
@@ -465,7 +459,8 @@ def _ernie_rope(
     verified = _ERNIE_ROPE.verified
     if (
         not _ERNIE_ROPE.disabled
-        and can_use_fused_rope_rotate_half(x, cos_, sin_)
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
         and (verified or _ERNIE_ROPE.can_attempt_once())
     ):
         try:

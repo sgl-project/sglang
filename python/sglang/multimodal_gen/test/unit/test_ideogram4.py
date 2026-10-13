@@ -101,6 +101,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
@@ -185,6 +186,7 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        component_precisions={},
         kv_gather_degree=1,
         sp_split_auto=False,
     )
@@ -470,6 +472,18 @@ class TestIdeogram4(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown Ideogram 4 preset"):
             Ideogram4SamplingParams(preset="V4_FAST")
 
+    def test_turbotime_and_distilled_presets_coexist(self):
+        for steps in (2, 4, 8):
+            preset = f"V4_TURBOTIME_LORA_{steps}"
+            with self.subTest(preset=preset):
+                params = Ideogram4SamplingParams(preset=preset)
+                self.assertEqual(params.num_inference_steps, steps)
+                self.assertEqual(params.guidance_scale, 1.0)
+                self.assertTrue(IDEOGRAM4_PRESETS[preset]["skip_unconditional"])
+                self.assertTrue(IDEOGRAM4_PRESETS[preset]["requires_lora"])
+        self.assertEqual(Ideogram4FastSamplingParams().preset, "V4_FAST_20")
+        self.assertEqual(Ideogram4InstantSamplingParams().preset, "V4_INSTANT_8")
+
     def test_ideogram_distilled_sampling_defaults(self):
         fast = Ideogram4FastSamplingParams()
         instant = Ideogram4InstantSamplingParams()
@@ -508,7 +522,9 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={},
+            component_weights_paths={},
+            component_quantizations={},
+            component_quantization_ignored_layers={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -523,11 +539,15 @@ class TestIdeogram4(unittest.TestCase):
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={
+            component_weights_paths={
                 "unconditional_transformer": (
                     "/ckpt/diffusion_models/"
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
                 )
+            },
+            component_quantizations={"unconditional_transformer": "fp8"},
+            component_quantization_ignored_layers={
+                "unconditional_transformer": ["lm_head"]
             },
         )
 
@@ -542,6 +562,8 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
+        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
 
     def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
         self.assertEqual(
@@ -694,6 +716,9 @@ class TestIdeogram4(unittest.TestCase):
         }
         stage.copy_deduplicated_outputs(base, same)
 
+        self.assertIs(same.prompt_embeds[0], base.prompt_embeds[0])
+        self.assertIs(same.prompt_embeds_mask[0], base.prompt_embeds_mask[0])
+        self.assertIsNot(same.prompt_embeds, base.prompt_embeds)
         self.assertIn("ideogram4", same.extra)
         self.assertTrue(
             torch.equal(
@@ -996,9 +1021,15 @@ class TestIdeogram4(unittest.TestCase):
                     sp_split_auto=False,
                 )
             )
-            with patch(
-                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
-                return_value=1,
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
             ):
                 with torch.device("meta"):
                     model = Ideogram4Transformer2DModel(
@@ -1058,6 +1089,10 @@ class TestIdeogram4(unittest.TestCase):
                 )
             )
             with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
                 patch(
                     "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
                     return_value=True,
@@ -1557,6 +1592,20 @@ class TestIdeogram4(unittest.TestCase):
 
             with patch.object(stage, "_run_ideogram_transformer", side_effect=fake_run):
                 stage._run_denoising_step(ctx, step, batch, args)
+            for skip_unconditional, unconditional in (
+                (True, unconditional_transformer),
+                (False, None),
+            ):
+                with self.subTest(skip_unconditional=skip_unconditional):
+                    ctx.latents.zero_()
+                    ctx.extra["ideogram4_skip_unconditional"] = skip_unconditional
+                    stage.unconditional_transformer = unconditional
+                    with patch.object(
+                        stage, "_run_ideogram_transformer", side_effect=fake_run
+                    ) as run:
+                        stage._run_denoising_step(ctx, step, batch, args)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertIs(run.call_args.args[0], transformer)
         finally:
             set_global_server_args(prev_args)
 

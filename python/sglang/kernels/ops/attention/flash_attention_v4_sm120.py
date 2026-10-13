@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.flash_attention_v4 import (
     _flash_attn_import_error,
     _flash_attn_varlen_func,

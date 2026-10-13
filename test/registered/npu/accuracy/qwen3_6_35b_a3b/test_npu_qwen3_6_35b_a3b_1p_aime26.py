@@ -8,12 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="full-2-npu-a3",
-    nightly=True,
-    disabled="performance testcase",
-)
+register_npu_ci(est_time=6500, suite="nightly-acc-2-npu-a3", nightly=True)
 
 QWEN3_6_35B_A3B_3K5_1K5_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -50,7 +45,7 @@ QWEN3_6_35B_A3B_3K5_1K5_OTHER_ARGS = [
     4,
     "--mem-fraction-static",
     0.7,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     3,

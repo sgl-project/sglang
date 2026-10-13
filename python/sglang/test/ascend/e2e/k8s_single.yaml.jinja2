@@ -22,6 +22,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         containers:
@@ -51,8 +52,13 @@ spec:
             value: "{{ kube_config }}"
           - name: HF_ENDPOINT
             value: "https://hf-mirror.com"
+          # Env vars consumed by run_npu_testcase.sh inside the pod
           - name: TROUBLE_SHOTTING
             value: "{{ trouble_shotting }}"
+          - name: RUN_LABEL
+            value: "{{ run_label }}"
+          - name: SGLANG_IS_IN_CI
+            value: "{{ sglang_is_in_ci }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
           command: ["/bin/bash", "-c"]

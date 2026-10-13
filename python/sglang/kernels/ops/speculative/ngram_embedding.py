@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     import torch
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _jit_ngram_embedding_module() -> Module:
     return load_jit(
         "ngram_embedding",
-        cuda_files=["ngram_embedding.cuh"],
+        cuda_files=["speculative/ngram_embedding.cuh"],
         cuda_wrappers=[
             ("compute_n_gram_ids", "&NgramEmbeddingKernel::compute_n_gram_ids"),
             (

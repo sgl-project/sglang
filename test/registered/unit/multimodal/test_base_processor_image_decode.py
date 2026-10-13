@@ -6,7 +6,7 @@ in the GPU fast paths. No server or model weights are required.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import asyncio
 import concurrent.futures
@@ -66,12 +66,6 @@ def _is_decoded(img: Image.Image) -> bool:
 
 
 class TestLoadSingleItemImageDecode(CustomTestCase):
-    def test_plain_open_is_lazy(self):
-        # Documents why the fix matters: a bare Image.open is not decoded yet, so
-        # without the fix the decode would land on the caller (main) thread.
-        lazy = Image.open(io.BytesIO(_png_bytes()))
-        self.assertFalse(_is_decoded(lazy))
-
     def test_load_single_item_forces_decode(self):
         img = _StubProcessor._load_single_item(_png_bytes("RGB"), Modality.IMAGE)
         self.assertIsInstance(img, Image.Image)
@@ -147,18 +141,18 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         decode.assert_called_once_with(data)
 
     def test_standard_gpu_jpeg_decoder_normalizes_grayscale_to_rgb(self):
-        decode_jpeg = common.decode_jpeg
+        from torchvision.io import ImageReadMode, decode_jpeg
 
         def decode_on_cpu(encoded_image, *, mode, device):
             # Keep the test deterministic on CPU while checking the arguments used
             # by the production CUDA path and exercising torchvision's conversion.
-            self.assertEqual(mode, common.ImageReadMode.RGB)
+            self.assertEqual(mode, ImageReadMode.RGB)
             self.assertEqual(device, "cuda")
             return decode_jpeg(encoded_image, mode=mode, device="cpu")
 
         with (
             patch.object(common, "is_cuda", return_value=True),
-            patch.object(common, "decode_jpeg", side_effect=decode_on_cpu),
+            patch("torchvision.io.decode_jpeg", side_effect=decode_on_cpu),
         ):
             images = [
                 common._load_image(image_bytes=_jpeg_bytes(mode), gpu_image_decode=True)

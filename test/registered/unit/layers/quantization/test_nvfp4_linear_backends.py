@@ -30,7 +30,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="4-gpu-b200")
 
 # (M, N, K). The second shape hits the padding paths: N=160 is not a multiple
 # of 128 (TRTLLM shuffle pad) and K=336 is neither a multiple of 32 (CUTLASS
@@ -85,8 +85,7 @@ def _make_merged_layer(n_half: int, k: int):
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
         prefix="model.layers.0.mlp.gate_up_proj",
-        tp_rank=0,
-        tp_size=1,
+        parallel_group="replicated",
     ).cuda()
 
     # process_weights_after_loading collapses shard scale_2 with max() without

@@ -4,28 +4,59 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
+
+
+def _requires_dsa_seed_for_cuda_graph(hf_config, topk: int) -> bool:
+    return topk == 1 and get_dsa_seed_metadata_dim(hf_config) > 0
+
+
+def pd_first_draft_proposal(topk_index: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Proposal distribution for a PD decode's first verify of a request.
+
+    Rejection sampling verifies each draft token X against the distribution q
+    it was drawn from. PD prefill hands decode the drafted tokens but not q,
+    so decode proposes each received X with probability one. The verify stays
+    exact: it accepts X with probability p(X) and otherwise resamples from p
+    with X removed, so the committed token is distributed as p, the verify's
+    target distribution. A greedy request's p is one-hot, so it accepts X
+    exactly when X is the target argmax, as it would with q. A sampled one
+    accepts X with probability p(X) instead of min(1, p(X) / q(X)).
+
+    ``topk_index`` is (b, n) under top-k 1: n is 1 for single-layer EAGLE and
+    the number of draft steps for multi-layer EAGLE. Returns (b, n, vocab).
+    """
+    probs = torch.zeros(
+        (*topk_index.shape, vocab_size),
+        dtype=torch.float32,
+        device=topk_index.device,
+    )
+    probs.scatter_(-1, topk_index.unsqueeze(-1), 1.0)
+    return probs
 
 
 def build_eagle_disagg_draft_input(
     batch: ScheduleBatch,
-    server_args: ServerArgs,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> EagleDraftInput:
-    num_states = server_args.speculative_eagle_topk
-    if server_args.enable_multi_layer_eagle:
-        num_states *= server_args.speculative_num_steps
+    # Adaptive spec moves the step count after publish, and this runs once per
+    # prebuilt batch.
+    spec = get_spec()
+    num_states = spec.speculative_eagle_topk
+    if spec.enable_multi_layer_eagle:
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [
@@ -58,7 +89,7 @@ def build_eagle_disagg_draft_input(
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
         dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
-        if should_remap_pd_dsa_seed_to_local_slots(server_args):
+        if should_remap_pd_dsa_seed_to_local_slots():
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token
@@ -85,12 +116,29 @@ def build_eagle_disagg_draft_input(
         if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
             dsa_topk_indices = None
 
+    requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(
+        batch.model_config.hf_config,
+        spec.speculative_eagle_topk,
+    )
+
+    draft_probs = None
+    if spec.speculative_use_rejection_sampling:
+        # Single-layer verifies one (b, vocab) proposal; multi-layer verifies
+        # the received (b, num_steps, vocab) chain directly.
+        draft_probs = pd_first_draft_proposal(topk_index, batch.model_config.vocab_size)
+        if not spec.enable_multi_layer_eagle:
+            draft_probs = draft_probs[:, 0]
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
+        draft_probs=draft_probs,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,
+        cuda_graph_compatible=not (
+            requires_dsa_seed_for_cuda_graph and dsa_topk_indices is None
+        ),
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 

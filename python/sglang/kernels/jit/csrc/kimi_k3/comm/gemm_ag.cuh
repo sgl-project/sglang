@@ -11,7 +11,6 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
 
-#include "ptx_sys.cuh"
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -22,7 +21,6 @@ namespace sglang {
 namespace gemm_ag {
 
 using device::distributed::Counter;
-using device::distributed::multimem_store_relaxed;
 
 constexpr uint32_t kWorld = 8;                      // TP world size
 constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
@@ -34,7 +32,7 @@ constexpr uint32_t kSpinVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per consumer
 struct ProducerParams {
   uint8_t* ws_mc;       // multicast VA of the push workspace base
   Counter* counter;     // per-block phase counters (READ only here)
-  uint32_t half_bytes;  // bytes per phase half (world_size * push_bytes)
+  uint32_t half_bytes;  // bytes per phase half (world_size * slot_bytes)
   uint32_t rank;
 };
 
@@ -73,7 +71,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   // Every push-workspace consumer flips the WHOLE counter array each round
   // (each has a tail loop up to num_counters), so all counters hold the same
   // phase at this point and counter[0] is equivalent to counter[bx]. Reading a
-  // single counter is what frees the producer grid from num_push_blocks.
+  // single counter is what frees the producer grid from the counter array size.
   const uint32_t phase = params.counter[0].get() & 1;
 
   vec_t input_vec[M];
@@ -117,7 +115,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const uint32_t elem = (params.rank * M + m) * kNLocal + bx * N_SPLIT + n;
     const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
     const auto dst = reinterpret_cast<uint32_t*>(base + elem);
-    multimem_store_relaxed(dst, bits);
+    ptx::multimem_store_relaxed(dst, bits);
   }
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -127,8 +125,8 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
   Counter* counter;       // per-block phase counters (read + flip)
-  uint32_t num_counters;  // full counter array size (num_push_blocks)
-  uint32_t half_bytes;    // bytes per phase half (world_size * push_bytes)
+  uint32_t num_counters;  // full counter array size (PushPlane::num_blocks)
+  uint32_t half_bytes;    // bytes per phase half (world_size * slot_bytes)
   const bf16_t* b;        // [M, N]
   const bf16_t* c;        // may be null
   bf16_t* out;            // [M, N]
@@ -175,10 +173,7 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
     // spin until all 4 packed pairs of the vector have landed
     uint4 raw;
     do {
-      asm volatile("ld.relaxed.gpu.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                   : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
-                   : "l"(src)
-                   : "memory");
+      ptx::ld_relaxed_16B(raw, src, 0);
     } while (raw.x == 0 || raw.y == 0 || raw.z == 0 || raw.w == 0);
     const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
     vec_t out_vec;
@@ -215,7 +210,7 @@ struct GEMMAGKernel {
   // Standalone GEMV at the same shape: 4.15 / 3.20 / 2.56 us, and 16 -> 4.42 us,
   // so the trend is monotonic and 2 is the floor (the epilogue stores column
   // pairs, so N_SPLIT must stay even). 8 used to be the largest grid that fit
-  // the old kNumProducerBlocks <= num_push_blocks bound; the producer now reads
+  // the old kNumProducerBlocks <= push.num_blocks bound; the producer now reads
   // a single phase counter, so the grid is free and 112 blocks did not even
   // fill one per SM.
   static constexpr uint32_t N_SPLIT = 2;
@@ -233,15 +228,9 @@ struct GEMMAGKernel {
   static constexpr auto kGemvTable = make_table(std::make_index_sequence<kMaxM>{});
 
   static void
-  run(CommunicatorRef ref,
-      TensorView x,
-      TensorView weight,
-      TensorView b,
-      std::optional<TensorView> c,
-      TensorView out,
-      intptr_t ws_mc_base) {
+  run(CommunicatorRef ref, TensorView x, TensorView weight, TensorView b, std::optional<TensorView> c, TensorView out) {
     using namespace host;
-    const auto& data = *ref.get();
+    const auto& push = ref.get()->get_push_obj();
 
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
@@ -255,19 +244,19 @@ struct GEMMAGKernel {
     TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     CHECK_HOST(num_tokens >= 1 && num_tokens <= kMaxM);
-    CHECK_HOST(data.world_size == gemm_ag::kWorld) << "the kernel is compiled for TP" << gemm_ag::kWorld;
-    CHECK_HOST(ws_mc_base != 0) << "requires a multicast-capable workspace";
-    CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= data.push_bytes)
-        << "staging slice exceeds the push slot size " << data.push_bytes;
+    CHECK_HOST(push.world_size == gemm_ag::kWorld) << "the kernel is compiled for TP" << gemm_ag::kWorld;
+    CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
+    CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= push.slot_bytes)
+        << "staging slice exceeds the push slot size " << push.slot_bytes;
     // The producer grid is no longer bound to the counter array: it reads only
     // counter[0] (see gemm_ag_gemv_kernel). The consumer grid still is.
-    CHECK_HOST(data.num_push_blocks > 0) << "no push blocks available";
+    CHECK_HOST(push.num_blocks > 0) << "no push blocks available";
     // producer: GEMV
     const auto producer_params = gemm_ag::ProducerParams{
-        .ws_mc = reinterpret_cast<uint8_t*>(ws_mc_base),
-        .counter = data.push_counter,
-        .half_bytes = static_cast<uint32_t>(data.push_bytes * data.world_size),
-        .rank = data.rank,
+        .ws_mc = push.mc_workspace,
+        .counter = push.counter,
+        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
+        .rank = push.rank,
     };
     LaunchKernel(kNumProducerBlocks, kGemvBlock, device.unwrap())
         .enable_pdl(kUsePDL)(
@@ -278,10 +267,10 @@ struct GEMMAGKernel {
 
     // consumer: spin + add3
     const auto consumer_params = gemm_ag::ConsumerParams{
-        .ws_local = data.push_workspaces[data.rank],
-        .counter = data.push_counter,
-        .num_counters = data.num_push_blocks,
-        .half_bytes = static_cast<uint32_t>(data.push_bytes * data.world_size),
+        .ws_local = push.workspaces[push.rank],
+        .counter = push.counter,
+        .num_counters = push.num_blocks,
+        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .b = static_cast<const bf16_t*>(b.data_ptr()),
         .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
         .out = static_cast<bf16_t*>(out.data_ptr()),
@@ -289,7 +278,7 @@ struct GEMMAGKernel {
     };
     const auto num_vecs = num_tokens * N / gemm_ag::kSpinVec;
     const auto num_consumers = host::div_ceil(num_vecs, gemm_ag::kSpinBlock);
-    CHECK_HOST(num_consumers + 1 <= data.num_push_blocks);
+    CHECK_HOST(num_consumers + 1 <= push.num_blocks);
     // use last block to clean up the counter
     const auto num_consumer_blocks = num_consumers + 1;
     using gemm_ag::spin_add3_kernel;
