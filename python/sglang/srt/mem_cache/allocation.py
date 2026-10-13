@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import is_pin_memory_available
+from sglang.utils import LazyImport
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -43,7 +44,9 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 if _is_cpu:
-    from sgl_kernel import assign_req_to_token_pool_cpu
+    assign_req_to_token_pool_cpu = LazyImport(
+        "sgl_kernel", "assign_req_to_token_pool_cpu"
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch

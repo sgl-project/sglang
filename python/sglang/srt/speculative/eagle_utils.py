@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -60,10 +61,10 @@ elif _is_musa:
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
 elif _is_cpu:
-    from sgl_kernel import (
-        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
+    sgl_build_tree_kernel_efficient_cpu = LazyImport(
+        "sgl_kernel", "build_tree_kernel_efficient_cpu"
     )
-    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+    sgl_verify_tree_greedy_cpu = LazyImport("sgl_kernel", "verify_tree_greedy_cpu")
 
 
 def per_step_draft_out_cache_loc(

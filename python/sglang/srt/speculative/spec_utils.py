@@ -70,6 +70,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.utils import LazyImport
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -87,7 +88,9 @@ if TYPE_CHECKING:
 
 
 if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+    assign_extend_cache_locs_cpu = LazyImport(
+        "sgl_kernel", "assign_extend_cache_locs_cpu"
+    )
 
 
 logger = logging.getLogger(__name__)
