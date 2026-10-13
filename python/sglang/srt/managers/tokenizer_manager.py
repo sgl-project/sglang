@@ -1195,6 +1195,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.mm_processor.prefer_tokenized_input and input_ids is not None
                 else (input_text or input_ids)
             )
+            if (
+                not self.mm_processor.use_token_space_processor
+                and isinstance(obj, GenerateReqInput)
+                and obj.mm_token_expansion_start_len
+            ):
+                raise ValueError(
+                    "Partial multimodal token expansion requires "
+                    "--enable-token-space-processor and a supported model."
+                )
 
             if (
                 not get_disagg().language_only
