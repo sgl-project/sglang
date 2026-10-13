@@ -1855,6 +1855,110 @@ class TestPrefillAdder(CustomTestCase):
             ).memory_budget.swa_never_fits(**req)
         )
 
+    def _create_mamba_fork_adder(self, *, chunk_tokens=4096):
+        # One extend tracks one Mamba state, so a prefill crossing the cached
+        # fork must stop there or the fork state never reaches the cache.
+        chunk_size = patch.object(
+            schedule_policy, "mamba_cache_chunk_size", return_value=64
+        )
+        chunk_size.start()
+        self.addCleanup(chunk_size.stop)
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=chunk_tokens
+        )
+        adder.split_prefill_at_mamba_fork = True
+        return adder
+
+    def _create_mamba_fork_req(self, rid, *, prompt=10000, prefix=0, fork=2112):
+        req = self.create_shared_req(rid)
+        req.full_untruncated_fill_ids = list(range(prompt))
+        req.prefix_len = prefix
+        req.mamba_branching_seqlen = fork
+        return req
+
+    def test_prefill_ends_at_mamba_fork(self):
+        adder = self._create_mamba_fork_adder()
+        req = self._create_mamba_fork_req("fork")
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(req.extend_len, 2112)
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_continuation_split_at_mamba_fork_keeps_one_unfinished_chunk(self):
+        adder = self._create_mamba_fork_adder()
+        continuation = self._create_mamba_fork_req("continuation", prefix=1024)
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        self.assertEqual(continuation.extend_len, 1088)
+
+        unfinished = self._create_mamba_fork_req("unfinished", fork=None)
+        self.assertEqual(
+            adder.add_one_req(
+                unfinished, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertIsNone(adder.new_chunked_req)
+        complete = self._create_mamba_fork_req("complete", prompt=512, fork=None)
+        adder.add_one_req(complete, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [continuation, complete])
+
+    def test_extended_host_load_still_stops_at_mamba_fork(self):
+        for loaded, expected_extend in ((1536, 576), (2048, 64)):
+            with self.subTest(loaded=loaded):
+                adder = self._create_mamba_fork_adder()
+                req = self._create_mamba_fork_req("load", prompt=3000)
+                req.host_hit_length = 1024
+                req.needs_host_load_back.return_value = True
+                req.best_match_node = req.last_node
+                req.kv = SimpleNamespace(cache_protected_len=0)
+                self.mock_tree_cache.init_load_back.side_effect = lambda params: (
+                    loaded,
+                    req.last_node,
+                )
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(req.prefix_len, loaded)
+                self.assertEqual(req.extend_len, expected_extend)
+                self.assertIs(adder.new_chunked_req, req)
+
+    def test_prefill_does_not_split_at_unreachable_or_unaligned_fork(self):
+        adder = self._create_mamba_fork_adder()
+        beyond_budget = self._create_mamba_fork_req("beyond", fork=5120)
+        adder.add_one_req(
+            beyond_budget, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(beyond_budget.extend_len, 4096)
+
+        for has_chunked_req, fork in ((False, 2100), (True, 2112)):
+            adder = self._create_mamba_fork_adder(chunk_tokens=None)
+            adder.rem_chunk_tokens = 32768
+            req = self._create_mamba_fork_req("whole", fork=fork)
+            adder.add_one_req(
+                req, has_chunked_req=has_chunked_req, truncation_align_size=None
+            )
+            self.assertEqual(req.extend_len, 10000)
+            self.assertIsNone(adder.new_chunked_req)
+
+    def test_prefill_fork_split_tracks_host_hit_prefix(self):
+        adder = self._create_mamba_fork_adder()
+        req = self._create_mamba_fork_req("host-hit")
+        admission = adder._select_prefill_admission(
+            req,
+            total_tokens=20000,
+            host_hit_length=1024,
+            swa_host_hit_length=0,
+            truncation_align_size=None,
+        )
+        self.assertEqual(admission.prefix_len, 1024)
+        self.assertEqual(admission.extend_len, 1088)
+        self.assertTrue(admission.is_chunked)
+
 
 if __name__ == "__main__":
     unittest.main()
