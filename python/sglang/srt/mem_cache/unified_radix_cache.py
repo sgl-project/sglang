@@ -912,11 +912,29 @@ class UnifiedRadixCache(BasePrefixCache):
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
+            # An allocation-driven FULL request names the allocator's
+            # shortfall, not what the walk must free: an allocator can hide
+            # headroom behind a clamp (a reserve it refills before raw
+            # allocation sees a page again) or page rounding, so freeing
+            # exactly the shortfall can leave its target unmet. Such a walk
+            # runs to the target; the check after every victim still stops it
+            # at the first sufficient one.
+            to_target = (
+                ct == ComponentType.FULL
+                and request_cnt > 0
+                and available_size_targets is not None
+                and ct in available_size_targets
+            )
             # A preceding component may have cascade-evicted this component or,
             # on a shared pool, released enough bytes to satisfy its allocation.
-            if tracker[ct] >= request_cnt or target_reached(ct):
+            if target_reached(ct) or (not to_target and tracker[ct] >= request_cnt):
                 continue
-            self.tree_core.evict_device_start(ct, request_cnt)
+            walk_quota = request_cnt
+            if to_target:
+                walk_quota = max(
+                    request_cnt, tracker[ct] + self.tree_core.full_evictable_size()
+                )
+            self.tree_core.evict_device_start(ct, walk_quota)
             try:
                 while True:
                     node_id, made_progress = self._evict_device_next_node(ct, tracker)
