@@ -56,6 +56,65 @@ def _make_mla_inputs(batch_size, num_heads, seed):
 
 
 class TestMLAScatterConcat(CustomTestCase):
+    def test_strided_absorbed_q_and_graph(self):
+        if not can_use_set_mla_kv_concat_q_fp8():
+            self.skipTest("fused FP8 MLA scatter+concat requires SM90+")
+        for batch_size in (1, 7, 64):
+            with self.subTest(batch_size=batch_size):
+                pool, loc, k_nope, k_rope, _, q_rope = _make_mla_inputs(
+                    batch_size, 4, seed=1
+                )
+                q = torch.randn(batch_size, 4, 128, device="cuda", dtype=torch.bfloat16)
+                w_kc = torch.randn(
+                    4, 128, NOPE_DIM, device="cuda", dtype=torch.bfloat16
+                )
+                absorbed = torch.bmm(q.transpose(0, 1), w_kc)
+                q_nope = absorbed.transpose(0, 1)
+                self.assertEqual(q_nope.data_ptr(), absorbed.data_ptr())
+                if batch_size > 1:
+                    self.assertFalse(q_nope.is_contiguous())
+                expected = torch.cat((q_nope, q_rope), dim=-1)
+                torch.testing.assert_close(
+                    concat_mla_absorb_q(q_nope, q_rope), expected
+                )
+                result = set_mla_kv_concat_q(pool, loc, k_nope, k_rope, q_nope, q_rope)
+                torch.testing.assert_close(result, expected)
+                fp8_pool = torch.zeros_like(pool, dtype=torch.float8_e4m3fn)
+
+                def concat():
+                    return set_mla_kv_concat_q_fp8(
+                        fp8_pool,
+                        loc,
+                        k_nope,
+                        k_rope,
+                        q_nope,
+                        q_rope,
+                        dcp_world_size=2,
+                        dcp_rank=1,
+                    )
+
+                concat()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    result = concat()
+                q_nope.mul_(0.5)
+                graph.replay()
+                expected = torch.cat((q_nope, q_rope), dim=-1).to(torch.float8_e4m3fn)
+                self.assertTrue(
+                    torch.equal(result.view(torch.uint8), expected.view(torch.uint8))
+                )
+                owned = loc % 2 == 1
+                expected_pool = torch.zeros_like(fp8_pool)
+                expected_pool[loc[owned] // 2] = torch.cat(
+                    (k_nope[owned], k_rope[owned]), dim=-1
+                ).to(torch.float8_e4m3fn)
+                self.assertTrue(
+                    torch.equal(
+                        fp8_pool.view(torch.uint8), expected_pool.view(torch.uint8)
+                    )
+                )
+
     def test_mla_scatter_concat_bf16_and_fp8(self):
         batch_size, num_heads = 64, 8
         pool, loc, k_nope, k_rope, q_nope, q_rope = _make_mla_inputs(
