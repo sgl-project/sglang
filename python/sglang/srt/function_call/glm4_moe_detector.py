@@ -23,6 +23,8 @@ from sglang.srt.function_call.utils import (
 
 logger = logging.getLogger(__name__)
 
+_ARG_VALUE_END_TAG = "</arg_value>"
+
 
 class StreamState(str, Enum):
     """State machine states for XML to JSON streaming conversion."""
@@ -32,6 +34,80 @@ class StreamState(str, Enum):
     IN_KEY = "IN_KEY"
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
+
+
+def _get_argument_schema(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> Any:
+    name2tool = {tool.function.name: tool for tool in defined_tools}
+    if func_name not in name2tool:
+        return None
+    tool = name2tool[func_name]
+    properties = get_schema_properties(tool.function.parameters)
+    return properties.get(arg_key)
+
+
+def _json_schema_allows_null(schema: Any) -> bool:
+    """Return whether ``null`` satisfies the supported JSON Schema keywords."""
+    if isinstance(schema, bool):
+        return schema
+    if not isinstance(schema, dict):
+        return False
+
+    nullable_extension = schema.get("nullable") is True
+    if "type" in schema:
+        schema_type = schema["type"]
+        type_allows_null = schema_type == "null" or (
+            isinstance(schema_type, list) and "null" in schema_type
+        )
+        if not type_allows_null and not nullable_extension:
+            return False
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and None not in enum_values:
+        return False
+    if "const" in schema and schema["const"] is not None:
+        return False
+
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and not any(
+        _json_schema_allows_null(branch) for branch in any_of
+    ):
+        return False
+
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        null_branch_count = sum(_json_schema_allows_null(branch) for branch in one_of)
+        if null_branch_count != 1:
+            return False
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list) and not all(
+        _json_schema_allows_null(branch) for branch in all_of
+    ):
+        return False
+
+    not_schema = schema.get("not")
+    if not_schema is not None and _json_schema_allows_null(not_schema):
+        return False
+
+    return True
+
+
+def _is_json_null(value: str) -> bool:
+    return value.strip() == "null"
+
+
+def _is_potential_json_null(value: str) -> bool:
+    """Whether a streamed value can still become ``null`` plus its end tag."""
+    stripped = value.lstrip()
+    tag_start = stripped.find("<")
+    if tag_start == -1:
+        return "null".startswith(stripped.rstrip())
+
+    value_part = stripped[:tag_start].rstrip()
+    tag_part = stripped[tag_start:]
+    return "null".startswith(value_part) and _ARG_VALUE_END_TAG.startswith(tag_part)
 
 
 def get_argument_type(
@@ -55,16 +131,12 @@ def get_argument_type(
     Returns:
         The type string (e.g., 'string', 'number', 'object') or None if not found
     """
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
-        return None
-    tool = name2tool[func_name]
-    properties = get_schema_properties(tool.function.parameters)
-    if arg_key not in properties:
+    schema = _get_argument_schema(func_name, arg_key, defined_tools)
+    if schema is None:
         return None
 
     # Use new type inference function for complex JSON Schema support
-    return infer_type_from_json_schema(properties[arg_key])
+    return infer_type_from_json_schema(schema)
 
 
 def _convert_to_number(value: str) -> Any:
@@ -165,17 +237,24 @@ class Glm4MoeDetector(BaseFormatDetector):
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
+    # Only the first opener can match (a later one sees a subset of the text), so
+    # anchoring to it keeps a failed search from rescanning from every opener.
     _STREAMING_PARTIAL_PATTERN = re.compile(
-        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+        r"\A(?:(?!<tool_call>).)*<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+        re.DOTALL,
     )
 
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        # An unclosed trailing call matches the second branch and yields "" (skipped
+        # by the caller), so findall does not rescan the tail from every opener.
+        self.func_call_regex = r"(<tool_call>.*?</tool_call>)|<tool_call>.*"
+        # Each split call starts at its opener, and a later opener sees a subset of
+        # the text, so anchoring keeps a failed search from rescanning per opener.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+            r"\A<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -198,6 +277,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._cached_value_allows_null = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -292,17 +372,22 @@ class Glm4MoeDetector(BaseFormatDetector):
         # Default to string (safest fallback)
         return "string"
 
-    def _format_value_complete(self, value: str, value_type: str) -> str:
+    def _format_value_complete(
+        self, value: str, value_type: str, allows_null: bool = False
+    ) -> str:
         """Format complete value based on type.
 
         Args:
             value: Raw value string
             value_type: Expected type ('string', 'number', 'object')
+            allows_null: Whether the argument schema explicitly permits null
 
         Returns:
             Properly formatted JSON value string
         """
         if value_type == "string":
+            if allows_null and _is_json_null(value):
+                return "null"
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
@@ -368,10 +453,15 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
+                    schema = _get_argument_schema(func_name, self._current_key, tools)
+                    self._cached_value_allows_null = (
+                        self._cached_value_type == "string"
+                        and _json_schema_allows_null(schema)
+                    )
 
             elif self._stream_state == StreamState.IN_VALUE:
-                if self._xml_tag_buffer.endswith("</arg_value>"):
-                    final_value = self._xml_tag_buffer[:-12]
+                if self._xml_tag_buffer.endswith(_ARG_VALUE_END_TAG):
+                    final_value = self._xml_tag_buffer[: -len(_ARG_VALUE_END_TAG)]
                     self._current_value += final_value
 
                     # Use cached value type for consistency
@@ -392,7 +482,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     else:
                         # Value was never started (empty or complete in one chunk)
                         json_output += self._format_value_complete(
-                            self._current_value, value_type
+                            self._current_value,
+                            value_type,
+                            self._cached_value_allows_null,
                         )
 
                     self._xml_tag_buffer = ""
@@ -400,8 +492,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
+                    self._cached_value_allows_null = False
                 else:
-                    closing_tag = "</arg_value>"
+                    closing_tag = _ARG_VALUE_END_TAG
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
                         closing_tag
                     ) and closing_tag.startswith(self._xml_tag_buffer)
@@ -412,6 +505,13 @@ class Glm4MoeDetector(BaseFormatDetector):
                         value_type = self._cached_value_type or "string"
 
                         if value_type == "string":
+                            # Delay only the prefix needed to distinguish JSON null
+                            # from an ordinary nullable string such as "nullish".
+                            if (
+                                self._cached_value_allows_null
+                                and _is_potential_json_null(self._xml_tag_buffer)
+                            ):
+                                continue
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -641,7 +741,16 @@ class Glm4MoeDetector(BaseFormatDetector):
             arg_type = get_argument_type(func_name, arg_key, tools)
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
-            if arg_type == "string":
+            schema = _get_argument_schema(func_name, arg_key, tools)
+            if (
+                arg_type == "string"
+                and _json_schema_allows_null(schema)
+                and is_good_json
+                and parsed_value is None
+                and _is_json_null(arg_value)
+            ):
+                arguments[arg_key] = None
+            elif arg_type == "string":
                 # Only convert to string if explicitly defined as string type
                 if isinstance(parsed_value, str):
                     arguments[arg_key] = parsed_value

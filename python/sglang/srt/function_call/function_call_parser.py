@@ -14,7 +14,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import NativeToolConstraintError, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -382,6 +382,10 @@ class FunctionCallParser:
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
                 return ("json_schema", json_schema)
+        except NativeToolConstraintError:
+            # The detector requires its native protocol. Returning None here
+            # would let serving silently replace it with a JSON constraint.
+            raise
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None

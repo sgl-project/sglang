@@ -371,7 +371,9 @@ class ServerArgs:
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
-            f"Use 'auto' to detect from chat template. "
+            f"Use 'auto' to detect from chat template. When unset, a model "
+            f"family with a dedicated parser defaults to it "
+            f"(BailingMoeV3 -> ling3). "
             f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
