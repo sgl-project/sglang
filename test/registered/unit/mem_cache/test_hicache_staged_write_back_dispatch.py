@@ -274,6 +274,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.components = {}
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)
@@ -517,6 +518,11 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.device_pool = device_pool
+        host.device_k_buffers = tuple(k_layers)
+        host.device_v_buffers = tuple(v_layers)
+        host.device_k_data_ptrs = device_pool.k_data_ptrs
+        host.device_v_data_ptrs = device_pool.v_data_ptrs
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
@@ -602,12 +608,14 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         device_k = torch.empty(2, 3, 2, 1, 1)
         device_v = torch.empty_like(device_k)
-        device_pool = SimpleNamespace(
+        device_pool = _device_pool_stub(
+            layer_num=2,
             # FIA exposes lists here; these must not be sent to the operator.
             k_buffer=[device_k[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
             v_buffer=[device_v[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
             get_hicache_transfer_buffers=mock.Mock(return_value=(device_k, device_v)),
         )
+        host.device_pool = device_pool
         host_indices = _indices(0, 2)
         device_indices = _indices(2, 4)
         directions = SimpleNamespace(H2D="H2D", D2H="D2H")
@@ -667,6 +675,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
         host.device_pool = device_pool
+        host.device_kv_buffers = tuple(device_layers)
+        host.device_data_ptrs = device_pool.data_ptrs
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
