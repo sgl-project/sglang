@@ -294,6 +294,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
         self.assertEqual(req.prefix_len, 4)
         self.assertEqual(req.dllm_block_offset, 4)
         self.assertFalse(req.is_dllm_prefill())
+        self.assertFalse(req.dllm_has_literal_mask)
         self.assertEqual(list(req.full_untruncated_fill_ids[4:8]), [5, 99, 99, 99])
 
     def test_retraction_reencodes_committed_outputs_before_denoising(self):
@@ -301,6 +302,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
         req.reset_for_retract()
         req.init_next_round_input()
         self.assertEqual(list(req.output_ids), [7, 99, 8, 9, 10])
+        self.assertTrue(req.dllm_has_literal_mask)
         self.assertTrue(req.is_dllm_prefill())
         # The second complete block consists of already-emitted output tokens.
         req.prefix_len = 4

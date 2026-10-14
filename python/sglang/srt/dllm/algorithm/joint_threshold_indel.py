@@ -54,8 +54,8 @@ class JointThresholdInDel(DllmAlgorithm):
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         # Explicit metadata distinguishes literal mask IDs in committed tokens
-        # from masks to denoise. Keep the legacy contiguous-prefix fallback for
-        # batches that do not provide it.
+        # from masks to denoise. Batches without literal mask IDs carry no
+        # mask, and their committed tokens are the contiguous non-mask prefix.
         prompt_mask = forward_batch.dllm_prompt_mask
         if prompt_mask is None:
             prompt_lens = (input_ids != self.mask_id).cumprod(dim=1).sum(dim=1)
