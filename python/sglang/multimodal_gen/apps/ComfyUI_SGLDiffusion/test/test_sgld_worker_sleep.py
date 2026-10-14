@@ -423,3 +423,32 @@ def test_release_worker_cache_records_resident_bytes(monkeypatch):
     gen.worker_asleep = True
     gen.release_worker_cache()
     assert len(sent) == 1
+
+
+# --- VRAM accounting, moved here from #43536 ---------------------------------
+
+
+def test_model_size_uses_real_computed_size_for_every_model_type():
+    for model_type, size in (
+        ("minimax_h3", 13_000_000_000),
+        ("qwen_image", 20_000_000_000),
+    ):
+        patcher = SGLDModelPatcher(
+            torch.nn.Module(),
+            torch.device("cpu"),
+            torch.device("cpu"),
+            size=size,
+            model_type=model_type,
+        )
+        assert patcher.model_size() == size
+
+
+def test_model_size_falls_back_to_table_only_when_size_unknown():
+    patcher = SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=0,
+        model_type="flux",
+    )
+    assert patcher.model_size() == 27 * 1024 * 1024 * 1024
