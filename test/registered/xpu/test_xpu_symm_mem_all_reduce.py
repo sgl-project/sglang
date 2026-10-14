@@ -25,14 +25,15 @@ from sglang.srt.distributed.device_communicators.xpu_symm_mem import (
 )
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.test_utils import is_in_ci
 
-register_xpu_ci(est_time=180, suite="nightly-xpu-2-gpu", nightly=True)
+register_xpu_ci(est_time=180, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 _WORLD_SIZE = 2
 _MAX_BYTES = 512 * 1024
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32]
-# 128 exercises a masked block tail; 65536 sits on the 512 KiB fp32 ceiling.
-_NUMELS = [128, 3584, 65536]
+# 128 exercises a masked block tail; 131072 fp32 fills the 512 KiB buffer.
+_NUMELS = [128, 3584, 131072]
 
 _comm_cache = {}
 
@@ -46,7 +47,14 @@ def _get_comm() -> XpuSymmMemCommunicator:
         _comm_cache["comm"] = XpuSymmMemCommunicator(
             group=dist.group.WORLD, device=torch.device(f"xpu:{local_rank}")
         )
-    return _comm_cache["comm"]
+    comm = _comm_cache["comm"]
+    if comm.disabled:
+        # The CI container grants SYS_PTRACE for rendezvous, so a disabled
+        # communicator there is a broken setup rather than a missing feature.
+        if is_in_ci():
+            pytest.fail("XPU symmetric memory unavailable in CI")
+        pytest.skip("XPU symmetric memory unavailable")
+    return comm
 
 
 def _shards(numel: int, dtype: torch.dtype, world_size: int) -> list[torch.Tensor]:
@@ -72,8 +80,6 @@ def _reference(shards: list[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
 @torch.inference_mode()
 def test_one_shot_all_reduce_matches_ordered_fp32_sum() -> None:
     comm = _get_comm()
-    if comm.disabled:
-        pytest.skip("XPU symmetric memory unavailable")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -99,8 +105,6 @@ def test_one_shot_all_reduce_matches_ordered_fp32_sum() -> None:
 def test_ineligible_payloads_fall_back() -> None:
     """Rejected inputs must return None so the caller falls back."""
     comm = _get_comm()
-    if comm.disabled:
-        pytest.skip("XPU symmetric memory unavailable")
 
     max_bf16 = comm.max_bytes // 2
     too_large = torch.zeros(max_bf16 + 1, dtype=torch.bfloat16, device=comm.device)

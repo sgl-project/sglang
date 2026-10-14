@@ -289,6 +289,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
+    xpu_symm_mem_comm: Optional[Any]  # Intel XPU symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -547,16 +548,17 @@ class GroupCoordinator:
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
-        self.torch_symm_mem_comm: Optional[
-            Union[TorchSymmMemCommunicator, XpuSymmMemCommunicator]
-        ] = None
+        self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
-            # XPU has no multimem / one-shot / two-shot symm_mem ops, so it
-            # needs its own communicator with the same call contract.
-            symm_mem_cls = (
-                XpuSymmMemCommunicator if _is_xpu else TorchSymmMemCommunicator
+            self.torch_symm_mem_comm = TorchSymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
             )
-            self.torch_symm_mem_comm = symm_mem_cls(
+        # Kept apart from torch_symm_mem_comm, which the Inkling kernels and the
+        # outplace path read as the CUDA communicator.
+        self.xpu_symm_mem_comm: Optional[XpuSymmMemCommunicator] = None
+        if self.use_torch_symm_mem_all_reduce and self.world_size > 1 and _is_xpu:
+            self.xpu_symm_mem_comm = XpuSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -1084,6 +1086,7 @@ class GroupCoordinator:
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
+        xpu_symm_mem_comm = self.xpu_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif (
@@ -1092,6 +1095,12 @@ class GroupCoordinator:
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
+        elif (
+            xpu_symm_mem_comm is not None
+            and not xpu_symm_mem_comm.disabled
+            and xpu_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            xpu_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
