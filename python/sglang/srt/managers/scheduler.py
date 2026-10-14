@@ -1540,7 +1540,6 @@ class Scheduler:
         )
 
     def init_request_intake(self) -> None:
-        """Built after the mode owners; a PD role switch rebuilds it."""
         self.request_intake = RequestIntake(
             core_lists=self.lists,
             counters=self.counters,
@@ -1553,12 +1552,9 @@ class Scheduler:
             session_controller=self.session_controller,
             grammar_manager=self.grammar_manager,
             request_retirer=self.request_retirer,
-            disagg_prefill=self.disagg_prefill,
-            disagg_decode=self.disagg_decode,
-            dllm=self.dllm,
+            mode_owners=self.mode_owners,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.disaggregation_mode,
             transfer_backend=self.transfer_backend,
             tokenizer=self.tokenizer,
             mm_processor=self._mm_processor,

@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.req_state import DisaggReqState
-from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
+from sglang.srt.disaggregation.utils import is_unadmitted_reject
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import publish, reset_context
@@ -291,7 +291,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         """
         req = _make_req()
         req.set_finish_with_abort(ERROR_MSG)
-        intake = make_request_intake(disaggregation_mode=DisaggregationMode.NULL)
+        intake = make_request_intake()
         intake._set_or_validate_priority = MagicMock(return_value=True)
         intake._abort_on_queued_limit = MagicMock(return_value=False)
         intake._prefetch_kvcache = MagicMock()

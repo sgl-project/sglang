@@ -349,6 +349,10 @@ _BUILT = {
         "managers/scheduler_components/request_registry.py",
         "RequestRegistry",
     ),
+    "RequestIntake": (
+        "managers/scheduler_components/request_intake.py",
+        "RequestIntake",
+    ),
 }
 
 # The modules whose classes sit below ModeOwners.

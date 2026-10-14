@@ -370,16 +370,15 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return manager.validate_request(req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
+        from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
         from sglang.srt.runtime_context import get_context, get_parallel
         from sglang.test.scheduler_request_intake import make_request_intake
 
         sender = Mock()
         intake = make_request_intake(
             model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
-            disaggregation_mode=DisaggregationMode.NULL,
-            dllm=_manager(fdfo=False),
+            mode_owners=ModeOwners(dllm=_manager(fdfo=False)),
             output_streamer=Mock(),
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
         )

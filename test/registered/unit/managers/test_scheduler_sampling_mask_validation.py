@@ -6,12 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.runtime_context import get_context
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
 
@@ -21,22 +28,24 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
         """Neither PD role may queue mask requests without metadata buffers."""
+        enter_scope(self, published_topology())
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 buffers = SimpleNamespace(enable_sampling_mask=False)
                 output_streamer = MagicMock()
                 intake = make_request_intake(
                     model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
-                    disaggregation_mode=mode,
-                    disagg_prefill=(
-                        prefill_owner_shell(metadata_buffers=buffers)
-                        if mode == DisaggregationMode.PREFILL
-                        else None
-                    ),
-                    disagg_decode=(
-                        decode_owner_shell(metadata_buffers=buffers)
-                        if mode == DisaggregationMode.DECODE
-                        else None
+                    mode_owners=ModeOwners(
+                        disagg_prefill=(
+                            prefill_owner_shell(metadata_buffers=buffers)
+                            if mode == DisaggregationMode.PREFILL
+                            else None
+                        ),
+                        disagg_decode=(
+                            decode_owner_shell(metadata_buffers=buffers)
+                            if mode == DisaggregationMode.DECODE
+                            else None
+                        ),
                     ),
                     spec_algorithm=SimpleNamespace(
                         is_dflash_family=lambda: False,
@@ -50,6 +59,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         ipc_channels=MagicMock(),
                     ),
                 )
+                get_context().override("test", disaggregation_mode=mode.value)
                 intake._maybe_namespace_elastic_radix_cache = MagicMock()
                 intake.add_request_to_queue = MagicMock()
                 recv_req = MagicMock(

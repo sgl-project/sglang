@@ -56,9 +56,6 @@ from sglang.srt.speculative.uno_validation import validate_uno_request
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.constrained.grammar_manager import GrammarManager
-    from sglang.srt.disaggregation.decode import DisaggDecode
-    from sglang.srt.disaggregation.prefill import DisaggPrefill
-    from sglang.srt.dllm.manager import DllmManager
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
@@ -71,6 +68,7 @@ if TYPE_CHECKING:
         SchedulerIpcChannels,
     )
     from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
@@ -111,12 +109,9 @@ class RequestIntake:
         session_controller: SessionController,
         grammar_manager: GrammarManager,
         request_retirer: RequestRetirer,
-        disagg_prefill: Optional[DisaggPrefill],
-        disagg_decode: Optional[DisaggDecode],
-        dllm: Optional[DllmManager],
+        mode_owners: ModeOwners,
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
-        disaggregation_mode: DisaggregationMode,
         transfer_backend: TransferBackend,
         tokenizer: Any,
         mm_processor: Any,
@@ -142,14 +137,10 @@ class RequestIntake:
         self.session_controller = session_controller
         self.grammar_manager = grammar_manager
         self.request_retirer = request_retirer
-        # The mode owners. A PD role switch replaces them, and the scheduler
-        # then builds a new intake.
-        self.disagg_prefill = disagg_prefill
-        self.disagg_decode = disagg_decode
-        self.dllm = dllm
+        # A PD role switch replaces the owners in place.
+        self.mode_owners = mode_owners
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
-        self.disaggregation_mode = disaggregation_mode
         self.transfer_backend = transfer_backend
         self.tokenizer = tokenizer
         self._mm_processor = mm_processor
@@ -505,6 +496,8 @@ class RequestIntake:
         *,
         mm_input_error: Optional[str] = None,
     ):
+        # Read at call time: a PD role switch changes it.
+        disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -551,7 +544,7 @@ class RequestIntake:
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
-                disagg_mode=self.disaggregation_mode,
+                disagg_mode=disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
@@ -583,7 +576,7 @@ class RequestIntake:
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
-            if self.disaggregation_mode != DisaggregationMode.NULL:
+            if disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
                     recv_req.bootstrap_room is None
@@ -613,7 +606,7 @@ class RequestIntake:
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
-                disagg_mode=self.disaggregation_mode,
+                disagg_mode=disaggregation_mode,
             )
             if get_memory().enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -663,7 +656,9 @@ class RequestIntake:
             self.add_request_to_queue(req)
             return
 
-        if self.dllm is not None and (error_msg := self.dllm.validate_request(req)):
+        if self.mode_owners.dllm is not None and (
+            error_msg := self.mode_owners.dllm.validate_request(req)
+        ):
             abort_req = make_abort_req(
                 req,
                 finished_reason={
@@ -696,9 +691,9 @@ class RequestIntake:
 
         if req.return_sampling_mask:
             if (
-                self.disaggregation_mode != DisaggregationMode.NULL
+                disaggregation_mode != DisaggregationMode.NULL
                 and not (
-                    self.disagg_prefill or self.disagg_decode
+                    self.mode_owners.disagg_prefill or self.mode_owners.disagg_decode
                 ).metadata_buffers.enable_sampling_mask
             ):
                 self.request_retirer.reject_sampling_mask_request(
@@ -986,11 +981,11 @@ class RequestIntake:
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
-        if self.disagg_prefill is not None:
+        if self.mode_owners.disagg_prefill is not None:
             self._prefetch_kvcache(req)
-            self.disagg_prefill.enqueue(req)
-        elif self.disagg_decode is not None:
-            self.disagg_decode.enqueue(req, is_retracted=is_retracted)
+            self.mode_owners.disagg_prefill.enqueue(req)
+        elif self.mode_owners.disagg_decode is not None:
+            self.mode_owners.disagg_decode.enqueue(req, is_retracted=is_retracted)
         else:
             if self._abort_on_queued_limit(req, admitted):
                 self.request_retirer.release_aborted_request(req)

@@ -79,17 +79,18 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
-            disagg_prefill=(
-                prefill_owner_shell(bootstrap_queue=MagicMock(), num_kv_heads=8)
-                if disaggregation_mode == DisaggregationMode.PREFILL
-                else None
+            mode_owners=ModeOwners(
+                disagg_prefill=(
+                    prefill_owner_shell(bootstrap_queue=MagicMock(), num_kv_heads=8)
+                    if disaggregation_mode == DisaggregationMode.PREFILL
+                    else None
+                ),
+                disagg_decode=(
+                    decode_owner_shell(prealloc_queue=MagicMock())
+                    if disaggregation_mode == DisaggregationMode.DECODE
+                    else None
+                ),
             ),
-            disagg_decode=(
-                decode_owner_shell(prealloc_queue=MagicMock())
-                if disaggregation_mode == DisaggregationMode.DECODE
-                else None
-            ),
-            disaggregation_mode=disaggregation_mode,
         )
         intake._prefetch_kvcache = MagicMock()
         intake._abort_on_queued_limit = MagicMock(return_value=False)
@@ -112,7 +113,9 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         intake.add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        intake.disagg_prefill.bootstrap_queue.add.assert_called_once_with(req, 8)
+        intake.mode_owners.disagg_prefill.bootstrap_queue.add.assert_called_once_with(
+            req, 8
+        )
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
@@ -122,7 +125,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         intake.add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        intake.disagg_decode.prealloc_queue.add.assert_called_once_with(
+        intake.mode_owners.disagg_decode.prealloc_queue.add.assert_called_once_with(
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
@@ -155,7 +158,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         ):
             intake.add_request_to_queue(req)
 
-        intake.disagg_decode.prealloc_queue.add.assert_not_called()
+        intake.mode_owners.disagg_decode.prealloc_queue.add.assert_not_called()
         intake.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
@@ -179,10 +182,10 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 )
                 intake._prefetch_kvcache.assert_not_called()
                 self.assertEqual(intake.lists.waiting_queue, [])
-                if intake.disagg_prefill is not None:
-                    intake.disagg_prefill.bootstrap_queue.add.assert_not_called()
-                if intake.disagg_decode is not None:
-                    intake.disagg_decode.prealloc_queue.add.assert_not_called()
+                if intake.mode_owners.disagg_prefill is not None:
+                    intake.mode_owners.disagg_prefill.bootstrap_queue.add.assert_not_called()
+                if intake.mode_owners.disagg_decode is not None:
+                    intake.mode_owners.disagg_decode.prealloc_queue.add.assert_not_called()
 
     def test_full_queue_releases_only_the_rejected_request(self):
         for priority in (0, 2):

@@ -122,17 +122,10 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
-            scheduler.init_request_intake()
             # The step planner outlives the switch; it reads the new decode
-            # owner, registry and intake.
+            # owner and registry.
             scheduler.step_planner.disagg_decode = scheduler.disagg_decode
             scheduler.step_planner.request_registry = scheduler.request_registry
-            scheduler.step_planner.add_request_to_queue = (
-                scheduler.request_intake.add_request_to_queue
-            )
-            scheduler.step_planner.prefetch_after_device_hit_loss = (
-                scheduler.request_intake.prefetch_after_device_hit_loss
-            )
             scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
             scheduler.init_step_launcher()

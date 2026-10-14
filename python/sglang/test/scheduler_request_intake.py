@@ -5,9 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_intake import RequestIntake
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -27,12 +28,9 @@ def make_request_intake(**deps) -> RequestIntake:
         session_controller=MagicMock(),
         grammar_manager=MagicMock(),
         request_retirer=MagicMock(),
-        disagg_prefill=None,
-        disagg_decode=None,
-        dllm=None,
+        mode_owners=ModeOwners(),
         model_config=MagicMock(),
         spec_algorithm=SpeculativeAlgorithm.NONE,
-        disaggregation_mode=DisaggregationMode.NULL,
         transfer_backend=TransferBackend.MOONCAKE,
         tokenizer=None,
         mm_processor=None,
