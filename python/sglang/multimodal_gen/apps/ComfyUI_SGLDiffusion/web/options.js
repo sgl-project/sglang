@@ -15,7 +15,6 @@ app.registerExtension({
       const states = new WeakMap();
       const headers = {};
       node.properties ??= {};
-      node.properties.sgld_sections ??= {};
       const sections = () => node.properties.sgld_sections ??= {};
       const values = () => Object.fromEntries(fieldWidgets.map(w => [w.name, w.value]));
       for (const [group, label] of Object.entries(GROUPS)) {
