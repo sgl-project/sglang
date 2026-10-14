@@ -460,7 +460,7 @@ class TestRustFrontendE2E(CustomTestCase):
             self.assertEqual(server.max_context_length, 4096)
             self.assertEqual(server.served_model_name, "e2e-model")
             self.assertEqual(server.disaggregation_mode, "null")
-            self.assertEqual(server.dp_size, 1)
+            self.assertEqual(server.deployment_info.dp_size, 1)
         decoded = self.stub.Detokenize(
             self.service_pb.DetokenizeRequest(tokens=self.tokens), timeout=30
         ).text
