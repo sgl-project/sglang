@@ -1,0 +1,184 @@
+---
+title: Ling-3.1-flash
+description: "Deploy Ling-3.1-flash with SGLang — FP8 hybrid KDA + MLA MoE recipes for H200 and GB300 GPUs, measured accuracy and decode speed, and Mooncake prefix caching."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Use the Ling-3.1-flash image, which includes model support and the decode optimizations used by these recipes. Both images support multiple CPU architectures.
+
+<Tabs>
+<Tab title="H200">
+
+```bash Command
+docker pull lmsysorg/sglang:dev-ling-3.1-flash
+```
+
+</Tab>
+<Tab title="GB300 (CUDA 13)">
+
+```bash Command
+docker pull lmsysorg/sglang:dev-cu13-ling-3.1-flash
+```
+
+</Tab>
+</Tabs>
+
+Select **Docker** in the command panel to launch the matching image. The **Python** command requires an environment with the same Ling-3.1-flash build. See the [installation guide](/docs/get-started/install#method-3-using-docker) for Docker setup.
+
+</Accordion>
+
+Pick your hardware and recipe to generate the launch command:
+
+- **High-Throughput** — the standard FP8 recipe: H200 TP8 + EP8 or GB300 TP4 + EP4, with speculative decoding off.
+- **HiCache + Mooncake** — H200 TP8 + EP8 with Mooncake L3 prefix storage over TCP. Start the services in §3.3 before launching this recipe.
+
+<Warning>
+NEXTN and DSpark are **checkpoint pending**. Keep speculative decoding off for the current checkpoint; see the verification table and §2 for details.
+</Warning>
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/inclusionAI/ling-3.1-flash.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.1-flash-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+Experiment with SGLang features on top of the selected deployment. Overrides are unverified combinations unless explicitly listed below. The speculative-decoding options show the checkpoint requirements; the multi-turn prefix-cache preset adds the paired scheduler flags and environment setting.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model introduction
+
+[Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash) is a hybrid-attention Mixture-of-Experts language model using the `BailingMoeV3ForCausalLM` architecture. Its 72 layers combine Kimi Delta Attention (KDA) with Multi-head Latent Attention (MLA), with 512 routed experts. The checkpoint uses FP8 E4M3 weights in 128×128 blocks with dynamic activation quantization.
+
+The model supports reasoning and structured tool calling. Its configured context limit is 262,144 tokens (256K); full-length serving remains unverified for Ling-3.1-flash.
+
+**Checkpoint:** [inclusionAI/Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash). **License:** MIT.
+
+### Verification status
+
+Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separately from accuracy.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%", background: "rgba(255,255,255,0.02)"}} />
+    <col style={{width: "22%", background: "rgba(255,255,255,0.05)"}} />
+    <col style={{width: "50%", background: "rgba(255,255,255,0.02)"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Configuration</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Status</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Evidence</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.19% (1282/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.27%; stop rate 99.92% (measured with NEXTN enabled; standard-decoding rerun pending the corrected MTP checkpoint). Mooncake/TCP prefetch verified on all ranks.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.42% (1285/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>Current MTP head: acceptance length 1.00, acceptance rate 0.00 on H200 TP8 and GB300 TP4.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated; unverified by SGLang</td><td style={{padding: "9px 12px"}}>Tuned configurations are available upstream; hardware was unavailable for independent verification.</td></tr>
+  </tbody>
+</table>
+
+## 2. Configuration tips
+
+- Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
+- On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
+- Leave `--mem-fraction-static` at its default. The explicit `ling3` parser flags make the recipe clear; SGLang also selects these parsers automatically for this architecture.
+- **NEXTN:** keep `--speculative-algorithm NEXTN` unset until the corrected MTP checkpoint is available and revalidated. The current head adds overhead with zero accepted draft tokens; the same behavior was reproduced with the vendor build.
+- **DSpark:** the [Ling-3.0-flash draft](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) targets a 2,560-wide, 42-layer model. Ling-3.1-flash uses width 4,096 and 72 layers, so that draft is incompatible. Wait for a 3.1-compatible draft.
+- For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
+
+### Performance
+
+With the decode gates enabled, H200 TP8 + EP8 measured **103.39 output tokens/s** at batch size 1, with **9.18 ms TPOT**, using random 2,048-token inputs and 512-token outputs. GB300 TP4 + EP4 measured **74.04 output tokens/s** at batch size 1 in steady state. These are hardware-specific measurements, not a matched-workload comparison.
+
+The image includes KDA normalization/quantization fusion, FP8 block GEMV, router-gate matrix-vector kernels, and a 512-expert top-k router. A separate H200 batch-size-1 comparison measured **10.1%** higher throughput (94.57 → 104.15 tokens/s) with the gated optimizations, and **7.5%** on Ling-3.0-flash-fp8.
+
+<Accordion title="Reproduce the H200 speed workload">
+
+Launch the H200 **High-Throughput** recipe, then run:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host localhost --port 30000 \
+  --model inclusionAI/Ling-3.1-flash \
+  --dataset-name random \
+  --random-input-len 2048 --random-output-len 512 \
+  --random-range-ratio 1 \
+  --num-prompts 16 --max-concurrency 1 \
+  --flush-cache
+```
+
+</Accordion>
+
+<Accordion title="Reproduce GSM8K accuracy">
+
+```bash Command
+pip install sgl-eval
+sgl-eval run gsm8k \
+  --base-url http://localhost:30000/v1 \
+  --num-threads 32
+```
+
+Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. Compare the stop rate with the measured 99.92%; accuracy alone can hide generations that reach the token limit.
+
+</Accordion>
+
+## 3. Advanced usage
+
+### 3.1 Reasoning
+
+The `ling3` parser returns reasoning in `message.reasoning_content` and the final answer in `message.content`. Thinking is enabled by default. To request a direct answer, pass `"chat_template_kwargs": {"enable_thinking": false}` in the request body, or `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` with the OpenAI Python client.
+
+Use the command panel's cURL request to query the selected deployment. See the [request guide](/docs/basic_usage/send_request) for client examples.
+
+### 3.2 Tool calling
+
+The `ling3` tool-call parser returns structured calls in `message.tool_calls`, with `finish_reason` set to `tool_calls`. Send tools through the OpenAI-compatible `tools` field and return each tool result with its matching `tool_call_id`. Read both `reasoning_content` and `content` on the follow-up assistant turn.
+
+### 3.3 HiCache with Mooncake
+
+The verified H200 recipe uses Mooncake as L3 prefix storage over TCP. Start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
+
+<Accordion title="Start Mooncake services">
+
+```bash Command
+docker run --rm --network host --ipc=host \
+  lmsysorg/sglang:dev-ling-3.1-flash \
+  bash -lc '
+    python3 -m mooncake.http_metadata_server --port 8290 &
+    mooncake_master --port 50171 --metrics_port 9024 &
+    exec mooncake_client \
+      --host=127.0.0.1 \
+      --port=50172 \
+      --master_server_address=127.0.0.1:50171 \
+      --metadata_server=http://127.0.0.1:8290/metadata \
+      --protocol=tcp \
+      --device_names= \
+      --global_segment_size=4294967296 \
+      --enable_http_server=true \
+      --http_port=8291
+  '
+```
+
+</Accordion>
+
+Then select **H200 → HiCache + Mooncake** in Deployment. Docker commands use host networking so the SGLang container can reach these localhost services. Change the master and metadata endpoints in the **Env** dialog for a remote store.
+
+The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. Verification confirmed L3 prefetch on every TP rank.
+
+For storage sizing and backend details, see [HiCache best practices](/docs/advanced_features/hicache_best_practices).
