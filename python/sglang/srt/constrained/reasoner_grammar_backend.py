@@ -15,6 +15,8 @@
 
 import json
 import logging
+from collections import OrderedDict
+from concurrent.futures import Future
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -49,6 +51,8 @@ _canonical_inkling_auto_tool_schema: Optional[dict] = None
 _INKLING_FRAMED_KEY_TYPES = ("json", "regex", "ebnf")
 _INKLING_OPEN_TEXT_VARIANT = "inkling_open_text"
 _INKLING_THINK_BUDGET_VARIANT = "inkling_think_budget="
+# Arbitrary bound; budgets are a per-request knob, so only recent variants stay cached.
+_INKLING_BUDGET_VARIANT_CACHE_SIZE = 32
 
 
 def _get_canonical_inkling_auto_tool_schema() -> dict:
@@ -355,6 +359,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
+        self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
         think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if not think_end_ids:
             raise ValueError(
@@ -455,10 +460,33 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if _ends_in_open_inkling_text_block(input_ids):
             return (f"{key_type}:{_INKLING_OPEN_TEXT_VARIANT}", key_string)
         # Mirrors the strict wrapper, which applies a request budget only while filtering.
-        if self.enable_token_filter and thinking_budget is not None:
-            variant = f"{_INKLING_THINK_BUDGET_VARIANT}{thinking_budget}"
-            return (f"{key_type}:{variant}", key_string)
-        return key
+        if not self.enable_token_filter or thinking_budget is None:
+            return key
+        budget = max(thinking_budget, -1)
+        if budget == max(self.max_think_tokens, -1):
+            return key
+        return (f"{key_type}:{_INKLING_THINK_BUDGET_VARIANT}{budget}", key_string)
+
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
+        if key in self._budget_variant_keys:
+            self._budget_variant_keys.move_to_end(key)
+        return super().get_cached_or_future_value(key, require_reasoning)
+
+    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        super().set_cache(key, value)
+        if _INKLING_THINK_BUDGET_VARIANT not in key[0]:
+            return
+        self._budget_variant_keys[key] = None
+        self._budget_variant_keys.move_to_end(key)
+        while len(self._budget_variant_keys) > _INKLING_BUDGET_VARIANT_CACHE_SIZE:
+            evicted, _ = self._budget_variant_keys.popitem(last=False)
+            self.cache.pop(evicted, None)
+
+    def reset(self):
+        super().reset()
+        self._budget_variant_keys.clear()
 
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool

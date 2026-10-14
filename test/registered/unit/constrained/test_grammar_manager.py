@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 from xgrammar import TokenizerInfo
 
+from sglang.srt.constrained import reasoner_grammar_backend
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
@@ -928,6 +929,27 @@ class TestStrictReasoningPaths(unittest.TestCase):
 
         self.assertIsNone(req.grammar)
 
+    def _serve_inkling_regex(self, mgr, budget):
+        params = None if budget is None else {"thinking_budget": budget}
+        req = _make_req(regex="yes", custom_params=params)
+        req.require_reasoning = True
+        req.origin_input_ids = []
+        compiled = mgr.process_req_with_grammar(req)
+        if compiled:
+            mgr.get_ready_grammar_requests()
+        return compiled, req.grammar
+
+    def _thinking_tokens_allowed(self, grammar, limit=16):
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        for token_id in [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]:
+            grammar.accept_token(token_id)
+        count = 0
+        while count < limit and _token_allowed(grammar, ord("x")):
+            grammar.accept_token(ord("x"))
+            count += 1
+        self.assertTrue(_token_allowed(grammar, ids[END_MESSAGE]))
+        return count
+
     def test_inkling_constraint_caps_thinking_at_the_request_budget(self):
         """An Inkling constraint compiles to a framed grammar, not a reasoning
         wrapper; the request's thinking budget must still cap its thinking message,
@@ -935,23 +957,33 @@ class TestStrictReasoningPaths(unittest.TestCase):
         mgr = self._make_mgr()
         mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
-        ids = INKLING_SPECIAL_TOKEN_IDS
-        queued = []
-        for budget in (3, 3, 5):
-            req = _make_req(regex="yes", custom_params={"thinking_budget": budget})
-            req.require_reasoning = True
-            req.origin_input_ids = []
-            queued.append(mgr.process_req_with_grammar(req))
-            if queued[-1]:
-                mgr.get_ready_grammar_requests()
-            for token_id in [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]:
-                req.grammar.accept_token(token_id)
-            for _ in range(budget):
-                self.assertTrue(_token_allowed(req.grammar, ord("x")))
-                req.grammar.accept_token(ord("x"))
-            self.assertFalse(_token_allowed(req.grammar, ord("x")))
-            self.assertTrue(_token_allowed(req.grammar, ids[END_MESSAGE]))
-        self.assertEqual(queued, [True, False, True])
+        served = [self._serve_inkling_regex(mgr, budget) for budget in (3, 3, 12)]
+        self.assertEqual([compiled for compiled, _ in served], [True, False, True])
+        self.assertEqual(
+            [self._thinking_tokens_allowed(grammar) for _, grammar in served],
+            [3, 3, 12],
+        )
+
+    def test_inkling_budget_variants_stay_bounded(self):
+        """Equivalent budgets share one cached frame and only recent budget variants
+        stay cached; an evicted budget recompiles with its exact cap."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        budgets = [0, 1, 2, 3, 4, 5, 6, 12, None, 10, -1, -2, 0]
+        with patch.object(
+            reasoner_grammar_backend, "_INKLING_BUDGET_VARIANT_CACHE_SIZE", 4
+        ):
+            served = [self._serve_inkling_regex(mgr, budget) for budget in budgets]
+        self.assertEqual(
+            [compiled for compiled, _ in served],
+            [True] * 9 + [False, True, False, True],
+        )
+        self.assertEqual(
+            [self._thinking_tokens_allowed(grammar) for _, grammar in served],
+            [0, 1, 2, 3, 4, 5, 6, 12, 10, 10, 16, 16, 0],
+        )
+        self.assertEqual(len(mgr.grammar_backend.cache), 1 + 4)
 
     def test_strict_constrained_request_uses_normal_dispatch(self):
         """Request with json_schema should go through normal dispatch, not strict path."""
