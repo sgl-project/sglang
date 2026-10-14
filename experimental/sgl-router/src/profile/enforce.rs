@@ -131,8 +131,11 @@ impl ApiProfile {
         for (k, v) in &set {
             out.insert(k, Field::New(v.clone()));
         }
-        let bytes = serde_json::to_vec(&out)
+        let mut bytes = serde_json::to_vec(&out)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("re-serialize request body: {e}")))?;
+        // The body lives as long as the request; don't let it carry the Vec's
+        // doubling slack (up to 2x a multi-MiB multimodal body) the whole time.
+        bytes.shrink_to_fit();
         Ok(Applied {
             body: Bytes::from(bytes),
             reasoning_general,

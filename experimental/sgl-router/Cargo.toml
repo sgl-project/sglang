@@ -146,6 +146,10 @@ sha2 = "0.10"
 url = "2"
 
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+# Global allocator for the binary (see `src/main.rs`).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
 hmac = "0.12"
 hex = "0.4"
 

@@ -7,6 +7,13 @@ use sgl_router::config::{Cli, LogFormat};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
+// jemalloc, not glibc malloc: glibc keeps the arena memory freed after a burst
+// of large (multimodal) request bodies, so RSS ratchets up to each burst's
+// high-water mark and never comes back down; jemalloc returns it to the OS.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Install the global tracing subscriber.
 ///
 /// Idempotent: a second call returns `Ok` without panicking. When

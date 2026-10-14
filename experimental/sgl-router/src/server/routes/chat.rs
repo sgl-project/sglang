@@ -1999,9 +1999,12 @@ fn build_outgoing_body(
             serde_json::Value::Number(b.room.into()),
         );
     }
-    let bytes = serde_json::to_vec(&obj).map_err(|e| {
+    let mut bytes = serde_json::to_vec(&obj).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
+    // Held until the dispatch returns (the whole generation for a
+    // non-streaming request), so drop the Vec's doubling slack first.
+    bytes.shrink_to_fit();
     Ok(Bytes::from(bytes))
 }
 
