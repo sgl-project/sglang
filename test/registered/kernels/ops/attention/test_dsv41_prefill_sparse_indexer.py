@@ -45,7 +45,7 @@ class Case(NamedTuple):
 def make_case(rows, ctx, seed) -> Case:
     """One request: `rows` query tokens whose causal lengths end at `ctx`, its
     index K in the pool page layout [pages, PAGE * 64 payload | PAGE * 4 scale]."""
-    from deep_gemm import fp8_fp4_mqa_logits
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
 
     torch.manual_seed(seed)
     dev = "cuda"
@@ -70,14 +70,13 @@ def make_case(rows, ctx, seed) -> Case:
     lens[0] = 0  # a query that sees no compressed position yet
     width = (ctx + 7) // 8 * 8
     starts = torch.zeros(rows, device=dev, dtype=torch.int32)
-    dense = fp8_fp4_mqa_logits(
+    dense = fp8_mqa_logits(
         (q_fp4, q_sf),
         (k_fp4[:width], k_sf[:width]),
         weights,
         starts,
         lens,
-        False,
-        width,
+        max_seqlen_k=width,
     )
     data = DeepGEMMPrefillData(
         k_slots=torch.arange(width, device=dev),

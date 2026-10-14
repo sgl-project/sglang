@@ -126,7 +126,7 @@ def generate_paged_mqa_test_data(
 
 
 def assert_paged_mqa_matches_ref(
-    logits, ref_logits, context_lens, B, next_n, max_model_len
+    logits, ref_logits, context_lens, B, next_n, max_model_len, atol=5e-5, rtol=1e-5
 ):
     device = logits.device
     positions = torch.arange(max_model_len, device=device).unsqueeze(0)
@@ -137,4 +137,4 @@ def assert_paged_mqa_matches_ref(
 
     logits_masked = logits.float().masked_fill(~mask, 0)
     ref_masked = ref_logits.float().masked_fill(~mask, 0)
-    torch.testing.assert_close(logits_masked, ref_masked, atol=5e-5, rtol=1e-5)
+    torch.testing.assert_close(logits_masked, ref_masked, atol=atol, rtol=rtol)

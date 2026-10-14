@@ -59,7 +59,7 @@ def test_off_rocm_the_budget_is_untouched():
 
 
 def _kpool_mqa_logits(num_q, num_k, cap_bytes):
-    """Run `IndexerKPool._fp8_mqa_logits` over a stub that returns each row's
+    """Run `IndexerKPool._aiter_mqa_logits` over a stub that returns each row's
     index plus its `starts`, so a misordered reassembly or an unsliced per-row
     argument shows up in the logits."""
     rows_per_call = []
@@ -88,14 +88,13 @@ def _kpool_mqa_logits(num_q, num_k, cap_bytes):
         mock.patch.object(dsa_indexer_kpool, "is_hip", lambda: True),
         mock.patch.object(dsa_indexer_kpool, "MQA_LOGITS_MAX_BYTES_ROCM", cap_bytes),
     ):
-        logits = dsa_indexer_kpool.IndexerKPool._fp8_mqa_logits(
+        logits = dsa_indexer_kpool.IndexerKPool._aiter_mqa_logits(
             q_fp8,
             k_fp8,
             torch.ones(num_k),
             torch.ones(num_q, 4),
             torch.arange(num_q, dtype=torch.float32) * 10,
             torch.full((num_q,), num_k, dtype=torch.int32),
-            clean_logits=True,
         )
     return logits, rows_per_call
 
