@@ -1284,6 +1284,28 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
             with self.assertRaises(ImportError):
                 spec_adapters.build_spec_adapter("inkling", ctx)
 
+    def test_inkling_parser_cannot_be_mixed_with_another_parser(self):
+        from sglang.srt.entrypoints.openai.serving_inkling import InklingSpecAdapter
+
+        for reasoning_parser, tool_call_parser in (
+            ("inkling", "qwen25"),
+            ("qwen3", "inkling"),
+        ):
+            with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
+                with self.assertRaises(ValueError):
+                    InklingSpecAdapter(
+                        reasoning_parser=reasoning_parser,
+                        tool_call_parser=tool_call_parser,
+                        chat_hooks=self._hooks(),
+                    )
+        for reasoning_parser, tool_call_parser in (("inkling", None), (None, None)):
+            with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
+                InklingSpecAdapter(
+                    reasoning_parser=reasoning_parser,
+                    tool_call_parser=tool_call_parser,
+                    chat_hooks=self._hooks(),
+                )
+
     def test_responses_handler_builds_one_adapter_bound_to_itself(self):
         """The Responses handler reuses the adapter from its base init; its
         chat hooks must belong to that handler, not to another instance."""

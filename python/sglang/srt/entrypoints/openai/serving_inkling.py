@@ -38,6 +38,8 @@ class InklingSpecAdapter:
     parses output from token IDs (the ``SpecAdapter`` and ``SpecOutputAdapter``
     protocols in ``spec_adapters``)."""
 
+    collects_openai_media = True
+
     def __init__(
         self,
         *,
@@ -50,11 +52,18 @@ class InklingSpecAdapter:
         # fail at boot, not 400 every request.
         self._default_reasoning_effort = get_default_reasoning_effort()
         load_tml_renderers()
-        self._token_output = "inkling" in (reasoning_parser, tool_call_parser)
+        parsers = {reasoning_parser, tool_call_parser} - {None}
+        if "inkling" in parsers and parsers != {"inkling"}:
+            # The token parser emits Inkling calls while constraints would come
+            # from the other parser's format.
+            raise ValueError(
+                "Inkling token parsing requires --reasoning-parser and "
+                "--tool-call-parser to be inkling or unset, got "
+                f"{reasoning_parser!r} and {tool_call_parser!r}"
+            )
+        self._token_output = "inkling" in parsers
         self._separate_reasoning = bool(reasoning_parser)
         self._hooks = chat_hooks
-
-    collects_openai_media = True
 
     @property
     def output(self) -> Optional[InklingSpecAdapter]:
