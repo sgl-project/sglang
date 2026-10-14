@@ -9,6 +9,15 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+)
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -35,11 +44,6 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-)
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
 )
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -1302,6 +1306,24 @@ class TestKvHintsTransport(CustomTestCase):
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
+
+    def test_empty_token_ids_raise_validation_error(self):
+        """Empty token input is a client error, not an indexing failure."""
+        req = EmbeddingReqInput(input_ids=[])
+        with self.assertRaisesRegex(ValueError, "input_ids cannot be empty"):
+            req.normalize_batch_and_arguments()
+
+    def test_nonempty_token_ids_normalize_as_single_or_batch(self):
+        for input_ids, is_single, batch_size in (
+            ([1, 2], True, 1),
+            ([[1], [2]], False, 2),
+        ):
+            with self.subTest(input_ids=input_ids):
+                req = EmbeddingReqInput(input_ids=input_ids)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.is_single, is_single)
+                self.assertEqual(req.batch_size, batch_size)
+                self.assertEqual(req.input_ids, input_ids)
 
     def test_priority_is_preserved(self):
         """Priority must survive the batch split, in both __getitem__ branches."""
