@@ -121,7 +121,7 @@ export const GLM45Deployment = () => {
 
     // Strategy-specific parameters
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size 8`;
     }
     if (strategyArray.includes('ep')) {
       cmd += ` \\\n  --ep 8`;

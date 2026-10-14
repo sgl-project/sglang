@@ -14,6 +14,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -950,18 +951,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.tile_sample_stride_height = 192
         self.tile_sample_stride_width = 192
 
-        # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
-        self._cached_conv_counts = {
-            "decoder": sum(
-                isinstance(m, (QwenImageCausalConv3d, SpatialParallelCausalConv3d))
-                for m in self.decoder.modules()
-            )
-            if self.decoder is not None
-            else 0,
-            "encoder": sum(isinstance(m, QwenImageCausalConv3d) for m in self.encoder.modules())
-            if self.encoder is not None
-            else 0,
-        }
         cuda_device = get_local_torch_device()
         dtype = torch.get_default_dtype()
         latent_channels = config.arch_config.z_dim
@@ -969,6 +958,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.shift_factor = (
             torch.tensor(
                 config.arch_config.latents_mean
+                if config.arch_config.latents_mean is not None
+                else [config.arch_config.shift_factor or 0.0] * latent_channels
             )
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)
@@ -1005,13 +996,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
         self.tile_sample_stride_height = tile_sample_stride_height or self.tile_sample_stride_height
         self.tile_sample_stride_width = tile_sample_stride_width or self.tile_sample_stride_width
-
-    def disable_tiling(self) -> None:
-        r"""
-        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to computing
-        decoding in one step.
-        """
-        self.use_tiling = False
 
     def enable_slicing(self) -> None:
         r"""
@@ -1067,6 +1051,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.clear_cache()
         return enc
 
+    @cached_vae_encode
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> DiagonalGaussianDistribution:

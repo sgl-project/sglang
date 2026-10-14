@@ -7,7 +7,6 @@ from sglang.srt.configs.linear_attn_model_registry import (
     LinearAttnModelSpec,
     get_linear_attn_config,
     get_linear_attn_spec_by_arch,
-    import_backend_class,
     register_linear_attn_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -137,24 +136,6 @@ class TestLinearAttnModelRegistry(CustomTestCase):
 
         result = get_linear_attn_config(FakeLinearAttnConfig())
         self.assertIs(result[0], spec1)
-
-    def test_import_backend_class(self):
-        # Import a real stdlib class to verify the mechanism
-        cls = import_backend_class("collections.OrderedDict")
-        from collections import OrderedDict
-
-        self.assertIs(cls, OrderedDict)
-
-    def test_spec_defaults(self):
-        spec = LinearAttnModelSpec(
-            config_class=FakeLinearAttnConfig,
-            backend_class_name="pkg.mod.Cls",
-        )
-        self.assertEqual(spec.arch_names, [])
-        self.assertTrue(spec.uses_mamba_radix_cache)
-        self.assertTrue(spec.support_mamba_cache)
-        self.assertFalse(spec.support_mamba_cache_extra_buffer)
-        self.assertFalse(spec.unwrap_text_config)
 
 
 if __name__ == "__main__":
