@@ -30,8 +30,18 @@ def kill_itself_when_parent_died() -> None:
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
+def kill_process_tree(
+    parent_pid,
+    include_parent: bool = True,
+    skip_pid: int = None,
+    wait_timeout: float | None = 10,
+):
+    """Kill a process tree and wait for its resources to be released.
+
+    SIGKILL is asynchronous. Waiting prevents a subsequent server test from
+    racing the old process for ports or accelerator resources. Pass ``None``
+    only in a context where blocking is not acceptable.
+    """
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -46,11 +56,13 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         return
 
     children = itself.children(recursive=True)
+    killed = []
     for child in children:
         if child.pid == skip_pid:
             continue
         try:
             child.kill()
+            killed.append(child)
         except psutil.NoSuchProcess:
             pass
 
@@ -65,5 +77,14 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
+            killed.append(itself)
         except psutil.NoSuchProcess:
             pass
+
+    if wait_timeout is not None and killed:
+        _, alive = psutil.wait_procs(killed, timeout=wait_timeout)
+        if alive:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) did not exit "
+                f"within {wait_timeout}s; pids={[process.pid for process in alive]}"
+            )

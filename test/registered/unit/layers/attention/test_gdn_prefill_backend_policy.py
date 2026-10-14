@@ -4,9 +4,7 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    MambaAttnBackendBase,
-)
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
@@ -23,6 +21,8 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,6 +81,76 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_prefill_conv_table_covers_only_nonempty_chunks(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.device = "cpu"
+        backend.mis_metadata = None
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 65, 66, 66, 67, 68, 69, 70, 71]),
+            mamba_cache_indices=torch.arange(8),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            tbo_parent_token_range=None,
+            extend_seq_lens_cpu=[65, 1, 0, 1, 1, 1, 1, 1],
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=True),
+            patch.object(gdn_backend, "is_pin_memory_available", return_value=False),
+        ):
+            backend._init_prefill_conv_block_table(batch)
+        torch.testing.assert_close(
+            backend.forward_metadata.conv_block_table,
+            torch.tensor(
+                [[0, i] for i in range(9)] + [[i, 0] for i in (1, 3, 4, 5, 6, 7)],
+                dtype=torch.int32,
+            ),
+        )
+
+    def test_prefill_conv_table_falls_back_and_clears_previous_batch(self):
+        cases = (
+            ("uniform", {"extend_seq_lens_cpu": [7, 8]}, {}),
+            ("mildly_ragged", {}, {}),
+            ("no_cpu_lengths", {"extend_seq_lens_cpu": None}, {}),
+            ("different_batch", {"extend_seq_lens_cpu": [17, 1, 1]}, {}),
+            ("tbo", {"tbo_parent_token_range": (0, 18)}, {}),
+            ("decode", {"forward_mode": ForwardMode.DECODE}, {}),
+            ("verify", {"forward_mode": ForwardMode.TARGET_VERIFY}, {}),
+            ("multi_item_scoring", {}, {"mis_metadata": sentinel.metadata}),
+            ("non_cuda", {}, {"cuda": False}),
+        )
+        for name, batch_fields, options in cases:
+            with self.subTest(name=name):
+                backend = object.__new__(GDNAttnBackend)
+                backend.device = "cpu"
+                backend.mis_metadata = options.get("mis_metadata")
+                backend.forward_metadata = ForwardMetadata(
+                    query_start_loc=torch.tensor([0, 17, 18]),
+                    mamba_cache_indices=torch.arange(2),
+                    conv_block_table=sentinel.previous_batch,
+                )
+                fields = dict(
+                    forward_mode=ForwardMode.EXTEND,
+                    tbo_parent_token_range=None,
+                    extend_seq_lens_cpu=[17, 1],
+                )
+                fields.update(batch_fields)
+                with patch.object(
+                    gdn_backend, "is_cuda", return_value=options.get("cuda", True)
+                ):
+                    backend._init_prefill_conv_block_table(SimpleNamespace(**fields))
+                self.assertIsNone(backend.forward_metadata.conv_block_table)
+
+    @staticmethod
+    def make_target_verify_routing_backend():
+        backend = object.__new__(GDNAttnBackend)
+        nominal_capability = MagicMock(return_value=False)
+        backend.kernel_dispatcher = SimpleNamespace(
+            verify_kernel_is_flashinfer=True,
+            target_verify_supports_strided_qkv=nominal_capability,
+        )
+        return backend, nominal_capability
+
     def test_mis_requires_triton_prefill_backend(self):
         runner = make_runner(self, enable_mis=True)
         with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
@@ -250,6 +320,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
@@ -264,7 +335,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
 
     def test_tree_verify_uses_triton_kernel(self):
-        flashinfer_kernel = MagicMock(supports_target_verify=True)
+        flashinfer_kernel = MagicMock(
+            supports_target_verify=True,
+            supports_strided_target_verify_qkv=False,
+        )
         with (
             patch.object(gdn_backend, "is_cuda", return_value=True),
             patch(
@@ -279,6 +353,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             )
 
         self.assertIsInstance(dispatcher.tree_verify_kernel, TritonGDNKernel)
+        self.assertFalse(dispatcher.target_verify_supports_strided_qkv(None))
+        self.assertTrue(
+            dispatcher.target_verify_supports_strided_qkv(sentinel.parent_token)
+        )
 
         tensor = sentinel.tensor
         with patch.object(
@@ -294,6 +372,41 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
+
+    def test_target_verify_strided_input_capability_is_opt_in(self):
+        dispatcher = GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+        )
+
+        self.assertTrue(dispatcher.target_verify_supports_strided_qkv(None))
+        dispatcher.verify_kernel = SimpleNamespace()
+        self.assertFalse(dispatcher.target_verify_supports_strided_qkv(None))
+
+    def test_target_verify_strided_qkv_routing(self):
+        backend, nominal_capability = self.make_target_verify_routing_backend()
+        cases = (
+            ("fp32_fold", True, False, torch.float32, 4, True, False),
+            ("short_bf16_fold", True, False, torch.bfloat16, 2, True, False),
+            ("cutedsl_fold", True, False, torch.bfloat16, 4, False, False),
+            ("circular", False, True, torch.bfloat16, 4, True, False),
+            ("nominal", False, False, torch.bfloat16, 4, False, True),
+        )
+        for name, fold, circular, dtype, draft_tokens, expected, delegates in cases:
+            with self.subTest(name=name):
+                nominal_capability.reset_mock()
+                actual = backend._target_verify_supports_strided_qkv(
+                    retrieve_parent_token=None,
+                    use_replayssm_fold=fold,
+                    use_replayssm_spec=circular,
+                    ssm_dtype=dtype,
+                    draft_token_num=draft_tokens,
+                )
+                self.assertEqual(actual, expected)
+                if delegates:
+                    nominal_capability.assert_called_once_with(None)
+                else:
+                    nominal_capability.assert_not_called()
 
     def test_helion_backend_reports_kda_only(self):
         cases = (

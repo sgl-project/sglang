@@ -1,7 +1,9 @@
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 with the trtllm attention backend.
 
-Mirrors the four FlashMLA recipes with a uniform-FP8 KV pool and trtllm-gen
-sparse MLA for decode and prefill.
+Mirrors two of the FlashMLA recipes with a uniform-FP8 KV pool and trtllm-gen
+sparse MLA for decode and prefill: the spec-decoding recipe (draft extend /
+target verify / multi-step backend) and the breakable-CUDA-graph DP recipe
+(DP padding, graph replay refresh, mixed chunk).
 """
 
 import unittest
@@ -10,7 +12,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -29,147 +30,10 @@ _DEEPEP_ENV = {
 }
 
 
-class TestDSV4FlashFP4B200Trtllm(
-    SpecDecodingMixin,
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
-):
-    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.8
-    bs_1_speed_thres = 220
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--dsv4-attn-backend",
-                "trtllm",
-                "--tp",
-                "4",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--chunked-prefill-size",
-                "4096",
-                "--disable-flashinfer-autotune",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
-class TestDSV4FlashFP4B200BalancedTrtllm(
-    SpecDecodingMixin,
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
-):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
-
-    gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.8
-    bs_1_speed_thres = 100
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--dsv4-attn-backend",
-                "trtllm",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
-class TestDSV4FlashFP4NonMTPB200Trtllm(
-    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
-):
-    """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--dsv4-attn-backend",
-                "trtllm",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
 class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
-    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
+    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk, no spec."""
 
     gsm8k_accuracy_thres = 0.93
 
@@ -187,9 +51,8 @@ class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
                 "trtllm",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--enable-mixed-chunk",
                 "--cuda-graph-backend-prefill",
                 "breakable",

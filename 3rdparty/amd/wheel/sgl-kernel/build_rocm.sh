@@ -3,9 +3,7 @@ set -euo pipefail
 
 ROCM_VERSION=${1:-}
 
-if [[ "${ROCM_VERSION}" == "700" ]]; then
-  IMAGE="lmsysorg/sglang:v0.5.8.post1-rocm700-mi35x"
-elif [[ "${ROCM_VERSION}" == "720" ]]; then
+if [[ "${ROCM_VERSION}" == "720" ]]; then
   IMAGE="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 elif [[ "${ROCM_VERSION}" == "1000" ]]; then
   # Ubuntu 24.04 / Python 3.12 / torch 2.11 matches the stack the released
@@ -13,7 +11,7 @@ elif [[ "${ROCM_VERSION}" == "1000" ]]; then
   # wheel can still cover both gfx942 and gfx950.
   IMAGE="rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.11.0"
 else
-  echo "ERROR: Unsupported ROCM_VERSION='${ROCM_VERSION}'. Only '700', '720' and '1000' are supported." >&2
+  echo "ERROR: Unsupported ROCM_VERSION='${ROCM_VERSION}'. Only '720' and '1000' are supported." >&2
   exit 1
 fi
 
@@ -69,9 +67,7 @@ docker run --rm \
   ${IMAGE} \
   bash -c "
   # Install torch, triton, and friends, depending on the ROCm version
-  if [[ "${ROCM_VERSION}" == "700" ]]; then
-    ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl
-  elif [[ "${ROCM_VERSION}" == "720" ]]; then
+  if [[ "${ROCM_VERSION}" == "720" ]]; then
     ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl
   fi
 ${ROCM_SETUP}

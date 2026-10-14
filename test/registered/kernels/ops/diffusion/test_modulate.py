@@ -40,6 +40,10 @@ register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
+CUDA_NATIVE_ONLY = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="the bit-exact residual-gate fast path is CUDA-only",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -146,26 +150,6 @@ GATE_CASES = [
 ]
 
 
-def _assert_gate_add(out, ref):
-    if ref.dtype == torch.float32:
-        # fp32 has no rounding boundary to reproduce; the kernel keeps the
-        # accumulation in fp32 and only order may differ.
-        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
-    else:
-        assert torch.equal(out, ref)
-
-
-@pytest.mark.parametrize("residual_shape,gate_shape", GATE_CASES)
-def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
-    residual = torch.randn(residual_shape, device=DEVICE, dtype=torch.bfloat16)
-    update = torch.randn_like(residual)
-    gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
-
-    ref = residual + update * gate
-    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
-    assert torch.equal(residual_gate_add(residual, update, gate), ref)
-
-
 # LingBot per-token gates are [B, S, 1]: one scalar per token, broadcast
 # along the hidden dimension.
 PER_TOKEN_GATE_CASES = [
@@ -175,32 +159,38 @@ PER_TOKEN_GATE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("residual_shape,gate_shape", PER_TOKEN_GATE_CASES)
-def test_residual_gate_add_per_token_matches_torch(residual_shape, gate_shape):
+def _assert_gate_add(out, ref):
+    if ref.dtype == torch.float32:
+        # fp32 has no rounding boundary to reproduce; the kernel keeps the
+        # accumulation in fp32 and only order may differ.
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+    else:
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("residual_shape,gate_shape", GATE_CASES + PER_TOKEN_GATE_CASES)
+def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     residual = torch.randn(residual_shape, device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
 
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
     ref = residual + update * gate
-    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
+    if torch.version.hip is None:
+        assert can_use_residual_gate_add_cuda(residual, update, gate)
+        _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
+    else:
+        assert not can_use_residual_gate_add_cuda(residual, update, gate)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_residual_gate_add_per_token_dtypes(dtype):
-    residual = torch.randn((1, 2560, 512), device=DEVICE, dtype=dtype)
-    update = torch.randn_like(residual)
-    gate = torch.randn((1, 2560, 1), device=DEVICE, dtype=dtype)
-    _assert_gate_add(
-        residual_gate_add_cuda(residual, update, gate), residual + update * gate
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("gate_shape", [(1, 1, 64), (1, 9, 64)])
-def test_residual_gate_add_dtypes(dtype, gate_shape):
-    residual = torch.randn((1, 9, 64), device=DEVICE, dtype=dtype)
+@pytest.mark.parametrize(
+    "shape,gate_shape",
+    [((1, 9, 64), (1, 1, 64)), ((1, 9, 64), (1, 9, 64)), PER_TOKEN_GATE_CASES[0]],
+)
+@CUDA_NATIVE_ONLY
+def test_residual_gate_add_dtypes(dtype, shape, gate_shape):
+    residual = torch.randn(shape, device=DEVICE, dtype=dtype)
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=dtype)
     _assert_gate_add(
@@ -210,6 +200,7 @@ def test_residual_gate_add_dtypes(dtype, gate_shape):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 17, 65), (1, 7800, 2240), (2, 33, 128)])
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_residual(dtype, shape):
     batch, tokens, hidden_size = shape
     residual = torch.randn(
@@ -226,6 +217,7 @@ def test_residual_gate_add_transposed_residual(dtype, shape):
     assert out.stride() == ref.stride() == residual.stride()
 
 
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_storage_offsets():
     tokens, hidden_size = 33, 128
     residual = (
@@ -248,10 +240,13 @@ def test_residual_gate_add_transposed_storage_offsets():
     assert torch.equal(out, residual + update * gate)
 
 
-def test_residual_gate_add_transposed_torch_compile_fullgraph():
-    residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
-        1, 2
-    )
+@pytest.mark.parametrize("transposed", [False, True])
+@CUDA_NATIVE_ONLY
+def test_residual_gate_add_torch_compile_fullgraph(transposed):
+    shape = (1, 128, 32) if transposed else (1, 32, 128)
+    residual = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+    if transposed:
+        residual = residual.transpose(1, 2)
     update = torch.randn_like(residual, memory_format=torch.contiguous_format)
     gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
     compiled = torch.compile(residual_gate_add, fullgraph=True)
@@ -260,6 +255,7 @@ def test_residual_gate_add_transposed_torch_compile_fullgraph():
     assert out.stride() == residual.stride()
 
 
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_transposed_cuda_graph():
     residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
         1, 2
@@ -285,7 +281,9 @@ def test_residual_gate_add_guards_and_eager_fallback():
     residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn((1, 1, 64), device=DEVICE, dtype=torch.bfloat16)
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    assert can_use_residual_gate_add_cuda(residual, update, gate) == (
+        torch.version.hip is None
+    )
 
     rejected = [
         (residual.cpu(), update, gate),  # not on device
@@ -297,9 +295,8 @@ def test_residual_gate_add_guards_and_eager_fallback():
     for args in rejected:
         assert not can_use_residual_gate_add_cuda(*args)
 
-    # Only [1, ..., 1, D] row-broadcast gates are supported; a batched
-    # [B>1, 1, D] gate is not row-broadcast here and must fall back.
-    batched = torch.randn((2, 8, 64), device=DEVICE, dtype=torch.bfloat16)
+    # Batched gates support contiguous BTD residuals, but not arbitrary strides.
+    batched = torch.randn((2, 16, 64), device=DEVICE, dtype=torch.bfloat16)[:, ::2]
     batched_update = torch.randn_like(batched)
     batched_gate = torch.randn((2, 1, 64), device=DEVICE, dtype=torch.bfloat16)
     assert not can_use_residual_gate_add_cuda(batched, batched_update, batched_gate)
@@ -309,12 +306,47 @@ def test_residual_gate_add_guards_and_eager_fallback():
     )
 
 
-def test_residual_gate_add_torch_compile_fullgraph():
-    residual = torch.randn((1, 32, 128), device=DEVICE, dtype=torch.bfloat16)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", [(2, 17, 65), (4, 126, 2048), (4, 6144, 4096)])
+@pytest.mark.parametrize("strided_gate", [False, True])
+def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
+    batch, _, hidden = shape
+    # Offset the odd-width case to also exercise the unaligned scalar kernel.
+    offset = 1 if hidden == 65 else 0
+    residual = torch.randn(
+        (batch * shape[1] * hidden + offset,), device=DEVICE, dtype=dtype
+    )[offset:].view(shape)
     update = torch.randn_like(residual)
-    gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
-    compiled = torch.compile(residual_gate_add, fullgraph=True)
-    assert torch.equal(compiled(residual, update, gate), residual + update * gate)
+    if strided_gate:
+        # Match LTX-2's get_ada_values(...).unbind: distinct batch rows, with
+        # gaps from the other scale/shift/gate values in between them.
+        gate = torch.randn((batch, 1, 6, hidden), device=DEVICE, dtype=dtype)[
+            :, :, 2, :
+        ]
+        assert not gate.is_contiguous()
+    else:
+        gate = torch.randn((batch, 1, hidden), device=DEVICE, dtype=dtype)
+    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    expected = residual + update * gate
+    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), expected)
+    _assert_gate_add(residual_gate_add(residual, update, gate), expected)
+
+
+def test_residual_gate_add_batched_rows_cuda_graph():
+    residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn((4, 1, 6, 128), device=DEVICE, dtype=torch.bfloat16)[:, :, 2]
+    residual_gate_add_cuda(residual, update, gate)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = residual_gate_add_cuda(residual, update, gate)
+    for _ in range(2):
+        residual.normal_()
+        update.normal_()
+        gate.normal_()
+        graph.replay()
+        assert torch.equal(out, residual + update * gate)
 
 
 @torch.no_grad()

@@ -31,6 +31,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
+        cache.tree_core.full_evictable_size.return_value = 80
 
         capacity = {"available": 30}
         allocator = MagicMock()
@@ -111,6 +112,32 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         self.assertEqual(leaf_count["value"], 1)
         self.assertEqual(result.num_tokens_evicted, 20)
         self.assertEqual(result.mamba_num_evicted, 1)
+
+    def test_allocation_eviction_runs_to_the_target_when_frees_stay_hidden(self):
+        """An allocator can hide freed pages behind a clamp or page rounding, so
+        freeing exactly the shortfall may leave its availability target unmet;
+        an allocation-driven FULL walk must keep going until the target shows."""
+        cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=0)
+        cache.tree_core.full_evictable_size.return_value = 60
+        quota = {}
+        cache.tree_core.evict_device_start.side_effect = quota.__setitem__
+
+        def next_node(component_type, tracker):
+            # The tree yields victims only up to the quota the walk opened with.
+            if tracker[component_type] >= quota[component_type]:
+                return None, False
+            return leaf_count["value"] + 1, True
+
+        cache._evict_device_next_node.side_effect = next_node
+
+        result = cache.evict_for_alloc(EvictParams(num_tokens=20))
+
+        self.assertEqual(leaf_count["value"], 2)
+        self.assertEqual(capacity["available"], 50)
+        self.assertEqual(result.num_tokens_evicted, 40)
+        cache.tree_core.evict_device_start.assert_called_once_with(
+            ComponentType.FULL, 60
+        )
 
     def test_explicit_evict_preserves_component_count_semantics(self):
         cache, _, leaf_count = self._build_cache(collateral_capacity_gain=70)
@@ -553,8 +580,12 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
-        tree_cache.token_to_kv_pool_allocator.available_size.return_value = 30
+        tree_cache.supports_prefix_sharing.return_value = True
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        allocator = object.__new__(TokenToKVPoolAllocator)
+        allocator.available_size = lambda: 30
+        tree_cache.token_to_kv_pool_allocator = allocator
 
         evict_from_tree_cache(tree_cache, num_tokens=100)
 

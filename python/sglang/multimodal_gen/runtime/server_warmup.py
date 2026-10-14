@@ -288,6 +288,9 @@ def prepare_warmup_image_path(server_args: ServerArgs) -> str:
 
 
 class SchedulerWarmupMixin:
+    # A failed request-based warmup leaves the next request cold.
+    _req_based_warmup_failed: bool = False
+
     @staticmethod
     def _format_warmup_req(req_or_group: Any) -> str:
         return format_warmup_req(req_or_group)
@@ -352,6 +355,27 @@ class SchedulerWarmupMixin:
             self._warmup_progress_bar.close()
             self._warmup_progress_bar = None
 
+    def _warn_if_bcg_captured_nothing(self) -> None:
+        """BCG takes effect only where a denoising stage captures; warmup is
+        where it captures, so after the first warmup an empty count is final."""
+        if (
+            self._checked_bcg_capture
+            or not self.server_args.enable_breakable_cuda_graph
+        ):
+            return
+        self._checked_bcg_capture = True
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+            BaseBreakableCudaGraphRunner,
+        )
+
+        if BaseBreakableCudaGraphRunner.num_captures == 0:
+            logger.warning(
+                "[Diffusion BCG] warmup captured no breakable CUDA graphs for %s, "
+                "so it runs eager: its denoising stage does not capture them, or "
+                "capture was rejected above.",
+                self.server_args.model_path,
+            )
+
     def _log_warmup_result(
         self,
         output_batch: OutputBatch,
@@ -378,6 +402,7 @@ class SchedulerWarmupMixin:
         self._advance_warmup_progress_bar(req_or_group, output_batch)
 
         if output_batch.error is None:
+            self._warn_if_bcg_captured_nothing()
             if (
                 not server_based_warmup
                 and not self._logged_server_ready_after_warmup
@@ -391,6 +416,8 @@ class SchedulerWarmupMixin:
         else:
             warmup_desc = self._format_warmup_req(req_or_group)
             logger.warning("%s processing failed: %s", warmup_desc, output_batch.error)
+            if not server_based_warmup:
+                self._req_based_warmup_failed = True
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: list[tuple[bytes, Any]]
