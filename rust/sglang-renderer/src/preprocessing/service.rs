@@ -863,4 +863,101 @@ mod tests {
         assert_eq!(requests[0].input_ids, vec![11, 12, 13]);
         assert_eq!(requests[0].sampling_params.max_new_tokens, Some(2));
     }
+
+    // Dynamic tools must affect decoding and constraints as well as prompt text.
+    #[test]
+    fn system_message_tools_enable_parsing_and_constraints() {
+        use futures::StreamExt;
+        use sglang_processor::{ChatEvent, ChatFinishReason, DecodedChatEvent};
+
+        let directory = std::env::temp_dir().join(format!(
+            "sglang-renderer-system-tools-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("config.json"), r#"{"model_type":"kimi_k3"}"#).unwrap();
+        let mut config = model_config(directory.to_string_lossy().into_owned());
+        config.tool_call_parser = Some("kimi_k3".into());
+        let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
+        let function = serde_json::json!({
+            "name": "lookup", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}, "strict": true
+        });
+        for wrapped in [false, true] {
+            for choice in [
+                serde_json::json!("auto"),
+                serde_json::json!("required"),
+                serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+                serde_json::json!("none"),
+            ] {
+                let mut request = chat_request();
+                let tool = if wrapped {
+                    serde_json::json!({"type":"function", "function":function})
+                } else {
+                    function.clone()
+                };
+                request.messages = serde_json::from_value(serde_json::json!([
+                    {"role":"user","content":"Before dynamic tools"},
+                    {"role":"system","tools":[tool]},
+                    {"role":"user","content":"Call lookup"}
+                ]))
+                .unwrap();
+                request.chat_template_args = Some(std::collections::HashMap::from([(
+                    "thinking".into(),
+                    serde_json::json!(false),
+                )]));
+                // Also cover a request that combines initial and dynamic declarations.
+                if wrapped {
+                    request.tools = serde_json::from_value(serde_json::json!([{
+                        "type":"function", "function": {
+                            "name":"initial_tool", "parameters":{"type":"object","properties":{}},
+                            "strict":true
+                        }
+                    }]))
+                    .unwrap();
+                }
+                request.tool_choice = serde_json::from_value(choice.clone()).unwrap();
+                let chat = service.preprocess_chat(request).unwrap();
+                let prompt = chat.text_requests[0].prompt.as_str();
+                assert!(
+                    prompt.find("Before dynamic tools").unwrap() < prompt.find("lookup").unwrap()
+                );
+                let sampling = &chat.text_requests[0].options.sampling_params;
+                let disabled = choice == "none";
+                assert_eq!(sampling.skip_special_tokens, disabled);
+                if disabled {
+                    assert!(sampling.structural_tag.is_none());
+                    continue;
+                }
+                let constraint = sampling.structural_tag.as_ref().unwrap();
+                assert!(constraint.contains("lookup"));
+                assert!(constraint.contains("query"));
+                if wrapped && (choice == "auto" || choice == "required") {
+                    assert!(constraint.contains("initial_tool"));
+                    assert!(
+                        prompt.find("initial_tool").unwrap()
+                            < prompt.find("Before dynamic tools").unwrap()
+                    );
+                }
+                let input = futures::stream::iter(vec![Ok::<_, crate::ResponseError>(DecodedChatEvent {
+                    choice: 0,
+                    text: "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>".into(),
+                    token_ids: vec![], finish_reason: Some(ChatFinishReason::Stop),
+                    logprobs: None, prompt_tokens: 1, completion_tokens: 1,
+                })]);
+                let events = futures::executor::block_on(
+                    chat.response_processor
+                        .process_stream(input)
+                        .collect::<Vec<_>>(),
+                );
+                assert!(events.iter().all(Result::is_ok), "{events:?}");
+                assert!(
+                    events.iter().any(|event| matches!(event,
+                        Ok(ChatEvent::Delta { tool_calls: Some(calls), .. }) if !calls.is_empty()
+                    )),
+                    "wrapped={wrapped}, choice={choice}: {events:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

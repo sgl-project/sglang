@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -171,10 +172,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         attn_backend,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=False,
             require_backend_selection=require_backend_selection,
         )

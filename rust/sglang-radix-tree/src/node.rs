@@ -112,6 +112,12 @@ impl KeyNamespace {
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
     }
+
+    pub fn extra_key_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.extra_key.clone())
+    }
 }
 
 impl PartialEq for KeyNamespace {
@@ -730,6 +736,20 @@ pub enum TreeCoreRuntimeError {
     /// A public NodeId no longer names a live arena node.
     #[error(transparent)]
     NodeAccess(#[from] NodeAccessError),
+    /// The requested component is not configured for this core.
+    #[error("component {component_type:?} is not enabled")]
+    ComponentNotEnabled { component_type: ComponentType },
+    /// A signed adjustment would underflow or overflow the selected device ledger.
+    #[error(
+        "invalid size delta {delta} for node {node_id} component {component_type:?}: current={current}, protected={protected}"
+    )]
+    InvalidComponentSizeDelta {
+        node_id: NodeId,
+        component_type: ComponentType,
+        current: usize,
+        delta: i64,
+        protected: bool,
+    },
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,
