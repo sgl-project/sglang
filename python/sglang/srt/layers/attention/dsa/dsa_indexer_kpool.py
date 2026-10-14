@@ -61,7 +61,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_forward
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +271,7 @@ class IndexerKPool(MultiPlatformOp):
             and not get_is_capture_mode()
             and not is_in_breakable_cuda_graph()
             and not dsa_use_prefill_cp(forward_batch)
+            and not get_forward().attn_input_scattered
         )
 
     @staticmethod
@@ -1236,6 +1237,7 @@ class IndexerKPool(MultiPlatformOp):
             and n_real >= 4096
             and q_fp8.is_cuda
             and not dsa_use_prefill_cp(forward_batch)
+            and not get_forward().attn_input_scattered
             and not capture_mode.is_capture_mode
             and not torch.cuda.is_current_stream_capturing()
             and not is_in_breakable_cuda_graph()
