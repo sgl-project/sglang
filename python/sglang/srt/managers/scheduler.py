@@ -1102,6 +1102,9 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    # Not DynamicGradMode: tensors created under inference mode here could not
+    # be written in place by the no_grad disagg event loops.
+    @torch.no_grad()
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
@@ -2153,6 +2156,13 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            # Before any early exit, so every request releases its CUDA IPC pool slot.
+            for tokenized_req in self._tokenized_requests(recv_req):
+                if tokenized_req.positional_embed_overrides is not None:
+                    tokenized_req.positional_embed_overrides.reconstruct(
+                        get_device().gpu_id
+                    )
+
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
@@ -2364,6 +2374,9 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
+
+    def get_prefill_adder_class(self) -> type[PrefillAdder]:
+        return PrefillAdder
 
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
@@ -3679,8 +3692,9 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        prepare_abort(req, reason.message, reason.status_code)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -3694,7 +3708,11 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=finished_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3729,6 +3747,11 @@ class Scheduler(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )
         batch.input_ids = None
+
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = self.future_map.make_staged_spec_input(
+                batch.req_pool_indices
+            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -4024,7 +4047,7 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder = PrefillAdder(
+        adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -4110,6 +4133,7 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
+                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -4130,12 +4154,11 @@ class Scheduler(
                 self._prefetch_after_device_hit_loss(req)
             ):
                 continue
-            if (
-                self.enable_hicache_storage
-                and buffer_pipeline is not None
-                and not buffer_pipeline.prepare_staged_prefetch(req)
-            ):
-                continue
+            if self.enable_hicache_storage and buffer_pipeline is not None:
+                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
+                req.time_stats.observe_storage_staging_ready(staging_ready)
+                if not staging_ready:
+                    continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4215,6 +4238,7 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
+        new_batch.hisparse_coordinator = self.hisparse_coordinator
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -4785,6 +4809,13 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
+
+        if self.enable_unified_cache_external_linker:
+            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+            if self.chunked_req in failed:
+                # Result processing finishes the others; a chunked one is
+                # released like a client abort so its next chunk never runs.
+                self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
 
