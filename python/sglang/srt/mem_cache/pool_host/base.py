@@ -287,9 +287,11 @@ class HostKVCache(abc.ABC):
         """
         if getattr(self, "_destroyed", False):
             return
-        self._destroyed = True
-        for cleanup in self._host_resource_cleanup or ():
-            cleanup()
+        # A failed callback keeps both itself and the allocation alive for retry.
+        # Completed callbacks are removed so retries do not close them twice.
+        while self._host_resource_cleanup:
+            self._host_resource_cleanup[0]()
+            self._host_resource_cleanup.pop(0)
         self._host_resource_cleanup = None
         buffers = getattr(self, "kv_buffer", None)
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
@@ -299,6 +301,7 @@ class HostKVCache(abc.ABC):
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+        self._destroyed = True
 
     # Bytes between strided device KV rows; None (the default, and what a pool
     # built without `_init_device_row_stride` keeps) means packed rows.

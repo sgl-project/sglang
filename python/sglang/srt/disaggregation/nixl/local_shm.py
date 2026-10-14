@@ -14,8 +14,11 @@ import secrets
 import socket
 import struct
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
+
+import msgspec
 
 if TYPE_CHECKING:
     import torch
@@ -25,6 +28,14 @@ if TYPE_CHECKING:
 # A failed unregister must not turn a still-pinned mapping into freed memory.
 _PINNED_MAPPING_QUARANTINE = []
 logger = logging.getLogger(__name__)
+
+
+# Internal state, never serialized; one lock protects one peer's lifecycle.
+class LocalShmPeer(msgspec.Struct):
+    lock: threading.RLock = msgspec.field(default_factory=threading.RLock)
+    mapping: Optional[LocalShmMapping] = None
+    error: Optional[Exception] = None
+    retry_at: Optional[float] = None
 
 
 def host_identity() -> list[str]:
@@ -45,12 +56,14 @@ class LocalShmExport:
         if pool.fd is None or not buffer.is_contiguous():
             raise ValueError("Local SHM requires a contiguous shared host KV pool")
         ptrs, lengths, items = pool.get_contiguous_buf_infos()
-        self.fd = os.dup(pool.fd)
         self.token = secrets.token_bytes(32)
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.stopped = threading.Event()
         name = "sglang-pd-" + secrets.token_hex(16)
-        try:
+        with ExitStack() as rollback:
+            self.fd = os.dup(pool.fd)
+            rollback.callback(os.close, self.fd)
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            rollback.callback(self.socket.close)
             self.socket.bind("\0" + name)
             self.socket.listen(16)
             self.socket.settimeout(0.2)
@@ -64,12 +77,9 @@ class LocalShmExport:
                 lengths=lengths,
                 items=items,
             )
-        except Exception:
-            self.socket.close()
-            os.close(self.fd)
-            raise
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
+            self.thread = threading.Thread(target=self._serve, daemon=True)
+            self.thread.start()
+            rollback.pop_all()
 
     def _serve(self) -> None:
         while not self.stopped.is_set():
@@ -99,22 +109,29 @@ class LocalShmExport:
                     continue
 
     def close(self) -> None:
-        if not self.stopped.is_set():
-            self.stopped.set()
-            self.socket.close()
-            self.thread.join()
+        self.stopped.set()
+        self.socket.close()
+        self.thread.join()
+        if self.fd is not None:
             os.close(self.fd)
+            self.fd = None
 
 
-def copy_plan(
-    src_lengths: Sequence[int],
-    dst_lengths: Sequence[int],
-    items: Sequence[int],
+def build_copy_plan(
+    src_lengths_bytes: Sequence[int],
+    dst_lengths_bytes: Sequence[int],
+    page_sizes_bytes: Sequence[int],
     src_indices: Sequence[int],
     dst_indices: Sequence[int],
 ) -> list[tuple[int, int, int, int]]:
-    """Validate the entire chunk before submitting any device writes."""
-    if len(src_lengths) != len(dst_lengths) or len(items) != len(src_lengths):
+    """Validate a chunk and return (region, src offset, dst offset, byte count).
+
+    Offsets and sizes are bytes; source/destination indices select KV pages.
+    No writes may be submitted until the entire plan has been validated.
+    """
+    if len(src_lengths_bytes) != len(dst_lengths_bytes) or len(page_sizes_bytes) != len(
+        src_lengths_bytes
+    ):
         raise ValueError("Local SHM KV region count mismatch")
     if len(src_indices) != len(dst_indices):
         raise ValueError("Local SHM page count mismatch")
@@ -123,7 +140,7 @@ def copy_plan(
     ]
     plan = []
     for layer, (src_size, dst_size, item) in enumerate(
-        zip(src_lengths, dst_lengths, items)
+        zip(src_lengths_bytes, dst_lengths_bytes, page_sizes_bytes)
     ):
         if item <= 0:
             raise ValueError("Invalid local SHM page size")
@@ -242,7 +259,7 @@ class LocalShmMapping:
 
         if len(src_ptrs) != len(self.ptrs):
             raise ValueError("Local SHM source region count mismatch")
-        plan = copy_plan(
+        plan = build_copy_plan(
             src_lengths, self.lengths, self.items, src_indices, dst_indices
         )
         with torch.cuda.device(self.gpu_id):
@@ -306,5 +323,9 @@ class LocalShmMapping:
                     "Local SHM host unregister failed; retaining mapping"
                 )
             self.buffer = None
+        if self.mapping is not None:
             self.mapping.close()
+            self.mapping = None
+        if self.fd is not None:
             os.close(self.fd)
+            self.fd = None

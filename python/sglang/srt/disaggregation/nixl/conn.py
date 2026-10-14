@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.nixl.local_shm import (
     LocalShmExport,
     LocalShmMapping,
+    LocalShmPeer,
     LocalShmTransfer,
     same_host,
 )
@@ -129,6 +130,10 @@ def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
             f"{sorted(unique)}"
         )
     return next(iter(unique))
+
+
+_LOCAL_SHM_REAP_INTERVAL_S = 5
+_LOCAL_SHM_RETRY_BACKOFF_S = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -529,10 +534,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         self.local_shm_enabled = envs.SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM.get()
         self.local_shm_descriptor = None
-        self.local_shm_mappings = {}
-        self.local_shm_errors = {}
-        self._local_shm_retry_at = {}
-        self._local_shm_lock = threading.RLock()
+        self._local_shm_peers: Dict[str, LocalShmPeer] = {}
+        self._local_shm_lock = threading.Lock()
         self._local_shm_shutdown = threading.Event()
         self._local_shm_reaper = None
         if self.local_shm_enabled:
@@ -764,40 +767,66 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
+    def _get_local_shm_peer(self, peer_name: str) -> LocalShmPeer:
+        # This lock only protects the table, never socket or CUDA operations.
+        with self._local_shm_lock:
+            peer = self._local_shm_peers.get(peer_name)
+            if peer is None:
+                peer = LocalShmPeer()
+                self._local_shm_peers[peer_name] = peer
+            return peer
+
+    def _local_shm_peer_snapshot(self) -> List[Tuple[str, LocalShmPeer]]:
+        with self._local_shm_lock:
+            return list(self._local_shm_peers.items())
+
     def _reap_local_shm_loop(self) -> None:
-        while not self._local_shm_shutdown.wait(5):
+        while not self._local_shm_shutdown.wait(_LOCAL_SHM_REAP_INTERVAL_S):
             self._reap_local_shm_mappings()
 
     def _reap_local_shm_mappings(self) -> None:
-        # Serialize retirement with submission and mapping initialization.
-        with self._local_shm_lock:
-            for peer, mapping in list(self.local_shm_mappings.items()):
-                if mapping.pending or not mapping.exporter_closed():
+        for peer_name, peer in self._local_shm_peer_snapshot():
+            # Busy peers are revisited next time; one slow initialization must
+            # not prevent the reaper from servicing other peers.
+            if not peer.lock.acquire(blocking=False):
+                continue
+            try:
+                mapping = peer.mapping
+                if mapping is None or mapping.pending or not mapping.exporter_closed():
                     continue
                 try:
                     mapping.close()
                 except Exception:
-                    logger.exception("Retaining local SHM mapping for peer %s", peer)
+                    logger.exception(
+                        "Retaining local SHM mapping for peer %s", peer_name
+                    )
                     continue
-                del self.local_shm_mappings[peer]
-                self.local_shm_errors[peer] = "Local SHM exporter has closed"
-                logger.info("Released local SHM mapping for closed peer %s", peer)
+                peer.mapping = None
+                peer.error = RuntimeError("Local SHM exporter has closed")
+                peer.retry_at = None
+                logger.info("Released local SHM mapping for closed peer %s", peer_name)
+            finally:
+                peer.lock.release()
 
     def release_host_resources(self) -> None:
         self._local_shm_shutdown.set()
         if self._local_shm_reaper is not None:
             self._local_shm_reaper.join()
-        with self._local_shm_lock:
-            for peer_name, mapping in list(self.local_shm_mappings.items()):
+        for peer_name, peer in self._local_shm_peer_snapshot():
+            with peer.lock:
+                if peer.mapping is None:
+                    continue
                 try:
-                    mapping.close()
+                    peer.mapping.close()
                 except Exception:
                     # Never unmap unresolved writes or still-pinned memory.
                     logger.exception(
                         "Retaining local SHM mapping for peer %s", peer_name
                     )
                 else:
-                    del self.local_shm_mappings[peer_name]
+                    peer.mapping = None
+                    peer.error = RuntimeError("Local SHM manager has shut down")
+                    peer.retry_at = None
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
@@ -1745,15 +1774,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not self.local_shm_enabled or decode_kv_args.local_shm is None:
             return None
         agent_name = decode_kv_args.agent_name
-        with self._local_shm_lock:
-            mapping = self.local_shm_mappings.get(agent_name)
+        peer = self._get_local_shm_peer(agent_name)
+        with peer.lock:
+            mapping = peer.mapping
             if mapping is not None:
                 return mapping
-            error = self.local_shm_errors.get(agent_name)
+            error = peer.error
             if error is not None:
-                retry_at = self._local_shm_retry_at.get(agent_name)
+                retry_at = peer.retry_at
                 if retry_at is None or time.monotonic() < retry_at:
-                    raise RuntimeError(error)
+                    raise RuntimeError(str(error)) from error
             try:
                 if not same_host(decode_kv_args.local_shm):
                     return None
@@ -1773,17 +1803,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 mapping = LocalShmMapping(decode_kv_args.local_shm, self.kv_args.gpu_id)
             except Exception as exc:
+                peer.error = exc
                 error = f"Local SHM peer initialization failed: {exc}"
-                self.local_shm_errors[agent_name] = error
                 if isinstance(exc, OSError):
-                    self._local_shm_retry_at[agent_name] = time.monotonic() + 2
+                    peer.retry_at = time.monotonic() + _LOCAL_SHM_RETRY_BACKOFF_S
                 else:
-                    self._local_shm_retry_at.pop(agent_name, None)
+                    peer.retry_at = None
                 logger.error("%s", error)
                 raise RuntimeError(error) from exc
-            self.local_shm_mappings[agent_name] = mapping
-            self.local_shm_errors.pop(agent_name, None)
-            self._local_shm_retry_at.pop(agent_name, None)
+            peer.mapping = mapping
+            peer.error = None
+            peer.retry_at = None
             logger.info("Local SHM D2H enabled for peer %s", agent_name)
             return mapping
 
@@ -2076,7 +2106,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
     ):
         if self.local_shm_enabled:
-            with self._local_shm_lock:
+            peer = self._get_local_shm_peer(peer_name)
+            with peer.lock:
                 mapping = self._ensure_local_shm_mapping(
                     self.decode_kv_args_table[peer_name]
                 )

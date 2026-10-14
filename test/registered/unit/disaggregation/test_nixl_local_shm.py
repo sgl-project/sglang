@@ -3,6 +3,7 @@
 import os
 import socket
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -11,8 +12,9 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.nixl.local_shm import (
     LocalShmExport,
     LocalShmMapping,
+    LocalShmPeer,
     LocalShmTransfer,
-    copy_plan,
+    build_copy_plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -74,21 +76,23 @@ class TestLocalShm(CustomTestCase):
 
     def test_shuffled_pages_and_reused_slots(self):
         self.assertEqual(
-            copy_plan([64], [128], [16], [3, 1], [0, 7]),
+            build_copy_plan([64], [128], [16], [3, 1], [0, 7]),
             [(0, 48, 0, 16), (0, 16, 112, 16)],
         )
-        self.assertEqual(copy_plan([64], [128], [16], [0], [7]), [(0, 0, 112, 16)])
+        self.assertEqual(
+            build_copy_plan([64], [128], [16], [0], [7]), [(0, 0, 112, 16)]
+        )
 
     def test_invalid_indices_and_geometry(self):
         for src, dst in [([-1], [0]), ([4], [0]), ([0], [8]), ([0, 1], [0])]:
             with self.subTest(src=src, dst=dst), self.assertRaises(ValueError):
-                copy_plan([64], [128], [16], src, dst)
+                build_copy_plan([64], [128], [16], src, dst)
         with self.assertRaises(ValueError):
-            copy_plan([64, 64], [128], [16], [0], [0])
+            build_copy_plan([64, 64], [128], [16], [0], [0])
         with self.assertRaises(TypeError):
-            copy_plan([64], [128], [16], [0.5], [0])
+            build_copy_plan([64], [128], [16], [0.5], [0])
         with self.assertRaises(ValueError):
-            copy_plan([64], [128], [0], [0], [0])
+            build_copy_plan([64], [128], [0], [0], [0])
 
     def test_barrier_waits_for_local_copy_and_nixl_state(self):
         from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -120,8 +124,6 @@ class TestLocalShm(CustomTestCase):
 
         manager = NixlKVManager.__new__(NixlKVManager)
         manager.local_shm_enabled = False
-        manager.local_shm_errors = {}
-        manager.local_shm_mappings = {}
         manager.src_mem_kind = "VRAM"
         manager.kv_args = SimpleNamespace(kv_data_ptrs=[10], kv_item_lens=[16])
         manager._send_kvcache_generic = Mock(return_value="nixl")
@@ -133,7 +135,7 @@ class TestLocalShm(CustomTestCase):
     def test_failed_mapping_cannot_fall_back_to_nixl_write(self):
 
         manager, info = self.mapping_manager()
-        manager.local_shm_errors = {"peer": "mapping failed"}
+        manager._get_local_shm_peer("peer").error = RuntimeError("mapping failed")
         manager.decode_kv_args_table = {"peer": info}
         manager._send_kvcache_generic = Mock()
         with self.assertRaisesRegex(RuntimeError, "mapping failed"):
@@ -150,11 +152,15 @@ class TestLocalShm(CustomTestCase):
         manager._local_shm_shutdown = threading.Event()
         manager._local_shm_reaper = None
         manager._local_shm_lock = threading.RLock()
-        manager.local_shm_mappings = {"settled": settled, "pending": pending}
+        manager._local_shm_peers = {
+            "settled": LocalShmPeer(mapping=settled),
+            "pending": LocalShmPeer(mapping=pending),
+        }
         with self.assertLogs("sglang.srt.disaggregation.nixl.conn", level="ERROR"):
             manager.release_host_resources()
         settled.close.assert_called_once()
-        self.assertEqual(manager.local_shm_mappings, {"pending": pending})
+        self.assertIsNone(manager._local_shm_peers["settled"].mapping)
+        self.assertIs(manager._local_shm_peers["pending"].mapping, pending)
 
     def test_sender_preserves_early_send_producer_event(self):
         from sglang.srt.disaggregation.nixl.conn import NixlKVSender
@@ -202,10 +208,8 @@ class TestLocalShm(CustomTestCase):
 
         manager = NixlKVManager.__new__(NixlKVManager)
         manager.local_shm_enabled = True
-        manager.local_shm_mappings = {}
-        manager.local_shm_errors = {}
-        manager._local_shm_retry_at = {}
-        manager._local_shm_lock = threading.RLock()
+        manager._local_shm_peers = {}
+        manager._local_shm_lock = threading.Lock()
         manager.is_mla_backend = True
         manager.attn_tp_size = 4
         manager.kv_args = SimpleNamespace(
@@ -243,8 +247,8 @@ class TestLocalShm(CustomTestCase):
             clock.return_value = 12
             self.assertIs(manager._ensure_local_shm_mapping(info), mapping)
             self.assertEqual(create.call_count, 2)
-            self.assertFalse(manager.local_shm_errors)
-            self.assertFalse(manager._local_shm_retry_at)
+            self.assertIsNone(manager._get_local_shm_peer("peer").error)
+            self.assertIsNone(manager._get_local_shm_peer("peer").retry_at)
             self.assertIs(manager._ensure_local_shm_mapping(info), mapping)
             self.assertEqual(create.call_count, 2)
 
@@ -260,19 +264,19 @@ class TestLocalShm(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "matching flat MLA"):
                     manager._ensure_local_shm_mapping(info)
             create.assert_not_called()
-            self.assertFalse(manager._local_shm_retry_at)
+            self.assertIsNone(manager._get_local_shm_peer("peer").retry_at)
 
     def test_dead_exporter_released_only_after_pending_copy_settles(self):
         manager, info = self.mapping_manager()
         mapping = Mock(pending={"copy"})
         mapping.exporter_closed.return_value = True
-        manager.local_shm_mappings["peer"] = mapping
+        manager._get_local_shm_peer("peer").mapping = mapping
         manager._reap_local_shm_mappings()
         mapping.close.assert_not_called()
         mapping.pending.clear()
         manager._reap_local_shm_mappings()
         mapping.close.assert_called_once()
-        self.assertFalse(manager.local_shm_mappings)
+        self.assertIsNone(manager._get_local_shm_peer("peer").mapping)
         # Late queued requests must not silently use NIXL or reopen the dead pool.
         with self.assertRaisesRegex(RuntimeError, "exporter has closed"):
             manager._ensure_local_shm_mapping(info)
@@ -284,24 +288,28 @@ class TestLocalShm(CustomTestCase):
         dead = Mock(pending=set())
         dead.exporter_closed.return_value = True
         dead.close.side_effect = RuntimeError("still pinned")
-        manager.local_shm_mappings = {"live": live, "dead": dead}
+        manager._local_shm_peers = {
+            "live": LocalShmPeer(mapping=live),
+            "dead": LocalShmPeer(mapping=dead),
+        }
         with self.assertLogs("sglang.srt.disaggregation.nixl.conn", level="ERROR"):
             manager._reap_local_shm_mappings()
         live.close.assert_not_called()
-        self.assertEqual(set(manager.local_shm_mappings), {"live", "dead"})
+        self.assertIs(manager._get_local_shm_peer("live").mapping, live)
+        self.assertIs(manager._get_local_shm_peer("dead").mapping, dead)
 
     def test_reaper_cannot_race_submission(self):
         manager, _ = self.mapping_manager()
         mapping = Mock(pending=set())
         mapping.exporter_closed.return_value = True
-        manager.local_shm_mappings["peer"] = mapping
+        manager._get_local_shm_peer("peer").mapping = mapping
         started = threading.Event()
 
         def reap():
             started.set()
             manager._reap_local_shm_mappings()
 
-        with manager._local_shm_lock:
+        with manager._get_local_shm_peer("peer").lock:
             worker = threading.Thread(target=reap)
             worker.start()
             self.assertTrue(started.wait(2))
@@ -310,8 +318,193 @@ class TestLocalShm(CustomTestCase):
         self.assertFalse(worker.is_alive())
         mapping.close.assert_not_called()
 
+    def test_initializing_peer_does_not_block_healthy_peer(self):
+        manager, info = self.mapping_manager()
+        healthy = SimpleNamespace(**vars(info))
+        healthy.agent_name = "healthy"
+        healthy_mapping = Mock()
+        manager._get_local_shm_peer("healthy").mapping = healthy_mapping
+        manager.decode_kv_args_table = {"healthy": healthy}
+        manager.kv_args.kv_data_lens = [64]
+        manager.agent = Mock()
+        entered, release, completed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        errors = []
+
+        def create(*args):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test initialization gate")
+            return Mock()
+
+        def initialize():
+            try:
+                manager._ensure_local_shm_mapping(info)
+            except Exception as exc:
+                errors.append(exc)
+
+        def send():
+            try:
+                manager.send_kvcache("healthy", [0], [20], [0], 0, "done")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        module = "sglang.srt.disaggregation.nixl.conn"
+        with (
+            patch(module + ".same_host", return_value=True),
+            patch(module + ".LocalShmMapping", side_effect=create),
+        ):
+            initializing = threading.Thread(target=initialize)
+            sending = threading.Thread(target=send)
+            initializing.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                sending.start()
+                self.assertTrue(
+                    completed.wait(2),
+                    "healthy peer blocked by unrelated initialization",
+                )
+                healthy_mapping.submit.assert_called_once()
+            finally:
+                release.set()
+                initializing.join(5)
+                if sending.ident is not None:
+                    sending.join(5)
+        self.assertFalse(errors)
+
+    def test_cleanup_callback_failure_can_be_retried(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        pool.pin_memory = False
+        buffer = object()
+        pool.kv_buffer = buffer
+        first, retry, last = (
+            Mock(),
+            Mock(side_effect=[OSError("cleanup"), None]),
+            Mock(),
+        )
+        for callback in (first, retry, last):
+            pool.register_host_resource_cleanup(callback)
+        with self.assertRaises(OSError):
+            pool.destroy()
+        self.assertIs(pool.kv_buffer, buffer)
+        self.assertFalse(getattr(pool, "_destroyed", False))
+        last.assert_not_called()
+        pool.destroy()
+        pool.destroy()
+        first.assert_called_once()
+        self.assertEqual(retry.call_count, 2)
+        last.assert_called_once()
+        self.assertIsNone(pool.kv_buffer)
+
+    def test_export_initialization_rolls_back_resources(self):
+        with tempfile.TemporaryFile() as file:
+            pool = SimpleNamespace(
+                fd=file.fileno(),
+                kv_buffer=Mock(),
+                get_contiguous_buf_infos=lambda: ([], [], []),
+            )
+            pool.kv_buffer.is_contiguous.return_value = True
+            pool.kv_buffer.data_ptr.return_value = 1000
+            pool.kv_buffer.numel.return_value = 4096
+            pool.kv_buffer.element_size.return_value = 1
+            module = "sglang.srt.disaggregation.nixl.local_shm"
+            duplicated = []
+            real_dup = os.dup
+
+            def duplicate_fd(fd):
+                result = real_dup(fd)
+                duplicated.append(result)
+                return result
+
+            for stage in ("socket", "thread"):
+                with (
+                    self.subTest(stage=stage),
+                    patch(module + ".os.dup", side_effect=duplicate_fd),
+                    patch(module + ".socket.socket") as socket_factory,
+                    patch(module + ".host_identity", return_value=["host", "net"]),
+                    patch(
+                        module + ".threading.Thread.start",
+                        side_effect=RuntimeError("thread startup"),
+                    ),
+                ):
+                    if stage == "socket":
+                        socket_factory.side_effect = OSError("socket allocation")
+                    with self.assertRaises((OSError, RuntimeError)):
+                        LocalShmExport(pool)
+                    with self.assertRaises(OSError):
+                        os.fstat(duplicated[-1])
+                    if stage == "thread":
+                        socket_factory.return_value.close.assert_called_once()
+
+    def test_export_close_retries_after_join_failure(self):
+        with tempfile.TemporaryFile() as file:
+            export = LocalShmExport.__new__(LocalShmExport)
+            export.fd = os.dup(file.fileno())
+            fd = export.fd
+            export.stopped = threading.Event()
+            export.socket = Mock()
+            export.thread = Mock()
+            export.thread.join.side_effect = [RuntimeError("join"), None, None]
+            with self.assertRaises(RuntimeError):
+                export.close()
+            os.fstat(fd)
+            export.close()
+            export.close()
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_submit_failure_records_completion_for_already_queued_writes(self):
+        self.check_submit_failure(event_record_fails=False)
+
+    def test_submit_event_failure_keeps_mapping_pending(self):
+        self.check_submit_failure(event_record_fails=True)
+
+    def check_submit_failure(self, *, event_record_fails):
+        mapping = LocalShmMapping.__new__(LocalShmMapping)
+        mapping.ptrs, mapping.lengths, mapping.items = [100], [64], [16]
+        mapping.gpu_id, mapping.pending = 0, set()
+        event, stream, notify = Mock(), Mock(cuda_stream=1), Mock()
+        event.query.return_value = False
+        if event_record_fails:
+            event.record.side_effect = RuntimeError("record event")
+        runtime = SimpleNamespace(
+            cudaMemcpyAsync=Mock(side_effect=[(0,), (1,)]),
+            cudaMemcpyKind=SimpleNamespace(cudaMemcpyDeviceToHost=2),
+        )
+        bindings = SimpleNamespace(runtime=runtime)
+        with (
+            patch.dict(
+                sys.modules,
+                {"cuda": SimpleNamespace(bindings=bindings), "cuda.bindings": bindings},
+            ),
+            patch("torch.cuda.device"),
+            patch("torch.cuda.Stream", return_value=stream),
+            patch("torch.cuda.Event", return_value=event),
+        ):
+            handle = mapping.submit([200], [64], [0, 1], [0, 1], notify)
+        self.assertEqual(runtime.cudaMemcpyAsync.call_count, 2)
+        event.record.assert_called_once_with(stream)
+        self.assertIn(handle, mapping.pending)
+        if event_record_fails:
+            with self.assertRaisesRegex(RuntimeError, "could not be recorded"):
+                handle.poll()
+            self.assertIn(handle, mapping.pending)
+        else:
+            self.assertEqual(handle.poll(), "PROC")
+            event.query.return_value = True
+            self.assertEqual(handle.poll(), "ERR")
+            self.assertFalse(mapping.pending)
+        notify.assert_not_called()
+
     def test_empty_chunk(self):
-        self.assertEqual(copy_plan([64], [128], [16], [], []), [])
+        self.assertEqual(build_copy_plan([64], [128], [16], [], []), [])
 
 
 @unittest.skipUnless(sys.platform == "linux", "FD exchange requires Linux")
