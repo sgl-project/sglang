@@ -51,7 +51,13 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 _DEV = "cpu"
@@ -686,6 +692,55 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                                 ),
                                 feasible[0] if feasible else None,
                             )
+                            # ``prefer_swa`` flips the lexicographic order:
+                            # least FULL reclaim first, then least SWA.
+                            self.assertEqual(
+                                allocator.reclaim_plan(
+                                    full_pages * page_size,
+                                    swa_pages * page_size,
+                                    full_evictable_tokens=full_evictable,
+                                    swa_evictable_tokens=swa_evictable,
+                                    prefer_swa=True,
+                                ),
+                                min(feasible) if feasible else None,
+                            )
+
+    def test_evict_to_free_tokens_prefers_swa_reclaim_on_storage_or_decode(self):
+        """The default quota order spends FULL prefix to keep the sliding
+        window. With a HiCache storage backend attached, or while serving as
+        the decode side of a PD pair, the FULL prefix is the one worth keeping,
+        so the allocator asks the planner for SWA-first quotas. Hierarchical
+        cache alone (no storage backend) keeps the default. Pins the planner
+        argument per configuration, so a predicate that degrades to one branch
+        is caught."""
+        _, allocator, _ = self._build(page_size=4)
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = True
+        tree_cache.full_evictable_size.return_value = 8
+        tree_cache.swa_evictable_size.return_value = 8
+        allocator.reclaim_plan = MagicMock(return_value=(0, 0))
+        cases = (
+            ({}, None, False),
+            ({"enable_hierarchical_cache": True}, None, False),
+            (
+                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
+                None,
+                True,
+            ),
+            ({}, "decode", True),
+        )
+        for memory, role, prefer_swa in cases:
+            with self.subTest(memory=memory, role=role):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(get_memory().override(**memory))
+                    if role is not None:
+                        stack.enter_context(
+                            get_disagg().override(disaggregation_mode=role)
+                        )
+                    allocator.evict_to_free_tokens(tree_cache, 4)
+                self.assertEqual(
+                    allocator.reclaim_plan.call_args.kwargs["prefer_swa"], prefer_swa
+                )
 
     def test_restore_swa_without_allocating_more_full(self):
         _, allocator, _ = self._build(page_size=4)

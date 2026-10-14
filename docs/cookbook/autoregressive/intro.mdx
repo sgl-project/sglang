@@ -148,7 +148,7 @@ metatags:
   <Card
     title="OpenBMB"
     mode="card"
-    href="/cookbook/autoregressive/OpenBMB/MiniCPM5-2B"
+    href="/cookbook/autoregressive/OpenBMB/MiniCPM-V-4_7"
     img="/cards/logos/openbmb.png"
   />
   <Card

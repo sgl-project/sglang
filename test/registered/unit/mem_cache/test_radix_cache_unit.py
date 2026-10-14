@@ -504,7 +504,9 @@ class TestRadixCache(CustomTestCase):
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
 
-    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+    def _checkpoint_split_request(self, priority):
+        """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
+
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -532,7 +534,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
-            priority=0,
+            priority=priority,
             last_node=cache.root_node,
             lock=None,
         )
@@ -541,9 +543,17 @@ class TestRadixCache(CustomTestCase):
         cache.checkpoint(req, up_to=up_to)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
         cache.unlock(req.lock)
+        return cache, prompt_ids, output_ids
 
+    @staticmethod
+    def _split_nodes(cache):
         (prompt_node,) = cache.root_node.children.values()
         (output_node,) = prompt_node.children.values()
+        return prompt_node, output_node
+
+    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+        cache, prompt_ids, output_ids = self._checkpoint_split_request(priority=0)
+        prompt_node, output_node = self._split_nodes(cache)
         self.assertEqual(len(prompt_node.key), len(prompt_ids))
         self.assertEqual(len(output_node.key), len(output_ids))
 
@@ -553,6 +563,15 @@ class TestRadixCache(CustomTestCase):
             MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
         )
         self.assertEqual(match.device_prefix_len, len(prompt_ids))
+
+    def test_prompt_priority_boost_saturates_at_int64_max(self):
+        """The prompt is kept one priority above the request; priorities are
+        signed 64-bit integers, so at INT64_MAX the boost saturates."""
+        int64_max = torch.iinfo(torch.int64).max
+        cache, _, _ = self._checkpoint_split_request(priority=int64_max)
+        prompt_node, output_node = self._split_nodes(cache)
+        self.assertEqual(prompt_node.priority, int64_max)
+        self.assertEqual(output_node.priority, int64_max)
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""

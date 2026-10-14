@@ -23,6 +23,9 @@
 // `(rowValues, base) => [...]` for cross-row composition (e.g. preset x cluster
 // size); a function returning null means "leave the base untouched".
 // Changing the Deploy selection resets every axis back to inherit-from-base.
+// moe.ep.matchCp limits EP to 1 or the effective CP size while CP is enabled;
+// invalid/stale picks fall back to 1 in both the selector and command. Optional
+// moe.ep.denseTpMatchesCp emits --moe-dense-tp-size CP for CP+EP configurations.
 // config.playgroundExclusiveGroups declares {axes, when, note} groups whose
 // Enable controls turn each other off for matching selections.
 //   pdDisagg     — role + transfer backend + IB device + optional router
@@ -725,6 +728,18 @@ export const Playground = ({ config }) => {
     moe: {
       initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
+      // One policy shared by rendering and command generation. Opt-in only:
+      // other cookbooks retain their existing EP choices and inherited value.
+      resolveEp: (value, fc, derived, cpSize) => {
+        const coupled = !!fc.ep?.matchCp && cpSize > 1;
+        const picked = value.ep ?? derived?.ep ?? null;
+        return {
+          coupled,
+          ep: coupled ? (picked === cpSize ? cpSize : 1) : picked,
+          entries: coupled ? [1, cpSize] : (fc.ep?.values || [null]),
+        };
+      },
+
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
       // mmQuant is derived from the base flag (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
@@ -804,11 +819,19 @@ export const Playground = ({ config }) => {
             env = h.stripEnvByPrefix(env, quantKeys);
           }
         }
-        if (value.ep !== null) {
+        const cpSize = cpEnabledIn(flags) ? h.parseIntFlag(flags, "--attn-cp-size") : 1;
+        const epState = AXIS_HANDLERS.moe.resolveEp(value, fc, derived, cpSize);
+        if (value.ep !== null || epState.coupled) {
           const epHead = h.flagSpelling(flags, h.EP_HEADS, "--ep");
           flags = h.stripFlagsByFirstToken(flags, h.EP_HEADS);
-          if (value.ep > 1) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`${epHead} ${value.ep}`]);
+          if (epState.ep > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`${epHead} ${epState.ep}`]);
+          }
+        }
+        if (fc.ep?.denseTpMatchesCp && cpSize > 1) {
+          flags = h.stripFlagsByFirstToken(flags, ["--moe-dense-tp-size"]);
+          if (epState.ep > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`--moe-dense-tp-size ${cpSize}`]);
           }
         }
         return { flags, env };
@@ -816,6 +839,7 @@ export const Playground = ({ config }) => {
 
       render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
         if (!fc.backend && !fc.ep) return null;
+        const epState = AXIS_HANDLERS.moe.resolveEp(value, fc, derived, base.effCp);
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         // Display: explicit > derived > null.
         const slotDisplay = (k) => {
@@ -863,7 +887,7 @@ export const Playground = ({ config }) => {
               {epShown && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
-                  {renderSelect(slotDisplay("ep"), fc.ep.values || [null],
+                  {renderSelect(epState.ep, epState.entries,
                     (v) => setSlot("ep", v), base, undefined,
                     { hideValues: hideNull("ep") })}
                 </span>
@@ -2598,6 +2622,8 @@ export const Playground = ({ config }) => {
     : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
+    effCp: constraintEffective && cpEnabledIn(constraintEffective.flags)
+      ? parseIntFlag(constraintEffective.flags, "--attn-cp-size") : 1,
     workerNnodes: baseCell?.nnodes ?? parseNnodes(base.nodes), specAlgorithm,
   };
 

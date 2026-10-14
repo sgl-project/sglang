@@ -6,6 +6,10 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
+    mqa_logits_static_budget_bytes,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -343,3 +347,156 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
+
+
+def _use_torch_mqa_logits() -> bool:
+    return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+
+
+@lru_cache(maxsize=1)
+def resolve_num_sms() -> int:
+    """SM count used to size the paged-MQA-logits schedule.
+
+    DeepGEMM exposes this as ``get_num_sms()``, but on the torch fallback path
+    DeepGEMM may not be installed at all, so read it off the device instead.
+    Both consumers only use it to shape the schedule metadata buffer, so the
+    raw device SM count is an acceptable stand-in.
+    """
+    if not _use_torch_mqa_logits():
+        import deep_gemm
+
+        return deep_gemm.get_num_sms()
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+@lru_cache(maxsize=1)
+def resolve_paged_mqa_logits_metadata_fn():
+    if _use_torch_mqa_logits():
+        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+
+        return get_paged_mqa_logits_metadata
+    import deep_gemm
+
+    return deep_gemm.get_paged_mqa_logits_metadata
+
+
+def _fp8_paged_mqa_logits_torch(
+    q_fp8,
+    kv_cache_fp8,
+    weights,
+    context_lens,
+    block_table,
+    schedule_metadata,
+    max_seq_len,
+    clean_logits=False,
+    indices=None,
+):
+    from sglang.srt.layers.attention.dsv4.indexer import fp8_paged_mqa_logits_torch
+
+    assert indices is None, "torch paged MQA logits does not take an index tensor"
+    if context_lens.dim() == 2:
+        assert context_lens.shape[1] == 1, (
+            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH does not support next_n > 1 "
+            f"(got {context_lens.shape[1]}); disable speculative decoding."
+        )
+        context_lens = context_lens[:, 0]
+    batch_size = q_fp8.shape[0]
+    block_size = kv_cache_fp8.shape[1]
+    head_dim = q_fp8.shape[-1]
+    padded_seq_len = block_table.shape[1] * block_size
+    per_token_work_bytes = 2 * (head_dim + 4) + 2 * head_dim + 4
+    per_row_bytes = padded_seq_len * per_token_work_bytes + max_seq_len * 4
+    if (
+        q_fp8.is_cuda
+        and per_row_bytes > 0
+        and mqa_logits_needs_budget_check(
+            num_rows=batch_size, num_cols=max(max_seq_len, padded_seq_len)
+        )
+    ):
+        device_index = q_fp8.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        budget_bytes = mqa_logits_static_budget_bytes(device_index=device_index)
+        rows_per_chunk = max(budget_bytes // per_row_bytes, 1)
+    else:
+        rows_per_chunk = batch_size
+    if rows_per_chunk < batch_size:
+        logits_chunks = []
+        for start in range(0, batch_size, rows_per_chunk):
+            end = min(start + rows_per_chunk, batch_size)
+            logits_chunks.append(
+                fp8_paged_mqa_logits_torch(
+                    q_fp8[start:end],
+                    kv_cache_fp8,
+                    weights[start:end],
+                    context_lens[start:end],
+                    block_table[start:end],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+            )
+        return torch.cat(logits_chunks, dim=0)
+    return fp8_paged_mqa_logits_torch(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_seq_len,
+        clean_logits=clean_logits,
+    )
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_paged_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_paged_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_paged_mqa_logits
+
+
+def _fp8_mqa_logits_torch(
+    q_fp8, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0
+):
+    """Pure-torch prefill indexer fallback (no DeepGEMM).
+
+    Accumulates per-head relu(q·k) weighted by gate, then applies fp8 scale.
+    Iterates over heads to keep the [num_q, num_kv] intermediate small.
+    """
+    assert not clean_logits, "torch fp8_mqa_logits only implements clean_logits=False"
+    k_fp8, k_scale = kv
+    num_q, num_heads, head_dim = q_fp8.shape
+    num_kv = k_fp8.shape[0]
+
+    q = q_fp8.to(torch.bfloat16)
+    k_t = k_fp8.reshape(num_kv, head_dim).to(torch.bfloat16).t()
+
+    # Pad rows to a multiple of 4: topk_v2 needs an aligned score_stride.
+    num_kv_padded = (num_kv + 3) // 4 * 4
+    logits_storage = torch.zeros(
+        num_q, num_kv_padded, dtype=torch.float32, device=q_fp8.device
+    )
+    logits = logits_storage[:, :num_kv]
+    w = weights.float()
+    for h in range(num_heads):
+        scores = torch.mm(q[:, h], k_t).float()
+        logits.addcmul_(torch.relu(scores), w[:, h : h + 1])
+    logits *= k_scale.reshape(1, num_kv).float()
+
+    positions = torch.arange(num_kv, device=logits.device).unsqueeze(0)
+    valid = (positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))
+    return logits.masked_fill_(~valid, 0.0)
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_mqa_logits
