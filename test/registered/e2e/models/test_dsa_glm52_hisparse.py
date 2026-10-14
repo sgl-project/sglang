@@ -53,7 +53,12 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 6}',
     ]
-    extra_prefill_args = common_args
+    # PD transfers KV bytes without converting layouts. Match FlashMLA decode's
+    # packed FP8 layout; Blackwell defaults prefill to TRT-LLM's raw FP8 layout.
+    extra_prefill_args = common_args + [
+        "--dsa-prefill-backend",
+        "flashmla_kv",
+    ]
     extra_decode_args = common_args + [
         "--attn-dp-size",
         "4",
