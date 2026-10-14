@@ -212,7 +212,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.request_lists import CoreLists, RequestList
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -401,9 +401,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_versions import (
-    record_weight_version_events,
-)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -652,11 +649,6 @@ class Scheduler:
         self.init_dsa_kpool_truncation_align()
         self.check_truncation_align_fits_chunk()
 
-        self.init_weight_updater()
-
-        # Init request dispatcher
-        self.init_request_dispatcher()
-
         # Init LoRA drainer for fair scheduling
         self.init_lora_drainer()
 
@@ -683,9 +675,6 @@ class Scheduler:
 
         self.init_load_publisher()
 
-        self.init_step_counters()
-        self.init_load_inquirer()
-
         self.init_output_streamer()
         self.init_services()
 
@@ -705,12 +694,23 @@ class Scheduler:
 
         self.init_mode_stages()
 
-        self.init_internal_state()
+        # Built after the request registry and the mode owners, which they read.
+        self.init_weight_updater()
+        self.init_flush_wrapper()
+
+        # Init request dispatcher
+        self.init_request_dispatcher()
+
+        self.init_step_counters()
+        self.init_load_inquirer()
 
         self.init_rank_consensus_checker()
 
         self.flags.is_initializing = False
         self.init_startup_timing_summary()
+
+        # Reads the startup time.
+        self.init_internal_state()
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -1329,11 +1329,6 @@ class Scheduler:
         self.flat_slot = ScheduleSlot()
         # The launched steps whose results are not committed yet.
         self.pending = PendingSteps()
-        self.flush_wrapper = SchedulerFlushWrapper(
-            flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
-            ipc_channels=self.ipc_channels,
-        )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self._deferred_input_requests: List = []
@@ -2539,11 +2534,17 @@ class Scheduler:
             draft_worker=self.draft_worker,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
+            request_registry=self.request_registry,
             flags=self.flags,
-            record_weight_version_change=self.record_weight_version_change,
-            get_disagg_owners=lambda: (self.disagg_decode, self.disagg_prefill),
+            mode_owners=self.mode_owners,
             metrics_collector=self.metrics_collector,
+        )
+
+    def init_flush_wrapper(self) -> None:
+        self.flush_wrapper = SchedulerFlushWrapper(
+            flush_cache=self.flush_cache,
+            request_registry=self.request_registry,
+            ipc_channels=self.ipc_channels,
         )
 
     def init_lora_drainer(self) -> None:
@@ -2756,8 +2757,8 @@ class Scheduler:
             spec_algorithm=self.spec_algorithm,
             policy=self.policy,
             metrics_sink=self.metrics_sink,
-            get_request_lists=self.request_lists,
-            get_disagg_decode_prealloc_queue=lambda: self.disagg_decode.prealloc_queue,
+            request_registry=self.request_registry,
+            mode_owners=self.mode_owners,
             step_counters=self.step_counters,
         )
 
@@ -2859,8 +2860,8 @@ class Scheduler:
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
             metrics_sink=self.metrics_sink,
             rust_server=self.rust_server,
-            get_request_lists=self.request_lists,
-            get_startup_time=lambda: self.startup_time,
+            request_registry=self.request_registry,
+            startup_time=self.startup_time,
             record_step_time=RECORD_STEP_TIME,
         )
 
@@ -5210,40 +5211,12 @@ class Scheduler:
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
-        self.record_weight_version_change(new_version=recv_req.new_version)
+        self.weight_updater.record_weight_version_change(
+            new_version=recv_req.new_version
+        )
         return UpdateWeightVersionReqOutput()
 
-    def record_weight_version_change(self, new_version: Optional[str]) -> None:
-        if new_version is None or new_version == get_serving().weight_version:
-            return
-
-        old_version = get_serving().weight_version
-        get_context().override("scheduler.weight_version", weight_version=new_version)
-
-        live_reqs = [
-            req
-            for entry in self.request_registry.request_lists().values()
-            for req in entry.reqs
-        ]
-        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
-        logger.info(
-            f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
-        )
-
-    # The abort RPC handler, and the callbacks of the components built before
-    # the registry.
-    def request_lists(self) -> Dict[str, RequestList]:
-        return self.request_registry.request_lists()
-
-    def is_fully_idle(
-        self, for_health_check=False, ignore_waiting=False, ignore_releasing=False
-    ) -> bool:
-        return self.request_registry.is_fully_idle(
-            for_health_check=for_health_check,
-            ignore_waiting=ignore_waiting,
-            ignore_releasing=ignore_releasing,
-        )
-
+    # The abort RPC handler.
     def abort_request(self, recv_req: AbortReq):
         self.request_registry.abort_request(recv_req)
 

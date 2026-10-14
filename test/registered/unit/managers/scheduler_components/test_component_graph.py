@@ -429,25 +429,7 @@ _CALLBACK_SITES = {
     ): 1,
     # To be removed.
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
-    (
-        "init_weight_updater",
-        "SchedulerWeightUpdaterManager",
-        "get_disagg_owners",
-        _LAMBDA,
-    ): 1,
     ("init_weight_updater", "SchedulerWeightUpdaterManager", "flush_cache", _BOUND): 1,
-    (
-        "init_weight_updater",
-        "SchedulerWeightUpdaterManager",
-        "is_fully_idle",
-        _BOUND,
-    ): 1,
-    (
-        "init_weight_updater",
-        "SchedulerWeightUpdaterManager",
-        "record_weight_version_change",
-        _BOUND,
-    ): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (
         "init_dp_attn_adapter",
@@ -455,27 +437,7 @@ _CALLBACK_SITES = {
         "get_require_mlp_sync",
         _LAMBDA,
     ): 1,
-    (
-        "init_load_inquirer",
-        "SchedulerLoadInquirer",
-        "get_disagg_decode_prealloc_queue",
-        _LAMBDA,
-    ): 1,
-    ("init_load_inquirer", "SchedulerLoadInquirer", "get_request_lists", _BOUND): 1,
-    (
-        "init_internal_state",
-        "SchedulerInternalStateController",
-        "get_startup_time",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_internal_state",
-        "SchedulerInternalStateController",
-        "get_request_lists",
-        _BOUND,
-    ): 1,
-    ("init_running_status", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
-    ("init_running_status", "SchedulerFlushWrapper", "is_fully_idle", _BOUND): 1,
+    ("init_flush_wrapper", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
     ("init_metrics_reporter", "SchedulerMetricsReporter", "scheduler", _SELF): 1,
 }
 

@@ -53,7 +53,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             "chunked": RequestList(name="chunked", reqs=[chunked_req]),
         }
         return SimpleNamespace(
-            get_request_lists=lambda: lists,
+            request_registry=SimpleNamespace(request_lists=lambda: lists),
             policy=SimpleNamespace(
                 waiting_queue_prefix_matched=lambda reqs: waiting_queue_prefix_matched
             ),

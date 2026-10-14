@@ -5,7 +5,17 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -44,8 +54,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_context, get_model, get_parallel, get_serving
 from sglang.srt.utils.weight_checker import overall_checksum
+from sglang.srt.utils.weight_versions import record_weight_version_events
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+    from sglang.srt.managers.scheduler_components.request_registry import (
+        RequestRegistry,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +107,10 @@ class SchedulerWeightUpdaterManager:
     draft_worker: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
-    is_fully_idle: Callable[..., bool]
+    request_registry: RequestRegistry
     flags: EngineFlags
-    record_weight_version_change: Callable[[Optional[str]], None]
-    # The PD owners, read at call time: a role switch rebuilds them.
-    get_disagg_owners: Callable[[], Tuple[Any, ...]]
+    # Read at call time: a PD role switch replaces the owners.
+    mode_owners: ModeOwners
     metrics_collector: Optional[Any] = None
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
@@ -136,6 +152,23 @@ class SchedulerWeightUpdaterManager:
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.record_weight_version_change(new_version=weight_version)
+
+    def record_weight_version_change(self, new_version: Optional[str]) -> None:
+        if new_version is None or new_version == get_serving().weight_version:
+            return
+
+        old_version = get_serving().weight_version
+        get_context().override("scheduler.weight_version", weight_version=new_version)
+
+        live_reqs = [
+            req
+            for entry in self.request_registry.request_lists().values()
+            for req in entry.reqs
+        ]
+        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
+        logger.info(
+            f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+        )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -339,7 +372,7 @@ class SchedulerWeightUpdaterManager:
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # Held releases are dropped with the pool below (the PD decode
         # transfer queue's release_memory_occupation).
-        assert self.is_fully_idle(
+        assert self.request_registry.is_fully_idle(
             ignore_waiting=self.flags._engine_paused,
             ignore_releasing=True,
         ), "release_memory_occupation should be called only when server is idle."
@@ -353,7 +386,10 @@ class SchedulerWeightUpdaterManager:
             self.flags.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            for owner in self.get_disagg_owners():
+            for owner in (
+                self.mode_owners.disagg_decode,
+                self.mode_owners.disagg_prefill,
+            ):
                 if owner is not None:
                     owner.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
@@ -398,7 +434,10 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-            for owner in self.get_disagg_owners():
+            for owner in (
+                self.mode_owners.disagg_decode,
+                self.mode_owners.disagg_prefill,
+            ):
                 if owner is not None:
                     owner.resume_memory_occupation()
 

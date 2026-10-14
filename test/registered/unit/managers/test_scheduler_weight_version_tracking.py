@@ -7,8 +7,8 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
 )
 from sglang.srt.managers.request_lists import RequestList
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -40,7 +40,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ("get_serving", serving),
             ("get_context", _ContextStub(serving)),
         ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.weight_updater.{name}",
+                return_value=value,
+            )
             patcher.start()
             self.addCleanup(patcher.stop)
         return serving
@@ -59,7 +62,9 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """The scheduler has to end up on the version it was told about, or nothing downstream can read it."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v2")
+        SchedulerWeightUpdaterManager.record_weight_version_change(
+            self._scheduler(), new_version="v2"
+        )
 
         self.assertEqual(serving.weight_version, "v2")
 
@@ -67,7 +72,9 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """Re-announcing the current version must not be treated as a change."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v1")
+        SchedulerWeightUpdaterManager.record_weight_version_change(
+            self._scheduler(), new_version="v1"
+        )
 
         self.assertEqual(serving.weight_version, "v1")
 
@@ -75,7 +82,9 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """An update that carries no version must leave the recorded one alone."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(self._scheduler(), new_version=None)
+        SchedulerWeightUpdaterManager.record_weight_version_change(
+            self._scheduler(), new_version=None
+        )
 
         self.assertEqual(serving.weight_version, "v1")
 
@@ -88,10 +97,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
+            "sglang.srt.managers.scheduler_components.weight_updater.record_weight_version_events",
             return_value=0,
         ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
+            SchedulerWeightUpdaterManager.record_weight_version_change(
+                scheduler, new_version="v2"
+            )
 
         self.assertEqual(
             set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
@@ -136,6 +147,13 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.recorded = []
+        patcher = patch.object(
+            SchedulerWeightUpdaterManager,
+            "record_weight_version_change",
+            lambda manager, new_version: self.recorded.append(new_version),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _build_manager(self, target, draft):
         return SchedulerWeightUpdaterManager(
@@ -151,12 +169,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             ),
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
-            is_fully_idle=lambda **kwargs: True,
+            request_registry=SimpleNamespace(is_fully_idle=lambda **kwargs: True),
             flags=EngineFlags(),
-            record_weight_version_change=lambda new_version: self.recorded.append(
-                new_version
-            ),
-            get_disagg_owners=lambda: (),
+            mode_owners=ModeOwners(),
         )
 
     def _manager(self, target, draft=None, *, session=True):

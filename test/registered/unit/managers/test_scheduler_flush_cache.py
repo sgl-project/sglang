@@ -16,15 +16,16 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def _new_scheduler(self) -> SimpleNamespace:
         """The wrapper plus the three collaborators it was handed."""
         flush_cache = MagicMock(return_value=True)
-        is_fully_idle = MagicMock(return_value=False)
+        request_registry = MagicMock()
+        request_registry.is_fully_idle.return_value = False
         ipc_channels = MagicMock()
         return SimpleNamespace(
             flush_cache=flush_cache,
-            is_fully_idle=is_fully_idle,
+            is_fully_idle=request_registry.is_fully_idle,
             ipc_channels=ipc_channels,
             flush_wrapper=SchedulerFlushWrapper(
                 flush_cache=flush_cache,
-                is_fully_idle=is_fully_idle,
+                request_registry=request_registry,
                 ipc_channels=ipc_channels,
             ),
         )

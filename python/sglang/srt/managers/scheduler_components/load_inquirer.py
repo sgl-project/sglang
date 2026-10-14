@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
@@ -21,8 +21,12 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
+    )
+    from sglang.srt.managers.scheduler_components.request_registry import (
+        RequestRegistry,
     )
     from sglang.srt.managers.scheduler_components.step_counters import StepCounters
     from sglang.srt.managers.tp_worker import BaseTpWorker
@@ -43,8 +47,8 @@ class SchedulerLoadInquirer:
     spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
     metrics_sink: MetricsSink
-    get_request_lists: Callable
-    get_disagg_decode_prealloc_queue: Callable
+    request_registry: RequestRegistry
+    mode_owners: ModeOwners
     step_counters: StepCounters
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -54,7 +58,7 @@ class SchedulerLoadInquirer:
             == DisaggregationMode.DECODE
         ):
             return 0
-        lists = self.get_request_lists()
+        lists = self.request_registry.request_lists()
         waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
             lists["waiting"].reqs
         )
@@ -73,7 +77,7 @@ class SchedulerLoadInquirer:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         stats = self.metrics_sink.stats
-        lists = self.get_request_lists()
+        lists = self.request_registry.request_lists()
         num_running_reqs = len(lists["decoding"].reqs)
 
         queued = [req for entry in lists.values() if entry.queued for req in entry.reqs]
@@ -162,7 +166,7 @@ class SchedulerLoadInquirer:
             decode_retracted = len(lists["retracted"].reqs)
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue
+                for decode_req in self.mode_owners.disagg_decode.prealloc_queue.queue
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)

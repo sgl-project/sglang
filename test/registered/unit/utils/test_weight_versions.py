@@ -11,6 +11,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -323,6 +326,14 @@ def _scheduler_stub(
     return scheduler
 
 
+def _record_weight_version_change(scheduler, new_version):
+    """Record through the weight updater, over the stub's request registry."""
+    updater = SimpleNamespace(request_registry=scheduler.request_registry)
+    SchedulerWeightUpdaterManager.record_weight_version_change(
+        updater, new_version=new_version
+    )
+
+
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _scheduler(self, *args, **kwargs):
         enter_scope(self, published_topology())
@@ -331,7 +342,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ("get_serving", scheduler.serving),
             ("get_context", _ContextStub(scheduler.serving)),
         ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.weight_updater.{name}",
+                return_value=value,
+            )
             patcher.start()
             self.addCleanup(patcher.stop)
         return scheduler
@@ -345,7 +359,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(scheduler.serving.weight_version, "v2")
         for req, output_len in (
@@ -364,7 +378,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         coordinator.staging = [staging_req]
         scheduler = self._scheduler("v1", [], [], hisparse=coordinator)
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(len(staging_req.weight_version_events), 1)
         self.assertEqual(staging_req.weight_version_events[0].old_version, "v1")
@@ -386,7 +400,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         )
         scheduler.request_registry = request_registry_of(scheduler)
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         for req, output_len in ((retracted_req, 4), (held_req, 6)):
             self.assertEqual(len(req.weight_version_events), 1)
@@ -398,7 +412,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         req = _ReqStub(3)
         scheduler = self._scheduler("v1", [req], [])
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v1")
+        _record_weight_version_change(scheduler, new_version="v1")
 
         self.assertEqual(scheduler.serving.weight_version, "v1")
         self.assertEqual(req.weight_version_events, [])
@@ -408,7 +422,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         req = _ReqStub(3)
         scheduler = self._scheduler("v1", [req], [])
 
-        Scheduler.record_weight_version_change(scheduler, new_version=None)
+        _record_weight_version_change(scheduler, new_version=None)
 
         self.assertEqual(scheduler.serving.weight_version, "v1")
         self.assertEqual(req.weight_version_events, [])

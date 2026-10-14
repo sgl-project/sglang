@@ -20,9 +20,11 @@ from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.request_lists import RequestList
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
+    )
+    from sglang.srt.managers.scheduler_components.request_registry import (
+        RequestRegistry,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -50,9 +52,8 @@ class SchedulerInternalStateController:
     startup_available_gpu_memory_gb: float
     metrics_sink: MetricsSink
     rust_server: Any
-    get_request_lists: Callable[[], Dict[str, RequestList]]
-    # Set once the scheduler finishes starting, after this is built.
-    get_startup_time: Callable[[], Any]
+    request_registry: RequestRegistry
+    startup_time: Any
     record_step_time: bool
 
     # ---------------------------------------------------------------- readback
@@ -83,7 +84,7 @@ class SchedulerInternalStateController:
             tp_size=get_parallel().tp_size,
             pp_size=get_parallel().pp_size,
         )
-        state["startup_time"] = self.get_startup_time()
+        state["startup_time"] = self.startup_time
         state["effective_max_running_requests_per_dp"] = self.max_running_requests
         state["last_gen_throughput"] = self.metrics_sink.last_gen_throughput
 
@@ -260,7 +261,7 @@ class SchedulerInternalStateController:
         request list."""
         return any(
             req.return_sampling_mask and not req.finished()
-            for entry in self.get_request_lists().values()
+            for entry in self.request_registry.request_lists().values()
             for req in entry.reqs
         )
 

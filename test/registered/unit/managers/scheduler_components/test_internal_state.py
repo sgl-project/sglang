@@ -40,8 +40,8 @@ def _controller(registry: RequestRegistry) -> SchedulerInternalStateController:
         startup_available_gpu_memory_gb=0.0,
         metrics_sink=None,
         rust_server=None,
-        get_request_lists=registry.request_lists,
-        get_startup_time=lambda: None,
+        request_registry=registry,
+        startup_time=None,
         record_step_time=False,
     )
 
