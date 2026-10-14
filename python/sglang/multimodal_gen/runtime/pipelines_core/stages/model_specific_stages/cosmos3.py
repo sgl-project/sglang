@@ -1778,7 +1778,6 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
             if batch.rollout:
                 # Capture the pre-step x_{t_i} before the scheduler advances it.
-                batch._rollout_loop_step_index = i
                 self._maybe_append_dit_trajectory_step(
                     batch=batch,
                     latents=latents,
