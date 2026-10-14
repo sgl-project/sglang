@@ -85,35 +85,36 @@ The experiment used four NVIDIA L20D GPUs, TP4/EP1/attention-DP1,
 DeepSeek-V4.1-Flash native FP8 dense/FP4 expert weights, context 4096 and a maximum
 of four requests. CUDA Graph and overlap were disabled.
 
-### Complete main-model weight reload time
+### Engram in GPU memory
 
-Each row compares the same Engram placement; all numbers cover the entire main
-model, including Engram and post-load state, rather than an isolated mapping call.
+Disk reload compared with resident CUDA IPC recovery:
 
-| Configuration | Before | After | Speedup |
+| Metric | Before | After | Speedup |
 | --- | --- | --- | --- |
-| GPU-resident Engram: disk reload → resident CUDA IPC | 50.56 s | 1.02 s | 49.6× |
-| Shared host Engram: disk reload → resident IPC + memfd | 85.45 s | 14.44 s | 5.9× |
-| Per-rank host Engram: existing memfd recovery → HOST_NUMA VMM | 4.77 s | 3.36 s | 1.42× |
+| Complete main-model weight reload | **50.56 s** | **1.02 s** | **49.6×** |
+| Complete service recovery: process launch → healthy service | **95.09 s** | **36.53 s** | **2.60×** |
 
-GPU disk reload uses the median of two final matched runs; other recovery values
-are medians of three runs. Shared host disk reload has one sample. These are
-separate experiments and comparisons; the shared-host disk result is not a
-baseline for the per-rank VMM result. Optimized workers import an already loaded
-daemon; initial daemon loading is excluded.
+Values are medians: two final matched disk runs and three recovery runs.
+Compilation/autotuning caches were warm. The weight reload covers the entire
+main model, including Engram and post-load state; service recovery also includes
+communication, KV and runtime initialization.
 
-### Time until the service is usable
+### Engram in shared host memory
 
-With GPU-resident Engram, complete process-launch to healthy-service time changed
-from **95.09 s to 36.53 s** (median), a **2.60×** speedup. Compilation/autotuning
-caches were warm for both sides. Weight recovery is approximately one second,
-but communication, KV and runtime initialization still keep reconstruction in
-the tens of seconds.
+| Host layout and comparison | Metric | Before | After | Speedup |
+| --- | --- | --- | --- | --- |
+| Shared table: disk reload → resident IPC + memfd | Complete main-model weight reload | **85.45 s** | **14.44 s** | **5.9×** |
+| Per-rank shards: existing memfd recovery → HOST_NUMA VMM | Complete main-model weight reload | **4.77 s** | **3.36 s** | **1.42×** |
+| Per-rank shards: existing memfd recovery → HOST_NUMA VMM | Launch-helper return → polled service readiness | **45.54 s** | **40.53 s** | **1.12×** |
 
-With per-rank host Engram, VMM clients took approximately **40.53 s** to polled
-readiness, versus **45.54 s** for existing memfd clients (medians). This timer
-starts after the launch helper returns; exact process-launch to ready time was
-not measured for this comparison.
+Host recovery values are medians of three runs; the shared-table disk baseline
+has one sample. Shared tables and per-rank shards are separate experiments:
+85.45 s is not a matched baseline for 3.36 s. Exact process-launch to healthy
+service time was not measured for the host VMM comparison; its readiness timer
+starts after the launch helper returns.
+
+Both placements require an already loaded, surviving daemon for optimized
+recovery; initial daemon startup is excluded.
 
 Across 30 prompt comparisons, all text and input/output token IDs matched.
 24/30 also matched logprobs exactly. The 1401-token case differed even in a memfd
