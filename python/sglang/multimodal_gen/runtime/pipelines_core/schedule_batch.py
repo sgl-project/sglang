@@ -18,7 +18,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -40,6 +40,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+        FlowRolloutController,
+    )
 
 logger = init_logger(__name__)
 
@@ -198,6 +203,8 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    # Rollout controllers of this request, keyed by latent stream.
+    rollout_controllers: dict[str, FlowRolloutController] = field(default_factory=dict)
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
