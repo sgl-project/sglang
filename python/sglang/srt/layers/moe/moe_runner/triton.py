@@ -170,6 +170,8 @@ class TritonRunnerCore(MoeRunnerCore):
             filter_expert=filter_expert,
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
+            gate_up_interleaved=self.config.gate_up_interleaved,
+            fp8_use_rn_division=self.config.fp8_use_rn_division,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 

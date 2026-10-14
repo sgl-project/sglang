@@ -41,6 +41,8 @@ struct MegaMoEPreDispatchParams {
   uint32_t hidden;
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
+  int32_t expert_offset;
+  uint32_t num_local_experts;
 };
 
 // kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
@@ -137,8 +139,10 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = params.topk_weights[off];
+      const int32_t local_id = params.topk_idx[off] - params.expert_offset;
+      const bool is_local = static_cast<uint32_t>(local_id) < params.num_local_experts;
+      params.buf_topk_idx[off] = is_local ? local_id : -1;
+      params.buf_topk_weights[off] = is_local ? params.topk_weights[off] : 0.0f;
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -175,7 +179,9 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_idx,
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
-      const int64_t shared_block_m) {
+      const int64_t shared_block_m,
+      int64_t expert_offset,
+      int64_t num_local_experts) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -284,6 +290,8 @@ struct MegaMoEPreDispatchKernel {
         .hidden = hidden,
         .num_groups = num_groups,
         .top_k = top_k,
+        .expert_offset = static_cast<int32_t>(expert_offset),
+        .num_local_experts = static_cast<uint32_t>(num_local_experts),
     };
 
     if (num_total_blocks == 0) return;

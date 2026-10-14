@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import torch
+
 from sglang.kernels.ops.speculative.multi_layer_eagle import (
     compute_widened_draft_extend_locs_positions_triton,
     fill_draft_extend_prepare_buffers_native,
@@ -23,6 +25,24 @@ from sglang.kernels.ops.speculative.multi_layer_eagle import (
     wide_row_softmax_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import fast_topk, is_sm100_supported
+
+
+def compute_mtp_topk(logits: torch.Tensor, topk: int, *, greedy_chain: bool):
+    # Full top-1 chains consume only token IDs. Sampling and pruned trees
+    # require the actual probabilities and must keep the softmax path.
+    if (
+        greedy_chain
+        and topk == 1
+        and logits.is_cuda
+        and logits.dtype == torch.float32
+        and logits.stride(-1) == 1
+        and is_sm100_supported()
+    ):
+        from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+
+        return draft_topk1_postprocess(logits)
+    return fast_topk(torch.softmax(logits, dim=-1), topk, dim=-1)
 
 
 def boundary_kv_fix_enabled() -> bool:
@@ -53,6 +73,7 @@ def compute_widened_draft_extend_locs_positions(
 
 __all__ = [
     "boundary_kv_fix_enabled",
+    "compute_mtp_topk",
     "compute_widened_draft_extend_locs_positions",
     "fill_draft_extend_prepare_buffers_native",
     "fill_draft_extend_prepare_buffers_triton",

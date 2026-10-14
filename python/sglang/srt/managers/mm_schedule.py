@@ -221,6 +221,20 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
     }
 
 
+def _encodes_multi_run_items_independently(
+    data_embedding_func: DataEmbeddingFunc,
+) -> bool:
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return False
+    if getattr(data_embedding_func, "__name__", None) != "get_image_feature":
+        return False
+    return owner.__class__.__name__ in {
+        "Step3p7ForConditionalGeneration",
+        "Step5ForConditionalGeneration",
+    }
+
+
 def _move_items_to_device(
     items: List[MultimodalDataItem],
     device: torch.device,
@@ -586,7 +600,9 @@ def _get_chunked_prefill_embedding(
         )
 
         # Audio items may span several runs (interleaved with transcript text).
-        is_per_image = all(
+        is_per_image = _encodes_multi_run_items_independently(
+            data_embedding_func
+        ) or all(
             len(item.offsets) == 1 or item.is_audio()
             for item in embedding_items_per_req
         )

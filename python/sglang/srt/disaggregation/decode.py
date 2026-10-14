@@ -57,11 +57,13 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    aux_state,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_cache_dtype_str,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -126,6 +128,7 @@ from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +172,7 @@ class DecodeReqToTokenPool:
     """
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
-    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    _on_alloc_rows: tuple[Callable[[List[int]], None], ...] = ()
 
     def __init__(
         self,
@@ -236,8 +239,9 @@ class DecodeReqToTokenPool:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        if self._on_alloc_rows is not None and select_index:
-            self._on_alloc_rows(select_index)
+        if select_index:
+            for hook in self._on_alloc_rows:
+                hook(select_index)
         offset = 0
         for r in reqs:
             if not r.kv.holds_kv:
@@ -253,11 +257,13 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        # req_generation must stay monotonic; see ReqToTokenPool.clear().
+        # Match ReqToTokenPool: cache flush must not reuse a previous identity.
+
+    def get_mtp_boundary_warmup_tokens(self) -> int:
+        return 0
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
-        assert self._on_alloc_rows is None
-        self._on_alloc_rows = hook
+        self._on_alloc_rows += (hook,)
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -392,12 +398,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_total_num_tokens: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        draft_kv_pools: tuple = (),
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_pools = draft_kv_pools
+        self._aux_states = None
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -537,6 +546,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
+    @property
+    def aux_states(self) -> tuple:
+        """Pool-attached state whose components travel on this wire."""
+        if self._aux_states is None:
+            state_types = self.kv_manager.kv_args.state_types
+            state = aux_state(self.token_to_kv_pool)
+            self._aux_states = (
+                (state,)
+                if state is not None
+                and any(
+                    StateType(name) in state_types
+                    for name, _ in state.get_pd_state_components()
+                )
+                else ()
+            )
+        return self._aux_states
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -591,8 +617,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = get_parallel().dp_rank
-        kv_args.kv_cache_dtype_str = (
-            self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
+        kv_args.kv_cache_dtype_str = get_pd_kv_cache_dtype_str(
+            self.scheduler.tp_worker.model_runner
         )
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
@@ -655,6 +681,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            draft_kv_pools=self.draft_kv_pools,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1688,6 +1715,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
+            for state in self.aux_states:
+                state.invalidate_pd_receive(int(decode_req.req.kv.req_pool_idx))
             if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_request_state = getattr(
                     self.token_to_kv_pool, "clear_request_scoped_state", None
@@ -1707,6 +1736,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.STEP5_COMPRESSED_INDEX_KEY: _full_kv_pages_payload,
+                StateType.STEP5_DSA_TAIL: lambda: np.asarray(
+                    [decode_req.req.kv.req_pool_idx], dtype=np.int32
+                ),
             }
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -2456,6 +2489,21 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+def _bind_aux_state(
+    scheduler, req, state, *, synthetic: bool = False
+) -> tuple[bool, int, int, int]:
+    """Validate one received request-slot state under D's local identity."""
+    slot = int(req.kv.req_pool_idx)
+    generation = int(scheduler.req_to_token_pool.req_generation[slot])
+    frontier = len(req.origin_input_ids)
+    if synthetic:
+        state.initialize_synthetic_pd_receive(request_slot=slot, frontier=frontier)
+    valid = state.bind_pd_receive(
+        request_slot=slot, generation=generation, frontier=frontier
+    )
+    return valid, slot, generation, frontier
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -2576,6 +2624,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             return
+
+        for state in self.scheduler.disagg_decode_prealloc_queue.aux_states:
+            valid, slot, generation, frontier = _bind_aux_state(
+                self.scheduler,
+                decode_req.req,
+                state,
+                synthetic=_is_fake_transfer(decode_req.req),
+            )
+            if not valid:
+                logger.error(
+                    "PD %s validation failed for request %s "
+                    "(slot=%d, generation=%d, frontier=%d)",
+                    type(state).__name__,
+                    decode_req.req.rid,
+                    slot,
+                    generation,
+                    frontier,
+                )
+                prepare_abort(
+                    decode_req.req,
+                    f"{type(state).__name__} failed PD validation",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
 
         self._commit_hicache_local_restore_to_req(decode_req)
 

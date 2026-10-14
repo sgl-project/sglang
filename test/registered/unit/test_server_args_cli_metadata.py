@@ -16,6 +16,14 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         cls.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(cls.parser)
 
+    def test_shortest_prefill_first_policy_is_accepted(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--schedule-policy", "shortest-prefill-first"]
+        )
+        self.assertEqual(
+            ServerArgs.from_cli_args(args).schedule_policy, "shortest-prefill-first"
+        )
+
     def test_data_parallel_aliases_keep_old_usage(self):
         for option in ("--data-parallel-size", "--dp-size"):
             with self.subTest(option=option):

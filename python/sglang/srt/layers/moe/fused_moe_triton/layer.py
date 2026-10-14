@@ -119,7 +119,7 @@ def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
         )
         or (
             isinstance(quant_method, UnquantizedFusedMoEMethod)
-            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            and quant_method.runner.runner_backend.is_flashinfer_trtllm_routed()
         )
     )
 
@@ -177,7 +177,13 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
-        return StandardDispatcher(moe_runner_config)
+        # Mixed-precision models may select a different runner for BF16 layers.
+        # Expert IDs must follow that layer's runner, not the global preference.
+        runner = getattr(quant_method, "runner", None)
+        return StandardDispatcher(
+            moe_runner_config,
+            runner_backend=runner.runner_backend if runner is not None else None,
+        )
     elif (
         a2a_backend.is_deepep()
         or a2a_backend.is_mooncake()
@@ -352,11 +358,16 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
+        fp8_use_rn_division: bool = False,
+        silu_clamp_mode: Optional[str] = None,
+        fc1_output_dtype: Optional[str] = None,
     ):
         super().__init__()
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        if fp8_use_rn_division and not get_moe_runner_backend().is_triton():
+            raise ValueError("FP8 RN division currently requires the Triton MoE runner")
         self.params_dtype = params_dtype
         self.layer_name = prefix
         self.layer_id = layer_id
@@ -465,6 +476,9 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            fp8_use_rn_division=fp8_use_rn_division,
+            silu_clamp_mode=silu_clamp_mode,
+            fc1_output_dtype=fc1_output_dtype,
             layer=self,
         )
 
@@ -543,6 +557,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
+        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            # The loader's gate/up order must match this layer's chosen runner.
+            self.use_flashinfer_trtllm_moe = self.quant_method.use_flashinfer_trtllm_moe
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
         )

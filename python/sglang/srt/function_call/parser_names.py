@@ -38,6 +38,7 @@ TOOL_CALL_PARSER_NAMES = [
     "spark25",
     "step3",
     "step3p5",
+    "step5",
     "minimax-m2",
     "minimax-m3",
     "nanbeige",

@@ -18,7 +18,6 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
-
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -28,8 +27,9 @@ from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
+    AnyRustMmSpec,
     RustMmProcessor,
-    RustMmSpec,
+    RustStep3VlSpec,
     settle_shm_buffers,
 )
 from sglang.srt.utils.flatten import (
@@ -59,7 +59,7 @@ class RustServer:
         self,
         server: Server,
         http_port: int,
-        mm_spec: Optional[RustMmSpec] = None,
+        mm_spec: Optional[AnyRustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
@@ -502,13 +502,29 @@ class RustServer:
             )
 
     @classmethod
-    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+    def _build_mm_spec(cls, spec: AnyRustMmSpec) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
         :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         ext = cls._load_extension()
+        if isinstance(spec, RustStep3VlSpec):
+            return ext.MmSpec.step3_vl(
+                feature_shm=spec.feature_shm,
+                image_token_id=spec.image_token_id,
+                image_start_id=spec.image_start_id,
+                image_end_id=spec.image_end_id,
+                patch_start_id=spec.patch_start_id,
+                patch_end_id=spec.patch_end_id,
+                patch_newline_id=spec.patch_newline_id,
+                image_size=spec.image_size,
+                patch_size=spec.patch_size,
+                image_feature_tokens=spec.image_feature_tokens,
+                patch_feature_tokens=spec.patch_feature_tokens,
+                image_mean=spec.image_mean,
+                image_std=spec.image_std,
+            )
         family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample
