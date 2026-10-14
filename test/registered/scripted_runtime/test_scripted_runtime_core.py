@@ -11,12 +11,13 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     advance_to_nth_chunk,
     base_engine_kwargs,
     exhaust_row_pool,
+    run_until,
     run_until_finished,
     warmup_radix,
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=460, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=297, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=460, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -301,9 +302,11 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     @staticmethod
     def _script_ignore_eos_runs_full_length(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=6, ignore_eos=True)
-        yield from run_until_finished(r)
+        # Hold the req while it runs: once its last token is processed it may
+        # leave every scheduler set in the same step.
+        yield from advance_to_decode_step(r, 1)
         req = r.req
-        assert req is not None, "finished req vanished before its output could be read"
+        yield from run_until_finished(r)
         assert len(req.output_ids) == 6, (
             f"ignore_eos must decode the full length; got {list(req.output_ids)!r}"
         )
@@ -643,13 +646,14 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from warmup_radix(t, [1] * (2 * _CHUNK_SIZE))
 
         r = t.start_req(prompt_len=2 * _CHUNK_SIZE + 1, max_new_tokens=1)
+        # Hold the req while it is visible: once its last token is processed it
+        # may leave every scheduler set in the same step.
+        yield from run_until(r, lambda h: h.req is not None)
+        req = r.req
         yield from run_until_finished(r)
-        assert r.req is not None, (
-            "finished req vanished before cached_tokens could be read"
-        )
-        assert r.req.cached_tokens > 0, (
+        assert req.cached_tokens > 0, (
             f"req with the warmed prefix should hit the radix cache; "
-            f"got cached_tokens={r.req.cached_tokens}"
+            f"got cached_tokens={req.cached_tokens}"
         )
 
     def test_exhaust_kv_creates_pressure_and_release_restores(self):

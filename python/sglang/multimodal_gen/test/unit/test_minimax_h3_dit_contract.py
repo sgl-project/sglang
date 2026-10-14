@@ -238,7 +238,9 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
+    block.attn.qkv_proj = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     block.mlp = torch.nn.Identity()
+    block.mlp.fc1 = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
@@ -261,7 +263,7 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
 
     with (
         patch(
-            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_rmsnorm_scale_shift",
             side_effect=lambda value, *_args, **_kwargs: value,
         ),
         patch(
@@ -848,3 +850,35 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("compiling", [False, True])
+def test_compiled_attention_runs_its_fused_section_eager(compiling):
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig()
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    tokens = 4
+    out = torch.empty(tokens, attention.local_inner_dim, device="meta")
+
+    with (
+        patch.object(torch.compiler, "is_compiling", return_value=compiling),
+        patch.object(MiniMaxH3Attention, "_attend", return_value=out) as attend,
+        patch.object(
+            MiniMaxH3Attention, "_attend_eager", return_value=out
+        ) as attend_eager,
+    ):
+        result = attention(
+            torch.empty(tokens, arch.hidden_size, device="meta"),
+            rope_cache=None,
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            max_seqlen=tokens,
+        )
+
+    assert result.shape == (tokens, arch.hidden_size)
+    assert (attend_eager if compiling else attend).call_count == 1
+    assert (attend if compiling else attend_eager).call_count == 0
+
+
+def test_eager_attention_section_is_hidden_from_dynamo():
+    assert MiniMaxH3Attention._attend_eager._torchdynamo_disable

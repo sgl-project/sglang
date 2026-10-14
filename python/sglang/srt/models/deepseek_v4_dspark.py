@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Iterable, List, Optional, Tuple
 
@@ -12,12 +13,11 @@ from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inpl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -33,22 +33,24 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     MqaAttentionBase,
+    _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
 )
 from sglang.srt.models.dspark import (
+    BaseDSparkMarkovHead,
     DSparkConfidenceHead,
-    StepSampler,
+    VocabShard,
     gather_and_crop_vocab,
     project_through_lm_head,
-    run_markov_block,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -63,16 +65,11 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 _is_npu = is_npu()
 
 
@@ -106,8 +103,6 @@ class DSparkAttention(MqaAttentionBase):
             layer_id,
             quant_config,
             prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
             compress_ratio=0,
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
@@ -189,6 +184,25 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if not self.q_head_norm:
+            if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+                fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
+                return q_out
+            if self._use_fast_kernel and not _is_npu:
+                fused_rope_inplace(
+                    q[..., -self.rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                )
+            else:
+                apply_rotary_emb(
+                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
+                )
+            if q_out is None:
+                return q
+            q_out.copy_(q)
+            return q_out
         if self._use_fast_kernel:
             if q_out is None:
                 q_out = torch.empty_like(q)
@@ -236,8 +250,9 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
-        if _is_npu and forward_batch.forward_mode.is_idle():
+        # Idle ranks have no draft KV rows or attention metadata, but still
+        # participate in the shared MoE forward later in the draft stage.
+        if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -254,7 +269,17 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        if (
+            pool.uniform_fp8
+            and not self.q_head_norm
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        ):
+            q_out = torch.empty(
+                (hidden_states.shape[0], self.n_local_heads, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+        elif self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -336,7 +361,13 @@ class DSparkAttention(MqaAttentionBase):
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o,
+                wo_a,
+                is_decode=forward_batch.forward_mode.is_decode(),
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
+            )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
@@ -360,13 +391,14 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
     num_embeddings_padded: int
 
 
-class DSparkV4MarkovHead(nn.Module):
-    markov_head_type = "vanilla"
-
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+class DSparkV4MarkovHead(BaseDSparkMarkovHead):
+    def __init__(
+        self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
+        self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"DSparkV4MarkovHead requires markov_rank > 0, got {self.markov_rank}."
@@ -418,12 +450,24 @@ class DSparkV4MarkovHead(nn.Module):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        vocab_gather = make_vocab_gather(
+            shard_group,
+            local_width=per_partition,
+            prefer_nvlink=self._is_dsv41
+            and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        )
+        if shard_group.rank == 0:
+            cls_name = type(vocab_gather).__name__
+            logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
             org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
             num_embeddings_per_partition=per_partition,
             num_embeddings_padded=num_padded,
+        )
+        self.vocab_shard = VocabShard(
+            start=self._tp_shard.org_vocab_start, gather=vocab_gather
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -437,67 +481,35 @@ class DSparkV4MarkovHead(nn.Module):
             return F.linear(latent_states.to(weight.dtype), weight).float()
         return F.linear(latent_states.float(), weight)
 
-    def compute_step_bias(
-        self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
-
-    def apply_step_logits(
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self._tp_shard is not None:
-            return self._apply_step_logits_sharded(
-                base_local=logits, token_ids=token_ids
-            )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def _apply_step_logits_sharded(
-        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del hidden_states
+        latent = self.get_prev_embeddings(prev_tokens)
         shard = self._tp_shard
-        latent = self.get_prev_embeddings(token_ids)
+        if shard is None:
+            return self.project_bias(latent), state
         weight_local = self.markov_w2.weight[
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if self._opt_markov_w2_bf16:
-            bias = F.linear(latent.to(weight_local.dtype), weight_local)
-        else:
-            bias = F.linear(latent.float(), weight_local)
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
-            assert self._shard_group is not None
-            full = self._shard_group.all_gather(step_local, dim=-1)
-        else:
-            full = step_local
-        return full[..., : self.vocab_size]
+            # Keep the bias in BF16; the step add upcasts it to FP32.
+            return F.linear(latent.to(weight_local.dtype), weight_local), state
+        return F.linear(latent.float(), weight_local), state
+
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias is FP32 or upcast into an FP32 add, sharded or not.
+        del base_dtype
+        return torch.float32
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
         return logits, embed
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
 
 def build_dspark_v4_confidence_head(
@@ -527,6 +539,22 @@ def build_dspark_v4_confidence_head(
     )
 
 
+def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
+    n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
+    n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
+    has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    if not (n_routed or n_active or has_vision):
+        return config
+    stage_config = copy.copy(config)
+    if n_routed:
+        stage_config.n_routed_experts = n_routed
+    if n_active:
+        stage_config.num_experts_per_tok = n_active
+    if has_vision:
+        stage_config.vision_n_layers = 0
+    return stage_config
+
+
 class DSparkV4Stage(DeepseekV4DecoderLayer):
     def __init__(
         self,
@@ -538,14 +566,18 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__(
-            config=config,
+            config=_dspark_stage_config(config),
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=prefix,
             is_nextn=True,
             alt_streams=alt_streams,
+            hc_stats_stream=hc_stats_stream,
+            moe_routed_quant_stream=moe_routed_quant_stream,
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
@@ -566,11 +598,16 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
         if stage_id == num_stages - 1:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            (
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-            ) = make_hc_head_params(config.hc_mult, config.hidden_size)
+            if self.hc_pre_from_prev_sublayer:
+                # V4.1 collapses the head with the last FFN's pre-mix; the
+                # checkpoint carries no hc_head_* tensors for the stages.
+                self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
+            else:
+                (
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                ) = make_hc_head_params(config.hc_mult, config.hidden_size)
 
     def _build_self_attn(
         self,
@@ -615,7 +652,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        prev_pre: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.hc_pre_from_prev_sublayer:
+            return self._forward_hc_pre_from_prev(
+                positions, hidden_states, forward_batch, prev_pre
+            )
         residual = hidden_states
         x, post, comb = self._hc_pre_block(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -632,7 +674,45 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         x = self.post_attention_layernorm(x)
         x = self._run_ffn(x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
-        return x
+        return x, None
+
+    def _forward_hc_pre_from_prev(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The draft stages run the plain four steps: no fused post, no seams, so
+        # they need nothing from `bind_next` and never hand anything forward.
+        assert self.attn_hc is not None and self.ffn_hc is not None
+        stats_stream = None
+        if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
+            stats_stream = self.hc_stats_stream
+
+        residual = hidden_states
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = mhc.mix_stats(
+            self.attn_hc, hidden_states, stats_stream
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = hidden_states
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
+            self.ffn_hc, hidden_states, stats_stream
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
@@ -648,6 +728,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+    precompile_kernels_after_loading = (
+        DeepseekV4ForCausalLM.precompile_kernels_after_loading
+    )
 
     @classmethod
     def shared_experts_fusion_disable_reason(
@@ -661,12 +744,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "shared experts into fused expert slots."
             )
 
-        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config, quant_config
-        )
-
-    @classmethod
-    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
@@ -720,6 +797,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None
         )
+        self.moe_routed_quant_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
+        self.hc_stats_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and get_platform().is_blackwell
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
         self.stages = nn.ModuleList(
             [
                 DSparkV4Stage(
@@ -731,6 +823,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"stages.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
+                    hc_stats_stream=self.hc_stats_stream,
+                    moe_routed_quant_stream=self.moe_routed_quant_stream,
                 )
                 for stage_id in range(self.num_stages)
             ]
@@ -738,6 +832,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
+            is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
@@ -745,6 +840,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.hc_mult = int(config.hc_mult)
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
+        self.hc_pre_from_prev_sublayer = bool(
+            getattr(config, "hc_pre_from_prev_sublayer", False)
+        )
 
         if self.uses_own_vocab_modules:
             self.embed_tokens = VocabParallelEmbedding(
@@ -797,6 +895,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
+            allow_strided_output=(
+                get_platform().is_blackwell
+                and not is_unified_kv_triton()
+                and not pool.uniform_fp8
+            ),
         )
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
@@ -842,12 +946,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
-        for stage in self.stages:
-            x = stage(positions, x, forward_batch)
+        pre = None
+        # Draft MoE layers have no recorder layer index, so keep them out of the stats.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x, pre = stage(positions, x, forward_batch, pre)
+        if self.hc_pre_from_prev_sublayer:
+            from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
+        if self.hc_pre_from_prev_sublayer:
+            assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
+            return x
         last = self.stages[-1]
         return hc_head_torch(
             x,
@@ -859,7 +973,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 
@@ -884,25 +997,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self,
         *,
         anchor_tokens: torch.Tensor,
-        sampled_tokens: torch.Tensor,
-        x_post_hc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        confidence_head = self.confidence_head
-        if confidence_head is None:
-            return None
-        bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
-        if confidence_head.with_markov:
-            prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
-            )
-            markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
-        else:
-            markov_embed_stack = None
-        confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
-        confidence = confidence_head.apply_sts(confidence_raw)
-        expect(_CONFIDENCE, confidence)
-        return confidence
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
@@ -1014,6 +1117,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
+            rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
+            rest = rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
             return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
@@ -1030,6 +1135,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+        if mapped_rest.endswith(".gate.bias_vl"):
+            return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
         return f"stages.{stage_id}.{mapped_rest}"

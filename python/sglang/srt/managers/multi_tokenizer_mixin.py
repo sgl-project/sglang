@@ -28,9 +28,11 @@ import signal
 import sys
 import threading
 import zlib
+from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
+import msgspec
 import psutil
 import setproctitle
 import zmq
@@ -78,6 +80,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
@@ -248,9 +252,6 @@ def _handle_output_by_index(output, i):
             output_token_sampling_mask=_extract_field_by_index(
                 output, "output_token_sampling_mask", i, check_length=False
             ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
-            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -369,9 +370,6 @@ def _handle_output_by_index(output, i):
             output_token_sampling_mask=_extract_field_by_index(
                 output, "output_token_sampling_mask", i, check_length=False
             ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
-            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -401,6 +399,144 @@ def _handle_output_by_index(output, i):
     return new_output
 
 
+class _CannotSplitBatch(Exception):
+    pass
+
+
+def _extract_field_by_indices(
+    output: Any, field_name: str, indices: List[int], check_length: bool = True
+) -> Any:
+    field = object.__getattribute__(output, field_name)
+    if field is None:
+        return None
+
+    should_wrap_result = field_name in ("customized_info", "time_stats")
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
+
+    max_index = max(indices)
+    if isinstance(field, dict):
+        new_field = {}
+        for key, values in field.items():
+            if len(values) <= max_index:
+                raise _CannotSplitBatch(
+                    f"{field_name}[{key!r}] cannot provide index {max_index}"
+                )
+            selected = [values[index] for index in indices]
+            new_field[key] = selected
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
+        return new_field
+
+    # Same as _extract_field_by_index: a field too short for every index (e.g.
+    # spec_* lists stay empty when speculative decoding is off) becomes None.
+    if check_length and len(field) <= min(indices):
+        return None
+    if len(field) <= max_index:
+        raise _CannotSplitBatch(f"{field_name} cannot provide index {max_index}")
+
+    selected = [field[index] for index in indices]
+    return wrap_as_pickle(selected) if should_wrap_result else selected
+
+
+# Per-request fields that may be shorter than rids; the rest must match rids or
+# be empty.
+_UNCHECKED_LENGTH_FIELDS = frozenset(
+    {
+        "input_token_logprobs_val",
+        "input_token_logprobs_idx",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+        "input_top_logprobs_val",
+        "input_top_logprobs_idx",
+        "input_top_logprobs_val_flat",
+        "input_top_logprobs_idx_flat",
+        "input_top_logprobs_flat_null_prefix",
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
+        "input_token_ids_logprobs_val",
+        "input_token_ids_logprobs_idx",
+        "output_token_ids_logprobs_val",
+        "output_token_ids_logprobs_idx",
+        "output_token_entropy_val",
+        "output_token_sampling_mask",
+        "output_hidden_states",
+        "routed_experts",
+        "indexer_topk",
+        "token_steps",
+        "customized_info",
+        "dp_ranks",
+    }
+)
+_NOT_SPLIT_FIELDS = frozenset(
+    {"rids", "http_worker_ipcs", "placeholder_tokens_idx", "placeholder_tokens_val"}
+)
+
+
+def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
+    if len(indices) == 1:
+        return _handle_output_by_index(output, indices[0])
+    if not isinstance(output, (BatchTokenIDOutput, BatchStrOutput)):
+        raise _CannotSplitBatch(f"Cannot split {type(output)}")
+
+    split_fields = {
+        field.name: _extract_field_by_indices(
+            output,
+            field.name,
+            indices,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        )
+        for field in _cached_output_fields(type(output))
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    return type(output)(
+        rids=[output.rids[index] for index in indices],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **split_fields,
+    )
+
+
+def _split_batch_by_key(
+    output: Any, keys: List[Any]
+) -> Optional[List[Tuple[Any, Any]]]:
+    indices_by_key: Dict[Any, List[int]] = {}
+    for index, key in enumerate(keys):
+        indices_by_key.setdefault(key, []).append(index)
+
+    # Build every sub-batch before any send, so a fallback never duplicates one.
+    try:
+        grouped = [
+            (key, _handle_output_by_indices(output, indices), indices)
+            for key, indices in indices_by_key.items()
+        ]
+    except _CannotSplitBatch:
+        return None
+
+    ipcs = output.http_worker_ipcs
+    for _, sub_output, indices in grouped:
+        sub_output.http_worker_ipcs = (
+            None if ipcs is None else [ipcs[index] for index in indices]
+        )
+    return [(key, sub_output) for key, sub_output, _ in grouped]
+
+
+def _send_output_to_tokenizer_workers(
+    output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
+) -> None:
+    grouped = _split_batch_by_key(output, ipcs)
+    if grouped is None:
+        for index, ipc_name in enumerate(ipcs):
+            single_output = _handle_output_by_index(output, index)
+            socket_mapping.send_output(ipc_name, single_output, is_tokenizer=True)
+        return
+
+    for ipc_name, grouped_output in grouped:
+        socket_mapping.send_output(ipc_name, grouped_output, is_tokenizer=True)
+
+
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
@@ -422,11 +558,9 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                    _send_output_to_tokenizer_workers(
+                        output, recv_obj.http_worker_ipcs, self.socket_mapping
+                    )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
@@ -567,14 +701,11 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``rid`` with
+    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
     always land on the same detokenizer and ``decode_status`` stays consistent.
-
-    The key is the ``rid`` rather than the ``http_worker_ipc`` because the
-    latter is only stamped when ``--tokenizer-worker-num > 1``, and even then it
-    identifies an HTTP worker instead of a request, so it can never spread load
-    over more detokenizers than there are tokenizer workers.
+    With a single tokenizer worker no ``http_worker_ipc`` is stamped, and the
+    ``rid`` is hashed instead.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -592,22 +723,47 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
+    def _pick_for(self, http_worker_ipc: Optional[str], rid: str) -> str:
+        return self._pick(rid if http_worker_ipc is None else http_worker_ipc)
+
+    def _send_batch(self, recv_obj: BaseBatchReq) -> None:
+        ipcs = recv_obj.http_worker_ipcs
+        assert ipcs is not None and len(ipcs) == len(recv_obj.rids), (
+            f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+        )
+        targets = [self._pick_for(ipc, rid) for ipc, rid in zip(ipcs, recv_obj.rids)]
+
+        grouped = _split_batch_by_key(recv_obj, targets)
+        if grouped is None:
+            for index, target in enumerate(targets):
+                one = _handle_output_by_index(recv_obj, index)
+                if one is recv_obj:
+                    raise TypeError(f"Cannot split {type(recv_obj)}")
+                one.http_worker_ipcs = [ipcs[index]]
+                self._send(target, one)
+            return
+
+        for target, output in grouped:
+            self._send(target, output)
+
     def event_loop(self):
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
 
-            # Control messages carry no rid and must reach every detokenizer.
+            # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own rid.
+            # Single request: route like the batch items of the same rid.
             if isinstance(recv_obj, BaseReq):
-                assert recv_obj.rid is not None, (
-                    f"Single req {type(recv_obj).__name__} missing rid"
+                assert (
+                    recv_obj.http_worker_ipc is not None or recv_obj.rid is not None
+                ), f"Single req {type(recv_obj).__name__} has no routing key"
+                self._send(
+                    self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj
                 )
-                self._send(self._pick(recv_obj.rid), recv_obj)
                 continue
 
             # Batch request.
@@ -618,22 +774,7 @@ class MultiDetokenizerRouter:
                         self._send(ipc, recv_obj)
                     continue
 
-                # http_worker_ipcs is only populated when there are multiple
-                # tokenizer workers. It is forwarded so the detokenizer can
-                # answer the right HTTP worker, it is not a routing key.
-                ipcs = recv_obj.http_worker_ipcs
-                assert ipcs is None or len(ipcs) == len(recv_obj.rids), (
-                    f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
-                )
-
-                # Split per-item and route each by its own rid.
-                for i, rid in enumerate(recv_obj.rids):
-                    one = _handle_output_by_index(recv_obj, i)
-                    if one is recv_obj:
-                        raise TypeError(f"Cannot split {type(recv_obj)}")
-                    if ipcs is not None:
-                        one.http_worker_ipcs = [ipcs[i]]
-                    self._send(self._pick(rid), one)
+                self._send_batch(recv_obj)
                 continue
 
             raise ValueError(

@@ -98,6 +98,15 @@ class RecoverSWAWithLockedFull(ComponentAction, frozen=True):
     component_type: ComponentType = ComponentType.SWA
 
 
+class RecoverEvictedSWA(ComponentAction, frozen=True):
+    """Recover evicted SWA on kept Full IDs by moving the incoming SWA mapping,
+    leaving Full cleanup and tree publication to the caller."""
+
+    component_type: ComponentType
+    kept_full: torch.Tensor
+    incoming_full: torch.Tensor
+
+
 class SWARebuild(ComponentAction, frozen=True):
     """Rebuild a node's SWA value by translating its source full value, then store it."""
 

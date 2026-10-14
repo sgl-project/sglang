@@ -31,10 +31,12 @@ import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=96, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(est_time=180, suite="stage-c-test-4-gpu-amd")
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
@@ -43,8 +45,9 @@ MAX_LORA_RANK = 32
 TP_SIZE = 4
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True
-PREFILL_ATTENTION_BACKEND = "fa4"
-DECODE_ATTENTION_BACKEND = "fa4"
+ATTENTION_BACKEND = "triton" if is_hip() else "flashinfer"
+PREFILL_ATTENTION_BACKEND = "triton" if is_hip() else "fa4"
+DECODE_ATTENTION_BACKEND = "triton" if is_hip() else "fa4"
 
 KL_THRESHOLD = 5e-3
 
@@ -80,7 +83,7 @@ class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
             max_lora_rank=MAX_LORA_RANK,
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
-            attention_backend="flashinfer",
+            attention_backend=ATTENTION_BACKEND,
             moe_runner_backend=MOE_RUNNER_BACKEND,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,

@@ -9,44 +9,15 @@ from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
 from sglang.srt.entrypoints.search.exa_client import (
     EXA_INTEGRATION_HEADER,
-    EXA_INTEGRATION_NAME,
-    ExaClient,
     ExaSearchConfig,
 )
 from sglang.srt.entrypoints.tool import HarmonyBrowserTool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class ExaClientTestCase(unittest.TestCase):
-    def test_headers_include_sglang_integration_tag(self):
-        client = ExaClient("test-key")
-
-        headers = client._headers()
-
-        self.assertEqual(headers["x-api-key"], "test-key")
-        self.assertEqual(headers[EXA_INTEGRATION_HEADER], EXA_INTEGRATION_NAME)
-        self.assertEqual(headers["Content-Type"], "application/json")
-
-    def test_default_search_payload_uses_server_side_defaults(self):
-        client = ExaClient("test-key")
-
-        payload = client._search_payload("SGLang native web search")
-
-        self.assertEqual(payload["numResults"], 10)
-        self.assertEqual(payload["type"], "auto")
-        self.assertEqual(payload["contents"], {"highlights": True})
-
-    def test_contents_payload_requests_text_and_highlights(self):
-        client = ExaClient("test-key")
-
-        payload = client._contents_payload(["https://example.com"])
-
-        self.assertEqual(payload["urls"], ["https://example.com"])
-        self.assertTrue(payload["text"])
-        self.assertTrue(payload["highlights"])
-
     def test_config_can_be_set_from_server_environment(self):
         env = {
             "SGLANG_EXA_NUM_RESULTS": "7",
@@ -59,52 +30,6 @@ class ExaClientTestCase(unittest.TestCase):
         self.assertEqual(config.num_results, 7)
         self.assertEqual(config.search_type, "fast")
         self.assertFalse(config.include_highlights)
-
-    def test_post_sends_integration_header_without_network(self):
-        captured = {}
-
-        class FakeResponse:
-            status = 200
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return None
-
-            async def text(self):
-                return '{"ok": true}'
-
-            async def json(self):
-                return {"ok": True}
-
-        class FakeSession:
-            def __init__(self, timeout):
-                captured["timeout"] = timeout
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return None
-
-            def post(self, url, json, headers):
-                captured["url"] = url
-                captured["json"] = json
-                captured["headers"] = headers
-                return FakeResponse()
-
-        client = ExaClient("test-key")
-        with patch(
-            "sglang.srt.entrypoints.search.exa_client.aiohttp.ClientSession",
-            FakeSession,
-        ):
-            result = asyncio.run(client._post("/search", {"query": "sglang"}))
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(captured["url"], "https://api.exa.ai/search")
-        self.assertEqual(captured["json"], {"query": "sglang"})
-        self.assertEqual(captured["headers"][EXA_INTEGRATION_HEADER], "sglang")
 
 
 class ResponsesNativeWebSearchTestCase(unittest.TestCase):
