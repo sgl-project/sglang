@@ -111,6 +111,11 @@ class TestDSV41FlashTP2EP2DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
 
     tp_size = 2
     parallel_args = ["--attn-dp-size", "1", "--ep-size", "2"]
+    # Engram tables on the GPU leave no KV cache at TP2 under mem-fraction 0.8.
+    server_env = {
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+    }
 
 
 class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
