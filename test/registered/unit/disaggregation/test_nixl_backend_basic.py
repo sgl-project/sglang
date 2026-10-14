@@ -331,8 +331,6 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
         mgr.local_shm_enabled = False
-        mgr.local_shm_errors = {}
-        mgr.local_shm_mappings = {}
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -1257,8 +1255,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
         mgr.local_shm_enabled = False
-        mgr.local_shm_errors = {}
-        mgr.local_shm_mappings = {}
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False
