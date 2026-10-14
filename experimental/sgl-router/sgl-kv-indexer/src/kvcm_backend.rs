@@ -859,8 +859,11 @@ impl Inner {
     }
 
     /// One-shot `RegisterInstance` when auto-registration is configured.
-    /// KVCM re-registration is idempotent for identical fields, so a race
-    /// between concurrent first batches is harmless.
+    ///
+    /// It runs on the apply budget, not a caller's: this is a setup call rather
+    /// than a data-plane answer. Concurrent first calls (a cold start) may each
+    /// send one; KVCM is idempotent for identical fields, and after the first
+    /// success the flag short-circuits the rest.
     async fn register_instance(&self) -> Result<(), Status> {
         let Some(auto) = &self.config.auto_register else {
             return Ok(());
@@ -1114,6 +1117,15 @@ impl KvIndexerBackend for KvcmIndexerBackend {
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
+        // A prefix query can be the first thing this backend ever does: the
+        // Router asks about a deployment before any worker has published a KV
+        // event, so no apply batch has registered the instance yet and KVCM
+        // answers INSTANCE_NOT_EXIST -- a permanent fault that would fail every
+        // request until traffic warmed a worker by some other path. The
+        // registration needs nothing from a batch, so the query path ensures it
+        // too; deployments without `auto_register` keep the fault, which is then
+        // a real configuration error.
+        self.inner.register_instance().await?;
         let response = self.inner.get_host_cache_state(&hashes).await?;
         let blocks_read = hashes.len() as u32;
         let workers = self.inner.workers_read()?;

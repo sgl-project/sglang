@@ -660,6 +660,73 @@ async fn environment_configuration_reaches_the_wire() {
 }
 
 #[tokio::test]
+async fn a_prefix_query_registers_an_auto_registering_instance_first() {
+    // The Router's first request can be a prefix query on a deployment where no
+    // KV event has arrived yet, so no apply batch has registered the instance.
+    // KVCM answers INSTANCE_NOT_EXIST for that, which is permanent: the query
+    // path has to register on its own, ahead of the query it is answering.
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let mut config = backend_config(addr);
+    config.auto_register = Some(sgl_kv_indexer::KvcmAutoRegister {
+        instance_group: "group-a".into(),
+        block_size: 16,
+        model_name: "qwen3-8b".into(),
+        dtype: "FP8".into(),
+    });
+    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+
+    backend
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: vec![1, 2, 3],
+            max_blocks: 0,
+        })
+        .await
+        .expect("a query before any report succeeds");
+    {
+        let state = MockState::lock(&state);
+        assert_eq!(state.registrations.len(), 1, "the query registered");
+        assert_eq!(state.queries.len(), 1, "and still asked");
+        assert_eq!(state.queries[0].instance_id, "test-instance");
+    }
+
+    // The second query does not re-register.
+    backend
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: vec![4],
+            max_blocks: 0,
+        })
+        .await
+        .expect("query succeeds");
+    assert_eq!(
+        MockState::lock(&state).registrations.len(),
+        1,
+        "registration is once per backend, not per query"
+    );
+
+    // Without auto-registration the instance stays missing and the query keeps
+    // surfacing KVCM's verdict: a typo'd instance id is a configuration error,
+    // not a transient condition to paper over.
+    let observer_state = Arc::new(Mutex::new(MockState::default()));
+    let observer_addr = start_mock_kvcm(Arc::clone(&observer_state)).await;
+    MockState::lock(&observer_state).query_error =
+        Some((ErrorCode::InstanceNotExist, "no such instance".into()));
+    let observer = KvcmIndexerBackend::new(backend_config(observer_addr)).expect("valid endpoint");
+    let error = observer
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: vec![1],
+            max_blocks: 0,
+        })
+        .await
+        .expect_err("an unregistered instance is still a permanent fault");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        MockState::lock(&observer_state).registrations.is_empty(),
+        "no registration was invented for a deployment that configured none"
+    );
+}
+
+#[tokio::test]
 async fn auto_register_registers_once_with_spec_names() {
     let state = Arc::new(Mutex::new(MockState::default()));
     let addr = start_mock_kvcm(Arc::clone(&state)).await;

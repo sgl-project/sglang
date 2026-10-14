@@ -304,14 +304,20 @@ Configuration variables (all under `KV_INDEXER_KVCM_`):
   the deployment's KVCM admin provisioned
 - `REPORT_TIERS`: tiers whose events are forwarded, default `HBM` (see below)
 - `AUTO_REGISTER` (default `0`) with `INSTANCE_GROUP`, `BLOCK_SIZE`,
-  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` before the first batch.
+  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` carried out before the
+  first thing this backend sends -- an apply batch *or* a prefix query, since the
+  Router's first request can arrive before any worker has published a KV event.
   It declares the `full,swa,mamba` spec names, and restates the block size and
   model deployment KVCM requires of every registration (a registration without
   a model name/dtype, or with a non-positive block size, is rejected
   `INVALID_ARGUMENT`).
 - `QUERY_TIMEOUT_MS` (default 50, half the Router-side prefix deadline),
   `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch)
-- `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats)
+- `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). It must be
+  comfortably below KVCM's EventReport liveness `heartbeat_timeout_ms`; at most a
+  third of it leaves room for a missed or delayed beat. A reporter that beats
+  too slowly is invisible to KVCM between beats, and its placements are swept
+  once the cleanup grace passes.
 
 Deployment prerequisites on the KVCM side: an event-report storage and an
 instance group listing it as an `event_report_storage_candidates` entry, and a
@@ -366,7 +372,12 @@ Semantics and limitations:
   after its configured heartbeat timeout and then *deletes* that reporter's
   placements once the cleanup grace has passed, so a deployment whose KVCM
   liveness is tighter than `HEARTBEAT_INTERVAL_MS` loses cache affinity for
-  idle workers. After such a cleanup the next plain report fails
+  idle workers. When the mismatch is large the reporter never counts as alive at
+  all: every beat lands on a tombstoned node, KVCM sweeps its blocks, and prefix
+  queries keep answering "nothing here" for a worker that has plenty cached --
+  the failure mode is a silently empty index, not an error. Check the two
+  intervals together first when cache affinity looks broken on a fresh
+  deployment. After such a cleanup the next plain report fails
   `NODE_NOT_REGISTERED`; the retry re-registers the reporter, but the reclaimed
   blocks stay gone until the worker re-reports them.
 - A `NODE_REGISTER` is resent whenever a report fails with

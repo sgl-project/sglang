@@ -610,6 +610,60 @@ async fn auto_registration_reports_and_answers_prefixes() {
     assert_eq!(answer.blocks_read, 2);
 }
 
+/// The Router's first request is a prefix query on an instance no worker has
+/// reported into yet. With auto-registration configured, that query must
+/// register the instance on its own -- KVCM answers `INSTANCE_NOT_EXIST`
+/// otherwise, which the backend classifies as permanent and the Router turns
+/// into a 503 for every request until some other path warms a worker. Without
+/// auto-registration, a missing instance stays exactly that loud.
+#[tokio::test]
+#[ignore]
+async fn a_query_before_any_report_registers_the_instance() {
+    let env = live_env!();
+    let instance = unique("earlyquery");
+    let keys = [9101, 9102, 9103];
+
+    // No apply has run, so KVCM has never heard of this instance.
+    let registrar = auto_registering_backend(&env, &instance, 128);
+    let answer = prefix(&registrar, &keys, 0).await;
+    assert!(
+        answer.matches.is_empty(),
+        "a fresh instance holds nothing: {answer:?}"
+    );
+    assert_eq!(answer.blocks_read, 3);
+
+    // The registration reached KVCM rather than only flipping our own flag: a
+    // second backend, which must not register anything, can query the same
+    // instance. Under the old order this is where INSTANCE_NOT_EXIST appeared.
+    let observer = backend(&env, &instance, None);
+    let answer = prefix(&observer, &keys, 0).await;
+    assert!(answer.matches.is_empty());
+
+    // A deployment that configured no auto-registration keeps the fault: a
+    // typo'd instance id is a configuration error, not a transient condition.
+    let stranger = backend(&env, &unique("nodice"), None);
+    let error = stranger
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: keys.to_vec(),
+            max_blocks: 0,
+        })
+        .await
+        .expect_err("an unknown instance is a permanent fault");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    // And the instance the query registered is usable, not just present.
+    let address = "http://127.0.0.1:31031";
+    registrar
+        .apply_external_kv_batch(report_batch(&format!("{instance}-w0"), address, 1, &keys))
+        .await
+        .expect("the registered instance accepts a report");
+    let answer = prefix(&registrar, &keys, 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 3)])
+    );
+}
+
 /// `max_blocks` truncates the ask before it reaches KVCM.
 #[tokio::test]
 #[ignore]
