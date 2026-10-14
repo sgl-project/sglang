@@ -337,15 +337,6 @@ def output_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return contracted
 
 
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    return scaling[..., None, None]
-
-
 class Xing4_0DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -353,7 +344,6 @@ class Xing4_0DecoderLayer(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         moe_quant_config_override: QuantizationConfig | None = None,
-        is_nextn: bool = False,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
@@ -371,19 +361,12 @@ class Xing4_0DecoderLayer(nn.Module):
         max_position_embeddings = config.max_position_embeddings
 
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
-
-        mtp_start_layer_idx = config.num_hidden_layers
-        self.is_mtp_layer = layer_id >= mtp_start_layer_idx
 
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
         v_head_dim = getattr(config, "v_head_dim", 0)
         kv_lora_rank = getattr(config, "kv_lora_rank", 0)
-        hasattr(config, "index_topk")
-        use_mha = config.model_type == "deepseek" or all(
-            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-        )
+        use_mha = all(dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim))
         self.use_mha = use_mha
 
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -407,7 +390,6 @@ class Xing4_0DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
-            is_nextn=is_nextn,
         )
 
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
@@ -422,7 +404,6 @@ class Xing4_0DecoderLayer(nn.Module):
                 quant_config=moe_quant_config_override or quant_config,
                 prefix=add_prefix("mlp", prefix),
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
                 is_deepseek_v4=False,
             )
         else:
@@ -451,18 +432,16 @@ class Xing4_0DecoderLayer(nn.Module):
 
         self.n = getattr(config, "hc_mult", 1)
         self.enable_mhc = self.n > 1
-        if self.enable_mhc and not self.is_mtp_layer:
+        if self.enable_mhc:
             self.attn_hc = mHCModule(config, config.num_hidden_layers)
             self.ffn_hc = mHCModule(config, config.num_hidden_layers)
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        self.is_layer_sparse = self._is_layer_sparse(layer_id)
+        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1)
 
         self._stage_enters_stack = (layer_id) == 0
-        self._stage_terminal = (layer_id) == (
-            1 if is_nextn else config.num_hidden_layers
-        ) - 1
+        self._stage_terminal = (layer_id) == config.num_hidden_layers - 1
         self._stage_previous_sparse = is_previous_layer_sparse
         self._stage_next_sparse = is_next_layer_sparse
 
@@ -516,7 +495,7 @@ class Xing4_0DecoderLayer(nn.Module):
         captured_last_layer_outputs: list[torch.Tensor] | None = None,
         next_full_attention_layer_id: int | None = None,
     ) -> torch.Tensor:
-        if self.enable_mhc and not self.is_mtp_layer:
+        if self.enable_mhc:
             S = hidden_states.shape[0]
             B = hidden_states.shape[1]
             C = self.hidden_size
@@ -699,8 +678,8 @@ class Xing4_0DecoderLayer(nn.Module):
 
         return hidden_states, topk_indices
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        return is_nextn or (
+    def _is_layer_sparse(self, layer_id: int) -> bool:
+        return (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
@@ -985,7 +964,7 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         else:
             return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         processed_weights = []
         hc_weights = []
 
@@ -1028,7 +1007,7 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             except Exception as e:
                 logger.warning("Failed to load %s -> %s: %s", name, target_name, e)
 
-        self.do_load_weights(processed_weights, is_nextn)
+        self.do_load_weights(processed_weights)
 
         # Upcast the mHC operands (hc_fn / hc_scale / hc_base) to fp32 buffers
         # so the fused mhc_pre / mhc_post kernels can run without per-step
