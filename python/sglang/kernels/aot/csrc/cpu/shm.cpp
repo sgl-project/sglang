@@ -79,13 +79,15 @@ void shared_create(SharedData* data, const char* name, void* bytes, size_t nbyte
 #define MAX_BUF_SIZE 1048576 * 32
 #define NAIVE_ALLREDUCE_THRESHOLD 1048576
 #define SHM_BUFFER_NAME "deepspeed_allreduce_buffer"
+constexpr int kNumCollectiveStates = STATE_GROUP_ALL_TO_ALL + 1;
+// idx=0 -- state for symmetric_naive_all_reduce
+// idx=1 -- state for distributed_naive_all_reduce
+// idx=2 -- state for all_gather
+// idx=3 -- state for all_gather_into_tensor
+// idx=4 -- state for reduce_scatter
+// idx=5 -- state for all_to_all
 struct allreduce_workspace {
-  enum coll_state states[6];  // idx=0 -- state for symmetric_naive_all_reduce
-                              // idx=1 -- state for distributed_naive_all_reduce
-                              // idx=2 -- state for all_gather
-                              // idx=3 -- state for all_gather_into_tensor
-                              // idx=4 -- state for reduce_scatter
-                              // idx=5 -- state for all_to_all
+  enum coll_state states[kNumCollectiveStates];
   // double buffer to avoid syncing between rounds
   // offset=0 -- 2*NAIVE_ALLREDUCE_THRESHOLD : buffer for
   // symmetric_naive_all_reduce after that : buffer for

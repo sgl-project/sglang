@@ -926,4 +926,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             and self.ulysses_world_size > 1
             and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
         ):
+            # TODO: Initialize a dedicated SHM handle for the Ulysses subgroup
+            # when Ring Attention is supported on CPU. The current SP handle
+            # is only valid when ring_degree == 1.
             self.ulysses_shm_handle = self.shm_handle

@@ -1,4 +1,3 @@
-#include <ATen/record_function.h>
 #include <torch/all.h>
 
 #include "shm.h"
@@ -70,8 +69,6 @@ torch::Tensor shm_allgather(torch::Tensor& data, int64_t dim, int64_t handle) {
 }
 
 void shm_allgather_into_tensor(torch::Tensor& output_tensor, torch::Tensor& data, int64_t handle) {
-  RECORD_FUNCTION("sgl-kernel::shm_allgather_into_tensor", std::vector<c10::IValue>({data}));
-
   auto numel = data.numel();
   int data_size = numel * data.element_size();
   int64_t dim = 0;
@@ -79,8 +76,6 @@ void shm_allgather_into_tensor(torch::Tensor& output_tensor, torch::Tensor& data
 }
 
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle) {
-  RECORD_FUNCTION("sgl-kernel::shm_reduce_scatter_tensor", std::vector<c10::IValue>({data}));
-
   TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
 
   auto numel = data.numel();
@@ -90,7 +85,6 @@ void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 }
 
 void shm_alltoall(torch::Tensor& output_tensor, torch::Tensor& input_tensor, int64_t handle) {
-  RECORD_FUNCTION("sgl_kernel::shm_alltoall", std::vector<c10::IValue>({input_tensor}));
   size_t data_size = input_tensor.numel() * input_tensor.element_size();
   all_to_all(
       static_cast<char*>(output_tensor.data_ptr()), static_cast<char*>(input_tensor.data_ptr()), data_size, handle);
