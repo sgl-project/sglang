@@ -85,6 +85,61 @@ latency, throughput, and prefix-cache metrics.
 
 ## Serving mode
 
+### Closed-loop workloads
+
+`OFFLINE` can optionally coordinate virtual time with an external workload
+driver. Leave `SGLANG_SIMULATOR_COORDINATOR` unset to retain the existing
+`OFFLINE` and `BLOCKING` behavior. Coordination is incompatible with `BLOCKING`.
+
+In the server terminal, use the existing launch command below with:
+
+```bash
+export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
+export SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001
+```
+
+Then run the two-request example from the repository root:
+
+```bash
+python3 tools/sglang-simulator/examples/closed_loop.py --tool-delay 5
+```
+
+The five-second tool delay advances virtual time without sleeping for five
+seconds. The example uses the existing `/generate` endpoint. OpenAI HTTP/SSE
+requests can use the same protocol by including the request `rid` in the body.
+One server handles one coordinated run; restart it for a fresh run and cache.
+
+A driver sends `Ready` after processing all work at the current time, listing
+its ordered `Submit`/`Cancel` operations and earliest timer. The simulator waits
+for all listed payloads, then replies with `Grant` at the next visible event.
+Normal completion requires both the HTTP result and its matching Grant terminal.
+Use unique, equal-length request IDs within a run. HTTP connections must not wait
+for earlier responses before sending the rest of a round; the example uses a
+dedicated aiohttp pool with no connection admission limit. Workload credits, not
+the physical pool, control simulated concurrency.
+
+The initial scope is one local driver and scheduler, text generation with
+ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
+sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
+Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
+timeouts must be disabled. HTTP/SSE transport and predictor execution time do not
+contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.
+Predicted batch durations must be positive at nanosecond resolution; a zero-cost
+fallback is rejected rather than allowing an endless workload at one timestamp.
+
+Startup generation warmup is skipped. Workload/cache warmup belongs to the
+driver and must be excluded from its measurement window while retaining cache
+state. Administrative resets and profiling requests are rejected. This protocol
+and example are the foundation for an AgentX adapter; they do not implement
+AgentX benchmark phases or native metrics.
+
+Focused tests are `test_simulation_coordinator.py`,
+`test_simulation_coordinated_bridge.py`, and
+`test_simulation_coordinated_serving.py`. Run test files in separate processes,
+as simulator hooks cache configuration at import time.
+
+### Timestamped serving workloads
+
 Choose a fresh output directory and export it in the server terminal before
 starting the server:
 

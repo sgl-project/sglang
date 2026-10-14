@@ -1,6 +1,7 @@
 """Early compatibility checks for the SGLang surfaces used by the simulator."""
 
 import inspect
+import os
 from importlib import metadata
 
 SIMULATOR_SERVER_ARG_OVERRIDES = {
@@ -45,16 +46,23 @@ def _require_parameters(function, required: set[str], surface: str) -> None:
 
 def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
+    overrides = SIMULATOR_SERVER_ARG_OVERRIDES
+    if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        overrides = {**overrides, "skip_server_warmup": True}
     if isinstance(target, dict):
-        target.update(SIMULATOR_SERVER_ARG_OVERRIDES)
+        target.update(overrides)
         return
 
-    for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
+    for name, value in overrides.items():
         setattr(target, name, value)
 
 
 def validate_simulator_server_args(server_args) -> None:
     """Fail early if a process bypassed a simulator-owned launch entry point."""
+    if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        from sglang_simulator.simulation.sglang.coordinated import validate_server_args
+
+        validate_server_args(server_args)
     mismatches = [
         f"{name}={getattr(server_args, name, None)!r} (expected {expected!r})"
         for name, expected in SIMULATOR_SERVER_ARG_OVERRIDES.items()

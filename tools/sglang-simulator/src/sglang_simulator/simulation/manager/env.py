@@ -7,6 +7,10 @@ logger = get_logger("sgl_simulator")
 
 class Envs:
     @classmethod
+    def coordinator_endpoint(cls) -> str | None:
+        return os.getenv("SGLANG_SIMULATOR_COORDINATOR") or None
+
+    @classmethod
     def config_path(cls) -> str:
         SGLANG_SIMULATOR_CONFIG_PATH = os.getenv("SGLANG_SIMULATOR_CONFIG_PATH")
         if not SGLANG_SIMULATOR_CONFIG_PATH or not os.path.exists(
