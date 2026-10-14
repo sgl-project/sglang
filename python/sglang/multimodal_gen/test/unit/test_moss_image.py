@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
     MOSSImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.moss_image import (
     MOSSImageTransformer,
@@ -28,6 +29,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
+    MOSSImageBeforeDenoisingStage,
+    MOSSImageDenoisingStage,
 )
 
 
@@ -85,13 +90,25 @@ def test_formal_guidance_is_unconditional_only_and_request_scoped():
         negative = config.prepare_neg_cond_kwargs(batch, "cpu", None, torch.bfloat16)
         assert "skip_layers" not in positive
         assert negative["skip_layers"] == expected
-    default.uncond_skip_layers.clear()
-    assert MOSSImageSamplingParams().uncond_skip_layers == [22]
 
 
-@pytest.mark.parametrize("uncond_skip_layers", [[], [22], [0, 41]])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"uncond_skip_layers": [0, 41]},
+        {"uncond_skip_layers": []},
+        {"uncond_skip_layers": [22], "slg_start": 0.01, "slg_stop": 1.0},
+        {
+            "uncond_skip_layers": [],
+            "slg_layers": [22],
+            "slg_scale": 3.0,
+            "slg_start": 0.01,
+            "slg_stop": 1.0,
+        },
+    ],
+)
 @pytest.mark.parametrize("nested", [False, True])
-def test_image_api_preserves_model_owned_uncond_skip_layers(uncond_skip_layers, nested):
+def test_image_api_preserves_model_owned_guidance_fields(extra, nested):
     from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -101,13 +118,14 @@ def test_image_api_preserves_model_owned_uncond_skip_layers(uncond_skip_layers, 
         request_model_kwargs,
     )
 
-    extra = {"uncond_skip_layers": uncond_skip_layers}
     request = ImageGenerationsRequest(
         prompt="example", **({"extra_params": extra} if nested else extra)
     )
     kwargs = request_model_kwargs(request, MOSSImageSamplingParams, "image")
     assert kwargs == extra
-    assert MOSSImageSamplingParams(**kwargs).uncond_skip_layers == uncond_skip_layers
+    params = MOSSImageSamplingParams(**kwargs)
+    for name, value in extra.items():
+        assert getattr(params, name) == value
     assert request_model_kwargs(request, SamplingParams, "image") == {}
 
 
@@ -682,3 +700,171 @@ def test_cfg_rule_applies_before_input_validation(guidance, expected_cfg, negati
     )
     assert result.do_classifier_free_guidance is expected_cfg
     assert result.negative_prompt == ""
+
+
+VELOCITIES = {
+    (True, False): torch.tensor([1.0078125, -0.00390625]).reshape(1, 2, 1, 1),
+    (False, False): torch.tensor([-0.0078125, 0.015625]).reshape(1, 2, 1, 1),
+    (True, True): torch.tensor([0.00390625, -1.015625]).reshape(1, 2, 1, 1),
+    (False, True): torch.tensor([-1.0234375, 0.00390625]).reshape(1, 2, 1, 1),
+}
+
+
+@pytest.mark.parametrize(
+    "guidance,options,uncond_steps,extra_steps",
+    [
+        (3.0, {"uncond_skip_layers": []}, (), ()),
+        (None, {}, (1, 2, 3), ()),
+        (3.0, {"uncond_skip_layers": [22], "slg_start": 0.0}, (0, 1, 2, 3), ()),
+        (
+            3.0,
+            {"uncond_skip_layers": [22], "slg_start": 0.01, "slg_stop": 1.0},
+            (1, 2, 3),
+            (),
+        ),
+        (
+            3.0,
+            {"uncond_skip_layers": [22], "slg_start": 0.25, "slg_stop": 0.75},
+            (1, 2),
+            (),
+        ),
+        (
+            5.0,
+            {
+                "slg_layers": [22],
+                "slg_scale": 3.0,
+                "slg_start": 0.01,
+            },
+            (),
+            (1, 2, 3),
+        ),
+        (
+            5.0,
+            {
+                "uncond_skip_layers": [22],
+                "slg_layers": [22],
+                "slg_scale": 3.0,
+                "slg_start": 0.01,
+            },
+            (1, 2, 3),
+            (1, 2, 3),
+        ),
+        (
+            1.0,
+            {
+                "slg_layers": [22],
+                "slg_scale": 3.0,
+                "slg_start": 0.25,
+                "slg_stop": 0.75,
+            },
+            (),
+            (1, 2),
+        ),
+        (1.0, {"slg_layers": [22], "slg_scale": 1.0}, (), (1, 2, 3)),
+        (5.0, {"uncond_skip_layers": [], "slg_layers": [22], "slg_scale": 0.0}, (), ()),
+        (5.0, {"uncond_skip_layers": [], "slg_layers": [], "slg_scale": 3.0}, (), ()),
+        (5.0, {"uncond_skip_layers": [], "slg_layers": None, "slg_scale": 3.0}, (), ()),
+        (
+            5.0,
+            {"slg_layers": [22], "slg_scale": 3.0, "slg_start": 0.5, "slg_stop": 0.5},
+            (),
+            (),
+        ),
+        (0.0, {"uncond_skip_layers": []}, (), ()),
+        (0.5, {"uncond_skip_layers": []}, (), ()),
+    ],
+)
+def test_guidance_formula_window_branch_count_and_request_isolation(
+    monkeypatch, guidance, options, uncond_steps, extra_steps
+):
+    """Check reference branch topology, FP32 guidance and window boundaries."""
+    if guidance is None:
+        params = MOSSImageSamplingParams(**options)
+        guidance = 3.0  # Recommended default from the reference recipe.
+        assert params.guidance_scale == guidance
+    else:
+        params = MOSSImageSamplingParams(guidance_scale=guidance, **options)
+    batch = Req(
+        sampling_params=params,
+        timesteps=torch.tensor([1000.0, 750.0, 500.0, 250.0]),
+    )
+    config = MOSSImagePipelineConfig()
+    pos = {"encoder_hidden_states": torch.ones(1, 1, 2)}
+    neg = {
+        "encoder_hidden_states": -torch.ones(1, 1, 2),
+        **config.prepare_neg_cond_kwargs(batch, "cpu", None, torch.float32),
+    }
+    policy = CFGPolicy().build(batch, {}, pos, neg)
+    initial_kwargs = [dict(branch.kwargs) for branch in policy.branches]
+    stage = object.__new__(MOSSImageDenoisingStage)
+    calls = []
+
+    def predict(**kwargs):
+        conditional = bool(kwargs["encoder_hidden_states"][0, 0, 0] > 0)
+        skip = tuple(kwargs.get("skip_layers", ()))
+        assert batch.is_cfg_negative == (not conditional)
+        calls.append((conditional, skip))
+        return VELOCITIES[(conditional, bool(skip))].clone()
+
+    monkeypatch.setattr(stage, "_predict_noise", predict)
+    for index, timestep in enumerate(batch.timesteps):
+        start = len(calls)
+        actual = stage._predict_noise_with_cfg(
+            current_model=None,
+            latent_model_input=torch.zeros(1, 2, 1, 1),
+            timestep=timestep,
+            batch=batch,
+            timestep_index=index,
+            attn_metadata=None,
+            target_dtype=torch.float32,
+            current_guidance_scale=guidance,
+            cfg_policy=policy,
+            cfg_gate_state=None,
+            server_args=SimpleNamespace(
+                pipeline_config=config, enable_cfg_parallel=False
+            ),
+            guidance=None,
+            latents=torch.zeros(1, 2, 1, 1),
+        )
+        conditional = VELOCITIES[(True, False)]
+        expected = conditional
+        expected_calls = [(True, ())]
+        if guidance != 1:
+            negative = VELOCITIES[(False, index in uncond_steps)]
+            expected = negative + guidance * (conditional - negative)
+            expected_calls.append((False, (22,) if index in uncond_steps else ()))
+        if index in extra_steps:
+            skipped = VELOCITIES[(True, True)]
+            if guidance == 1:
+                expected = skipped
+            expected = expected + params.slg_scale * (conditional - skipped)
+            expected_calls.append((True, (22,)))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert calls[start:] == expected_calls
+        assert [branch.kwargs for branch in policy.branches] == initial_kwargs
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        ({"uncond_skip_layers": 22}, "skip_layers"),
+        ({"slg_layers": [42]}, "skip_layers"),
+        ({"slg_scale": -1.0}, "slg_scale"),
+        ({"slg_scale": None}, "slg_scale"),
+        ({"slg_scale": "3"}, "slg_scale"),
+        ({"slg_scale": float("nan")}, "slg_scale"),
+        ({"slg_scale": float("inf")}, "slg_scale"),
+        ({"slg_start": -0.01}, "slg_start"),
+        ({"slg_stop": 1.01}, "slg_start"),
+        ({"slg_start": 0.8, "slg_stop": 0.2}, "slg_start"),
+        ({"slg_start": float("nan")}, "slg_start"),
+        ({"slg_stop": float("inf")}, "slg_start"),
+    ],
+)
+def test_invalid_guidance_is_rejected_before_encoding(options, message):
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+    stage = MOSSImageBeforeDenoisingStage(None, None, None)
+    batch = Req(sampling_params=MOSSImageSamplingParams(prompt="test", **options))
+    with pytest.raises(ValueError, match=message):
+        stage.forward(batch, SimpleNamespace(pipeline_config=MOSSImagePipelineConfig()))

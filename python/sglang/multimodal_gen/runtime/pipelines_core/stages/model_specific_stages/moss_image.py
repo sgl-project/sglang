@@ -31,15 +31,21 @@
 # DAMAGE.
 
 import math
+from dataclasses import replace
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.sample.moss_image import (
+    MOSSImageSamplingParams,
+    resolve_uncond_skip_layers,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_encoder_call,
     prefer_conditioning_cache,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -53,6 +59,115 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import Denois
 
 
 class MOSSImageDenoisingStage(DenoisingStage):
+    @staticmethod
+    def _has_extra_slg(params: MOSSImageSamplingParams) -> bool:
+        return bool(params.slg_layers) and params.slg_scale > 0.0
+
+    @classmethod
+    def _has_dynamic_guidance(cls, params: MOSSImageSamplingParams) -> bool:
+        return cls._has_extra_slg(params) or (
+            bool(resolve_uncond_skip_layers(params))
+            and (params.slg_start != 0.0 or params.slg_stop != 1.0)
+        )
+
+    @staticmethod
+    def _with_uncond_skip_layers(
+        cfg_policy: CFGPolicy, skip_layers: tuple[int, ...]
+    ) -> CFGPolicy:
+        if all(
+            branch.is_conditional
+            or tuple(branch.kwargs.get("skip_layers", ())) == skip_layers
+            for branch in cfg_policy.branches
+        ):
+            return cfg_policy
+        # Preserve the request-wide branches when changing one step's topology.
+        return replace(
+            cfg_policy,
+            branches=[
+                branch
+                if branch.is_conditional
+                else replace(
+                    branch, kwargs={**branch.kwargs, "skip_layers": skip_layers}
+                )
+                for branch in cfg_policy.branches
+            ],
+        )
+
+    def _predict_noise_with_cfg(
+        self,
+        current_model,
+        latent_model_input,
+        timestep,
+        batch,
+        timestep_index,
+        attn_metadata,
+        target_dtype,
+        current_guidance_scale,
+        cfg_policy,
+        cfg_gate_state,
+        server_args,
+        guidance,
+        latents,
+    ):
+        params = batch.sampling_params
+        active = (
+            params.slg_start <= timestep_index / len(batch.timesteps) < params.slg_stop
+        )
+        uncond_layers = resolve_uncond_skip_layers(params) if active else ()
+        cfg_policy = self._with_uncond_skip_layers(cfg_policy, uncond_layers)
+        # A cached CFG delta represents the old branch topology. Keep the
+        # reference's actual forwards when guidance changes within a request.
+        if self._has_dynamic_guidance(params):
+            cfg_gate_state = None
+        if not (active and self._has_extra_slg(params)):
+            return super()._predict_noise_with_cfg(
+                current_model=current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=timestep_index,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                current_guidance_scale=current_guidance_scale,
+                cfg_policy=cfg_policy,
+                cfg_gate_state=cfg_gate_state,
+                server_args=server_args,
+                guidance=guidance,
+                latents=latents,
+            )
+
+        config = server_args.pipeline_config
+
+        def predict(branch, **overrides):
+            branch.configure_batch(batch)
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ):
+                prediction = self._predict_noise(
+                    current_model=current_model,
+                    latent_model_input=latent_model_input,
+                    timestep=timestep,
+                    target_dtype=target_dtype,
+                    guidance=guidance,
+                    **{**branch.kwargs, **overrides},
+                )
+            return config.slice_noise_pred(prediction, latents).float()
+
+        predictions = [predict(branch) for branch in cfg_policy.branches]
+        noise_pred = cfg_policy.combine(
+            predictions,
+            batch,
+            config.get_classifier_free_guidance_scale(batch, current_guidance_scale),
+            config,
+        )
+        skipped = predict(cfg_policy.branches[0], skip_layers=tuple(params.slg_layers))
+        if not batch.do_classifier_free_guidance:
+            # Reference CFG=1 SLG uses the skipped prediction as its base.
+            noise_pred = skipped
+        return noise_pred + params.slg_scale * (predictions[0] - skipped)
+
     def _before_denoising_loop(self, ctx, batch, server_args):
         super()._before_denoising_loop(ctx, batch, server_args)
         self._manage_dit_use_site(self.transformer, "transformer", batch)
@@ -137,10 +252,27 @@ class MOSSImageBeforeDenoisingStage(PipelineStage):
 
     @staticmethod
     def _validate_request(batch, server_args):
+        params = batch.sampling_params
+        try:
+            valid_scale = math.isfinite(params.slg_scale) and params.slg_scale >= 0
+        except (TypeError, ValueError):
+            valid_scale = False
+        if not valid_scale:
+            raise ValueError("MOSSImage slg_scale must be finite and nonnegative.")
         validate_skip_layers(
-            batch.sampling_params.uncond_skip_layers,
+            resolve_uncond_skip_layers(params),
             server_args.pipeline_config.dit_config.arch_config.num_layers,
         )
+        validate_skip_layers(
+            params.slg_layers if params.slg_layers is not None else (),
+            server_args.pipeline_config.dit_config.arch_config.num_layers,
+        )
+        try:
+            valid_window = 0 <= params.slg_start <= params.slg_stop <= 1
+        except (TypeError, ValueError):
+            valid_window = False
+        if not valid_window:
+            raise ValueError("MOSSImage requires 0 <= slg_start <= slg_stop <= 1.")
         if (
             not isinstance(batch.height, int)
             or not isinstance(batch.width, int)

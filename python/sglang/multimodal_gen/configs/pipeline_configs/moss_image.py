@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.sample.moss_image import resolve_uncond_skip_layers
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
@@ -60,7 +61,7 @@ class MOSSImagePipelineConfig(SpatialImagePipelineConfig):
         return batch.negative_prompt_embeds[0]
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {"skip_layers": tuple(batch.sampling_params.uncond_skip_layers)}
+        return {"skip_layers": resolve_uncond_skip_layers(batch.sampling_params)}
 
     def post_denoising_loop(self, latents, batch):
         return latents
