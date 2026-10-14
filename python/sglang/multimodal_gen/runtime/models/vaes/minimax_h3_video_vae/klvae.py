@@ -207,6 +207,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             "pixel_norm_type": self.pixel_norm_type,
             "transform": self.transform,
             "transform_rev": self.transform_rev,
+            "transform_rev_inplace": self.transform_rev_inplace,
             "use_3d_conv": self.use_3d_conv,
         }
         if hasattr(self, "processor"):
@@ -663,7 +664,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return int(total_frames), int(pad_frames), int(total_frames - pad_frames)
 
     def _decode_temporal_streaming(
-        self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+        self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype, on_frames
     ):
         total_frames, pad_frames, output_frames = (
             self._decode_temporal_output_frame_plan(
@@ -703,6 +704,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     part[:, :, :copy_frames, :, :]
                 )
                 write_pos += copy_frames
+                if on_frames is not None:
+                    on_frames(dec[:, :, write_pos - copy_frames : write_pos])
             dropped_frames += part_frames - copy_frames
 
         for i in range(num_chunks):
@@ -777,7 +780,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         return dec
 
-    def decode_temporal(self, z):
+    def decode_temporal(self, z, on_frames=None):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
 
         isolated_token_num = 0
@@ -817,7 +820,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         temporal_cat_dtype = _resolve_temporal_cat_dtype()
         if not self.training and _resolve_temporal_stream_cat():
             return self._decode_temporal_streaming(
-                z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+                z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype, on_frames
             )
 
         decoded_tasks = []
@@ -888,16 +891,23 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if pad_frames > 0:
             dec = dec[:, :, :-pad_frames, :, :]
 
+        if on_frames is not None:
+            on_frames(dec)
         return dec
 
-    def decode_base(self, z, frame_num=None, process_image=False):
+    def decode_base(self, z, frame_num=None, process_image=False, on_frames=None):
+        """``on_frames`` receives every output frame once, in order, as soon as it is final."""
+        if on_frames is not None and (
+            process_image or not self.use_3d_conv or frame_num is not None
+        ):
+            raise ValueError("on_frames needs an untrimmed temporal video decode")
         if process_image or not self.use_3d_conv:
             if not self.use_3d_conv and z.ndim == 5:
                 z = z.squeeze(2)
 
             recon = self._adaptive_decode(z)
         else:
-            recon = self.decode_temporal(z)
+            recon = self.decode_temporal(z, on_frames=on_frames)
 
         if self.use_3d_conv:
             if frame_num is not None:
@@ -1231,11 +1241,13 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         self.transform = get_normalize_transform(pixel_norm_type)
         self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        self.transform_rev_inplace = get_denormalize_transform(
+            pixel_norm_type, inplace=True
+        )
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
         self.causal_decoder = causal_decoder
-        self.slidedec = self.causal_encoder and not self.causal_decoder
 
         # some registered parameters for simplicity
         self.vae_ratio = int(np.cumprod(space_down)[-1])

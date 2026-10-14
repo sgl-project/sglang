@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
+    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
@@ -176,13 +177,14 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         tp_cache_group=None,
                         pp_cache_group=None,
                     )
+                    controller = SimpleNamespace(transfer_layer_id_max=4)
+                    built = (
+                        (MagicMock(), controller, SimpleNamespace(pools=()))
+                        if strategy_cls is _MambaStrategy
+                        else (MagicMock(), controller)
+                    )
                     with patch.object(
-                        hybrid_pool_assembler,
-                        builder_name,
-                        return_value=(
-                            MagicMock(),
-                            SimpleNamespace(transfer_layer_id_max=4),
-                        ),
+                        hybrid_pool_assembler, builder_name, return_value=built
                     ) as build_stack:
                         result = strategy_cls().build(
                             cache=SimpleNamespace(page_size=1),
@@ -268,6 +270,8 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         draft_kv_pool.layer_num = 1
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
+        draft_kv_pool.page_size = 64
+        draft_kv_pool.index_page_size = 64
         draft_kv_pool.skip_topk_layers = [False]
         draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
         draft_host_pool = SimpleNamespace(layer_num=1)
@@ -333,6 +337,8 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
     pool.index_head_dim = 128
+    pool.page_size = 64
+    pool.index_page_size = 64
     pool.skip_topk_layers = [False] * layer_num
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
     pool.layer_shard_enabled = shard is not None
@@ -732,6 +738,114 @@ class TestKvHostPoolRow(CustomTestCase):
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
 
 
+class TestHybridMambaDeclaredIndexer(CustomTestCase):
+    """hybrid Mamba + DSA reuses the target's indexer declaration: the KV/Mamba
+    stack gains an INDEXER entry whose mirror and layer mapping cover only the
+    DSA layers that own index buffers."""
+
+    def test_stack_declares_indexer_and_skips_empty_layers(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
+        mamba_pool = SimpleNamespace(layer_num=2, num_mamba_layers=2, size=8)
+        # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
+        full_mapping = {0: 0, 2: 1, 4: 2}
+        mamba_mapping = {1: 0, 3: 1}
+        params = SimpleNamespace(
+            page_size=64,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=None,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    alloc=lambda n: None, free=lambda x: None
+                )
+            ),
+        )
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+
+        def dummy_kv_host(**kwargs):
+            return MLATokenToKVPoolHost(
+                kwargs["kv_pool"],
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=kwargs["page_size"],
+                layout="page_first",
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=None,
+                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
+            )
+
+        def dummy_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
+            return real_indexer_host(
+                decl=decl,
+                anchor_host=anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
+                allocator_type=allocator_type,
+                pin_memory=False,
+                is_dummy=True,
+            )
+
+        with (
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(
+                hybrid_pool_assembler,
+                "build_mamba_host_pool",
+                return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
+            ),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_size=0,
+                    hicache_ratio=2,
+                    hicache_mem_layout="page_first",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            group, _, config = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=params,
+                decls=kv_pool.host_pool_decls(),
+                mamba_pool=mamba_pool,
+                full_layer_mapping=full_mapping,
+                mamba_layer_mapping=mamba_mapping,
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=True,
+            )
+
+        names = [e.name for e in group.entries]
+        self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
+        indexer = group.entry_map[PoolName.INDEXER]
+        kv = group.entry_map[PoolName.KV]
+        # KV still maps every DSA transfer layer. The indexer drops device layer 1.
+        self.assertEqual([kv.layer_mapper(t) for t in range(5)], [0, None, 1, None, 2])
+        self.assertEqual(
+            [indexer.layer_mapper(t) for t in range(5)], [0, None, None, None, 2]
+        )
+        self.assertEqual(indexer.host_pool.layer_num, 2)
+        self.assertEqual(indexer.host_pool._host_layer_index(2), 1)
+        self.assertEqual(
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
+        )
+
+
 class TestDeclaredPoolPlanning(CustomTestCase):
     """Sidecar indices resolve from one primary source in HostPoolGroup, so the
     planner must reject self-references and sidecar chains up front."""
@@ -1009,7 +1123,43 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
-    def test_sidecar_read_error_is_only_a_cache_miss_with_unified_memory(self):
+    def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
+        bundle = _build_unified_swa_pool()
+        pool = bundle.token_to_kv_pool
+        for draft_arg in (
+            "mtp_full_device_pools",
+            "mtp_swa_device_pools",
+            "mtp_swa_full_device_pools",
+        ):
+            with (
+                self.subTest(draft_arg=draft_arg),
+                patch(
+                    _ASSEMBLER + "get_memory",
+                    return_value=SimpleNamespace(hicache_host_memory_mode="auto"),
+                ),
+                patch(
+                    _ASSEMBLER + "build_kv_host_pool",
+                    side_effect=NotImplementedError("packed pool reached host factory"),
+                ),
+                patch.object(
+                    UnifiedPageEnvelopeHostPool, "build_hybrid_swa_pool_pair"
+                ) as build_pair,
+            ):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "reached host factory"
+                ):
+                    build_hybrid_swa_group(
+                        page_size=4,
+                        full_kv_pool=pool.full_kv_pool,
+                        swa_kv_pool=pool.swa_kv_pool,
+                        full_layer_mapping={0: 0, 1: 1, 2: 2},
+                        swa_layer_mapping={3: 0},
+                        use_mla=False,
+                        **{draft_arg: (object(),)},
+                    )
+                build_pair.assert_not_called()
+
+    def test_sidecar_read_error_is_a_cache_miss_with_unified_memory(self):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -1021,34 +1171,28 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 raise ValueError("sidecar read failed")
 
         self.addCleanup(reset_context)
-        for unified in (False, True):
-            with self.subTest(unified=unified):
-                reset_context()
-                publish(
-                    ServerArgs(model_path="dummy", enable_unified_memory=unified),
-                    role="tokenizer",
-                )
-                cc = HybridCacheController.__new__(HybridCacheController)
-                cc.storage_backend = FailingStorage()
-                cc.prefetch_sync_queue = Queue()
-                operation = PrefetchOperation(
-                    CacheRequestHandle("r", 0),
-                    [1],
-                    pool_transfers=[PoolTransfer(name=PoolName.SWA)],
-                )
-                operation.hash_value = ["h0"]
-                operation.prefix_keys = ["prefix"]
-                if unified:
-                    with self.assertLogs(level="ERROR"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                    ack = cc.prefetch_sync_queue.get_nowait()
-                    self.assertIs(ack.operation, operation)
-                    self.assertEqual(ack.pool_hits, {})
-                else:
-                    with self.assertRaisesRegex(ValueError, "sidecar read failed"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                self.assertTrue(cc.prefetch_sync_queue.empty())
-        self.assertEqual(seen_prefixes, [["prefix", "h0"], ["prefix", "h0"]])
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", enable_unified_memory=True),
+            role="tokenizer",
+        )
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.storage_backend = FailingStorage()
+        cc.prefetch_sync_queue = Queue()
+        operation = PrefetchOperation(
+            CacheRequestHandle("r", 0),
+            [1],
+            pool_transfers=[PoolTransfer(name=PoolName.SWA)],
+        )
+        operation.hash_value = ["h0"]
+        operation.prefix_keys = ["prefix"]
+        with self.assertLogs(level="ERROR"):
+            cc._page_transfer_sidecar(operation, kv_completed_pages=1)
+        ack = cc.prefetch_sync_queue.get_nowait()
+        self.assertIs(ack.operation, operation)
+        self.assertEqual(ack.pool_hits, {})
+        self.assertTrue(cc.prefetch_sync_queue.empty())
+        self.assertEqual(seen_prefixes, [["prefix", "h0"]])
 
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4
@@ -1106,7 +1250,12 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 operation.hash_value = list(hashes)
                 operation.storage_hit_count = hit_tokens
                 operation.sidecar_hash_values = None
+                operation.prefetch_kv_page_offset = 0
                 cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertEqual(
+                    operation.prefetch_kv_page_offset,
+                    (hit_tokens - full_tokens) // page_size,
+                )
                 self.assertTrue(
                     cc.can_fit_prefetch_host_buffers(operation, full_tokens)
                 )
@@ -1131,6 +1280,41 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class TestUnifiedPageEnvelopeSelection(CustomTestCase):
+    """Only no backend and Mori store the complete shared page, so only they
+    keep the page-envelope host arena."""
+
+    def test_only_no_backend_and_mori_select_the_envelope(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        self.addCleanup(reset_context)
+        for backend, expected in (
+            (None, True),
+            ("mori", True),
+            ("mooncake", False),
+            ("dynamic", False),
+        ):
+            with self.subTest(backend=backend):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_unified_memory=True,
+                        hicache_storage_backend=backend,
+                        hicache_mem_layout="layer_first",
+                    ),
+                    role="tokenizer",
+                )
+                self.assertEqual(
+                    _uses_unified_page_envelope_host(
+                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

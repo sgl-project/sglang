@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -10,6 +11,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -18,7 +23,9 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
     should_use_guidance: bool = False
     enable_autocast: bool = False
-    vae_tiling: bool = False
+    # Avoid high-resolution full-frame decode hangs on gfx1151 by default.
+    # Explicit CLI, config-file, and Python API values still take precedence.
+    vae_tiling: bool = field(default_factory=lambda: current_platform.is_gfx1151())
     vae_sp: bool = False
     vae_precision: str = "bf16"
     generator_device: str = "cpu"
@@ -26,13 +33,25 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     vae_config: QwenImage21VAEConfig = field(default_factory=QwenImage21VAEConfig)
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
+    sample_sigmas: list[float] | None = None
+
+    def validate_server_args(self, server_args: Any) -> None:
+        super().validate_server_args(server_args)
+        if not self.vae_tiling and current_platform.is_gfx1151():
+            logger.warning(
+                "VAE tiling is disabled for Qwen-Image 2.1 on gfx1151. "
+                "Full-frame decoding may hang at resolutions of 896px or higher; "
+                "use --vae-tiling true to enable tiling."
+            )
 
     def supports_dynamic_batching(self):
         # the scheduler excludes reference-image requests from cross-request merging
         return True
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
-        return self._prepare_sigmas(sigmas, num_inference_steps)
+        if sigmas is None:
+            sigmas = self.sample_sigmas
+        return list(self._prepare_sigmas(sigmas, num_inference_steps))
 
     def get_classifier_free_guidance_scale(self, batch, guidance_scale):
         return (
@@ -97,6 +116,6 @@ def register():
     register_configs(
         sampling_param_cls=QwenImage21SamplingParams,
         pipeline_config_cls=QwenImage21PipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        hf_model_paths=["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
         model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
     )

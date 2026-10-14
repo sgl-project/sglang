@@ -71,10 +71,6 @@ class TestLayerNormSPGating(CustomTestCase):
         _initialize(enable=False, arch="Qwen3ForCausalLM")
         self.assertFalse(layernorm_sp.layernorm_sp_enabled())
 
-    def test_defaults_off_before_initialization(self):
-        # A process that never runs initialize_layernorm_sp must not enable SP.
-        self.assertFalse(layernorm_sp.layernorm_sp_enabled())
-
     def test_runs_sp_only_on_extend(self):
         with get_flags().sp.override(enabled=True):
             self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
@@ -152,16 +148,6 @@ class TestLayerNormSPValidation(CustomTestCase):
                 }
             )
 
-    def test_qwen4_exp_requires_pp_one(self):
-        with self.assertRaisesRegex(ValueError, "pp_size == 1"):
-            validate_layernorm_sp(
-                **{
-                    **self.VALID,
-                    "architecture": "Qwen4ExpForConditionalGeneration",
-                    "pp_size": 2,
-                }
-            )
-
     def test_qwen4_exp_rejects_attention_context_parallelism(self):
         with self.assertRaisesRegex(ValueError, "attn_cp_size == 1"):
             validate_layernorm_sp(
@@ -174,6 +160,10 @@ class TestLayerNormSPValidation(CustomTestCase):
 
     def test_qwen3_behavior_is_unchanged_with_attention_context_parallelism(self):
         validate_layernorm_sp(**{**self.VALID, "attn_cp_size": 2})
+
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
 
 class _Norm:

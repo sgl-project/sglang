@@ -24,6 +24,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    kv_mamba_slots,
+)
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -1021,10 +1024,9 @@ class TestTriFactorySizing(unittest.TestCase):
                     )
                     session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
                     session.slots = {"test": slot}
-                    self.assertEqual(session.session_held_mamba_slots(), count + 1)
-                    self.assertEqual(session.session_held_mamba_slots({1}), 0)
+                    self.assertEqual(kv_mamba_slots(slot.kv), count + 1)
                     session._free_slot_mamba(slot)
-                    self.assertEqual(session.session_held_mamba_slots(), 0)
+                    self.assertEqual(kv_mamba_slots(slot.kv), 0)
                     self.assertEqual(allocator.available_size(), available)
                     session._free_slot_mamba(slot)
                     self.assertEqual(allocator.available_size(), available)
@@ -1071,6 +1073,8 @@ class TestTriFactorySizing(unittest.TestCase):
                             is_hybrid_swa=tri_pool,
                             is_hybrid_swa_compress=False,
                             forward_stream=None,
+                            # Spec off: no draft region to fuse.
+                            _fused_draft_for_mamba_factory=lambda: None,
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.

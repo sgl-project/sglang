@@ -63,11 +63,6 @@ def validate_layernorm_sp(
                 "--enable-layernorm-sp requires ep_size == tp_size for Qwen4Exp; "
                 f"got ep_size={ep_size}, tp_size={tp_size}."
             )
-        if pp_size != 1:
-            raise ValueError(
-                "--enable-layernorm-sp requires pp_size == 1 for Qwen4Exp; "
-                f"got pp_size={pp_size}."
-            )
         if attn_cp_size != 1:
             raise ValueError(
                 "--enable-layernorm-sp requires attn_cp_size == 1 for Qwen4Exp; "
@@ -84,4 +79,10 @@ def validate_layernorm_sp(
             "--enable-layernorm-sp is not compatible with speculative decoding "
             "(EAGLE/EAGLE3): the captured aux hidden states would be "
             "sequence-sharded."
+        )
+    if pp_size > 1:
+        raise ValueError(
+            "--enable-layernorm-sp is not compatible with pipeline parallelism: "
+            "only the first rank's stack starts the sequence-sharded region, so "
+            "the next rank would receive a stream it does not expect."
         )

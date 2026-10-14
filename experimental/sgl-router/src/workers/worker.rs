@@ -3,9 +3,10 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::collections::HashMap;
+use sglang_processor::openai::OpenAiSettings;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long a prefill stays unroutable, after joining its model pool, while
@@ -40,11 +41,13 @@ pub enum WireProtocol {
 }
 
 /// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineProfile {
     pub protocol: WireProtocol,
     /// `dp_size * attn_dp_size`; 0 is treated as 1.
     pub dp_ranks: u32,
+    /// The engine's OpenAI-layer server args; `None` if unread.
+    pub openai: Option<Arc<OpenAiSettings>>,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -52,6 +55,7 @@ impl From<WireProtocol> for EngineProfile {
         Self {
             protocol,
             dp_ranks: 1,
+            openai: None,
         }
     }
 }
@@ -221,8 +225,10 @@ pub struct Worker {
     /// PD pairing scope; carried from `WorkerSpec`. See
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
+    services: RwLock<BTreeSet<String>>,
     /// Router in-flight requests per DP rank; one slot per rank.
     dp_rank_inflight: Arc<[AtomicUsize]>,
+    openai: Option<Arc<OpenAiSettings>>,
 }
 
 impl Worker {
@@ -238,7 +244,11 @@ impl Worker {
         cb: Option<CircuitBreakerConfig>,
         profile: impl Into<EngineProfile>,
     ) -> Self {
-        let EngineProfile { protocol, dp_ranks } = profile.into();
+        let EngineProfile {
+            protocol,
+            dp_ranks,
+            openai,
+        } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
             None => Arc::new(CircuitBreaker::new()),
@@ -259,8 +269,30 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
+            services: RwLock::new(spec.services),
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            openai,
         }
+    }
+
+    pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
+        self.openai.as_ref()
+    }
+
+    pub fn services(&self) -> BTreeSet<String> {
+        self.services.read().unwrap().clone()
+    }
+
+    pub fn matches_services(&self, services: &HashSet<String>) -> bool {
+        self.services
+            .read()
+            .unwrap()
+            .iter()
+            .any(|s| services.contains(s))
+    }
+
+    pub(crate) fn set_services(&self, services: BTreeSet<String>) {
+        *self.services.write().unwrap() = services;
     }
 
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
@@ -377,7 +409,7 @@ pub fn paired_prefills(
     mut prefills: Vec<Arc<Worker>>,
     decoders: &[Arc<Worker>],
 ) -> Vec<Arc<Worker>> {
-    let groups: std::collections::HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
+    let groups: HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
     prefills.retain(|p| groups.contains(&p.version_group()));
     prefills
 }
