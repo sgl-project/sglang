@@ -7,6 +7,7 @@ import triton
 if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
+from sglang.kernels.ops.mono import hooks as mono
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -582,12 +583,17 @@ def forward_hc_pre_from_prev_fused_boundary(
     prev_pre: Optional[torch.Tensor],
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
+    plan=None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
-    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
+    comb); with defer_post this layer's is returned the same way and hidden_states is None.
+    Under a monokernel plan, a covered span runs from the point where it starts."""
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
+    span = mono.kernel(plan, layer.layer_id, "layer_in")
+    if span is not None:
+        return span(positions, forward_batch, pending_post, prev_pre, defer_post)
     residual, x, attn_coefficients = hc_boundary(
         layer,
         *pending_post,
@@ -600,6 +606,7 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
+    span = mono.kernel(plan, layer.layer_id, "attn_partial")
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
         x = layer.self_attn(
@@ -607,8 +614,11 @@ def forward_hc_pre_from_prev_fused_boundary(
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-            defer_all_reduce=mhc is not None,
+            defer_all_reduce=mhc is not None or span is not None,
         )
+    if span is not None:
+        # the span starts at wo_b's unreduced output and does the all-reduce
+        return span(x.partial, residual, attn_coefficients, defer_post)
     if mhc is not None:
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.

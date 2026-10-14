@@ -218,10 +218,12 @@ def forward_layer_fused_boundary(
     forward_batch,
     input_ids_global: torch.Tensor,
     capture_dspark: bool,
+    plan=None,
 ):
     """Layer i through the fused mHC boundary. Its FFN hc_post stays pending for the next
     layer's boundary launch unless that layer reads the residual stream first (Engram gate,
-    DSpark capture) or there is none; hidden_states is None while a post is pending."""
+    DSpark capture) or there is none; hidden_states is None while a post is pending.
+    ``plan``: the forward's monokernel plan (``mono.route``)."""
     nxt = i + 1
     defer_post = (
         nxt < model.end_layer
@@ -243,6 +245,7 @@ def forward_layer_fused_boundary(
         prev_pre=state.pre,
         pending_post=tuple(state.streams) if pending else None,
         defer_post=defer_post,
+        plan=plan,
     )
     return HcState(
         hidden_states if pending_post is None else HcPending(*pending_post),

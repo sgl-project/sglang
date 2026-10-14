@@ -169,7 +169,9 @@ class MonoSpec:
 
 
 # HF architecture -> the "module:attribute" paths of its specs, one a vendor
-_REGISTRY: dict[str, tuple[str, ...]] = {}
+_REGISTRY: dict[str, tuple[str, ...]] = {
+    "DeepseekV4ForCausalLM": ("sglang.kernels.ops.mono.deepseek_v41_hip.spec:SPEC",),
+}
 
 
 def register(architecture: str, path: str) -> None:
