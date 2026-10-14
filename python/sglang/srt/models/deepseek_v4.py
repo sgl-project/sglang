@@ -76,7 +76,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
@@ -96,7 +95,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
-    set_dp_buffer_len_from_batch,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -165,6 +163,11 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+)
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    enter_late_layer_dp,
+    exit_late_layer_dp,
+    late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -3876,66 +3879,13 @@ def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
     )
 
 
-def _late_layer_dp_counts(
-    forward_batch: ForwardBatch, local_late_rows: int
-) -> Optional[List[int]]:
-    # Bounded replay shrinks an extending rank's late layers to its tail, but the
-    # TP-MoE gather / combine there spans every DP rank, so each rank needs all
-    # ranks' late-layer row counts. Eager forwards only: every rank takes this
-    # branch together, and graph replays never reach the late-layer switch.
-    early = forward_batch.global_num_tokens_padded_cpu
-    if early is None:
-        early = forward_batch.global_num_tokens_cpu
-    if early is None or torch.cuda.is_current_stream_capturing():
-        return None
-    device = forward_batch.global_num_tokens_gpu.device
-    local = torch.tensor([local_late_rows], dtype=torch.int64, device=device)
-    counts = torch.empty(len(early), dtype=torch.int64, device=device)
-    get_parallel().tp_group.all_gather_into_tensor(counts, local)
-    counts = counts.tolist()
-    return None if counts == list(early) else counts
-
-
-def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:
-    fb = forward_batch
-    saved = (
-        fb.global_num_tokens_cpu,
-        fb.global_num_tokens_gpu,
-        fb.global_num_tokens_padded_cpu,
-        fb.global_num_tokens_for_logprob_cpu,
-        fb.global_dp_buffer_len,
-        fb.dp_padding_mode,
-        fb.dp_local_start_pos,
-        fb.dp_local_num_tokens,
-    )
-    fb.global_num_tokens_cpu = counts
-    fb.global_num_tokens_gpu = torch.tensor(
-        counts, dtype=torch.int64, device=fb.global_num_tokens_gpu.device
-    )
-    fb.global_num_tokens_padded_cpu = counts
-    # The MoE gatherv reads its sizes from the logprob counts when present.
-    fb.global_num_tokens_for_logprob_cpu = counts
-    fb.global_dp_buffer_len = sum(counts)
-    # Tail rows are real rows only, so the late layers gather variable lengths.
-    fb.dp_padding_mode = DpPaddingMode.SUM_LEN
-    fb.dp_local_start_pos = fb.dp_local_num_tokens = None
-    set_dp_buffer_len_from_batch(fb)
-    return saved
-
-
-def _exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
-    fb = forward_batch
-    (
-        fb.global_num_tokens_cpu,
-        fb.global_num_tokens_gpu,
-        fb.global_num_tokens_padded_cpu,
-        fb.global_num_tokens_for_logprob_cpu,
-        fb.global_dp_buffer_len,
-        fb.dp_padding_mode,
-        fb.dp_local_start_pos,
-        fb.dp_local_num_tokens,
-    ) = saved
-    set_dp_buffer_len_from_batch(fb)
+def _gather_late_layer_ids(
+    input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    # Re-gather the compact tail IDs in the late-layer MoE layout.
+    gathered = input_ids.new_empty((sum(counts), 1))
+    dp_gather_replicate(gathered, input_ids[:, None].clone(), forward_batch)
+    return gathered.squeeze(-1)
 
 
 def _scatter_tail_rows(
@@ -4087,6 +4037,15 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+            assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
+                "decoder SWA bounded replay needs hash routing before the late layers"
+            )
+        # Only vision routing reads token IDs in the late layers.
+        self.late_layer_vl_routing = (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4197,12 +4156,11 @@ class DeepseekV4Model(nn.Module):
         late_dp_counts = None
         saved_dp = None
         if (
-            _is_hip
-            and self.late_layer_start is not None
+            self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and get_moe_a2a_backend().is_none()
+            and (forward_batch.is_extend_in_batch or _is_hip)
         ):
-            late_dp_counts = _late_layer_dp_counts(
+            late_dp_counts = late_layer_dp_counts(
                 forward_batch,
                 (
                     tail.token_indices.shape[0]
@@ -4234,18 +4192,23 @@ class DeepseekV4Model(nn.Module):
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
+                if not (
+                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                ):
+                    input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-            # late_dp_counts is only not None on hip
             if late_dp_counts is not None and i == self.late_layer_start:
-                saved_dp = _enter_late_layer_dp(forward_batch, late_dp_counts)
-                # Gathered over the full extend; no late layer is hash-routed.
-                input_ids_global = None
+                saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
+                if get_moe_a2a_backend().is_none():
+                    # Full-prefill IDs are not indexed by this rank's tail rows.
+                    input_ids_global = (
+                        _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
+                        if self.late_layer_vl_routing
+                        else None
+                    )
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4300,9 +4263,8 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        # saved_dp is only not None on hip
         if saved_dp is not None:
-            _exit_late_layer_dp(forward_batch, saved_dp)
+            exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             if tail_in_graph:
                 tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
