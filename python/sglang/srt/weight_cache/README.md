@@ -1,10 +1,48 @@
 # Experimental DeepSeek V4.1 recovery
 
-This extension lets a replacement worker import the daemon's processed DeepSeek
-V4.1 weights and derived model state. GPU weights use Torch CUDA IPC. Host Engram
-storage uses shared memfds by default, or explicitly selected CUDA `HOST_NUMA`
-VMM allocations. The daemon must remain alive; this does not recover a failed GPU,
-a failed daemon, or in-flight request/KV state.
+This extension extends the existing Weight Cache Daemon feature introduced in
+[#27139](https://github.com/sgl-project/sglang/pull/27139) and described in
+[Fast Engine Recovery: Sub-Second Engine Restart for SGLang via Weight Cache Daemon](https://www.lmsys.org/blog/2026-08-21-sglang-fast-recovery)
+to DeepSeek V4.1, with Engram in either GPU or host memory.
+
+The article addresses the repeated checkpoint I/O and weight processing paid on
+every engine restart, which prolong service outages during worker failures and
+rolling updates. It retains processed weights in a persistent daemon and lets
+replacement engines reuse them through CUDA IPC. This extension builds on that feature
+and addresses the gaps that prevent the same recovery path from working for V4.1.
+
+**Why this extension is needed:**
+
+- **V4.1 needs more than tensor import.** Its FP8 dense / FP4 expert path has
+  post-load layouts, quantization metadata and cached tensor references that a
+  replacement engine must restore consistently. Related failures are documented
+  in [#39794](https://github.com/sgl-project/sglang/pull/39794). This extension restores
+  the processed state, rebinds mHC and TopK references, and checks backend/layout
+  compatibility instead of merely relaxing the IPC admission check or repeating
+  transforms on shared weights.
+- **Host Engram needs its own resident recovery path.** GPU tensor IPC cannot
+  share its host backing. This extension preserves daemon-owned host tables and imports
+  them in replacement workers; optional HOST_NUMA VMM reuses allocation handles
+  to avoid repeated `cudaHostRegister` on unchanged tables.
+- **Faster checkpoint reads still pay checkpoint I/O on restart.** The
+  InstantTensor and positioned-read PRs below accelerate loading from storage.
+  This extension complements them by reusing already processed GPU weights and host
+  Engram after a worker restart, while the daemon survives. Their cold-load
+  optimizations can still benefit initial daemon startup, but are not included
+  in this patch.
+
+The result is a V4.1-specific implementation of the article's resident-weight
+recovery path, plus an experimental prewarmed standby for its active-standby
+scenario. Complete weight reload and service recovery results are reported below;
+full long-context acceptance and other remaining gates are still pending.
+
+### Related work
+
+- [#27139 — Support fast engine recovery through weight cache](https://github.com/sgl-project/sglang/pull/27139): the original feature this extension extends.
+- [#38306 — Support post-load lifecycle and MXFP4 IPC](https://github.com/sgl-project/sglang/pull/38306): related model-support work describing K3/DSV3 validation; this extension adds V4.1-specific state restoration and host Engram recovery.
+- [#39794 — Reject routed MXFP4 experts for IPC](https://github.com/sgl-project/sglang/pull/39794): documents why accepting a base FP8 configuration is insufficient for routed-expert post-load layouts.
+- [#40453 — Add InstantTensor loader support](https://github.com/sgl-project/sglang/pull/40453), and [#42919 — Load V4.1 with the Engram host table](https://github.com/sgl-project/sglang/pull/42919): accelerate checkpoint loading while keeping host-resident tables off the GPU stream.
+- [#42920 — Parallel positioned reads for Engram host tables](https://github.com/sgl-project/sglang/pull/42920): accelerates storage-to-host loading with parallel `preadv`; this extension addresses resident recovery and mapping reuse instead.
 
 ## Host Engram configuration
 
