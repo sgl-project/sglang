@@ -19,10 +19,6 @@ from sglang.multimodal_gen.configs.models.vaes.kandinsky6_sr import (
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6 import (
     Kandinsky6TI2VAPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     global_force_attn_backend_context_manager,
 )
@@ -47,24 +43,12 @@ from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import (
     TINY_KVAE,
     TINY_LU_MODEL,
 )
-from sglang.srt.utils.network import get_free_port_below_ephemeral
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @pytest.fixture(autouse=True)
-def single_gpu(monkeypatch, default_global_server_args):
-    if not model_parallel_is_initialized():
-        port = get_free_port_below_ephemeral()
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT=str(port),
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            monkeypatch.setenv(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+def single_gpu(monkeypatch, default_global_server_args, single_process_model_parallel):
     monkeypatch.setattr(
         precision._mixed_precision_state,
         "state",
