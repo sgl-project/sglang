@@ -45,7 +45,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_hidden_state_dtype,
+    get_draft_input_from_target_hidden_dim,
+)
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -174,10 +177,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            # Width and dtype both come from the draft `model_runner` so the
-            # source stays consistent (the draft dtype matches the target dtype
-            # that produced these hidden states).
-            _hidden_dtype = model_runner.model_config.dtype
+            # State precision can differ from the draft's weight precision.
+            _hidden_dtype = get_draft_hidden_state_dtype(model_runner.model_config)
             _hidden_size = (
                 None
                 if self.eagle_worker.speculative_algorithm.is_standalone()

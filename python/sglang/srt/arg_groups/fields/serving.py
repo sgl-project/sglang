@@ -245,9 +245,16 @@ class Serving(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    min_output_token_reserve: A[
+        int,
+        "Minimum output space required when admitting a generation prompt. "
+        "Reject prompts longer than context length minus this value; "
+        "clamp the requested output budget to the remaining context. "
+        "Does not force the model to generate this many tokens.",
+    ] = 1
     allow_auto_truncate: A[
         bool,
-        "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+        "Allow automatically truncating embedding inputs that exceed the maximum input length. Generation prompts are never truncated.",
     ] = False
 
     # -------------------------------------------------------------------------

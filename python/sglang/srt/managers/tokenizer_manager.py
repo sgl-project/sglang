@@ -29,10 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -54,12 +56,12 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -515,6 +517,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Initialize blocking request preprocessor
+        self.init_request_preprocessor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -555,6 +560,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
+        if not 1 <= get_serving().min_output_token_reserve < self.context_len:
+            raise ValueError(
+                "--min-output-token-reserve must be positive and less than the model context length"
+            )
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
@@ -629,6 +638,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
             )
+
+    def init_request_preprocessor(self):
+        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        func_call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._request_preprocessor_executor, func_call
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -1029,15 +1047,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize_sync():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
+
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.run_in_request_preprocessor(
+                tokenize_sync
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
@@ -1275,7 +1299,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        """Validate prompt length and cap generation to the remaining context."""
+        if input_ids and get_step5_text_config(self.model_config.hf_config) is not None:
+            vocab_size = self.model_config.vocab_size
+            sequences = input_ids if isinstance(input_ids[0], list) else [input_ids]
+            if any(
+                token_id < 0 or token_id >= vocab_size
+                for seq in sequences
+                for token_id in seq
+            ):
+                raise ValueError(
+                    f"The input_ids {input_ids} contains values outside [0, {vocab_size})."
+                )
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if any(
@@ -1302,52 +1337,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.num_reserved_tokens
-
-        # Validate input length
-        if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
+        if isinstance(obj, GenerateReqInput):
+            # Draft tokens occupy separately allocated scratch slots, not the
+            # user-visible prompt/output context budget. Never truncate prompts.
+            reserve = get_serving().min_output_token_reserve
+            if input_token_num > self.context_len - reserve:
+                raise ValueError(
+                    f"The input ({input_token_num} tokens) exceeds the maximum "
+                    f"allowed prompt length ({self.context_len - reserve} tokens): "
+                    f"context length {self.context_len} requires {reserve} output tokens of space."
                 )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
+            max_new_tokens = obj.sampling_params.get("max_new_tokens")
+            if max_new_tokens is not None:
+                obj.sampling_params["max_new_tokens"] = min(
+                    max_new_tokens, self.context_len - input_token_num
+                )
+        elif input_token_num >= self.context_len:
+            # Preserve the embedding-only truncation contract.
+            if self.allow_auto_truncate:
+                del input_ids[self.context_len :]
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
                 )
-
-        # Validate total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if (
-            self.validate_total_tokens
-            and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) > _max_req_len
-        ):
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
-                )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
-            else:
-                total_tokens = max_new_tokens + input_token_num
-                error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                    f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                    f"of tokens in the input messages or the completion to fit within the limit."
-                )
-                raise ValueError(error_msg)
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
@@ -1781,7 +1795,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-            for tokenized_obj in tokenized_objs:
+            for index, tokenized_obj in enumerate(tokenized_objs):
+                tokenized_obj = wrap_shm_features(tokenized_obj)
+                tokenized_objs[index] = tokenized_obj
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -1844,7 +1860,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_stream: bool,
     ) -> Optional[dict]:
         """Returns the output dict to yield (stream abort), None for normal flow;
-        raises ValueError/HTTPException for non-stream aborts."""
+        raises ValueError for bad requests and HTTPException for non-stream
+        service aborts."""
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
@@ -1862,9 +1879,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         release_task = self._release_lora_once(state)
         if release_task is not None:
             await release_task
+        if status_code == HTTPStatus.BAD_REQUEST:
+            raise ValueError(finish_reason["message"])
         if not is_stream:
-            if status_code == HTTPStatus.BAD_REQUEST:
-                raise ValueError(finish_reason["message"])
             raise fastapi.HTTPException(
                 status_code=status_code, detail=finish_reason["message"]
             )

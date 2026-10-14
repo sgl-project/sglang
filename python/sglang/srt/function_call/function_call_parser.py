@@ -54,6 +54,7 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.step5_detector import Step5Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
@@ -103,6 +104,7 @@ class FunctionCallParser:
         "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "step5": Step5Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
         "nanbeige": Qwen3CoderDetector,

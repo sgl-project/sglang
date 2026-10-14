@@ -166,8 +166,15 @@ def _activation_type(runner_config: MoeRunnerConfig):
             is_gated=runner_config.is_gated,
         )
     )
+    if (
+        runner_config.is_gated
+        and runner_config.activation == "silu"
+        and runner_config.silu_clamp_mode == "post"
+    ):
+        activation = ActivationType.SwigluStep
     supported = {
         ActivationType.Swiglu,
+        ActivationType.SwigluStep,
         ActivationType.Geglu,
         ActivationType.Relu2,
         ActivationType.Identity,

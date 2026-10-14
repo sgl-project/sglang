@@ -1001,6 +1001,8 @@ class RoutingMethodType(IntEnum):
     Sigmoid = (8,)
     # Unspecified
     Unspecified = 9
+    # SigmoidBiasOrderedRenorm: Sigmoid + Bias -> TopK -> ordered sum normalize -> scale
+    SigmoidBiasOrderedRenorm = (11,)
 
 
 AITER_PADDING_SIZE = 128

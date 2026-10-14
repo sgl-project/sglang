@@ -93,6 +93,16 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.min_output_token_reserve < 1:
+        raise ValueError("--min-output-token-reserve must be at least 1")
+    if (
+        cfg.context_length is not None
+        and cfg.min_output_token_reserve >= cfg.context_length
+    ):
+        raise ValueError(
+            "--min-output-token-reserve must be less than --context-length"
+        )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

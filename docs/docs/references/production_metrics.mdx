@@ -287,3 +287,73 @@ Average estimated memory bandwidth in GB/s:
 - These metrics are estimates intended for observability and trend analysis.
 - Estimated memory bytes reflect modeled traffic and are not a direct hardware
   counter from GPU profilers.
+
+## HiCache host pools and SWA prefix coverage
+
+With `--enable-metrics`, hierarchical caches report:
+
+| Metric | Extra labels | Meaning |
+| --- | --- | --- |
+| `sglang:hicache_host_pool_used_tokens` | `pool` | Allocated logical host slots, including in-flight reservations. |
+| `sglang:hicache_host_pool_total_tokens` | `pool` | Logical host pool capacity. |
+| `sglang:hicache_host_evicted_tokens_total` | `pool`, `trigger` | Host slots freed by unified-cache host eviction, grouped by the pool freed and the pool requesting eviction. |
+
+Pool names include `kv`, `swa`, and `mamba`. Gauges also cover registered
+auxiliary pools; eviction counts describe tree components, not separate copies
+in auxiliary transfer buffers. Mamba slots represent states, so do not sum them
+with KV token slots. Existing `hicache_host_used_tokens` and
+`hicache_host_total_tokens` retain their original labels and meaning.
+
+For Full+SWA caches, `sglang:prefix_swa_truncated_tokens_total` records the gap
+between the available Full-KV prefix (GPU or host) and the prefix validated by
+SWA. Both lengths use the same request prefix limit. The gap is counted once
+when the first prefill chunk is admitted, and reduced if a later prefetch has
+already materialized a longer prefix. A failed or declined host load does not
+increase this gap. Subsequent chunks and retractions do not count it again.
+Forced cache misses, intentional SWA ring re-prefill, and mixed Mamba caches are
+excluded. Caches that do not supply Full-KV coverage contribute zero.
+
+When request-time stats logging is enabled, `ReqTimeStats` includes
+`full_kv_hit_len` and `swa_truncated_tokens` from that first-prefill snapshot.
+This measures a prefix-coverage limitation, not exact recomputation or its cause:
+it does not distinguish out-of-window cleanup from GPU or host eviction.
+A high eviction rate with `trigger="swa"` indicates requests to reclaim SWA host
+space; it alone does not establish which pool filled first.
+
+### Queries and aggregation
+
+For a colocated TP-only deployment, select one TP rank before aggregation.
+Cache counters report replicated logical counts on each TP rank. Retain `pod`,
+`pool`, `trigger`, `tp_rank`, `pp_rank`, and `dp_rank` (where present) in Grafana
+Adaptive Metrics rules. Apply this to the new metrics and existing
+`sglang:hicache_backup_tokens_total` and `sglang:load_back_tokens_total`.
+Selecting a rank after its label has been removed cannot undo double counting.
+For DP attention or PP deployments, select one reporting rank per distinct
+replica and cache shard according to the deployment topology.
+
+SWA host occupancy:
+
+```promql
+sglang:hicache_host_pool_used_tokens{pool="swa",tp_rank="0"}
+/
+sglang:hicache_host_pool_total_tokens{pool="swa",tp_rank="0"}
+```
+
+Host eviction rate by affected pool and requesting pool:
+
+```promql
+sum by (pod, pool, trigger) (
+  rate(sglang:hicache_host_evicted_tokens_total{tp_rank="0"}[5m])
+)
+```
+
+SWA-constrained prefix coverage lost per second:
+
+```promql
+sum by (pod) (
+  rate(sglang:prefix_swa_truncated_tokens_total{tp_rank="0"}[5m])
+)
+```
+
+These additions do not change cache retention, eviction, or memory allocation.
+Grafana aggregation rules must be updated separately from the engine.

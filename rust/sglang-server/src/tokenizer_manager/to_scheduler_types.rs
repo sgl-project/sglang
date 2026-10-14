@@ -25,9 +25,11 @@ pub struct Limits {
     pub vocab_size: u64,
     /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
     pub context_len: u64,
-    /// Output slots reserved on top of the input (eagle draft tokens).
+    /// Minimum context space left after the prompt (admission only).
+    pub min_output_token_reserve: u64,
+    /// Speculative scratch slots; not charged to the public context budget.
     pub num_reserved_tokens: u64,
-    /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
+    /// Legacy setting; generation prompts are never truncated.
     pub allow_auto_truncate: bool,
     /// Whether the server can produce hidden states at all.
     pub enable_return_hidden_states: bool,
@@ -39,6 +41,7 @@ impl From<&ServerArgs> for Limits {
             skip_tokenizer_init: sa.skip_tokenizer_init,
             vocab_size: sa.model_config.vocab_size,
             context_len: sa.model_config.context_len,
+            min_output_token_reserve: sa.min_output_token_reserve,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,

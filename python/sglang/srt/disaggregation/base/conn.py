@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -35,6 +34,13 @@ class StateType(str, enum.Enum):
     # KV it describes (whole sequence for full attention, window for SWA).
     BLOCK_SCALE = "block_scale"
     BLOCK_SCALE_SWA = "block_scale_swa"
+    # Step5 compressed index keys follow physical FULL pages.  The committed
+    # partial tail follows a process-local request slot and is transferred as a
+    # separate component so source/destination slots may differ positionally.
+    STEP5_COMPRESSED_INDEX_KEY = "step5_compressed_index_key"
+    STEP5_DSA_TAIL = "step5_dsa_tail"
+    # Request-indexed Step5 MTP history.  The local generation is deliberately
+    # not part of the wire and is rebound by decode after transfer completion.
 
 
 @dataclasses.dataclass

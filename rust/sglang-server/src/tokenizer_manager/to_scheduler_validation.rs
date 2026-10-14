@@ -104,55 +104,20 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
     Ok(())
 }
 
-/// The context-window checks that need the tokenized length, mirroring Python
-/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
-/// and the client gets a 200 with a truncated completion instead of an actionable
-/// 400.
-///
-/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
-/// opted into that.
+/// Admit prompts without truncation and cap output at the remaining context.
 pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
     let max_req_len = limits.context_len;
-    // Python counts the reserved slots as part of the input, so a request can be
-    // rejected for them even when the prompt alone fits.
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this. Python's comparison is `>=` — a prompt
-    // that exactly fills the window leaves no room to generate.
-    if input_len >= max_req_len {
-        if !limits.allow_auto_truncate {
-            return Err(Error::Validation(format!(
-                "The input ({input_len} tokens) is longer than the model's context \
-                 length ({max_req_len} tokens)."
-            )));
-        }
-        if let Some(ids) = &mut g.input_ids {
-            ids.truncate(max_req_len as usize);
-        }
-    }
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
-        return Ok(()); // no cap requested → nothing to add to the input length
-    };
-    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
-        return Ok(());
-    }
-    if !limits.allow_auto_truncate {
+    let input_len = g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
+    let reserve = limits.min_output_token_reserve;
+    if reserve == 0 || reserve >= max_req_len || input_len > max_req_len - reserve {
         return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-             tokens from the input messages and {max_new_tokens} tokens for the \
-             completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
+            "The input ({input_len} tokens) exceeds the maximum allowed prompt length: context length {max_req_len} requires {reserve} output tokens of space."
         )));
     }
-    let clamped = max_req_len.saturating_sub(input_len) as i64;
+    let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
+        return Ok(());
+    };
+    let clamped = max_new_tokens.min((max_req_len - input_len).min(i64::MAX as u64) as i64);
     // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
     // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
     // and `is_normalized: true` stops the scheduler from re-verifying, so nothing

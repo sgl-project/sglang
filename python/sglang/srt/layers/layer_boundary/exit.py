@@ -60,6 +60,7 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
 )
 from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
     get_moe_a2a_backend,
     post_experts_reduction_group,
 )
@@ -125,7 +126,20 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
             or (path.returns_over_dp and not output.update.applied_at_exit)
         )
     )
-    single_sum = may_defer_sum and post_experts_sum_is_one_all_reduce()
+    # Step5's local MegaMoE path declares a TP partial, unlike A2A paths
+    # whose combine already completes the expert sum. Its deferred fallback
+    # is the same TP all-reduce as an immediate boundary completion.
+    megamoe_tp_sum = (
+        output.group is SumGroup.TP
+        and get_moe_a2a_backend() is MoeA2ABackend.MEGAMOE
+        and not is_dp_attention_enabled()
+        and not get_exec().comm.enable_quant_communications
+        and not get_lora().enable_lora
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+    )
+    single_sum = may_defer_sum and (
+        megamoe_tp_sum or post_experts_sum_is_one_all_reduce()
+    )
     return ExitFacts(
         may_defer_sum=may_defer_sum,
         sum_in_reduce_scatter=sum_in_reduce_scatter,
