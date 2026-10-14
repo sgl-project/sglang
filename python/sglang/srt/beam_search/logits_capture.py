@@ -38,6 +38,8 @@ class BeamLogitsCapture(msgspec.Struct):
     leader_logits: torch.Tensor  # pre-sample clone of the leader rows
     tail_logits: Optional[torch.Tensor] = None  # member rows' slice (decode)
     leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
+    leader_normalizer: Optional[torch.Tensor] = None
+    tail_normalizer: Optional[torch.Tensor] = None
 
 
 def capture_pre_sample_logits(
@@ -60,10 +62,18 @@ def capture_pre_sample_logits(
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]
         leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
+        normalizer = logits_output.beam_normalizer
         logits_output.beam = BeamLogitsCapture(
             leader_logits=logits[leader_rows].clone(),
             tail_logits=logits[n:],
+            leader_normalizer=(
+                normalizer[leader_rows].clone() if normalizer is not None else None
+            ),
+            tail_normalizer=(
+                normalizer[n:].clone() if normalizer is not None else None
+            ),
         )
+        logits_output.beam_normalizer = None
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[:n]
         forward_batch.positions = forward_batch.positions[:n]
@@ -72,7 +82,12 @@ def capture_pre_sample_logits(
         # relay point, after sampling -- clone before it clobbers them.
         leader_rows = [i for i, r in enumerate(batch.reqs) if r.beam_group is not None]
         if leader_rows:
+            normalizer = logits_output.beam_normalizer
             logits_output.beam = BeamLogitsCapture(
                 leader_logits=logits_output.next_token_logits[leader_rows].clone(),
                 leader_rows=leader_rows,
+                leader_normalizer=(
+                    normalizer[leader_rows].clone() if normalizer is not None else None
+                ),
             )
+            logits_output.beam_normalizer = None

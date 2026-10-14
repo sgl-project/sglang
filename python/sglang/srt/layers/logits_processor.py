@@ -30,6 +30,11 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
+from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
+from sglang.srt.beam_search.trie_output_head import (
+    BeamTrieHeadOutput,
+    BeamTrieOutputHead,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -268,6 +273,7 @@ class LogitsProcessorOutput:
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
+    beam_normalizer: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -336,6 +342,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam_trie_levels: Optional[torch.Tensor] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -399,6 +406,7 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
+            beam_trie_levels=forward_batch.beam_trie_levels,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -485,6 +493,7 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.beam_trie_output_head: Optional[BeamTrieOutputHead] = None
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -506,6 +515,11 @@ class LogitsProcessor(nn.Module):
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
+        )
+
+    def configure_beam_trie(self, config: Optional[TrieOutputHeadConfig]) -> None:
+        self.beam_trie_output_head = (
+            BeamTrieOutputHead(config, self.vocab_size) if config is not None else None
         )
 
     def forward(
@@ -595,7 +609,9 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits, beam_normalizer = self._get_logits_with_beam_normalizer(
+                pruned_states, lm_head, logits_metadata
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -605,6 +621,7 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                beam_normalizer=beam_normalizer,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -865,14 +882,14 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
-    def _get_logits(
+    def _get_logits_with_beam_normalizer(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Get logits from hidden_states.
 
         If sampled_logits_only is True, it means hidden_states only contain the
@@ -905,8 +922,19 @@ class LogitsProcessor(nn.Module):
             if self.do_tensor_parallel_all_gather_dp_attn
             else LoRABatchLayout.DP_LOCAL
         )
-        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        beam_head_output = None
+        if logits_metadata.beam_trie_levels is not None:
+            beam_head_output = self._compute_mixed_beam_trie_lm_head(
+                hidden_states,
+                lm_head,
+                logits_metadata.beam_trie_levels,
+                embedding_bias,
+            )
+        if beam_head_output is None:
+            with get_forward().scoped(lora_batch_layout=lora_batch_layout):
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        else:
+            logits = beam_head_output.logits
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -917,6 +945,7 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
+        assert not (beam_head_output is not None and self.do_tensor_parallel_all_gather)
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
@@ -946,16 +975,22 @@ class LogitsProcessor(nn.Module):
             )
 
         fuse_cast_softcap = (
-            self.final_logit_softcapping
+            beam_head_output is None
+            and self.final_logit_softcapping
             and logits.is_cuda
             and logits.dtype in (torch.float16, torch.bfloat16)
         )
-        logits = self._copy_logits_to_buffer(
-            logits,
-            logits_metadata,
-            use_buffer=use_logits_buffer,
-            softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
-        )
+        if beam_head_output is None:
+            logits = self._copy_logits_to_buffer(
+                logits,
+                logits_metadata,
+                use_buffer=use_logits_buffer,
+                softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
+            )
+        else:
+            # Match the dense path: logit_scale runs in the LM-head dtype,
+            # then scoring and softcapping consume FP32 logits.
+            logits = logits.float()
 
         if self.final_logit_softcapping and not fuse_cast_softcap:
             if not (_is_npu or _is_cpu):
@@ -965,7 +1000,101 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        return logits, (
+            beam_head_output.normalizer if beam_head_output is not None else None
+        )
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+        use_logits_buffer: bool = True,
+    ) -> torch.Tensor:
+        logits, _ = self._get_logits_with_beam_normalizer(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            embedding_bias,
+            use_logits_buffer,
+        )
         return logits
+
+    def _beam_trie_output_head_for(
+        self,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor],
+    ) -> Optional[BeamTrieOutputHead]:
+        output_head = self.beam_trie_output_head
+        if (
+            output_head is None
+            or embedding_bias is not None
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+            or use_intel_amx_backend(lm_head)
+            or self.rl_on_policy_target is not None
+        ):
+            return None
+        return output_head
+
+    def _project_beam_trie_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_fp32_lm_head:
+            use_mm_out_dtype = (
+                hidden_states.is_cuda
+                and hidden_states.dtype == weight.dtype
+                and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            )
+            if use_mm_out_dtype:
+                return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
+            return torch.matmul(
+                hidden_states.to(torch.float32), weight.to(torch.float32).T
+            )
+        return torch.matmul(hidden_states.to(weight.dtype), weight.T)
+
+    def _transform_beam_trie_normalizer_logits(
+        self, logits: torch.Tensor
+    ) -> torch.Tensor:
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        if self.final_logit_softcapping is None:
+            return logits
+        logits = logits.float()
+        if not (_is_npu or _is_cpu):
+            fused_softcap(logits, self.final_logit_softcapping)
+        else:
+            logits = self.final_logit_softcapping * torch.tanh(
+                logits / self.final_logit_softcapping
+            )
+        return logits
+
+    def _compute_mixed_beam_trie_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        depths: torch.Tensor,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> Optional[BeamTrieHeadOutput]:
+        output_head = self._beam_trie_output_head_for(lm_head, embedding_bias)
+        if output_head is None:
+            return None
+        if depths.ndim != 1 or depths.shape[0] != hidden_states.shape[0]:
+            raise RuntimeError(
+                "Per-row beam trie depths must match the LM-head input rows"
+            )
+
+        return output_head.project_mixed(
+            hidden_states,
+            lm_head.weight,
+            depths,
+            self._project_beam_trie_lm_head,
+            self._transform_beam_trie_normalizer_logits,
+            use_grouped_projection=not self.use_fp32_lm_head,
+        )
 
     def _compute_lm_head(
         self,

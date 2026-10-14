@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.beam_search.beam_group import BeamGroup
 from sglang.srt.beam_search.fork import (
     StagedOrphans,
     alias_members_prompt_kv,
@@ -218,6 +219,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             pending_orphans=[StagedOrphans(7, old_map, new_map)],
             slots_freed=0,
             retired=False,
+            kv_reserved=False,
             _pending_steps=[],
         )
 
@@ -243,6 +245,23 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         coordinator._retire_group(group)
         self.assertEqual(len(allocator.freed), len(by_rows) + len(orphans))
         self.assertEqual(coordinator._num_live_groups, 0)
+
+    def test_retire_releases_kv_reservation(self):
+        allocator = _FakeAllocator()
+        coordinator = self._make_coordinator(allocator)
+        group = BeamGroup(beam_width=4, max_new_tokens=3)
+        req = SimpleNamespace(beam_group=group)
+        coordinator._num_live_groups = 1
+
+        coordinator.reserve_kv_for([req, req])
+        self.assertTrue(group.kv_reserved)
+        self.assertEqual(coordinator.reserved_kv_tokens(), 8)
+        self.assertEqual(len(coordinator._kv_reserved_groups), 1)
+
+        coordinator._retire_group(group)
+        self.assertFalse(group.kv_reserved)
+        self.assertEqual(coordinator.reserved_kv_tokens(), 0)
+        self.assertEqual(coordinator._kv_reserved_groups, [])
 
 
 class TestNeutralParams(CustomTestCase):

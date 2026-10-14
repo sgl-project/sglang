@@ -73,8 +73,11 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertIsNone(child.global_num_tokens_padded_cpu)
 
     def test_filter_batch_resets_plan_marker_on_children(self):
-        child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
+        parent = _make_target_verify_batch(8)
+        parent.beam_trie_levels = torch.arange(8)
+        child = _filter(parent, lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
+        torch.testing.assert_close(child.beam_trie_levels, torch.arange(4))
         self.assertFalse(child.forward_metadata_ready)
         self.assertIsNone(child.forward_metadata_planned_bs)
         self.assertIsNone(child.forward_metadata_planned_num_tokens)

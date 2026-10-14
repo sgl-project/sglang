@@ -29,6 +29,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -106,6 +108,44 @@ class TestInitProfileBatchMode(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
             self.assertIsNone(fake_self._profile_trace_tag)
+
+
+class TestBeamTrieGraphAvailability(CustomTestCase):
+    def test_trie_graph_requires_capture(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.capture_beam_trie_graph = False
+        self.assertTrue(runner._has_beam_trie_graph(False))
+        self.assertFalse(runner._has_beam_trie_graph(True))
+        runner.capture_beam_trie_graph = True
+        self.assertTrue(runner._has_beam_trie_graph(True))
+
+    def test_shared_attention_uses_eager_fallback(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.require_mlp_tp_gather = False
+        runner.capture_beam_trie_graph = False
+        for levels, metadata in ((None, object()), (torch.zeros(4), None)):
+            with self.subTest(levels=levels, metadata=metadata):
+                forward_batch = SimpleNamespace(
+                    replace_embeds=None,
+                    spec_info=None,
+                    batch_size=4,
+                    beam_trie_levels=levels,
+                    beam_attention_metadata=metadata,
+                )
+                self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_stages_depths_with_padding(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.beam_trie_levels_buffer = torch.full((6,), 9, dtype=torch.int64)
+        runner._stage_beam_trie_levels(
+            SimpleNamespace(beam_trie_levels=torch.tensor([2, 1, 2, 1])),
+            raw_num_token=4,
+            padded_num_tokens=6,
+        )
+        torch.testing.assert_close(
+            runner.beam_trie_levels_buffer, torch.tensor([2, 1, 2, 1, 0, 0])
+        )
 
 
 class TestInitProfileOriginalMode(CustomTestCase):
