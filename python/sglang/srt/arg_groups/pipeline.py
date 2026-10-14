@@ -167,6 +167,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.cuda_graph_hook import (
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+        apply_prefill_cp_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -266,6 +267,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+    if cfg.enable_prefill_cp:
+        run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.

@@ -363,6 +363,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -401,6 +402,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -739,6 +741,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self):
                 self.mm_inputs = object()
+                self.positional_embed_overrides = None
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
@@ -798,7 +801,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         self._prepare_scheduler(scheduler)
         raw_inputs = object()
         materialized = object()
-        request = SimpleNamespace(mm_inputs=raw_inputs)
+        request = SimpleNamespace(mm_inputs=raw_inputs, positional_embed_overrides=None)
 
         with (
             patch.object(
@@ -831,6 +834,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self, mm_inputs):
                 self.mm_inputs = mm_inputs
+                self.positional_embed_overrides = None
 
         class BatchRequest:
             def __init__(self, batch):
@@ -1030,7 +1034,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         class TokenizedRequest:
-            pass
+            positional_embed_overrides = None
 
         class EmbeddingRequest:
             pass
