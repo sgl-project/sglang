@@ -526,10 +526,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.dllm_attention.init_prefill_graph_state(
                     max_req, self.capture_num_tokens
                 )
-            if hasattr(model_runner.attn_backend, "init_cuda_graph_state"):
-                model_runner.attn_backend.init_cuda_graph_state(
-                    self.max_bs, self.max_num_tokens
-                )
 
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
@@ -551,6 +547,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
+        # Only enable chunked-prefix FullCG if the backend explicitly supports it
+        # (e.g., FlashAttentionBackend on CUDA). Other backends (e.g., XPUAttentionBackend)
+        # gracefully fall back to plain EXTEND full graph capture.
         self._capture_chunked_prefix = (
             self._is_full_backend
             and not get_schedule().disable_chunked_prefix_cache
