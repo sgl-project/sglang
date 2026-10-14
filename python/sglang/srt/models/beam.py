@@ -384,7 +384,7 @@ class BeamMoE(nn.Module):
             )
         if router_gemv_supported(hidden_states, self.gate.weight):
             return router_gemv(hidden_states, self.gate.weight)
-        return router_gemm_bf16x3(hidden_states, self.gate.weight)
+        return router_gemm_bf16x3_cublas(hidden_states, self.gate.weight)
 
     def forward(
         self,
