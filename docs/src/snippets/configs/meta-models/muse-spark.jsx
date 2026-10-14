@@ -1,7 +1,8 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
 // NVIDIA recipes follow the Muse Spark deployment specification.
-// MI355X cells are the ROCm aiter + FlyDSL profile (MXFP4 TEP 4/8, BF16
-// TEP 8). Xeon is the CPU-engine profile: the INT4 checkpoint and TP 6
+// MI355X cells are the ROCm aiter + FlyDSL profile (Quark MXFP4 or the NVFP4
+// checkpoint requantized to MXFP4 at load, TEP 4/8; BF16 TEP 8; Dflash V2 on
+// the Triton draft attention backend). Xeon is the CPU-engine profile: the INT4 checkpoint and TP 6
 // (tensor parallel only — the CPU engine has no expert-parallel degree), with
 // KV Cache Precision and Parsers as the only overlays that apply there.
 // H200 remains a placeholder with no cells.
@@ -22,8 +23,6 @@ export const config = {
           id: "nvfp4",
           label: "NVFP4",
           showWhen: (s) => s.hw !== "xeon",
-          disabled: (s) => s.hw === "mi355x",
-          disableReason: "NVFP4 is the NVIDIA recipe; MI355X uses Quark MXFP4 or BF16.",
         },
         {
           id: "mxfp4",
@@ -94,14 +93,15 @@ export const config = {
         {
           id: "dflash-v2",
           label: "Dflash V2",
-          flags: [
+          // fa4 is CUDA-only; MI355X runs the draft on the Triton attention backend.
+          flags: (s) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
-            "--speculative-draft-attention-backend fa4",
+            s.hw === "mi355x"
+              ? "--speculative-draft-attention-backend triton"
+              : "--speculative-draft-attention-backend fa4",
             "--speculative-num-draft-tokens 8",
           ],
-          disabled: (s) => s.hw === "mi355x",
-          disableReason: "Dflash V2 with fa4 draft attention is not validated on MI355X.",
         },
         { id: "off", label: "Off" },
       ],
@@ -368,9 +368,12 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
-    // MI355X ROCm — page-16 aiter attention + FlyDSL MoE. MXFP4 runs TEP 4 or
-    // TEP 8; BF16 is TEP 8 only. Do not copy NVIDIA overlays (Dflash V2 /
-    // MegaMoE / CUDA IPC / Mooncake PD / HiCache) onto these cells.
+    // MI355X ROCm — page-16 aiter attention + FlyDSL MoE. MXFP4 and the
+    // NVFP4 checkpoint (requantized to MXFP4 at load, --quantization quark_mxfp4)
+    // run TEP 4 or TEP 8; BF16 is TEP 8 only. Dflash V2 applies with the Triton
+    // draft backend; mem-fraction 0.85 (BF16: 0.92, its weights take 199 GB per
+    // GPU) leaves room for the draft. Do not copy the
+    // other NVIDIA overlays (MegaMoE / CUDA IPC / Mooncake PD / HiCache).
     {
       match: { hw: "mi355x", quant: "mxfp4", tep: "4" },
       nnodes: 1,
@@ -385,7 +388,27 @@ export const config = {
         "--ep-size 4",
         "--attention-backend aiter",
         "--page-size 16",
-        "--mem-fraction-static 0.90",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "nvfp4", tep: "4" },
+      nnodes: 1,
+      env: [
+        "SGLANG_USE_AITER=1",
+        "SGLANG_USE_AITER_UNIFIED_ATTN=1",
+        "MUSE_MOE_BACKEND=flydsl",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 4",
+        "--ep-size 4",
+        "--quantization quark_mxfp4",
+        "--attention-backend aiter",
+        "--page-size 16",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -404,7 +427,27 @@ export const config = {
         "--ep-size 8",
         "--attention-backend aiter",
         "--page-size 16",
-        "--mem-fraction-static 0.90",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "nvfp4", tep: "8" },
+      nnodes: 1,
+      env: [
+        "SGLANG_USE_AITER=1",
+        "SGLANG_USE_AITER_UNIFIED_ATTN=1",
+        "MUSE_MOE_BACKEND=flydsl",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--quantization quark_mxfp4",
+        "--attention-backend aiter",
+        "--page-size 16",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -424,7 +467,7 @@ export const config = {
         "--dtype bfloat16",
         "--attention-backend aiter",
         "--page-size 16",
-        "--mem-fraction-static 0.90",
+        "--mem-fraction-static 0.92",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
