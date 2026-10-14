@@ -945,30 +945,49 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
         )
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Undo the TRT-LLM BF16 block layout so checkpoint-shaped expert weights load again.
+
+        Shape only: the bytes stay permuted until the refit rewrites every expert, and
+        end_weight_update's postprocess re-applies the layout.
+        """
+        if not self.use_flashinfer_trtllm_moe:
+            return
+        self._restore_flashinfer_trtllm_bf16_load_shape(
+            layer, layer.w13_weight, "w13_weight"
+        )
+        self._restore_flashinfer_trtllm_bf16_load_shape(
+            layer, layer.w2_weight, "w2_weight"
+        )
+
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
         layer: torch.nn.Module,
         param: torch.nn.Parameter,
         weight_name: str,
     ) -> None:
-        """Restore canonical BF16 MoE load shapes before hot weight copy.
-
-        The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
-        block layout. During weight update, checkpoint tensors are in
-        canonical layout and need a temporary shape restore for copy.
-        """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        """Per-tensor restore for loads that run outside a weight-update session (disk, IPC)."""
+        # Gate on the flag that applied the block layout, not on the routed backend:
+        # the non-routed flashinfer_trtllm runner packs bf16 experts the same way.
+        if not self.use_flashinfer_trtllm_moe:
             return
+        self._restore_flashinfer_trtllm_bf16_load_shape(layer, param, weight_name)
 
+    def _restore_flashinfer_trtllm_bf16_load_shape(
+        self,
+        layer: torch.nn.Module,
+        param: torch.nn.Parameter,
+        weight_name: str,
+    ) -> None:
         expected_shape = None
-        if weight_name.endswith(".experts.w13_weight"):
+        if weight_name.endswith("w13_weight"):
             w13_rows = (
                 2 * layer.intermediate_size_per_partition
                 if layer.moe_runner_config.is_gated
                 else layer.intermediate_size_per_partition
             )
             expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
-        elif weight_name.endswith(".experts.w2_weight"):
+        elif weight_name.endswith("w2_weight"):
             expected_shape = (
                 layer.num_local_experts,
                 layer.hidden_size,
