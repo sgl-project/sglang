@@ -121,7 +121,11 @@ class MuseSpark1xBf16Experts(nn.Module):
         )
         self.use_trtllm = False
         self.use_triton = False
+        self.use_megamoe = False
         self._triton_runner_config = None
+        # TRT-LLM row permutations keyed by weight shape, on the host; recomputing
+        # them is costly.
+        self._trtllm_permute_cache: dict = {}
         self._finalize_op: Optional[FusedPostExpertNormWeightedSumTRTLLM] = None
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
         self.gate_up_proj = nn.Parameter(
@@ -152,27 +156,59 @@ class MuseSpark1xBf16Experts(nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if self.use_trtllm:
-            raise RuntimeError(
-                f"Cannot load {weight_name}: BF16 expert weights are already "
-                "shuffled for TRT-LLM, and per-expert loading needs the "
-                "checkpoint layout"
-            )
         local_id = expert_id - self.local_expert_offset
         if not 0 <= local_id < self.num_local_experts:
+            return
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"Unsupported expert shard: {shard_id}")
+        if self.use_trtllm:
+            self._load_into_trtllm_layout(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                local_id=local_id,
+            )
             return
         target = param.data[local_id]
         if shard_id in ("w1", "w3"):
             offset = 0 if shard_id == "w1" else self.intermediate_size
             target = target.narrow(0, offset, self.intermediate_size)
-        elif shard_id != "w2":
-            raise ValueError(f"Unsupported expert shard: {shard_id}")
         if target.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {weight_name}: "
                 f"parameter={tuple(target.shape)}, checkpoint={tuple(loaded_weight.shape)}"
             )
         target.copy_(loaded_weight)
+
+    @torch.no_grad()
+    def _load_into_trtllm_layout(
+        self,
+        *,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        local_id: int,
+    ) -> None:
+        if self.use_megamoe:
+            raise NotImplementedError(
+                "Online expert weight updates are not supported with MegaMoE weights"
+            )
+        kind = "w2" if shard_id == "w2" else "w13"
+        matrix = self._from_trtllm_layout(param.data[local_id], kind=kind)
+        target = matrix
+        if kind == "w13":
+            # The kernel order is [w3, w1]; see _shuffle_weights.
+            offset = self.intermediate_size if shard_id == "w1" else 0
+            target = matrix.narrow(0, offset, self.intermediate_size)
+        if target.shape != loaded_weight.shape:
+            raise RuntimeError(
+                f"Expert weight shape mismatch for {weight_name}: "
+                f"parameter={tuple(target.shape)}, checkpoint={tuple(loaded_weight.shape)}"
+            )
+        target.copy_(loaded_weight)
+        param.data[local_id].copy_(self._to_trtllm_layout(matrix, kind=kind))
 
     @torch.no_grad()
     def prepare_trtllm_weights(self, post_expert_norm: Optional[nn.Module]) -> None:
@@ -226,7 +262,9 @@ class MuseSpark1xBf16Experts(nn.Module):
         )
 
     @torch.no_grad()
-    def _refresh_finalize_norm_weight(self, post_expert_norm: Optional[nn.Module]) -> None:
+    def _refresh_finalize_norm_weight(
+        self, post_expert_norm: Optional[nn.Module]
+    ) -> None:
         if post_expert_norm is None or self._post_expert_norm_weight is None:
             return
         weight = post_expert_norm._get_effective_weight()
@@ -235,13 +273,6 @@ class MuseSpark1xBf16Experts(nn.Module):
         self._post_expert_norm_weight.copy_(weight.detach().to(torch.bfloat16))
 
     def _shuffle_weights(self) -> None:
-        from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w3_w1_permute_indices,
-            convert_to_block_layout,
-            get_w2_permute_indices_with_cache,
-        )
-
-        cache: dict = {}
         half = self.intermediate_size
         old_shape_w13 = self.gate_up_proj.data[0].shape
         old_shape_w2 = self.down_proj.data[0].shape
@@ -250,30 +281,64 @@ class MuseSpark1xBf16Experts(nn.Module):
             # Muse's checkpoint is [w1, w3]; the kernel's gated row interleave
             # assumes [w3, w1] (see muse_spark_nvfp4_moe for the FP4 twin).
             gate, up = self.gate_up_proj.data[i].split(half, dim=0)
-            w13 = torch.cat([up, gate], dim=0).view(torch.uint8)
-            indices = _maybe_get_cached_w3_w1_permute_indices(
-                cache, w13, _EPILOGUE_TILE_M
-            )
-            w13 = convert_to_block_layout(
-                w13[indices.to(w13.device)].contiguous(), _BLOCK_K_BYTES
-            )
-
-            w2 = self.down_proj.data[i].view(torch.uint8)
-            indices = get_w2_permute_indices_with_cache(cache, w2, _EPILOGUE_TILE_M)
-            w2 = convert_to_block_layout(
-                w2[indices.to(w2.device)].contiguous(), _BLOCK_K_BYTES
-            )
-
-            new_shape_w13 = w13.view(torch.bfloat16).shape
-            new_shape_w2 = w2.view(torch.bfloat16).shape
-            self.gate_up_proj.data[i] = w13.view(torch.bfloat16).reshape(old_shape_w13)
-            self.down_proj.data[i] = w2.view(torch.bfloat16).reshape(old_shape_w2)
+            w13 = self._to_trtllm_layout(torch.cat([up, gate], dim=0), kind="w13")
+            w2 = self._to_trtllm_layout(self.down_proj.data[i], kind="w2")
+            new_shape_w13 = w13.shape
+            new_shape_w2 = w2.shape
+            self.gate_up_proj.data[i] = w13.reshape(old_shape_w13)
+            self.down_proj.data[i] = w2.reshape(old_shape_w2)
         self.gate_up_proj.data = self.gate_up_proj.data.reshape(
             self.num_local_experts, *new_shape_w13
         )
         self.down_proj.data = self.down_proj.data.reshape(
             self.num_local_experts, *new_shape_w2
         )
+
+    def _unshuffled_shape(self, kind: str) -> tuple[int, int]:
+        if kind == "w13":
+            return 2 * self.intermediate_size, self.expert_hidden_size
+        return self.expert_hidden_size, self.intermediate_size
+
+    def _trtllm_row_permutation(
+        self, matrix_bytes: torch.Tensor, *, kind: str
+    ) -> torch.Tensor:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        get_indices = (
+            _maybe_get_cached_w3_w1_permute_indices
+            if kind == "w13"
+            else get_w2_permute_indices_with_cache
+        )
+        # The indices depend only on the shape. Keep the cache on the host: a GPU
+        # copy made during weight loading is zeroed by a memory-saver pause/resume.
+        shape_only = torch.empty((), dtype=torch.uint8).expand(matrix_bytes.shape)
+        indices = get_indices(self._trtllm_permute_cache, shape_only, _EPILOGUE_TILE_M)
+        return indices.to(matrix_bytes.device)
+
+    # One expert's [M, K] BF16 matrix (w13 in [w3, w1] order) to the kernel's
+    # BlockMajorK layout [K * 2 // 128, M, 64].
+    def _to_trtllm_layout(self, matrix: torch.Tensor, *, kind: str) -> torch.Tensor:
+        from flashinfer.fused_moe.core import convert_to_block_layout
+
+        matrix_bytes = matrix.contiguous().view(torch.uint8)
+        permuted = matrix_bytes[self._trtllm_row_permutation(matrix_bytes, kind=kind)]
+        return convert_to_block_layout(permuted.contiguous(), _BLOCK_K_BYTES).view(
+            torch.bfloat16
+        )
+
+    def _from_trtllm_layout(self, blocks: torch.Tensor, *, kind: str) -> torch.Tensor:
+        rows, cols = self._unshuffled_shape(kind)
+        permuted = (
+            blocks.view(torch.uint8)
+            .permute(1, 0, 2)
+            .reshape(rows, cols * blocks.element_size())
+        )
+        matrix_bytes = torch.empty_like(permuted)
+        matrix_bytes[self._trtllm_row_permutation(permuted, kind=kind)] = permuted
+        return matrix_bytes.view(torch.bfloat16)
 
     def _build_finalize_op(self, post_expert_norm: Optional[nn.Module]) -> None:
         """Which RMSNorm form applies is selected by ``use_ffn_learnable_scales``
