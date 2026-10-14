@@ -393,13 +393,20 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.hf_config.vision_config, "tokens_per_second", None
         )
 
-        # Also match the legacy sglang <image> sentinel used by /generate,
-        # so the artifact fast path can normalize it before build_input_ids.
+        # Match only the native chat-template image tokens. The legacy
+        # <image> sentinel (used by raw /generate prompts) is intentionally
+        # excluded here: the chat template always emits the native
+        # <|vision_start|><|image_pad|><|vision_end|> sequence, so any
+        # bare <image> in the rendered prompt is user text and must NOT
+        # be counted as an image placeholder. The legacy sentinel is still
+        # normalized in _normalize_prompt_for_fast_path below for raw
+        # /generate prompts.
+        self._legacy_image_sentinel = "<image>"
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
@@ -950,12 +957,24 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         if not isinstance(input_text, str):
             return input_text
         native = self.mm_tokens.image_token
-        normalized, count = self.mm_tokens.image_token_regex.subn(native, input_text)
-        if count != expected_image_count:
+        # First try the native chat-template tokens.
+        normalized, native_count = self.mm_tokens.image_token_regex.subn(
+            native, input_text
+        )
+        total_count = native_count
+        # If no native tokens found, the prompt may be using the legacy
+        # /generate <image> sentinel. Normalize those too so legacy raw
+        # prompts still work on the fast path.
+        if native_count == 0:
+            normalized, legacy_count = re.subn(
+                re.escape(self._legacy_image_sentinel), native, normalized
+            )
+            total_count = legacy_count
+        if total_count != expected_image_count:
             logger.debug(
                 "Qwen-VL fast path skipped: %d image placeholder(s) in prompt "
                 "vs %d prepared artifact(s); falling back to full preprocessing",
-                count,
+                total_count,
                 expected_image_count,
             )
             return None
