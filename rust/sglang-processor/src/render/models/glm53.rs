@@ -232,7 +232,7 @@ fn join_text_parts(message: &mut Value) {
 
 /// `render_jinja_template`: Python iterates `documents` and requires each item
 /// to be a dict, so only an empty string or object passes besides a list of objects.
-fn valid_documents(documents: &Value) -> bool {
+pub(super) fn valid_documents(documents: &Value) -> bool {
     match documents {
         Value::Null => true,
         Value::Array(items) => items.iter().all(Value::is_object),
