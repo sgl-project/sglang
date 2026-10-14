@@ -71,7 +71,10 @@ class TestChatSamplingValidation(CustomTestCase):
 
     def test_invalid_sampling_bounds_return_400(self):
         """Out-of-range requests previously passed validation and reached serving."""
-        for field, values in (("n", (-1, 0, MAX_N + 1)),):
+        for field, values in (
+            ("n", (-1, 0, MAX_N + 1)),
+            ("top_logprobs", (-1, 21)),
+        ):
             for value in values:
                 with self.subTest(field=field, value=value):
                     response = self._post(**{field: value}, logprobs=True)
@@ -91,6 +94,41 @@ class TestChatSamplingValidation(CustomTestCase):
                     response.json(),
                     {"n": n, "top_logprobs": top_logprobs, "temperature": None},
                 )
+
+    def test_default_and_null_top_logprobs_are_accepted(self):
+        for params in ({}, {"top_logprobs": None}):
+            with self.subTest(params=params):
+                response = self._post(**params)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json(),
+                    {"n": 1, "top_logprobs": None, "temperature": None},
+                )
+
+    def test_positive_top_logprobs_requires_logprobs(self):
+        """A candidate count previously passed validation with logprobs disabled."""
+        for top_logprobs in (1, 5, 20):
+            for params in ({}, {"logprobs": False}):
+                with self.subTest(top_logprobs=top_logprobs, params=params):
+                    response = self._post(top_logprobs=top_logprobs, **params)
+                    self._assert_validation_error(response)
+                    self.assertIn("logprobs", response.json()["message"])
+                    self.assertIn("top_logprobs", response.json()["message"])
+
+    def test_valid_logprobs_combinations_are_accepted(self):
+        for logprobs, top_logprobs in (
+            (False, None),
+            (False, 0),
+            (True, None),
+            (True, 0),
+            (True, 1),
+            (True, 5),
+            (True, 20),
+        ):
+            with self.subTest(logprobs=logprobs, top_logprobs=top_logprobs):
+                response = self._post(logprobs=logprobs, top_logprobs=top_logprobs)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["top_logprobs"], top_logprobs)
 
 
 if __name__ == "__main__":

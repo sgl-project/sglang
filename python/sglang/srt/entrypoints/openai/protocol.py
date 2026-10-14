@@ -867,7 +867,7 @@ class ChatCompletionRequest(PDRoutingFields):
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
-    top_logprobs: Optional[int] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
     max_tokens: Optional[int] = Field(
         default=None,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
@@ -1002,6 +1002,18 @@ class ChatCompletionRequest(PDRoutingFields):
             else:
                 values["tool_choice"] = "auto"
         return values
+
+    @model_validator(mode="after")
+    def validate_top_logprobs(self):
+        if (
+            self.top_logprobs is not None
+            and self.top_logprobs > 0
+            and not self.logprobs
+        ):
+            raise ValueError(
+                "logprobs must be true when top_logprobs is greater than 0"
+            )
+        return self
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
