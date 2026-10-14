@@ -81,20 +81,39 @@ only one worker remains available while the standby is rebuilding.
 
 ## Validation and limitations
 
-The frozen experimental run used four NVIDIA L20D GPUs, TP4/EP1/attention-DP1,
-native FP8 dense/FP4 expert weights, and the configuration above. Host placement
-was `per_rank`. Whole-model `load_weight` measurements with a resident daemon:
+The experiment used four NVIDIA L20D GPUs, TP4/EP1/attention-DP1,
+DeepSeek-V4.1-Flash native FP8 dense/FP4 expert weights, context 4096 and a maximum
+of four requests. CUDA Graph and overlap were disabled.
 
-| Arm | Host backend | Seconds |
-| --- | --- | --- |
-| A0 | memfd | 4.18, 6.36 |
-| B | CUDA HOST_NUMA VMM | 3.75, 2.08, 3.36 |
-| A1 | memfd | 4.77 |
+### Complete main-model weight reload time
 
-The median changed from 4.77 to 3.36 seconds (29.6% lower), with only three samples
-per backend. These measurements include GPU weights, host tables and model-state
-restoration; they exclude initial daemon loading. Client-launch-return to polled
-readiness took 38.53–43.02 seconds with VMM, not subsecond full service recovery.
+Each row compares the same Engram placement; all numbers cover the entire main
+model, including Engram and post-load state, rather than an isolated mapping call.
+
+| Configuration | Before | After | Speedup |
+| --- | --- | --- | --- |
+| GPU-resident Engram: disk reload → resident CUDA IPC | 50.56 s | 1.02 s | 49.6× |
+| Shared host Engram: disk reload → resident IPC + memfd | 85.45 s | 14.44 s | 5.9× |
+| Per-rank host Engram: existing memfd recovery → HOST_NUMA VMM | 4.77 s | 3.36 s | 1.42× |
+
+GPU disk reload uses the median of two final matched runs; other recovery values
+are medians of three runs. Shared host disk reload has one sample. These are
+separate experiments and comparisons; the shared-host disk result is not a
+baseline for the per-rank VMM result. Optimized workers import an already loaded
+daemon; initial daemon loading is excluded.
+
+### Time until the service is usable
+
+With GPU-resident Engram, complete process-launch to healthy-service time changed
+from **95.09 s to 36.53 s** (median), a **2.60×** speedup. Compilation/autotuning
+caches were warm for both sides. Weight recovery is approximately one second,
+but communication, KV and runtime initialization still keep reconstruction in
+the tens of seconds.
+
+With per-rank host Engram, VMM clients took approximately **40.53 s** to polled
+readiness, versus **45.54 s** for existing memfd clients (medians). This timer
+starts after the launch helper returns; exact process-launch to ready time was
+not measured for this comparison.
 
 Across 30 prompt comparisons, all text and input/output token IDs matched.
 24/30 also matched logprobs exactly. The 1401-token case differed even in a memfd
