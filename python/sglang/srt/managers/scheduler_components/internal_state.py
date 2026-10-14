@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -19,7 +20,6 @@ from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.request_lists import RequestList
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
