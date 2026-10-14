@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
@@ -911,7 +912,7 @@ class PrefillAdder:
         if get_exec().features.enable_encoder_swa_bounded_replay and (
             req.kv.req_pool_idx is None or req.is_retracted
         ):
-            replay_tokens = min(prefix_len, 128)
+            replay_tokens = min(prefix_len, DSV41_REPLAY_WINDOW)
             self.log_replay_tokens += replay_tokens
             self.rem_input_tokens -= replay_tokens
             if self.rem_chunk_tokens is not None:

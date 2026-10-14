@@ -772,6 +772,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
+    # This extend is the bounded decode-side replay for a cache-only P handoff.
+    dsv41_cache_only_replay: bool = False
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
@@ -1082,6 +1084,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            dsv41_cache_only_replay=batch.dsv41_cache_only_replay,
+            encoder_swa_replay=batch.dsv41_cache_only_replay,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,

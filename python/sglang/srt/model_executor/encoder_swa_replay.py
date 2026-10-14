@@ -2,6 +2,8 @@ from copy import copy
 
 import torch
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
+
 
 def run_encoder_swa_replay(worker, batch):
     from sglang.srt.model_executor.forward_batch_info import (
@@ -25,7 +27,7 @@ def run_encoder_swa_replay(worker, batch):
             raise ValueError(
                 "encoder SWA replay requires an even cached-prefix boundary"
             )
-        start = max(0, end - 128)
+        start = max(0, end - DSV41_REPLAY_WINDOW)
         req = batch.reqs[i]
         replay = copy(batch)
         replay.reqs = [req]
