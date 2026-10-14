@@ -119,10 +119,20 @@ class AdaptiveController:
     ):
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
-        self._context_policy = (
+        context_policy = (
             policy if isinstance(policy, ContextAwareAdaptiveSpecPolicy) else None
         )
+        self._context_policy = (
+            context_policy
+            if context_policy is not None
+            and getattr(context_policy, "uses_context", True)
+            else None
+        )
         self._states: dict[int, SpecRuntimeState] = {}
+
+    @property
+    def uses_context(self) -> bool:
+        return self._context_policy is not None
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -188,3 +198,13 @@ class AdaptiveController:
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
         self.worker.apply_runtime_state(state)
+
+
+def get_batch_context_length_for_controller(
+    controller: AdaptiveController | None,
+    reqs: Sequence["Req"],
+) -> int:
+    """Compute the context signal only for an opted-in adaptive policy."""
+    if controller is None or not controller.uses_context:
+        return 0
+    return get_batch_context_length(reqs)

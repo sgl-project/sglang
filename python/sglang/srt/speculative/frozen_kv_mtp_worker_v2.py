@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.adaptive_runtime_state import get_batch_context_length
 from sglang.srt.speculative.base_spec_worker import (
     BaseSpecWorker,
     EagleDraftWorkerBase,
@@ -786,7 +785,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 )
                 return batch_output
         else:
-            ctx_repr = get_batch_context_length(batch.reqs)
+            ctx_repr = self.get_adaptive_context(batch.reqs)
             self.activate_step_by_batch(batch.seq_lens.shape[0], ctx_repr)
 
             if batch.spec_info is None:

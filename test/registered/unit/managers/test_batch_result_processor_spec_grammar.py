@@ -6,6 +6,7 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -64,7 +65,12 @@ class _FakeBatch:
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(model_worker=None) -> SchedulerBatchResultProcessor:
+    if model_worker is None:
+        model_worker = SimpleNamespace(
+            get_adaptive_context=lambda reqs: 0,
+            on_verify_complete_cpu=lambda *a, **k: None,
+        )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -79,7 +85,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         metrics_collector=None,
         metrics_reporter=SimpleNamespace(),
         draft_worker=None,
-        model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        model_worker=model_worker,
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
@@ -154,6 +160,25 @@ def _commit_disagg_handoff(
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_resolve_forwards_worker_context_to_adaptive_feedback(self):
+        req = _make_req(terminate_after=99)
+        batch = _FakeBatch([req])
+        model_worker = SimpleNamespace(
+            get_adaptive_context=MagicMock(return_value=4096),
+            on_verify_complete_cpu=MagicMock(),
+        )
+        proc = _make_processor(model_worker)
+        result = _make_result(4, [3], [101, 102, 103, 0])
+
+        proc._resolve_spec_v2_tokens(result, batch)
+
+        model_worker.get_adaptive_context.assert_called_once_with(batch.reqs)
+        model_worker.on_verify_complete_cpu.assert_called_once_with(
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=1,
+            ctx_repr=4096,
+        )
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()

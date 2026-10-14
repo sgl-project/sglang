@@ -345,6 +345,7 @@ class AdaptiveSpeculativeParams:
         self._ctx_lo_by_bs: dict[int, list[int]] = {}
         self._ctx_hi_by_bs: dict[int, list[int]] = {}
         self._cuda_graph_bs: list[int] | None = None
+        self._uses_context = False
 
         for bs, entry in sorted(bs_entries.items()):
             ctx_raw = entry.get("ctx_buckets")
@@ -359,6 +360,7 @@ class AdaptiveSpeculativeParams:
                 los.append(1)
                 his.append(_CTX_BUCKET_MAX)
             else:
+                self._uses_context = True
                 ordered: list[tuple[int, int, dict]] = []
                 for bucket_key, bucket_entry in ctx_raw.items():
                     lo, hi = _parse_ctx_bucket_key(bucket_key)
@@ -386,6 +388,11 @@ class AdaptiveSpeculativeParams:
             f"steps={first_slot.current_steps}, "
             f"candidate_steps={first_slot.candidate_steps}",
         )
+
+    @property
+    def uses_context(self) -> bool:
+        """Whether routing depends on an explicit ``ctx_buckets`` axis."""
+        return self._uses_context
 
     @cached_property
     def candidate_steps(self) -> list[int]:

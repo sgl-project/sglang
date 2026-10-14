@@ -12,6 +12,9 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+from sglang.srt.speculative.adaptive_runtime_state import (
+    get_batch_context_length_for_controller,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -351,6 +354,12 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def get_adaptive_context(self, reqs) -> int:
+        """Return the context signal only when the adaptive policy opts in."""
+        return get_batch_context_length_for_controller(
+            getattr(self, "adaptive_controller", None), reqs
+        )
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.

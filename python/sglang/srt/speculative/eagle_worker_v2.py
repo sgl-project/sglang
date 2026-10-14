@@ -72,7 +72,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
-    get_batch_context_length,
 )
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
@@ -1377,7 +1376,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
                     )
         else:
-            ctx_repr = get_batch_context_length(batch.reqs)
+            ctx_repr = self.get_adaptive_context(batch.reqs)
             self.activate_step_by_batch(batch.seq_lens.shape[0], ctx_repr)
 
             if batch.spec_info is None:

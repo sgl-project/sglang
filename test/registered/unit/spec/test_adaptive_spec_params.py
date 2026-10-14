@@ -458,8 +458,14 @@ class TestTwoDSchemaParsing(unittest.TestCase):
             }
         )
         self.assertEqual(params._bs_list, [1, 8])
+        self.assertTrue(params.uses_context)
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
         self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
+
+    def test_legacy_1d_schema_does_not_opt_in_to_context(self):
+        params = self._params({"1": {"candidate_steps": [1, 3, 7]}})
+
+        self.assertFalse(params.uses_context)
 
     def test_2d_bucket_gap_raises(self):
         with self.assertRaises(ValueError):

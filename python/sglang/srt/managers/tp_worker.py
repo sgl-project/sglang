@@ -95,6 +95,10 @@ class BaseTpWorker(ABC):
         """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
         process relayed spec results through a plain worker."""
 
+    def get_adaptive_context(self, reqs) -> int:
+        """Plain workers never own a context-aware adaptive controller."""
+        return 0
+
     @property
     def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
