@@ -633,7 +633,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         slices = []
         offset = 0
         for member, full_size in enumerate(self.base_layer.output_sizes):
-            slices.append(self.slice_lora_b_member(member, B[offset : offset + full_size, :]))
+            slices.append(
+                self.slice_lora_b_member(member, B[offset : offset + full_size, :])
+            )
             offset += full_size
         return torch.concat(slices, dim=0)
 
@@ -668,7 +670,11 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
     def slice_lora_b_weights(self, B: torch.Tensor):
         members = torch.split(B, self.lora_b_member_full_rows(), dim=0)
         return torch.concat(
-            [self.slice_lora_b_member(i, member_b) for i, member_b in enumerate(members)], dim=0
+            [
+                self.slice_lora_b_member(i, member_b)
+                for i, member_b in enumerate(members)
+            ],
+            dim=0,
         )
 
     def lora_b_member_full_rows(self) -> Tuple[int, ...]:
@@ -681,7 +687,9 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         bl = self.base_layer
         q_size, kv_size, _, r_size = self.lora_b_member_full_rows()
         tp = bl.inkling_tp_size
-        kv_local = bl.inkling_head_dim if tp > bl.inkling_num_kv_heads else kv_size // tp
+        kv_local = (
+            bl.inkling_head_dim if tp > bl.inkling_num_kv_heads else kv_size // tp
+        )
         return q_size // tp, kv_local, kv_local, r_size // tp
 
     def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
@@ -761,7 +769,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         members = torch.split(B, self.lora_b_member_full_rows(), dim=0)
         return torch.concat(
-            [self.slice_lora_b_member(i, member_b) for i, member_b in enumerate(members)], dim=0
+            [
+                self.slice_lora_b_member(i, member_b)
+                for i, member_b in enumerate(members)
+            ],
+            dim=0,
         )
 
     def lora_b_member_full_rows(self) -> Tuple[int, ...]:

@@ -1119,9 +1119,9 @@ class LoRAMemoryPool:
 
             fused_member_modules = self._fused_member_modules(cur_layer_modules)
             # fused module -> {(side, slot): (member weight, cache key)}
-            temp_member_weights: Dict[str, Dict[Tuple[str, int], Tuple[torch.Tensor, str]]] = {
-                target_module: {} for target_module in fused_member_modules
-            }
+            temp_member_weights: Dict[
+                str, Dict[Tuple[str, int], Tuple[torch.Tensor, str]]
+            ] = {target_module: {} for target_module in fused_member_modules}
 
             fused_moe = self._get_fused_shared_moe(self.base_model, layer_id)
             for name, weights in layer_weights.items():
@@ -1138,7 +1138,10 @@ class LoRAMemoryPool:
                 if fused_member is not None and fused_member[0] in fused_member_modules:
                     fused_module, slot = fused_member
                     side = "A" if "lora_A" in name else "B"
-                    temp_member_weights[fused_module][(side, slot)] = (weights, cache_name)
+                    temp_member_weights[fused_module][(side, slot)] = (
+                        weights,
+                        cache_name,
+                    )
                     continue
                 if fused_member is not None and not any(
                     target in name for target in self.target_modules
@@ -1327,7 +1330,10 @@ class LoRAMemoryPool:
                         module,
                         target_module,
                         member_weights=temp_member_weights[target_module],
-                        fused_weights=(temp_A_buffer[target_module], temp_B_buffer[target_module]),
+                        fused_weights=(
+                            temp_A_buffer[target_module],
+                            temp_B_buffer[target_module],
+                        ),
                         fused_cache_keys=(
                             temp_A_cache_keys[target_module],
                             temp_B_cache_keys[target_module],
@@ -1364,7 +1370,9 @@ class LoRAMemoryPool:
             for name, (a_writes, b_writes) in fused_member_writes.items():
                 self._load_fused_member_writes(
                     a_view=self.A_buffer[name][layer_id][
-                        buffer_id, : lora_rank * get_stacked_multiply(name, self.base_model), :
+                        buffer_id,
+                        : lora_rank * get_stacked_multiply(name, self.base_model),
+                        :,
                     ],
                     b_buffer=self.B_buffer[name][layer_id][buffer_id],
                     a_writes=a_writes,
@@ -1764,13 +1772,17 @@ class LoRAMemoryPool:
                     self.new_embeddings_buffer["input_embeddings"][buffer_id], None
                 )
 
-    def _fused_member_modules(self, layer_modules: Dict[str, torch.nn.Module]) -> Dict[str, torch.nn.Module]:
+    def _fused_member_modules(
+        self, layer_modules: Dict[str, torch.nn.Module]
+    ) -> Dict[str, torch.nn.Module]:
         """This layer's fused modules that load member by member (LORA_FUSED_MEMBERS)."""
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
         modules = {}
         for module_name, module in layer_modules.items():
-            if isinstance(module, FusedMoEWithLoRA) or getattr(module, "is_shared_fused_moe", False):
+            if isinstance(module, FusedMoEWithLoRA) or getattr(
+                module, "is_shared_fused_moe", False
+            ):
                 continue
             target_module = get_target_module_name(module_name, self.target_modules)
             if target_module in LORA_FUSED_MEMBERS:
@@ -1826,7 +1838,13 @@ class LoRAMemoryPool:
             if side == "A":
                 a_writes.append((slot, module.slice_lora_a_weights(weight), cache_key))
             else:
-                b_writes.append((b_offsets[slot], module.slice_lora_b_member(slot, weight), cache_key))
+                b_writes.append(
+                    (
+                        b_offsets[slot],
+                        module.slice_lora_b_member(slot, weight),
+                        cache_key,
+                    )
+                )
         return a_writes, b_writes
 
     def _load_fused_member_writes(
@@ -1843,13 +1861,21 @@ class LoRAMemoryPool:
         """Zero the adapter's fused slots, then write each present member; absent members stay zero."""
         load_lora_weight_tensor(a_view, None)
         for slot, weight, cache_key in a_writes:
-            weight = self._get_maybe_cached_weight_for_transfer(pinned_layer_weights, cache_key, weight)
-            load_lora_weight_tensor(a_view[slot * lora_rank : (slot + 1) * lora_rank], weight)
+            weight = self._get_maybe_cached_weight_for_transfer(
+                pinned_layer_weights, cache_key, weight
+            )
+            load_lora_weight_tensor(
+                a_view[slot * lora_rank : (slot + 1) * lora_rank], weight
+            )
         b_view = b_buffer[:, :lora_rank]
         load_lora_weight_tensor(b_view, None)
         for row_offset, weight, cache_key in b_writes:
-            weight = self._get_maybe_cached_weight_for_transfer(pinned_layer_weights, cache_key, weight)
-            load_lora_weight_tensor(b_view[row_offset : row_offset + weight.shape[0]], weight)
+            weight = self._get_maybe_cached_weight_for_transfer(
+                pinned_layer_weights, cache_key, weight
+            )
+            load_lora_weight_tensor(
+                b_view[row_offset : row_offset + weight.shape[0]], weight
+            )
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Zero beyond loaded rank: the experimental dense LoRA-B kernel
             # contracts over the full padded max_rank, so the tail must be clean.

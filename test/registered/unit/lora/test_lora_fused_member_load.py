@@ -104,12 +104,26 @@ def _qkv(tp_rank, tp_size=4):
         num_kv_head_replicas=replicas,
         output_sizes=[8, 2 * tp_size, 2 * tp_size],
     )
-    return "self_attn.qkv_proj", ("q_proj", "k_proj", "v_proj"), (8, 4, 4), _wrap(QKVParallelLinearWithLoRA, bl), lambda B: _reference_qkv_slice(bl, B)
+    return (
+        "self_attn.qkv_proj",
+        ("q_proj", "k_proj", "v_proj"),
+        (8, 4, 4),
+        _wrap(QKVParallelLinearWithLoRA, bl),
+        lambda B: _reference_qkv_slice(bl, B),
+    )
 
 
 def _gate_up(tp_rank, tp_size=2):
-    bl = SimpleNamespace(tp_rank=tp_rank, output_sizes=[6, 6], output_partition_sizes=[6 // tp_size] * 2)
-    return "mlp.gate_up_proj", ("gate_proj", "up_proj"), (6, 6), _wrap(MergedColumnParallelLinearWithLoRA, bl), lambda B: _reference_merged_slice(bl, B)
+    bl = SimpleNamespace(
+        tp_rank=tp_rank, output_sizes=[6, 6], output_partition_sizes=[6 // tp_size] * 2
+    )
+    return (
+        "mlp.gate_up_proj",
+        ("gate_proj", "up_proj"),
+        (6, 6),
+        _wrap(MergedColumnParallelLinearWithLoRA, bl),
+        lambda B: _reference_merged_slice(bl, B),
+    )
 
 
 def _qkvr(tp_rank, tp_size=4):
@@ -132,8 +146,16 @@ def _qkvr(tp_rank, tp_size=4):
 
 def _mla_qkv_a(tp_rank, tp_size=1):
     del tp_rank, tp_size
-    wrapper = _wrap(ReplicatedLinearWithLoRA, SimpleNamespace(), first_output_dim=3, output_size=5)
-    return "self_attn.fused_qkv_a_proj_with_mqa", ("q_a_proj", "kv_a_proj_with_mqa"), (3, 2), wrapper, lambda B: B
+    wrapper = _wrap(
+        ReplicatedLinearWithLoRA, SimpleNamespace(), first_output_dim=3, output_size=5
+    )
+    return (
+        "self_attn.fused_qkv_a_proj_with_mqa",
+        ("q_a_proj", "kv_a_proj_with_mqa"),
+        (3, 2),
+        wrapper,
+        lambda B: B,
+    )
 
 
 _LAYERS = {
@@ -151,7 +173,9 @@ def _pool(module_path, wrapper, full_rows, max_rank):
     fused = module_path.rsplit(".", 1)[-1]
     pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
     pool.num_layer = 1
-    pool.tp_rank = wrapper.base_layer.tp_rank if hasattr(wrapper.base_layer, "tp_rank") else 0
+    pool.tp_rank = (
+        wrapper.base_layer.tp_rank if hasattr(wrapper.base_layer, "tp_rank") else 0
+    )
     pool.max_lora_rank = max_rank
     pool.target_modules = {fused}
     pool.strict_loading = True
@@ -165,7 +189,10 @@ def _pool(module_path, wrapper, full_rows, max_rank):
     pool.lm_head_A_buffer = {}
     pool.lm_head_B_buffer = {}
     pool.new_embeddings_buffer = {}
-    local_rows = sum(wrapper.slice_lora_b_member(i, torch.zeros(rows, 1)).shape[0] for i, rows in enumerate(full_rows))
+    local_rows = sum(
+        wrapper.slice_lora_b_member(i, torch.zeros(rows, 1)).shape[0]
+        for i, rows in enumerate(full_rows)
+    )
     pool.A_buffer = {fused: [torch.full((1, max_rank * len(full_rows), _HIDDEN), -9.0)]}
     pool.B_buffer = {fused: [torch.full((1, local_rows, max_rank), -9.0)]}
     return pool
@@ -195,7 +222,13 @@ def _member_weights(members, full_rows, present):
     torch.manual_seed(0)
     a = {m: torch.randn(_RANK, _HIDDEN) for m in members}
     b = {m: torch.randn(rows, _RANK) for m, rows in zip(members, full_rows)}
-    block = _PREFIX + ("attn." if members[0] == "wq_du" else "mlp." if members[0] == "gate_proj" else "self_attn.")
+    block = _PREFIX + (
+        "attn."
+        if members[0] == "wq_du"
+        else "mlp."
+        if members[0] == "gate_proj"
+        else "self_attn."
+    )
     weights = {}
     for m in present:
         weights[f"{block}{m}.lora_A.weight"] = a[m]
@@ -205,8 +238,15 @@ def _member_weights(members, full_rows, present):
 
 def _expected(members, full_rows, a, b, present, reference_slice):
     """The previous loader's buffer for the adapter with every absent member written as zeros."""
-    fused_a = torch.cat([a[m] if m in present else torch.zeros_like(a[m]) for m in members])
-    fused_b = torch.cat([b[m] if m in present else torch.zeros(rows, _RANK) for m, rows in zip(members, full_rows)])
+    fused_a = torch.cat(
+        [a[m] if m in present else torch.zeros_like(a[m]) for m in members]
+    )
+    fused_b = torch.cat(
+        [
+            b[m] if m in present else torch.zeros(rows, _RANK)
+            for m, rows in zip(members, full_rows)
+        ]
+    )
     return fused_a, reference_slice(fused_b)
 
 
@@ -218,14 +258,20 @@ def _cases():
 
 @pytest.mark.parametrize("kind, tp_rank", list(_cases()))
 @pytest.mark.parametrize("max_rank", [_RANK, _RANK + 1], ids=["max_r=r", "max_r>r"])
-def test_a_complete_adapter_loads_like_the_concatenating_loader(kind, tp_rank, max_rank):
-    module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](tp_rank)
+def test_a_complete_adapter_loads_like_the_concatenating_loader(
+    kind, tp_rank, max_rank
+):
+    module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](
+        tp_rank
+    )
     pool = _pool(module_path, wrapper, full_rows, max_rank)
     weights, a, b = _member_weights(members, full_rows, members)
 
     a_buffer, b_buffer = _load(pool, module_path, wrapper, weights)
 
-    expected_a, expected_b = _expected(members, full_rows, a, b, members, reference_slice)
+    expected_a, expected_b = _expected(
+        members, full_rows, a, b, members, reference_slice
+    )
     assert torch.equal(a_buffer[: len(members) * _RANK], expected_a)
     assert torch.equal(b_buffer[:, :_RANK], expected_b)
 
@@ -234,7 +280,9 @@ def test_a_complete_adapter_loads_like_the_concatenating_loader(kind, tp_rank, m
 def test_any_member_subset_loads_with_the_absent_members_zero(kind, tp_rank):
     """A q-only adapter raised KeyError, a k/v-only or partial qkvr adapter was dropped, and a
     q_a-only MLA adapter got kv_a rows of q_a's width."""
-    module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](tp_rank)
+    module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](
+        tp_rank
+    )
     for size in range(1, len(members)):
         for present in itertools.combinations(members, size):
             pool = _pool(module_path, wrapper, full_rows, _RANK)
@@ -242,7 +290,9 @@ def test_any_member_subset_loads_with_the_absent_members_zero(kind, tp_rank):
 
             a_buffer, b_buffer = _load(pool, module_path, wrapper, weights)
 
-            expected_a, expected_b = _expected(members, full_rows, a, b, present, reference_slice)
+            expected_a, expected_b = _expected(
+                members, full_rows, a, b, present, reference_slice
+            )
             assert torch.equal(a_buffer[: len(members) * _RANK], expected_a), present
             assert torch.equal(b_buffer[:, :_RANK], expected_b), present
 
@@ -258,7 +308,9 @@ def test_an_already_fused_qkv_adapter_matches_its_members(stacked_a):
         f"{_PREFIX}self_attn.qkv_proj.lora_B.weight": fused_b,
     }
 
-    a_buffer, b_buffer = _load(_pool(module_path, wrapper, full_rows, _RANK), module_path, wrapper, weights)
+    a_buffer, b_buffer = _load(
+        _pool(module_path, wrapper, full_rows, _RANK), module_path, wrapper, weights
+    )
 
     expected_a = fused_a if stacked_a else fused_a.repeat(3, 1)
     assert torch.equal(a_buffer[: 3 * _RANK], expected_a)
@@ -269,10 +321,14 @@ def test_an_adapter_with_fused_and_separate_projections_is_rejected():
     module_path, members, full_rows, wrapper, _ = _qkv(tp_rank=0)
     weights, _, _ = _member_weights(members, full_rows, ("q_proj",))
     weights[f"{_PREFIX}self_attn.qkv_proj.lora_A.weight"] = torch.randn(_RANK, _HIDDEN)
-    weights[f"{_PREFIX}self_attn.qkv_proj.lora_B.weight"] = torch.randn(sum(full_rows), _RANK)
+    weights[f"{_PREFIX}self_attn.qkv_proj.lora_B.weight"] = torch.randn(
+        sum(full_rows), _RANK
+    )
 
     with pytest.raises(AssertionError, match="both fused and as separate projections"):
-        _load(_pool(module_path, wrapper, full_rows, _RANK), module_path, wrapper, weights)
+        _load(
+            _pool(module_path, wrapper, full_rows, _RANK), module_path, wrapper, weights
+        )
 
 
 def test_the_adapter_keeps_dense_projections_per_member():
@@ -288,8 +344,14 @@ def test_the_adapter_keeps_dense_projections_per_member():
         f"{_PREFIX}mlp.experts.0.gate_proj.lora_A.weight",
         f"{_PREFIX}mlp.experts.0.up_proj.lora_A.weight",
     ]
-    object.__setattr__(adapter, "layers", [SimpleNamespace(weights={n: torch.ones(_RANK, _HIDDEN) for n in names})])
+    object.__setattr__(
+        adapter,
+        "layers",
+        [SimpleNamespace(weights={n: torch.ones(_RANK, _HIDDEN) for n in names})],
+    )
 
     adapter._normalize_weights()
 
-    assert sorted(adapter.layers[0].weights) == sorted(names[:3] + [f"{_PREFIX}mlp.experts.0.gate_up_proj.lora_A.weight"])
+    assert sorted(adapter.layers[0].weights) == sorted(
+        names[:3] + [f"{_PREFIX}mlp.experts.0.gate_up_proj.lora_A.weight"]
+    )
