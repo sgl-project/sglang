@@ -45,6 +45,8 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     rows_per_request: Optional[List[int]] = None
     # Hopper decode materializes this once at the source and reuses it in consumers.
     decode_mask: Optional[torch.Tensor] = None
+    # CUDA dense-prefill consumers share one bool per block, never a token mask.
+    prefill_mask: Optional[torch.Tensor] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -53,7 +55,13 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
             tail_rows_per_request=rows_per_request,
             device=self.blocks.device,
         )
-        return BlockIds(blocks=self.blocks[rows], rows_per_request=rows_per_request)
+        return BlockIds(
+            blocks=self.blocks[rows],
+            rows_per_request=rows_per_request,
+            prefill_mask=self.prefill_mask[rows]
+            if self.prefill_mask is not None
+            else None,
+        )
 
 
 class DenseBlocksBackend:
@@ -157,7 +165,13 @@ class DenseBlocksBackend:
             block_size=self.block_size,
         )
         data.write_selection(selected, inputs)
-        return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
+        score_width = (max(data.lens_per_request, default=0) + 3) // 4 * 4
+        num_blocks = -(-score_width // self.block_size)
+        return BlockIds(
+            blocks=blocks,
+            rows_per_request=data.rows_per_request,
+            prefill_mask=candidate_block_mask(blocks, num_blocks, 1),
+        )
 
     def _deep_gemm_consume_prefill(
         self,
@@ -177,6 +191,7 @@ class DenseBlocksBackend:
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,
             block_size=self.block_size,
+            block_mask=published.prefill_mask,
         )
         data.write_selection(selected, inputs)
 
@@ -285,11 +300,19 @@ def _publish_tile_blocks(
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
         scores = logits[rows, :lc]
-        scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
-            -torch.inf,
-        )
-        ids = select_candidate_block_ids(
+        select_blocks = select_candidate_block_ids
+        if logits.is_cuda and not torch.version.hip:
+            from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+                select_prefill_candidate_block_ids,
+            )
+
+            select_blocks = select_prefill_candidate_block_ids
+        else:
+            scores.masked_fill_(
+                torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
+                -torch.inf,
+            )
+        ids = select_blocks(
             logits=scores,
             compress_lens=lens[rows, None],
             topk_blocks=topk_blocks,
@@ -305,15 +328,21 @@ def _consume_prefill_blocks(
     topk: int,
     blocks: torch.Tensor,
     block_size: int,
+    block_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     selected = data.empty_selection(topk)
-    for tile, logits in score_tiles(data, kv, width_align=block_size):
+    if block_mask is None:
+        score_width = (max(data.lens_per_request, default=0) + 3) // 4 * 4
+        num_blocks = -(-score_width // block_size)
+        block_mask = candidate_block_mask(blocks, num_blocks, 1)
+    for tile, logits in score_tiles(data, kv, width_align=4):
         _consume_tile_blocks(
             data=data,
             tile=tile,
             logits=logits,
             blocks=blocks[tile],
             block_size=block_size,
+            block_mask=block_mask[tile],
             out=selected[tile],
         )
         # Free this tile's logits before the generator scores the next one.
@@ -329,22 +358,24 @@ def _consume_tile_blocks(
     blocks: torch.Tensor,
     block_size: int,
     out: torch.Tensor,
+    block_mask: Optional[torch.Tensor] = None,
 ) -> None:
-    lens = data.compress_lens[tile]
-    starts = data.request_starts[tile]
-    for rows, lc in _requests_in_tile(data, tile):
-        # Columns past a row's length hold garbage; topk_among_blocks drops them.
-        # The slice is block-aligned (the tile is), so the op gathers in place.
-        positions = topk_among_blocks(
-            logits[rows, : -(-lc // block_size) * block_size],
-            lens[rows],
-            blocks[rows],
-            out.shape[1],
-            block_size=block_size,
-        )
-        out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
-            torch.int32
-        )
+    from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+        topk_prefill_candidates,
+    )
+
+    if block_mask is None:
+        score_width = (max(data.lens_per_request, default=0) + 3) // 4 * 4
+        num_blocks = -(-score_width // block_size)
+        block_mask = candidate_block_mask(blocks, num_blocks, 1)
+    topk_prefill_candidates(
+        logits,
+        data.compress_lens[tile],
+        block_mask,
+        block_size,
+        data.request_starts[tile],
+        out,
+    )
 
 
 def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):
