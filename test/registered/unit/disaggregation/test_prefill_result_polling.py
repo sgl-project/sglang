@@ -53,6 +53,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import result_processor_shell
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.scheduler_request_lists import (
     assert_one_list_per_request,
     request_registry_of,
@@ -634,14 +635,6 @@ class TestPrefillResultPolling(CustomTestCase):
     def test_empty_polls_and_arrival_bursts_preserve_storage_retry_pacing(self):
         class CapacityBlockedScheduler(_Scheduler):
             _process_hicache_events = Scheduler._process_hicache_events
-            _process_storage_prefetch_retries = (
-                Scheduler._process_storage_prefetch_retries
-            )
-            _retry_storage_prefetch = Scheduler._retry_storage_prefetch
-
-            def _prefetch_kvcache(self, req, storage_hit_end):
-                self.reissues.append(self.iteration)
-                self.tree_cache.storage_prefetch_retries.poll_miss(req.rid)
 
             def get_new_batch_prefill(self, slot):
                 if self.iteration > 0 and not self.result_processes[1]:
@@ -682,6 +675,18 @@ class TestPrefillResultPolling(CustomTestCase):
                     swa_reprefill_tail_tokens=lambda: 0,
                     match_prefix=match_prefix,
                 )
+                scheduler.request_intake = make_request_intake(
+                    core_lists=scheduler.lists,
+                    kv=SimpleNamespace(
+                        tree_cache=scheduler.tree_cache, token_to_kv_pool_allocator=None
+                    ),
+                )
+
+                def reissue(req, storage_hit_end):
+                    scheduler.reissues.append(scheduler.iteration)
+                    retries.poll_miss(req.rid)
+
+                scheduler.request_intake._prefetch_kvcache = reissue
                 scheduler.policy = SchedulePolicy(
                     "fcfs", scheduler.tree_cache, False, False, False
                 )

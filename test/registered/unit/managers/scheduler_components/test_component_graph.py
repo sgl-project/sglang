@@ -420,14 +420,6 @@ _CALLBACK_SITES = {
         _SELF,
     ): 1,
     # To be removed.
-    # Until the request enqueuer and the storage prefetcher leave the scheduler.
-    ("init_step_planner", "StepPlanner", "add_request_to_queue", _BOUND): 1,
-    (
-        "init_step_planner",
-        "StepPlanner",
-        "prefetch_after_device_hit_loss",
-        _BOUND,
-    ): 1,
     ("init_weight_updater", "SchedulerWeightUpdaterManager", "flush_cache", _BOUND): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (

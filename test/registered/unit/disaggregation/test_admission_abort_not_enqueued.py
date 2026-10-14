@@ -29,15 +29,13 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
-from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -232,7 +230,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                         receiver.init.assert_called_once_with(0)
 
     def test_preempted_reentry_is_not_retired(self):
-        """Preemption requeues through a bare `_add_request_to_queue`.
+        """Preemption requeues through a bare `add_request_to_queue`.
 
         The door sees no flag at all, and `release_req` -> `reset_for_retract`
         is the only thing that marks the request. The resource markers miss
@@ -293,18 +291,12 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         """
         req = _make_req()
         req.set_finish_with_abort(ERROR_MSG)
-        sched = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.NULL,
-            disagg_prefill=None,
-            disagg_decode=None,
-            lists=CoreLists(),
-            counters=LaunchCounters(),
-            _set_or_validate_priority=MagicMock(return_value=True),
-            _abort_on_queued_limit=MagicMock(return_value=False),
-            _prefetch_kvcache=MagicMock(),
-        )
-        Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.lists.waiting_queue, [req])
+        intake = make_request_intake(disaggregation_mode=DisaggregationMode.NULL)
+        intake._set_or_validate_priority = MagicMock(return_value=True)
+        intake._abort_on_queued_limit = MagicMock(return_value=False)
+        intake._prefetch_kvcache = MagicMock()
+        intake.add_request_to_queue(req)
+        self.assertEqual(intake.lists.waiting_queue, [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):

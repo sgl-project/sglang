@@ -52,6 +52,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation = MagicMock()
         s.maybe_init_disagg_prefill = MagicMock()
         s.maybe_init_disagg_decode = MagicMock()
+        s.init_request_intake = MagicMock()
+        s.request_intake = MagicMock()
         s.init_mode_stages = MagicMock()
         s.init_step_launcher = MagicMock()
         s.mode_owners.disagg_prefill = None
@@ -176,12 +178,17 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
         s.maybe_init_disagg_decode.assert_called_once()
-        # The new owner's stages and launcher replace the old one's.
+        # The new owner's intake, stages and launcher replace the old one's.
+        s.init_request_intake.assert_called_once()
         s.init_mode_stages.assert_called_once()
         s.init_step_launcher.assert_called_once()
         # The step planner outlives the switch and reads the new owner.
         self.assertIs(s.step_planner.disagg_decode, s.disagg_decode)
         self.assertIs(s.step_planner.request_registry, s.request_registry)
+        self.assertIs(
+            s.step_planner.add_request_to_queue,
+            s.request_intake.add_request_to_queue,
+        )
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()

@@ -45,7 +45,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             ),
         )
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
-        s._process_storage_prefetch_retries = self.calls.retry
+        s.request_intake = SimpleNamespace(
+            process_storage_prefetch_retries=self.calls.retry
+        )
         s.process_pending_chunked_abort = Mock()
         s.lists.chunked_req = None
         s.pending = []

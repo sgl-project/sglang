@@ -26,6 +26,7 @@ from sglang.srt.utils.weight_versions import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.scheduler_request_lists import request_registry_of
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -485,7 +486,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         sent = []
         enter_scope(self, published_topology())
         get_context().override("test", abort_on_priority_when_disabled=True)
-        scheduler = SimpleNamespace(
+        intake = make_request_intake(
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda obj, req_arg: sent.append(obj)
@@ -497,7 +498,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
             "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
-            accepted = Scheduler._set_or_validate_priority(scheduler, req)
+            accepted = intake._set_or_validate_priority(req)
 
         self.assertFalse(accepted)
         self.assertEqual(

@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
+from sglang.srt.managers.scheduler_components.request_intake import RequestIntake
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -45,6 +46,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -60,41 +62,38 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.mode_owners = ModeOwners()
-        scheduler.counters = LaunchCounters()
-        scheduler.flags = EngineFlags()
-        scheduler.lists = CoreLists()
-        scheduler.disaggregation_mode = disaggregation_mode
+    def _new_intake(self, disaggregation_mode: DisaggregationMode) -> RequestIntake:
         get_context().override("test", enable_priority_scheduling=True)
         get_context().override("test", schedule_low_priority_values_first=False)
         get_context().override("test", abort_on_priority_when_disabled=False)
         get_context().override("test", enable_hierarchical_cache=False)
         get_context().override("test", enable_unified_cache_external_linker=False)
-        scheduler.counters.processed_tokens_counter = 0
-        scheduler.lists.waiting_queue = []
-        scheduler._prefetch_kvcache = MagicMock()
-        scheduler.tree_cache = MagicMock()
-        scheduler._abort_on_queued_limit = MagicMock(return_value=False)
-        scheduler.mode_owners.disagg_prefill = (
-            prefill_owner_shell(bootstrap_queue=MagicMock(), num_kv_heads=8)
-            if disaggregation_mode == DisaggregationMode.PREFILL
-            else None
+        tree_cache = MagicMock()
+        ipc_channels = MagicMock()
+        intake = make_request_intake(
+            kv=SimpleNamespace(tree_cache=tree_cache, token_to_kv_pool_allocator=None),
+            ipc_channels=ipc_channels,
+            request_retirer=RequestRetirer(
+                kv=SimpleNamespace(tree_cache=tree_cache),
+                beam_coordinator=MagicMock(),
+                output_streamer=MagicMock(),
+                ipc_channels=ipc_channels,
+            ),
+            disagg_prefill=(
+                prefill_owner_shell(bootstrap_queue=MagicMock(), num_kv_heads=8)
+                if disaggregation_mode == DisaggregationMode.PREFILL
+                else None
+            ),
+            disagg_decode=(
+                decode_owner_shell(prealloc_queue=MagicMock())
+                if disaggregation_mode == DisaggregationMode.DECODE
+                else None
+            ),
+            disaggregation_mode=disaggregation_mode,
         )
-        scheduler.mode_owners.disagg_decode = (
-            decode_owner_shell(prealloc_queue=MagicMock())
-            if disaggregation_mode == DisaggregationMode.DECODE
-            else None
-        )
-        scheduler.ipc_channels = MagicMock()
-        scheduler.request_retirer = RequestRetirer(
-            kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
-            beam_coordinator=MagicMock(),
-            output_streamer=MagicMock(),
-            ipc_channels=scheduler.ipc_channels,
-        )
-        return scheduler
+        intake._prefetch_kvcache = MagicMock()
+        intake._abort_on_queued_limit = MagicMock(return_value=False)
+        return intake
 
     def _new_req(self, priority=None):
         req = MagicMock()
@@ -107,30 +106,30 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         return req
 
     def test_prefill_mode_assigns_default_priority_before_bootstrap_queue(self):
-        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        intake = self._new_intake(DisaggregationMode.PREFILL)
         req = self._new_req(priority=None)
 
-        scheduler._add_request_to_queue(req)
+        intake.add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        scheduler.disagg_prefill.bootstrap_queue.add.assert_called_once_with(req, 8)
+        intake.disagg_prefill.bootstrap_queue.add.assert_called_once_with(req, 8)
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
-        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        intake = self._new_intake(DisaggregationMode.DECODE)
         req = self._new_req(priority=None)
 
-        scheduler._add_request_to_queue(req)
+        intake.add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        scheduler.disagg_decode.prealloc_queue.add.assert_called_once_with(
+        intake.disagg_decode.prealloc_queue.add.assert_called_once_with(
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
 
     def test_decode_retraction_queue_time_excludes_decoding_before_it(self):
         """After a PD-decode retraction, queue_time counts waits, not earlier decoding."""
-        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        intake = self._new_intake(DisaggregationMode.DECODE)
         req = self._new_req(priority=0)
         stats = SchedulerReqTimeStats(disagg_mode=DisaggregationMode.DECODE)
         req.time_stats = stats
@@ -139,13 +138,13 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         stats.set_forward_entry_time(t0 + 0.1)
 
         with patch.object(req_time_stats.time, "perf_counter", return_value=t0 + 10.0):
-            scheduler._add_request_to_queue(req, is_retracted=True)
+            intake.add_request_to_queue(req, is_retracted=True)
         stats.set_forward_entry_time(t0 + 12.0)
 
         self.assertAlmostEqual(stats.get_queueing_time(), 0.1 + 2.0)
 
     def test_priority_disabled_abort_validation_applies_to_decode_mode(self):
-        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        intake = self._new_intake(DisaggregationMode.DECODE)
         get_context().override("test", enable_priority_scheduling=False)
         get_context().override("test", abort_on_priority_when_disabled=True)
         req = self._new_req(priority=10)
@@ -154,66 +153,66 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
-            scheduler._add_request_to_queue(req)
+            intake.add_request_to_queue(req)
 
-        scheduler.disagg_decode.prealloc_queue.add.assert_not_called()
-        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        intake.disagg_decode.prealloc_queue.add.assert_not_called()
+        intake.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
     def test_priority_rejection_releases_early_prefetch(self):
         for mode in DisaggregationMode:
             with self.subTest(mode=mode):
-                scheduler = self._new_scheduler(mode)
+                intake = self._new_intake(mode)
                 get_context().override("test", enable_priority_scheduling=False)
                 get_context().override("test", abort_on_priority_when_disabled=True)
-                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
+                intake.request_retirer.tree_cache = MagicMock(spec=["finish"])
                 req = self._new_req(priority=10)
 
                 with patch(
                     "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
-                    scheduler._add_request_to_queue(req)
+                    intake.add_request_to_queue(req)
 
-                scheduler.request_retirer.tree_cache.finish.assert_called_once_with(
+                intake.request_retirer.tree_cache.finish.assert_called_once_with(
                     req.cache_request_handle, CacheRequestOutcome.ABORT
                 )
-                scheduler._prefetch_kvcache.assert_not_called()
-                self.assertEqual(scheduler.lists.waiting_queue, [])
-                if scheduler.disagg_prefill is not None:
-                    scheduler.disagg_prefill.bootstrap_queue.add.assert_not_called()
-                if scheduler.disagg_decode is not None:
-                    scheduler.disagg_decode.prealloc_queue.add.assert_not_called()
+                intake._prefetch_kvcache.assert_not_called()
+                self.assertEqual(intake.lists.waiting_queue, [])
+                if intake.disagg_prefill is not None:
+                    intake.disagg_prefill.bootstrap_queue.add.assert_not_called()
+                if intake.disagg_decode is not None:
+                    intake.disagg_decode.prealloc_queue.add.assert_not_called()
 
     def test_full_queue_releases_only_the_rejected_request(self):
         for priority in (0, 2):
             with self.subTest(incoming_priority=priority):
-                scheduler = self._new_scheduler(DisaggregationMode.NULL)
-                del scheduler._abort_on_queued_limit  # Exercise the real queue check.
-                scheduler.max_queued_requests = 1
-                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
-                scheduler.beam_coordinator = MagicMock()
+                intake = self._new_intake(DisaggregationMode.NULL)
+                del intake._abort_on_queued_limit  # Exercise the real queue check.
+                intake.max_queued_requests = 1
+                intake.request_retirer.tree_cache = MagicMock(spec=["finish"])
+                intake.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.lists.waiting_queue = [queued]
+                intake.lists.waiting_queue = [queued]
                 incoming = self._new_req(priority=priority)
 
                 with patch(
                     "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
-                    scheduler._add_request_to_queue(incoming)
+                    intake.add_request_to_queue(incoming)
 
                 rejected = incoming if priority == 0 else queued
-                scheduler.request_retirer.tree_cache.finish.assert_called_once_with(
+                intake.request_retirer.tree_cache.finish.assert_called_once_with(
                     rejected.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 if priority == 0:
-                    self.assertEqual(scheduler.lists.waiting_queue, [queued])
-                    scheduler._prefetch_kvcache.assert_not_called()
+                    self.assertEqual(intake.lists.waiting_queue, [queued])
+                    intake._prefetch_kvcache.assert_not_called()
                 else:
-                    self.assertEqual(scheduler.lists.waiting_queue, [incoming])
-                    scheduler._prefetch_kvcache.assert_called_once_with(incoming)
+                    self.assertEqual(intake.lists.waiting_queue, [incoming])
+                    intake._prefetch_kvcache.assert_called_once_with(incoming)
 
     def test_full_queue_skips_the_requests_a_step_admits(self):
         """A request preempted while a prefill step is built is requeued before
@@ -221,16 +220,16 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         count toward the limit nor are aborted."""
         for limit, expected_abort in ((2, None), (1, "queued")):
             with self.subTest(max_queued_requests=limit):
-                scheduler = self._new_scheduler(DisaggregationMode.NULL)
-                del scheduler._abort_on_queued_limit  # Exercise the real queue check.
-                scheduler.max_queued_requests = limit
-                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
-                scheduler.beam_coordinator = MagicMock()
+                intake = self._new_intake(DisaggregationMode.NULL)
+                del intake._abort_on_queued_limit  # Exercise the real queue check.
+                intake.max_queued_requests = limit
+                intake.request_retirer.tree_cache = MagicMock(spec=["finish"])
+                intake.beam_coordinator = MagicMock()
                 admitted = self._new_req(priority=0)
                 admitted.rid = "admitted"
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.lists.waiting_queue = [admitted, queued]
+                intake.lists.waiting_queue = [admitted, queued]
                 preempted = self._new_req(priority=2)
                 preempted.rid = "preempted"
 
@@ -238,20 +237,18 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
-                    scheduler._add_request_to_queue(preempted, admitted={admitted})
+                    intake.add_request_to_queue(preempted, admitted={admitted})
 
-                send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+                send_output = intake.ipc_channels.send_to_tokenizer.send_output
                 if expected_abort is None:
                     send_output.assert_not_called()
                     self.assertEqual(
-                        scheduler.lists.waiting_queue, [admitted, queued, preempted]
+                        intake.lists.waiting_queue, [admitted, queued, preempted]
                     )
                 else:
                     send_output.assert_called_once()
                     self.assertIs(send_output.call_args.args[1], queued)
-                    self.assertEqual(
-                        scheduler.lists.waiting_queue, [admitted, preempted]
-                    )
+                    self.assertEqual(intake.lists.waiting_queue, [admitted, preempted])
 
 
 class TestOptimisticPrefillCacheOwnership(unittest.TestCase):

@@ -13,7 +13,6 @@ from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
 from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult
-from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -373,22 +372,20 @@ class TestGemma4RequestValidation(unittest.TestCase):
     def test_logprob_rejection_never_enters_the_generation_queue(self):
         from sglang.srt.disaggregation.utils import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
-        from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.mode_owners = ModeOwners()
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
-        scheduler.tokenizer = None
-        scheduler.mode_owners.dllm = _manager(fdfo=False)
-        scheduler._maybe_namespace_elastic_radix_cache = Mock()
-        scheduler._add_request_to_queue = Mock()
-        scheduler.init_req_max_new_tokens = Mock()
-        scheduler.output_streamer = Mock()
         sender = Mock()
-        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        intake = make_request_intake(
+            model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
+            disaggregation_mode=DisaggregationMode.NULL,
+            dllm=_manager(fdfo=False),
+            output_streamer=Mock(),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+        )
+        intake._maybe_namespace_elastic_radix_cache = Mock()
+        intake.add_request_to_queue = Mock()
+        intake.init_req_max_new_tokens = Mock()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,
@@ -406,21 +403,25 @@ class TestGemma4RequestValidation(unittest.TestCase):
         with (
             get_context().override_server_args(weight_version="test"),
             get_parallel().override(tp_rank=0),
-            patch("sglang.srt.managers.scheduler.Req", return_value=req),
             patch(
-                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                "sglang.srt.managers.scheduler_components.request_intake.Req",
+                return_value=req,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_intake."
+                "BeamCoordinator.request_beam_width",
                 return_value=1,
             ),
         ):
-            scheduler.handle_generate_request(recv_req)
+            intake.handle_generate_request(recv_req)
         sender.send_output.assert_called_once()
         abort, original = sender.send_output.call_args.args
         self.assertIsInstance(abort, AbortReq)
         self.assertIs(original, req)
         self.assertEqual(abort.finished_reason["status_code"], 400)
         self.assertIn("return_logprob", abort.finished_reason["message"])
-        scheduler._add_request_to_queue.assert_not_called()
-        scheduler.output_streamer.stream_output.assert_not_called()
+        intake.add_request_to_queue.assert_not_called()
+        intake.output_streamer.stream_output.assert_not_called()
 
     def test_core_and_posthoc_controls_are_supported(self):
         params = SamplingParams(

@@ -10,7 +10,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -24,14 +23,13 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -66,22 +64,13 @@ def _req(
     return _FakeReq(rid, wait_entry, forward_entry, finished)
 
 
-def _scheduler(waiting_queue, decoding=(), chunked_req=None):
-    s = Scheduler.__new__(Scheduler)
-    s.mode_owners = ModeOwners()
-    s.lists = CoreLists()
-    s.lists.waiting_queue = waiting_queue
-    s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
-    s.beam_coordinator = MagicMock()
-    s.lists.decoding = list(decoding)
-    s.lists.chunked_req = chunked_req
-    s.disaggregation_mode = DisaggregationMode.NULL
-    s.mode_owners.disagg_prefill = None
-    s.mode_owners.disagg_decode = None
-    s.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=MagicMock())
-    s.mode_owners.dllm = None
-    s.mode_owners.hisparse_coordinator = None
-    return s
+def _intake(waiting_queue):
+    core_lists = CoreLists()
+    core_lists.waiting_queue = waiting_queue
+    return make_request_intake(
+        core_lists=core_lists,
+        ipc_channels=SimpleNamespace(send_to_tokenizer=MagicMock()),
+    )
 
 
 def _registry(waiting_queue, decoding=(), chunked_req=None):
@@ -108,28 +97,28 @@ class TestQueuedLimitAbort(CustomTestCase):
         incoming = _req("incoming", wait_entry=2.0)
         incoming.priority = 1
 
-        s = _scheduler([candidate])
-        s.max_queued_requests = 1
+        intake = _intake([candidate])
+        intake.max_queued_requests = 1
         get_context().override(
             "test",
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=False,
             enable_hierarchical_cache=True,
         )
-        s.tree_cache = MagicMock(spec=["finish"])
-        s.request_retirer = RequestRetirer(
-            kv=SimpleNamespace(tree_cache=s.tree_cache),
-            beam_coordinator=s.beam_coordinator,
+        intake.tree_cache = MagicMock(spec=["finish"])
+        intake.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=intake.tree_cache),
+            beam_coordinator=intake.beam_coordinator,
             output_streamer=MagicMock(),
-            ipc_channels=s.ipc_channels,
+            ipc_channels=intake.ipc_channels,
         )
 
-        self.assertFalse(s._abort_on_queued_limit(incoming))
+        self.assertFalse(intake._abort_on_queued_limit(incoming))
 
-        s.tree_cache.finish.assert_called_once_with(
+        intake.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
-        self.assertEqual(s.lists.waiting_queue, [])
+        self.assertEqual(intake.lists.waiting_queue, [])
 
 
 class TestWaitingTimeout(CustomTestCase):

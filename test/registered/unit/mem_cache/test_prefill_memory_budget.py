@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -28,6 +27,7 @@ from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -172,17 +172,18 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             origin_input_ids=array("q", [1] * (page_size + 1)),
             sampling_params=SamplingParams(max_new_tokens=1, ignore_eos=ignore_eos),
         )
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.max_req_len = 16 * page_size
-        scheduler.capacity = SimpleNamespace(
-            widened_max_total_num_tokens=allocator.size_full, kv_shard_widening=1
+        intake = make_request_intake(
+            kv=SimpleNamespace(tree_cache=None, token_to_kv_pool_allocator=allocator),
+            capacity=SimpleNamespace(
+                widened_max_total_num_tokens=allocator.size_full, kv_shard_widening=1
+            ),
+            max_req_len=16 * page_size,
+            sliding_window_size=page_size,
+            chunked_prefill_size=page_size,
         )
         get_context().override("test", page_size=page_size)
-        scheduler.sliding_window_size = page_size
-        scheduler.chunked_prefill_size = page_size
-        scheduler.token_to_kv_pool_allocator = allocator
         with get_parallel().override(attn_dcp_size=1):
-            scheduler.init_req_max_new_tokens(req)
+            intake.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 1)
         req.refresh_fill_ids()
 

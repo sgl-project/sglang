@@ -195,7 +195,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         def record(req):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
 
-        scheduler._add_request_to_queue = MagicMock(side_effect=record)
+        scheduler.request_intake = SimpleNamespace(
+            add_request_to_queue=MagicMock(side_effect=record)
+        )
         return requeue_log
 
     def _decode_req_with_pending_offload(
@@ -474,9 +476,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.process_batch_result = MagicMock(side_effect=process_result)
         scheduler.step_counters = MagicMock()
-        scheduler._add_request_to_queue = MagicMock(
-            side_effect=lambda req: event_log.append(
-                "requeue-released" if req.is_retracted else "requeue-unreleased"
+        scheduler.request_intake = SimpleNamespace(
+            add_request_to_queue=MagicMock(
+                side_effect=lambda req: event_log.append(
+                    "requeue-released" if req.is_retracted else "requeue-unreleased"
+                )
             )
         )
 
@@ -500,7 +504,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.mode_owners.disagg_prefill = prefill_owner_shell()
-        scheduler._add_request_to_queue = MagicMock()
+        scheduler.request_intake = SimpleNamespace(add_request_to_queue=MagicMock())
 
         chunked_req = MagicMock()
         chunked_req.finished.return_value = False
@@ -512,7 +516,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         mock_retract_all.assert_not_called()
-        scheduler._add_request_to_queue.assert_not_called()
+        scheduler.request_intake.add_request_to_queue.assert_not_called()
         self.assertIs(scheduler.lists.chunked_req, chunked_req)
 
     def test_retract_commits_pending_steps(self):
@@ -547,7 +551,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler._add_request_to_queue = MagicMock()
+        scheduler.request_intake = SimpleNamespace(add_request_to_queue=MagicMock())
         scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=MagicMock()
         )
@@ -565,7 +569,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         ) as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler._add_request_to_queue.assert_not_called()
+        scheduler.request_intake.add_request_to_queue.assert_not_called()
         scheduler.disagg_decode.prealloc_queue.hold_rebootstrap.assert_called_once_with(
             req
         )

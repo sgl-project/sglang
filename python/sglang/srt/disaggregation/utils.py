@@ -1842,7 +1842,7 @@ def is_unadmitted_reject(req: Req) -> bool:
 
     `req.is_retracted` catches the two re-entries that declare nothing:
     priority preemption and the pause/retract-all path both requeue through a
-    bare `_add_request_to_queue`. `release_req` always calls
+    bare `add_request_to_queue`. `release_req` always calls
     `reset_for_retract`, which sets it, and its clear sites all run downstream
     of these doors. The resource markers stay as a second line of defence --
     on their own they miss a `seqlen <= 1` preemption, whose KV is already

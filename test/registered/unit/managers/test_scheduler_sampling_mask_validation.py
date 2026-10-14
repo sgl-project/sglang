@@ -11,10 +11,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_intake import make_request_intake
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -24,39 +23,35 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.mode_owners = ModeOwners()
-                scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128
-                )
-                scheduler.disaggregation_mode = mode
                 buffers = SimpleNamespace(enable_sampling_mask=False)
-                scheduler.mode_owners.disagg_prefill = (
-                    prefill_owner_shell(metadata_buffers=buffers)
-                    if mode == DisaggregationMode.PREFILL
-                    else None
+                output_streamer = MagicMock()
+                intake = make_request_intake(
+                    model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
+                    disaggregation_mode=mode,
+                    disagg_prefill=(
+                        prefill_owner_shell(metadata_buffers=buffers)
+                        if mode == DisaggregationMode.PREFILL
+                        else None
+                    ),
+                    disagg_decode=(
+                        decode_owner_shell(metadata_buffers=buffers)
+                        if mode == DisaggregationMode.DECODE
+                        else None
+                    ),
+                    spec_algorithm=SimpleNamespace(
+                        is_dflash_family=lambda: False,
+                        is_uno=lambda: False,
+                    ),
+                    output_streamer=output_streamer,
+                    request_retirer=RequestRetirer(
+                        kv=MagicMock(),
+                        beam_coordinator=MagicMock(),
+                        output_streamer=output_streamer,
+                        ipc_channels=MagicMock(),
+                    ),
                 )
-                scheduler.mode_owners.disagg_decode = (
-                    decode_owner_shell(metadata_buffers=buffers)
-                    if mode == DisaggregationMode.DECODE
-                    else None
-                )
-                scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
-                scheduler.tokenizer = None
-                scheduler.mode_owners.dllm = None
-                scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
-                scheduler.spec_algorithm = SimpleNamespace(
-                    is_dflash_family=lambda: False,
-                    is_uno=lambda: False,
-                )
-                scheduler._add_request_to_queue = MagicMock()
-                scheduler.output_streamer = MagicMock()
-                scheduler.request_retirer = RequestRetirer(
-                    kv=MagicMock(),
-                    beam_coordinator=MagicMock(),
-                    output_streamer=scheduler.output_streamer,
-                    ipc_channels=MagicMock(),
-                )
+                intake._maybe_namespace_elastic_radix_cache = MagicMock()
+                intake.add_request_to_queue = MagicMock()
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
@@ -67,15 +62,19 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 req = MagicMock(return_sampling_mask=True, return_logprob=False)
                 with (
                     patch(
-                        "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                        "sglang.srt.managers.scheduler_components.request_intake."
+                        "BeamCoordinator.request_beam_width",
                         return_value=1,
                     ),
-                    patch("sglang.srt.managers.scheduler.Req", return_value=req),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.request_intake.Req",
+                        return_value=req,
+                    ),
                     patch(
                         "sglang.srt.managers.scheduler_components.request_retirer.prepare_abort"
                     ) as abort,
                 ):
-                    scheduler.handle_generate_request(recv_req)
+                    intake.handle_generate_request(recv_req)
                 abort.assert_called_once()
                 self.assertIs(abort.call_args.args[0], req)
                 self.assertIn(
@@ -85,10 +84,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                 )
-                scheduler.output_streamer.stream_output.assert_called_once_with(
-                    [req], False
-                )
-                scheduler._add_request_to_queue.assert_not_called()
+                output_streamer.stream_output.assert_called_once_with([req], False)
+                intake.add_request_to_queue.assert_not_called()
 
 
 if __name__ == "__main__":

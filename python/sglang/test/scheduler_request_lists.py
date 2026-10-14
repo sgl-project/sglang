@@ -71,7 +71,6 @@ def request_registry_of(scheduler: Scheduler, **deps) -> RequestRegistry:
 # name for each.
 _PLANNER_FIELDS = {
     "core_lists": "lists",
-    "add_request_to_queue": "_add_request_to_queue",
     **{
         name: name
         for name in (
@@ -103,6 +102,8 @@ def step_planner_of(scheduler: Scheduler, **fields) -> StepPlanner:
         if hasattr(scheduler, field):
             setattr(planner, name, getattr(scheduler, field))
     planner.request_registry = scheduler.request_registry
+    if hasattr(scheduler, "request_intake"):
+        planner.add_request_to_queue = scheduler.request_intake.add_request_to_queue
     planner.__dict__.update(fields)
     return planner
 

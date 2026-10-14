@@ -469,7 +469,7 @@ class SchedulePolicy:
           - Maintain a monotonically increasing counter of prefill tokens processed so far
             (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
           - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
-            (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+            (pop_bootstrapped for disagg prefill, add_request_to_queue for unified).
 
         Call sites that omit `processed_tokens` (dllm, disagg decode)
         degrade to rid-lexicographic order; those queues carry no prefill work.
