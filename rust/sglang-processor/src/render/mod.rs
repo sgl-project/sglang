@@ -20,8 +20,8 @@ use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
-    render_deepseek_v41,
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, render_deepseek_v4,
+    render_deepseek_v41, render_glm53,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -48,6 +48,8 @@ pub enum ChatFormatter {
     },
     DeepSeekV4(DeepSeekV4Profile),
     DeepSeekV41,
+    /// GLM-5.3's Jinja template, which `render_request` renders as SGLang does.
+    Glm53(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -65,7 +67,9 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. } => render_oai(formatter, request),
+            ChatFormatter::HuggingFace { formatter, .. } | ChatFormatter::Glm53(formatter) => {
+                render_oai(formatter, request)
+            }
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
                 if let Some(tools) = request.tools() {
@@ -118,7 +122,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4 and V4.1 render this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1 and GLM-5.3 render this way; others use
+    /// [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -129,6 +134,7 @@ impl ChatFormatter {
                 render_deepseek_v4(*profile, request, default_kwargs)
             }
             ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs),
+            ChatFormatter::Glm53(formatter) => render_glm53(formatter, request, default_kwargs),
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| TemplateError::Renderer { message })
@@ -143,9 +149,16 @@ impl ChatFormatter {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4(_)
-            | ChatFormatter::DeepSeekV41 => None,
+            | ChatFormatter::DeepSeekV41
+            | ChatFormatter::Glm53(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
+    }
+
+    /// Whether the template always reasons, as `template_detection` resolves
+    /// GLM-5.3's (`glm53_always_think`).
+    pub fn always_thinks(&self) -> bool {
+        matches!(self, ChatFormatter::Glm53(_))
     }
 
     /// Resolve the template's effective thinking mode and materialize its
@@ -170,6 +183,8 @@ impl ChatFormatter {
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)
             }
+            // `template_detection`'s `glm53_always_think`.
+            ChatFormatter::Glm53(_) => Some(true),
             ChatFormatter::Legacy(_) => None,
         }
     }
