@@ -28,8 +28,9 @@ import signal
 import sys
 import threading
 import zlib
+from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
 import msgspec
 import psutil
@@ -79,6 +80,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
@@ -485,7 +488,7 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
             indices,
             check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
         )
-        for field in msgspec.structs.fields(output)
+        for field in _cached_output_fields(type(output))
         if field.name not in _NOT_SPLIT_FIELDS
     }
     return type(output)(
@@ -494,6 +497,41 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         placeholder_tokens_val=None,
         **split_fields,
     )
+
+
+def _split_batch_by_key(
+    output: Any, ipcs: List[Optional[str]], key_fn: Callable[[Optional[str]], Any]
+) -> Optional[List[Tuple[Any, Any]]]:
+    indices_by_key: Dict[Any, List[int]] = {}
+    for index, ipc_key in enumerate(ipcs):
+        indices_by_key.setdefault(key_fn(ipc_key), []).append(index)
+
+    # Build every sub-batch before any send, so a fallback never duplicates one.
+    try:
+        grouped = [
+            (key, _handle_output_by_indices(output, indices), indices)
+            for key, indices in indices_by_key.items()
+        ]
+    except _CannotSplitBatch:
+        return None
+
+    for _, sub_output, indices in grouped:
+        sub_output.http_worker_ipcs = [ipcs[index] for index in indices]
+    return [(key, sub_output) for key, sub_output, _ in grouped]
+
+
+def _send_output_to_tokenizer_workers(
+    output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
+) -> None:
+    grouped = _split_batch_by_key(output, ipcs, lambda ipc_name: ipc_name)
+    if grouped is None:
+        for index, ipc_name in enumerate(ipcs):
+            single_output = _handle_output_by_index(output, index)
+            socket_mapping.send_output(ipc_name, single_output, is_tokenizer=True)
+        return
+
+    for ipc_name, grouped_output in grouped:
+        socket_mapping.send_output(ipc_name, grouped_output, is_tokenizer=True)
 
 
 class MultiHttpWorkerDetokenizerMixin:
@@ -517,11 +555,9 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                    _send_output_to_tokenizer_workers(
+                        output, recv_obj.http_worker_ipcs, self.socket_mapping
+                    )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
@@ -682,7 +718,7 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
-    def _split_batch_by_target(self, recv_obj: BaseBatchReq):
+    def _send_batch(self, recv_obj: BaseBatchReq) -> None:
         ipcs = recv_obj.http_worker_ipcs
         assert (
             ipcs is not None
@@ -690,29 +726,7 @@ class MultiDetokenizerRouter:
             and all(x is not None for x in ipcs)
         ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
-        indices_by_target: Dict[str, List[int]] = {}
-        for index, ipc_key in enumerate(ipcs):
-            target = self._pick(ipc_key)
-            indices_by_target.setdefault(target, []).append(index)
-
-        try:
-            grouped = [
-                (
-                    target,
-                    _handle_output_by_indices(recv_obj, indices),
-                    indices,
-                )
-                for target, indices in indices_by_target.items()
-            ]
-        except _CannotSplitBatch:
-            return None
-
-        for _, output, indices in grouped:
-            output.http_worker_ipcs = [ipcs[index] for index in indices]
-        return grouped
-
-    def _send_batch(self, recv_obj: BaseBatchReq) -> None:
-        grouped = self._split_batch_by_target(recv_obj)
+        grouped = _split_batch_by_key(recv_obj, ipcs, self._pick)
         if grouped is None:
             for index, ipc_key in enumerate(recv_obj.http_worker_ipcs):
                 one = _handle_output_by_index(recv_obj, index)
@@ -722,7 +736,7 @@ class MultiDetokenizerRouter:
                 self._send(self._pick(ipc_key), one)
             return
 
-        for target, output, _ in grouped:
+        for target, output in grouped:
             self._send(target, output)
 
     def event_loop(self):

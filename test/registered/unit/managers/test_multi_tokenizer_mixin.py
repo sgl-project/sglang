@@ -1,5 +1,7 @@
+import pickle
 import unittest
-from unittest import mock
+from types import SimpleNamespace
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import numpy as np
 
@@ -20,9 +22,12 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
+    MultiHttpWorkerDetokenizerMixin,
     TokenizerWorker,
+    _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
+    _send_output_to_tokenizer_workers,
     get_tokenizer_worker_class,
 )
 
@@ -194,15 +199,15 @@ class TestMultiTokenizerMixin(CustomTestCase):
         for enabled in (False, True):
             with self.subTest(enable_metrics=enabled):
                 with (
-                    mock.patch.multiple(
+                    patch.multiple(
                         multi_tokenizer_mixin,
-                        kill_itself_when_parent_died=mock.DEFAULT,
-                        configure_logger=mock.DEFAULT,
-                        MultiDetokenizerRouter=mock.DEFAULT,
-                        start_cpu_monitor_thread=mock.DEFAULT,
+                        kill_itself_when_parent_died=DEFAULT,
+                        configure_logger=DEFAULT,
+                        MultiDetokenizerRouter=DEFAULT,
+                        start_cpu_monitor_thread=DEFAULT,
                     ) as mocks,
-                    mock.patch("setproctitle.setproctitle"),
-                    mock.patch("psutil.Process"),
+                    patch("setproctitle.setproctitle"),
+                    patch("psutil.Process"),
                 ):
                     multi_tokenizer_mixin.run_multi_detokenizer_router_process(
                         [], None, None, enable_metrics=enabled
@@ -290,6 +295,22 @@ class TestMultiTokenizerMixin(CustomTestCase):
             grouped.input_top_logprobs_val_flat[1], np.array([[1.0]], np.float32)
         )
 
+    def test_grouped_split_caches_struct_fields_by_output_type(self):
+        self.addCleanup(_cached_output_fields.cache_clear)
+        _cached_output_fields.cache_clear()
+
+        str_output = _make_batch_str_output()
+        token_output = _make_batch_token_id_output()
+        _handle_output_by_indices(str_output, [0, 1])
+        _handle_output_by_indices(str_output, [1, 0])
+        _handle_output_by_indices(token_output, [0, 1])
+        _handle_output_by_indices(token_output, [1, 0])
+
+        cache_info = _cached_output_fields.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 2)
+        self.assertEqual(cache_info.currsize, 2)
+
     def test_router_groups_by_target_and_preserves_owner_ipcs(self):
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
@@ -351,6 +372,91 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [(target, obj.rids) for target, obj in sent],
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
+
+    def test_return_path_groups_noncontiguous_owners(self):
+        output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
+        output.rids = ["rid-0", "rid-1", "rid-2"]
+        output.output_strs = ["first", "second", "third"]
+        ipcs = ["worker-b", "worker-a", "worker-b"]
+        output.http_worker_ipcs = list(ipcs)
+        original = pickle.dumps(output)
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append(
+                (target, obj.rids, obj.output_strs, obj.http_worker_ipcs, is_tokenizer)
+            )
+        )
+
+        _send_output_to_tokenizer_workers(output, ipcs, mapping)
+
+        self.assertEqual(
+            sent,
+            [
+                (
+                    "worker-b",
+                    ["rid-0", "rid-2"],
+                    ["first", "third"],
+                    ["worker-b", "worker-b"],
+                    True,
+                ),
+                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+            ],
+        )
+        self.assertEqual(pickle.dumps(output), original)
+
+    def test_return_path_falls_back_before_sending_any_group(self):
+        output = _make_batch_embedding_output()
+        output.rids.append("embedding-rid-2")
+        output.embeddings.append([0.5, 0.6])
+        output.prompt_tokens.append(30)
+        output.cached_tokens.append(5)
+        output.finished_reasons.append(None)
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append((target, obj))
+        )
+
+        _send_output_to_tokenizer_workers(
+            output, ["worker-b", "worker-a", "worker-a"], mapping
+        )
+
+        self.assertEqual(
+            [(target, obj.rids) for target, obj in sent],
+            [
+                ("worker-b", ["embedding-rid-0"]),
+                ("worker-a", ["embedding-rid-1"]),
+                ("worker-a", ["embedding-rid-2"]),
+            ],
+        )
+
+    def test_event_loop_sends_one_message_per_owner(self):
+        output = _make_batch_str_output()
+        output.http_worker_ipcs = ["worker-a", "worker-a"]
+        worker = MultiHttpWorkerDetokenizerMixin()
+        worker.recv_from_scheduler = object()
+        worker.soft_watchdog = MagicMock()
+        worker._request_dispatcher = lambda obj: obj
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append(
+                (target, obj.rids)
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.SocketMapping",
+                return_value=mapping,
+            ),
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
+                side_effect=[output, EOFError("end of input")],
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            worker.multi_http_worker_event_loop()
+
+        self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
