@@ -36,6 +36,7 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+MAX_N = 128
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
 MAX_STOP_REGEX_COUNT = 32
@@ -220,6 +221,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if type(self.n) is not int or not 1 <= self.n <= MAX_N:
+            raise ValueError(f"n must be an integer in [1, {MAX_N}], got {self.n}.")
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
