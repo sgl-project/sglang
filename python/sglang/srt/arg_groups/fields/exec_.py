@@ -182,6 +182,10 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
     ] = None
+    enable_monokernel: A[
+        bool,
+        "Run the model's monokernels (persistent kernels that run most of a decoder layer, including its TP all-reduce, in one or two launches) for decode and verify steps the model's spec covers. Startup fails if the model has no spec for this GPU or the setup uses a feature the spec does not accept.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(

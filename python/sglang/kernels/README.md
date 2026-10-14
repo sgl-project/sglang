@@ -26,7 +26,7 @@ sglang/kernels/
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lora`, `lplb`, `mamba`, `memory`, `mm`, `moe`,
+`kvcache`, `layernorm`, `lora`, `lplb`, `mamba`, `memory`, `mm`, `mono`, `moe`,
 `quantization`, `sampling`, `speculative`.
 
 Place model-specific implementations and tuning data inside the corresponding
@@ -56,6 +56,14 @@ routing belongs in `moe`, matrix multiplication (including quantized GEMM and
 its tuning data) in `gemm`, and attention index selection in `attention`.
 Keep a fused operation intact; an attention kernel that fuses RoPE with a
 projection may stay in `attention`. A model name inside a logical group is fine.
+
+`mono` is its own group because it has a distinct responsibility: monokernels,
+persistent kernels that run most of a decoder layer in one or two launches
+(RFC #43949). It is the one exception to the next rule: the group also holds
+the monokernel runtime (`hooks.py`, the calls SGLang makes; `spec.py`; each
+model's spec and glue in `<model>_<vendor>/spec.py`, next to its kernels).
+Monokernel work then changes `srt` only where it must: the hook calls at fixed
+points in a model's code, and any cache feature a kernel needs, in its own PR.
 
 Runtime integration that owns process groups, symmetric buffers, or model
 dispatch stays in `srt`; the K3 communication adapters live in
