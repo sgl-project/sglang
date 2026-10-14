@@ -46,7 +46,7 @@ import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 This cookbook provides deployment recipes for the Muse Spark 816B-A42B checkpoints:
 
 - **NVFP4:** `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (NVIDIA default).
-- **MXFP4:** `amd/Muse-Spark-open-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
+- **MXFP4:** `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
 - **NVFP4 on MI355X (direct load):** the same `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` checkpoint runs on MI355X with `--quantization quark_mxfp4`; the weights are requantized to MXFP4 while loading, so no separate export is needed. Select **MI355X / NVFP4** in the panel for this command.
 - **INT4** `intel-ai/Muse-Spark-open-816B-A42B-INT4` (Xeon default; AutoRound-quantized).
 - **BF16:** `meta-models/Muse-Spark-Open-816B-A42B`.
