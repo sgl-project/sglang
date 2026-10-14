@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -775,7 +776,10 @@ class BlockAcceptEstimateRecorder:
     def _host_to_device_async(
         self, values: List[int], *, device: torch.device
     ) -> torch.Tensor:
-        host = torch.tensor(values, dtype=torch.long, pin_memory=device.type == "cuda")
+        # Pin so the non_blocking H2D is stream-ordered
+        host = torch.tensor(
+            values, dtype=torch.long, pin_memory=is_pin_memory_available(device)
+        )
         self._retained_h2d.append(host)
         return host.to(device=device, non_blocking=True)
 
