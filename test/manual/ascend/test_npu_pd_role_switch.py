@@ -3,15 +3,17 @@
 Run inside the configured NPU environment:
   python3 test/manual/ascend/test_npu_pd_role_switch.py > pd-role-switch.log 2>&1
 
-The defaults below match the existing NPU PD tests: Qwen3-32B, TP2 per side,
-and devices 0,1,2,3. Environment overrides remain available for other setups.
+The defaults below match the existing NPU PD tests: Qwen3-32B, TP2 per side.
+Set ASCEND_RT_VISIBLE_DEVICES before running to select four idle devices.
+Environment overrides remain available for other setups.
 BASELINE_ONLY=1 runs fixed roles without --enable-pd-role-switch, including
-its disabled-flag rejection. Worker logs and JSON evidence go to a fresh
-temporary directory, whose path is printed in the test output.
+its disabled-flag rejection. Worker logs and JSON evidence are printed to
+standard output, so shell redirection captures the complete test log.
 This test does not establish PLE, hybrid/Mamba, RDMA, or other topology support.
 """
 
 import concurrent.futures
+import io
 import json
 import os
 import re
@@ -20,7 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -33,30 +35,25 @@ from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
 # Default launch configuration for direct manual runs.
 MODEL_PATH = QWEN3_32B_WEIGHTS_PATH
 TP_SIZE = 2
-ASCEND_DEVICES = "0,1,2,3"
 MEM_FRACTION_STATIC = 0.9
 
 
 class TestNpuPdRoleSwitch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.root = Path(
-            os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_LOG_DIR")
-            or tempfile.mkdtemp(prefix="pd-role-switch-")
-        )
-        cls.root.mkdir(parents=True, exist_ok=True)
         cls.model = os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_MODEL", MODEL_PATH)
         cls.tp = int(os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_TP_SIZE", str(TP_SIZE)))
         cls.baseline_only = (
             os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_BASELINE_ONLY") == "1"
         )
         cls.port = int(os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_PORT", "28000"))
-        cls.processes, cls.files, cls.records = [], [], []
+        cls.processes, cls.log_threads, cls.records = [], [], []
         cls.urls = [f"http://127.0.0.1:{cls.port + i}" for i in range(2)]
         cls.bootstrap_ports = [cls.port + 10, cls.port + 11]
-        cls.log_paths = [cls.root / f"worker_{i}.log" for i in range(2)]
+        cls.logs = [io.StringIO() for _ in range(2)]
+        cls.log_output_lock = threading.Lock()
         # Refuse to take a port held by another service.
-        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ASCEND_DEVICES).split(",")
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",")
         if (
             cls.tp < 1
             or len(visible) != 2 * cls.tp
@@ -67,7 +64,7 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
             )
         print(
             f"Model: {cls.model}; TP per side: {cls.tp}; "
-            f"ASCEND_RT_VISIBLE_DEVICES={','.join(visible)}; logs: {cls.root}",
+            f"ASCEND_RT_VISIBLE_DEVICES={','.join(visible)}",
             flush=True,
         )
         ports = [
@@ -137,40 +134,60 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
                 )
                 env = dict(
                     os.environ,
-                    ASCEND_RT_VISIBLE_DEVICES=",".join(visible),
                     ASCEND_MF_STORE_URL=f"tcp://127.0.0.1:{cls.port + 30}",
+                    PYTHONUNBUFFERED="1",
                 )
                 print(f"Launching {role}: {shlex.join(args)}", flush=True)
-                log = cls.log_paths[i].open("w")
-                cls.files.append(log)
                 cls.records.append({"launch": args, "visible_dies": visible})
                 cls.processes.append(
                     subprocess.Popen(
                         args,
                         env=env,
-                        stdout=log,
+                        stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
                         start_new_session=True,
                     )
                 )
+                thread = threading.Thread(
+                    target=cls._forward_log, args=(i,), daemon=True
+                )
+                cls.log_threads.append(thread)
+                thread.start()
                 cls._wait_ready(i)
         except BaseException:
             cls.tearDownClass()
             raise
 
     @classmethod
+    def _forward_log(cls, i):
+        # Keep a copy for graph assertions while streaming everything to the
+        # caller's stdout; `> test.log 2>&1` captures both worker logs.
+        with cls.processes[i].stdout as output:
+            for line in output:
+                cls.logs[i].write(line)
+                with cls.log_output_lock:
+                    sys.stdout.write(f"[worker {i}] {line}")
+                    sys.stdout.flush()
+
+    @classmethod
     def _wait_ready(cls, i):
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             if cls.processes[i].poll() is not None:
-                raise RuntimeError(f"Worker {i} exited; see {cls.log_paths[i]}")
+                raise RuntimeError(f"Worker {i} exited; see the worker logs above")
             try:
                 if requests.get(cls.urls[i] + "/health", timeout=5).status_code == 200:
                     return
             except requests.RequestException:
                 pass
             time.sleep(1)
-        raise TimeoutError(f"Worker {i} did not become ready; see {cls.log_paths[i]}")
+        raise TimeoutError(
+            f"Worker {i} did not become ready; see the worker logs above"
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -187,9 +204,17 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=30)
-        for log in cls.files:
-            log.close()
-        (cls.root / "evidence.json").write_text(json.dumps(cls.records, indent=2))
+        for thread in cls.log_threads:
+            thread.join(timeout=30)
+        print("PD role-switch evidence:", json.dumps(cls.records, indent=2), flush=True)
+        # Preserve explicit artifact export for existing launch wrappers.
+        log_dir = os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_LOG_DIR")
+        if log_dir:
+            root = Path(log_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            for i, log in enumerate(cls.logs):
+                (root / f"worker_{i}.log").write_text(log.getvalue())
+            (root / "evidence.json").write_text(json.dumps(cls.records, indent=2))
 
     def _state(self, i):
         response = requests.get(self.urls[i] + "/server_info", timeout=30)
@@ -238,7 +263,7 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
             "bootstrap_port": self.bootstrap_ports[prefill],
             "bootstrap_room": room,
         }
-        offset = self.log_paths[decode].stat().st_size
+        offset = self.logs[decode].tell()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
                 executor.submit(
@@ -257,13 +282,16 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
         self.assertEqual(len(tokens), 16)
         # Require graph use in this request's new decode log lines, rather than
         # accepting a graph captured at startup but never replayed after a flip.
-        with self.log_paths[decode].open("rb") as log:
-            log.seek(offset)
-            messages = log.read().decode(errors="replace")
-        self.assertRegex(
-            messages,
-            re.compile(r"Decode batch.*(?:NPU|CUDA) graph: True", re.IGNORECASE),
+        graph_pattern = re.compile(
+            r"Decode batch.*(?:NPU|CUDA) graph: True", re.IGNORECASE
         )
+        deadline = time.monotonic() + 5
+        while True:
+            messages = self.logs[decode].getvalue()[offset:]
+            if graph_pattern.search(messages) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)  # Allow the log-forwarding thread to drain the pipe.
+        self.assertRegex(messages, graph_pattern)
         self.records.append(
             {"prefill": prefill, "input_length": length, "decode_response": output}
         )
@@ -327,8 +355,8 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
                     f"token mismatch after flip for input length {n}",
                 )
         # Only one decode capture per rank/worker, despite repeated flips.
-        for path in self.log_paths:
-            messages = path.read_text()
+        for log in self.logs:
+            messages = log.getvalue()
             self.assertEqual(
                 messages.count("Capture target decode NPU graph begin."), self.tp
             )
