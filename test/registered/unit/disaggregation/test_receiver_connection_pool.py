@@ -61,6 +61,7 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
     manager.customized_info_enabled = False
+    manager.local_shm_descriptor = None
     return manager
 
 
@@ -315,6 +316,8 @@ class TestReceiverControlMessages(CustomTestCase):
                         expected_frames.index(aux) + 1,
                         struct.pack("Q", 64) if enabled else b"",
                     )
+                if backend == "nixl":
+                    expected_frames.append(b"")
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
@@ -333,6 +336,18 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertEqual(info.dst_state_item_lens, [[32]])
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
+                    self.assertIsNone(info.local_shm)
+                    self.assertIsNone(registration_type.from_zmq(frames[:-1]).local_shm)
+                    descriptor = {"version": 1, "endpoint": "test-pool"}
+                    receiver.kv_mgr.local_shm_descriptor = descriptor
+                    registered = registration_type.from_zmq(
+                        receiver.kv_mgr.build_receiver_registration_message()[1:]
+                    )
+                    self.assertEqual(registered.local_shm, descriptor)
+                    self.assertEqual(
+                        registered.dst_aux_item_lens, info.dst_aux_item_lens
+                    )
+                    self.assertEqual(registered.dst_state_data_lens, [[512]])
 
     def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:

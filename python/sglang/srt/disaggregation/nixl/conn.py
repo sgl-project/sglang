@@ -43,6 +43,12 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.nixl.local_shm import (
+    LocalShmExport,
+    LocalShmMapping,
+    LocalShmTransfer,
+    same_host,
+)
 from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
@@ -373,6 +379,7 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_aux_item_lens: Optional[List[int]] = None
+    local_shm: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -421,6 +428,7 @@ class KVArgsRegisterInfo:
             agent_name=msg[3].decode("ascii"),
             agent_metadata=msg[4],
             dst_kv_ptrs=dst_kv_ptrs,
+            local_shm=json.loads(msg[25]) if len(msg) > 25 and msg[25] else None,
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             dst_aux_item_lens=(
@@ -632,6 +640,33 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
             )
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
+
+        self.local_shm_enabled = envs.SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM.get()
+        self.local_shm_descriptor = None
+        self.local_shm_mappings = {}
+        self.local_shm_errors = {}
+        if self.local_shm_enabled:
+            if not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get():
+                raise ValueError("Local SHM requires deferred decode KV release")
+            if (
+                self.pp_size != 1
+                or self.dcp_size != 1
+                or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            ):
+                raise ValueError("Local SHM requires PP1, DCP1 and no staging buffer")
+            pool = args.local_shm_pool
+            if disaggregation_mode == DisaggregationMode.DECODE:
+                from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+                if not isinstance(pool, MLATokenToKVPoolHost) or any(
+                    kind != "DRAM" for kind in args.kv_data_mem_kinds
+                ):
+                    raise ValueError(
+                        "Local SHM requires a HiSparse MLA host pool without draft KV"
+                    )
+                export = LocalShmExport(pool)
+                pool.register_host_resource_cleanup(export.close)
+                self.local_shm_descriptor = export.descriptor
 
         self.register_buffer_to_engine()
 
@@ -1094,6 +1129,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
+    def release_host_resources(self):
+        for peer_name, mapping in list(self.local_shm_mappings.items()):
+            try:
+                mapping.close()
+            except Exception:
+                # Never unmap a buffer whose writes or pinning are unresolved.
+                logger.exception("Retaining local SHM mapping for peer %s", peer_name)
+            else:
+                del self.local_shm_mappings[peer_name]
+
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
@@ -1123,7 +1168,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             any_failed = failure_seen
             try:
                 for handle in handles:
-                    state = self.agent.check_xfer_state(handle)
+                    state = (
+                        handle.poll()
+                        if isinstance(handle, LocalShmTransfer)
+                        else self.agent.check_xfer_state(handle)
+                    )
                     if state == "ERR":
                         any_failed = True
                     elif state != "DONE":
@@ -1712,6 +1761,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
                     )
                     decode_tp_size = dst_info.decode_tp_size
+                    error = self.local_shm_errors.get(req.agent_name)
+                    if error is not None:
+                        raise RuntimeError(error)
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -2069,6 +2121,33 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if decode_kv_args.requires_dcp_relayout:
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+        if self.local_shm_enabled and decode_kv_args.local_shm is not None:
+            try:
+                if same_host(decode_kv_args.local_shm):
+                    if (
+                        not (self.is_mla_backend or self.is_hybrid_mla_backend)
+                        or self.attn_tp_size != decode_kv_args.decode_tp_size
+                        or decode_kv_args.dst_dcp_size != 1
+                        or decode_kv_args.staging_base_ptr
+                        or decode_kv_args.dst_kv_mem_kinds
+                        != ["DRAM"] * len(self.kv_args.kv_data_ptrs)
+                        or decode_kv_args.dst_kv_item_lens != self.kv_args.kv_item_lens
+                        or decode_kv_args.local_shm["items"]
+                        != self.kv_args.kv_item_lens
+                        or decode_kv_args.dst_kv_layer_ids != self.kv_args.kv_layer_ids
+                    ):
+                        raise ValueError(
+                            "Local SHM requires matching flat MLA KV layouts and TP sizes"
+                        )
+                    self.local_shm_mappings[agent_name] = LocalShmMapping(
+                        decode_kv_args.local_shm, self.kv_args.gpu_id
+                    )
+                    logger.info("Local SHM D2H enabled for peer %s", agent_name)
+            except Exception as exc:
+                self.local_shm_errors[agent_name] = (
+                    f"Local SHM peer initialization failed: {exc}"
+                )
+                logger.error("%s", self.local_shm_errors[agent_name])
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2339,6 +2418,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_gpu_id: int,
         dst_mem_kind: str = "VRAM",
     ):
+        error = self.local_shm_errors.get(peer_name)
+        if error is not None:
+            raise RuntimeError(error)
+        mapping = self.local_shm_mappings.get(peer_name)
+        if mapping is not None:
+            return mapping.submit(
+                self.kv_args.kv_data_ptrs,
+                self.kv_args.kv_data_lens,
+                prefill_kv_indices,
+                dst_kv_indices,
+                # The worker publishes status through conclude_transfer only
+                # after both local DMA and NIXL state transfers have drained.
+                lambda: None,
+            )
         assert self.src_mem_kind is not None
         return self._send_kvcache_generic(
             peer_name=peer_name,
@@ -3328,6 +3421,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
+        ready_event = wait_event
+        if ready_event is None and self.local_shm_enabled:
+            ready_event = torch.cuda.Event()
+            ready_event.record()
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -3335,9 +3432,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 index_slice=index_slice,
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
+                wait_event=ready_event,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
             )
         )
         return None
@@ -3535,6 +3632,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
+            (
+                json.dumps(self.local_shm_descriptor).encode("ascii")
+                if self.local_shm_descriptor is not None
+                else b""
+            ),
         ]
 
     def build_receiver_metadata_message(
