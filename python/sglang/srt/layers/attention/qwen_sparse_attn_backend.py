@@ -1519,29 +1519,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
-    def _get_flydsl_partials(
-        self, capacity_rows, num_kv_heads, splits, group_size, head_dim, dtype, device
+    def _get_flydsl_workspace(
+        self, batch, num_kv_heads, splits, group_size, head_dim, dtype, device
     ):
-        """Split-KV partials for the FlyDSL paged decode, cached per shape.
+        """Cache mainline PA work metadata and partials for graph replay."""
+        from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan
 
-        Allocated at the captured maximum batch and sliced per call: the kernel
-        refuses to allocate mid-capture, and `num_partitions` is one of its
-        compile-time constants, so neither may vary once a graph is recorded.
-        """
-        key = (capacity_rows, num_kv_heads, splits, group_size, head_dim, dtype, device)
+        key = (batch, num_kv_heads, splits, group_size, head_dim, dtype, device)
         cached = self._flydsl_partials.get(key)
         if cached is None:
-            from aiter.ops.flydsl.pa_decode import flydsl_pa_decode_partials
-
-            cached = flydsl_pa_decode_partials(
-                capacity_rows,
+            num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+            max_parts = splits or num_cu
+            capacity = min(
+                batch * max_parts,
+                max(batch, (2 * num_cu + num_kv_heads - 1) // num_kv_heads),
+            )
+            plan = PADecodePlan(
+                torch.empty((capacity, 4), dtype=torch.int32, device=device),
+                torch.empty((batch, 2), dtype=torch.int32, device=device),
                 num_kv_heads,
-                splits,
-                1,  # query_length: every QSA row is its own length-one sequence
-                group_size,
-                head_dim,
-                dtype=dtype,
-                device=device,
+                max_parts,
+            )
+            shape = (num_kv_heads, capacity, group_size)
+            cached = (
+                plan,
+                torch.empty(shape, dtype=torch.float32, device=device),
+                torch.empty(shape, dtype=torch.float32, device=device),
+                torch.empty((*shape, head_dim), dtype=dtype, device=device),
             )
             self._flydsl_partials[key] = cached
         return cached
@@ -1565,10 +1569,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         this holds for speculative verify rows too, which arrive here one row per
         draft token.
         """
-        from aiter.ops.flydsl.pa_decode import (
-            flydsl_pa_decode,
-            flydsl_pa_decode_recommended_splits,
-        )
+        from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
         batch, topk = topk_indices.shape
         page = _TRTLLM_SPARSE_PAGE_SIZE
@@ -1632,36 +1633,29 @@ class QwenSparseAttnBackend(AttentionBackend):
             page,
             stride,
         )
-        # Pinned so a captured graph and its replays agree; 0 means "ask once".
-        splits = envs.SGLANG_AITER_QSA_PA_DECODE_SPLITS.get() or (
-            flydsl_pa_decode_recommended_splits(
-                max(capacity_rows, batch), num_kv_heads, page
-            )
+        splits = envs.SGLANG_AITER_QSA_PA_DECODE_SPLITS.get()
+        plan, pmax, psum, pout = self._get_flydsl_workspace(
+            batch, num_kv_heads, splits, group_size, head_dim, q.dtype, device
         )
-        pmax, psum, pout = self._get_flydsl_partials(
-            max(capacity_rows, batch),
-            num_kv_heads,
-            splits,
-            group_size,
-            head_dim,
-            q.dtype,
-            device,
-        )
+        # Refresh selected lengths on the current stream, including graph replay.
+        plan_pa_decode(valid_counts, num_kv_heads, plan=plan)
         output = torch.empty(
             (batch, q.shape[1], head_dim), dtype=q.dtype, device=device
         )
-        flydsl_pa_decode(
+        pa_decode(
             output,
             q.contiguous(),
             key_cache,
             value_cache,
-            block_tables,
             valid_counts,
+            block_tables,
             layer.scaling,
-            num_partitions=splits,
-            pmax=pmax[:batch],
-            psum=psum[:batch],
-            pout=pout[:batch],
+            1,  # Each sparse query row has independently selected KV.
+            work_plan=plan,
+            max_context_length=stride,
+            max_logits=pmax,
+            exp_sums=psum,
+            temporary_output=pout,
         )
         return output.reshape(q.shape[0], -1)
 

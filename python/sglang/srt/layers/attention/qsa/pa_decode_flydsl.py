@@ -68,13 +68,17 @@ def flydsl_qsa_pa_decode_supported(
     if not _aiter_pa_decode_available():
         return False
 
-    from aiter.ops.flydsl.pa_decode import flydsl_pa_decode_supported
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    # Probe with the cache shape the backend will actually build, not the pool's.
-    probe_key = k_buffer.new_empty(
-        (1, k_buffer.shape[1], head_dim // vec, page_size, vec)
+    return (
+        get_gfx_runtime() in ("gfx942", "gfx950")
+        and page_size in (16, 64, 128)
+        and 64 <= head_dim <= 1024
+        and head_dim % 64 == 0
+        and q.shape[2] == head_dim
+        and k_buffer.shape[1] > 0
+        and q.shape[1] % k_buffer.shape[1] == 0
     )
-    return flydsl_pa_decode_supported(q, probe_key, block_size=page_size)
 
 
 def paged_cache_views(
