@@ -147,6 +147,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         allocator.free_group_begin = lambda: None
         allocator.free_group_end = lambda: None
         config = SimpleNamespace(
+            algorithm="LowConfidence",
             block_size=4,
             mask_id=0,
             max_running_requests=2,
@@ -173,6 +174,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         scheduler.dllm_config = config
         scheduler.model_config = SimpleNamespace(context_len=64)
         scheduler.enable_overlap = True
+        scheduler.result_queue = []
         scheduler.spec_algorithm = None
         scheduler.req_to_token_pool = self.pool
         scheduler.token_to_kv_pool_allocator = allocator

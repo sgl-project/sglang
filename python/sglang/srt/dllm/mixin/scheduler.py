@@ -410,11 +410,30 @@ class SchedulerDllmMixin:
 
         return res
 
+    def _dllm_inflight_reqs(self: Scheduler) -> Set[Req]:
+        if not self.enable_overlap or self.dllm_config.algorithm != "LowConfidence":
+            return set()
+
+        return {req for batch, _ in self.result_queue for req in batch.reqs}
+
+    def _dllm_waiting_for_final_forward(
+        self: Scheduler, req: Req, inflight_reqs: Set[Req]
+    ) -> bool:
+        tokens = req.dllm_incomplete_ids
+        return (
+            bool(tokens)
+            and self.dllm_config.mask_id not in tokens
+            and req in inflight_reqs
+        )
+
     def process_dllm_staging_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
+        inflight_reqs = self._dllm_inflight_reqs()
         for req in reqs:
+            if self._dllm_waiting_for_final_forward(req, inflight_reqs):
+                continue
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res
