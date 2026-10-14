@@ -91,6 +91,7 @@ class OpenAIServingScore(OpenAIServingBase):
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
                 temperature=request.temperature,
                 return_token_logprobs=request.return_token_logprobs,
+                rid=request.rid,
             )
 
             # pooled_hidden_states is flat (pointwise / single-set setwise) or
