@@ -14,10 +14,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import (
-    dcp_dsa_owned_prefill,
-    is_graph_dsa_split_op_surface,
-)
+from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -106,7 +103,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch, use_dsa: bool = False) 
             use_dsa
             and (
                 forward_batch.forward_mode.is_draft_extend_v2()
-                or dcp_dsa_owned_prefill()
+                or forward_batch.dcp_owned_prefill
             )
         )
     )

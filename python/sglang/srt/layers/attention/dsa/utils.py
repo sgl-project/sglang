@@ -7,10 +7,7 @@ import triton
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -197,22 +194,6 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
         and not get_parallel().dcp_enabled
         and (not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots())
     )
-
-
-def _dsa_backend_flag(name: str) -> bool:
-    # TboAttnBackend wraps the real backend; the per-batch flags live inside.
-    backend = get_attn_backend()
-    return getattr(getattr(backend, "primary", backend), name, False)
-
-
-def dcp_dsa_owned_prefill() -> bool:
-    """This batch's DSA prefill attends owned top-k slots and LSE-merges."""
-    return _dsa_backend_flag("dcp_owned_prefill")
-
-
-def dcp_dsa_split_indexer() -> bool:
-    """This batch's gathered-KV DSA prefill splits indexer rows across ranks."""
-    return _dsa_backend_flag("dcp_split_indexer")
 
 
 def is_dsa_enable_prefill_cp():
