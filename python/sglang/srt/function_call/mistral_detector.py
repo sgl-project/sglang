@@ -130,8 +130,6 @@ class MistralDetector(BaseFormatDetector):
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
