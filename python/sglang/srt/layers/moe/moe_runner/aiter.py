@@ -313,6 +313,21 @@ class AiterRunnerCore(MoeRunnerCore):
         if activation is None:
             activation = _aiter_activation(self.config)
 
+        if (
+            _aiter_fused_moe_supports_output()
+            and not extra.get("no_combine")
+            and runner_input.num_local_tokens is None
+        ):
+            from sglang.srt.layers import zero_copy_context
+
+            dst = zero_copy_context.get_moe_output_spec(
+                (runner_input.hidden_states.shape[0], quant_info.w2_weight.shape[1]),
+                runner_input.output_dtype or runner_input.hidden_states.dtype,
+                runner_input.hidden_states.device,
+            )
+            if dst is not None:
+                extra["output"] = dst
+
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,

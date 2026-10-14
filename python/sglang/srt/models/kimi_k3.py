@@ -11,6 +11,7 @@ import os
 import re
 from array import array
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -19,6 +20,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.moe.moe_sorting_small import K3SortPlan, k3_sort_plan
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -92,6 +94,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -286,6 +289,26 @@ def _dense_mlp_parallel_group() -> str:
         if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled()
         else "tp"
     )
+
+
+def _rocm_up_ag_fits(num_tokens: int, hidden_size: int) -> bool:
+    if not _is_hip:
+        return False
+    if not 0 < num_tokens <= 128:
+        return False
+    group = get_parallel().tp_group
+    ca = group.ca_comm
+    return (
+        group.world_size > 1
+        and hidden_size % (group.world_size * 8) == 0
+        and ca is not None
+        and not getattr(ca, "disabled", True)
+        and hasattr(ca, "all_gather_lastdim_add")
+    )
+
+
+# fused SiTU + shared down GEMM + top-k beats situ + hipBLASLt + top-k up to this M (MI355X)
+_K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS = 64
 
 
 class KimiK3MLP(nn.Module):
@@ -520,6 +543,11 @@ class KimiK3MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        if _is_hip:
+            # Tuned AITER decode MoE configs for this model's expert shape.
+            from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
+
+            apply_k3_moe_decode_cfg()
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
@@ -748,14 +776,30 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
+        if _is_hip and not self._front_is_ep_pair:
+            from sglang.srt.layers import k3_rocm_dense_fp8
+
+            if k3_rocm_dense_fp8.front_enabled():
+                # One E4M3 copy of the merged front; the bf16 component weights
+                # become row views of it (the fused front is their only reader).
+                fp8 = k3_rocm_dense_fp8.StaticFP8Weight(self._front_w)
+                off = 0
+                for mod, rows in zip(mods, self._front_sizes):
+                    mod.weight.data = fp8.weight[off : off + rows]
+                    off += rows
+                self._front_w = fp8.weight
+                self._front_fp8 = fp8
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
             "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_rocm_epi_fuse_ok",
         ):
             self.__dict__.pop(prop, None)
+        if self._rocm_epi_fuse_ok:
+            self._fold_latent_norm_into_up_proj()
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1305,9 +1349,18 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            with zero_copy_context.set_moe_output(latent):
-                expert_output = self.experts(routed_input, topk_output)
+            mid = self._rocm_route_mid(router_logits, routed_input)
+            if mid is not None:
+                topk_output, mid_state = mid
+                with (
+                    k3_sort_plan(K3SortPlan(route_state=mid_state)),
+                    zero_copy_context.set_moe_output(latent),
+                ):
+                    expert_output = self.experts(routed_input, topk_output)
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
+                with zero_copy_context.set_moe_output(latent):
+                    expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
@@ -1364,21 +1417,37 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
+        if self._rocm_epi_fuse_ok and self._rocm_epi_fuse_fits(
+            hidden_states, prefix_sum
+        ):
+            return self._forward_fused_rocm_epi(hidden_states, prefix_sum=prefix_sum)
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(
+                hidden_states,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
-            # off an fp32 front the cast allocates the dense buffer, so the
-            # contiguous() behind it is free; off a bf16 front it is the copy
-            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
+                # ROCm aiter runner: the fused small-batch sort+quant reads the
+                # strided front slice directly and the patched fused_moe densifies
+                # it only when it falls back to aiter's own quant, so skip the copy.
+                pass
+            else:
+                # off an fp32 front the cast allocates the dense buffer, so the
+                # contiguous() behind it is free; off a bf16 front it is the copy
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1472,11 +1541,302 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if not fused_norm:
             latent = self._latent_norm(latent)
+        if (
+            _rocm_up_ag_fits(num_tokens, hidden_size)
+            and latent.is_contiguous()
+            and (prefix_sum is None or prefix_sum.is_contiguous())
+        ):
+            return self._rocm_up_proj_all_gather(latent, shared_output, prefix_sum)
         out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    @cached_property
+    def _rocm_epi_fuse_ok(self) -> bool:
+        """Static eligibility for _forward_fused_rocm_epi (k3_moe_epi kernels)."""
+        if not _is_hip:
+            return False
+        if not self._eligible_for_fused_front or self._front_fp32:
+            return False
+        shared = self.shared_experts
+        act = getattr(shared, "act_fn", None)
+        down_w = getattr(shared.down_proj, "weight", None)
+        up = self.routed_expert_up_proj
+        up_w = getattr(up, "weight", None)
+
+        def _plain_bf16(w):
+            return (
+                isinstance(w, torch.Tensor)
+                and w.dtype == torch.bfloat16
+                and w.dim() == 2
+                and w.is_contiguous()
+            )
+
+        if not (isinstance(act, SituAndMul) and _plain_bf16(down_w)):
+            return False
+        if not (
+            _plain_bf16(up_w) and isinstance(up.quant_method, UnquantizedLinearMethod)
+        ):
+            return False
+        if up_w.shape != (down_w.shape[0], self.moe_hidden_size):
+            return False
+        norm = self.routed_expert_norm
+        if norm is None or (
+            norm.weight.shape != (self.moe_hidden_size,)
+            or type(norm).forward is not RMSNorm.forward
+            or getattr(norm, "cast_x_before_out_mul", False)
+        ):
+            return False
+        if self._front_sizes[0] != 2 * down_w.shape[1]:
+            return False
+        # the kernel emits (weights, ids) itself
+        backend = get_moe_runner_backend()
+        return (
+            self._aiter_standard_topk_ok()
+            and self._front_sizes[1] < 0xFFFF
+            and not backend.is_triton_kernels()
+            and not backend.is_flashinfer_trtllm()
+            and not backend.is_flashinfer_mxfp4()
+        )
+
+    def _aiter_standard_topk_ok(self) -> bool:
+        """Routing the fused K3 top-k kernels reproduce: sigmoid + bias, one
+        group, scale 1, power-of-two top-k."""
+        cfg = self.topk.topk_config
+        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
+            return False
+        if cfg.scoring_func != "sigmoid" or cfg.correction_bias is None:
+            return False
+        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
+            return False
+        if cfg.num_shared_topk_slots != 0 or cfg.custom_routing_function is not None:
+            return False
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if cfg.routed_scaling_factor not in (None, 1.0):
+            return False
+        if cfg.top_k & (cfg.top_k - 1):
+            return False
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            or get_exec().deterministic.enable_deterministic_inference
+        ):
+            return False
+        return True
+
+    def _rocm_epi_fuse_fits(self, hidden_states, prefix_sum) -> bool:
+        n = hidden_states.shape[0]
+        return (
+            0 < n <= 256
+            and getattr(self, "_up_norm_folded", False)
+            and not k3_ar_fusion.enabled()
+            and (
+                prefix_sum is None
+                or (
+                    prefix_sum.is_contiguous()
+                    and prefix_sum.shape == hidden_states.shape
+                )
+            )
+        )
+
+    @cached_property
+    def _rocm_route_mid_ok(self) -> bool:
+        """Static eligibility for k3_route_sort_mid."""
+        return (
+            _is_hip
+            and get_moe_runner_backend().is_aiter()
+            and self.topk.topk_config.top_k <= 64
+            and self._aiter_standard_topk_ok()
+        )
+
+    def _rocm_route_mid(self, router_logits, routed_input):
+        """k3_route_sort_mid launch A (top-k + expert counts + mxfp8 quant);
+        returns (topk_output, state) for K3SortPlan(route_state=state), or None."""
+        if not self._rocm_route_mid_ok:
+            return None
+        from sglang.kernels.ops.moe import k3_route_sort_mid
+
+        cfg = self.topk.topk_config
+        m = router_logits.shape[0]
+        e = router_logits.shape[1]
+        if not (
+            m * cfg.top_k > 256
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.stride(1) == 1
+            and routed_input.dtype == torch.bfloat16
+            and routed_input.dim() == 2
+            and routed_input.stride(1) == 1
+            and k3_route_sort_mid.supported(m, cfg.top_k, e, 32, routed_input.shape[1])
+        ):
+            return None
+        topk_ids = torch.empty(
+            (m, cfg.top_k), dtype=torch.int32, device=router_logits.device
+        )
+        topk_weights = torch.empty(
+            (m, cfg.top_k), dtype=torch.float32, device=router_logits.device
+        )
+        st = k3_route_sort_mid.route_quant(
+            routed_input,
+            k3_route_sort_mid.counts_buffer(router_logits.device, self.layer_idx, e),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            logits=router_logits,
+            correction_bias=cfg.correction_bias,
+            renormalize=cfg.renormalize,
+            routed_scale=1.0,
+        )
+        return build_precomputed_topk_output(
+            topk_weights, topk_ids, cfg, self.layer_idx
+        ), st
+
+    def _forward_fused_rocm_epi(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """_forward_fused's single-collective tail with the shared GEMM and
+        top-k fused into the routing launches and a fused norm + add3 tail.
+        Equal up to bf16 rounding: w_up carries the norm weight (see
+        _fold_latent_norm_into_up_proj) and the tail applies the row rstd."""
+        from sglang.kernels.ops.moe import k3_moe_epi
+
+        num_tokens, hidden_size = hidden_states.shape
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(hidden_states)
+        else:
+            fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if self._moe_front_needs_dense_bf16 and not (
+            _aiter_k3_opt and routed_input.dtype == hidden_states.dtype
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        latent_numel = num_tokens * self.moe_hidden_size
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+
+        sort_plan = K3SortPlan()
+        if num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS:
+            cfg = self.topk.topk_config
+            topk_ids = torch.empty(
+                (num_tokens, cfg.top_k), dtype=torch.int32, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, cfg.top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            act = self.shared_experts.act_fn
+            w_down = self.shared_experts.down_proj.weight
+            # the shared down GEMM rides the small-sort launch (M * top_k <= 256)
+            if num_tokens * cfg.top_k <= 256 and w_down.is_contiguous():
+                shared_act = torch.empty(
+                    (num_tokens, w_down.shape[1]),
+                    dtype=w_down.dtype,
+                    device=hidden_states.device,
+                )
+                k3_moe_epi.situ_topk(
+                    gate_up,
+                    shared_act,
+                    act.beta,
+                    act.linear_beta,
+                    router_logits,
+                    cfg.correction_bias,
+                    topk_ids,
+                    topk_weights,
+                    renormalize=cfg.renormalize,
+                    routed_scale=1.0,
+                )
+                sort_plan.shared_gemm = (topk_ids, shared_act, w_down, shared_output)
+            else:
+                k3_moe_epi.shared_down_topk(
+                    gate_up,
+                    w_down,
+                    shared_output,
+                    act.beta,
+                    act.linear_beta,
+                    router_logits,
+                    cfg.correction_bias,
+                    topk_ids,
+                    topk_weights,
+                    renormalize=cfg.renormalize,
+                    routed_scale=1.0,
+                )
+            topk_output = build_precomputed_topk_output(
+                topk_weights, topk_ids, cfg, self.layer_idx
+            )
+        else:  # larger batches: the tuned hipBLASLt GEMM wins
+            self._forward_shared(gate_up, shared_output)
+            mid = self._rocm_route_mid(router_logits, routed_input)
+            if mid is not None:
+                topk_output, sort_plan.route_state = mid
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
+        # the plan runs an untaken shared GEMM on exit, before the all-reduce
+        with k3_sort_plan(sort_plan), zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+        buf = self._reduce_latent_and_shared(buf)
+
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if _rocm_up_ag_fits(num_tokens, hidden_size):
+            return self._rocm_up_proj_all_gather(
+                self._latent_norm(latent), shared_output, prefix_sum
+            )
+        up, _ = self.routed_expert_up_proj(latent)
+        return k3_moe_epi.norm_add3(
+            up, latent, self._up_norm_eps, shared_output, prefix_sum
+        )
+
+    @torch.no_grad()
+    def _fold_latent_norm_into_up_proj(self) -> None:
+        """w_up <- bf16(w_up * norm_w), norm_w <- 1, so the norm + add3 tail
+        can apply only the row rstd; unfused consumers see the unit norm."""
+        if getattr(self, "_up_norm_folded", False):
+            return
+        norm = self.routed_expert_norm
+        w = self.routed_expert_up_proj.weight
+        if norm is not None:
+            g = norm.weight.data.float()
+            for r in range(0, w.shape[0], 1024):
+                w.data[r : r + 1024] = (w.data[r : r + 1024].float() * g).to(w.dtype)
+            norm.weight.data.fill_(1.0)
+            self._up_norm_eps = norm.variance_epsilon
+        else:
+            self._up_norm_eps = None
+        self.__dict__.pop("_up_shard_w", None)
+        self._up_norm_folded = True
+
+    def _rocm_up_proj_all_gather(self, latent, shared_output, prefix_sum):
+        """Each rank computes its hidden/tp columns of the replicated up_proj;
+        one fused all-gather + add3 assembles bf16(bf16(up + shared) + prefix)."""
+        from aiter.tuned_gemm import tgemm
+
+        group = get_parallel().tp_group
+        ca = group.ca_comm
+        w = self.__dict__.get("_up_shard_w")
+        if w is None:
+            full = self.routed_expert_up_proj.weight  # [hidden, latent]
+            n = full.shape[0] // group.world_size
+            w = full[group.rank_in_group * n : (group.rank_in_group + 1) * n]
+            self.__dict__["_up_shard_w"] = w
+        y = tgemm.mm(latent, w, None, otype=latent.dtype)
+        if (
+            getattr(ca, "_IS_CAPTURING", False)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # graph warm-up: no collective (ranks may warm up unevenly)
+            out = torch.empty_like(shared_output)
+            return _add3(out.zero_(), shared_output, prefix_sum)
+        return ca.all_gather_lastdim_add(y, shared_output, prefix_sum)
 
     def forward(
         self,
@@ -1490,10 +1850,12 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        # opts the AITER runner into the K3 sort kernels
+        with k3_sort_plan() if _is_hip else nullcontext():
+            if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         return out.view(num_tokens, hidden_size)
 
 
