@@ -35,11 +35,11 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 
 Pick your hardware and recipe to generate the launch command:
 
-- **High-Throughput** — the standard FP8 recipe: H200 TP8 + EP8 or GB300 TP4 + EP4, with speculative decoding off.
+- **High-Throughput** — the standard FP8 recipe: H200 TP8 + EP8 or GB300 TP4 + EP4. Select **NEXTN** in the Playground for built-in MTP speculative decoding (verified, acceptance length ~2.4).
 - **HiCache + Mooncake** — H200 TP8 + EP8 with Mooncake L3 prefix storage over TCP. Start the services in §3.3 before launching this recipe.
 
 <Warning>
-NEXTN and DSpark are **checkpoint pending**. Keep speculative decoding off for the current checkpoint; see the verification table and §2 for details.
+DSpark is **checkpoint pending**: a Ling-3.1-flash compatible draft is not yet available. NEXTN is verified for the current checkpoint revision; see the verification table and §2.
 </Warning>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -83,9 +83,9 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
   </thead>
   <tbody>
     <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.19% (1282/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.27%; stop rate 99.92% (measured with NEXTN enabled; standard-decoding rerun pending the corrected MTP checkpoint). Mooncake/TCP prefetch verified on all ranks.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.27%; stop rate 99.92%. Mooncake/TCP prefetch verified on all TP ranks (measured with NEXTN; MTP is verified for the current checkpoint revision).</td></tr>
     <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.42% (1285/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>Current MTP head: acceptance length 1.00, acceptance rate 0.00 on H200 TP8 and GB300 TP4.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>NEXTN</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>Acceptance length 2.13 on real-text probes (2.61 on the random-token bench). Matched full GSM8K (identical sampling and seed): NEXTN 96.89% vs standard decoding 96.97%; stop rate 99.85% vs 99.77%. bs=1 output throughput: 251.2 tok/s with NEXTN vs 103.4 tok/s without accepted drafts (2.4×).</td></tr>
     <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated; unverified by SGLang</td><td style={{padding: "9px 12px"}}>Tuned configurations are available upstream; hardware was unavailable for independent verification.</td></tr>
@@ -97,7 +97,7 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
 - Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
 - Leave `--mem-fraction-static` at its default. The explicit `ling3` parser flags make the recipe clear; SGLang also selects these parsers automatically for this architecture.
-- **NEXTN:** keep `--speculative-algorithm NEXTN` unset until the corrected MTP checkpoint is available and revalidated. The current head adds overhead with zero accepted draft tokens; the same behavior was reproduced with the vendor build.
+- **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. It requires the current checkpoint revision, whose config excludes the BF16 `model.layers.72.eh_proj` from quantization; clients on an older download (acceptance length 1.00) should re-download. Measured acceptance length is 2.43.
 - **DSpark:** the [Ling-3.0-flash draft](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) targets a 2,560-wide, 42-layer model. Ling-3.1-flash uses width 4,096 and 72 layers, so that draft is incompatible. Wait for a 3.1-compatible draft.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 

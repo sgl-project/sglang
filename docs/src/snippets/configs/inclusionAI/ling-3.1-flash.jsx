@@ -40,9 +40,8 @@ export const config = {
         { id: "off", label: "Off" },
         {
           id: "nextn",
-          label: "NEXTN — checkpoint pending",
-          disable: true,
-          disableReason: "The current MTP head has acceptance length 1.00 and acceptance rate 0.00. Revalidate after the corrected checkpoint is available.",
+          label: "NEXTN (built-in MTP)",
+          flags: ["--speculative-algorithm NEXTN"],
         },
         {
           id: "dspark",
@@ -119,7 +118,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [
         "SGLANG_ENABLE_FP8_BLOCK_GEMV=1",
         "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1",

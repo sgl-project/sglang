@@ -11,7 +11,5 @@ export const benchmarks = [
   },
   {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
-    sglang_version: "dev-ling-3.1-flash",
-    accuracy: { gsm8k_pct: 97.27, stop_rate_pct: 99.92 },
   },
 ];
