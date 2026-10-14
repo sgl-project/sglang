@@ -4,7 +4,6 @@
 
 import math
 import re
-from copy import copy
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,10 +19,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.media_artifacts import MediaArtifactCacheMixin
-from sglang.srt.multimodal.media_artifacts.minimax_m3 import (
-    MiniMaxM3CachedImageProcessor,
-    MiniMaxM3ImageArtifact,
-)
+from sglang.srt.multimodal.media_artifacts.minimax_m3 import MiniMaxM3ImageArtifact
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -263,10 +259,11 @@ class MiniMaxM3VLProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
             image = image.convert("RGB")
         return image
 
-    def prepare_artifact_batch(self, entries):
+    def prepare_artifact_batch(self, entries, *, processor=None):
         if not entries:
             return []
-        result = self._processor.image_processor(
+        processor, _ = self._resolve_processor(processor)
+        result = processor.image_processor(
             images=[entry.media for entry in entries],
             **{**self.image_config, "return_tensors": "pt"},
         )
@@ -296,20 +293,32 @@ class MiniMaxM3VLProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
             )
         return artifacts
 
-    def compose_image_artifacts(self, input_text, artifacts):
-        # Keep HF's image start/end expansion and tokenizer settings authoritative.
-        # Copy the wrapper instead of modifying the shared processor across requests.
-        processor = copy(self._processor)
-        processor.image_processor = MiniMaxM3CachedImageProcessor(
-            self._processor.image_processor, artifacts
-        )
-        ret = self.process_mm_data(
-            input_text=input_text,
-            # Recent HF ProcessorMixin validates and flattens image inputs
-            # before calling the adapter. A valid tiny image keeps that layout
-            # path intact without retaining or reloading the source pixels.
-            images=[Image.new("RGB", (1, 1))] * len(artifacts),
-            processor=processor,
+    def compose_image_artifacts(self, input_text, artifacts, *, processor=None):
+        processor, tokenizer = self._resolve_processor(processor)
+        # Mirror HF MiniMaxM3VLProcessor.replace_image_token from cached grids,
+        # so cache hits never call the image processor.
+        merge_length = processor.image_processor.merge_size**2
+        parts = input_text.split(self.IMAGE_TOKEN)
+        if len(parts) != len(artifacts) + 1:
+            raise ValueError("Expected one MiniMax M3 image placeholder per artifact")
+        expanded = [parts[0]]
+        for artifact, part in zip(artifacts, parts[1:]):
+            num_tokens = math.prod(artifact.grid_thw) // merge_length
+            expanded.append(
+                self.IMAGE_START_TOKEN
+                + self.IMAGE_TOKEN * num_tokens
+                + self.IMAGE_END_TOKEN
+                + part
+            )
+        input_text = "".join(expanded)
+        # Same tokenizer call and BOS handling as process_mm_data.
+        tokenizer_kwargs = {}
+        if self._tokenizer_auto_adds_specials:
+            bos = getattr(tokenizer, "bos_token", None)
+            if bos and input_text.startswith(bos):
+                tokenizer_kwargs["add_special_tokens"] = False
+        ret = tokenizer(
+            [input_text], padding=True, return_tensors="pt", **tokenizer_kwargs
         )
         input_ids = ret["input_ids"].flatten()
         offsets = self.get_mm_items_offset(input_ids, self.IM_TOKEN_ID)
@@ -361,13 +370,12 @@ class MiniMaxM3VLProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
                 for item in image_data
             )
             and self.image_config.get("device", "cpu") == "cpu"
-            and len(self.mm_tokens.image_token_regex.findall(input_text))
-            == len(image_data)
+            # The legacy path leaves alias placeholders such as <image> as
+            # text, so only canonical prompts can take this path unchanged.
+            and self.mm_tokens.image_token_regex.findall(input_text)
+            == [self.IMAGE_TOKEN] * len(image_data)
             and not any(self._is_preprocessed_input(item) for item in image_data)
         ):
-            input_text = self.mm_tokens.image_token_regex.sub(
-                self.IMAGE_TOKEN, input_text
-            )
             artifacts = await self.prepare_media_artifacts(
                 image_data,
                 content_hashes=request_obj.mm_content_hashes,
