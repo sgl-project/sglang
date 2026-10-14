@@ -92,7 +92,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
-from sglang.srt.disaggregation.pp_ring_consensus import (
+from sglang.srt.disaggregation.pd_pp_consensus import (
     _DisaggDecodeRing,
     _DisaggPrefillRing,
 )

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.disaggregation.pp_ring_consensus import (
+from sglang.srt.disaggregation.pd_pp_consensus import (
     _DisaggDecodeRing,
     _DisaggPrefillRing,
 )
@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-PP_MODULE = "sglang.srt.disaggregation.pp_ring_consensus"
+PP_MODULE = "sglang.srt.disaggregation.pd_pp_consensus"
 
 
 class _Channel:

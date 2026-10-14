@@ -34,7 +34,7 @@ LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.
 RESULT_TIMESTAMPS = tuple(ts + 0.1 for ts in LAUNCH_TIMESTAMPS)
 PP_MODULE = "sglang.srt.managers.scheduler_components.pp_ring"
-PD_RING_MODULE = "sglang.srt.disaggregation.pp_ring_consensus"
+PD_RING_MODULE = "sglang.srt.disaggregation.pd_pp_consensus"
 
 
 def _decode_owner():
