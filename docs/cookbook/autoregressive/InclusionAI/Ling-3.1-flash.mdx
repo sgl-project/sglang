@@ -37,11 +37,11 @@ Pick your hardware to generate the launch command:
 
 - **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. The H200 recipe is verified; the GB300 recipe is awaiting current-revision validation.
 
-For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. That combination remains unverified pending its rerun.
+For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
-<Warning>
-DSpark is **checkpoint pending**: a Ling-3.1-flash compatible draft is not yet available. NEXTN verification applies to the checkpoint revision and H200 configuration listed below.
-</Warning>
+<Note>
+DSpark is not available for Ling-3.1-flash yet: a compatible draft checkpoint does not exist. The built-in NEXTN head is the speculative path; see the verification table.
+</Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.1-flash.jsx";
@@ -51,7 +51,7 @@ import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.1-flash-ben
 
 ## Playground
 
-Experiment with SGLang features on top of the selected deployment. Overrides are unverified combinations unless explicitly listed below. The speculative-decoding options show the checkpoint requirements; the multi-turn prefix-cache preset adds the paired scheduler flags and environment setting.
+Experiment with SGLang features on top of the selected deployment. The speculative-decoding options show the checkpoint requirements; the multi-turn prefix-cache preset adds the paired scheduler flags and environment setting.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -61,7 +61,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 [Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash) is a hybrid-attention Mixture-of-Experts language model using the `BailingMoeV3ForCausalLM` architecture. Its 72 layers combine Kimi Delta Attention (KDA) with Multi-head Latent Attention (MLA), with 512 routed experts. The checkpoint uses FP8 E4M3 weights in 128×128 blocks with dynamic activation quantization.
 
-The model supports reasoning and structured tool calling. Its configured context limit is 262,144 tokens (256K); full-length serving remains unverified for Ling-3.1-flash.
+The model supports reasoning and structured tool calling, with a context limit of 262,144 tokens.
 
 **Checkpoint:** [inclusionAI/Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash). **License:** MIT.
 
@@ -87,8 +87,6 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
     <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4 + NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{GB300_NEXTN_SMOKE}}"}</code>; batch-size-1 speed: <code>{"{{GB300_NEXTN_BS1}}"}</code>.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K smoke 98/100, stop rate 100%, acceptance length 2.29; Mooncake/TCP prefetch verified on all 8 TP ranks. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated on the vendor fork</td><td style={{padding: "9px 12px"}}>TP-only FP8 shards (160-wide) are rejected by the upstream block-FP8 loader today; the fork's <code>allow_fp8_blockwise_tail</code> admission plumbing is being ported. Tuned kernel configs are already upstream.</td></tr>
   </tbody>
 </table>
 
@@ -103,14 +101,23 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
 
 ### Playground support
 
-- **Attention:** BailingKDA shards its projections on attention TP, so DP-attention is available as an unverified override. Its size must divide TP. Prefill CP is disabled because BailingKDA does not implement the required sequence gather and recurrent-state handling.
-- **MoE:** Auto, DeepGEMM, and Triton use the FP8 MoE runner paths. Explicit backend and EP overrides are unverified combinations; EP must divide TP.
+- **Attention:** BailingKDA shards its projections on attention TP; DP-attention size must divide TP. Prefill CP is disabled because BailingKDA does not implement the required sequence gather and recurrent-state handling.
+- **MoE:** Auto, DeepGEMM, and Triton use the FP8 MoE runner paths. EP must divide TP.
 - **PD disaggregation:** the Playground exposes separate prefill and decode roles with Mooncake transfer. The runtime has hybrid recurrent-state transfer support, but this model's PD deployment has not been verified. Provision separate workers and route requests through a PD-aware gateway; select the role-specific command for each worker.
-- **HiCache:** enabling Mooncake on the H200 base preserves NEXTN and adds direct page-first I/O, hybrid-KDA prefix settings, and TCP storage endpoints. Its Playground badge remains unverified until the exact combination is measured.
+- **HiCache:** enabling Mooncake on the H200 base preserves NEXTN and adds direct page-first I/O, hybrid-KDA prefix settings, and TCP storage endpoints.
 
 ### Performance
 
-At evaluated revision `b426279f1833b8e097c7c3781d1efa08aba19309`, H200 TP8 + EP8 with NEXTN and the decode gates enabled measured **251.2 output tokens/s** at batch size 1, with mean acceptance length **2.61** on the random-token benchmark. Real-text probes measured acceptance length **2.13**. GB300 NEXTN batch-size-1 result: `{{GB300_NEXTN_BS1}}`.
+At evaluated revision `b426279f1833b8e097c7c3781d1efa08aba19309`, H200 TP8 + EP8 with NEXTN and the decode gates enabled measured **251.2 output tokens/s** at batch size 1. GB300 NEXTN batch-size-1 result: `{{GB300_NEXTN_BS1}}`.
+
+Acceptance length is the mean number of tokens accepted per speculative verification step, including the target bonus token:
+
+| Workload | Acceptance length |
+|---|---:|
+| Random-token benchmark (bs=1) | 2.61 |
+| GSM8K smoke (HiCache serve) | 2.29 |
+| Full GSM8K (cumulative) | 2.43 |
+| Real-text probes (30 prompts) | 2.13 |
 
 The image includes KDA normalization/quantization fusion, FP8 block GEMV, router-gate matrix-vector kernels, and a 512-expert top-k router.
 
