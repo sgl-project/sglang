@@ -9,7 +9,7 @@ import requests
 
 # Import by path: the sglang package root pulls in the LLM serving stack.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from harness import PKG, FakeResponse, load_plugin  # noqa: E402
+from harness import OUTPUT_VIDEO, PKG, FakeResponse, load_plugin  # noqa: E402
 
 SERVER_API, UTILS, NODES = load_plugin()
 
@@ -31,7 +31,7 @@ def _video_run(job_extra=None, **node_kwargs):
         return FakeResponse({"id": "job-1"})
 
     def fake_get(url, headers=None, timeout=None):
-        job = {"id": "job-1", "status": "completed", "file_path": "/tmp/out.mp4"}
+        job = {"id": "job-1", "status": "completed", "file_path": OUTPUT_VIDEO}
         job.update(job_extra or {})
         return FakeResponse(job)
 

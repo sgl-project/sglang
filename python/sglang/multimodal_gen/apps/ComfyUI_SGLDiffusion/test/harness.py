@@ -7,6 +7,7 @@ the real node through the real ``SGLDiffusionServerAPI`` and mock only HTTP.
 
 import functools
 import importlib.util
+import os
 import sys
 import tempfile
 import types
@@ -25,6 +26,11 @@ PKG = "sgld_comfy_harness"
 
 TEMP_DIR = tempfile.mkdtemp(prefix="sgld_comfy_test_")
 
+# A completed job's file_path must exist locally, or the client fetches the
+# result over HTTP as it would from a remote server.
+OUTPUT_VIDEO = os.path.join(TEMP_DIR, "out.mp4")
+open(OUTPUT_VIDEO, "wb").close()
+
 
 def _stubs() -> dict:
     folder_paths = types.ModuleType("folder_paths")
@@ -33,6 +39,18 @@ def _stubs() -> dict:
     folder_paths.get_filename_list = lambda folder: []
     folder_paths.get_full_path = lambda folder, name: f"/{folder}/{name}"
 
+    comfy = types.ModuleType("comfy")
+    comfy_utils = types.ModuleType("comfy.utils")
+    comfy_utils.ProgressBar = lambda total: types.SimpleNamespace(
+        update_absolute=lambda value, total=None, preview=None: None
+    )
+    comfy_mm = types.ModuleType("comfy.model_management")
+    comfy_mm.InterruptProcessingException = type(
+        "InterruptProcessingException", (Exception,), {}
+    )
+    comfy_mm.throw_exception_if_processing_interrupted = lambda: None
+    comfy.utils, comfy.model_management = comfy_utils, comfy_mm
+
     comfy_api = types.ModuleType("comfy_api")
     comfy_api_input = types.ModuleType("comfy_api.input")
     comfy_api_input.VideoInput = type("VideoInput", (), {})
@@ -40,6 +58,9 @@ def _stubs() -> dict:
 
     return {
         "folder_paths": folder_paths,
+        "comfy": comfy,
+        "comfy.utils": comfy_utils,
+        "comfy.model_management": comfy_mm,
         "comfy_api": comfy_api,
         "comfy_api.input": comfy_api_input,
     }

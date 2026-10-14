@@ -8,7 +8,7 @@ from unittest import mock
 
 # Import by path: the sglang package root pulls in the LLM serving stack.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from harness import PKG, FakeResponse, load_plugin  # noqa: E402
+from harness import OUTPUT_VIDEO, PKG, FakeResponse, load_plugin  # noqa: E402
 
 SERVER_API, UTILS, NODES = load_plugin()
 
@@ -54,7 +54,7 @@ def test_image_request_is_logged(caplog):
 def test_video_request_is_logged(caplog):
     def fake_get(url, headers=None, timeout=None):
         return FakeResponse(
-            {"id": "job-1", "status": "completed", "file_path": "/tmp/out.mp4"}
+            {"id": "job-1", "status": "completed", "file_path": OUTPUT_VIDEO}
         )
 
     with (
