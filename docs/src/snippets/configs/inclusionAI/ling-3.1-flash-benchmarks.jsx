@@ -13,6 +13,12 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-    notes: "GSM8K smoke 97/100, stop rate 100%, acceptance length 2.40; 180.0 tok/s (TPOT 5.14 ms, accept 2.59)",
+    sglang_version: "dev-ling-3.1-flash",
+    speed: [
+      { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1 },
+        ttft_ms: 256.95, tpot_ms: 5.14, tokens_per_sec_per_gpu: 224.9 },
+    ],
+    accuracy: { gsm8k_pct: 97.42, stop_rate_pct: 99.92 },
+    notes: "NEXTN; acceptance length 2.59 (bench) / 2.40 (GSM8K smoke 97/100). Accuracy from the full 1319-question run; weights are byte-identical across revisions.",
   },
 ];
