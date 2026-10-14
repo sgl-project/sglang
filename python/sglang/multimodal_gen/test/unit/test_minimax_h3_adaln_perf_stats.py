@@ -359,11 +359,20 @@ class TestAdalnPerfStats(CustomTestCase):
             attention_backend="torch_sdpa",
             component_attention_backends={},
         )
-        with patch.object(
-            MiniMaxH3DenoisingStage,
-            "current_use_nvtx",
-            new_callable=PropertyMock,
-            return_value=False,
+        with (
+            patch.object(
+                MiniMaxH3DenoisingStage,
+                "current_use_nvtx",
+                new_callable=PropertyMock,
+                return_value=False,
+            ),
+            # The cache, oracle weights and fake DiT outputs live on the CPU;
+            # keep the loop there too when the host has an accelerator.
+            patch(
+                f"{MiniMaxH3DenoisingStage.__module__}.current_platform"
+                ".get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
         ):
             stage._run_full_loop(batch, server_args)
         self.assertEqual(batch.latents.ndim, 5)
