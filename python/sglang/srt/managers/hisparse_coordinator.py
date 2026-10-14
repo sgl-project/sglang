@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.kvcache.hisparse import HiSparseSpecState
@@ -657,6 +657,13 @@ class HiSparseCoordinator:
                     page_size=self.mem_pool_device.page_size,
                     layout="layer_first",
                     override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                    allocator_type=(
+                        "shm"
+                        if envs.SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM.get()
+                        and get_disagg().disaggregation_mode == "decode"
+                        and get_disagg().disaggregation_transfer_backend == "nixl"
+                        else "default"
+                    ),
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size

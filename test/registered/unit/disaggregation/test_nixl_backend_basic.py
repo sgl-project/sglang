@@ -1,5 +1,6 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import json
 import struct
 import sys
 import threading
@@ -391,6 +392,19 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertEqual(info.staging_base_ptr, staging_ptr)
         self.assertEqual(info.staging_total_size, 1048576)
+        self.assertIsNone(info.local_shm)
+        self.assertIsNone(KVArgsRegisterInfo.from_zmq(msg + [b""]).local_shm)
+        descriptor = {"version": 1, "endpoint": "test-pool", "items": [1024, 2048]}
+        registered = KVArgsRegisterInfo.from_zmq(
+            msg
+            + [
+                pack_int_lists([[4096], [8192, 8192]], "Q"),
+                json.dumps(descriptor).encode("ascii"),
+            ]
+        )
+        self.assertEqual(registered.local_shm, descriptor)
+        self.assertEqual(registered.dst_state_data_lens, [[4096], [8192, 8192]])
+        self.assertEqual(registered.dst_kv_ptrs, kv_ptrs)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -410,6 +424,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
 
         info = KVArgsRegisterInfo.from_zmq(msg)
 
+        self.assertIsNone(info.local_shm)
         self.assertEqual(info.dst_state_data_ptrs, [])
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
@@ -683,6 +698,9 @@ class TestNixlUpdateStatus(CustomTestCase):
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
+        mgr.local_shm_enabled = False
+        mgr.local_shm_errors = {}
+        mgr.local_shm_mappings = {}
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -1547,6 +1565,9 @@ class ReloadFakeAgent:
 class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
+        mgr.local_shm_enabled = False
+        mgr.local_shm_errors = {}
+        mgr.local_shm_mappings = {}
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False

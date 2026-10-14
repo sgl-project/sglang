@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, TypeGuard
+from typing import Callable, Optional, TypeGuard
 
 import torch
 
@@ -160,6 +160,7 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    _host_resource_cleanup: Optional[list[Callable[[], None]]] = None
     dcp_size = 1
     dcp_rank = 0
     shared_allocation_domain = None
@@ -270,6 +271,12 @@ class HostKVCache(abc.ABC):
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
 
+    def register_host_resource_cleanup(self, cleanup: Callable[[], None]) -> None:
+        """Close users of the host allocation before unregistering its memory."""
+        if self._host_resource_cleanup is None:
+            self._host_resource_cleanup = []
+        self._host_resource_cleanup.append(cleanup)
+
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
 
@@ -281,6 +288,9 @@ class HostKVCache(abc.ABC):
         if getattr(self, "_destroyed", False):
             return
         self._destroyed = True
+        for cleanup in self._host_resource_cleanup or ():
+            cleanup()
+        self._host_resource_cleanup = None
         buffers = getattr(self, "kv_buffer", None)
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
             if not isinstance(buffers, (list, tuple)):
