@@ -1075,6 +1075,15 @@ def _cmp_aligned_roles(cmp_reqs, c4pos_rows, idxin_rows):
             return ("largest-ntok", miss, hit,
                     f"no [C4POS]/[IDXIN]; MISS=ALL largest-ntok prefill "
                     f"(ntok={mx}) {miss}")
+        # `ntok` cannot separate the requests (all equal, or missing/unparsed):
+        # fall back to the harness convention -- N full-prefill MISS then ONE
+        # suffix HIT => the LAST request is the HIT, earlier ones are MISS.
+        n = len(cmp_reqs)
+        miss, hit = list(range(n - 1)), [n - 1]
+        if miss and hit:
+            return ("harness-last-hit", miss, hit,
+                    "ntok cannot separate requests; harness convention: "
+                    f"LAST=HIT(req{hit[0]}), earlier=MISS")
     return "none", [], [], "no usable MISS/HIT split"
 
 
@@ -3480,6 +3489,14 @@ def main(path):
         # marked only ONE MISS and labeled the other N-1 MISS as HIT.
         miss_set = {i for i, n in enumerate(_ntoks) if n == _mx}
         hit_set = {i for i in range(len(cmp_reqs))} - miss_set
+        _note = f"ALL largest prefill ntok={_mx}"
+        if not hit_set:
+            # ntok identical across ALL requests (or missing) -> harness
+            # convention: the LAST request is the suffix HIT, earlier are MISS.
+            miss_set = set(range(len(cmp_reqs) - 1))
+            hit_set = {len(cmp_reqs) - 1}
+            _note = ("ntok cannot separate requests -> harness convention "
+                     "(LAST=HIT)")
         print("\n== requests (classified by [CMPIDX] prefill ntok) ==")
         for i, rq in enumerate(cmp_reqs[:MAX_REQ_SHOWN]):
             role = "MISS" if i in miss_set else "HIT "
@@ -3487,8 +3504,7 @@ def main(path):
                   f"  steps={len(rq['steps'])}")
         if len(cmp_reqs) > MAX_REQ_SHOWN:
             print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
-        print(f"\nMISS = req{sorted(miss_set)} (ALL largest prefill ntok={_mx}); "
-              f"each HIT compared to them.")
+        print(f"\nMISS = req{sorted(miss_set)} ({_note}); each HIT compared to them.")
         miss_i = min(miss_set) if miss_set else 0
     else:
         # No [CMPIDX]: ntok is unavailable, so use the harness convention --
