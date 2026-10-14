@@ -35,6 +35,7 @@ from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -997,12 +998,12 @@ class TestDecodeAdmission(unittest.TestCase):
         owner.commit_prefill_handoff = MagicMock()
         kept.finished.return_value = False
         finished.finished.return_value = True
-        scheduler.get_decode_step = MagicMock(return_value=None)
+        scheduler.step_planner = MagicMock(spec=StepPlanner)
+        scheduler.step_planner.get_decode_step.return_value = None
         scheduler.dp_attn_adapter = MagicMock()
         scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
             lambda step, need_sync=None: step
         )
-        scheduler._arm_prefill_decode_interval = MagicMock()
         scheduler.enable_fpm = False
         scheduler.scripted_scheduler_hook = None
         scheduler.ngram_embedding_manager = MagicMock()

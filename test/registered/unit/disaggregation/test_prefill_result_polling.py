@@ -56,6 +56,7 @@ from sglang.test.disagg_owner_shells import result_processor_shell
 from sglang.test.scheduler_request_lists import (
     assert_one_list_per_request,
     request_registry_of,
+    step_planner_of,
 )
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -308,7 +309,6 @@ class _Scheduler:
             maybe_prepare_mlp_sync_batch=lambda batch, need_sync=None: batch,
             maybe_set_extend_view=lambda batch: None,
         )
-        self._arm_prefill_decode_interval = Mock()
         self.mode_owners.disagg_prefill = _Owner(self)
 
     def apply_config(self):
@@ -328,6 +328,16 @@ class _Scheduler:
     def request_registry(self):
         # Over the collaborators as the tests last replaced them.
         return request_registry_of(self)
+
+    @property
+    def step_planner(self):
+        # The real pause retraction over the same collaborators; admission is
+        # this fake's own.
+        return step_planner_of(
+            self,
+            get_new_batch_prefill=self.get_new_batch_prefill,
+            arm_prefill_decode_interval=lambda step: None,
+        )
 
     def ingest_requests(self, stop_at_pause=False):
         assert_one_list_per_request(self)

@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.bundles import Streams
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 from sglang.srt.runtime_context import get_context
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 
@@ -60,7 +61,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.mode_owners.hisparse_coordinator = None
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
-        s._arm_prefill_decode_interval = Mock()
+        s.step_planner = Mock(spec=StepPlanner)
         s.enable_fpm = False
         self.running_batch = SimpleNamespace(
             batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
@@ -107,8 +108,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler
-        s.get_new_batch_prefill = self.calls.admit
-        s.get_new_batch_prefill.return_value = None
+        s.step_planner.get_new_batch_prefill = self.calls.admit
+        s.step_planner.get_new_batch_prefill.return_value = None
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.return_value = None
         slot = ScheduleSlot()
@@ -131,11 +132,11 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.mode_owners.disagg_prefill = None
         s.lists.chunked_req = None
         s.require_mlp_sync = False
-        s._should_defer_prefill = self.calls.defer
-        s._should_defer_prefill.return_value = True
-        s.get_new_batch_prefill = Mock()
-        s.get_decode_step = Mock(return_value=None)
-        s._arm_prefill_decode_interval = Mock()
+        s.step_planner.should_defer_prefill = self.calls.defer
+        s.step_planner.should_defer_prefill.return_value = True
+        s.step_planner.get_new_batch_prefill = Mock()
+        s.step_planner.get_decode_step = Mock(return_value=None)
+        s.step_planner.arm_prefill_decode_interval = Mock()
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.return_value = None
 
@@ -143,7 +144,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         step = s.get_next_batch_to_run(ScheduleSlot())
 
         self.assertIsNone(step)
-        s.get_new_batch_prefill.assert_not_called()
+        s.step_planner.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
             self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
         )
@@ -177,9 +178,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 return_value=Mock(is_first_rank=True, is_last_rank=True),
             ),
         )
-        s.get_new_batch_prefill = self.calls.admit
+        s.step_planner.get_new_batch_prefill = self.calls.admit
         # Stop the infinite loop at admission; no PP transport or GPU is needed.
-        s.get_new_batch_prefill.side_effect = StopIteration
+        s.step_planner.get_new_batch_prefill.side_effect = StopIteration
 
         s.init_mode_stages()
         with self.assertRaises(StopIteration):

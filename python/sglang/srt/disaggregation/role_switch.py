@@ -122,6 +122,10 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
+            # The step planner outlives the switch; it reads the new decode
+            # owner and registry.
+            scheduler.step_planner.disagg_decode = scheduler.disagg_decode
+            scheduler.step_planner.request_registry = scheduler.request_registry
             scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
             scheduler.init_step_launcher()
@@ -251,7 +255,7 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     their KV-pool slots *locked* even while idle. Carried across a role switch
     that means (a) the new role would match against stale prefixes whose KV no
     longer means what it did (corruption) and (b) those locked slots would leak
-    on every flip. Reset mirrors ``Scheduler.flush_cache``'s cache-release block
+    on every flip. Reset mirrors ``StepPlanner.flush_cache``'s cache-release block
     (the instance is already fully idle, checked before teardown) and, for
     hicache, best-effort clears the storage backend so it is released completely.
     """

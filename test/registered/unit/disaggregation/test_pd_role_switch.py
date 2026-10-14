@@ -56,6 +56,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_step_launcher = MagicMock()
         s.mode_owners.disagg_prefill = None
         s.mode_owners.disagg_decode = None
+        s.step_planner = SimpleNamespace(disagg_decode="stale", request_registry=None)
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
@@ -178,6 +179,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # The new owner's stages and launcher replace the old one's.
         s.init_mode_stages.assert_called_once()
         s.init_step_launcher.assert_called_once()
+        # The step planner outlives the switch and reads the new owner.
+        self.assertIs(s.step_planner.disagg_decode, s.disagg_decode)
+        self.assertIs(s.step_planner.request_registry, s.request_registry)
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()

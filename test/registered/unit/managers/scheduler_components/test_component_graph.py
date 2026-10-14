@@ -146,36 +146,30 @@ _DECLARED = {
         "PendingSteps",
         "DecodeOffloadManager",
     ],
-    "DecodeSelector": [
+    # Prefill admission, decode selection and retraction, and the retract/reset
+    # half of pause and flush.
+    "StepPlanner": [
         "CoreLists",
         "PendingSteps",
         "EngineFlags",
-        "KvResources",
-        "NewTokenRatioTracker",
-        "MetricsSink",
-        "IpcChannels",
-        "BeamCoordinator",
-        "RequestEnqueuer",
-        "ModeOwners",
-        "HiSparse",
         "LaunchCounters",
-    ],
-    "PrefillAdmission": [
-        "CoreLists",
-        "PendingSteps",
         "KvResources",
         "KvCapacity",
         "SchedulePolicy",
         "NewTokenRatioTracker",
-        "LaunchCounters",
         "PoolStatsObserver",
         "LoraAdmission",
         "StoragePrefetcher",
         "RequestEnqueuer",
+        "RequestRegistry",
         "BeamCoordinator",
-        "DecodeSelector",
         "StepBuilder",
         "HiSparse",
+        "GrammarManager",
+        "MetricsSink",
+        "IpcChannels",
+        "DecodeOffloadManager",
+        "ModeOwners",
         "Workers",
     ],
     "StepLauncher": [
@@ -207,18 +201,6 @@ _DECLARED = {
         "KvResources",
         "KvCapacity",
         "IpcChannels",
-        "Workers",
-    ],
-    "GenerationControl": [
-        "RequestRegistry",
-        "RequestEnqueuer",
-        "CoreLists",
-        "LaunchCounters",
-        "ModeOwners",
-        "KvResources",
-        "HiSparse",
-        "GrammarManager",
-        "MetricsSink",
         "Workers",
     ],
     "MetricsReporter": [
@@ -254,7 +236,7 @@ _DECLARED = {
         "KvCapacity",
     ],
     "WeightUpdater": [
-        "GenerationControl",
+        "StepPlanner",
         "RequestRegistry",
         "EngineFlags",
         "ModeOwners",
@@ -262,7 +244,7 @@ _DECLARED = {
         "MetricsSink",
     ],
     "RequestReceiver": ["IpcChannels", "MMReceiver", "OutputStreamer", "StageMetrics"],
-    "FlushWrapper": ["GenerationControl", "RequestRegistry", "IpcChannels"],
+    "FlushWrapper": ["StepPlanner", "RequestRegistry", "IpcChannels"],
     "PPRing": [
         "PendingSteps",
         "StepLauncher",
@@ -316,6 +298,7 @@ _PARAM = {
     "ProfilerManager": ("profiler_manager",),
     "PPSpecForward": ("pp_spec_forward",),
     "LoraAdmission": ("lora_admission",),
+    "StepPlanner": ("step_planner",),
 }
 
 # Components in their final form: node -> (module under srt/, class).
@@ -437,6 +420,14 @@ _CALLBACK_SITES = {
         _SELF,
     ): 1,
     # To be removed.
+    # Until the request enqueuer and the storage prefetcher leave the scheduler.
+    ("init_step_planner", "StepPlanner", "add_request_to_queue", _BOUND): 1,
+    (
+        "init_step_planner",
+        "StepPlanner",
+        "prefetch_after_device_hit_loss",
+        _BOUND,
+    ): 1,
     ("init_weight_updater", "SchedulerWeightUpdaterManager", "flush_cache", _BOUND): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (

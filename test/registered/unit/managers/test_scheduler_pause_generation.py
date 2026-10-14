@@ -9,7 +9,7 @@ import torch
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
-from sglang.test.scheduler_request_lists import request_registry_of
+from sglang.test.scheduler_request_lists import request_registry_of, step_planner_of
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -59,6 +59,11 @@ class _Scheduler(Scheduler):
     def request_registry(self):
         # Over the lists and owners as each test last set them.
         return request_registry_of(self)
+
+    @property
+    def step_planner(self):
+        # Over the scheduler's fields as each test last set them.
+        return step_planner_of(self)
 
 
 def _all_reduce_with_peer(ops, peer_queue_sizes, peer_pending):
@@ -275,7 +280,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         scheduler.ipc_channels = MagicMock()
         scheduler.beam_coordinator = MagicMock()
-        scheduler.get_decode_step(scheduler.flat_slot)
+        scheduler.step_planner.get_decode_step(scheduler.flat_slot)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
@@ -501,7 +506,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         chunked_req.finished.return_value = False
         scheduler.lists.chunked_req = chunked_req
 
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+        with patch(
+            "sglang.srt.managers.scheduler_components.step_planner.retract_all"
+        ) as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         mock_retract_all.assert_not_called()
@@ -553,7 +560,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         scheduler.lists.decoding = [req]
 
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+        with patch(
+            "sglang.srt.managers.scheduler_components.step_planner.retract_all"
+        ) as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         scheduler._add_request_to_queue.assert_not_called()
@@ -591,7 +600,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.lists.decoding = [running]
         scheduler.disagg_decode.ready = [staged]
 
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+        with patch(
+            "sglang.srt.managers.scheduler_components.step_planner.retract_all"
+        ) as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])

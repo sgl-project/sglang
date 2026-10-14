@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -80,10 +81,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.spec_algorithm = MagicMock()
     s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
     s.lists.decoding = []
-    s.prefill_decode_interval = 0
-    s._prefill_decode_interval_remaining = 0
-    s.get_new_batch_prefill = MagicMock(return_value=None)
-    s.get_decode_step = MagicMock(return_value=None)
+    s.step_planner = MagicMock(spec=StepPlanner)
+    s.step_planner.should_defer_prefill.return_value = False
+    s.step_planner.get_new_batch_prefill.return_value = None
+    s.step_planner.get_decode_step.return_value = None
     s.dp_attn_adapter = MagicMock()
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch

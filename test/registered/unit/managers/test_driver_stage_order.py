@@ -219,7 +219,6 @@ class _Shell:
         s.is_generation = True
         s.tp_size = 2
         s.spec_algorithm = SpeculativeAlgorithm.NONE
-        s._prefill_decode_interval_remaining = 0
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.scripted_scheduler_hook = _Hook(self)
         s.mode_owners.dllm = None
@@ -240,13 +239,16 @@ class _Shell:
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
         s._process_hicache_events = self.hicache_events
-        s.get_new_batch_prefill = lambda *slot: self.schedule_leaf("prefill")
-        s.get_decode_step = lambda *slot: self.schedule_leaf("decode")
+        s.step_planner = SimpleNamespace(
+            should_defer_prefill=lambda: False,
+            get_new_batch_prefill=lambda *slot: self.schedule_leaf("prefill"),
+            get_decode_step=lambda *slot: self.schedule_leaf("decode"),
+            arm_prefill_decode_interval=lambda step: self.log("arm_interval"),
+        )
         s.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=self.mlp_sync,
             maybe_set_extend_view=lambda step: self.log("extend_view"),
         )
-        s._arm_prefill_decode_interval = lambda step: self.log("arm_interval")
         s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=self.ngram)
         s.step_launcher = SimpleNamespace(
             run_batch=self.run_batch, launch_batch_sample_if_needed=self.sample

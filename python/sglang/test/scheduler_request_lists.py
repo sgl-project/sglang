@@ -1,4 +1,5 @@
-"""Checks on the scheduler's request lists, for tests."""
+"""Checks on the scheduler's request lists, and its registry and step planner
+over a partial scheduler, for tests."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_registry import (
     RequestRegistry,
 )
+from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -63,6 +65,46 @@ def request_registry_of(scheduler: Scheduler, **deps) -> RequestRegistry:
         args["kv"] = SimpleNamespace(tree_cache=scheduler.tree_cache)
     args.update(deps)
     return make_request_registry(**args)
+
+
+# The step planner's fields a partial scheduler may carry, by the scheduler's
+# name for each.
+_PLANNER_FIELDS = {
+    "core_lists": "lists",
+    "add_request_to_queue": "_add_request_to_queue",
+    **{
+        name: name
+        for name in (
+            "pending",
+            "flags",
+            "counters",
+            "req_to_token_pool",
+            "token_to_kv_pool_allocator",
+            "tree_cache",
+            "new_token_ratio_tracker",
+            "beam_coordinator",
+            "step_builder",
+            "hisparse_coordinator",
+            "metrics_sink",
+            "ipc_channels",
+            "decode_offload_manager",
+            "disagg_decode",
+            "spec_algorithm",
+        )
+    },
+}
+
+
+def step_planner_of(scheduler: Scheduler, **fields) -> StepPlanner:
+    """A step planner over the fields a test's partial scheduler carries now
+    and its registry; `fields` replaces any planner field."""
+    planner = StepPlanner.__new__(StepPlanner)
+    for name, field in _PLANNER_FIELDS.items():
+        if hasattr(scheduler, field):
+            setattr(planner, name, getattr(scheduler, field))
+    planner.request_registry = scheduler.request_registry
+    planner.__dict__.update(fields)
+    return planner
 
 
 def request_lists(scheduler: Scheduler) -> Dict[str, List[Req]]:

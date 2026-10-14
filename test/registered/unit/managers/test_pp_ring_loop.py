@@ -35,6 +35,9 @@ from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.pending_steps import (  # noqa: E402
     PendingSteps,
 )
+from sglang.srt.managers.scheduler_components.step_planner import (  # noqa: E402
+    StepPlanner,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
@@ -192,10 +195,12 @@ class TestPPSlotTag(CustomTestCase):
                 slot,
             )
 
-        self.assertEqual(s._select_decode_reqs(slots[0]), reqs[:2])
-        self.assertEqual(s._select_decode_reqs(slots[1]), reqs[2:])
+        planner = StepPlanner.__new__(StepPlanner)
+        planner.core_lists, planner.pending, planner.flags = s.lists, s.pending, s.flags
+        self.assertEqual(planner._select_decode_reqs(slots[0]), reqs[:2])
+        self.assertEqual(planner._select_decode_reqs(slots[1]), reqs[2:])
         # Outside PP every decoding request runs.
-        self.assertEqual(s._select_decode_reqs(ScheduleSlot()), reqs)
+        self.assertEqual(planner._select_decode_reqs(ScheduleSlot()), reqs)
 
     def test_pd_decode_admits_up_to_the_slot_cap(self):
         """PD decode admission fills the scheduled slot up to the per-slot cap,
