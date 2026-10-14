@@ -1,0 +1,15 @@
+{
+  "deepseek_v41_hip": {
+    "setup": "sglang.test.monokernels.deepseek_v41.server (MI35x, TP4, DSpark), PERF_ENV: per-user decode tok/s of 1500-token requests",
+    "normal": {
+      "1": 451.6,
+      "4": 319.7,
+      "8": 281.8
+    },
+    "monokernel": {
+      "1": 569.7,
+      "4": 381.1,
+      "8": 298.6
+    }
+  }
+}

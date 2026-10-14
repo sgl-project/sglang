@@ -29,7 +29,6 @@ _GROUPS = (
     "mamba",
     "memory",
     "mm",
-    "mono",
     "moe",
     "quantization",
     "sampling",
