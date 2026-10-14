@@ -34,7 +34,19 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
 
-template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+// kRoundScale rounds the per-token scale up to a power of two; kPackScale stores it
+// as packed UE8M0 (its exponent byte for each of the 4 32-channel groups, MXFP8)
+template <bool kRoundScale, bool kPackScale>
+SGL_DEVICE void store_index_k_scale(void* ptr, float scale) {
+  if constexpr (kPackScale) {
+    static_assert(kRoundScale, "UE8M0 scales must be powers of two");
+    *static_cast<uint32_t*>(ptr) = ((__float_as_uint(scale) >> 23) & 0xFFu) * 0x01010101u;
+  } else {
+    *static_cast<float*>(ptr) = scale;
+  }
+}
+
+template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL, bool kRoundScale, bool kPackScale>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
@@ -62,8 +74,8 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
-  // use normal fp32 scale
-  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+  auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+  if constexpr (kRoundScale) scale = exp2f(ceilf(log2f(scale)));
   const auto inv_scale = 1.0f / scale;
   const int32_t page = index >> kPageBits;
   const int32_t offset = index & ((1 << kPageBits) - 1);
@@ -74,17 +86,17 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
   static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  store_index_k_scale<kRoundScale, kPackScale>(scale_ptr, scale);
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL, bool kRoundScale, bool kPackScale>
 struct FusedStoreCacheIndexerKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
   /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
   static constexpr int64_t kPageBytes = 132 * kPageSize;
-  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
+  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL, kRoundScale, kPackScale>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);

@@ -250,6 +250,8 @@ def _load_deep_gemm():
 def test_matches_deep_gemm(bs: int, max_ctx: int):
     """Byte-equal against the production deep_gemm reference. Auto-skips
     at large bs where deep_gemm exceeds sm_90 smem cap."""
+    if torch.cuda.get_device_capability()[0] == 10:
+        pytest.skip("SM100 DeepGEMM uses its own varlen schedule format")
     deep_gemm = _load_deep_gemm()
     seq_lens = _make_seq_lens(bs, max_ctx)
     got = get_paged_mqa_logits_metadata(seq_lens, PAGE_SIZE, NUM_SM)

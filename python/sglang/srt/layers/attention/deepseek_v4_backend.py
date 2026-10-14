@@ -82,6 +82,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    has_deep_gemm_index_logits,
     has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
@@ -1555,7 +1556,7 @@ class DeepseekV4AttnBackend(
         return (
             bool(self.low_ratios)
             and has_dense_fp4_indexer()
-            and is_sm100_or_newer()
+            and has_deep_gemm_index_logits()
             and get_parallel().attn_cp_size == 1
         )
 
