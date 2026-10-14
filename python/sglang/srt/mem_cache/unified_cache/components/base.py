@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
         PoolBeliefPolicy,
     )
@@ -774,6 +775,23 @@ class TreeComponent(ABC):
         component owns; None picks the built-in one for the transfer's hit
         policy."""
         return None
+
+    def create_buffer_pipeline(
+        self,
+        *,
+        swa_window_pages: int,
+        write_backlog_cap: int,
+        max_context_len: int = 0,
+    ) -> BufferModePipeline:
+        """Called on the FULL component to construct the buffer-mode pipeline."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        return BufferModePipeline(
+            cache=self.cache,
+            swa_window_pages=swa_window_pages,
+            write_backlog_cap=write_backlog_cap,
+            max_context_len=max_context_len,
+        )
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
