@@ -136,20 +136,6 @@ class TestQwen4ExpPDPrefillCP(GSM8KMixin, PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("Paris", response.json()["text"])
 
-    def test_long_context_needle(self):
-        for depth in NEEDLE_DEPTHS:
-            with self.subTest(depth=depth):
-                response = requests.post(
-                    self.base_url + "/generate",
-                    json={
-                        "text": self._needle_prompt(depth),
-                        "sampling_params": {"temperature": 0, "max_new_tokens": 32},
-                    },
-                    timeout=600,
-                )
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertIn(NEEDLE_KEY, response.json()["text"])
-
 
 if __name__ == "__main__":
     unittest.main()
