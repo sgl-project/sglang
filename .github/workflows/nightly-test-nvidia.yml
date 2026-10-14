@@ -26,6 +26,7 @@ on:
           - '4-gpu-gb300'
           - '8-gpu-h200'
           - '8-gpu-b200'
+          - '8-gpu-b300'
           - 'diffusion'
       full_parallel:
         description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
@@ -184,6 +185,21 @@ jobs:
       scheduled: true
     secrets: inherit
 
+  nightly-8-gpu-b300:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-b300')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-8-gpu-b300
+      runner_config: 8-gpu-b300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
+    secrets: inherit
+
   # Hand-written because it is not a registry suite: it drives run_comparison.py
   # and publishes a dashboard rather than running test files.
   nightly-test-diffusion:
@@ -268,6 +284,7 @@ jobs:
       - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
+      - nightly-8-gpu-b300
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -315,6 +332,7 @@ jobs:
       - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
+      - nightly-8-gpu-b300
       - nightly-test-diffusion
       - consolidate-metrics
     runs-on: ubuntu-latest

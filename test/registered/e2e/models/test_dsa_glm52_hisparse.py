@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(
     est_time=700,
-    stage="extra-b",
+    stage="nightly",
     runner_config="8-gpu-b300",
 )
 
@@ -54,6 +54,9 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     # packed FP8 layout; Blackwell defaults prefill to TRT-LLM's raw FP8 layout.
     extra_prefill_args = common_args + [
         "--dsa-prefill-backend",
+        "flashmla_kv",
+        # Startup autotune runs a decode forward even on the prefill worker.
+        "--dsa-decode-backend",
         "flashmla_kv",
     ]
     extra_decode_args = common_args + [
