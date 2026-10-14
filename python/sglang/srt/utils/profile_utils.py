@@ -1,10 +1,30 @@
 import logging
 import os
+import re
 import time
 from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+
+
+def _sanitize_filename_component(value: str) -> str:
+    """Sanitize a caller-supplied filename component to prevent path traversal.
+
+    Strips path separators, parent-directory references, and other characters
+    that could let the caller escape the intended output directory.
+    """
+    if not value:
+        return value
+    # Strip any directory component (handles both absolute and relative paths)
+    value = os.path.basename(value)
+    # Replace any remaining path separators just in case
+    value = value.replace("/", "_").replace("\\", "_")
+    # Replace '..' to be safe
+    value = value.replace("..", "_")
+    # Replace other potentially dangerous characters with underscores
+    value = re.sub(r"[^\w\-.]", "_", value)
+    return value
 
 import torch
 
@@ -123,8 +143,9 @@ class ProfileManager:
             with_stack=with_stack,
             record_shapes=record_shapes,
             output_dir=output_dir,
-            output_prefix=profile_prefix,
-            profile_id=profile_id,
+            # Sanitize caller-supplied filename components to prevent path traversal
+            output_prefix=_sanitize_filename_component(profile_prefix),
+            profile_id=_sanitize_filename_component(profile_id),
         )
 
         self.stage_based_trigger.configure(

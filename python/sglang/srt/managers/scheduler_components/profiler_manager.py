@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,25 @@ from typing import (
     List,
     Optional,
 )
+
+
+def _sanitize_filename_component(value: str) -> str:
+    """Sanitize a caller-supplied filename component to prevent path traversal.
+
+    Strips path separators, parent-directory references, and other characters
+    that could let the caller escape the intended output directory.
+    """
+    if not value:
+        return value
+    # Strip any directory component (handles both absolute and relative paths)
+    value = os.path.basename(value)
+    # Replace any remaining path separators just in case
+    value = value.replace("/", "_").replace("\\", "_")
+    # Replace '..' to be safe
+    value = value.replace("..", "_")
+    # Replace other potentially dangerous characters with underscores
+    value = re.sub(r"[^\w\-.]", "_", value)
+    return value
 
 import torch
 
@@ -136,8 +156,9 @@ class SchedulerProfilerManager:
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
-        self.profile_id = profile_id
-        self.profile_prefix = profile_prefix
+        # Sanitize caller-supplied filename components to prevent path traversal
+        self.profile_id = _sanitize_filename_component(profile_id)
+        self.profile_prefix = _sanitize_filename_component(profile_prefix)
         self.detailed_annotations = detailed_annotations
 
         if start_step:
