@@ -213,6 +213,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.bundles import (
+    ComponentClasses,
     KvCapacity,
     KvResources,
     SchedulerServices,
@@ -429,6 +430,7 @@ class Scheduler:
             get_spec().speculative_algorithm
         )
         reject_modes_without_pipeline_support()
+        self.init_component_classes()
 
         # Init model configs
         self.init_model_config()
@@ -662,6 +664,18 @@ class Scheduler:
 
         # Reads the startup time.
         self.init_internal_state()
+
+    def init_component_classes(self) -> None:
+        self.component_classes = ComponentClasses(
+            rust_server=self.get_rust_server_class(),
+            output_streamer=self.get_output_streamer_class(),
+        )
+
+    def get_rust_server_class(self) -> type[RustServer]:
+        return RustServer
+
+    def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
+        return SchedulerOutputStreamer
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -2490,7 +2504,7 @@ class Scheduler:
             self.rust_server = None
             return
 
-        rust_server = self.get_rust_server_class().launch(
+        rust_server = self.component_classes.rust_server.launch(
             server_args=self.server_args,
             model_config=self.model_config,
             processor=self.processor,
@@ -2503,9 +2517,6 @@ class Scheduler:
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server, flags=self.flags)
-
-    def get_rust_server_class(self) -> type[RustServer]:
-        return RustServer
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
@@ -2687,7 +2698,7 @@ class Scheduler:
         )
 
     def init_output_streamer(self) -> None:
-        self.output_streamer = self.get_output_streamer_class()(
+        self.output_streamer = self.component_classes.output_streamer(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             send_to_tokenizer=self.ipc_channels.send_to_tokenizer,
             tree_cache=self.tree_cache,
@@ -2703,9 +2714,6 @@ class Scheduler:
             output_streamer=self.output_streamer,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
-
-    def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
-        return SchedulerOutputStreamer
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(

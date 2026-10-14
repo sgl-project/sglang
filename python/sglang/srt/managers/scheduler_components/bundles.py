@@ -70,3 +70,14 @@ class SchedulerServices:
     metrics_sink: MetricsSink
     output_streamer: SchedulerOutputStreamer
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ComponentClasses:
+    """The classes a `Scheduler` subclass swaps through its `get_*_class`
+    override points, resolved once at construction. Whoever builds one of these
+    objects, the scheduler or a component, takes its class from here; a
+    component takes it as a constructor argument (`prefill_adder_class=...`)."""
+
+    rust_server: type
+    output_streamer: type
