@@ -135,25 +135,8 @@ def _build_prefetch_groups(
 
 class HiSparseCoordinator:
     """HiSparse as an add-on: its requests' KV lives in host rows plus a small
-    device buffer per request. Each hook names its side: a core stage moves
-    requests between lists and reads host state only; an executor action does
-    device work.
-
-    - launch, core stage: `on_launch` (the launched last prefill chunks join
-      staging);
-    - prefill commit, executor action: `admit_request_into_staging` (the host
-      copy);
-    - schedule, core stage: `collect_ready_reqs` (ready -> decoding);
-    - decode forward entry, executor action: `map_last_loc_to_buffer` (the
-      slot maps);
-    - decode commit, executor action: `free_remapped_decode_slots` (the stale
-      slots);
-    - commit, core stage: `leave_finished` (finished requests leave staging);
-    - PD decode: `alloc_transfer_rows` at preallocation; executor action
-      `admit_request_direct` when a transferred request becomes ready;
-    - release: `request_finished` when `holds_rows`, through the result
-      processor's `release_finished_req`; retraction: `retract_req`.
-    """
+    device buffer per request. A core-stage hook moves requests between lists
+    and reads host state only; an executor action does device work."""
 
     def __init__(
         self,

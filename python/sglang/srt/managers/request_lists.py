@@ -13,12 +13,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, kw_only=True)
 class RequestList:
     """One list that owns live requests, with what the readers ask of it.
-
-    Each live request is in exactly one list. `Scheduler.request_lists()`
-    gathers the core lists and each owner's lists; abort, idle, the running
-    timeout, weight version, the sampling-mask scan, load and metrics read
-    the lists through it.
-    """
+    Each live request is in exactly one list."""
 
     # Unique among the scheduler's lists; load and metrics look lists up by it.
     name: str
@@ -36,11 +31,11 @@ class RequestList:
     # Aborts the members an `AbortReq` matches (beyond `to_finish`); None when
     # abort reaches the list only through `inflight`, or not at all.
     abort: Optional[Callable[[AbortReq], None]] = None
-    # `is_fully_idle` counts the members, except:
-    # - for the health check, unless they run soon and so carry it (a queued
-    #   PD request may wait on a handshake, KV space or a transfer);
+    # The members keep the scheduler from being fully idle, except:
+    # - for the health check, unless this is set (they run soon; a queued PD
+    #   request may instead wait on a handshake, KV space or a transfer);
     health_check: bool = False
-    # - with ignore_waiting, the members that hold no KV;
+    # - with ignore_waiting, when this is set, the members that hold no KV;
     waiting: bool = False
     # - with ignore_releasing, all of them.
     releasing: bool = False

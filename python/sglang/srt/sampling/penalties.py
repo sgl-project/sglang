@@ -1,28 +1,17 @@
 """Penalty history in per-request rows, keyed by req_pool_idx.
 
-API:
-- `PenaltyStore(vocab_size, device)`: one per scheduler, keyed by the slots of
-  its `ReqToTokenPool`; registered as the pool's free-slot hook, so freeing a
-  request's slot calls `free`.
-- `PenaltyStore.alloc(req) -> None`: whenever `req` enters an extend step (each
-  prefill chunk, readmission after retract, PD decode admission), after its
-  slot is assigned; (re)sets its row to the history of `req.output_ids`.
-- `PenaltyStore.free(req_pool_idx: int) -> None`: when the slot is released.
-- `StepPenalties.build(reqs, store, device) -> Optional[StepPenalties]`: called
-  by `SamplingBatchInfo.build`.
-- `StepPenalties.logit_penalties()` before sampling and
-  `StepPenalties.commit(token_ids, accept_mask=None)` after it: called by the
-  sampling path through `SamplingBatchInfo`.
+`PenaltyStore` is one per scheduler: `alloc` (re)sets a request's row to the
+history of its `output_ids` each time it enters an extend step, and the
+pool's free-slot hook frees the row with the slot.
 
 Invariants:
-- Only a request whose params use a penalty (frequency, presence, repetition,
-  min_new_tokens) holds a row. A step without one has no `StepPenalties`, and
-  a store that never saw one holds no rows.
-- A row holds history only: per-token output counts and the output length.
-  Penalty values come from the request's params at build.
-- Host calls (`alloc`, `free`, `build`) never touch rows. Rows are grown,
-  reset, read, and written only by the sampling path, on the stream that
-  samples, so a step sees exactly the tokens of the steps sampled before it.
+- Only a request whose params use a penalty holds a row; a step without one
+  has no `StepPenalties`.
+- A row holds history only (per-token output counts and the output length);
+  penalty values come from the request's params at build.
+- Host calls (`alloc`, `free`, `build`) update only the host maps; device rows
+  are grown, reset, read, and written only on the sampling stream, so a step
+  sees exactly the tokens of the steps sampled before it.
 - A slot is not reallocated between the build of a step holding it and that
   step's sampling; a row freed in between may still take the step's commit,
   and its next `alloc` resets it.

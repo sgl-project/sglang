@@ -262,12 +262,10 @@ _MAX_LIVE_PUBLISHES = 64
 
 
 class StepPublish:
-    """The device commit of one forward's FutureMap writes.
-
-    `seq_lens_ready` is recorded on the forward stream once the step's new
-    lengths are in FutureMap, `ready` once all of its slot writes (lengths and
-    draft state) are. A gather waits on the publishes of the steps that last
-    wrote its slots; the pending record of a step carries its publish.
+    """The device commit of one forward's FutureMap writes: `seq_lens_ready`
+    is recorded on the forward stream once the step's new lengths are in
+    FutureMap, `ready` once all its slot writes are. A gather waits on the
+    publishes of the steps that last wrote its slots.
     """
 
     __slots__ = ("step_id", "stream", "seq_lens_ready", "ready")
@@ -280,13 +278,10 @@ class StepPublish:
 
 
 class FutureMap:
-    """Pool-indexed relay for cross-step values, keyed by req_pool_idx.
-
-    The producing forward writes its slots (publish / stash, the device half
-    of commit); the next step's worker gathers them (gather_seq_lens /
-    gather_draft_input) after waiting on the publishes of the steps that last
-    wrote those slots. A slot is released (release_slots) only after the host
-    commit of the last pending step that references it.
+    """Pool-indexed relay for cross-step values, keyed by req_pool_idx: the
+    producing forward writes its slots and the next step's worker gathers
+    them. A slot is released only after the host commit of the last pending
+    step that references it.
     """
 
     def __init__(

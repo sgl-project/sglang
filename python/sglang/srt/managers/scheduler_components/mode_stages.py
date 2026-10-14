@@ -1,9 +1,9 @@
 """What the drivers run per mode, and what they hand to it.
 
-A mode's stages come from its owner and are chosen once, when the scheduler
-(or a PD role switch) builds the owner; the flat and the ring driver read the
-same set. An entry left None runs the core default inline, so a mode pays no
-call for a stage it does not have.
+The scheduler chooses a mode's stages once (again on a PD role switch); the
+flat and the ring driver read the same set. Only `schedule` is required; an
+optional stage left None runs the core default inline, so a mode pays no call
+for a stage it does not have.
 """
 
 from __future__ import annotations
@@ -20,8 +20,7 @@ class ScheduleSlot:
     """What one step is scheduled for: the decoding requests it may run and
     its admission flag. The flat driver has one slot, over every decoding
     request; the PP ring has one per microbatch slot, over the requests that
-    slot launched. A launch tags the requests joining decoding with it, and
-    the commit of the slot's step reopens its admission."""
+    slot launched."""
 
     # The ring slot; None for the flat driver.
     index: Optional[int] = None

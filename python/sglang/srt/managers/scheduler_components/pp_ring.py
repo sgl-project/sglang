@@ -89,9 +89,7 @@ class RingSlot:
 class PPRing:
     """The PP ring driver of one rank: its microbatch slots in ring order, the
     steps they launched, the outputs the ring brings back for them, and the
-    PP+spec trees relayed by request slot. The scheduler builds it per ring
-    loop from narrow arguments, never itself; the PP messages go over the
-    ring's channel."""
+    PP+spec trees relayed by request slot."""
 
     # The gated PP+spec relay flow's trees, per request slot; None without it.
     # Class-level default for rings built without __init__ (unit-test doubles).

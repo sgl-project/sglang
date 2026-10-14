@@ -1,7 +1,7 @@
-"""Launched steps whose results are not committed yet.
+"""Launched steps whose results are not committed yet, in launch order, and
+what the scheduler asks of the requests they carry.
 
-Each event loop decides when it commits a pending step; this container only
-keeps the records in launch order.
+Each event loop decides when it commits a pending step.
 """
 
 from __future__ import annotations

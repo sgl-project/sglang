@@ -23,7 +23,7 @@ def _send_consensus_bootstrapped_ids(
     consensus_bootstrapped_rids: List[str],
     bootstrapped_rids: List[str],
 ):
-    # 3 (Release): send the release rids from last stage to the first stage
+    # 3 (Bootstrap): send the bootstrapped rids from the last stage to the first stage
     send_consensus_bootstrapped_work = []
     if channel.is_last_rank:
         if bmbs[next_first_rank_mb_id] is not None:
@@ -31,7 +31,7 @@ def _send_consensus_bootstrapped_ids(
             send_consensus_bootstrapped_work = channel.send_next(
                 consensus_bootstrapped_rids
             )
-    # 4 (Release): send the release rids from non last rank to the next rank
+    # 4 (Bootstrap): send the bootstrapped rids from a non-last rank to the next rank
     else:
         if consensus_bootstrapped_rids is not None:
             send_consensus_bootstrapped_work = channel.send_next(
@@ -74,30 +74,9 @@ def _route_aborts_to_bad(good_rids, bad_rids, aborted_rids):
 
 
 class _DisaggPrefillRing:
-    """The PD prefill messages around each ring slot: the PP ranks agree on the
-    requests whose KV transfer ended before releasing them. The owner polls
-    and releases; the driver callables move the core waiting list.
-
-    Prefill Server Schedule:
-    ====================================================================
-    Stage P
-    recv ith req from previous stage
-    pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
-    recv ith transferred req from previous stage
-    recv ith proxy from previous stage
-    run ith batch
-    recv prev (i+1) % mb_size th release req from previous stage
-    local consensus on release req
-    recv prev (i+1) % mb_size th outputs
-    process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
-    send ith req to next stage
-    send ith transferred req to next stage
-    send ith proxy to next stage
-    send current stage's outputs to next stage (can be stashed and delayed to send later)
-    ====================================================================
-
-    Release Requests still use the two-pass PP consensus. Bootstrap uses
-    PPConsensusStore instead of the legacy two-round RID sync.
+    """The PD prefill messages around each ring slot: the PP ranks agree, in two
+    passes, on the requests whose KV transfer ended before releasing them. The
+    owner polls and releases; the driver callables move the core waiting list.
     """
 
     def __init__(

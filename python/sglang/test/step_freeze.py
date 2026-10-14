@@ -1,15 +1,14 @@
 """Checks that a scheduled step stays as built from finalize to commit, for tests.
 
-`freeze_step` runs when the scheduler finalizes a step: from then on, setting
-a field of the step raises, and `release_step` (at the step's commit) asserts
-that nothing reachable from the step changed: no field or nested attribute was
-rebound, no list, tuple or dict changed its contents, and no tensor was
-written in place (its version counter moved).
+After `freeze_step` (at finalize), setting a step field raises; `release_step`
+(at commit) asserts that, down to `_MAX_DEPTH` below each field, no attribute
+was rebound, no list, tuple, dict or set changed its members (set members by
+identity), and no tensor was written in place.
 
-The walk stops at references the step only points to: the engine-lifetime
-pools, allocators and caches, the requests and what they own (grammars,
-multimodal inputs), and other steps. A write by a kernel that bypasses the
-tensor's version counter (a raw data_ptr write) is not seen.
+The walk stops at what the step only points to: the engine-lifetime pools,
+allocators and caches, the requests and what they own, and other steps. A
+write that bypasses the tensor's version counter (a raw data_ptr write) is
+not seen.
 """
 
 from __future__ import annotations

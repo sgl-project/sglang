@@ -1333,7 +1333,7 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        # The PD protocol state, attached by the PD queue that takes the request.
+        # PD per-request bookkeeping, attached by the PD queue that takes the request.
         self.disagg: Optional[DisaggReqState] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         # Set when the request's in-flight forward ran on KV that never landed:
@@ -2522,10 +2522,8 @@ def req_pool_indices_of(
 @dataclasses.dataclass(frozen=True)
 class DecodeRows:
     """The inputs a decode step takes from its requests alone: their slots and
-    their sampling params. Nothing writes them after build, so consecutive
-    decode steps share them while the key matches: the same requests in the
-    same order, each still in the same slot and penalty row. A request
-    re-admitted after leaving decoding may come back to another slot or row."""
+    their sampling params. Consecutive decode steps share them while the same
+    requests stay in the same order, each in the same slot and penalty row."""
 
     reqs: List[Req]
     slots: List[int]

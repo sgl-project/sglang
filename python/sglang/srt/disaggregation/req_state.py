@@ -6,9 +6,7 @@ from typing import Optional
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class DisaggReqState:
-    """A PD request's transfer state, ``req.disagg``: plain data, attached by
-    the PD queue that takes the request and written by the stages that move it.
-    It survives a retraction, as the KV transfer state did on ``Req``."""
+    """PD per-request bookkeeping, ``req.disagg``; it survives a retraction."""
 
     # PD prefill.
     # the start index of the sent kv cache

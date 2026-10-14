@@ -1616,8 +1616,7 @@ class Scheduler:
         )
 
     def init_mode_stages(self) -> None:
-        """Take the mode's stages from its owner, once; a PD role switch
-        rebuilds them with the owner."""
+        """Choose the mode's stages, once; a PD role switch rebuilds them."""
         hisparse = self.hisparse_coordinator
         if self.dllm is not None:
             stages = dict(
@@ -2024,29 +2023,7 @@ class Scheduler:
 
     @DynamicGradMode()
     def event_loop_pp(self):
-        """
-        A scheduler loop for pipeline parallelism.
-        Notes:
-        1. Each stage runs in the same order and is notified by the previous stage.
-        2. We use async send but sync recv to avoid desynchronization while minimizing the communication overhead.
-        3. We can use async batch depth to buffer the outputs in the last stage for to allow overlapping the GPU computation and CPU processing and avoid last PP rank staggler.
-
-        Unified Schedule:
-        ====================================================================
-        Stage P
-        recv ith req from previous stage
-        recv ith proxy from previous stage
-        run ith batch
-        recv prev (i+1)% mb_size th outputs
-        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
-        send ith req to next stage
-        send ith proxy to next stage
-        send current stage's outputs to next stage(can be stashed and delayed to send later)
-
-        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
-
-        ====================================================================
-        """
+        """A scheduler loop for pipeline parallelism."""
         self.init_pp_ring()
         self.pp_ring.run_ring_loop()
 
@@ -2096,18 +2073,11 @@ class Scheduler:
         self._sched_idled = True
 
     def run_flat_loop(self, overlap: bool):
-        """The loop of every mode without PP. Each pass takes intake, then
-        schedules and launches a step, then commits: without overlap every
-        pending step, its own included; with overlap the oldest step launched
-        before this pass, so scheduling the next step overlaps its forward.
-        A shutdown stops new launches.
-
-        With a commit readiness gate (PD prefill continuous polling), a pass
-        whose oldest pending result is not ready on every rank skips the
-        commit and returns to intake, holding a pause request back until the
-        wait ends; it builds no new step while two are pending, retries a
-        failed schedule only on new input or bootstrapped requests, and counts
-        no storage retry deadline."""
+        """The loop of every mode without PP. Each pass takes intake, schedules
+        and launches a step, then commits: without overlap every pending step,
+        with overlap the oldest step launched before this pass. With a commit
+        readiness gate (PD prefill continuous polling), a pass whose oldest
+        result is not ready on every rank returns to intake instead."""
         stages = self.stages
         prefetch, intake, schedule = stages.prefetch, stages.intake, stages.schedule
         after_commit = stages.after_commit

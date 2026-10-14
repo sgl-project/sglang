@@ -15,12 +15,9 @@ from sglang.srt.managers.schedule_policy import (
 
 
 class DllmPrefillAdder(PrefillAdder):
-    """A PrefillAdder for dLLM steps.
-
-    A request extends one block (a separate-context model: its context, then
-    one block per round), never a chunk, and reserves no decode tokens. The
-    dLLM step budget `rem_dllm_tokens` takes the chunk budget's place.
-    """
+    """A PrefillAdder for dLLM steps: a request extends one block, never a
+    chunk, and reserves no decode tokens; the dLLM step budget
+    `rem_dllm_tokens` takes the chunk budget's place."""
 
     def __init__(self, *args, dllm_config: DllmConfig, **kwargs):
         super().__init__(*args, **kwargs)

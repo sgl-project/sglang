@@ -9,10 +9,10 @@ Life cycle of a request in the prefill server
 
 2. Waiting Queue
     a. Use PrefillAdder to pop requests
-    b. Run forward; a launched request sits in prefilling until its step commits
-    c. The commit of its last chunk adds the request to Inflight Queue
+    b. Run forward; a launched request sits in `prefilling` until its step commits
+    c. The commit of its last chunk adds the request to `transfer`
 
-3. Inflight Queue
+3. `transfer`
     a. Poll (non-blocking) the sender of the request
     b. Once the transfer has finished, return the request
 """
@@ -584,13 +584,10 @@ class PrefillBootstrapQueue:
 
 
 class DisaggPrefill:
-    """The PD prefill mode owner.
-
-    It owns three lists: the bootstrap queue, the requests whose decode peer
-    has not finished its handshake; `prefilling`, the requests a launched step
-    prefills, until its commit hands their KV over; and `transfer`, the
-    requests whose KV is being sent. In between, bootstrapped requests wait in
-    the core waiting list. Built with narrow dependencies, never the scheduler.
+    """The PD prefill mode owner, and its three lists: the bootstrap queue,
+    `prefilling` (in a launched step until its commit), and `transfer` (KV
+    being sent). Bootstrapped requests wait in the core waiting list between
+    the first two.
     """
 
     def __init__(
@@ -1529,7 +1526,7 @@ class DisaggPrefill:
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
-            # that decode used to register the destination row.
+            # with which decode registered the destination row.
             seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 

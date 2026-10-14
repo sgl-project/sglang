@@ -15,7 +15,7 @@ Life cycle of a request in the decode server
     b. Admission commits the prefill node's step: no prefill forward runs here
 
 4. Decoding:
-    a. Admitted requests decode in the decode steps built from this list
+    a. Admitted requests join the scheduler's `decoding` list and decode there
 """
 
 from __future__ import annotations
@@ -3088,8 +3088,8 @@ class DisaggDecode:
     It owns the lists a request moves through before it decodes: the
     preallocation queue (new and rebootstrapping requests), the retracted
     queue, the requests held for rebootstrap while generation is paused, the
-    transfer queue (KV in flight), and the failed transfers still releasing
-    their KV. Built with narrow dependencies, never the scheduler.
+    transfer queue (KV in flight), `ready` (transferred, waiting for a
+    decoding row), and the failed transfers still releasing their KV.
     """
 
     def __init__(

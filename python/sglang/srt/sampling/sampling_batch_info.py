@@ -1,23 +1,12 @@
 """Sampling metadata of one step, built from the step's requests.
 
-API:
-- `SamplingBatchInfo.build(reqs, vocab_size, device, penalty_store=None)`
-  builds a step's info; `penalty_store` (the scheduler's `PenaltyStore`) is
-  required when a request uses a penalty.
-- The sampling path reads penalties with `logit_penalties()` (also through
-  `apply_logits_bias`) and, right after sampling, on the same stream, writes
-  the step's tokens into the penalty history with
-  `commit_sampled_tokens(token_ids, accept_mask=None)`.
-
 Invariants:
-- `build` reads each request's params and `req.grammar` only; it has no side
-  effects on `Req` or slot storage, so building twice gives equal infos.
-- A built info is never filtered, merged, copied, or written: a different set
-  of requests gets a new info.
-- Exceptions still written after build: `grammar_mask`, derived from
-  `grammars` at sample time after the previous step's grammar advance and
-  cleared after use; `rids_int` / `bootstrap_room_ids_int`, set by
-  `ForwardBatch` for the token oracle.
+- `build` reads only each request's params and `req.grammar` and has no side
+  effects, so building twice gives equal infos.
+- A different set of requests gets a new info, never a filtered or merged one.
+- A forward fills `grammar_mask`, `rids_int`, and `bootstrap_room_ids_int` on
+  its own copy (`forward_sampling_info`); the step's info keeps its built
+  values, except that the MLX worker sets `grammars` on it.
 """
 
 from __future__ import annotations

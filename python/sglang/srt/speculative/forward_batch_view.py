@@ -1,9 +1,8 @@
 """Per-forward batches a speculative worker builds from the step it is handed.
 
-A worker takes the scheduled batch (the step) as read-only. It builds its own
-forward batch from it, and from that each phase's batch (draft, verify, draft
-extend), with `derive_batch`; a phase rebinds fields only on the batch it was
-built for.
+A worker treats the step as read-only: it derives its forward batch, and from
+that each phase's batch, with `derive_batch`, and rebinds fields only on a
+batch it derived.
 """
 
 from __future__ import annotations
@@ -18,11 +17,9 @@ if TYPE_CHECKING:
 
 
 def derive_batch(batch: ScheduleBatch, **fields) -> ScheduleBatch:
-    """A new batch with every field of `batch` and `fields` rebound.
-
-    `batch` is left as it is. Tensors, the reqs list and the sub-objects not
-    named in `fields` are shared, so they are never written in place.
-    """
+    """A shallow copy of `batch` with `fields` rebound; `batch` is unchanged.
+    Every field not in `fields` (tensors, the reqs list, sub-objects) is shared
+    with `batch`, so it must not be written in place."""
     unknown = fields.keys() - batch.__dict__.keys()
     if unknown:
         raise AttributeError(f"ScheduleBatch has no fields {sorted(unknown)}")

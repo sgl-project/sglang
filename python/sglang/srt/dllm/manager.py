@@ -37,19 +37,12 @@ if TYPE_CHECKING:
 
 
 class DllmManager:
-    """The dLLM mode owner.
-
-    It owns three disjoint lists of the requests it took from the core
-    waiting list (at most `max_running_requests` in all): `waiting`, those no
-    step has launched yet; `staging`, those of the launched step, until its
-    commit; and `between_blocks`, those a committed step left unfinished,
-    until a step launches their next block. `waiting` and `between_blocks`
-    keep the order the requests were taken in, and a step selects from both
-    in that order. dLLM requests never decode.
-
-    Stages the scheduler calls: `schedule` builds the step, `on_launch` moves
-    its requests to staging, `commit_extend` writes their blocks; `lists`
-    exposes the three lists to the readers.
+    """The dLLM mode owner, and its three disjoint lists of the requests it
+    took from the core waiting list (at most `max_running_requests` in all):
+    `waiting` (no step launched them yet), `staging` (in the launched step,
+    until its commit), and `between_blocks` (left unfinished by a committed
+    step). A step selects from `waiting` and `between_blocks` in the order the
+    requests were taken. dLLM requests never decode.
     """
 
     def __init__(

@@ -8,15 +8,10 @@ from sglang.srt.runtime_context import get_spec
 
 
 class PPSpecRelay:
-    """Per request slot (req_pool_idx): the draft tree the request's next
-    verify round runs, as the last PP stage drafted it.
-
-    Under PP the draft model lives on the last stage only, so every stage takes
-    the tree from the output relay instead of drafting it. When the relay
-    brings a step's outputs back, the ring writes their trees into the slots of
-    the step's rows; the next round's launch gathers its rows' trees and builds
-    the verify input every stage runs. The ring commits a slot's step before it
-    schedules the slot again, so a row's tree is written before it is read.
+    """Per request slot (req_pool_idx): the draft tree its next verify round
+    runs, drafted by the last PP stage (the only one holding the draft model)
+    and brought back by the output relay. The ring commits a slot's step before
+    it schedules the slot again, so a row's tree is written before it is read.
     """
 
     def __init__(self, req_pool_size: int, device: str):

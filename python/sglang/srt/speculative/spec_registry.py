@@ -40,17 +40,9 @@ class CustomSpecAlgo:
     disabled (synchronous). Migrate plugin workers to the V2 schema and
     overlap scheduling.
 
-    A plugin worker subclasses ``BaseSpecWorker`` and implements
-    ``_forward(batch, on_publish, pp_proxy_tensors, pending_grammar)``, as the
-    builtin workers do. The base's ``forward_batch_generation(step)`` takes
-    the step read-only, runs ``_forward`` on ``self.forward_input(step)`` (the
-    step's rows with their draft state and lengths gathered from FutureMap),
-    and commits the result: ``next_draft_input`` goes into the rows' FutureMap
-    slots (``SpecInput.relay_payload``), keyed by ``req_pool_idx``.
-    ``_forward`` calls ``on_publish`` with the new lengths as soon as they are
-    known, and passes ``pending_grammar`` to ``build_grammar_vocab_mask``. A
-    worker whose draft input is not an ``EagleDraftInput`` overrides
-    ``_new_draft_input``, from which ``keyed_draft_input`` builds a step's.
+    A plugin worker subclasses ``BaseSpecWorker`` and implements ``_forward``;
+    a worker whose draft input is not an ``EagleDraftInput`` also overrides
+    ``_new_draft_input``.
     """
 
     def __init__(
