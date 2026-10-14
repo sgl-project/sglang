@@ -240,7 +240,11 @@ class TestCleanup(CustomTestCase):
         backend._outputs = {ShapeKey(size=1): object()}
         backend._pool = object()
 
-        backend.cleanup()
+        with mock.patch(
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.set_global_graph_memory_pool"
+        ) as mock_set_pool:
+            backend.cleanup()
+            mock_set_pool.assert_called_once_with(None)
 
         for graph in graphs:
             graph.reset.assert_called_once_with()
