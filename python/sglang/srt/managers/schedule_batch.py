@@ -1155,7 +1155,7 @@ class Req(ReqDllmMixin):
 
             self.mamba_branching_seqlen = seed_mamba_boundary(
                 system_prefix_boundary,
-                get_server_args().mamba_cache_chunk_size,
+                mamba_cache_chunk_size(),
             )
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.

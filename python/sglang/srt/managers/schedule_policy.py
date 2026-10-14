@@ -822,18 +822,12 @@ class PrefillAdder:
         host_slots = req.mamba_host_hit_length if include_host_hit else 0
         if slots == 0:
             return host_slots * self._mamba_slot_cost
-        from sglang.srt.mem_cache.common import (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
-        )
         from sglang.srt.system_prompt import is_system_prefix_warm
 
         req_pool = self.tree_cache.req_to_token_pool
-        cold_factor = (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-            if req_pool.enable_mamba_extra_buffer_lazy
-            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-        )
+        # Matches the slots alloc_req_slots actually allocates: running slot
+        # plus the pool's initial tracking slots (1 + 2 overlap / 1 + 1 lazy).
+        cold_factor = 1 + req_pool.mamba_initial_tracking_slots
         factor = (
             1
             if is_system_prefix_warm(
