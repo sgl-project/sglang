@@ -386,9 +386,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# Must match CHUNK_SIZE in sglang/kernels/ops/attention/fla/chunk.py.
-_GDN_PREFILL_BLOCK_TOKENS = 64
-
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1694,15 +1691,16 @@ class Scheduler(
         }
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        aligns = []
+        if env_var:
+            aligns.append(get_int_env_var(env_var, default_size))
         if hybrid_gdn_config(self.model_config) is not None:
             # Gated DeltaNet prefill sums each chunk in blocks counted from the chunk
             # start, so a split off this grid changes the result.
-            self.truncation_align_size = math.lcm(
-                self.truncation_align_size or 1, _GDN_PREFILL_BLOCK_TOKENS
-            )
+            from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+
+            aligns.append(CHUNK_SIZE)
+        self.truncation_align_size = math.lcm(*aligns) if aligns else None
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
