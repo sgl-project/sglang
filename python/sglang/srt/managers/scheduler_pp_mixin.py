@@ -608,7 +608,11 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        # Under PP, only prefill_complete keeps optimistic prefill, which parks requests.
+        if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
+            reqs = self.pop_bootstrapped_and_resolve_parked_pp()
+        else:
+            reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
