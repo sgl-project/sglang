@@ -66,6 +66,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
+    run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
@@ -124,6 +125,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -140,6 +142,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -164,6 +167,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
+    return redact_watermark_secrets(server_args.resolved_dict())
+
+
 @dataclasses.dataclass
 class SchedulerInitResult:
     """Result from launching schedulers."""
@@ -173,6 +180,12 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    grpc_server: Optional[Any] = None
+
+    def stop_grpc_server(self) -> None:
+        if self.grpc_server is not None:
+            self.grpc_server.shutdown()
+            self.grpc_server = None
 
 
 def init_tokenizer_manager(
@@ -283,10 +296,14 @@ class Engine(EngineScoreMixin, EngineBase):
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                "Engine("
+                + ", ".join(
+                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                )
+                + ")",
             )
         self.server_args = server_args
-        logger.info(f"server_args={server_args.resolved_dict()}")
+        logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -394,15 +411,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().dp_size
-            if dp_size <= 1 and routed_dp_rank == 0:
+            num_dp_ranks = get_parallel().num_dp_ranks
+            if num_dp_ranks <= 1 and routed_dp_rank == 0:
                 logger.debug(
-                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
                 )
                 return None
-            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+            if routed_dp_rank < 0 or routed_dp_rank >= num_dp_ranks:
                 raise ValueError(
-                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
@@ -886,10 +903,17 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
         )
+        prelaunch_dp_schedulers = (
+            use_dp_controller
+            and get_parallel().attn_dp_enabled
+            and get_exec().moe.elastic_ep_backend is None
+            and not get_exec().moe.is_ep_joiner
+        )
+        prelaunched_schedulers = {}
 
-        if not use_dp_controller:
+        if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=get_exec().features.enable_memory_saver
@@ -902,7 +926,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
+                    reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
                     gpu_id = (
                         get_device().base_gpu_id
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
@@ -910,9 +934,12 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                        if prelaunch_dp_schedulers:
+                            target = run_scheduler_process_with_init_pipe
+                            args = (run_scheduler_process_func, writer)
+                        else:
+                            target = run_scheduler_process_func
+                            args = (
                                 server_args,
                                 port_args,
                                 gpu_id,
@@ -920,8 +947,8 @@ class Engine(EngineScoreMixin, EngineBase):
                                 pp_rank,
                                 None,
                                 writer,
-                            ),
-                        )
+                            )
+                        proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
@@ -929,8 +956,13 @@ class Engine(EngineScoreMixin, EngineBase):
                             proc.start()
 
                     scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
-        else:
+                    if prelaunch_dp_schedulers:
+                        prelaunched_schedulers[pp_rank, tp_rank] = (proc.pid, reader)
+                        writer.close()
+                    else:
+                        scheduler_pipe_readers.append(reader)
+
+        if use_dp_controller:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
@@ -941,29 +973,53 @@ class Engine(EngineScoreMixin, EngineBase):
                     port_args=port_args,
                     pipe_writer=writer,
                     run_scheduler_process_func=run_scheduler_process_func,
+                    prelaunched_schedulers=prelaunched_schedulers or None,
                 ),
             )
-            proc.start()
-            scheduler_procs.append(proc)
+            try:
+                proc.start()
+            finally:
+                for _, init_pipe in prelaunched_schedulers.values():
+                    init_pipe.close()
+            scheduler_procs.insert(0, proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            if any("kv_event_sources" in info for info in infos):
+                # Both gRPC entrypoints consume the first scheduler info. Keep
+                # the sources from every local scheduler, not just the first.
+                infos[0]["kv_event_sources"] = sorted(
+                    (
+                        source
+                        for info in infos
+                        for source in info.get("kv_event_sources", [])
+                    ),
+                    key=lambda source: source["dp_rank"],
+                )
             scheduler_infos.extend(infos)
-            if use_dp_controller:
+            if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def block_until_scheduler_exits():
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} "
-                    f"terminated with {proc.exitcode}"
-                )
+            watchdog = None
+            if prelaunch_dp_schedulers and get_parallel().node_rank > 0:
+                watchdog = SubprocessWatchdog(scheduler_procs)
+                watchdog.start()
+            try:
+                for proc in scheduler_procs:
+                    proc.join()
+                    logger.error(
+                        f"Scheduler or DataParallelController {proc.pid} "
+                        f"terminated with {proc.exitcode}"
+                    )
+            finally:
+                if watchdog is not None:
+                    watchdog.stop()
 
         return (
             SchedulerInitResult(
@@ -1120,7 +1176,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={server_args.resolved_dict()}")
+            logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
@@ -1173,6 +1229,18 @@ class Engine(EngineScoreMixin, EngineBase):
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
+            try:
+                scheduler_init_result.grpc_server = start_follower_grpc_server(
+                    server_args, scheduler_init_result.scheduler_infos[0]
+                )
+            except BaseException:
+                # Engine.__init__ has not received these handles yet. Do not
+                # leave GPU workers behind if binding the metadata port fails.
+                for proc in scheduler_procs or []:
+                    kill_process_tree(proc.pid, wait_timeout=60)
+                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                raise
+
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
@@ -1202,14 +1270,16 @@ class Engine(EngineScoreMixin, EngineBase):
             rust_server_owns_base_port = (
                 envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             )
-            if not rust_server_owns_base_port:
-                launch_dummy_health_check_server(
-                    get_serving().host,
-                    get_serving().port,
-                    get_observability().enable_metrics,
-                )
-
-            scheduler_init_result.block_until_scheduler_exits()
+            try:
+                if not rust_server_owns_base_port:
+                    launch_dummy_health_check_server(
+                        get_serving().host,
+                        get_serving().port,
+                        get_observability().enable_metrics,
+                    )
+                scheduler_init_result.block_until_scheduler_exits()
+            finally:
+                scheduler_init_result.stop_grpc_server()
             return (
                 None,
                 None,
@@ -1384,6 +1454,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 pass
             self._multi_tokenizer_shm = None
         try:
+            scheduler_init_result = getattr(self, "_scheduler_init_result", None)
+            if scheduler_init_result is not None:
+                scheduler_init_result.stop_grpc_server()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
@@ -1487,14 +1560,16 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         return msgspec_to_builtins(
-            {
-                **self.tokenizer_manager.server_args.resolved_dict(),
-                "launch_command": self.tokenizer_manager.server_args.launch_command,
-                **self._scheduler_init_result.scheduler_infos[0],
-                "startup_time": self.tokenizer_manager.startup_time,
-                "internal_states": internal_states,
-                "version": __version__,
-            }
+            redact_watermark_secrets(
+                {
+                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    "launch_command": self.tokenizer_manager.server_args.launch_command,
+                    **self._scheduler_init_result.scheduler_infos[0],
+                    "startup_time": self.tokenizer_manager.startup_time,
+                    "internal_states": internal_states,
+                    "version": __version__,
+                }
+            )
         )
 
     def get_model_info(self):
@@ -1789,7 +1864,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
@@ -1848,7 +1922,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.18",
+                "0.7.1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1856,7 +1930,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.7",
+                "0.4.9",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

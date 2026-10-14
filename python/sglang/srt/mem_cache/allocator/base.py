@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Hashable, Protocol
 
 import torch
 
@@ -75,6 +75,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return PrefillBudget(
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
+
+        ``prefill_tokens`` includes the cached prefix and selected extension.
+        """
+        return 0
 
     def max_new_tokens_for_memory(
         self,
@@ -141,7 +150,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         shortfall = num_tokens - self.available_size()
         if shortfall > 0:
@@ -227,6 +236,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        """Record an asynchronous HiCache transfer completion event if needed."""
+        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

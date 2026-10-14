@@ -134,27 +134,6 @@ impl SwaComponent {
         }
     }
 
-    /// The node's SWA lock-window uuid for the tier, stamping a fresh one if absent.
-    fn ensure_swa_uuid<K: ChildKeyType>(
-        tree_core: &mut UnifiedTreeCore<K>,
-        node_id: NodeIdx_,
-        host: bool,
-    ) -> i64 {
-        match Self::swa_uuid(tree_core.arena.node(node_id), host) {
-            Some(uuid) => uuid,
-            None => {
-                let minted = tree_core.next_swa_uuid_();
-                let node = tree_core.arena.node_mut(node_id);
-                if host {
-                    node.swa_host_uuid = Some(minted);
-                } else {
-                    node.swa_uuid = Some(minted);
-                }
-                minted
-            }
-        }
-    }
-
     /// Nodes whose SWA data needs a host backup, deepest first. Buffer mode
     /// stages one node per FIFO backup intent; cache mode backs up every
     /// device-only node within one sliding window of `node_id`.
@@ -414,7 +393,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
-        let swa_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let swa_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Branch at the last page-aligned Full-KV position past the SWA boundary.
         let page_aligned_full_hit_len =
@@ -823,6 +802,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     break 'step None;
                 }
             }
+            // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,
@@ -1208,7 +1188,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             covered += key_len;
             if covered >= sliding_window_size {
-                swa_uuid = Some(Self::ensure_swa_uuid(tree_core, cur, lock_host));
+                swa_uuid = Some(self.get_or_fill_uuid(tree_core, cur, lock_host));
             }
             cur = parent;
         }
