@@ -855,7 +855,10 @@ class TestAllocationIntegration(CustomTestCase):
     def test_rebootstrap_dispatch_precedes_ready_without_allocating(self):
         receiver = self.receiver()
         receiver.init = Mock()
-        req = SimpleNamespace(build_rebootstrap_payload=lambda: {"rid": "resume"})
+        req = SimpleNamespace(
+            bootstrap_host="prefill",
+            build_rebootstrap_payload=lambda: {"rid": "resume"},
+        )
         entry = DecodeRequest(req=req, kv_receiver=receiver, is_rebootstrap=True)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         dispatched = []
@@ -877,6 +880,7 @@ class TestAllocationIntegration(CustomTestCase):
                 try:
                     receiver = Mock(conclude_state=None)
                     req = SimpleNamespace(
+                        bootstrap_host="prefill",
                         build_rebootstrap_payload=lambda: {"rid": "resume"},
                         time_stats=Mock(),
                     )

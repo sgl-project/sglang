@@ -539,11 +539,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
-            confidence_fn=(
-                self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
-                else None
-            ),
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
@@ -899,13 +894,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -939,7 +927,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
@@ -1075,6 +1063,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_logits=logits_output.next_token_logits,
             layout=layout,
             confidence=confidence,
+            confidence_raw=proposal.confidence_raw,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             draft_block=draft_block,
