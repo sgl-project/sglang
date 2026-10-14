@@ -272,7 +272,7 @@ class TestMambaSpecBoundaryCommit(unittest.TestCase):
             ),
             patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
         ):
-            # Scheduler._build_decode_step, then the verify on its forward view.
+            # StepBuilder.new_decode_step, then the verify on its forward view.
             step.prepare_for_decode()
             spec_prepare_for_decode(step)
             forward_batch = worker_forward_batch(step)

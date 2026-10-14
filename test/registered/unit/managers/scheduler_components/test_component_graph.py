@@ -289,6 +289,7 @@ _PARAM = {
     "PendingSteps": ("pending",),
     "KvResources": ("kv",),
     "KvCapacity": ("capacity",),
+    "Workers": ("tp_worker", "model_worker"),
     "Streams": ("streams",),
     "SchedulerServices": ("services",),
     "IpcChannels": ("ipc_channels",),
@@ -310,6 +311,7 @@ _PARAM = {
     "RequestRegistry": ("request_registry", "abort_request"),
     "ModeOwners": ("mode_owners",),
     "RequestEnqueuer": ("request_enqueuer",),
+    "StepBuilder": ("step_builder",),
 }
 
 # Components in their final form: node -> (module under srt/, class).
@@ -350,6 +352,7 @@ _BUILT = {
         "managers/scheduler_components/request_retirer.py",
         "RequestRetirer",
     ),
+    "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
 }
 
 # The modules whose classes sit below ModeOwners.
@@ -444,7 +447,6 @@ _CALLBACK_SITES = {
         "get_require_mlp_sync",
         _LAMBDA,
     ): 1,
-    ("init_dp_attn_adapter", "SchedulerDPAttnAdapter", "new_step", _BOUND): 1,
     (
         "init_load_inquirer",
         "SchedulerLoadInquirer",
@@ -484,8 +486,6 @@ _CALLBACK_SITES = {
     ): 1,
     ("init_running_status", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
     ("init_running_status", "SchedulerFlushWrapper", "is_fully_idle", _BOUND): 1,
-    ("maybe_init_dllm", "DllmManager", "build_extend_step", _BOUND): 1,
-    ("maybe_init_dllm", "DllmManager", "build_sampling_info", _BOUND): 1,
     ("init_metrics_reporter", "SchedulerMetricsReporter", "scheduler", _SELF): 1,
 }
 

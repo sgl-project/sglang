@@ -215,14 +215,12 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    DecodeRows,
     MultimodalInputs,
     MultimodalProcessorOutput,
     Req,
     ScheduleBatch,
     check_decode_mem,
     commit_step_counters,
-    req_pool_indices_of,
     retract_all,
     retract_decode,
 )
@@ -315,6 +313,7 @@ from sglang.srt.managers.scheduler_components.request_retirer import (
     RequestRetirer,
     make_abort_req,
 )
+from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -358,7 +357,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.penalties import PenaltyStore
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -684,6 +682,8 @@ class Scheduler:
         self.maybe_init_scripted_scheduler_hook()
 
         self.init_request_receiver()
+
+        self.init_step_builder()
 
         self.init_dp_attn_adapter()
 
@@ -1319,9 +1319,6 @@ class Scheduler:
         self.flat_slot = ScheduleSlot()
         # The launched steps whose results are not committed yet.
         self.pending = PendingSteps()
-        # The last decode step's request inputs, shared with the next decode
-        # step of the same requests.
-        self.decode_rows: Optional[DecodeRows] = None
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -2641,6 +2638,18 @@ class Scheduler:
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
+    def init_step_builder(self) -> None:
+        self.step_builder = StepBuilder(
+            kv=self.kv,
+            future_map=self.future_map,
+            counters=self.counters,
+            tp_worker=self.tp_worker,
+            model_worker=self.model_worker,
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            device=self.device,
+        )
+
     def init_dp_attn_adapter(self) -> None:
         # Spec workers have no .model_runner of their own; the prefill graph
         # runner that votes belongs to the target model.
@@ -2653,7 +2662,7 @@ class Scheduler:
             model_runner=target_worker.model_runner,
             flags=self.flags,
             spec_algorithm=self.spec_algorithm,
-            new_step=self._new_step,
+            new_step=self.step_builder.new_step,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
@@ -2839,8 +2848,8 @@ class Scheduler:
             truncation_align_size=self.truncation_align_size,
             context_len=self.model_config.context_len,
             beam_coordinator=self.beam_coordinator,
-            build_extend_step=self.build_extend_step,
-            build_sampling_info=self._build_sampling_info,
+            build_extend_step=self.step_builder.build_extend_step,
+            build_sampling_info=self.step_builder.build_sampling_info,
             request_retirer=self.request_retirer,
         )
 
@@ -4339,7 +4348,9 @@ class Scheduler:
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
-        new_batch = self.build_extend_step(can_run_list, chunked_req=chunked_req)
+        new_batch = self.step_builder.build_extend_step(
+            can_run_list, chunked_req=chunked_req
+        )
 
         # Record prefill stats for logging after forward. The tokens pending
         # prefill once this step launches: the waiting requests it does not
@@ -4382,9 +4393,11 @@ class Scheduler:
                 tree_cache=self.tree_cache,
                 spec_algorithm=self.spec_algorithm,
             ):
-                new_batch.mix_decode_rows(self._build_decode_step(decode_reqs))
+                new_batch.mix_decode_rows(
+                    self.step_builder.new_decode_step(decode_reqs)
+                )
 
-        new_batch.sampling_info = self._build_sampling_info(new_batch.reqs)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(new_batch.reqs)
         return new_batch
 
     def can_schedule_lora_req(
@@ -4451,83 +4464,6 @@ class Scheduler:
             and len(req.output_ids) + num_inflight >= req.sampling_params.max_new_tokens
         )
 
-    def build_extend_step(
-        self,
-        can_run_list: List[Req],
-        chunked_req: Optional[Req] = None,
-        kv_reuse_lens: Optional[List[int]] = None,
-    ) -> ScheduleBatch:
-        """The extend step of the admitted requests: allocated, and each
-        request's chunk admitted."""
-        new_batch = self._new_step(
-            can_run_list, chunked_req=chunked_req, kv_reuse_lens=kv_reuse_lens
-        )
-
-        new_batch.contains_last_prefill_chunk = (
-            chunked_req is None or len(can_run_list) != 1
-        )
-
-        if (
-            get_memory().enable_hierarchical_cache
-            or get_memory().enable_unified_cache_external_linker
-        ):
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
-
-        new_slot_reqs = [req for req in can_run_list if not req.kv.holds_kv]
-        new_batch.prepare_for_extend()
-        if new_slot_reqs and not self.spec_algorithm.is_none():
-            # A slot taken now may still name its previous request's draft
-            # state; forget it before this step's forward publishes the slot.
-            self.future_map.release_slots(
-                torch.tensor([req.kv.req_pool_idx for req in new_slot_reqs])
-            )
-        # Admission of each request's chunk; the build above read the state
-        # before it (a retracted request's encoder replay). The penalty store
-        # (re)sets a penalized request's history row from its outputs.
-        for req in can_run_list:
-            req.admit_prefill_chunk(self.device)
-            self.penalty_store.alloc(req)
-        new_batch.admit_mamba_track()
-
-        if self.tp_worker.model_runner.prefill_aware_swa:
-            for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
-
-        return new_batch
-
-    def _new_step(
-        self,
-        reqs: List[Req],
-        chunked_req: Optional[Req] = None,
-        kv_reuse_lens: Optional[List[int]] = None,
-    ) -> ScheduleBatch:
-        """An empty step of reqs, numbered as the next launch."""
-        return ScheduleBatch.init_new(
-            reqs,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            (not get_schedule().disable_overlap_schedule),
-            self.spec_algorithm,
-            chunked_req=chunked_req,
-            kv_reuse_lens=kv_reuse_lens,
-            forward_iter=self.counters.forward_ct + 1,
-        )
-
-    def _build_decode_step(
-        self,
-        reqs: List[Req],
-        req_pool_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> ScheduleBatch:
-        step = self._new_step(reqs)
-        step.prepare_for_decode(req_pool_indices)
-        self.model_worker.prepare_decode_step(step)
-        return step
-
     def get_decode_step(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         """Build the decode step of the decoding requests, retracting some when
         the step does not fit the KV pool; None skips decode this step."""
@@ -4558,40 +4494,7 @@ class Scheduler:
 
         if not reqs:
             return None
-        slots = [r.kv.req_pool_idx for r in reqs]
-        row_of_slot = self.penalty_store.row_of_slot
-        penalty_rows = [row_of_slot.get(s) for s in slots]
-        rows = self.decode_rows
-        if (
-            rows is None
-            or rows.reqs != reqs
-            or rows.slots != slots
-            or rows.penalty_rows != penalty_rows
-        ):
-            req_pool_indices, req_pool_indices_cpu = req_pool_indices_of(
-                reqs, self.device
-            )
-            rows = self.decode_rows = DecodeRows(
-                reqs=list(reqs),
-                slots=slots,
-                penalty_rows=penalty_rows,
-                req_pool_indices=req_pool_indices,
-                req_pool_indices_cpu=req_pool_indices_cpu,
-                sampling_info=self._build_sampling_info(reqs),
-            )
-        step = self._build_decode_step(
-            reqs, (rows.req_pool_indices, rows.req_pool_indices_cpu)
-        )
-        step.sampling_info = rows.sampling_info
-        return step
-
-    def _build_sampling_info(self, reqs: List[Req]) -> SamplingBatchInfo:
-        return SamplingBatchInfo.build(
-            reqs,
-            self.model_config.vocab_size,
-            self.device,
-            self.penalty_store,
-        )
+        return self.step_builder.build_decode_step(reqs)
 
     def _retract_decode_reqs(
         self, reqs: List[Req], kv_full_retract_flag: bool, slot: ScheduleSlot
@@ -5186,7 +5089,7 @@ class Scheduler:
 
         # Nothing decodes: release the requests the last decode step's inputs
         # still reference.
-        self.decode_rows = None
+        self.step_builder.clear_decode_rows()
 
         # Fully-idle publish, post-flush so the gauge reflects compacted KV.
         # Forced (immediate) so the busy->idle transition is never delayed.

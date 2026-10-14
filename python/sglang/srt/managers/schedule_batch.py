@@ -3564,7 +3564,7 @@ class ScheduleBatch:
 
         if not self.spec_algorithm.is_none():
             # A speculative step allocates in spec_prepare_for_decode once its
-            # draft input is keyed (Scheduler._build_decode_step).
+            # draft input is keyed (StepBuilder.new_decode_step).
             self.orig_seq_lens = self.seq_lens.to(torch.int32)
             return
 
