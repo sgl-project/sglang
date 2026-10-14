@@ -5,14 +5,12 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    List,
-    Optional,
 )
 
 
@@ -34,8 +32,8 @@ def _sanitize_filename_component(value: str) -> str:
     value = re.sub(r"[^\w\-.]", "_", value)
     return value
 
-import torch
 
+import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
@@ -86,17 +84,17 @@ class SchedulerProfilerManager:
             return
 
         self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[Path] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profile_id: Optional[str] = None
+        self.torch_profiler_output_dir: Path | None = None
+        self.profiler_activities: list[str] | None = None
+        self.profile_id: str | None = None
 
-        self.profiler_start_forward_ct: Optional[int] = None
-        self.profiler_target_forward_ct: Optional[int] = None
+        self.profiler_start_forward_ct: int | None = None
+        self.profiler_target_forward_ct: int | None = None
 
-        self.profiler_prefill_ct: Optional[int] = None
-        self.profiler_decode_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_prefill_ct: int | None = None
+        self.profiler_decode_ct: int | None = None
+        self.profiler_target_prefill_ct: int | None = None
+        self.profiler_target_decode_ct: int | None = None
 
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
@@ -108,18 +106,18 @@ class SchedulerProfilerManager:
 
     def _init_profile(
         self,
-        output_dir: Optional[str],
-        start_step: Optional[int],
-        num_steps: Optional[int],
-        activities: Optional[List[str]],
-        with_stack: Optional[bool],
-        record_shapes: Optional[bool],
+        output_dir: str | None,
+        start_step: int | None,
+        num_steps: int | None,
+        activities: list[str] | None,
+        with_stack: bool | None,
+        record_shapes: bool | None,
         profile_by_stage: bool,
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
         detailed_annotations: bool = False,
-        profile_stages: Optional[List[str]] = None,
+        profile_stages: list[str] | None = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
             self.detailed_annotations = detailed_annotations
@@ -189,7 +187,7 @@ class SchedulerProfilerManager:
         set_detailed_annotations_enabled(enabled)
 
     def _start_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: ForwardMode | None = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             self._apply_detailed_annotations(self.detailed_annotations)
@@ -337,7 +335,7 @@ class SchedulerProfilerManager:
             return merge_message
 
     def _stop_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: ForwardMode | None = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             self._apply_detailed_annotations(False)

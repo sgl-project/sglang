@@ -18,12 +18,11 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
+from typing import Any, Literal, Optional, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
 import zmq
-
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -102,11 +101,11 @@ class _BaseConfig(ABC):
         return raw
 
     @classmethod
-    def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_BaseConfig":
+    def from_kv_pairs(cls, pairs: list[str] | None) -> "_BaseConfig":
         return cls(**cls._kv_pairs_to_dict(pairs))
 
     @classmethod
-    def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
+    def _kv_pairs_to_dict(cls, pairs: list[str] | None) -> dict:
         if not pairs:
             return {}
 
@@ -138,7 +137,7 @@ _DEFAULT_EXP_NAME_PREFIX = "dump_"
 @dataclass(frozen=True)
 class DumperConfig(_BaseConfig):
     enable: bool = False
-    filter: Optional[str] = None
+    filter: str | None = None
     dir: str = "/tmp/dumper"
     enable_output_file: bool = True
     enable_output_console: bool = True
@@ -146,16 +145,16 @@ class DumperConfig(_BaseConfig):
     enable_grad: bool = False
     enable_model_value: bool = False
     enable_model_grad: bool = False
-    exp_name: Optional[str] = None
+    exp_name: str | None = None
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
     non_intrusive_mode: str = "core"
-    source_patcher_config: Optional[str] = None
+    source_patcher_config: str | None = None
     grafter_enable: bool = False
     grafter_role: str = ""  # required if enabled: "baseline" or "target"
-    grafter_b2t_filter: Optional[str] = None  # names flowing baseline -> target
-    grafter_t2b_filter: Optional[str] = None  # names flowing target -> baseline
+    grafter_b2t_filter: str | None = None  # names flowing baseline -> target
+    grafter_t2b_filter: str | None = None  # names flowing target -> baseline
     grafter_master_address: str = ""  # required if enabled
     grafter_master_port: int = -1  # required if enabled (positive port)
     grafter_baseline_world_size: int = -1  # required if enabled
@@ -165,7 +164,7 @@ class DumperConfig(_BaseConfig):
     grafter_timeout: int = 300
     # Fully-qualified Python path "pkg.subpkg.module.fn_name"
     # None -> use the default identity-by-rank fallback in _Grafter._default_transform.
-    grafter_transform_path: Optional[str] = None
+    grafter_transform_path: str | None = None
     # When True, append parallel-rank tags (pp_rank/tp_rank/...) to dump filenames so
     # tensors from different ranks do not collide when dumped into a shared directory.
     include_parallel_rank_in_filename: bool = False
@@ -206,7 +205,7 @@ class DumperConfig(_BaseConfig):
             )
 
     @property
-    def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
+    def server_port_parsed(self) -> int | Literal["reuse"] | None:
         raw = self.server_port
         if raw == "reuse":
             return "reuse"
@@ -224,7 +223,7 @@ class _DumperState:
     dump_index: int = 0
     step: int = 0
     global_ctx: dict = field(default_factory=dict)
-    captured_output_data: Optional[dict] = None
+    captured_output_data: dict | None = None
     cleanup_previous_handled: bool = False
 
 
@@ -289,9 +288,9 @@ class _Dumper:
         name: str,
         value,
         save: bool = True,
-        dims: Optional[str] = None,
-        dims_grad: Optional[str] = None,
-        grafter_extras: Optional[dict] = None,
+        dims: str | None = None,
+        dims_grad: str | None = None,
+        grafter_extras: dict | None = None,
         **kwargs,
     ) -> None:
         value_meta: dict = {}
@@ -323,8 +322,8 @@ class _Dumper:
         model: "torch.nn.Module",
         name_prefix: str = "param",
         save: bool = True,
-        get_grad: Optional[Callable] = None,
-        step: Optional[int] = None,
+        get_grad: Callable | None = None,
+        step: int | None = None,
         **kwargs,
     ) -> None:
         for param_name, param in model.named_parameters():
@@ -366,7 +365,7 @@ class _Dumper:
 
     def ctx(
         self,
-        _extractor: Optional[Callable[..., dict]] = None,
+        _extractor: Callable[..., dict] | None = None,
         **static_ctx: Any,
     ) -> Callable:
         """Decorator that sets context before calling the wrapped function and clears it after.
@@ -478,11 +477,11 @@ class _Dumper:
         enable_future_grad: bool,
         value_tag: str,
         grad_tag: str,
-        value_meta_only_fields: Optional[dict] = None,
-        grad_meta_only_fields: Optional[dict] = None,
-        grafter_extras: Optional[dict] = None,
-        get_grad: Optional[Callable] = None,
-        step: Optional[int] = None,
+        value_meta_only_fields: dict | None = None,
+        grad_meta_only_fields: dict | None = None,
+        grafter_extras: dict | None = None,
+        get_grad: Callable | None = None,
+        step: int | None = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -548,7 +547,7 @@ class _Dumper:
         tensor,
         extra_kwargs: dict,
         save: bool,
-        meta_only_fields: Optional[dict] = None,
+        meta_only_fields: dict | None = None,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
@@ -581,8 +580,8 @@ class _Dumper:
         tags: dict,
         value,
         save: bool,
-        step: Optional[int] = None,
-        meta_only_fields: Optional[dict] = None,
+        step: int | None = None,
+        meta_only_fields: dict | None = None,
     ) -> None:
         self._ensure_exp_name()
         self._state.dump_index += 1
@@ -696,7 +695,7 @@ class _NonIntrusiveDumper:
     @classmethod
     def _detect_module_ctx(
         cls, module_name: str, module: "torch.nn.Module"
-    ) -> Optional[dict]:
+    ) -> dict | None:
         match = cls._LAYER_NAME_RE.fullmatch(module_name)
         if match:
             for plugin in _plugins:
@@ -852,7 +851,7 @@ class GraftTransformInput:
     received_list: "list[torch.Tensor]"
     # Parallel list of per-sender `grafter_extras` (the dict passed to
     # dumper.dump on each sender; None if the sender omitted it).
-    received_extras_list: "list[Optional[dict]]"
+    received_extras_list: "list[dict | None]"
     # Recv side's local tensor that will be copy_'d into.
     target: "torch.Tensor"
 
@@ -881,7 +880,7 @@ class _Grafter:
         return self._config.grafter_enable
 
     def maybe_intercept(
-        self, *, value: Any, tags: dict, extras: Optional[dict] = None
+        self, *, value: Any, tags: dict, extras: dict | None = None
     ) -> None:
         """Intercept a dumper.dump call. `extras` is per-call auxiliary data
         (e.g., shard layout, dtype hint) that the sender attaches and the
@@ -989,7 +988,7 @@ class _Grafter:
         return gathered[cfg.grafter_baseline_world_size :]
 
     @staticmethod
-    def _match(expr: Optional[str], tags: dict) -> bool:
+    def _match(expr: str | None, tags: dict) -> bool:
         if expr is None:
             return False
         return _evaluate_filter(expr, tags)
@@ -1186,7 +1185,7 @@ def _get_default_exp_name(timeout_seconds: int = 60):
     return object_list[0]
 
 
-def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
+def _cleanup_old_dumps(base_dir: Path, exp_name: str | None = None) -> None:
     import shutil
 
     if _get_rank() == 0:
@@ -1355,9 +1354,7 @@ class _SafeRegexWrapper:
         # Only allow internal Python protocol lookups (dunder methods).
         if name.startswith("__") and name.endswith("__"):
             return object.__getattribute__(self, name)
-        raise AttributeError(
-            f"Access to '{name}' is not allowed in filter expressions"
-        )
+        raise AttributeError(f"Access to '{name}' is not allowed in filter expressions")
 
 
 _FILTER_BUILTINS: dict[str, Any] = {
@@ -1427,7 +1424,9 @@ def _safe_eval_node(node, namespace: dict[str, Any]) -> Any:
             right = _safe_eval_node(comparator, namespace)
             op_func = _SAFE_COMPARE_OPS.get(type(op))
             if op_func is None:
-                raise ValueError(f"Comparison operator {type(op).__name__} is not allowed")
+                raise ValueError(
+                    f"Comparison operator {type(op).__name__} is not allowed"
+                )
             if not op_func(left, right):
                 return False
             left = right
@@ -1517,7 +1516,7 @@ def _compute_static_meta():
             result[f"{plugin.name}_parallel_info"] = info
 
     for plugin in _plugins:
-        tokenizer_path: Optional[str] = plugin.get_tokenizer_path()
+        tokenizer_path: str | None = plugin.get_tokenizer_path()
         if tokenizer_path is not None:
             result["tokenizer_path"] = tokenizer_path
             break
@@ -1695,7 +1694,7 @@ class _RpcBroadcastBase:
     def __getattr__(self, method_name: str):
         raise NotImplementedError
 
-    def __init__(self, handles: List[_ZmqRpcHandle]):
+    def __init__(self, handles: list[_ZmqRpcHandle]):
         self._handles = handles
 
 
@@ -1705,7 +1704,7 @@ class _ZmqRpcBroadcast(_RpcBroadcastBase):
     Returns a list of results, one per rank (ordered by rank).
     """
 
-    def __init__(self, handles: List[_ZmqRpcHandle]):
+    def __init__(self, handles: list[_ZmqRpcHandle]):
         self._handles = handles
 
     def __getattr__(self, method_name: str):
@@ -1721,7 +1720,7 @@ class _ZmqRpcBroadcast(_RpcBroadcastBase):
 # --------------------------------- copied code (avoid dependency) --------------------------------------
 
 
-def _get_local_ip_by_remote() -> Optional[str]:
+def _get_local_ip_by_remote() -> str | None:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -1852,19 +1851,19 @@ class _FrameworkPlugin(ABC):
     @abstractmethod
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return converted dict, or None if this plugin doesn't handle the value."""
         ...
 
     @abstractmethod
-    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+    def detect_layer_id(self, module: "torch.nn.Module") -> int | None:
         """Return 0-indexed layer_id, or None if not detectable."""
         ...
 
     def core_fields(self) -> frozenset[str]:
         return frozenset()
 
-    def get_tokenizer_path(self) -> Optional[str]:
+    def get_tokenizer_path(self) -> str | None:
         return None
 
     def detect_recompute_status(self) -> _RecomputeStatus:
@@ -1872,7 +1871,7 @@ class _FrameworkPlugin(ABC):
 
     def transform_model_param_name(
         self, model: "torch.nn.Module", param_name: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Return a rewritten parameter name, or None to keep the original.
 
         Used by ``dump_model`` to canonicalize parameter names across parallel
@@ -1936,7 +1935,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         if not self._available:
             return None
 
@@ -1971,7 +1970,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         return None
 
-    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+    def detect_layer_id(self, module: "torch.nn.Module") -> int | None:
         if hasattr(module, "layer_id"):
             return module.layer_id
         return None
@@ -1981,7 +1980,7 @@ class _SGLangPlugin(_FrameworkPlugin):
             {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
         )
 
-    def get_tokenizer_path(self) -> Optional[str]:
+    def get_tokenizer_path(self) -> str | None:
         if not self._available:
             return None
 
@@ -2059,7 +2058,7 @@ class _MegatronPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         if not self._available:
             return None
         if isinstance(value, self.PackedSeqParams):
@@ -2070,7 +2069,7 @@ class _MegatronPlugin(_FrameworkPlugin):
             }
         return None
 
-    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+    def detect_layer_id(self, module: "torch.nn.Module") -> int | None:
         if hasattr(module, "layer_number"):
             return module.layer_number - 1
         return None
@@ -2096,7 +2095,7 @@ class _MegatronPlugin(_FrameworkPlugin):
 
     def transform_model_param_name(
         self, model: "torch.nn.Module", param_name: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Rewrite pipeline-local layer indices to global ones in a param name.
 
         With pipeline parallelism, ``model.named_parameters()`` reports layer

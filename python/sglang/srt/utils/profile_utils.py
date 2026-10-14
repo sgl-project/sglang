@@ -3,9 +3,9 @@ import os
 import re
 import time
 from abc import ABC
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 
 def _sanitize_filename_component(value: str) -> str:
@@ -26,8 +26,8 @@ def _sanitize_filename_component(value: str) -> str:
     value = re.sub(r"[^\w\-.]", "_", value)
     return value
 
-import torch
 
+import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -112,17 +112,17 @@ class ProfileManager:
     def configure(
         self,
         *,
-        output_dir: Optional[str],
-        start_step: Optional[int],
-        num_steps: Optional[int],
-        activities: Optional[List[str]],
-        with_stack: Optional[bool],
-        record_shapes: Optional[bool],
+        output_dir: str | None,
+        start_step: int | None,
+        num_steps: int | None,
+        activities: list[str] | None,
+        with_stack: bool | None,
+        record_shapes: bool | None,
         profile_by_stage: bool,
         profile_id: str,
         merge_profiles: bool,
         profile_prefix: str,
-        profile_stages: Optional[List[str]] = None,
+        profile_stages: list[str] | None = None,
         detailed_annotations: bool = False,
     ):
         self.detailed_annotations = detailed_annotations
@@ -161,7 +161,7 @@ class ProfileManager:
     def manual_stop(self):
         raise NotImplementedError("manually stop is only supported yet")
 
-    def _do_start(self, stage: Optional[str] = None):
+    def _do_start(self, stage: str | None = None):
         logger.info(
             f"Profiling starts{f' for {stage}' if stage else ''}. "
             f"Traces will be saved to: {self.profiler_kwargs['output_dir']} "
@@ -221,11 +221,11 @@ class _StageBasedTrigger:
         self.on_start = on_start
         self.on_stop = on_stop
 
-        self.running_state: Optional[_StageBasedTrigger._RunningState] = None
+        self.running_state: _StageBasedTrigger._RunningState | None = None
         # When a stage is in the dict, it means it is being or should be executed
-        self.stage_configs: Dict[str, _StageBasedTrigger._StageConfig] = {}
+        self.stage_configs: dict[str, _StageBasedTrigger._StageConfig] = {}
 
-    def configure(self, num_steps: int, interesting_stages: List[str]):
+    def configure(self, num_steps: int, interesting_stages: list[str]):
         assert self.running_state is None
         self.stage_configs = {
             stage: self._StageConfig(target_count=num_steps)
@@ -303,7 +303,7 @@ class _ProfilerBase(ABC):
 
 
 class _ProfilerList(_ProfilerBase):
-    def __init__(self, inners: List[_ProfilerBase]):
+    def __init__(self, inners: list[_ProfilerBase]):
         self.inners = inners
 
     def start(self):
@@ -424,12 +424,12 @@ class _ProfilerMemory(_ProfilerConcreteBase):
 class _ProfilerCudart(_ProfilerConcreteBase):
     def start(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStart")
+            logger.info("Call cudaProfilerStart")
             torch.cuda.cudart().cudaProfilerStart()
 
     def stop(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStop")
+            logger.info("Call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
 
 
