@@ -32,7 +32,7 @@ _CONFIGS = (
     (_MAX_M, (32, 32, 512, 8, 4)),
 )
 # FP32 weights on CUDA (FP32 router gates) use the FP32 row path only; above
-# 8 rows router_gemm_bf16x3 is faster. Swept for N=256, K=5120 on H200 and B300.
+# 8 rows router_gemm_bf16x3_cublas is faster. Swept for N=256, K=5120 on H200 and B300.
 _CUDA_FP32_CONFIGS = ((8, (1, 16, 128, 8, 8)),)
 
 
@@ -228,7 +228,7 @@ def split_fp32_to_bf16x3(
 _split_scratch: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
 
 
-def router_gemm_bf16x3(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """[M, K] bf16 x [N, K] fp32 router logits on BF16 tensor cores.
 
     The fp32 weight is split per call, so in-place weight updates take effect

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.router_gemv import (
-    router_gemm_bf16x3,
+    router_gemm_bf16x3_cublas,
     router_gemv,
     router_gemv_supported,
     split_fp32_to_bf16x3,
@@ -71,7 +71,7 @@ def test_fp32_gate_gemv_stops_at_its_row_path():
 @pytest.mark.parametrize("m", [9, 64, 1024, 16384])
 def test_bf16x3_router_gemm_matches_fp64(m):
     x, w = _inputs(m)
-    out = router_gemm_bf16x3(x, w)
+    out = router_gemm_bf16x3_cublas(x, w)
     assert out.dtype == torch.float32
     # Measured up to about 5e-5 (tensor-core accumulation); an fp32 SGEMM is about 2e-5.
     assert _max_error(out, x, w) < 1e-4
@@ -81,10 +81,10 @@ def test_bf16x3_router_gemm_matches_fp64(m):
 @requires_cuda
 def test_bf16x3_router_gemm_reads_in_place_weight_updates():
     x, w = _inputs(64)
-    router_gemm_bf16x3(x, w)
+    router_gemm_bf16x3_cublas(x, w)
     # Online weight updates copy into the gate in place, without a reload hook.
     w.copy_(-2 * w)
-    assert _max_error(router_gemm_bf16x3(x, w), x, w) < 1e-4
+    assert _max_error(router_gemm_bf16x3_cublas(x, w), x, w) < 1e-4
 
 
 if __name__ == "__main__":

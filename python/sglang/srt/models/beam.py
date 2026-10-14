@@ -29,7 +29,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
 )
 from sglang.kernels.ops.elementwise import BeamAttentionGateOp
 from sglang.kernels.ops.gemm.router_gemv import (
-    router_gemm_bf16x3,
+    router_gemm_bf16x3_cublas,
     router_gemv,
     router_gemv_supported,
 )
