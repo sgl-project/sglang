@@ -3375,11 +3375,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
         _use_cp = is_cp_active(forward_batch)
-        # DWDP keeps every token on-rank (self.mlp runs the MoE with no cross-rank
-        # combine), so the DP-attn gather/scatter around the MoE must be skipped --
-        # under SGLANG_SCHEDULER_SKIP_ALL_GATHER the global DP buffer /
-        # global_num_tokens_gpu are never populated, so gathering here reads a
-        # None cumsum / an unsized buffer.
+        # DWDP keeps every token on-rank, so skip the DP-attn gather/scatter around
+        # the MoE: under SKIP_ALL_GATHER its global DP buffer is never populated.
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -4291,10 +4288,8 @@ class DeepseekV4Model(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            # DWDP (and non-dp-attn) keep every token on-rank: no cross-rank
-            # gather, so the global token ids are just the local ids. Under
-            # SGLANG_SCHEDULER_SKIP_ALL_GATHER the global DP buffer / global_num_tokens
-            # are never populated, so gathering here would crash on a None cumsum.
+            # DWDP / non-dp-attn: tokens stay on-rank, so the global ids are just
+            # the local ones (no DP buffer to gather from under SKIP_ALL_GATHER).
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None

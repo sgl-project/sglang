@@ -192,12 +192,11 @@ class DwdpManager:
 
     @staticmethod
     def _memory_major_permutation(tensor: torch.Tensor) -> Optional[List[int]]:
-        """Returns a permutation that makes `tensor` contiguous, or None if already so.
-        DeepGEMM's `transform_sf_into_required_layout` hands back mn-major expert
-        scales — logically (E, n, sk) but laid out as (E, sk, n) — and NCCL's
-        all_gather rejects non-contiguous tensors. Permuting dims by descending
-        stride recovers the contiguous view; the expert dim must stay outermost so
-        the gather still concatenates along experts.
+        """Return a permutation making `tensor` contiguous, or None if already so.
+
+        DeepGEMM hands back mn-major expert scales (logical (E, n, sk), stored
+        (E, sk, n)), which NCCL rejects; sorting dims by descending stride recovers
+        the contiguous view while keeping experts outermost for the gather.
         """
         if tensor.is_contiguous():
             return None
@@ -218,10 +217,7 @@ class DwdpManager:
 
         for li, experts in moe_layers:
             for pname, data in experts.named_per_expert_tensors(local_experts):
-                # Gather in memory-major order, then restore
-                # the logical dim order so the kernel still sees the layout it
-                # was given (mn-major for DeepGEMM ue8m0 scales, plain
-                # contiguous otherwise).
+                # Gather in memory-major order, then restore the logical dim order.
                 perm = self._memory_major_permutation(data)
                 send = data if perm is None else data.permute(perm)
 
