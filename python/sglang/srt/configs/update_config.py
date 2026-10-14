@@ -296,6 +296,20 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config, moe_intermediate_attr, intermediate_padding_size
         )
 
+    if hasattr(model_config.hf_config, "auto_map") and isinstance(model_config.hf_config.auto_map, dict):
+        auto_config_val = model_config.hf_config.auto_map.get("AutoConfig")
+        if auto_config_val is not None and "MiMoV2Config" in auto_config_val:
+            vision_config = getattr(model_config.hf_config, "vision_config", None)
+            if isinstance(vision_config, dict):
+                from sglang.srt.models.mimo_vl import MiMoVLVisionConfig
+
+                vision_config = dict(vision_config)
+                vision_config.setdefault(
+                    "model_type",
+                    getattr(model_config.hf_config, "vision_model_type", "mimovl"),
+                )
+                model_config.hf_config.vision_config = MiMoVLVisionConfig.from_dict(vision_config)
+
     multimodal_config = [
         [
             model_config.hf_config,
@@ -310,6 +324,7 @@ def adjust_config_with_unaligned_cpu_tp(
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen4_exp", "num_heads"],
         [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
+        [model_config.hf_config, "vision_config", "mimovl", "num_heads"],
         [
             model_config.hf_config,
             "vision_config",
