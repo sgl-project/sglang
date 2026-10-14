@@ -37,6 +37,7 @@ class FlowRolloutController:
         gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
         latents_shape: tuple,
+        ode_transition: Callable[..., torch.Tensor] | None = None,
     ) -> None:
         self.sde_type = sde_type
         self.noise_level = noise_level
@@ -55,6 +56,10 @@ class FlowRolloutController:
         # never divides by 1 - sigma = 0.
         self.sigma_max = sigmas[min(1, len(sigmas) - 1)].item()
         self.latents_shape = latents_shape
+        # The model's own deterministic update, called as
+        # ode_transition(model_output=, sample=, step_index=) on ODE steps;
+        # None means the flow-matching Euler update sample + dt * model_output.
+        self.ode_transition = ode_transition
         self.noise_buffer: torch.Tensor | None = None
 
         self.local_log_prob_sum: list[torch.Tensor] = []
@@ -299,7 +304,12 @@ class FlowRolloutController:
             log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
         elif effective_sde_type == "ode":
-            prev_sample = sample + dt * model_output
+            if self.ode_transition is None:
+                prev_sample = sample + dt * model_output
+            else:
+                prev_sample = self.ode_transition(
+                    model_output=model_output, sample=sample, step_index=step_index
+                )
             prev_sample_mean = prev_sample
             variance_noise = torch.zeros_like(model_output)
             noise_std_dev = torch.zeros(
