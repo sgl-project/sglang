@@ -1250,4 +1250,44 @@ mod tests {
         ]);
         assert_eq!(unsupported(messages), None);
     }
+
+    #[test]
+    fn stream_chunks_repeat_the_stream_created() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let settings = OpenAiSettings::default();
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        // A `created` far in the past stands in for the clock ticking mid-stream:
+        // a chunk that re-reads the clock would report a different second.
+        responder.created = 1;
+        let meta = |finish: Value| json!({"id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1});
+        let mut events = Vec::new();
+        for frame in [
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(Value::Null)}).to_string(),
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(json!({"type": "stop"}))})
+                .to_string(),
+            "[DONE]".into(),
+        ] {
+            events.extend(responder.stream_data(frame.as_bytes()).unwrap());
+        }
+        let created: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .map(|chunk| chunk["created"].clone())
+            .collect();
+        assert!(created.len() > 1, "{events:?}");
+        assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
 }

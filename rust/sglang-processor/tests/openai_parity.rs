@@ -180,16 +180,10 @@ fn check_case(
                     reply_json(reply.status, &reply.body),
                     case["openai"].clone(),
                 ),
-                None => {
-                    let events: Vec<Value> = events.iter().map(|e| event_json(e)).collect();
-                    // `_generate_chat_stream` stamps every chunk with one `created`.
-                    let created: Vec<&Value> =
-                        events.iter().filter_map(|e| e.get("created")).collect();
-                    if created.windows(2).any(|pair| pair[0] != pair[1]) {
-                        return Err(format!("stream chunks differ in created: {created:?}"));
-                    }
-                    (json!({"events": events}), case["openai"].clone())
-                }
+                None => (
+                    json!({"events": events.iter().map(|e| event_json(e)).collect::<Vec<_>>()}),
+                    case["openai"].clone(),
+                ),
             }
         }
         None => {
