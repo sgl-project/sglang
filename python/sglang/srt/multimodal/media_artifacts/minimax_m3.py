@@ -29,31 +29,3 @@ class MiniMaxM3ImageArtifact:
             self.grid_thw,
             self.feature,
         )
-
-
-class MiniMaxM3CachedImageProcessor:
-    """Reuse grid metadata while the HF processor composes the current prompt.
-
-    No pixels are concatenated here: each request's items reference the ordered
-    artifacts directly. The wrapped processor supplies token expansion settings.
-    """
-
-    def __init__(self, processor, artifacts):
-        self.processor = processor
-        self.artifacts = artifacts
-
-    def __getattr__(self, name):
-        return getattr(self.processor, name)
-
-    def fetch_images(self, images):
-        # These are request-local image placeholders, never URLs to reload.
-        return images
-
-    def __call__(self, images, **kwargs):
-        if len(images) != len(self.artifacts):
-            raise ValueError("Expected one MiniMax M3 artifact per image")
-        return {
-            "image_grid_thw": torch.tensor(
-                [artifact.grid_thw for artifact in self.artifacts], dtype=torch.long
-            )
-        }
