@@ -185,8 +185,11 @@ class DecodeReqToTokenPool:
 
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
-        self._alloc_size = size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
+        from sglang.srt.mem_cache.request_pool_budget import request_mapping_shape
+
+        self._alloc_size, self.max_context_len = request_mapping_shape(
+            size + pre_alloc_size, max_context_len
+        )
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):

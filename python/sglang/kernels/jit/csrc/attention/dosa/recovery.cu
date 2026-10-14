@@ -1,0 +1,306 @@
+// One original H32 arithmetic/TMEM implementation for both modes.
+#include "score.cuh"
+#include <torch/extension.h>
+#include "geometry.cuh"
+namespace dosa_replay_layout {
+__device__ __forceinline__ int logical_extent(const int* logical_nk,
+                                             int storage_capacity) {
+  return logical_nk ? *logical_nk : storage_capacity;
+}
+
+__device__ __forceinline__ bool valid_interval(int begin, int end,
+                                              int logical_nk,
+                                              int storage_capacity) {
+  return logical_nk >= 0 && logical_nk <= storage_capacity &&
+         begin >= 0 && begin <= end && end <= logical_nk;
+}
+}  // namespace dosa_replay_layout
+
+#include "score.cuh"
+namespace dosa_h32_replay {
+using namespace certicascade_streaming_exact;
+
+__device__ __forceinline__ int swizzle(int row, int vec) {
+  return row * 8 + (vec ^ (row % 8));
+}
+
+// Both recovery policies issue the same H32 packet and consume the same TMEM
+// result. The caller retains its active-row reduction and output publication.
+template <class Shared, class Inputs>
+__device__ __forceinline__ void load_packet(
+    Shared& s, const Inputs& a, int64_t key, bool active,
+    int t, int tm, int seq, float (&acc)[kHeads]) {
+  // No out-of-interval K/scale read, including a partial final packet.
+  #pragma unroll
+  for(int v=0;v<8;++v)
+    reinterpret_cast<uint4*>(s.keys)[swizzle(t,v)]=active
+        ? reinterpret_cast<const uint4*>(a.k+uint64_t(key)*128)[v]
+        : make_uint4(0,0,0,0);
+  s.scale[t]=active?a.scale[key]:0.0f;
+  cutlass::arch::fence_view_async_shared();
+  __syncthreads();
+  if(t==0) {
+    deep_gemm::ptx::tcgen05_after_thread_sync();
+    issue_h32_mma<128,kHeads>(reinterpret_cast<cutlass::float_e4m3_t*>(s.keys),
+        reinterpret_cast<cutlass::float_e4m3_t*>(s.q),0,tm,
+        cute::cast_smem_ptr_to_uint(&s.done));
+  }
+  s.done.wait(seq&1);
+  deep_gemm::ptx::tcgen05_after_thread_sync();
+  tmem_load_heads(tm,acc);
+}
+}  // namespace dosa_h32_replay
+
+namespace partitioned_h32_replay {
+using namespace certicascade_streaming_exact;
+using Barrier = cutlass::arch::ClusterTransactionBarrier;
+struct alignas(1024) Smem {
+  alignas(1024) uint8_t keys[128*128], q[kHeads*128];
+  alignas(128) float weights[kHeads], scale[128];
+  Barrier done;
+  uint32_t tmem;
+  int job;
+};
+struct Args {
+  const uint8_t *q, *k;
+  const float *scale, *weights;
+  const int *starts, *ends;
+  int *error;
+  float *dense;
+  int *counts;
+  int nk;  // Physical K storage and dense row pitch.
+  const int2* tasks;
+  int* state;
+  int* row_slot;
+  float* leaf;
+  int* fast_rows;
+  int* fast_state;
+  int* finite;
+  int* leaf_lengths;
+  int chunks;
+  const int* logical_nk;
+};
+using dosa_h32_replay::swizzle;
+
+
+constexpr int PartitionKeys=4096;
+// One reservation per failed query; normal rows never read Q/K or emit jobs.
+__global__ void prepare_jobs(Args a,int nq,int2*tasks){
+  int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=nq)return;
+  a.counts[row]=0;a.row_slot[row]=-1;
+  if(a.error[row]==0)return;
+  int begin=a.starts[row],end=a.ends[row];
+  int logical=dosa_replay_layout::logical_extent(a.logical_nk,a.nk);
+  if(!dosa_replay_layout::valid_interval(begin,end,logical,a.nk)){atomicOr(a.error+row,2);return;}
+  if(end>0){
+    int slot=atomicAdd(a.state+2,1);a.row_slot[row]=slot;
+    if(slot<8){a.state[11+slot]=row;if(begin>0||end<2048)atomicOr(a.state+3+slot,1);}
+  }
+  int chunks=int((int64_t(end)-begin+PartitionKeys-1)/PartitionKeys);
+  chunks=max(chunks,1); // An empty visible interval can still need its -Inf prefix.
+  int base=atomicAdd(a.state,chunks);
+  for(int j=0;j<chunks;++j)tasks[base+j]=make_int2(row,int(int64_t(begin)+int64_t(j)*PartitionKeys));
+}
+CUTLASS_GLOBAL void __launch_bounds__(128,4) replay_worker(Args a){
+  const int t=threadIdx.x,warp=t/32,task_count=a.state[0];
+  if(blockIdx.x>=task_count)return;
+  extern __shared__ __align__(1024) uint8_t buf[];
+  auto&s=*reinterpret_cast<Smem*>(buf);
+  if(t==0){s.done.init(1);cutlass::arch::fence_barrier_init();}
+  if(warp==0){cute::TMEM::Allocator1Sm().allocate(kHeads,&s.tmem);cute::TMEM::Allocator1Sm().release_allocation_lock();}
+  __syncthreads();
+  const int tm=deep_gemm::ptx::ld_shared(&s.tmem);
+  int seq=0;
+  for(;;){
+    if(t==0)s.job=atomicAdd(a.state+1,1);
+    __syncthreads();
+    int job=s.job;
+    if(job>=task_count)break;
+    int2 task=a.tasks[job];int row=task.x;
+    int begin=a.starts[row],end=a.ends[row],segment_begin=task.y;
+    int segment_end=int(min(int64_t(end),int64_t(segment_begin)+PartitionKeys));
+    float*dst=a.dense+uint64_t(row)*a.nk;
+    int fast_slot=a.row_slot[row];
+    bool emit_leaf=a.state[2]<=8&&fast_slot>=0&&fast_slot<8;
+    // Exactly the first partition owns the original-ID -Inf prefix. Other
+    // partitions write only their disjoint visible ranges; no clearing race.
+    if(segment_begin==begin)for(int64_t key=t;key<begin;key+=128)dst[key]=-INFINITY;
+    if(segment_begin>=segment_end){__syncthreads();continue;}
+  for(int i=t;i<kHeads*8;i+=128)
+    reinterpret_cast<uint4*>(s.q)[swizzle(i/8,i%8)]=
+        reinterpret_cast<const uint4*>(a.q+uint64_t(row)*kHeads*128)[i];
+  if(t<kHeads)s.weights[t]=a.weights[row*kHeads+t];
+  __syncthreads();
+  for(int64_t first=segment_begin;first<segment_end;first+=128,++seq) {
+    const int64_t key=first+t;
+    const bool active=key<segment_end;
+    float acc[kHeads];
+    dosa_h32_replay::load_packet(s, a, key, active, t, tm, seq, acc);
+    if(active){
+      float score=exact_h32_reduce(acc,s.weights,s.scale[t]);dst[key]=score;
+      if(emit_leaf){
+        a.leaf[uint64_t(fast_slot)*a.chunks*32768+key]=score;
+        if(!isfinite(score))atomicOr(a.state+3+fast_slot,1);
+      }
+    }
+    deep_gemm::ptx::tcgen05_before_thread_sync();
+    __syncthreads();
+  }
+
+  }
+  if(warp==0)cute::TMEM::Allocator1Sm().free(tm,kHeads);
+}
+// Publish counts only after every worker finished all required dense writes.
+__global__ void publish_counts(Args a,int nq){
+  int index=blockIdx.x*blockDim.x+threadIdx.x,total=a.state[2];
+  if(index<nq){
+    int count=0;
+    if(a.error[index]!=0){
+      int begin=a.starts[index],end=a.ends[index];
+      int logical=dosa_replay_layout::logical_extent(a.logical_nk,a.nk);
+      if(dosa_replay_layout::valid_interval(begin,end,logical,a.nk))count=end;
+    }
+    a.counts[index]=count;
+  }
+  if(index==0)*a.fast_state=total;
+  if(index<8){
+    a.fast_rows[index]=index<total?a.state[11+index]:-1;
+    a.finite[index]=total<=8&&index<total&&a.state[3+index]==0;
+  }
+  if(index<8*a.chunks){
+    int slot=index/a.chunks,seg=index%a.chunks;
+    bool valid=total<=8&&slot<total&&a.state[3+slot]==0;
+    a.leaf_lengths[index]=valid?max(0,min(32768,a.ends[a.state[11+slot]]-seg*32768)):0;
+  }
+}
+} // namespace partitioned_h32_replay
+static void replay_and_leaf_impl(torch::Tensor q,torch::Tensor k,torch::Tensor scale,torch::Tensor weights,
+            torch::Tensor starts,torch::Tensor ends,torch::Tensor error_status,
+            torch::Tensor dense_scores,torch::Tensor counts,torch::Tensor leaf,torch::Tensor fast_rows,
+            torch::Tensor fast_state,torch::Tensor finite,torch::Tensor leaf_lengths,
+            torch::Tensor logical_nk) {
+  using namespace partitioned_h32_replay;
+  c10::cuda::CUDAGuard guard(q.device());
+  const int64_t nq=q.size(0), nk=k.size(0);
+  // Owned Q[<=512,H,128]/K[Kcap,128] FP8, F32 dense rows and scales,
+  // I32 row status/intervals and the immutable I32[1] live extent. Kcap<=2^20.
+  // Leaf storage is F32[8*ceil(Kcap/32768),32768] with independent I32 metadata.
+  // All buffers are retained by the owner's recovery graph on this stream.
+  const int* logical=logical_nk.data_ptr<int>();
+  const int chunks=int((nk+32767)/32768);
+  const int64_t max_tasks=nq*std::max<int64_t>(1,(nk+PartitionKeys-1)/PartitionKeys);
+  const int blocks=int(std::min<int64_t>(max_tasks,4*at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount));
+  auto tasks=torch::empty({max_tasks,2},error_status.options());
+  auto state=torch::zeros({19},error_status.options());
+  auto row_slot=torch::empty({nq},error_status.options());
+  Args a{static_cast<const uint8_t*>(q.data_ptr()),static_cast<const uint8_t*>(k.data_ptr()),
+      scale.data_ptr<float>(),weights.data_ptr<float>(),starts.data_ptr<int>(),ends.data_ptr<int>(),
+      error_status.data_ptr<int>(),dense_scores.data_ptr<float>(),counts.data_ptr<int>(),int(nk),
+      reinterpret_cast<const int2*>(tasks.data_ptr<int>()),state.data_ptr<int>(),row_slot.data_ptr<int>(),
+      leaf.data_ptr<float>(),fast_rows.data_ptr<int>(),fast_state.data_ptr<int>(),finite.data_ptr<int>(),leaf_lengths.data_ptr<int>(),chunks,logical};
+  auto stream=at::cuda::getCurrentCUDAStream();
+  prepare_jobs<<<(nq+127)/128,128,0,stream>>>(a,int(nq),reinterpret_cast<int2*>(tasks.data_ptr<int>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(replay_worker,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(Smem)));
+  replay_worker<<<blocks,128,sizeof(Smem),stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  publish_counts<<<(std::max<int64_t>(nq,8*chunks)+127)/128,128,0,stream>>>(a,int(nq));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void replay_and_leaf_capacity(torch::Tensor q,torch::Tensor k,torch::Tensor scale,torch::Tensor weights,
+            torch::Tensor starts,torch::Tensor ends,torch::Tensor error_status,
+            torch::Tensor dense_scores,torch::Tensor counts,torch::Tensor leaf,torch::Tensor fast_rows,
+            torch::Tensor fast_state,torch::Tensor finite,torch::Tensor leaf_lengths,
+            torch::Tensor logical_nk) {
+  replay_and_leaf_impl(q,k,scale,weights,starts,ends,error_status,dense_scores,counts,
+      leaf,fast_rows,fast_state,finite,leaf_lengths,logical_nk);
+}
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+using torch::Tensor;
+constexpr int Limit=8, Segment=32768, Top=2048;
+__global__ void gather_kernel(const float*leaf,const int*selected,const int*lengths,int chunks,const int*rows,const int*state,int*finite,float*merge,int*ids){
+ if(*state>Limit)return;
+ int slot=blockIdx.x/chunks,seg=blockIdx.x%chunks;
+ if(rows[slot]<0)return;
+ // The finite mask is published by a prior kernel. A later selected-ID fault
+ // only rejects this row; all remaining writes are bounded temporary data.
+ if(!finite[slot])return;
+ int length=lengths[blockIdx.x];
+ for(int j=threadIdx.x;j<Top;j+=blockDim.x){
+  int i=selected[int64_t(blockIdx.x)*Top+j];
+  int64_t out=int64_t(slot)*(chunks*Top)+seg*Top+j;
+  if(i>=0&&i<length){merge[out]=leaf[int64_t(blockIdx.x)*Segment+i];ids[out]=seg*Segment+i;}
+  else {merge[out]=-INFINITY;ids[out]=-1;if(i!=-1||length>=Top)atomicExch(finite+slot,0);}
+ }
+}
+__global__ void final_meta_kernel(const int*counts,int nq,int chunks,const int*rows,const int*state,const int*finite,int*merge_lengths,int*fallback_lengths){
+ int r=blockIdx.x*blockDim.x+threadIdx.x;
+ if(r<Limit)merge_lengths[r]=(*state<=Limit&&rows[r]>=0&&finite[r])?chunks*Top:0;
+ if(r>=nq)return;
+ bool fast=false;
+ if(*state<=Limit)for(int i=0;i<Limit;++i)fast|=rows[i]==r&&finite[i];
+ fallback_lengths[r]=fast?0:counts[r];
+}
+__global__ void publish_kernel(const int*ids,const int*selected,int width,const int*rows,const int*state,const int*finite,int*out){
+ int slot=blockIdx.x;
+ if(*state>Limit||rows[slot]<0||!finite[slot])return;
+ for(int j=threadIdx.x;j<Top;j+=blockDim.x){
+  int i=selected[slot*Top+j];
+  // Original FI on >=2048 finite candidates guarantees this range and a
+  // nonnegative selected ID. Retain a bounds guard before any indexed load.
+  out[int64_t(rows[slot])*Top+j]=(i>=0&&i<width)?ids[int64_t(slot)*width+i]:-1;
+ }
+}
+
+void gather(Tensor leaf,Tensor selected,Tensor lengths,Tensor rows,Tensor state,Tensor finite,Tensor merge,Tensor ids){
+ c10::cuda::CUDAGuard guard(leaf.device());
+ // Owned F32 leaf/merge and I32[8*chunks,2048] selections/IDs on one stream.
+ const int chunks=leaf.size(0)/Limit;
+ gather_kernel<<<Limit*chunks,256,0,at::cuda::getCurrentCUDAStream()>>>(leaf.data_ptr<float>(),selected.data_ptr<int>(),lengths.data_ptr<int>(),chunks,rows.data_ptr<int>(),state.data_ptr<int>(),finite.data_ptr<int>(),merge.data_ptr<float>(),ids.data_ptr<int>());C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void final_meta(Tensor counts,Tensor rows,Tensor state,Tensor finite,Tensor merge_lengths,Tensor fallback_lengths,int64_t chunks){
+ c10::cuda::CUDAGuard guard(counts.device());
+ // Owned I32 counts/row routing; chunks derives from the fixed K capacity.
+ final_meta_kernel<<<(std::max<int64_t>(counts.numel(),Limit)+127)/128,128,0,at::cuda::getCurrentCUDAStream()>>>(counts.data_ptr<int>(),counts.numel(),chunks,rows.data_ptr<int>(),state.data_ptr<int>(),finite.data_ptr<int>(),merge_lengths.data_ptr<int>(),fallback_lengths.data_ptr<int>());C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void publish(Tensor ids,Tensor selected,Tensor rows,Tensor state,Tensor finite,Tensor output){
+ c10::cuda::CUDAGuard guard(ids.device());
+ // Owned I32[8,chunks*2048] IDs and selected[8,2048]; output has2048 columns.
+ publish_kernel<<<Limit,256,0,at::cuda::getCurrentCUDAStream()>>>(ids.data_ptr<int>(),selected.data_ptr<int>(),ids.size(1),rows.data_ptr<int>(),state.data_ptr<int>(),finite.data_ptr<int>(),output.data_ptr<int>());C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <climits>
+__global__ void replay_publish(const int*selected,const int64_t*order,const int*error,int*out,int64_t out_stride){
+ int row=blockIdx.x;
+ if(error[row]==0)return;
+ int64_t destination=order[row];
+ for(int j=threadIdx.x;j<2048;j+=blockDim.x)out[destination*out_stride+j]=selected[int64_t(row)*2048+j];
+}
+
+void recovered(torch::Tensor selected,torch::Tensor order,torch::Tensor error,torch::Tensor output){
+ // Owned I32[n,2048] recovered IDs, I64[n] original-row order and I32[n]
+ // status. Current-stream publication writes only failed rows in owned output.
+ c10::cuda::CUDAGuard guard(selected.device());
+ replay_publish<<<selected.size(0),256,0,at::cuda::getCurrentCUDAStream()>>>(selected.data_ptr<int>(),order.data_ptr<int64_t>(),error.data_ptr<int>(),output.data_ptr<int>(),output.stride(0));C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+m.def("replay_and_leaf_capacity",&replay_and_leaf_capacity);
+m.def("gather", &gather);
+    m.def("final_meta", &final_meta);
+    m.def("publish", &publish);
+m.def("recovered",&recovered);
+}

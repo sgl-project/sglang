@@ -375,6 +375,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   __shared__ int32_t s_topk_indices[kMaxTopK];
 
   const auto bx = blockIdx.x;
+  device::PDLWaitPrimary<kPDLEarly>();
   auto problem = params.problem(bx);
   if (problem.seq_len <= problem.topk) {
     return trivial_transform<kPDLEarly, kMode>(problem, params.get_transform(bx));
@@ -445,8 +446,8 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   using ClusterN = impl::TopKCluster<kClusterSize>;
   __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
   const auto bx = blockIdx.x;
-  const auto num_cluster_items = params.global().num_cluster_items;
   device::PDLWaitPrimary<kPDL>();
+  const auto num_cluster_items = params.global().num_cluster_items;
   if (bx >= params.batch_size) return;
   device::PDLTriggerSecondary<kPDL>();
   auto idx = static_cast<int32_t>(num_cluster_items - 1 - bx);
@@ -466,6 +467,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   const auto bx = blockIdx.x;
   const auto by = blockIdx.y;
+  device::PDLWaitPrimary<kPDL>();
   auto problem = params.problem(bx);
   __shared__ int32_t s_topk_indices[kMaxTopK];
   using ClusterN = impl::TopKCluster<kClusterSize>;
@@ -726,6 +728,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       smem->v_hi = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
       smem->v_lo = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
     });
+    refine_bounds(problem, smem);
 
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;

@@ -105,6 +105,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        single_request_table: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -196,11 +197,17 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
-                    if batch_idx_list is not None
-                    else attn_metadata.page_table_1
-                )
+                page_table_size_1 = attn_metadata.page_table_1
+                if batch_idx_list is not None:
+                    if single_request_table and page_table_size_1.shape[0] == 1:
+                        # The stock caller proved non-CP single-request rows.
+                        # Keep the fused selector's row mapping; native supports
+                        # stride zero, so each query reads the same owned table.
+                        page_table_size_1 = page_table_size_1.expand(
+                            len(batch_idx_list), -1
+                        )
+                    else:
+                        page_table_size_1 = page_table_size_1[batch_idx_list]
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,

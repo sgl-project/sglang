@@ -283,3 +283,9 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local DoSA reproduction artifacts
+!/benchmark/dosa/ttft-results.csv
+.dosa_topk/
+ttft-inputs/
+ttft-results/

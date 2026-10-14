@@ -2794,7 +2794,9 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def resolve_max_num_reqs(self, token_capacity: int) -> int:
+    def resolve_max_num_reqs(
+        self, token_capacity: int, *, log_warnings: bool = True
+    ) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
@@ -2815,16 +2817,17 @@ class KVCacheConfigurator:
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
-                logger.warning(
-                    "max_running_requests is capped to %d by the mamba state "
-                    "cache (max_mamba_cache_size=%d, %d state slots per "
-                    "request). To raise it: increase --mamba-full-memory-ratio "
-                    "or --max-mamba-cache-size, or halve the state size with "
-                    "--mamba-ssm-dtype bfloat16.",
-                    mamba_cap,
-                    get_schedule().max_mamba_cache_size,
-                    ratio,
-                )
+                if log_warnings:
+                    logger.warning(
+                        "max_running_requests is capped to %d by the mamba state "
+                        "cache (max_mamba_cache_size=%d, %d state slots per "
+                        "request). To raise it: increase --mamba-full-memory-ratio "
+                        "or --max-mamba-cache-size, or halve the state size with "
+                        "--mamba-ssm-dtype bfloat16.",
+                        mamba_cap,
+                        get_schedule().max_mamba_cache_size,
+                        ratio,
+                    )
             max_num_reqs = min(max_num_reqs, mamba_cap)
 
             if max_num_reqs <= 0:
@@ -2837,7 +2840,8 @@ class KVCacheConfigurator:
                     f"(3) use GPUs with more memory."
                 )
         if (
-            requested_per_worker is not None
+            log_warnings
+            and requested_per_worker is not None
             and max_num_reqs < requested_per_worker
             and not capped_by_mamba
         ):
@@ -2854,16 +2858,79 @@ class KVCacheConfigurator:
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
         from sglang.srt.model_executor.pool_configurator import (
+            PoolBudgetExhaustedError,
             create_memory_pool_configurator,
+        )
+        from sglang.srt.mem_cache.request_pool_budget import (
+            request_mapping_bytes,
+            solve_request_mapping_budget,
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
+        configurator = create_memory_pool_configurator(self)
+        if self.req_to_token_pool is None:
+            context_len = (
+                self.model_config.context_len + get_req_to_token_extra_context_len()
+            )
+            extra_slots = (
+                get_disagg().disaggregation_decode_extra_slots
+                if get_disagg().disaggregation_mode == "decode"
+                else 0
+            )
+
+            def mapping_cost(tokens):
+                requests = self.resolve_max_num_reqs(tokens, log_warnings=False)
+                return request_mapping_bytes(requests + extra_slots, context_len)
+
+            def local_kv_capacity(budget):
+                try:
+                    return configurator.calculate_pool_sizes(
+                        budget, get_schedule().page_size
+                    ).max_total_num_tokens
+                except PoolBudgetExhaustedError:
+                    return 0
+
+            tokens = solve_request_mapping_budget(
+                budget_bytes=available_bytes,
+                token_ceiling=config.max_total_num_tokens,
+                page_size=get_schedule().page_size,
+                mapping_bytes_for_tokens=mapping_cost,
+                kv_capacity_for_budget=local_kv_capacity,
+            )
+            # The search above is local. Reconcile PP ranks once, then build
+            # the final original pool layout. A lower shared capacity cannot
+            # increase its request-map cost. Never debit config_from_budget:
+            # post-capture resizing profiles memory with this map resident.
+            tokens = self._apply_token_constraints(tokens)
+            config = configurator.calculate_pool_sizes_from_max_tokens(
+                tokens, get_schedule().page_size
+            )
+            logger.info(
+                "Request mapping budget: %.3f GiB, context_columns=%d, KV tokens=%d",
+                mapping_cost(config.max_total_num_tokens) / (1 << 30),
+                context_len,
+                config.max_total_num_tokens,
+            )
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
-        configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
+        if self.req_to_token_pool is None:
+            # Validate the final architecture/PP result as well as the search.
+            # This fails before allocation if a configurator violates the
+            # monotone budget contract or changes the resolved request count.
+            mapping_bytes = request_mapping_bytes(
+                config.max_running_requests + extra_slots, context_len
+            )
+            if (
+                mapping_bytes > available_bytes
+                or local_kv_capacity(available_bytes - mapping_bytes)
+                < config.max_total_num_tokens
+            ):
+                raise RuntimeError(
+                    "Resolved request mapping and KV exceed the initial pool budget"
+                )
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
 

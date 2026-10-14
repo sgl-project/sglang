@@ -1,3 +1,15 @@
+# DoSA on SGLang main
+
+DoSA accelerates GLM-5.2-FP8 prefill with exact sparse scoring. At 1M input
+tokens, TTFT improves from **133.65 s to 71.15 s (1.88×)** on eight GB200 GPUs.
+
+See [TTFT reproduction](benchmark/dosa/README.md) for installation, the original
+inputs, launch commands and complete 16K/32K results. This branch is based on
+official SGLang commit `d2a436446cca3d955358e7b4a5bf6881ea8591cd` and retains
+the full upstream history.
+
+---
+
 # SGLang: Fast inference for LLMs and multimodal models
 
 <p align="center" id="sglangtop">
