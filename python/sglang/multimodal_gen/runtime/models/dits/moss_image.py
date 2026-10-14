@@ -52,6 +52,9 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -400,7 +403,7 @@ class _RoPE(nn.Module):
         return torch.cat((phase.sin(), phase.cos()), -2).flatten(-2).unsqueeze(0)
 
 
-class MOSSImageTransformer(BaseDiT):
+class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
     """MOSSImage DiT with checkpoint-compatible names and SGLang attention.
 
     Each sample is evaluated at its true text length, including text refinement;
@@ -426,6 +429,7 @@ class MOSSImageTransformer(BaseDiT):
             arch.latent_channels,
             arch.rope_base,
         )
+        self.layer_names = ["layers"]
         self.hidden_size = dim
         self.num_attention_heads = num_heads
         self.num_channels_latents = latent_channels

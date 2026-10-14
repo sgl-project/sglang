@@ -672,6 +672,65 @@ def test_pipeline_residency_declares_only_components_used_by_each_stage(
     assert stages[2].vae is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("resident_layers", [0, 1])
+@pytest.mark.parametrize("skip_layers", [(), (0,), (1,), (0, 1)])
+def test_layerwise_offload_preserves_requests_and_streams(
+    small_model, resident_layers, skip_layers
+):
+    torch.manual_seed(0)
+    model = small_model.to(device="cuda", dtype=torch.bfloat16)
+    text = torch.randn(1, 5, 32, device="cuda", dtype=torch.bfloat16)
+    timestep = torch.tensor([630.0], device="cuda")
+    latents = [
+        torch.randn(1, 8, h, w, device="cuda", dtype=torch.bfloat16)
+        for h, w in [(2, 3), (3, 2), (2, 3)]
+    ]
+    with torch.inference_mode(), set_forward_context(0, None):
+        expected = [model(x, timestep, text, skip_layers=skip_layers) for x in latents]
+    model.configure_layerwise_offload(
+        SimpleNamespace(
+            performance_mode="manual",
+            pin_cpu_memory=True,
+            layerwise_tuning_for=lambda *args, **kwargs: (
+                1,
+                resident_layers,
+                "strided",
+                "forward",
+            ),
+        )
+    )
+    assert len(model.layerwise_offload_managers) == 1
+    manager = model.layerwise_offload_managers[0]
+    assert manager.enabled and manager.num_layers == 2
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    torch.cuda.synchronize()
+    try:
+        for index, (x, reference) in enumerate(zip(latents, expected)):
+            with (
+                torch.cuda.stream(streams[index % 2]),
+                torch.inference_mode(),
+                set_forward_context(0, None),
+            ):
+                model.prepare_for_next_req()
+                prepared = model.prepare_conditioning(
+                    text, None, *x.shape[-2:], x.dtype
+                )
+                output = model(
+                    x,
+                    timestep,
+                    text,
+                    prepared_conditioning=prepared,
+                    skip_layers=skip_layers,
+                )
+                manager.release_all()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    finally:
+        model.disable_offload()
+        manager.release_host_stores()
+
+
 @pytest.mark.parametrize(
     "guidance,expected_cfg", [(0.0, True), (0.5, True), (1.0, False), (5.0, True)]
 )
