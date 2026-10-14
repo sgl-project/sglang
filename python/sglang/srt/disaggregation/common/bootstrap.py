@@ -50,8 +50,8 @@ class DeferredBootstrap:
             if state.failed:
                 return state.endpoint, True
             if state.ready and not state.ready_notified:
-                # One readiness message per transfer. Decode must consume it
-                # before publishing destinations, so none can trail Success
+                # One readiness message per transfer and PP stage, sent before
+                # that stage's Success; so none can trail the room's Success
                 # and accidentally admit the next transfer using this room.
                 state.ready_notified = True
                 return state.endpoint, False
