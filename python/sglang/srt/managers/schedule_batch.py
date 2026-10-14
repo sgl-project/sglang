@@ -588,7 +588,7 @@ class Req(ReqDllmMixin):
 
             self.mamba_branching_seqlen = seed_mamba_boundary(
                 system_prefix_boundary,
-                get_server_args().mamba_cache_chunk_size,
+                mamba_cache_chunk_size(),
             )
         # Lazy extra buffer + spec: False when the finishing verify wrote the
         # keep slot or had no plan, so the keep slot may not hold the state at
