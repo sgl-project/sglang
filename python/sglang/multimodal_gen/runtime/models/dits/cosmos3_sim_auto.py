@@ -1,0 +1,426 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Cosmos3-Nano-Sim-Auto transformer.
+
+The weights are the Cosmos3 Nano multiview generator: the shared GEN stack,
+the LiDAR input/output projections and the rig-view embedding table. What
+changes is the GEN attention: every token of the current chunk takes one
+softmax over the keys the replay predicate admits from the current chunk, the
+KV ring of committed chunks and the per-camera caption documents, executed as
+one block-sparse FlexAttention call planned on the host
+(``cosmos3_sim_auto_attention``). Every forward returns the chunk's post-norm,
+post-RoPE K and raw V, which a clean refresh commits to the ring.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
+
+import msgspec
+import torch
+import torch.nn as nn
+
+from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
+    Cosmos3SimAutoManifest,
+    load_cosmos3_sim_auto_manifest,
+)
+from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+)
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
+    add_rig_view_rows,
+    lidar_patch_grid,
+    patchify_lidar,
+    spatial_patch_hw,
+    unpatchify_lidar,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
+    ReplayBlockMask,
+    replay_attention,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
+    StreamItem,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+    Cosmos3CrossAttention,
+    Cosmos3GenDecoderLayer,
+    Cosmos3OmniTransformer,
+    _apply_qwen3_qk_norm_rope,
+    compute_mrope_position_ids_text,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+KVPair = tuple[torch.Tensor, torch.Tensor]
+
+
+class Cosmos3SimAutoForwardOutput(msgspec.Struct):
+    """Predictions of the target items (in item order) plus the chunk's per-layer ``[1, S, H_kv, D]`` K/V."""
+
+    targets: list[torch.Tensor]
+    current_kv: list[KVPair]
+
+
+def _replay_layer_attention(
+    attention: Cosmos3CrossAttention,
+    hidden: torch.Tensor,
+    *,
+    cos_sin_cache: torch.Tensor,
+    rope_positions: torch.Tensor,
+    history: KVPair,
+    captions: KVPair,
+    mask: ReplayBlockMask,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V."""
+    batch_size, seq_len = hidden.shape[:2]
+    num_q_heads = attention.local_num_attention_heads
+    num_kv_heads = attention.local_num_key_value_heads
+    qkv, _ = attention.to_qkv(hidden)
+    qkv = qkv.view(
+        batch_size, seq_len, num_q_heads + 2 * num_kv_heads, attention.head_dim
+    )
+    q = qkv[:, :, :num_q_heads]
+    k = qkv[:, :, num_q_heads : num_q_heads + num_kv_heads]
+    v = qkv[:, :, num_q_heads + num_kv_heads :]
+    q, k = _apply_qwen3_qk_norm_rope(
+        q,
+        k,
+        attention.norm_q,
+        attention.norm_k,
+        attention.head_dim,
+        cos_sin_cache,
+        rope_positions,
+    )
+    k = k.contiguous()
+    v = v.contiguous()
+    # Key order is the plan's stream order: current chunk, ring, captions.
+    keys = torch.cat([k, history[0], captions[0]], dim=1)
+    values = torch.cat([v, history[1], captions[1]], dim=1)
+    out = replay_attention(q, keys, values, mask)
+    out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
+    return out, k, v
+
+
+def _gen_layer_forward(
+    layer: Cosmos3GenDecoderLayer, hidden: torch.Tensor, **attention_kwargs: Any
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual = hidden
+    attention_output, k, v = _replay_layer_attention(
+        layer.cross_attention, layer.input_layernorm(hidden), **attention_kwargs
+    )
+    hidden = residual + attention_output
+    hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+    return hidden, k, v
+
+
+class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
+    """Cosmos3 Nano multiview weights driven as a chunk-causal world model."""
+
+    def __init__(
+        self,
+        config: Cosmos3VideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
+        backbone_type = hf_config.get("backbone_type")
+        if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+            raise ValueError(
+                "Cosmos3SimAutoTransformer requires transformer/config.json "
+                f"backbone_type={COSMOS3_MULTIVIEW_BACKBONE_TYPE!r}, got {backbone_type!r}."
+            )
+        super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
+        self.manifest: Cosmos3SimAutoManifest = load_cosmos3_sim_auto_manifest(
+            hf_config
+        )
+        self._validate_causal_arch(hf_config)
+        manifest = self.manifest
+        self.lidar_patch_hw = spatial_patch_hw(
+            manifest.lidar_latent_patch_size_hw
+            if manifest.lidar_latent_patch_size_hw is not None
+            else self.latent_patch_size
+        )
+        if manifest.lidar is not None:
+            lidar_width = (
+                self.lidar_patch_hw[0]
+                * self.lidar_patch_hw[1]
+                * int(manifest.lidar["latent_channels"])
+            )
+            self.lidar_proj_in = ReplicatedLinear(
+                lidar_width,
+                self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix="lidar_proj_in",
+            )
+            self.lidar_proj_out = ReplicatedLinear(
+                self.hidden_size,
+                lidar_width,
+                bias=True,
+                quant_config=quant_config,
+                prefix="lidar_proj_out",
+            )
+        rig = manifest.rig_view_embedding
+        self.rig_view_embed = nn.Embedding(int(rig["num_embeddings"]), self.hidden_size)
+        self.rig_lidar_id = int(rig["lidar_id"])
+        # A checkpoint without the rig table would run on random rows and no
+        # error; the loader turns the missing tensor into a hard failure.
+        self.rig_view_embed.weight.missing_param_init = "error"
+
+    def _validate_causal_arch(self, hf_config: dict[str, Any]) -> None:
+        expected_flags = {
+            "joint_attn_implementation": "multiview",
+            "video_temporal_causal": True,
+            "unified_3d_mrope_reset_spatial_ids": True,
+        }
+        for key, expected in expected_flags.items():
+            if hf_config.get(key) != expected:
+                raise ValueError(
+                    f"Unsupported Cosmos3-Nano-Sim-Auto transformer config: {key}={hf_config.get(key)!r}; "
+                    f"expected {expected!r}."
+                )
+        if self.sound_gen or self.config.action_gen:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto checkpoints carry no sound or action pathway."
+            )
+        manifest = self.manifest
+        mismatches = {
+            "temporal_compression_factor": (
+                self.temporal_compression_factor,
+                manifest.temporal_compression_factor,
+            ),
+            "latent_patch_size": (self.latent_patch_size, manifest.latent_patch_size),
+            "latent_channels": (self.latent_channel, manifest.latent_channels),
+            "temporal_modality_margin": (
+                self.temporal_margin,
+                manifest.temporal_modality_margin,
+            ),
+            "base_fps": (float(self.base_fps), float(manifest.base_fps)),
+        }
+        for name, (arch_value, manifest_value) in mismatches.items():
+            if arch_value != manifest_value:
+                raise ValueError(
+                    f"Cosmos3-Nano-Sim-Auto {name} differs between transformer config and artifact: "
+                    f"{arch_value} != {manifest_value}."
+                )
+        if get_sp_world_size() > 1:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto supports tensor parallelism but not sequence parallelism."
+            )
+
+    def lidar_patch_grid(self, height: int, width: int) -> tuple[int, int]:
+        """LiDAR token grid ``(patch_h, patch_w)`` of a latent of this height and width."""
+        return lidar_patch_grid(height, width, self.lidar_patch_hw)[:2]
+
+    # -- captions ------------------------------------------------------------
+
+    def encode_caption(self, text_ids: torch.Tensor) -> list[KVPair]:
+        """One causal UND pass over a single caption document, positions rewound to zero."""
+        if text_ids.ndim != 2 or text_ids.shape[0] != 1 or text_ids.shape[1] < 1:
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Auto captions must be [1, L] token ids, got {tuple(text_ids.shape)}."
+            )
+        positions, _ = compute_mrope_position_ids_text(
+            text_ids.shape[1], temporal_offset=0, device=text_ids.device
+        )
+        return self.language_model(
+            text_ids, torch.ones_like(text_ids), positions.unsqueeze(1)
+        )
+
+    # -- geometry --------------------------------------------------------------
+
+    def chunk_position_ids(
+        self, items: Sequence[StreamItem], *, text_extent: int, device: torch.device
+    ) -> torch.Tensor:
+        """Absolute 3D mRoPE ids of the packed chunk, ``[3, S]`` float32.
+
+        Caption documents are rewound to ``0..len-1``, so media starts at
+        ``text_extent + temporal_modality_margin``. With FPS modulation a sensor
+        frame advances ``seconds_per_frame * base_fps / temporal_compression``
+        positions (1.0 per RGB latent at 30 fps, 0.75 per 10 Hz LiDAR sweep);
+        camera-major items repeat the temporal ids per view and spatial ids
+        restart at zero per frame.
+        """
+        offset = float(text_extent + self.temporal_margin)
+        parts = []
+        for item in items:
+            rate = (
+                item.seconds_per_frame
+                * float(self.base_fps)
+                / self.temporal_compression_factor
+            )
+            frames = torch.tensor(item.frames, dtype=torch.float32, device=device)
+            grid_h, grid_w = item.grid.grid_height, item.grid.grid_width
+            spatial = grid_h * grid_w
+            t_ids = (frames * rate + offset).view(-1, 1).expand(-1, spatial).reshape(-1)
+            h_ids = (
+                torch.arange(grid_h, dtype=torch.float32, device=device)
+                .view(-1, 1)
+                .expand(grid_h, grid_w)
+            )
+            w_ids = (
+                torch.arange(grid_w, dtype=torch.float32, device=device)
+                .view(1, -1)
+                .expand(grid_h, grid_w)
+            )
+            ids = torch.stack(
+                [
+                    t_ids,
+                    h_ids.reshape(-1).repeat(len(item.frames)),
+                    w_ids.reshape(-1).repeat(len(item.frames)),
+                ]
+            )
+            parts.append(ids.repeat(1, len(item.view_ids)))
+        return torch.cat(parts, dim=1)
+
+    # -- embedding -------------------------------------------------------------
+
+    def embed_items(
+        self,
+        items: Sequence[StreamItem],
+        latents: Sequence[torch.Tensor],
+        *,
+        timestep: torch.Tensor | None,
+        rig_view_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project every item, add its rig identity, then the timestep to generated target frames only.
+
+        ``timestep`` is ``None`` for clean refresh forwards: controls, observed
+        condition frames and committed-clean targets never carry a time embed.
+        """
+        if len(items) != len(latents):
+            raise ValueError(f"{len(items)} items but {len(latents)} latent tensors.")
+        dtype = self.proj_in.weight.dtype
+        time_embed = None
+        if timestep is not None:
+            time_embed = (
+                self.time_embedder(timestep.reshape(1).float()).to(dtype).view(1, 1, -1)
+            )
+        camera_rows = self.rig_view_embed.weight[
+            rig_view_ids.to(self.rig_view_embed.weight.device)
+        ]
+        lidar_row = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+        embeddings = []
+        for item, latent in zip(items, latents, strict=True):
+            expected_frames = len(item.view_ids) * len(item.frames)
+            if (
+                latent.ndim != 5
+                or latent.shape[0] != 1
+                or latent.shape[2] != expected_frames
+            ):
+                raise ValueError(
+                    f"Item {item.kind} latents must be [1, C, {expected_frames}, H, W] (camera-major), "
+                    f"got {tuple(latent.shape)}."
+                )
+            if item.is_lidar:
+                hidden, _ = self.lidar_proj_in(
+                    patchify_lidar(latent.to(dtype), self.lidar_patch_hw)
+                )
+                rows = lidar_row
+            else:
+                hidden, _ = self.proj_in(
+                    self.patchify(latent.to(dtype), *latent.shape[2:])
+                )
+                if camera_rows.shape[0] != len(item.view_ids):
+                    raise ValueError(
+                        f"{camera_rows.shape[0]} rig view ids for a {len(item.view_ids)}-camera {item.kind} item."
+                    )
+                rows = camera_rows
+            if hidden.shape[1] != item.num_tokens:
+                raise ValueError(
+                    f"Item {item.kind} produced {hidden.shape[1]} tokens, layout expects {item.num_tokens}."
+                )
+            hidden = add_rig_view_rows(hidden, rows, len(item.view_ids))
+            if time_embed is not None and not item.is_control:
+                generated = torch.tensor(
+                    [frame not in item.condition_frames for frame in item.frames],
+                    dtype=torch.bool,
+                    device=hidden.device,
+                )
+                mask = generated.repeat(len(item.view_ids)).repeat_interleave(
+                    item.tokens_per_frame
+                )
+                hidden = hidden + time_embed * mask.view(1, -1, 1).to(dtype)
+            embeddings.append(hidden)
+        return torch.cat(embeddings, dim=1)
+
+    # -- forward -----------------------------------------------------------------
+
+    def forward(
+        self,
+        *,
+        items: Sequence[StreamItem],
+        latents: Sequence[torch.Tensor],
+        timestep: torch.Tensor | None,
+        text_extent: int,
+        und_kv: Sequence[KVPair],
+        history_kv: Sequence[KVPair],
+        block_mask: ReplayBlockMask,
+        rig_view_ids: torch.Tensor,
+    ) -> Cosmos3SimAutoForwardOutput:
+        """Denoise (``timestep`` set) or clean-refresh (``timestep`` None) one chunk.
+
+        ``und_kv`` holds the per-layer caption K/V ``[1, U, H_kv, D]`` and
+        ``history_kv`` the per-layer ring K/V ``[1, R, H_kv, D]`` over the whole
+        ring capacity; the plan behind ``block_mask`` decides which of their
+        tokens a query may read.
+        """
+        if (
+            len(und_kv) != self.num_hidden_layers
+            or len(history_kv) != self.num_hidden_layers
+        ):
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Auto expects {self.num_hidden_layers} caption and history KV layers, "
+                f"got {len(und_kv)} and {len(history_kv)}."
+            )
+        if timestep is not None and timestep.numel() != 1:
+            raise ValueError(
+                f"timestep must hold one value, got {tuple(timestep.shape)}."
+            )
+        hidden = self.embed_items(
+            items, latents, timestep=timestep, rig_view_ids=rig_view_ids
+        )
+        position_ids = self.chunk_position_ids(
+            items, text_extent=text_extent, device=hidden.device
+        )
+        cos_sin_cache, rope_positions = (
+            self.language_model.rotary_emb.build_rope_cache_inputs(
+                position_ids.unsqueeze(1), cache_dtype=hidden.dtype
+            )
+        )
+        current_kv: list[KVPair] = []
+        for layer_idx, layer in enumerate(self.gen_layers):
+            hidden, k, v = _gen_layer_forward(
+                layer,
+                hidden,
+                cos_sin_cache=cos_sin_cache,
+                rope_positions=rope_positions,
+                history=history_kv[layer_idx],
+                captions=und_kv[layer_idx],
+                mask=block_mask,
+            )
+            current_kv.append((k, v))
+        hidden = self.norm_moe_gen(hidden)
+        outputs = []
+        parts = hidden.split([item.num_tokens for item in items], dim=1)
+        for item, latent, part in zip(items, latents, parts, strict=True):
+            if item.is_control:
+                continue
+            if item.is_lidar:
+                projected, _ = self.lidar_proj_out(part)
+                outputs.append(
+                    unpatchify_lidar(projected, latent.shape[1:], self.lidar_patch_hw)
+                )
+            else:
+                projected, _ = self.proj_out(part)
+                outputs.append(self.unpatchify(projected, *latent.shape[2:]))
+        return Cosmos3SimAutoForwardOutput(targets=outputs, current_kv=current_kv)
+
+
+EntryClass = Cosmos3SimAutoTransformer

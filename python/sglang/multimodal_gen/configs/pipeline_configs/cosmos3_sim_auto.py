@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Cosmos3-Nano-Sim-Auto pipeline configuration.
+
+A Sim-Auto export is a distilled causal Multiview-AV student: the same Nano
+weights, Wan VAE, tokenizer and LiDAR VAE as Cosmos3-Nano-Transfer-Auto, plus
+a ``cosmos3_nano_sim_auto`` artifact in ``transformer/config.json`` and a
+fixed-step scheduler. The config reuses ``Cosmos3Config`` and derives the
+multiview stage contract from the artifact so the Multiview-AV stages serve
+this pipeline unchanged; only the transformer class and the denoising stage
+differ.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, replace
+from typing import Any, ClassVar
+
+from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
+    Cosmos3SimAutoManifest,
+    load_cosmos3_sim_auto_manifest,
+    multiview_deployment_from_manifest,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+    Cosmos3Config,
+    _transformer_config,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+    Cosmos3MultiviewDeploymentConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
+
+
+@dataclass
+class Cosmos3SimAutoConfig(Cosmos3Config):
+    """Cosmos3-Nano-Sim-Auto: causal rolling multiview WSM transfer, optional joint LiDAR."""
+
+    # Single-task pipeline; the parent's multi-task declaration does not apply.
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
+    transformer_class_override: str | None = "Cosmos3SimAutoTransformer"
+    # The multiview tokenization stage owns prompt formatting (system prompt,
+    # duration and resolution sentences, per-camera rig headers).
+    use_duration_template: bool = True
+    use_system_prompt: bool = True
+    # Parsed once from transformer/config.json in update_config_from_dict.
+    sim_auto_manifest: Cosmos3SimAutoManifest | None = None
+    # The stage contract derived from the manifest; the multiview sampling
+    # params and stages read it under this name.
+    multiview_deployment: Cosmos3MultiviewDeploymentConfig | None = None
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        if self.model_path:
+            manifest = load_cosmos3_sim_auto_manifest(
+                _transformer_config(self.model_path)
+            )
+            self._validate_scheduler(manifest)
+            self.sim_auto_manifest = manifest
+            self.multiview_deployment = multiview_deployment_from_manifest(manifest)
+
+    def _validate_scheduler(self, manifest: Cosmos3SimAutoManifest) -> None:
+        if self.distilled_sigmas is None:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto requires a distilled fixed-step scheduler "
+                "(FlowMatchEulerDiscreteScheduler with fixed_step_sampler_config.t_list)."
+            )
+        if len(self.distilled_sigmas) != len(manifest.t_list) or any(
+            not math.isclose(a, b, rel_tol=0.0, abs_tol=1e-8)
+            for a, b in zip(self.distilled_sigmas, manifest.t_list, strict=True)
+        ):
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto scheduler and transformer manifests define different "
+                f"fixed-step schedules: scheduler={self.distilled_sigmas}, "
+                f"transformer={list(manifest.t_list)}."
+            )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # The student runs one branch per step, so CFG parallel would only
+        # duplicate the rollout; the per-camera decode follows the rollout, so
+        # the VAE stays resident next to the DiT.
+        return replace(
+            super().get_model_deployment_config(),
+            auto_enable_cfg_parallel=False,
+            supports_cfg_parallel=False,
+            keep_resident_components=("dit", "vae"),
+        )
+
+    def validate_server_args(self, server_args: Any) -> None:
+        super().validate_server_args(server_args)
+        for name in ("sp_degree", "ulysses_degree", "ring_degree"):
+            if int(getattr(server_args, name) or 1) > 1:
+                raise ValueError(
+                    f"{type(self).__name__} does not support sequence parallelism "
+                    f"({name}={getattr(server_args, name)} for num_gpus={server_args.num_gpus}); "
+                    "the causal ring attends one chunk on one rank. Use --dp-size for "
+                    "independent replicas or --tp-size to shard the transformer."
+                )
+
+    def supports_action_endpoint(self) -> bool:
+        return False
+
+    def supports_dynamic_batching(self) -> bool:
+        return False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos3_sim_auto import (
+        Cosmos3SimAutoSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    # The hf path must sort before the shorter "nvidia/Cosmos3-Nano" in the
+    # partial-path match, so local folders named after the release resolve here.
+    register_configs(
+        sampling_param_cls=Cosmos3SimAutoSamplingParams,
+        pipeline_config_cls=Cosmos3SimAutoConfig,
+        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Auto"],
+        # Matches the ``Cosmos3NanoSimAutoPipeline`` ``_class_name`` of the export.
+        model_detectors=[lambda hf_id: "cosmos3nanosimautopipeline" in hf_id.lower()],
+    )
