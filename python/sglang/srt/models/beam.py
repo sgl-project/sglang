@@ -367,12 +367,15 @@ class BeamMoE(nn.Module):
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # All fast paths read BF16 activations and the live FP32 gate; tiny GEMM and
         # the GEMV are IEEE FP32, the BF16x3 GEMM accumulates on tensor cores.
-        if not self.use_fast_router or torch.compiler.is_compiling():
+        if (
+            not self.use_fast_router
+            or torch.compiler.is_compiling()
+            or hidden_states.dtype != torch.bfloat16
+        ):
             router_logits, _ = self.gate(hidden_states.float())
             return router_logits
         if (
             self.use_fp32_router
-            and hidden_states.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and hidden_states.data_ptr() % 16 == 0
             # Larger batches win in isolation but did not improve the

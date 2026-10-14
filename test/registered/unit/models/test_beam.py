@@ -719,6 +719,21 @@ class TestBeamNumerics(CustomTestCase):
         self.assertEqual(output.topk_ids.dtype, torch.int32)
         return output.topk_weights, output.topk_ids
 
+    def test_non_bf16_router_uses_linear_fallback(self):
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                hidden = torch.randn(17, 24, dtype=dtype)
+                weight = torch.randn(8, 24)
+                expected = hidden.float() @ weight.T
+                gate = Mock(weight=weight, return_value=(expected, None))
+                moe = SimpleNamespace(
+                    use_fast_router=True, use_fp32_router=True, gate=gate
+                )
+                actual = BeamMoE._router_logits(moe, hidden)
+                torch.testing.assert_close(actual, expected)
+                gate.assert_called_once()
+                torch.testing.assert_close(gate.call_args.args[0], hidden.float())
+
     def test_router_bias_selects_experts_with_unscaled_fp32_combine_scores(self):
         config = tiny_config()
         config.num_experts = 32
