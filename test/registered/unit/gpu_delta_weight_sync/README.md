@@ -54,6 +54,7 @@ python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/manual/gpu_delta/test_codec.py
 python -m pytest -q test/manual/gpu_delta/test_host_cuda.py
+python -m pytest -q test/manual/gpu_delta/test_device_allocator_cuda.py
 ```
 
 For a standalone deployment, start the engine from the same immutable HF base
@@ -182,8 +183,8 @@ callbacks. Temporary frame and raw-packing plans are then released; the decode
 plan retains the buffer leases and execution metadata.
 After scheduler pause and its reader fence, decoded-mask slots are allocated and
 checked, output pointers are uploaded, and scratch-dependent apply setup/tuning
-runs. Slots are reused across layers and released before resume. PyTorch may
-cache their storage, but the feature retains no large HBM lease during rollout.
+runs. Slots are reused across layers and their dedicated CUDA allocations are freed
+before resume; the feature retains no large HBM lease during rollout.
 Host arena capacity and static CPU plans remain persistent.
 Preparation records the omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
@@ -466,3 +467,25 @@ background preparation and post-resume cleanup. Open, failed or caller-retained 
 null `resumed_ns` and `blocked_s`. Resume responses carry the completed receipts,
 so measurement needs no extra synchronization or status RPC. This measures
 scheduler blocking, not GPU idle time, HTTP latency or first-token recovery.
+
+### Dedicated decode buffers
+
+GPU-delta decode outputs, workspace and nvCOMP metadata use feature-owned
+`cuMemAlloc` storage. Every pointer must pass the hardware-decompression capability
+query. This does not change the ordinary Torch allocator or its process settings.
+Tensor aliases retain the allocation; registered producer/consumer streams are
+fenced before freeing it in its original CUDA context. Decode slots are still
+allocated only after the scheduler pause and released before resume.
+
+Run the manual allocator and codec tests in separate fresh processes with each
+ambient mode; do not change the allocator inside a running server:
+
+```bash
+PYTORCH_ALLOC_CONF=backend:native,expandable_segments:True \
+  python -m pytest -q test/manual/gpu_delta/test_device_allocator_cuda.py test/manual/gpu_delta/test_codec.py
+PYTORCH_ALLOC_CONF=backend:cudaMallocAsync,expandable_segments:False \
+  python -m pytest -q test/manual/gpu_delta/test_device_allocator_cuda.py test/manual/gpu_delta/test_codec.py
+```
+
+The context-restoration case requires two CUDA devices. These native tests require
+a CUDA 13 driver/device exposing hardware decompression and nvCOMP 5.3.

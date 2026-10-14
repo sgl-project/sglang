@@ -89,29 +89,6 @@ class DecodeWorkspace:
     statuses: torch.Tensor
 
 
-def _require_hardware_allocator(device: torch.device) -> None:
-    # Native caching alone is insufficient: expandable_segments uses CUDA VMM
-    # without the hardware-decompression allocation flag. Inspect effective
-    # settings, not only the environment (PyTorch can change them at runtime).
-    if torch.cuda.memory.get_allocator_backend() != "native":
-        raise RuntimeError("GPU deltas require native CUDA allocations")
-    snapshot = torch.cuda.memory._snapshot()
-    expandable = snapshot.get("allocator_settings", {}).get("expandable_segments")
-    if expandable is not False:
-        raise RuntimeError(
-            "Hardware decoding requires verifiable expandable_segments:False; "
-            "PyTorch expandable VMM buffers are not admitted"
-        )
-    if any(
-        segment.get("device") == device.index and segment.get("is_expandable", False)
-        for segment in snapshot.get("segments", [])
-    ):
-        raise RuntimeError(
-            "Hardware decoding cannot reuse existing PyTorch expandable VMM segments; "
-            "start the process with expandable_segments:False"
-        )
-
-
 class NvcompDecoder:
     """One device's fixed inner-codec hardware decoder.
 
@@ -147,7 +124,6 @@ class NvcompDecoder:
         self.maximum_chunk_bytes = _require_hardware_device(
             self.device, self._algorithm
         )
-        _require_hardware_allocator(self.device)
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
         )
@@ -214,16 +190,19 @@ class NvcompDecoder:
 
     def _allocate_workspace(self, geometry, slot_count) -> DecodeWorkspace:
         """DE uses one temporary buffer; statuses/sizes belong to decoded slots."""
-        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import (
+            device_empty,
+            require_de_capable,
+        )
 
         maximum_count = max((batch[0] for batch in geometry), default=0)
         temporary = max((self.temporary_bytes(batch) for batch in geometry), default=0)
         workspace = DecodeWorkspace(
-            torch.empty(temporary, dtype=torch.uint8, device=self.device),
-            torch.empty(
+            device_empty(temporary, dtype=torch.uint8, device=self.device),
+            device_empty(
                 (slot_count, maximum_count), dtype=torch.int64, device=self.device
             ),
-            torch.empty(
+            device_empty(
                 (slot_count, maximum_count), dtype=torch.int32, device=self.device
             ),
         )
@@ -305,7 +284,10 @@ class NvcompDecoder:
         until the DE stream drains. Only input/size rows are uploaded now;
         ``bind_outputs`` fills output pointers under the serving pause.
         """
-        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import (
+            device_empty,
+            require_de_capable,
+        )
 
         if (
             host_input.device.type != "cpu"
@@ -329,7 +311,7 @@ class NvcompDecoder:
             host_rows = host.numpy()
             np.add(table[0], input_base, out=host_rows[0])
             host_rows[1:3] = table[1:3]
-            metadata = torch.empty(host.shape, dtype=torch.int64, device=self.device)
+            metadata = device_empty(host.shape, dtype=torch.int64, device=self.device)
             if metadata.numel():
                 require_de_capable(metadata.data_ptr())
                 metadata[:3].copy_(host[:3], non_blocking=True)
@@ -416,6 +398,21 @@ class PreparedDecodePlan:
             )
             offset += count
 
+    def record_stream(self, stream):
+        """Register every non-DE consumer before it can enqueue storage readers."""
+        from sglang.srt.weight_sync.gpu_delta.memory import record_device_stream
+
+        if stream.device != self.decoder.device:
+            raise ValueError("Decoder consumer stream/device mismatch")
+        for tensor in (
+            self.metadata,
+            self.workspace.temporary,
+            self.workspace.actual_sizes,
+            self.workspace.statuses,
+            *self.decoded_slots,
+        ):
+            record_device_stream(tensor, stream)
+
     def bind_outputs(
         self, decoded_slots: Sequence[torch.Tensor]
     ) -> list[PreparedDecode]:
@@ -425,7 +422,10 @@ class PreparedDecodePlan:
         The caller waits for prior apply readers before reusing each output and
         its status/actual-size row; DE uses one stream and temporary workspace.
         """
-        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
+        from sglang.srt.weight_sync.gpu_delta.memory import (
+            record_device_stream,
+            require_de_capable,
+        )
 
         if len(decoded_slots) != self.slot_count:
             raise ValueError("Decoded output count differs from prepared slots")
@@ -458,6 +458,8 @@ class PreparedDecodePlan:
                 and (base + remainder) % self.decoder.alignments.output
             ):
                 raise ValueError("Misaligned decoded frame")
+        for tensor in decoded_slots:
+            record_device_stream(tensor, self.stream)
         with torch.cuda.device(self.decoder.device), torch.cuda.stream(self.stream):
             for base, capacity in zip(bases, capacities):
                 if capacity:
@@ -494,8 +496,9 @@ class PreparedDecode:
         """Launch only; caller checks statuses/sizes on device before applying weights.
 
         This object and all storage must outlive the submitted work. There is no
-        implicit synchronization in destruction; the session owns the final fence
-        and enters the captured DE stream/device context around submission.
+        normal-path synchronization here; the session owns the final fence and
+        enters the captured DE stream/device context around submission. Foreign
+        allocation finalizers also fence their recorded consumers before freeing.
         """
         if not self.statuses.numel():
             return

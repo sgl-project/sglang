@@ -502,6 +502,7 @@ class PreparedDelta:
                     self.de_stream,
                     slot_count=self.decode_stages,
                 )
+                self.decode_plan.record_stream(self.stream)
                 self.workspace = self.decode_plan.workspace
             from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 
@@ -529,12 +530,16 @@ class PreparedDelta:
 
     def _allocate_paused(self):
         """Allocate reusable decoded outputs, then bind their pointers."""
+        from sglang.srt.weight_sync.gpu_delta.memory import device_empty
+
         started = time.perf_counter()
         self.stream.wait_stream(torch.cuda.default_stream(self.device))
         with torch.cuda.stream(self.stream):
             self.decoded = (
                 [
-                    torch.empty(self.max_decoded, dtype=torch.uint8, device=self.device)
+                    device_empty(
+                        self.max_decoded, dtype=torch.uint8, device=self.device
+                    )
                     for _ in range(self.decode_stages)
                 ]
                 if self.static_plans
@@ -691,8 +696,10 @@ class PreparedDelta:
                 name: sum(start.elapsed_time(end) for start, end in pairs)
                 for name, pairs in self.events.items()
             }
-        # Release the large GPU leases before resume. PyTorch may cache their
-        # storage for later updates; generation can reuse that free storage.
+        # The loop-local batch also holds output/workspace leases. Drop it before
+        # releasing the dedicated DE allocations, so free/fence overhead is
+        # included in paused host wall time and completes before generation resumes.
+        batch = None
         self._release_gpu()
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         return {

@@ -21,7 +21,7 @@ from sglang.srt.weight_sync.gpu_delta.layout import (
     _plan_decode,
     _PreparedBatch,
 )
-from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
+from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, device_empty
 
 
 def _frame_table(batches):
@@ -93,10 +93,11 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     workspace = plan.workspace
     # Large outputs are allocated only at the paused binding boundary.
     decoded = [
-        torch.empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
+        device_empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
         for _ in range(stages)
     ]
     plans = plan.bind_outputs(decoded)
+    plan.record_stream(stream)
     del plan
     assert plans[0].metadata.untyped_storage().data_ptr() == (
         plans[1].metadata.untyped_storage().data_ptr()
@@ -265,7 +266,7 @@ def test_rejects_frame_range_before_decode():
     allocation = HostAllocation(256, device.index)
     host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
     decoded = tuple(
-        torch.empty(256, dtype=torch.uint8, device=device) for _ in range(2)
+        device_empty(256, dtype=torch.uint8, device=device) for _ in range(2)
     )
     stream = torch.cuda.Stream(device=device)
     good = [(0, 32, 128, 0)]

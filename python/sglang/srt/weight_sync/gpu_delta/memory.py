@@ -5,15 +5,21 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Original HOST_NUMA allocations admitted for Blackwell hardware decompression.
+"""Feature-owned allocations admitted for Blackwell hardware decompression.
 
 Each rank owns its persistent host input arena; allocations are never exported
 or imported.
-This module allocates no device memory and submits no CUDA stream work.
+Device buffers use cuMemAlloc directly, without changing PyTorch's allocator.
 """
 
 import ctypes
+import logging
+import math
+import weakref
 from functools import cache
+
+logger = logging.getLogger(__name__)
+_device_owners = weakref.WeakValueDictionary()
 
 
 @cache
@@ -27,21 +33,140 @@ def _driver():
 def _check(result, operation):
     code = result[0]
     if code:
-        raise RuntimeError(f"GPU-delta host allocation {operation} failed: CUDA {code}")
+        raise RuntimeError(f"GPU-delta allocation {operation} failed: CUDA {code}")
     return result[1] if len(result) > 1 else None
+
+
+@cache
+def _pointer_attribute_query():
+    # cuda-bindings 13.3.1 exports the new enum but its typed result dispatcher
+    # rejects it before calling CUDA. Keep the image's bindings and query the
+    # same driver API directly in that specific case. CUdeviceptr is uint64;
+    # IS_HW_DECOMPRESS_CAPABLE writes an unsigned-int boolean.
+    library = ctypes.CDLL("libcuda.so.1")
+    query = library.cuPointerGetAttribute
+    query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+    query.restype = ctypes.c_int
+    return query
 
 
 def require_de_capable(pointer):
     driver = _driver()
-    capable = _check(
-        driver.cuPointerGetAttribute(
-            driver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE,
-            pointer,
-        ),
-        "IS_HW_DECOMPRESS_CAPABLE",
-    )
+    attribute = driver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE
+    try:
+        result = driver.cuPointerGetAttribute(attribute, pointer)
+    except TypeError as error:
+        if (
+            str(error)
+            != "Unsupported attribute: CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE"
+        ):
+            raise
+        capable = ctypes.c_uint(0)
+        status = _pointer_attribute_query()(
+            ctypes.byref(capable), int(attribute), int(pointer)
+        )
+        result = status, capable.value
+    capable = _check(result, "IS_HW_DECOMPRESS_CAPABLE")
     if not capable:
         raise RuntimeError("GPU-delta pointer is not hardware-decompression capable")
+
+
+class _DeviceAllocation:
+    """Foreign tensor storage owns this object, including through escaped views.
+
+    Never retain the wrapping tensor here or free while a tensor alias survives.
+    Finalization drains recorded streams even on partial-construction failures;
+    the normal receiver path already joins them before dropping its leases.
+    """
+
+    def __init__(self, size, device, stream):
+        self.address = 0
+        self.release_attempted = False
+        self.device = device
+        self.driver = driver = _driver()
+        self.streams = {stream.cuda_stream: stream}
+        self.context = _check(driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
+        if not int(self.context):
+            raise RuntimeError("GPU-delta device allocation requires a current context")
+        if int(_check(driver.cuCtxGetDevice(), "cuCtxGetDevice")) != device.index:
+            raise RuntimeError("GPU-delta device allocation context/device mismatch")
+        self.size = size
+        self.address = int(_check(driver.cuMemAlloc(size), "cuMemAlloc"))
+        try:
+            require_de_capable(self.address)
+        except BaseException:
+            self._release()
+            raise
+        _device_owners[self.address] = self
+
+    @property
+    def __cuda_array_interface__(self):
+        # Newly allocated bytes have no producer work. PyTorch's CAI importer
+        # retains this owner in the storage deleter; stream safety is explicit.
+        return {
+            "shape": (self.size,),
+            "typestr": "|u1",
+            "data": (self.address, False),
+            "version": 3,
+        }
+
+    def _release(self):
+        if not self.address or self.release_attempted:
+            return
+        # Cleanup failure is retained as a leak rather than an uncertain retry.
+        self.release_attempted = True
+        driver = self.driver
+        _check(driver.cuCtxPushCurrent(self.context), "cuCtxPushCurrent")
+        try:
+            for stream in self.streams.values():
+                stream.synchronize()
+            _check(driver.cuMemFree(self.address), "cuMemFree")
+            self.address = 0
+        finally:
+            _check(driver.cuCtxPopCurrent(), "cuCtxPopCurrent")
+
+    def __del__(self):
+        try:
+            self._release()
+        except Exception:
+            # A failed fence/free must never trigger replay of a committed XOR.
+            # Do not force-free a buffer whose stream completion is uncertain.
+            logger.exception("GPU-delta device allocation cleanup failed")
+
+
+def device_empty(shape, dtype, device):
+    """Allocate only a DE-facing tensor outside the global Torch allocator."""
+    import torch
+
+    device = torch.device(device)
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    if device.type != "cuda" or device.index is None:
+        raise ValueError("GPU-delta device allocation requires an explicit CUDA device")
+    if any(not isinstance(size, int) or size < 0 for size in shape):
+        raise ValueError("GPU-delta device allocation requires nonnegative dimensions")
+    if dtype not in (torch.uint8, torch.int32, torch.int64):
+        raise ValueError("Unsupported GPU-delta device allocation dtype")
+    size = math.prod(shape) * dtype.itemsize
+    if not size:
+        # cuMemAlloc(0) is invalid. Empty tensors have no DE-addressable storage.
+        return torch.empty(shape, dtype=dtype, device=device)
+    with torch.cuda.device(device):
+        # Establish the existing PyTorch primary context; create no new context.
+        stream = torch.cuda.current_stream(device)
+        owner = _DeviceAllocation(size, device, stream)
+        value = torch.as_tensor(owner, dtype=torch.uint8, device=device)
+        if value.data_ptr() != owner.address or value.device != device:
+            raise RuntimeError("GPU-delta CUDA array import must preserve storage")
+        return value.view(dtype).reshape(shape)
+
+
+def record_device_stream(tensor, stream):
+    """Record foreign-storage readers; Tensor.record_stream only covers Torch pools."""
+    owner = _device_owners.get(tensor.untyped_storage().data_ptr())
+    if owner is not None:
+        if stream.device != owner.device:
+            raise ValueError("GPU-delta allocation consumer stream/device mismatch")
+        owner.streams[stream.cuda_stream] = stream
 
 
 class HostAllocation:

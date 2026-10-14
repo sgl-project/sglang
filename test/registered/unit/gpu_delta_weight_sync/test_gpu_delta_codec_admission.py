@@ -32,35 +32,6 @@ def _frame_table(batches):
 
 
 @pytest.mark.parametrize(
-    "backend,settings,segments,error",
-    [
-        ("cudaMallocAsync", False, [], "native CUDA"),
-        ("native", True, [], "expandable_segments"),
-        ("native", None, [], "expandable_segments"),
-        ("native", False, [{"device": 0, "is_expandable": True}], "existing PyTorch"),
-        ("native", False, [{"device": 1, "is_expandable": True}], None),
-    ],
-)
-def test_hardware_allocator_uses_effective_settings(
-    monkeypatch, backend, settings, segments, error
-):
-    monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: backend)
-    monkeypatch.setattr(
-        torch.cuda.memory,
-        "_snapshot",
-        lambda: {
-            "allocator_settings": {"expandable_segments": settings},
-            "segments": segments,
-        },
-    )
-    if error:
-        with pytest.raises(RuntimeError, match=error):
-            codec._require_hardware_allocator(torch.device("cuda", 0))
-    else:
-        codec._require_hardware_allocator(torch.device("cuda", 0))
-
-
-@pytest.mark.parametrize(
     "name,algorithm,options_type,reserved_offset",
     [
         ("snappy", "Snappy", codec._SnappyOptions, 8),
@@ -82,7 +53,7 @@ def test_codec_abi_and_frozen_hardware_options(
         assert options_type.data_type.offset == 8
         assert options_type.bitshuffle_mode.offset == 12
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sorting)
-    calls, admissions, device_queries = [], [], []
+    calls, device_queries = [], []
     attributes = {136: {"Snappy": 2, "LZ4": 4}[algorithm], 137: 4 << 20}
 
     def device_attribute(attribute, device):
@@ -134,11 +105,19 @@ def test_codec_abi_and_frozen_hardware_options(
     monkeypatch.setattr(codec.ctypes, "CDLL", lambda _: SimpleNamespace(**functions))
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-    monkeypatch.setattr(codec, "_require_hardware_allocator", admissions.append)
+    for allocator_api in (
+        "get_allocator_backend",
+        "_snapshot",
+        "_set_allocator_settings",
+    ):
+        monkeypatch.setattr(
+            torch.cuda.memory,
+            allocator_api,
+            lambda *a: pytest.fail("global allocator access"),
+        )
     decoder = codec.NvcompDecoder(torch.device("cuda", 0), name)
     assert decoder.inner_codec == name and decoder.backend == "hardware"
     assert decoder.maximum_chunk_bytes == 4 << 20
-    assert admissions == [decoder.device]
     assert decoder._options.backend == 1
     assert decoder._options.sort_before_hw_decompress == int(sorting)
     assert bytes(decoder._options)[8:] == bytes(56)
@@ -287,7 +266,10 @@ def test_host_input_plans_reject_invalid_geometry_before_device_work(
     monkeypatch.setitem(
         sys.modules,
         "sglang.srt.weight_sync.gpu_delta.memory",
-        SimpleNamespace(require_de_capable=lambda _: pytest.fail("queried device")),
+        SimpleNamespace(
+            require_de_capable=lambda _: pytest.fail("queried device"),
+            record_device_stream=lambda *a: pytest.fail("recorded device"),
+        ),
     )
     outputs = [torch.empty(256, dtype=torch.uint8) for _ in range(stages)]
     a, b, *rest = outputs
