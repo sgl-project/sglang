@@ -1,5 +1,10 @@
 """HiCache integration mixins for the decode side of PD disaggregation"""
 
+# TODO: these are no longer scheduler mixins. Each one is the HiCache part of
+# a single decode queue (DecodePreallocQueue, DecodeTransferQueue) and reads
+# only that queue's own fields. Fold each into its queue class, or rename the
+# module to decode_hicache.py, the next time this code changes.
+
 from __future__ import annotations
 
 import logging
