@@ -1297,6 +1297,8 @@ class Envs:
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
+    SGLANG_DEEPEP_V2_CPU_TIMEOUT_SECS = EnvInt(300)
+    SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS = EnvInt(100)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
     # by the model-specific dispatcher configuration; all other paths retain
