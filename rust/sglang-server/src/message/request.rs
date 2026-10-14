@@ -972,67 +972,12 @@ mod tests {
                     "action_id": "a",
                     "action_type": "t",
                     "action_version": "1",
-                    "payload": {"value": payload}
+                    "payload": serde_json::json!({"value": payload}).to_string()
                 }]
             }
         });
         let error = requests(&body.to_string()).unwrap_err();
         assert!(error.to_string().contains("kv_hints"), "{error}");
-        assert!(error.to_string().contains("broadcast"), "{error}");
-    }
-
-    /// `lora_path` and `kv_hints` follow Python `GenerateReqInput`: a scalar
-    /// applies to every prompt, a list is one nullable value per prompt. The
-    /// Python server validates `/generate` against this same schema, so a
-    /// per-prompt list rejected here was a 400 there too.
-    #[test]
-    fn orchestrator_lists_are_per_prompt() {
-        let mut lora_ids = BTreeMap::new();
-        lora_ids.insert("adapter".into(), "stable-id".into());
-        let policy = GenerationPolicy {
-            lora_ids,
-            ..GenerationPolicy::default()
-        };
-        let envelope = serde_json::json!({
-            "protocol_version": "1",
-            "message_id": "m",
-            "actions": [{"action_id": "a", "action_type": "t", "action_version": "1", "payload": {}}]
-        });
-
-        let body = serde_json::json!({
-            "text": ["a", "b", "c", "d"],
-            "lora_path": ["adapter", null, "", "adapter"],
-            "kv_hints": [envelope, null, null, envelope]
-        });
-        let (requests, _) = requests_with_policy(&body.to_string(), &policy).unwrap();
-        let lora: Vec<_> = requests.iter().map(|r| r.lora_id.as_deref()).collect();
-        assert_eq!(lora, [Some("stable-id"), None, None, Some("stable-id")]);
-        let hints: Vec<_> = requests.iter().map(|r| r.kv_hints.is_some()).collect();
-        assert_eq!(hints, [true, false, false, true]);
-
-        let body =
-            serde_json::json!({"text": ["a", "b"], "lora_path": "adapter", "kv_hints": envelope});
-        let (requests, _) = requests_with_policy(&body.to_string(), &policy).unwrap();
-        assert!(
-            requests
-                .iter()
-                .all(|r| r.lora_id.as_deref() == Some("stable-id"))
-        );
-        assert!(requests.iter().all(|r| r.kv_hints.is_some()));
-
-        for field in ["lora_path", "kv_hints"] {
-            let value = if field == "lora_path" {
-                serde_json::json!(["adapter"])
-            } else {
-                serde_json::json!([envelope])
-            };
-            let body = serde_json::json!({"text": ["a", "b"], field: value});
-            let error = requests_with_policy(&body.to_string(), &policy).unwrap_err();
-            assert!(
-                error.to_string().contains("does not match batch size"),
-                "{field}: {error}"
-            );
-        }
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).

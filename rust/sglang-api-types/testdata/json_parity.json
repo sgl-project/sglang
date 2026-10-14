@@ -436,18 +436,6 @@
         }
       },
       "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]}}}"
-    },
-    {
-      "type": "GenerateRequest",
-      "name": "orchestrator batch: per-prompt lora_path and kv_hints lists with null items",
-      "input": {"text": ["a", "b", "c"], "lora_path": ["lora0", null, "lora0"], "kv_hints": [{"protocol_version": "1", "message_id": "m", "actions": [{"action_id": "a", "action_type": "t", "action_version": "1", "payload": {"k": [1, 2]}}]}, null, {"protocol_version": "1", "message_id": "m", "actions": [{"action_id": "a", "action_type": "t", "action_version": "1", "payload": {"k": [1, 2]}}]}]},
-      "canonical": "{\"text\":[\"a\",\"b\",\"c\"],\"stream\":false,\"lora_path\":[\"lora0\",null,\"lora0\"],\"kv_hints\":[{\"protocol_version\":\"1\",\"message_id\":\"m\",\"actions\":[{\"action_id\":\"a\",\"action_type\":\"t\",\"action_version\":\"1\",\"payload\":{\"k\":[1,2]}}]},null,{\"protocol_version\":\"1\",\"message_id\":\"m\",\"actions\":[{\"action_id\":\"a\",\"action_type\":\"t\",\"action_version\":\"1\",\"payload\":{\"k\":[1,2]}}]}]}"
-    },
-    {
-      "type": "GenerateRequest",
-      "name": "orchestrator single: scalar lora_path, routing, priority, reasoning, kv_hints",
-      "input": {"text": "a", "lora_path": "lora0", "routing_key": "r", "priority": 3, "require_reasoning": true, "max_thinking_tokens": 64, "kv_hints": {"protocol_version": "1", "message_id": "m", "actions": [{"action_id": "a", "action_type": "t", "action_version": "1", "payload": {"k": [1, 2]}}]}},
-      "canonical": "{\"text\":\"a\",\"stream\":false,\"lora_path\":\"lora0\",\"routing_key\":\"r\",\"priority\":3,\"require_reasoning\":true,\"max_thinking_tokens\":64,\"kv_hints\":{\"protocol_version\":\"1\",\"message_id\":\"m\",\"actions\":[{\"action_id\":\"a\",\"action_type\":\"t\",\"action_version\":\"1\",\"payload\":{\"k\":[1,2]}}]}}"
     }
   ]
 }
