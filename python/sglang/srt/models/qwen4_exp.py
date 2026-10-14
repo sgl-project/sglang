@@ -125,7 +125,6 @@ def _breakable_qsa_indexer(layer, hidden_states, positions):
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
-        use_host_prefill_lengths=True,
     )
     # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
     # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
@@ -1787,8 +1786,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
-        use_host_prefill_lengths: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1807,13 +1804,6 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        if use_host_prefill_lengths:
-            indexer_metadata = msgspec.structs.replace(
-                indexer_metadata,
-                prefill_sequence_lengths_cpu=tuple(
-                    forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
-                ),
-            )
         topk_indices = self.indexer(
             hidden_states,
             positions,
