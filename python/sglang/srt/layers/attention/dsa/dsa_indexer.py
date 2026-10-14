@@ -1804,18 +1804,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
-        can_fuse_store = (
+        if (
             _is_cuda
             and (not _is_fp8_fnuz)
+            # A sharded pool writes through set_index_k_scale_buffer, which
+            # stages scratch and keeps only owner-local rows.
+            and get_kv_shard_pool(pool) is None
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
                 pool.page_size,
             )
-        )
-        # Sharded stores must stage all keys in scratch and persist only
-        # owner-local rows through the pool's address-aware setter.
-        if can_fuse_store and get_kv_shard_pool(pool) is None:
+        ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
@@ -1848,16 +1848,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return
 
-        # The CUDA fused writers store unrounded FP32 scales. Preserve that
-        # quantization when sharding routes an otherwise eligible fused write
-        # through the pool setter; UE8M0 rounding would change keys and top-k.
+        # Fallback: original path
         assert act_quant is not None
-        if can_fuse_store:
-            k_fp8, k_scale = act_quant(
-                key, self.block_size, None, use_fused_store_math=True
-            )
-        else:
-            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()

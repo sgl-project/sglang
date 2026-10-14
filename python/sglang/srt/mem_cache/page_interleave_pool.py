@@ -610,7 +610,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        assert not self.use_dsa, "DSA requires PageInterleaveDSATokenToKVPool"
+        assert not self.use_dsa, "DSA models are not supported by KV sharding yet"
         self._init_page_shard_state(shard_spec, shard_group)
 
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, torch.Tensor]:
@@ -840,9 +840,8 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
     expose owner-local storage; ``index_key_cache.get_local_buffer`` always
     exposes that storage.
 
-    The DSA backend translates kernel metadata to scratch addresses, while
-    indexer writes go through the pool setter to stage scratch and retain
-    only owner-local keys. Shared-topk layers can use empty indexer buffers.
+    This is a pool-level implementation. Model-runner selection still
+    requires separate integration.
     """
 
     def __init__(

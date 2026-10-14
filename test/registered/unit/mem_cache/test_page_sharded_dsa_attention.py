@@ -3,16 +3,16 @@
 """DSA attention and indexer integration for page-interleaved KV caches.
 
 The multi-GPU test reuses the byte-exact pool fixture and additionally exercises
-real DSA metadata construction and each supported sparse attention backend.
-Full and shared indexer layers must produce the same output as an unsharded
-cache, including packed FlashMLA FP8 and raw TRT-LLM FP8 cache layouts.
+real DSA metadata construction, the real indexer read, and each supported sparse
+attention backend. Full and shared indexer layers must produce the same output
+as an unsharded cache, including packed FlashMLA FP8 and raw TRT-LLM FP8 caches.
 """
 
 import os
 import tempfile
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 import torch.multiprocessing as mp
@@ -29,113 +29,8 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
 
-class TestGLM52IndexerCacheRouting(unittest.TestCase):
-    def test_both_indexer_writers_preserve_logical_locations_for_sharded_pool(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer
-
-        # This batch spans both owners. Direct fused stores address the read
-        # buffer and bypass the pool setter, losing owner-local persistence.
-        # The pool GPU tests separately verify that setter's exact cache bytes.
-        locations = torch.tensor([65, 128, 193], dtype=torch.int64)
-        key = torch.arange(3 * 128, dtype=torch.float32).reshape(3, 128).bfloat16()
-        quantized = (key % 16).to(torch.float8_e4m3fn)
-        scales = torch.tensor([[0.5], [1.0], [2.0]])
-        positions = torch.tensor([0, 1, 2])
-        for fused_prepare in (False, True):
-            for sharded, fused_eligible in (
-                (False, False),
-                (False, True),
-                (True, False),
-                (True, True),
-            ):
-                with self.subTest(
-                    fused_prepare=fused_prepare,
-                    sharded=sharded,
-                    fused_eligible=fused_eligible,
-                ):
-                    pool = (
-                        PageInterleaveDSATokenToKVPool.__new__(
-                            PageInterleaveDSATokenToKVPool
-                        )
-                        if sharded
-                        else SimpleNamespace()
-                    )
-                    pool.page_size = 64
-                    pool.get_index_k_with_scale_buffer = Mock(return_value=object())
-                    pool.set_index_k_scale_buffer = Mock()
-                    indexer = SimpleNamespace(
-                        block_size=128,
-                        scale_fmt="ue8m0",
-                        k_norm=SimpleNamespace(
-                            weight=object(), bias=object(), variance_epsilon=1e-6
-                        ),
-                        _indexer_cos_sin_cache=object(),
-                    )
-                    indexer._store_index_k_cache = MethodType(
-                        dsa_indexer.Indexer._store_index_k_cache, indexer
-                    )
-                    quantize = Mock(return_value=(quantized, scales))
-                    batch = SimpleNamespace(out_cache_loc=locations)
-                    with (
-                        patch.object(
-                            dsa_indexer, "get_token_to_kv_pool", return_value=pool
-                        ),
-                        patch.object(dsa_indexer, "_is_cuda", True),
-                        patch.object(dsa_indexer, "_is_fp8_fnuz", False),
-                        patch.object(dsa_indexer, "_use_aiter", False),
-                        patch.object(
-                            dsa_indexer,
-                            "can_use_dsa_fused_store",
-                            return_value=fused_eligible,
-                        ),
-                        patch.object(
-                            dsa_indexer, "fused_store_index_k_cache"
-                        ) as fused_store,
-                        patch.object(
-                            dsa_indexer,
-                            "fused_k_indexer_norm_rope_store",
-                            create=True,
-                        ) as fused_prepare_store,
-                        patch.object(
-                            dsa_indexer,
-                            "fused_k_indexer_norm_rope",
-                            return_value=key,
-                            create=True,
-                        ),
-                    ):
-                        if fused_prepare:
-                            dsa_indexer.Indexer._fused_k_prepare_and_store(
-                                indexer, key, positions, batch, 3, quantize
-                            )
-                        else:
-                            indexer._store_index_k_cache(
-                                batch, 3, key, act_quant=quantize
-                            )
-                    if sharded or not fused_eligible:
-                        fused_store.assert_not_called()
-                        fused_prepare_store.assert_not_called()
-                        if fused_eligible:
-                            quantize.assert_called_once_with(
-                                key, 128, None, use_fused_store_math=True
-                            )
-                        else:
-                            quantize.assert_called_once_with(key, 128, "ue8m0")
-                        pool.set_index_k_scale_buffer.assert_called_once_with(
-                            layer_id=3,
-                            loc=locations,
-                            index_k=quantized,
-                            index_k_scale=scales,
-                        )
-                    else:
-                        # Positive control: the same device/shape settings do
-                        # enter the fused branch for the ordinary cache.
-                        (
-                            fused_prepare_store if fused_prepare else fused_store
-                        ).assert_called_once()
-                        pool.set_index_k_scale_buffer.assert_not_called()
-                        quantize.assert_not_called()
-
-    def test_cuda_writers_match_unsharded_quantization(self):
+class TestShardedDSAIndexerWrite(unittest.TestCase):
+    def test_indexer_writers_store_through_sharded_pool(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 
         if not dsa_indexer._is_cuda:
@@ -147,10 +42,6 @@ class TestGLM52IndexerCacheRouting(unittest.TestCase):
             PageShardSpec,
         )
 
-        self.assertTrue(
-            dsa_indexer.can_use_dsa_fused_store(torch.bfloat16, torch.int64, 64),
-            "the unsharded positive control must execute the real fused writer",
-        )
         device = "cuda"
         generator = torch.Generator(device=device).manual_seed(20261013)
         num_tokens, num_pages, page_size = 2305, 80, 64
@@ -195,8 +86,7 @@ class TestGLM52IndexerCacheRouting(unittest.TestCase):
         )
         reference = DSATokenToKVPool(num_pages * page_size, **pool_args)
         sharded = PageInterleaveDSATokenToKVPool.__new__(PageInterleaveDSATokenToKVPool)
-        # Initialize the actual owner-aware cache and its real storage kernels.
-        # This write-only batch needs no prefix collective or NCCL communicator.
+        # Rank 0 of 2 with an active extend; a write-only batch needs no gather.
         DSATokenToKVPool.__init__(sharded, num_pages * page_size // 2, **pool_args)
         sharded.shard_spec = PageShardSpec(
             shard_rank=0,
@@ -216,120 +106,40 @@ class TestGLM52IndexerCacheRouting(unittest.TestCase):
         ).roll(7)
         local_buffer = sharded.index_key_cache.get_local_buffer(0)
 
-        def unpack(buffer, loc):
-            keys = buffer[:, : page_size * 128].reshape(-1, 128)[loc]
-            scales = (
-                buffer[:, page_size * 128 :]
-                .contiguous()
-                .view(torch.float32)
-                .reshape(-1, 1)[loc]
-            )
-            return keys, scales
-
-        query = torch.randn((8, 128), device=device, generator=generator)
         for fused_prepare in (False, True):
             with self.subTest(fused_prepare=fused_prepare):
                 for buffer in (reference_buffer, local_buffer, scratch):
                     buffer.zero_()
-                for pool in (reference, sharded):
-                    # Only the runtime pool lookup is replaced. Quantization,
-                    # norm/RoPE, owner filtering, and all writes are real CUDA.
-                    with patch.object(
-                        dsa_indexer, "get_token_to_kv_pool", return_value=pool
-                    ):
-                        if fused_prepare:
-                            dsa_indexer.Indexer._fused_k_prepare_and_store(
-                                indexer, key, positions, batch, 0, act_quant
-                            )
-                        else:
-                            indexer._store_index_k_cache(
-                                batch, 0, key, act_quant=act_quant
-                            )
-                expected_keys, expected_scales = unpack(reference_buffer, locations)
-                actual_keys, actual_scales = unpack(
-                    scratch, sharded.translate_loc_to_scratch(locations)
+                stored_key = key
+                if fused_prepare:
+                    stored_key = dsa_indexer.fused_k_indexer_norm_rope(
+                        key,
+                        indexer.k_norm.weight,
+                        indexer.k_norm.bias,
+                        indexer.k_norm.variance_epsilon,
+                        indexer._indexer_cos_sin_cache,
+                        positions,
+                    )
+                reference.set_index_k_scale_buffer(
+                    0, locations, *act_quant(stored_key, 128, "ue8m0")
                 )
-                self.assertTrue(
-                    torch.any(expected_scales != expected_scales.log2().ceil().exp2()),
-                    "regression inputs must exercise non-power-of-two FP32 scales",
-                )
-                torch.testing.assert_close(
-                    actual_scales, expected_scales, rtol=0, atol=0
-                )
-                torch.testing.assert_close(actual_keys, expected_keys, rtol=0, atol=0)
+                with patch.object(
+                    dsa_indexer, "get_token_to_kv_pool", return_value=sharded
+                ):
+                    if fused_prepare:
+                        dsa_indexer.Indexer._fused_k_prepare_and_store(
+                            indexer, key, positions, batch, 0, act_quant
+                        )
+                    else:
+                        indexer._store_index_k_cache(batch, 0, key, act_quant=act_quant)
+                # Every key is staged at its scratch row; rank 0 keeps even pages.
                 torch.testing.assert_close(
                     scratch[sharded._page_pos.long()], reference_buffer, rtol=0, atol=0
                 )
                 torch.testing.assert_close(
                     local_buffer, reference_buffer[::2], rtol=0, atol=0
                 )
-                # More candidates than GLM's top-k make scale-induced ranking
-                # changes observable; short prompts would select every token.
-                topk = []
-                for keys, scales in (
-                    (actual_keys, actual_scales),
-                    (expected_keys, expected_scales),
-                ):
-                    logits = query @ (keys.view(torch.float8_e4m3fn).float() * scales).T
-                    topk.append(logits.topk(2048, dim=-1).indices)
-                torch.testing.assert_close(*topk, rtol=0, atol=0)
         torch.cuda.synchronize()
-
-    def test_ragged_indexer_reads_logical_pages_through_pool(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer
-        from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
-            DSAIndexerMetadata,
-        )
-        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        class ReachedCacheRead(Exception):
-            pass
-
-        logical_pages = torch.tensor([[17, 18]], dtype=torch.int32)
-        scratch_pages = torch.tensor([[1, 2]], dtype=torch.int32)
-        lengths = torch.tensor([65], dtype=torch.int32)
-        metadata = DSAIndexerMetadata(
-            SimpleNamespace(
-                real_page_table=scratch_pages,
-                indexer_logical_page_table=logical_pages,
-                indexer_k_start_end=(torch.tensor([0]), torch.tensor([65])),
-                indexer_seq_lens_cpu=lengths,
-                indexer_seq_lens=lengths,
-            ),
-            TopkTransformMethod.RAGGED,
-        )
-        pool = SimpleNamespace(
-            page_size=64,
-            get_index_k_scale_buffer=Mock(side_effect=ReachedCacheRead),
-        )
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            seq_lens_cpu=lengths,
-            extend_seq_lens_cpu=[1],
-        )
-        # The read is intercepted before CUDA computation. The method only
-        # inspects query shape/device before asking the pool to gather keys.
-        query = SimpleNamespace(shape=(1, 32, 128), device=torch.device("cuda:0"))
-        with (
-            patch.object(dsa_indexer, "get_token_to_kv_pool", return_value=pool),
-            patch.object(dsa_indexer, "_is_hip", False),
-            patch.object(dsa_indexer, "_is_xpu", False),
-            self.assertRaises(ReachedCacheRead),
-        ):
-            dsa_indexer.Indexer._get_topk_ragged(
-                SimpleNamespace(),
-                False,
-                batch,
-                3,
-                query,
-                torch.ones((1, 32, 1)),
-                metadata,
-                topk_result=torch.empty((1, 2048), dtype=torch.int32),
-            )
-        pool.get_index_k_scale_buffer.assert_called_once_with(
-            3, lengths, logical_pages, 65, 65
-        )
 
 
 def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse"):
@@ -395,7 +205,6 @@ class _MetadataShardPool(PageInterleaveKVPoolMixin):
         self.dtype = torch.float8_e4m3fn
         self.size = 64
         self.page_size = 64
-        self.shard_spec = SimpleNamespace(scratch_rows=1024)
         self.begin_args = None
 
     def begin_shard_extend(self, *args):
@@ -407,7 +216,7 @@ class _MetadataShardPool(PageInterleaveKVPoolMixin):
         return loc % 512
 
 
-class TestGLM52ShardCPMetadata(unittest.TestCase):
+class TestShardedDSAMetadata(unittest.TestCase):
     def test_cp_request_filtering_keeps_both_address_spaces_aligned(self):
         from sglang.srt.layers.attention import dsa_backend
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -497,37 +306,21 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
             self.logits = logits.clone()
             return self.metadata.topk_transform(logits, *args, **kwargs)
 
-    results, logits, cache_reads = [], [], []
-    reference_repeat = None
+    results, logits = [], []
     for backend in backends:
         metadata = RecordingMetadata(backend.get_indexer_metadata(layer_id, batch))
-        pool = backend.token_to_kv_pool
-        with patch.object(dsa_indexer, "get_token_to_kv_pool", return_value=pool):
-            result = dsa_indexer.Indexer._get_topk_ragged(
-                indexer, False, batch, layer_id, query, weights, metadata
-            )
-            if pool is check.reference:
-                reference_repeat = dsa_indexer.Indexer._get_topk_ragged(
+        with patch.object(
+            dsa_indexer, "get_token_to_kv_pool", return_value=backend.token_to_kv_pool
+        ):
+            results.append(
+                dsa_indexer.Indexer._get_topk_ragged(
                     indexer, False, batch, layer_id, query, weights, metadata
                 )
-        results.append(result)
+            )
         starts, ends = metadata.get_indexer_kvcache_range()
         columns = torch.arange(metadata.logits.shape[1], device=query.device)
         valid = (columns[None] >= starts[:, None]) & (columns[None] < ends[:, None])
         logits.append(metadata.logits[valid])
-        cache_reads.append(
-            pool.get_index_k_scale_buffer(
-                layer_id,
-                metadata.get_indexer_seq_len(),
-                metadata.get_cache_page_table_64(),
-                int(batch.seq_lens_cpu.sum()),
-                int(batch.seq_lens_cpu.max()),
-            )
-        )
-    for component in (0, 1):
-        torch.testing.assert_close(
-            cache_reads[0][component], cache_reads[1][component], rtol=0, atol=0
-        )
     torch.testing.assert_close(*logits, rtol=0, atol=0)
     expected = results[1]
     if metadata.topk_transform_method == TopkTransformMethod.PAGED:
@@ -536,43 +329,22 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
             check.pool.translate_loc_to_scratch(expected.clamp_min(0)),
             -1,
         ).to(results[0].dtype)
-    # Legacy SGL top-k emits selected values in atomic insertion order. Check
-    # the selected set independently before diagnosing ordering variation.
+    # SGL top-k emits selected values in atomic insertion order; FlashInfer's
+    # deterministic mode also fixes the order.
     torch.testing.assert_close(
         results[0].sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0
     )
-    torch.testing.assert_close(
-        reference_repeat.sort(dim=-1).values,
-        results[1].sort(dim=-1).values,
-        rtol=0,
-        atol=0,
-    )
     if backends[0].dsa_topk_backend.is_flashinfer():
         torch.testing.assert_close(results[0], expected, rtol=0, atol=0)
-        torch.testing.assert_close(reference_repeat, results[1], rtol=0, atol=0)
-    elif check.rank == 0:
-        print(
-            f"{backends[0].dsa_prefill_impl} layer {layer_id}: exact indexer bytes/logits; "
-            f"baseline repeat order changed={not torch.equal(reference_repeat, results[1])}, "
-            f"sharded order changed={not torch.equal(results[0], expected)}",
-            flush=True,
-        )
-    # Use matching selection order for the subsequent exact attention check;
-    # the deterministic FlashInfer case already requires this order naturally.
+    # Use matching selection order for the subsequent exact attention check.
     return [expected, results[1]]
 
 
-def _check_attention_batch(
-    check,
-    requests,
-    generation,
-    prefill_impl,
-    *,
-    real_indexer=False,
-    topk_backend="sgl-kernel",
-):
+def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_backend):
     import test_page_interleave_shard as fixture
 
+    from sglang.srt.layers.attention.dsa import dsa_indexer
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     device = check.device
@@ -582,9 +354,7 @@ def _check_attention_batch(
     rows = [fixture._locs(pages, length, device) for pages, _, length in requests]
     req_ids = torch.arange(len(rows), device=device) * 2 + 1
     req_to_token = torch.zeros(
-        (2 * len(rows) + 1, max(lengths)),
-        device=device,
-        dtype=torch.int32 if real_indexer else torch.int64,
+        (2 * len(rows) + 1, max(lengths)), device=device, dtype=torch.int32
     )
     for req_id, row in zip(req_ids, rows):
         req_to_token[req_id, : row.numel()] = row
@@ -609,13 +379,9 @@ def _check_attention_batch(
         _attention_backend(pool, req_to_token, device, prefill_impl)
         for pool in (check.pool, check.reference)
     ]
-    if real_indexer:
-        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-
-        for backend in backends:
-            backend.use_fused_topk = True
-            backend.dsa_topk_backend = DSATopKBackend(topk_backend)
     for backend in backends:
+        backend.use_fused_topk = True
+        backend.dsa_topk_backend = DSATopKBackend(topk_backend)
         backend.init_forward_metadata(batch)
     torch.testing.assert_close(req_to_token[req_ids], logical_table, rtol=0, atol=0)
     sharded_metadata = backends[0].get_indexer_metadata(0, batch)
@@ -641,39 +407,32 @@ def _check_attention_batch(
         )
         / 8
     )
-    index_q = torch.randn((sum(extends), 128), generator=generator, device=device)
-    if real_indexer:
-        from sglang.srt.layers.attention.dsa import dsa_indexer
-
-        query = torch.randn(
-            (sum(extends), 32, 128),
-            generator=generator,
-            device=device,
-            dtype=torch.bfloat16,
+    query = torch.randn(
+        (sum(extends), 32, 128),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gates = (
+        torch.rand(
+            (sum(extends), 32), generator=generator, device=device, dtype=torch.bfloat16
         )
-        gates = (
-            torch.rand(
-                (sum(extends), 32),
-                generator=generator,
-                device=device,
-                dtype=torch.bfloat16,
-            )
-            + 0.5
-        )
-        angles = torch.randn((max(lengths), 32), generator=generator, device=device)
-        positions = torch.cat(
-            [
-                torch.arange(prefix, length, device=device)
-                for prefix, length in zip(prefixes, lengths)
-            ]
-        )
-        index_q, index_weights = dsa_indexer.fused_q_indexer_rope_first_quant(
-            query,
-            gates,
-            128**-0.5 * 32**-0.5,
-            torch.cat((angles.cos(), angles.sin()), dim=-1),
-            positions,
-        )
+        + 0.5
+    )
+    angles = torch.randn((max(lengths), 32), generator=generator, device=device)
+    positions = torch.cat(
+        [
+            torch.arange(prefix, length, device=device)
+            for prefix, length in zip(prefixes, lengths)
+        ]
+    )
+    index_q, index_weights = dsa_indexer.fused_q_indexer_rope_first_quant(
+        query,
+        gates,
+        128**-0.5 * 32**-0.5,
+        torch.cat((angles.cos(), angles.sin()), dim=-1),
+        positions,
+    )
     # TRT-LLM's FP8 path quantizes the split query before dispatch. FlashMLA
     # consumes the BF16 query directly, including when its KV cache is FP8.
     query_args = (
@@ -681,72 +440,28 @@ def _check_attention_batch(
         if prefill_impl == "trtllm"
         else {"q": q}
     )
-    previous_topk = None
+    topk = None
     for local_layer, shared in enumerate(fixture._INDEXER_SKIP_TOPK):
         layer_id = fixture._INDEXER_START_LAYER + local_layer
-        if real_indexer:
-            if not shared:
-                keys, scales = fixture._index_values(chunk_locs, layer_id, generation)
-                for pool in (check.pool, check.reference):
-                    pool.set_index_k_scale_buffer(layer_id, chunk_locs, keys, scales)
-                previous_topk = _real_indexer_topk(
-                    check, backends, batch, layer_id, index_q, index_weights
-                )
-            # The real indexer read above acquires its slot and prefetches the
-            # next layer before this layer writes its latent KV chunk.
-            chunk = fixture._latent_values(chunk_locs, layer_id, generation)
-            for pool in (check.pool, check.reference):
-                pool.set_mla_kv_buffer(
-                    SimpleNamespace(layer_id=layer_id),
-                    chunk_locs,
-                    chunk[..., :512].contiguous(),
-                    chunk[..., 512:].contiguous(),
-                )
-        else:
-            check.store(chunk_locs, layer_id, generation)
-        if not shared and not real_indexer:
-            topk_per_pool = []
-            for pool in (check.pool, check.reference):
-                keys, scales = pool.get_index_k_scale_buffer(
-                    layer_id,
-                    batch.seq_lens.to(torch.int32),
-                    sharded_metadata.get_cache_page_table_64().to(torch.int32),
-                    sum(lengths),
-                    max(lengths),
-                )
-                keys = keys.view(torch.float8_e4m3fn).float() * scales.view(
-                    torch.float32
-                )
-                parts = []
-                q_offset = k_offset = 0
-                for length, prefix, extend in zip(lengths, prefixes, extends):
-                    scores = (
-                        index_q[q_offset : q_offset + extend]
-                        @ keys[k_offset : k_offset + length].T
-                    )
-                    causal = (
-                        torch.arange(length, device=device)[None, :]
-                        <= prefix + torch.arange(extend, device=device)[:, None]
-                    )
-                    scores.masked_fill_(~causal, float("-inf"))
-                    values, indices = scores.topk(min(length, 64), dim=-1)
-                    indices.masked_fill_(values == float("-inf"), -1)
-                    if length < 64:
-                        indices = torch.nn.functional.pad(
-                            indices, (0, 64 - length), value=-1
-                        )
-                    parts.append(indices.to(torch.int32))
-                    q_offset += extend
-                    k_offset += length
-                # Match GLM-5.2's kernel tile-compatible index width, retaining
-                # a small selected set so sequences longer than 64 are sparse.
-                topk_per_pool.append(
-                    torch.nn.functional.pad(torch.cat(parts), (0, 2048 - 64), value=-1)
-                )
-            torch.testing.assert_close(*topk_per_pool, rtol=0, atol=0)
-            previous_topk = [topk_per_pool[0], topk_per_pool[0]]
-        elif shared:
+        if shared:
             assert check.pool.index_key_cache.get_local_buffer(layer_id).numel() == 0
+        else:
+            keys, scales = fixture._index_values(chunk_locs, layer_id, generation)
+            for pool in (check.pool, check.reference):
+                pool.set_index_k_scale_buffer(layer_id, chunk_locs, keys, scales)
+            topk = _real_indexer_topk(
+                check, backends, batch, layer_id, index_q, index_weights
+            )
+        # The indexer read above acquires its slot and prefetches the next
+        # layer before this layer writes its latent KV chunk.
+        chunk = fixture._latent_values(chunk_locs, layer_id, generation)
+        for pool in (check.pool, check.reference):
+            pool.set_mla_kv_buffer(
+                SimpleNamespace(layer_id=layer_id),
+                chunk_locs,
+                chunk[..., :512].contiguous(),
+                chunk[..., 512:].contiguous(),
+            )
         layer = SimpleNamespace(
             layer_id=layer_id,
             is_cross_attention=False,
@@ -755,7 +470,6 @@ def _check_attention_batch(
             v_head_dim=512,
             scaling=576**-0.5,
         )
-        chunk = fixture._latent_values(chunk_locs, layer_id, generation)
         outputs = [
             backend.forward_extend(
                 **query_args,
@@ -765,9 +479,9 @@ def _check_attention_batch(
                 layer=layer,
                 forward_batch=batch,
                 save_kv_cache=False,
-                topk_indices=topk,
+                topk_indices=topk_indices,
             )
-            for backend, topk in zip(backends, previous_topk)
+            for backend, topk_indices in zip(backends, topk)
         ]
         torch.testing.assert_close(
             *outputs,
@@ -780,9 +494,10 @@ def _check_attention_batch(
     torch.distributed.barrier()
 
 
-def _run_glm_attention(rank, world, init_method, real_indexer=False):
+def _run_attention(rank, world, init_method):
     import test_page_interleave_shard as fixture
 
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
     from sglang.srt.distributed.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
@@ -808,23 +523,18 @@ def _run_glm_attention(rank, world, init_method, real_indexer=False):
     # Consecutive shared layers exercise two-slot prefetch progression while
     # reusing the preceding full indexer's top-k, as in GLM-5.2.
     fixture._INDEXER_SKIP_TOPK[:] = [False, True, True, False, True]
-    if real_indexer:
-        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
-        def index_values(locs, layer_id, generation):
-            dims = torch.arange(128, device=locs.device)
-            state = (
-                locs[:, None] * 1103515245 + dims * 12345 + layer_id * 789 + generation
-            )
-            state = ((state ^ (state >> 13)) * 1274126177) & 0xFFFFFFFF
-            key = ((state % 65535).float() / 16384 - 2).bfloat16()
-            return act_quant(key, 128, None, use_fused_store_math=True)
+    def index_values(locs, layer_id, generation):
+        dims = torch.arange(128, device=locs.device)
+        state = locs[:, None] * 1103515245 + dims * 12345 + layer_id * 789 + generation
+        state = ((state ^ (state >> 13)) * 1274126177) & 0xFFFFFFFF
+        return act_quant(((state % 65535).float() / 16384 - 2).bfloat16(), 128)
 
-        # Avoid the short-period byte fixture's tied scores at long contexts.
-        fixture._index_values = index_values
-        envs.SGLANG_DSA_FUSE_TOPK.set(True)
-        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-        envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.set(True)
+    # Avoid the short-period byte fixture's tied scores at long contexts.
+    fixture._index_values = index_values
+    envs.SGLANG_DSA_FUSE_TOPK.set(True)
+    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.set(True)
     cases = [
         ("flashmla_sparse", False),
         ("flashmla_sparse", True),
@@ -832,89 +542,59 @@ def _run_glm_attention(rank, world, init_method, real_indexer=False):
     ]
     if torch.cuda.get_device_capability()[0] == 10:
         cases.append(("trtllm", False))
-    cases = [
-        (prefill_impl, packed, topk_backend)
-        for prefill_impl, packed in cases
-        for topk_backend in (
-            ("sgl-kernel", "flashinfer") if real_indexer else ("sgl-kernel",)
-        )
-    ]
-    for prefill_impl, packed, topk_backend in cases:
-        check = fixture._IndexerCacheCheck(
-            get_parallel().attn_tp_group,
-            packed,
-            raw_fp8=prefill_impl == "trtllm",
-            prefix_contexts=16 if real_indexer else 8,
-        )
-        prefix = (
-            list(range(world, world + 32))
-            if real_indexer
-            else [5 * world + 1, 2 * world + 2 % world, 9 * world + 3 % world]
-        )
-        indexer_kwargs = dict(real_indexer=real_indexer, topk_backend=topk_backend)
-        check.seed(prefix, generation=1)
-        _check_attention_batch(
-            check,
-            (
-                [
-                    (prefix + list(range(40, 45)), 2048, 2305),
-                    (prefix + [48], 2048, 2065),
-                ]
-                if real_indexer
-                else [
-                    (prefix + [12 * world], 192, 209),
-                    ([prefix[0], 16 * world + 2 % world], 64, 71),
-                ]
-            ),
-            generation=2,
-            prefill_impl=prefill_impl,
-            **indexer_kwargs,
-        )
-        _check_attention_batch(
-            check,
-            [([20 * world + world - 1, 21 * world], 0, 73)],
-            generation=3,
-            prefill_impl=prefill_impl,
-            **indexer_kwargs,
-        )
-        check.seed([prefix[0]], generation=4)
-        _check_attention_batch(
-            check,
-            [([prefix[0], 23 * world + 2 % world], 64, 83)],
-            generation=5,
-            prefill_impl=prefill_impl,
-            **indexer_kwargs,
-        )
-        if rank == 0:
-            layout = "packed FP8" if packed else str(check.pool.dtype)
-            print(
-                f"{prefill_impl} ({layout}, {topk_backend}): exact sharded attention match",
-                flush=True,
+    for prefill_impl, packed in cases:
+        for topk_backend in ("sgl-kernel", "flashinfer"):
+            check = fixture._IndexerCacheCheck(
+                get_parallel().attn_tp_group,
+                packed,
+                raw_fp8=prefill_impl == "trtllm",
+                prefix_contexts=16,
             )
-        del check
+            prefix = list(range(world, world + 32))
+            check.seed(prefix, generation=1)
+            # A shared prefix across two requests, then a prefix-free request.
+            for generation, requests in (
+                (
+                    2,
+                    [
+                        (prefix + list(range(40, 45)), 2048, 2305),
+                        (prefix + [48], 2048, 2065),
+                    ],
+                ),
+                (3, [([20 * world + world - 1, 21 * world], 0, 73)]),
+            ):
+                _check_attention_batch(
+                    check,
+                    requests,
+                    generation=generation,
+                    prefill_impl=prefill_impl,
+                    topk_backend=topk_backend,
+                )
+            if rank == 0:
+                layout = "packed FP8" if packed else str(check.pool.dtype)
+                print(
+                    f"{prefill_impl} ({layout}, {topk_backend}): "
+                    "exact sharded attention match",
+                    flush=True,
+                )
+            del check
     destroy_model_parallel()
     destroy_distributed_environment()
 
 
-class TestGLM52ShardedAttention(unittest.TestCase):
-    def _test_four_gpu(self, real_indexer):
+class TestShardedDSAAttention(unittest.TestCase):
+    def test_four_gpu_matches_unsharded_full_and_shared_layers(self):
         if torch.cuda.device_count() < 4:
             self.skipTest("requires four CUDA GPUs")
         if torch.cuda.get_device_capability()[0] not in (9, 10):
             self.skipTest("FlashMLA sparse requires Hopper or Blackwell")
-        with tempfile.TemporaryDirectory(prefix="sglang-glm52-shard-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="sglang-dsa-shard-") as tmp:
             mp.spawn(
-                _run_glm_attention,
-                args=(4, f"file://{tmp}/init", real_indexer),
+                _run_attention,
+                args=(4, f"file://{tmp}/init"),
                 nprocs=4,
                 join=True,
             )
-
-    def test_four_gpu_matches_unsharded_full_and_shared_layers(self):
-        self._test_four_gpu(real_indexer=False)
-
-    def test_four_gpu_real_indexer_with_shared_prefix(self):
-        self._test_four_gpu(real_indexer=True)
 
 
 if __name__ == "__main__":

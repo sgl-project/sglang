@@ -15,7 +15,6 @@ def _act_quant_kernel(
     N,
     group_size: tl.constexpr,
     round_scale: tl.constexpr,
-    use_fused_store_math: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -65,19 +64,12 @@ def _act_quant_kernel(
         log_val = tl.log2(amax * fp8_max_inv)
         log_ceil = tl.ceil(log_val)
         scale = tl.exp2(log_ceil)
-    elif use_fused_store_math:
-        # Match the CUDA indexer writer's correctly rounded divisions, then
-        # multiply by the reciprocal. Approximate division changes FP8 ties.
-        scale = tl.div_rn(amax, fp8_max)
     else:
         scale = amax * fp8_max_inv
 
     # Quantize: y = clamp(x / scale, fp8_min, fp8_max)
     scale_broadcast = scale[:, None]
-    if use_fused_store_math:
-        y = x * tl.div_rn(1.0, scale_broadcast)
-    else:
-        y = x / scale_broadcast
+    y = x / scale_broadcast
     y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
 
     # Store quantized output
@@ -92,11 +84,7 @@ def _act_quant_kernel(
 
 
 def act_quant(
-    x: torch.Tensor,
-    block_size: int = 128,
-    scale_fmt: Optional[str] = None,
-    *,
-    use_fused_store_math: bool = False,
+    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization with Triton.
@@ -105,13 +93,11 @@ def act_quant(
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
         scale_fmt (Optional[str], optional): The format of the scale. Default is None.
-        use_fused_store_math (bool): Match the CUDA indexer store's FP32 scale and reciprocal rounding. Requires scale_fmt=None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
-    assert not use_fused_store_math or scale_fmt is None
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert x.size(-1) % block_size == 0, (
         f"Last dimension size must be divisible by block_size (block_size={block_size})"
@@ -142,7 +128,6 @@ def act_quant(
         N,
         group_size=block_size,
         round_scale=round_scale,
-        use_fused_store_math=use_fused_store_math,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_stages=0 if round_scale else 2,

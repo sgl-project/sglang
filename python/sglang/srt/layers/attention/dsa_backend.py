@@ -474,7 +474,6 @@ class DeepseekSparseAttnBackend(
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
-        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -1012,16 +1011,10 @@ class DeepseekSparseAttnBackend(
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
 
-        indexer_logical_page_table = None
-        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+        kv_shard_extend = self._kv_shard_pool is not None and prepare_kv_shard_forward(
             self._kv_shard_pool, self.req_to_token, forward_batch
-        ):
-            # Keep allocator locations in the batch and request table. Only
-            # kernel-facing metadata addresses the gathered prefix/chunk scratch.
-            indexer_logical_page_table = self._transform_table_1_to_real(page_table)
-            page_table = self._kv_shard_pool.translate_loc_to_scratch(page_table).to(
-                page_table.dtype
-            )
+        )
+        indexer_logical_page_table = None
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -1180,13 +1173,14 @@ class DeepseekSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
-                if indexer_logical_page_table is not None:
-                    max_pages = (
-                        max_seqlen_k + self.physical_page_size - 1
-                    ) // self.physical_page_size
-                    indexer_logical_page_table = indexer_logical_page_table[
-                        bs_idx, :max_pages
-                    ]
+
+            if kv_shard_extend:
+                # Kernels read the gathered prefix/chunk scratch; the indexer
+                # pool read takes logical pages and translates them itself.
+                indexer_logical_page_table = self._transform_table_1_to_real(page_table)
+                page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                    page_table
+                ).to(page_table.dtype)
 
             if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
@@ -1224,11 +1218,13 @@ class DeepseekSparseAttnBackend(
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
                 kv_cache_capacity = (
-                    self._kv_shard_pool.shard_spec.scratch_rows
-                    if self._kv_shard_pool is not None
-                    else self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+                    self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
                 )
-                if forward_batch.seq_lens_sum > kv_cache_capacity:
+                if (
+                    # Sharded extends index scratch rows, bounded by construction.
+                    not kv_shard_extend
+                    and forward_batch.seq_lens_sum > kv_cache_capacity
+                ):
                     max_idx = page_table_1_flattened.max().item()
                     assert max_idx < kv_cache_capacity, (
                         f"Invalid page table index: max={max_idx}, "
