@@ -31,13 +31,36 @@
 # DAMAGE.
 
 # Adapted from OpenMOSS-Team/MOSS-Image-Base, revision 355120bd6b44ff67b8df18f57e40b928fc886cd3.
+
 import torch
 from torch import nn
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_situ,
+    can_use_torch_rmsnorm,
+    can_use_torch_rmsnorm_modulate,
+    can_use_torch_rmsnorm_rope,
+    fused_rope_rotate_half_bitexact,
+    fused_situ_bitexact,
+    modulate_scale_shift,
+    residual_gate_add,
+    torch_rmsnorm_bitexact,
+    torch_rmsnorm_modulate_bitexact,
+    torch_rmsnorm_rope_bitexact,
+)
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+_SITU_FUSION = BitExactFusionGate("MOSSImage SiTU")
+_ROPE_FUSION = BitExactFusionGate("MOSSImage RoPE")
+_RMSNORM_FUSION = BitExactFusionGate("MOSSImage RMSNorm", per_signature=True)
+_NORM_MOD_FUSION = BitExactFusionGate("MOSSImage RMSNorm + modulation")
+_NORM_ROPE_FUSION = BitExactFusionGate("MOSSImage RMSNorm + RoPE")
 
 
 def validate_skip_layers(skip_layers, num_layers):
@@ -65,30 +88,163 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        if not _RMSNORM_FUSION.disabled and can_use_torch_rmsnorm(
+            device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
+        ):
+            sig = (x.device.index, x.dtype, x.shape[-1], x.numel() // x.shape[-1] >= 16)
+            verified = _RMSNORM_FUSION.is_verified(sig)
+            if not verified and (
+                torch.compiler.is_compiling()
+                or torch.cuda.is_current_stream_capturing()
+            ):
+                return self.forward_native(x)
+            try:
+                out = torch_rmsnorm_bitexact(x, self.weight)
+            except ValueError:
+                raise
+            except Exception as exc:
+                _RMSNORM_FUSION.on_exception(exc, logger=logger)
+            else:
+                if verified:
+                    return out
+                return _RMSNORM_FUSION.accept_or_fallback(
+                    out, self.forward_native(x), sig=sig, logger=logger
+                )
+        return self.forward_native(x)
+
+    def forward_native(self, x):
         y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
         return y.to(x.dtype) * self.weight
 
 
-def _situ(hidden, gate):
+def _situ_native(hidden, gate):
     return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (
         25.0 * torch.tanh(hidden / 25.0)
     )
 
 
-def _rotate(x, rope):
+def _situ(hidden, gate):
+    verified = _SITU_FUSION.verified
+    if (
+        not _SITU_FUSION.disabled
+        and can_use_fused_situ(device=hidden.device, dtype=hidden.dtype)
+        and (verified or _SITU_FUSION.can_attempt_once())
+    ):
+        try:
+            out = fused_situ_bitexact(hidden, gate)
+        except ValueError:
+            raise
+        except Exception as exc:
+            _SITU_FUSION.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _SITU_FUSION.accept_or_fallback(
+                out, _situ_native(hidden, gate), logger=logger
+            )
+    return _situ_native(hidden, gate)
+
+
+def _prepare_rope(rope):
+    # Every layer and both Q/K projections share these expanded coefficients.
     sin, cos = rope.chunk(2, -1)
-    sin = torch.cat((sin, sin), -1).unsqueeze(-2)
-    cos = torch.cat((cos, cos), -1).unsqueeze(-2)
+    return torch.cat((sin, sin), -1), torch.cat((cos, cos), -1)
+
+
+def _rotate_native(x, rope):
+    sin, cos = (part.unsqueeze(-2) for part in rope)
     a, b = x.chunk(2, -1)
     return x * cos + torch.cat((-b, a), -1) * sin
 
 
+def _rotate(x, rope):
+    sin, cos = (part.flatten(0, 1) for part in rope)
+    verified = _ROPE_FUSION.verified
+    if (
+        not _ROPE_FUSION.disabled
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and (verified or _ROPE_FUSION.can_attempt_once())
+    ):
+        try:
+            out = fused_rope_rotate_half_bitexact(x, cos, sin)
+        except ValueError:
+            raise
+        except Exception as exc:
+            _ROPE_FUSION.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _ROPE_FUSION.accept_or_fallback(
+                out, _rotate_native(x, rope), logger=logger
+            )
+    return _rotate_native(x, rope)
+
+
 def _attention(q, k, v, rope, heads, attention):
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
-    q = _rotate(q.reshape(shape), rope)
-    k = _rotate(k.reshape(shape), rope)
+    q, k = q.reshape(shape), k.reshape(shape)
+    if rope is not None:
+        q = _rotate(q, rope)
+        k = _rotate(k, rope)
     v = v.reshape(shape)
     return attention(q.to(v.dtype), k.to(v.dtype), v).flatten(2)
+
+
+def _norm_modulate(norm, x, scale, shift):
+    gate = _NORM_MOD_FUSION
+    if (
+        not gate.disabled
+        and can_use_torch_rmsnorm_modulate(
+            device=x.device,
+            dtype=x.dtype,
+            dim=x.shape[-1],
+            rows=x.numel() // x.shape[-1],
+        )
+        and (gate.verified or gate.can_attempt_once())
+    ):
+        try:
+            out = torch_rmsnorm_modulate_bitexact(x, norm.weight, scale, shift)
+        except ValueError:
+            raise
+        except Exception as exc:
+            gate.on_exception(exc, logger=logger)
+        else:
+            if gate.verified:
+                return out
+            return gate.accept_or_fallback(
+                out, modulate_scale_shift(norm(x), scale, shift), logger=logger
+            )
+    return modulate_scale_shift(norm(x), scale, shift)
+
+
+def _norm_rope(norm, x, rope, heads):
+    x = x.unflatten(-1, (heads, -1))
+    sin, cos = (part.flatten(0, 1) for part in rope)
+    gate = _NORM_ROPE_FUSION
+    if (
+        not gate.disabled
+        and can_use_torch_rmsnorm_rope(
+            device=x.device,
+            dtype=x.dtype,
+            dim=x.shape[-1],
+            rows=x.numel() // x.shape[-1],
+        )
+        and (gate.verified or gate.can_attempt_once())
+    ):
+        try:
+            out = torch_rmsnorm_rope_bitexact(x, norm.weight, cos, sin)
+        except ValueError:
+            raise
+        except Exception as exc:
+            gate.on_exception(exc, logger=logger)
+        else:
+            if gate.verified:
+                return out.flatten(2)
+            return gate.accept_or_fallback(
+                out, _rotate(norm(x), rope), logger=logger
+            ).flatten(2)
+    return _rotate(norm(x), rope).flatten(2)
 
 
 class _TextBlock(nn.Module):
@@ -158,21 +314,23 @@ class _Block(nn.Module):
 
     def forward(self, x, rope, modulation):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
-        y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+        y = _norm_modulate(self.norm1, x, scale_a, shift_a)
         dtype = self.proj["q"].weight.dtype
         y = y.to(dtype)
-        q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
-        k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
-        x = (
-            x
-            + self.proj["o"](
-                _attention(q, k, self.proj["v"](y), rope, self.heads, self.attention)
-            )
-            * gate_a[:, None]
+        q = _norm_rope(self.q_norm, self.proj["q"](y), rope, self.heads)
+        k = _norm_rope(self.k_norm, self.proj["k"](y), rope, self.heads)
+        x = residual_gate_add(
+            x,
+            self.proj["o"](
+                _attention(q, k, self.proj["v"](y), None, self.heads, self.attention)
+            ),
+            gate_a[:, None],
         )
-        y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
+        y = _norm_modulate(self.norm2, x, scale_f, shift_f)
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
-        return x + self.proj["ffn_down"](_situ(hidden, gate)) * gate_f[:, None]
+        return residual_gate_add(
+            x, self.proj["ffn_down"](_situ(hidden, gate)), gate_f[:, None]
+        )
 
 
 class _RoPE(nn.Module):
@@ -279,6 +437,37 @@ class MOSSImageTransformer(BaseDiT):
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
 
+    def _unpad_text(self, encoder_hidden_states, encoder_attention_mask):
+        if (
+            encoder_hidden_states.ndim != 3
+            or encoder_hidden_states.shape[-1] != self.config.text_dim
+        ):
+            raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
+        mask = encoder_attention_mask
+        if mask is None:
+            contexts = tuple(encoder_hidden_states.split(1))
+        else:
+            if mask.shape != encoder_hidden_states.shape[:2] or not torch.all(
+                (mask == 0) | (mask == 1)
+            ):
+                raise ValueError("encoder_attention_mask must be a binary [B, S] mask.")
+            contexts = tuple(
+                encoder_hidden_states[index : index + 1, mask[index].bool()]
+                for index in range(encoder_hidden_states.shape[0])
+            )
+        if any(context.shape[1] == 0 for context in contexts):
+            raise ValueError("Each sample needs at least one valid text token.")
+        return contexts
+
+    def _prepare_sample_conditioning(self, context, height, width, dtype):
+        rope = _prepare_rope(
+            self.rope(height, width, context.shape[1], context.device).to(dtype)
+        )
+        text = self.text_embedder(
+            context, tuple(part[:, height * width :] for part in rope)
+        )
+        return text, rope
+
     def forward(
         self,
         hidden_states,
@@ -296,17 +485,7 @@ class MOSSImageTransformer(BaseDiT):
         batch, _, height, width = hidden_states.shape
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[0] != batch:
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-        mask = encoder_attention_mask
-        if mask is None:
-            mask = torch.ones(
-                encoder_hidden_states.shape[:2],
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        if mask.shape != encoder_hidden_states.shape[:2] or not torch.all(
-            (mask == 0) | (mask == 1)
-        ):
-            raise ValueError("encoder_attention_mask must be a binary [B, S] mask.")
+        contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
         times = torch.as_tensor(
             timestep, device=hidden_states.device, dtype=torch.float32
         ).reshape(-1)
@@ -329,18 +508,13 @@ class MOSSImageTransformer(BaseDiT):
         ).view(batch, 2, -1)
         outputs = []
         for index in range(batch):
-            context = encoder_hidden_states[index : index + 1, mask[index].bool()]
-            if context.shape[1] == 0:
-                raise ValueError("Each sample needs at least one valid text token.")
             video = hidden_states[index : index + 1].flatten(2).transpose(1, 2)
             video = self.video_embedder(
                 video.to(self.video_embedder.weight.dtype).contiguous()
             )
-            # Match the reference activation dtype under fp32 weights + autocast.
-            rope = self.rope(height, width, context.shape[1], hidden_states.device).to(
-                video.dtype
+            text, rope = self._prepare_sample_conditioning(
+                contexts[index], height, width, video.dtype
             )
-            text = self.text_embedder(context, rope[:, height * width :])
             x = torch.cat((video, text), 1)
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip_layers:
