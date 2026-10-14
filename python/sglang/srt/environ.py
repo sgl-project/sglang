@@ -248,16 +248,6 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
-class DsparkFoldedSampling(IntEnum):
-    """Sampling support in the graph-folded DSpark draft proposal: OFF =
-    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
-    FORCE = always."""
-
-    OFF = 0
-    AUTO = 1
-    FORCE = 2
-
-
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -363,6 +353,8 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
+    SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -386,6 +378,7 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -542,15 +535,16 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
-    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
-    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    # Argmax every draft row, sampling requests included, accepted as a one-hot
+    # draft: no step logits kept, lower acceptance at high temperatures.
+    SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
-    # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
+    # With the TP-sharded markov_w2, run the draft's vocab all-gathers (each
+    # step's per-shard token candidates, and the step logits sampling keeps) over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
@@ -873,6 +867,17 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
+    # true forces EPv2; false forces EPv1.
+    SGLANG_MORI_EP_V2 = EnvBool(True)
+    SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
+    SGLANG_MORI_COMBINE_DTYPE = EnvStr("auto")
+    SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS = EnvInt(0)
+    # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
+    # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
+    SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
+    SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
     # AMD, ROCm, and AITER
@@ -1094,9 +1099,10 @@ class Envs:
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
-    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
-    # region and can win at large batch, but makes the output accumulation order
-    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # cutedsl mega kernels (NVFP4 / MXFP8). Permits in-kernel reduction;
+    # FlashInfer's tuning profile may still select external reduction.
+    # BF16 atomic accumulation is nondeterministic -- keep off for
+    # bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
@@ -1117,6 +1123,8 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
+    SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1424,7 +1432,7 @@ class Envs:
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
-    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
@@ -1597,6 +1605,7 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
@@ -1627,6 +1636,9 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
+    # sizes; decode stays on aiter.
+    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
@@ -1987,6 +1999,18 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
+        note="DSpark draft sampling always uses Gumbel-max."
+    ),
+    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
+        note="A one-row step of SGLANG_DSPARK_USE_GREEDY_DRAFT on a vanilla markov "
+        "head fuses the bias GEMV."
+    ),
+    "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
+        note="A folded DSpark draft proposal samples; set "
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
+    ),
     "SGLANG_SKIP_RUST_TESTS": _DeprecatedEnv(
         note="The Rust tests run in pr-test-rust-workspace.yml now."
     ),

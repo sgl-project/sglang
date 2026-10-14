@@ -42,6 +42,8 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_cp_take_back_output,
     attn_tp_gather_input,
     attn_tp_slice_output,
+    cp_gather_in_token_order,
+    cp_take_back_in_token_order,
     dp_cp_take_back_output,
     keep_output,
     moe_cp_take_back_output,
@@ -444,15 +446,31 @@ def _select_entry_step(
         # A head-parallel mixer consumes full context, but its residual and
         # readout coefficients remain on the CP shard. Complete the producer's
         # sum onto that shard before the (possibly nonlinear) update/read.
-        if (
-            residual != residual_to
-            or cp_moves is None
-            or owes not in (None, SumGroup.ATTN_CP)
-            or (owes is not None and cp_moves.reduce_scatter is None)
+        if residual != residual_to or cp_moves is None:
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        if produced.in_token_order:
+            # The whole sequence in token order (a scan's): complete the sum on
+            # every row, then take this rank's shard back. No model runs two
+            # token-order stages back to back, so that edge is not bound.
+            if need.in_token_order or owes not in (
+                None,
+                SumGroup.ATTN_CP,
+                SumGroup.TP,
+            ):
+                raise NotImplementedError(f"{produced=} {residual=} {need=}")
+            move = partial(cp_take_back_in_token_order, group=owes)
+        elif owes not in (None, SumGroup.ATTN_CP) or (
+            owes is not None and cp_moves.reduce_scatter is None
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        else:
+            move = cp_moves.reduce_scatter if owes is not None else cp_moves.take_back
         local = msgspec.structs.replace(
-            produced, layout=residual_to, group=None, always_partial=False
+            produced,
+            layout=residual_to,
+            group=None,
+            always_partial=False,
+            in_token_order=False,
         )
         inner = _select_entry_step(
             local,
@@ -466,13 +484,7 @@ def _select_entry_step(
             enters_stack=enters_stack,
         )
         return inner._replace(
-            step=partial(
-                _move_before_read,
-                move=cp_moves.reduce_scatter
-                if owes is not None
-                else cp_moves.take_back,
-                read=inner.step,
-            )
+            step=partial(_move_before_read, move=move, read=inner.step)
         )
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
@@ -549,6 +561,9 @@ def _select_entry_step(
             cp_moves=cp_moves,
             enters_stack=enters_stack,
         ).step
+        if need.in_token_order:
+            # The stage scans the whole sequence: gather it in token order.
+            return EntryStep(on_chunk, input_move=cp_gather_in_token_order)
         return EntryStep(partial(cp_moves.gather, gather=on_chunk))
     if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP

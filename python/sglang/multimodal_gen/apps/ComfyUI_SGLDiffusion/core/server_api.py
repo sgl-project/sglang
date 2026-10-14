@@ -89,13 +89,16 @@ class SGLDiffusionServerAPI:
             - vae_precision: VAE model precision
         """
         try:
-            # Remove /v1 from base_url for /models endpoint
-            models_url = self.base_url.removesuffix("/v1") + "/models"
-            response = requests.get(models_url, headers=self.headers, timeout=30)
+            response = requests.get(
+                f"{self.base_url}/models", headers=self.headers, timeout=30
+            )
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            return data["data"][0]
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to get model info: {str(e)}")
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"Unexpected response shape from /models: {str(e)}")
 
     def get_model_path(self) -> str:
         """Return the model path the server was launched with."""

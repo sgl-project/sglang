@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import get_eviction_strategy
@@ -95,7 +97,7 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
-def _kv_event_from_tagged(event: tuple):
+def _kv_event_from_tagged(event: tuple, lora_names: LoRANameTable):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
@@ -108,6 +110,7 @@ def _kv_event_from_tagged(event: tuple):
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
             session_id=event[7],
+            lora_name=lora_names.resolve(event[8]),
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -301,15 +304,21 @@ def _fill_evict_result(binding_result, result):
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
-    def __init__(self, binding, enabled: bool):
+    def __init__(
+        self, binding, enabled: bool, lora_names: Optional[LoRANameTable] = None
+    ):
         self._binding = binding
         self.enabled = enabled
+        self.lora_names = lora_names if lora_names is not None else LoRANameTable()
 
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
 
     def take(self) -> list:
-        return [_kv_event_from_tagged(event) for event in self._binding.take_events()]
+        return [
+            _kv_event_from_tagged(event, self.lora_names)
+            for event in self._binding.take_events()
+        ]
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -422,6 +431,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_sliding_window_size=params.sliding_window_size,
                 swa_req_ring=is_swa_req_ring(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
+                dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
                 ),
@@ -434,7 +444,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             [int(component) for component in self.tree_components],
         )
         self.kv_events = _RustKVCacheEventRecorder(
-            self._binding, params.enable_kv_cache_events
+            self._binding,
+            params.enable_kv_cache_events,
+            lora_names=params.kv_event_lora_names,
         )
         # The default-root empty result, prebuilt once from the binding.
         self._empty_match_result = _match_result_from_binding(
@@ -1126,6 +1138,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
         return self._binding.write_back_duplicate_reclaim_digest()
+
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        self._binding.adjust_component_size(node_id, int(component_type), delta)
+
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = self._binding.collect_path_info(list(end_node_ids))
+        return tuple(tuple(TreePathNodeInfo(*node) for node in path) for path in paths)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

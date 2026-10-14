@@ -625,6 +625,7 @@ class TestQwenImageModulationCache(CustomTestCase):
         block.img_mod = nn.ModuleList([nn.Identity(), _CountingProjection(1.0)])
         block.txt_mod = nn.ModuleList([nn.Identity(), _CountingProjection(2.0)])
         block._modulation_cache = None
+        block._shard_modulation = False
         return block
 
     def _key(self, timestep, hidden, additional_t_cond=None):

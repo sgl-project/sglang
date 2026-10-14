@@ -42,7 +42,7 @@ docker run --gpus all \
 **AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006
+docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006 \
+    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012 \
     sglang serve <use args below>
 ```
 
@@ -105,7 +105,7 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 **Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group, which costs an all-reduce per engram layer. `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` (**opt-in**) moves them to host memory instead: the freed HBM goes to the KV pool and output is bitwise unchanged — at the cost of host RAM, a longer load, and needing huge-page backing to keep the gather cheap. `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` trades the two all-reduces for page size: `shared` (the default) maps a single copy all ranks read and needs no reduce; `per_rank` splits that same table into one shard per rank and keeps the reduce, but is the only one the kernel reliably backs with 2 MiB pages.
 
-**SWA bounded replay.** Because the window store is per-layer and cheap to rebuild, it need not all be recomputed. `--enable-decoder-swa-bounded-replay` (**opt-in**) runs the early layers over the whole extend and the late layers over only each request's last 128 tokens, sharing late-layer KV from source layer 20. Prefill gets materially faster. It is validated on the decode path only, refuses prompt logprobs by design, is not numerically equivalent to full prefill, and is excluded at launch with the prefill CUDA graph and with DP attention.
+**SWA bounded replay.** Because the window store is per-layer and cheap to rebuild, it need not all be recomputed. `--enable-decoder-swa-bounded-replay` (**opt-in**) runs the early layers over the whole extend and the late layers over only each request's last 128 tokens, sharing late-layer KV from source layer 20. Prefill gets materially faster. It is validated on the decode path only, refuses prompt logprobs by design, is not numerically equivalent to full prefill, and is excluded at launch with the prefill CUDA graph and with DP attention. The one DP exception is ROCm with TP MoE and `--attn-dp-size` equal to `--tp` (see §3.6).
 
 **Kernels.** At decode token counts these kernels are launch-bound rather than bandwidth-bound, so the work is fusion and overlap: the compressor projection, ratio-2 pooling, RoPE with fp4 quantization and indexer packing, paged fp4 indexer scoring with top-k resolved straight to cache addresses, and the mHC statistics and Sinkhorn — with compression, indexing and mHC overlapped against attention and FFN on dedicated streams. All of it is selected automatically; the environment switches it once sat behind were removed, so there is nothing to turn on. One caveat outranks the fusions: **output is not bitwise stable across batch composition today** — two default kernels are shape-guarded to a single token — and `--enable-deterministic-inference` is refused on this backend.
 
@@ -220,21 +220,22 @@ Only the L2 tier is exposed here. For the storage (L3) tier and the canonical fl
 
 ### 3.6 Agentic Long-Context on MI355X (FP4, DSpark)
 
-Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Both topologies keep the engram tables on the host, and neither adds a HiCache tier. The sessions fit the device pool.
+Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Every command keeps the engram tables on the host, and none adds a HiCache tier. The sessions fit the device pool.
 
-TP2 sweeps concurrency 1 to 64 and raises `--mem-fraction-static` as it climbs; TP4 sweeps 1 to 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+Two commands follow, one per concurrency range. TP2 and TP4 cover concurrency 1 to 16; at 32 and 64 the same two GPUs switch to DP attention with TP MoE.
+
+**TP2 or TP4, concurrency 1–16:** TP2 raises `--mem-fraction-static` at concurrency 16; TP4 holds 0.70, with a quarter of the checkpoint per rank leaving room to spare. A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency. Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
 
 The braced values in the command follow concurrency:
 
-| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
-|---|---|---|---|---|---|---|---|
-| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
-| `--cuda-graph-max-bs-decode` | 64 | 64 | 64 | 64 | 64 | 64 | 128 |
-| `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 | 2048 | 4096 |
-| `--chunked-prefill-size` | 16384 | 16384 | 16384 | 16384 | 16384 | 16384 | 4096 |
-| `--prefill-decode-interval` | 16 | 16 | 16 | 16 | 16 | 4 | 4 |
-| `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 | 0.80 | 0.85 |
-| `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | — | — |
+| Concurrency | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 |
+| `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 |
+| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 |
+| `--schedule-policy` | lpm | lpm | lpm | lpm | fcfs |
+| `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 |
+| `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 |
 
 ```bash Command
 SGLANG_DEFAULT_THINKING=1 \
@@ -246,7 +247,8 @@ SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 AITER_BF16_FP8_MOE_BOUND=0 \
 TRITON_HIP_USE_ASYNC_COPY=0 \
-ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
+SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=2 \
 sglang serve \
@@ -261,12 +263,71 @@ sglang serve \
   --enable-decoder-swa-bounded-replay \
   --cuda-graph-backend-prefill disabled \
   --mem-fraction-static {mem-fraction-static} \
-  --chunked-prefill-size {chunked-prefill-size} \
+  --chunked-prefill-size 16384 \
   --prefill-decode-interval {prefill-decode-interval} \
+  --schedule-policy {schedule-policy} \
   --swa-prefix-tails {swa-prefix-tails} \
   --max-running-requests {max-running-requests} \
-  --cuda-graph-max-bs-decode {cuda-graph-max-bs-decode} \
+  --cuda-graph-max-bs-decode 64 \
   --reasoning-parser auto \
   --tool-call-parser auto \
   --watchdog-timeout 3600
 ```
+
+**DP2, concurrency 32–64:** two DP attention ranks, one per GPU, with the MoE still tensor parallel across both. The braced values follow concurrency:
+
+| Concurrency | 32 | 64 |
+|---|---|---|
+| `--mem-fraction-static` | 0.80 | 0.85 |
+| `--chunked-prefill-size` | 32768 | 8192 |
+| `--prefill-decode-interval` | 32 | 16 |
+| `--swa-prefix-tails` | 2048 | 4096 |
+
+```bash Command
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV41_REASONING_EFFORT=high \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
+SGLANG_USE_AITER=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+AITER_BF16_FP8_MOE_BOUND=0 \
+TRITON_HIP_USE_ASYNC_COPY=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
+SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
+HSA_NO_SCRATCH_RECLAIM=0 \
+GPU_MAX_HW_QUEUES=5 \
+SGLANG_SHARED_EXPERT_TP1=1 \
+SGLANG_DP_USE_GATHERV=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=1 \
+SGLANG_AITER_CAPTURE_COPY_IN=1 \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --tp 2 \
+  --attn-dp-size 2 \
+  --ep-size 1 \
+  --enable-dp-lm-head \
+  --enable-prefill-delayer \
+  --enable-dp-attention-local-control-broadcast \
+  --tokenizer-worker-num 2 \
+  --prefill-delayer-token-usage-low-watermark 0.7 \
+  --load-balance-method total_requests \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --enforce-shared-experts-fusion \
+  --fp8-gemm-backend aiter \
+  --enable-decoder-swa-bounded-replay \
+  --cuda-graph-backend-prefill disabled \
+  --mem-fraction-static {mem-fraction-static} \
+  --chunked-prefill-size {chunked-prefill-size} \
+  --prefill-decode-interval {prefill-decode-interval} \
+  --swa-prefix-tails {swa-prefix-tails} \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 64 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 3600
+```
+
+Front the server with `sglang_router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix.

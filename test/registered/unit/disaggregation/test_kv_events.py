@@ -26,6 +26,8 @@ from sglang.srt.disaggregation.kv_events import (
     NullEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
@@ -355,6 +357,20 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(len(decoded), 3)
 
 
+class TestNamespacedBlockHash(CustomTestCase):
+    def test_values_are_pinned(self):
+        # Rust has its own copy of this function, and its test uses the same
+        # values. Thus the two copies must give the same hashes, and the hashes
+        # must not change.
+        seed = kv_event_namespace_seed(extra_key="lora-a", cache_salt=None)
+        self.assertEqual(
+            namespaced_block_hash(123, namespace_seed=seed), 9220659119954863560
+        )
+        self.assertEqual(
+            namespaced_block_hash(-5, namespace_seed=seed), -1810974732006142875
+        )
+
+
 class TestReplay(CustomTestCase):
     def test_descriptor_advertises_replay_port(self):
         def descriptor(**cfg):
@@ -372,7 +388,10 @@ class TestReplay(CustomTestCase):
         # The router's DEALER client relies on this exact framing.
         replay = f"tcp://127.0.0.1:{get_free_port()}"
         publisher = ZmqEventPublisher(
-            attn_dp_rank=0, endpoint="inproc://kv-replay-test", replay_endpoint=replay
+            attn_dp_rank=0,
+            endpoint="inproc://kv-replay-test",
+            replay_endpoint=replay,
+            topic="kv@prefill@model",
         )
         dealer = zmq.Context.instance().socket(zmq.DEALER)
         dealer.setsockopt(zmq.RCVTIMEO, 5000)
@@ -386,10 +405,16 @@ class TestReplay(CustomTestCase):
         finally:
             dealer.close(linger=0)
             publisher.shutdown()
-        seqs = [int.from_bytes(f[1], "big", signed=True) for f in frames]
+        self.assertEqual([len(f) for f in frames], [4, 4, 4])
+        seqs = [int.from_bytes(f[2], "big", signed=True) for f in frames]
         self.assertEqual(seqs, [1, 2, -1])
         self.assertEqual([f[0] for f in frames], [b""] * 3)
-        self.assertEqual(frames[2][2], b"")
+        self.assertEqual([f[1] for f in frames], [b"kv@prefill@model"] * 2 + [b""])
+        for frame in frames[:2]:
+            batch = msgspec.msgpack.decode(frame[3], type=KVEventBatch)
+            self.assertEqual(batch.events, [AllBlocksCleared()])
+            self.assertEqual(batch.attn_dp_rank, 0)
+        self.assertEqual(frames[2][3], b"")
 
 
 if __name__ == "__main__":

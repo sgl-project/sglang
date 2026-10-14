@@ -6,6 +6,8 @@
 //! request types, sampling, validation, transport, and runtime.
 
 mod error;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod kimi_k3_format;
 mod model_files;
 #[cfg(feature = "openai")]
 pub mod openai;

@@ -158,7 +158,7 @@ pub fn lower_completion(
     if (request.echo || request.logprobs.is_some()) && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
-    if let Some(schema) = format_json_schema(request.response_format.as_ref())? {
+    if let Some(schema) = format_json_schema(request.response_format.as_ref(), false)? {
         request.json_schema = Some(schema);
     }
     if request.routed_dp_rank.is_none() {

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=1100, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 

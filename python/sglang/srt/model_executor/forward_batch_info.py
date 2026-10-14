@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from functools import total_ordering
+from functools import lru_cache, total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -628,12 +629,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
+    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
     defer_logits_to_eager: bool = False
+    # Full prefill graph capture uses a fixed request axis whose inactive slots
+    # must not participate in data-dependent row selection.
+    full_prefill_cuda_graph_capture: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -992,6 +998,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
+        watermark_state = (
+            model_runner.watermark_state
+            if isinstance(model_runner, ModelRunner)
+            else None
+        )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1053,6 +1067,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            watermark_prompt_tail_ids=(
+                watermark_state.prompt_tails(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
+            watermark_context_hash_history=(
+                watermark_state.retracted_context_hashes(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -2115,10 +2141,27 @@ def enable_num_token_non_padded():
 
     # Elastic joiners also need graph padding masked after joining WORLD; a
     # customized A2A backend consumes the count whatever the EP size.
-    return (
+    if (
         get_parallel().moe_ep_size > 1
         or world_dp_gather_enabled()
         or get_moe_a2a_backend().is_customized()
+    ):
+        return True
+    # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
+    # so the model needs the real count to zero the pad rows (see
+    # deepseek_v4 _run_moe_ffn_dp_sync).
+    return _dp_tp_moe_masks_pad_rows()
+
+
+@lru_cache(maxsize=1)
+def _dp_tp_moe_masks_pad_rows() -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return (
+        _is_hip
+        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
+        and get_parallel().attn_dp_size > 1
+        and get_moe_a2a_backend().is_none()
     )
 
 

@@ -633,6 +633,9 @@ def test_hopper_indexer_backends_replay(ratio):
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
     )
     full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
+    # This replay test checks the paged select_decode output contract; DeepSelect
+    # decode is covered by test_deep_select.py.
+    full.use_deep_select_decode = False
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
