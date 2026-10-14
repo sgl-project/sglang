@@ -2786,9 +2786,20 @@ def apply_fp8_linear_bmm_flashinfer(
     else:
         qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
         output_dtype = input.dtype
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
-    if bias is not None:
-        output = output + bias
+    if bias is None:
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
+    else:
+        # bmm_fp8 takes no bias; torch._scaled_mm runs the same cuBLASLt GEMM
+        # and adds the bias in its epilogue instead of in a separate kernel.
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            bias=bias,
+            use_fast_accum=True,  # bmm_fp8 sets cuBLASLt fast accumulation too
+        )
     return output.view(*output_shape)
 
 
