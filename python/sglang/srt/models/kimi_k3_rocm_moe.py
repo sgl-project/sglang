@@ -45,6 +45,9 @@ def init_moe_rocm_state(self) -> None:
     self._k3_latent_tail_max_tokens = (
         envs.SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS.get()
     )
+    self._k3_quark_shared_full_front = (
+        envs.SGLANG_OPT_HIP_K3_QUARK_SHARED_FULL_FRONT.get()
+    )
     from sglang.srt.models.kimi_k3_rocm_ptpc import ptpc_window
 
     self._k3_ptpc = ptpc_window()
@@ -72,6 +75,8 @@ def select_front_modules(self) -> Optional[list]:
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
 
+    if self._k3_quark_shared_full_front and self.shared_experts is not None:
+        _densify_quark_shared_experts(self.shared_experts)
     if self.shared_experts is not None and get_moe_a2a_backend().is_none():
         full_front = [
             self.shared_experts.gate_up_proj,
@@ -85,6 +90,15 @@ def select_front_modules(self) -> Optional[list]:
         # projections dense; only the pre-route front uses this partial merge.
         return [self.gate, self.routed_expert_down_proj]
     return None
+
+
+def _densify_quark_shared_experts(shared_experts: torch.nn.Module) -> None:
+    # The loader's later post-processing leaves an already-BF16 shared expert alone.
+    for linear in (shared_experts.gate_up_proj, shared_experts.down_proj):
+        if isinstance(linear.quant_method, QuarkLinearMethod) and isinstance(
+            linear.scheme, QuarkW4A4MXFP4
+        ):
+            linear.scheme.dequantize_to_bf16(linear)
 
 
 def _keep_correction_bias_in_logit_dtype(self) -> None:

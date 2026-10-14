@@ -266,17 +266,24 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return layer.weight
         return _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
 
+    def dequantize_to_bf16(self, layer: torch.nn.Module) -> None:
+        """Switch the linear to a dense BF16 weight and GEMM."""
+        w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
+        layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
+        # FP4 block scales are folded into the bf16 weight; drop them.
+        layer.weight_scale = None
+        layer.dequantized_bf16 = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # A model may already have densified this linear before the loader pass.
+        if layer.dequantized_bf16:
+            return
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
 
         if _dequant_linear_to_bf16:
-            w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
-            layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
-            # FP4 block scales are folded into the bf16 weight; drop them.
-            layer.weight_scale = None
-            layer.dequantized_bf16 = True
+            self.dequantize_to_bf16(layer)
 
     def create_weights(
         self,
@@ -288,6 +295,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         **kwargs,
     ):
         self.input_size_per_partition = input_size_per_partition
+        layer.dequantized_bf16 = False
 
         output_size_per_partition = sum(output_partition_sizes)
         self.output_size_per_partition = output_size_per_partition

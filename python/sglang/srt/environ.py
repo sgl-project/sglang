@@ -1961,6 +1961,9 @@ class Envs:
     SGLANG_OPT_HIP_K3_LATENT_TAIL_FP8 = EnvBool(False)
     # Measured fastest at 4 on MI355X agentic serving; the microbench wins through 32.
     SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS = EnvInt(4)
+    # Dequantize Quark MXFP4 shared experts to BF16 at load so they join the
+    # fused Kimi-K3 MoE front on ROCm.
+    SGLANG_OPT_HIP_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
