@@ -183,8 +183,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_writer_or_non
 from sglang.srt.managers.min_free_slots_delayer import create_min_free_slots_delayer
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
-    decide_needs_confidence_relay,
-    decide_needs_cpu_seq_lens,
+    create_future_map,
 )
 from sglang.srt.managers.prefill_delayer import (
     RecentPrefillBatchSizeTracker,
@@ -248,9 +247,7 @@ from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.lora_admission import LoraAdmission
-from sglang.srt.managers.scheduler_components.memory_usage import (
-    combine_graph_memory_usage,
-)
+from sglang.srt.managers.scheduler_components.memory_usage import emit_startup_metrics
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     MetricsSink,
@@ -463,6 +460,7 @@ class Scheduler:
 
         # Streams: the schedule stream settles before anything that waits on it.
         self.init_overlap()
+        self.init_copy_stream()
         self.finalize_schedule_stream()
         self.init_streams()
         self.maybe_init_pp_spec_forward()
@@ -884,26 +882,13 @@ class Scheduler:
         if not get_observability().enable_metrics:
             return
 
-        self.metrics_collector.emit_constants(
+        emit_startup_metrics(
+            self.metrics_collector,
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             max_total_num_tokens=self.max_total_num_tokens,
-            max_total_num_tokens_swa=self.swa_tokens_per_layer,
-            weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
-            kv_cache_memory_usage_gb=(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage
-            ),
-            graph_memory_usage_gb=combine_graph_memory_usage(
-                self.tp_worker.graph_memory_usage,
-                (
-                    None
-                    if self.draft_worker is None
-                    else self.draft_worker.graph_memory_usage
-                ),
-            ),
-            # TODO: max_running_requests_under_SLO has no setter — dead chain.
-            max_running_requests_under_SLO=None,
-            page_size=get_schedule().page_size,
-            num_pages=self.max_total_num_tokens
-            // self.token_to_kv_pool_allocator.page_size,
+            swa_tokens_per_layer=self.swa_tokens_per_layer,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
@@ -1303,31 +1288,19 @@ class Scheduler:
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
-        # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers without the spec_v2_attn_backends override fall back to
-        # target-only so the helper still produces a safe decision (no
-        # accidental opt-out for unaudited shapes).
-        if self.draft_worker is not None:
-            attn_backends = getattr(
-                self.draft_worker,
-                "spec_v2_attn_backends",
-                (self.tp_worker.model_runner.attn_backend,),
-            )
-        else:
-            attn_backends = (self.tp_worker.model_runner.attn_backend,)
-        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
-        needs_confidence_relay = decide_needs_confidence_relay()
-        self.future_map = self.spec_algorithm.create_future_map(
-            self.device,
-            self.req_to_token_pool,
-            needs_cpu_seq_lens=needs_cpu_seq_lens,
-            needs_confidence_relay=needs_confidence_relay,
+        self.future_map = create_future_map(
+            spec_algorithm=self.spec_algorithm,
+            device=self.device,
+            req_to_token_pool=self.req_to_token_pool,
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
         )
         self.model_worker.attach_future_map(
             self.future_map,
             enable_overlap=(not get_schedule().disable_overlap_schedule),
         )
 
+    def init_copy_stream(self) -> None:
         # copy_stream is also used by PP (non-overlap) via the PP ring; init
         # unconditionally to match main.
         self.copy_stream: CudaStream = self.device_module.Stream()
