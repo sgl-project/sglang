@@ -18,7 +18,9 @@ pub struct Config {
 /// Outbound request timeout and retry settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
-    /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
+    /// Timeout for upstream response headers, and for a non-streaming body.
+    /// SGLang's chat endpoint sends streaming headers with the first token.
+    /// Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
     /// Maximum silence between streamed upstream chunks before the stream fails.
     pub stream_idle_timeout_secs: u64,

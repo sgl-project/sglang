@@ -76,9 +76,12 @@
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
-/rust/sglang-radix-tree @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
-/rust/sglang-processor @sagearc @rainj-me @ishandhanani @sherlockwu
-/rust/sglang-renderer @sagearc
+/rust/sglang-grpc @alexnails @ishandhanani
+/rust/sglang-mm @sherlockwu @merrymercy
+/rust/sglang-processor @sagearc @sherlockwu
+/rust/sglang-radix-tree @Jialin @alphabetc1
+/rust/sglang-renderer @sagearc @rainj-me
+/rust/sglang-server @rainj-me @merrymercy
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237

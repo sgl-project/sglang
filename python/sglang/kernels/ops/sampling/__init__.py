@@ -111,3 +111,17 @@ register_kernel(
         target="sglang.kernels.ops.sampling.murmur_hash:murmur_hash32",
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="sampling.denoiser_statistics",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.denoiser_statistics:denoiser_statistics",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32",),
+            description="FP32 probabilities, entropy and raw-logit argmax for contiguous [B,M,V] logits; optional BF16 probabilities.",
+        ),
+    )
+)
