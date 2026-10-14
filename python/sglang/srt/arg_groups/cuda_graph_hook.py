@@ -101,6 +101,38 @@ def parse_cuda_graph_config(server_args: Any):
     server_args._cuda_graph_config_locked = locked
 
 
+def apply_prefill_cp_cuda_graph_default(server_args: Any):
+    """Select BCG for supported CP after the backend and topology resolve."""
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    cfg = resolving_view(server_args)
+    # Preserve explicit graph choices, but enable supported CP paths even if
+    # an earlier default disabled capture before CP/backend resolution.
+    if (Phase.PREFILL, "backend") not in getattr(
+        server_args, "_cuda_graph_config_locked", set()
+    ) and supports_prefill_cp_bcg(server_args):
+        declare_resolution(
+            server_args,
+            "apply_prefill_cp_cuda_graph_default",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+            ),
+        )
+        # Keep unrelated incompatibilities and DeepEP bucket alignment intact
+        # when restoring a graph disabled before CP/backend resolution.
+        apply_cuda_graph_compatibility(server_args)
+        apply_cuda_graph_disaggregation_roles(server_args)
+        apply_deepep_adjustments(server_args)
+        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            logger.info(
+                "Enabling breakable prefill CUDA graph for supported prefill CP."
+            )
+    if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+        logger.warning(
+            "Breakable prefill CUDA graph is not enabled for this prefill CP configuration."
+        )
+
+
 def apply_cuda_graph_compatibility(server_args: Any):
     """Auto-disable prefill cuda graph for incompatible configs.
     Breakable and Full have different constraints. Skip automatic selection
@@ -159,14 +191,19 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
-        # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+        # c4 indexer scratch is pinned in the capture pool and OOMs. The
+        # supported CP path captures a smaller rank-local body.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
+            lambda: (
+                is_deepseek_v4(model_config_of(server_args).hf_config)
+                and not supports_prefill_cp_bcg(server_args)
+            ),
         ),
-        # CP all_gather replay size mismatch under BCG.
+        # CP all_gather replay size mismatch under BCG. Defer the warning until
+        # apply_prefill_cp_cuda_graph_default has resolved the final CP default.
         (
-            "context parallel (attn_cp_size > 1)",
+            None,
             lambda: (
                 resolved_view(server_args).attn_cp_size > 1
                 and not supports_prefill_cp_bcg(server_args)
@@ -202,11 +239,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     ]
     for name, predicate in rules:
         if predicate():
-            logger.warning(
-                "Breakable CUDA graph is incompatible with %s; "
-                "disabling prefill CUDA graph.",
-                name,
-            )
+            if name is not None:
+                logger.warning(
+                    "Breakable CUDA graph is incompatible with %s; "
+                    "disabling prefill CUDA graph.",
+                    name,
+                )
             declare_resolution(
                 server_args,
                 "_disable_breakable_cudagraph_if_incompatible",
