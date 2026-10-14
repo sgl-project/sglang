@@ -896,6 +896,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.bootstrap_addr = "prefill:8998"
         receiver.started_transfer = False
         receiver.init_time = None
+        receiver.prealloc_start_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
         receiver._connection_pool_entries = {}
@@ -912,7 +913,21 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver, mgr = self._make_receiver(status=KVPoll.Bootstrapping)
 
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+        self.assertIsNone(receiver.init_time)
         mgr.update_transfer_status.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_preallocation_wait_times_out_before_transfer_starts(self, clock):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        clock.return_value = 10.0
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(receiver.prealloc_start_time, 10.0)
+        self.assertIsNone(receiver.init_time)
+        clock.return_value = 15.0
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertFalse(receiver.started_transfer)
+        mgr.update_transfer_status.assert_not_called()
+        mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
 
     def test_manager_success_or_failed_status_is_terminal(self):
         for terminal_status in (KVPoll.Success, KVPoll.Failed):
