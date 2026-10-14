@@ -549,9 +549,11 @@ class BufferModePipeline:
     def _log_backup_dropped(
         self, num_tokens: int, reason: str, node_id: NodeId
     ) -> None:
-        """Count one dropped span under ``reason`` and log it, rate limited per
-        reason: the pages reach L3 only on a later recompute, and without the
-        line a lagging store shows up as an unexplained L3 miss rate."""
+        """Count one dropped span under ``reason`` and tally it for the
+        per-tick, per-reason rate-limited log line (``_log_pending_backup_drops``;
+        the line is deferred so it reports the queue after the sweep). The
+        pages reach L3 only on a later recompute, and without the line a
+        lagging store shows up as an unexplained L3 miss rate."""
         if num_tokens <= 0:
             return
         cache = self._cache
@@ -567,46 +569,41 @@ class BufferModePipeline:
         tally.total_tokens += num_tokens
         if len(tally.sample_node_ids) < 4:
             tally.sample_node_ids.append(node_id)
-        self._maybe_log_backup_drops(reason, tally, time.monotonic())
 
     def _log_pending_backup_drops(self) -> None:
-        """Report spans tallied since a reason's last line once its interval
-        has elapsed, so a burst's tail is not held until the next drop."""
+        """Once per tick: report each reason's spans tallied since its last
+        line, at most one line per reason per interval."""
         if not self._backup_drop_tallies:
             return
         now = time.monotonic()
         for reason, tally in self._backup_drop_tallies.items():
-            if tally.spans:
-                self._maybe_log_backup_drops(reason, tally, now)
-
-    def _maybe_log_backup_drops(
-        self, reason: str, tally: _BackupDropTally, now: float
-    ) -> None:
-        if (
-            tally.last_logged_at is not None
-            and now - tally.last_logged_at < self.backup_drop_log_interval_s
-        ):
-            return
-        tally.last_logged_at = now
-        logger.log(
-            logging.ERROR if reason == "backlog_cap" else logging.WARNING,
-            "HiCache buffer-mode backup dropped (reason=%s): %d span(s), %d tokens "
-            "since the last report (%d total), node_ids=%s; %s. Queue %d intents "
-            "/ %d tokens, staged %d of live cap %d host tokens.",
-            reason,
-            tally.spans,
-            tally.tokens,
-            tally.total_tokens,
-            tally.sample_node_ids,
-            _BACKUP_DROP_DETAILS[reason],
-            len(self.pending_write_queue),
-            self.write_backlog_tokens_,
-            self.write_staged_tokens_,
-            self._write_staging_cap(),
-        )
-        tally.spans = 0
-        tally.tokens = 0
-        tally.sample_node_ids = []
+            if not tally.spans or (
+                tally.last_logged_at is not None
+                and now - tally.last_logged_at < self.backup_drop_log_interval_s
+            ):
+                continue
+            tally.last_logged_at = now
+            logger.log(
+                logging.ERROR if reason == "backlog_cap" else logging.WARNING,
+                "HiCache buffer-mode backup dropped (reason=%s): %d span(s), %d "
+                "tokens since the last report (%d total), node_ids=%s; %s. Queue "
+                "%d intents / %d tokens (cap %d), staged %d of live cap %d host "
+                "tokens.",
+                reason,
+                tally.spans,
+                tally.tokens,
+                tally.total_tokens,
+                tally.sample_node_ids,
+                _BACKUP_DROP_DETAILS[reason],
+                len(self.pending_write_queue),
+                self.write_backlog_tokens_,
+                self.write_backlog_cap,
+                self.write_staged_tokens_,
+                self._write_staging_cap(),
+            )
+            tally.spans = 0
+            tally.tokens = 0
+            tally.sample_node_ids = []
 
     def dropped_backup_tokens(self, reason: str) -> int:
         """Tokens dropped under ``reason`` since the last reset."""

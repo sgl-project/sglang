@@ -1,5 +1,10 @@
 """Buffer-only backup drops: every drop site labels the metric with its reason
-and logs a rate-limited line; the write window is published every tick."""
+and logs a rate-limited line; the write window is published every tick.
+
+Separate from test_buffer_mode_sidecar.py because these cases need a metrics
+collector double (storage metrics on) and a recording collector class, which
+the sidecar fixtures run without.
+"""
 
 import logging
 import unittest
@@ -185,10 +190,21 @@ class TestBufferModeBackupDrops(CustomTestCase):
         with self.subTest(reason="backlog_cap"):
             self.pipeline.write_backlog_cap = 0
             tokens = self._add_node(4)
-            with self.assertLogs(pipeline_module.logger, level=logging.ERROR) as logs:
-                self.pipeline.enqueue_backup_intent(4)
+            self.pipeline.enqueue_backup_intent(4)
             self.assertEqual(self._drops()[-1], (tokens, "backlog_cap"))
-            self.assertIn("reason=backlog_cap", logs.records[0].getMessage())
+        # Admission-time drops are reported by the next tick, the cap at ERROR.
+        with self.assertLogs(pipeline_module.logger, level=logging.WARNING) as logs:
+            self.pipeline.flush_pending_writes()
+        by_reason = {
+            record.getMessage().split("reason=")[1].split(")")[0]: record
+            for record in logs.records
+        }
+        self.assertEqual(
+            set(by_reason), {"parent_uncovered", "oversize", "backlog_cap"}
+        )
+        self.assertEqual(by_reason["backlog_cap"].levelno, logging.ERROR)
+        self.assertIn("(cap 0)", by_reason["backlog_cap"].getMessage())
+        self.assertEqual(by_reason["oversize"].levelno, logging.WARNING)
         self.assertFalse(self.pipeline.pending_write_queue)
         self.assertFalse(self.pipeline.inflight_backup_node_ids)
 
@@ -224,14 +240,20 @@ class TestBufferModeBackupDrops(CustomTestCase):
             self._evict(node_id)
         with self.assertLogs(pipeline_module.logger, level=logging.WARNING) as logs:
             self.pipeline.flush_pending_writes()
-        # Two swept spans: two metric increments, one line (the second span
-        # falls inside the interval and is tallied for a later line).
+        # Two swept spans: two metric increments, one line for the tick,
+        # reporting the post-sweep queue.
         self.assertEqual(len(self._drops()), 2)
         self.assertEqual(len(logs.records), 1)
-        self.assertIn("1 span(s)", logs.records[0].getMessage())
-        # Still inside the interval: an idle tick reports nothing.
+        message = logs.records[0].getMessage()
+        self.assertIn("2 span(s)", message)
+        self.assertIn("Queue 0 intents / 0 tokens", message)
+        # Inside the interval: a later drop is tallied, not reported.
+        tokens += self._add_node(10)
+        self.pipeline.enqueue_backup_intent(10)
+        self._evict(10)
         with self.assertNoLogs(pipeline_module.logger, level=logging.WARNING):
             self.pipeline.flush_pending_writes()
+        self.assertEqual(len(self._drops()), 3)
 
         # Interval elapsed: the next tick reports the tail of the burst even
         # without a new drop, so the log converges on the metric.
@@ -243,13 +265,6 @@ class TestBufferModeBackupDrops(CustomTestCase):
         self.assertIn(f"({tokens} total)", message)
         with self.assertNoLogs(pipeline_module.logger, level=logging.WARNING):
             self.pipeline.flush_pending_writes()
-
-        tokens += self._add_node(10)
-        self.pipeline.enqueue_backup_intent(10)
-        self._evict(10)
-        with self.assertLogs(pipeline_module.logger, level=logging.WARNING) as logs:
-            self.pipeline.flush_pending_writes()
-        self.assertIn(f"({tokens} total)", logs.records[0].getMessage())
         self.assertEqual(self.pipeline.dropped_backup_tokens("source_evicted"), tokens)
 
     def test_write_window_gauges_are_published_every_flush(self):
