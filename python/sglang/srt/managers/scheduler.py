@@ -187,7 +187,6 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
-from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
@@ -301,6 +300,7 @@ from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
 from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
+from sglang.srt.managers.scheduler_components.tokenizer_setup import load_tokenizer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -335,7 +335,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.penalties import PenaltyStore
@@ -361,12 +360,6 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
     triton_load_watch,
-)
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -718,96 +711,15 @@ class Scheduler:
             return None
 
     def init_tokenizer(self):
-        server_args = self.server_args
         self.is_generation = self.model_config.is_generation
-
-        if self.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    image_processor_backend=resolve_image_processor_backend(get_mm()),
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                    model_name=get_model().model_path,
-                )
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-            else:
-                self.processor = None
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
-
-        # Load multimodal processor for M-RoPE fallback computation.
-        self._mm_processor = None
-        if (
-            self.model_config.is_multimodal
-            and self.processor is not None
-            and not get_disagg().language_model_only
-        ):
-            try:
-                import_processors("sglang.srt.multimodal.processors")
-                self._mm_processor = get_mm_processor(
-                    self.model_config.hf_config,
-                    server_args,
-                    self.processor,
-                    "default",
-                    skip_mm_pool=True,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to load multimodal processor in scheduler; "
-                    "M-RoPE fallback will not be available."
-                )
-
-        if get_serving().reasoning_parser and self.tokenizer:
-            reasoning_parser = ReasoningParser(
-                model_type=get_serving().reasoning_parser,
-                stream_reasoning=False,
-                tokenizer=self.tokenizer,
-            )
-            think_end_ids = reasoning_parser.detector.get_think_end_token_ids(
-                self.tokenizer
-            )
-            if think_end_ids:
-                self.model_config.think_end_ids = think_end_ids
-            else:
-                logger.warning(
-                    "Reasoning parser think_end_token %r could not be encoded; "
-                    "grammar-gated reasoning is disabled.",
-                    reasoning_parser.detector.think_end_token,
-                )
-
-            selectable_tokens = getattr(
-                reasoning_parser.detector,
-                "request_selectable_think_end_tokens",
-                (),
-            )
-            if selectable_tokens:
-                selectable_sequences = []
-                for end_token in selectable_tokens:
-                    token_ids = self.tokenizer.encode(
-                        end_token, add_special_tokens=False
-                    )
-                    if not token_ids:
-                        raise ValueError(
-                            f"Request-selectable reasoning terminator {end_token!r} "
-                            "could not be encoded"
-                        )
-                    selectable_sequences.append(token_ids)
-                self.model_config.request_selectable_think_end_id_sequences = [
-                    list(sequence)
-                    for sequence in dict.fromkeys(
-                        tuple(sequence) for sequence in selectable_sequences
-                    )
-                ]
+        loaded = load_tokenizer(
+            model_config=self.model_config,
+            server_args=self.server_args,
+            skip_tokenizer_init=self.skip_tokenizer_init,
+        )
+        self.tokenizer = loaded.tokenizer
+        self.processor = loaded.processor
+        self._mm_processor = loaded.mm_processor
 
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:

@@ -511,13 +511,13 @@ class TestReasonerGrammarBackend(CustomTestCase):
                 self.assertIs(grammar, backend._dispatch_result)
 
     def test_inkling_scheduler_uses_native_reasoning_end(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.tokenizer_setup import (
+            load_tokenizer,
+        )
 
+        mod = "sglang.srt.managers.scheduler_components.tokenizer_setup"
         tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = SimpleNamespace(skip_tokenizer_init=False)
-        scheduler.skip_tokenizer_init = False
-        scheduler.model_config = SimpleNamespace(
+        model_config = SimpleNamespace(
             is_generation=True, is_multimodal=False, think_end_ids=None
         )
         serving = SimpleNamespace(
@@ -527,19 +527,21 @@ class TestReasonerGrammarBackend(CustomTestCase):
             reasoning_parser="inkling",
         )
         with (
+            patch(f"{mod}.get_tokenizer", return_value=tokenizer),
+            patch(f"{mod}.get_serving", return_value=serving),
             patch(
-                "sglang.srt.managers.scheduler.get_tokenizer", return_value=tokenizer
-            ),
-            patch("sglang.srt.managers.scheduler.get_serving", return_value=serving),
-            patch(
-                "sglang.srt.managers.scheduler.get_model",
+                f"{mod}.get_model",
                 return_value=SimpleNamespace(trust_remote_code=False, revision=None),
             ),
         ):
-            scheduler.init_tokenizer()
+            load_tokenizer(
+                model_config=model_config,
+                server_args=SimpleNamespace(skip_tokenizer_init=False),
+                skip_tokenizer_init=False,
+            )
 
         self.assertEqual(
-            scheduler.model_config.think_end_ids,
+            model_config.think_end_ids,
             [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
         )
 
