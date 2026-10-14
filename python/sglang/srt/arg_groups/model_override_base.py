@@ -329,7 +329,14 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "torch_native"
         else:
             # FlashInfer does not support attention sinks.
-            if get_platform().has_flashinfer and not model_config.has_attention_sinks:
+            # Workaround for flashinfer-ai/flashinfer#4299: FA2 prefill faults or returns
+            # wrong results when a head dim is not a multiple of 64; drop once fixed.
+            if (
+                get_platform().has_flashinfer
+                and not model_config.has_attention_sinks
+                and model_config.head_dim % 64 == 0
+                and model_config.v_head_dim % 64 == 0
+            ):
                 return "flashinfer"
             return "triton"
     else:
