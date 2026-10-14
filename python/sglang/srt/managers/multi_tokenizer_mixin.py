@@ -28,6 +28,7 @@ import signal
 import sys
 import threading
 import zlib
+from functools import lru_cache
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -78,6 +79,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
@@ -484,7 +487,7 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
             indices,
             check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
         )
-        for field in msgspec.structs.fields(output)
+        for field in _cached_output_fields(type(output))
         if field.name not in _NOT_SPLIT_FIELDS
     }
     return type(output)(

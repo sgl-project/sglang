@@ -23,6 +23,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
     TokenizerWorker,
+    _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
     _send_output_to_tokenizer_workers,
@@ -270,6 +271,22 @@ class TestMultiTokenizerMixin(CustomTestCase):
         np.testing.assert_array_equal(
             grouped.input_top_logprobs_val_flat[1], np.array([[1.0]], np.float32)
         )
+
+    def test_grouped_split_caches_struct_fields_by_output_type(self):
+        self.addCleanup(_cached_output_fields.cache_clear)
+        _cached_output_fields.cache_clear()
+
+        str_output = _make_batch_str_output()
+        token_output = _make_batch_token_id_output()
+        _handle_output_by_indices(str_output, [0, 1])
+        _handle_output_by_indices(str_output, [1, 0])
+        _handle_output_by_indices(token_output, [0, 1])
+        _handle_output_by_indices(token_output, [1, 0])
+
+        cache_info = _cached_output_fields.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 2)
+        self.assertEqual(cache_info.currsize, 2)
 
     def test_router_groups_by_target_and_preserves_owner_ipcs(self):
         output = _make_batch_str_output()
