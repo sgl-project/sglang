@@ -87,7 +87,7 @@ _PLANNER_FIELDS = {
             "metrics_sink",
             "ipc_channels",
             "decode_offload_manager",
-            "disagg_decode",
+            "mode_owners",
             "spec_algorithm",
         )
     },

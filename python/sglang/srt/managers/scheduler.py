@@ -2559,7 +2559,7 @@ class Scheduler:
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
             decode_offload_manager=self.decode_offload_manager,
-            disagg_decode=self.disagg_decode,
+            mode_owners=self.mode_owners,
             add_request_to_queue=self.request_intake.add_request_to_queue,
             prefetch_after_device_hit_loss=(
                 self.request_intake.prefetch_after_device_hit_loss

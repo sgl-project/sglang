@@ -34,7 +34,6 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.constrained.grammar_manager import GrammarManager
-    from sglang.srt.disaggregation.decode import DisaggDecode
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
@@ -65,6 +64,7 @@ if TYPE_CHECKING:
         LoraAdmission,
     )
     from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -113,7 +113,7 @@ class StepPlanner:
         tp_worker: TpModelWorker,
         draft_worker,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
-        disagg_decode: Optional[DisaggDecode],
+        mode_owners: ModeOwners,
         add_request_to_queue: Callable[..., None],
         prefetch_after_device_hit_loss: Callable[[Req], bool],
         prefill_delayer: Optional[PrefillDelayer],
@@ -151,9 +151,9 @@ class StepPlanner:
         self.tp_worker = tp_worker
         self.draft_worker = draft_worker
         self.decode_offload_manager = decode_offload_manager
-        # The registry and the PD decode owner; a PD role switch replaces both.
         self.request_registry = request_registry
-        self.disagg_decode = disagg_decode
+        # A PD role switch replaces the owners in place.
+        self.mode_owners = mode_owners
         self.add_request_to_queue = add_request_to_queue
         self.prefetch_after_device_hit_loss = prefetch_after_device_hit_loss
         self.prefill_delayer = prefill_delayer
@@ -621,9 +621,12 @@ class StepPlanner:
     ) -> List[Req]:
         """Move decoding requests back to the waiting queue until the rest fit
         one decode step; return the requests that stay."""
-        if self.disagg_decode is not None and self.decode_offload_manager is not None:
+        if (
+            self.mode_owners.disagg_decode is not None
+            and self.decode_offload_manager is not None
+        ):
             # Pending offload copies may still read the device KV that retraction frees.
-            self.disagg_decode.drain_offloads_before_retraction()
+            self.mode_owners.disagg_decode.drain_offloads_before_retraction()
         old_available_tokens = self.token_to_kv_pool_allocator.available_size()
         old_ratio = self.new_token_ratio_tracker.current
         mamba_allocator = getattr(
@@ -715,10 +718,13 @@ class StepPlanner:
 
         self.counters.cur_batch_for_debug = None
 
-        if self.disagg_decode is not None and self.decode_offload_manager is not None:
+        if (
+            self.mode_owners.disagg_decode is not None
+            and self.decode_offload_manager is not None
+        ):
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
-            self.disagg_decode.drain_offloads_before_retraction()
+            self.mode_owners.disagg_decode.drain_offloads_before_retraction()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
@@ -733,8 +739,8 @@ class StepPlanner:
                 offload_kv=False,
             )
         self.core_lists.decoding = []
-        if self.disagg_decode is not None:
-            self.disagg_decode.hold_for_rebootstrap(retract_reqs)
+        if self.mode_owners.disagg_decode is not None:
+            self.mode_owners.disagg_decode.hold_for_rebootstrap(retract_reqs)
         else:
             for req in retract_reqs:
                 self.add_request_to_queue(req)
