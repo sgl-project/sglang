@@ -99,6 +99,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
+        hisparse_coordinator=None,
         prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
