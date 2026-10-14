@@ -100,7 +100,6 @@ class XverseMoE(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         self.n_routed_experts = config.num_experts
         self.top_k = config.moe_top_k

@@ -986,6 +986,7 @@ class TestBeamLoading(CustomTestCase):
                 ),
                 get_parallel().override(
                     tp_size=tp_size,
+                    tp_rank=rank,
                     attn_tp_rank=rank,
                     attn_tp_size=tp_size,
                     moe_tp_size=tp_size,
@@ -998,9 +999,7 @@ class TestBeamLoading(CustomTestCase):
                 ),
             ):
                 attention = BeamAttention(config, layer_id=0)
-                dense = MergedColumnParallelLinear(
-                    24, [32, 32], bias=False, tp_rank=rank, tp_size=tp_size
-                )
+                dense = MergedColumnParallelLinear(24, [32, 32], bias=False)
                 params = {
                     "model.layers.0.self_attn.gate_bias": attention.gate_bias,
                     "model.layers.0.mlp.gate_up_proj.weight": dense.weight,

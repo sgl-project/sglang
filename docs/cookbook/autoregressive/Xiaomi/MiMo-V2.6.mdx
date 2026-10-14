@@ -113,7 +113,7 @@ The shared prefill settings are `--chunked-prefill-size 49152 --max-prefill-toke
 
 The base recipe uses `--speculative-algorithm DFLASH --speculative-num-draft-tokens 8`. Supply the DFlash checkpoint paired with the selected target model; the draft path is independently editable and does not have to be a subdirectory of the target checkpoint.
 
-At the pinned commit, DFlash on NVIDIA GPUs requires PP=1 and rejects DP-attention. Do not add `--enable-dp-attention` or copy EAGLE-specific settings from the V2.5 cookbook.
+At the pinned commit, DFlash on NVIDIA GPUs requires PP=1 and rejects DP-attention. Do not set `--attn-dp-size` above 1 or copy EAGLE-specific settings from the V2.5 cookbook.
 
 ## 3. Reasoning and tool calling
 

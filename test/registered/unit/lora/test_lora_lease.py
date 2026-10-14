@@ -4,7 +4,7 @@ A leaked lease leaves the adapter's in-flight counter above zero forever, so
 unload's wait_for_zero never returns; a double release drives the counter
 negative, which hangs it just the same (it waits for exactly zero). Covers:
 
-  * TokenizerManager._finalize_lora_lease is the single, idempotent release
+  * TokenizerManager._release_lora_once is the single, idempotent release
     owner for every terminal path
   * pre-acquire failures (lora_id never set) release nothing
   * LoRARegistry.acquire: lookup + counter increment are one atomic admission
@@ -39,6 +39,7 @@ def _make_tm(enable_lora: bool = True) -> TokenizerManager:
     tm.enable_lora = enable_lora
     tm.lora_registry = MagicMock()
     tm.lora_registry.release = AsyncMock()
+    tm._lora_release_tasks = set()
     return tm
 
 
@@ -51,7 +52,7 @@ class TestFinalizeLoraLease(CustomTestCase):
     def _finalize(self, tm, state, times=1):
         async def run():
             for _ in range(times):
-                tm._finalize_lora_lease(state)
+                tm._release_lora_once(state)
             # Let the create_task'd release coroutines run.
             await asyncio.sleep(0)
 
@@ -62,7 +63,7 @@ class TestFinalizeLoraLease(CustomTestCase):
         state = _make_state()
         self._finalize(tm, state, times=3)
         tm.lora_registry.release.assert_awaited_once_with("id-1")
-        self.assertTrue(state.lora_lease_released)
+        self.assertTrue(state.lora_released)
 
     def test_pre_acquire_failure_releases_nothing(self):
         # _init_req_state runs before the LoRA acquire; a failure in between
@@ -71,7 +72,7 @@ class TestFinalizeLoraLease(CustomTestCase):
         state = _make_state(lora_id=None)
         self._finalize(tm, state)
         tm.lora_registry.release.assert_not_awaited()
-        self.assertFalse(state.lora_lease_released)
+        self.assertFalse(state.lora_released)
 
     def test_no_lora_path_is_noop(self):
         tm = _make_tm()
@@ -89,7 +90,7 @@ class TestFinalizeLoraLease(CustomTestCase):
         tm = _make_tm()
 
         async def run():
-            tm._finalize_lora_lease(None)
+            tm._release_lora_once(None)
 
         asyncio.run(run())
         tm.lora_registry.release.assert_not_awaited()

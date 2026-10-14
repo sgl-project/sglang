@@ -2,6 +2,7 @@
 whole-adapter apply at end_weight_update."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import torch
@@ -23,6 +24,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import MultiprocessingSerializer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -37,13 +39,13 @@ def _make_manager(**overrides) -> SchedulerWeightUpdaterManager:
     kwargs = dict(
         tp_worker=MagicMock(),
         draft_worker=None,
-        tp_cpu_group=MagicMock(),
         memory_saver_adapter=MagicMock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
     )
     kwargs.update(overrides)
-    return SchedulerWeightUpdaterManager(**kwargs)
+    with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+        return SchedulerWeightUpdaterManager(**kwargs)
 
 
 class TestSplitLoraNamedTensors(CustomTestCase):
@@ -91,14 +93,15 @@ class TestLoraStash(CustomTestCase):
     def test_per_rank_payload_is_unwrapped(self):
         """A LoRA tensor never reaches the base loader, so the stash is the last
         place a per-rank payload can be reduced to this rank's tensor."""
-        tp_worker = MagicMock()
-        tp_worker.model_runner.tp_rank = 1
-        mgr = _make_manager(tp_worker=tp_worker)
+        # The rank comes from the parallel context; a MagicMock worker would hand
+        # back a mock rank whose __index__ happens to be 1.
+        mgr = _make_manager(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()))
         rank_tensors = [torch.zeros(2), torch.ones(2)]
         payload = LocalSerializedTensor(
             values=[MultiprocessingSerializer.serialize(t) for t in rank_tensors]
         )
-        mgr._stash_lora_tensors([(f"miles_lora:{LORA_A}", payload)])
+        with get_parallel().override(tp_rank=1):
+            mgr._stash_lora_tensors([(f"miles_lora:{LORA_A}", payload)])
         self.assertTrue(
             torch.equal(mgr._lora_stash["miles_lora"][LORA_A], rank_tensors[1])
         )

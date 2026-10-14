@@ -10,6 +10,16 @@ from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 __all__ = []
 
+register_kernel(
+    KernelSpec(
+        op="communication.moe_finalize_shared_gate_all_reduce",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        description="BF16 routed finalize, FP32 shared gate, and clustered all-reduce.",
+    )
+)
+
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn in [
