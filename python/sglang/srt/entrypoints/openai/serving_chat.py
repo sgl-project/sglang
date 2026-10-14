@@ -2069,9 +2069,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages.append(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
-            openai_compatible_messages, assistant_prefix = (
-                self._handle_last_assistant_message(openai_compatible_messages, request)
-            )
+            add_generation_prompt = request._format_add_generation_prompt
+            assistant_prefix = None
+            if add_generation_prompt is None or request.continue_final_message:
+                openai_compatible_messages, assistant_prefix = (
+                    self._handle_last_assistant_message(
+                        openai_compatible_messages, request
+                    )
+                )
 
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
@@ -2096,9 +2101,15 @@ class OpenAIServingChat(OpenAIServingBase):
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
             # avoid double BOS on tokenizers that would add it.
+            add_special_tokens = request._format_add_special_tokens
+            if add_special_tokens and self._prompt_text_round_trip_is_lossy:
+                raise ValueError(
+                    "add_special_tokens is not supported with this tokenizer's "
+                    "chat template"
+                )
             encode_kwargs = (
-                {"add_special_tokens": False}
-                if self._tokenizer_auto_adds_specials
+                {"add_special_tokens": add_special_tokens}
+                if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
             try:
@@ -2108,6 +2119,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
+                    add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -2124,6 +2136,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
+                        add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -2169,6 +2182,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        add_generation_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
@@ -2185,6 +2199,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools,
                         template_kwargs,
                         encode_kwargs,
+                        add_generation_prompt,
                     ),
                 )
             except TypeError:
@@ -2202,7 +2217,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 return_dict=False,
                 **template_kwargs,
@@ -2211,7 +2226,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 return_dict=False,
                 **template_kwargs,
