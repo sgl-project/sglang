@@ -243,6 +243,12 @@ tools = [
 
 import json
 
+
+def get_weather(city: str, unit: str = "celsius"):
+    # Stand-in for your real tool implementation.
+    return {"city": city, "temperature": 22, "condition": "sunny", "unit": unit}
+
+
 response = client.chat.completions.create(
     model="Ling-3.1-flash",
     messages=[{"role": "user", "content": "What's the weather like in Hangzhou right now?"}],
@@ -330,23 +336,31 @@ docker run --rm --network host --ipc=host \
 <Accordion title="Example Output">
 
 ```text Output
-Master service started on port 50171 ... role=leader, state=serving, service_ready=true
-Master Admin Metrics: role=leader, state=serving, service_ready=true, master={Mem Storage: 0 B / 4.00 GB ... | Clients: 1 ...}
-Client HTTP server started on port 8291
-Starting real client service on 127.0.0.1:50172
+I1014 11:47:24.542050 328820 master.cpp:1522] Master service started on port 50171, max_threads=16, enable_metric_reporting=1, metrics_port=9024, ...
+I1014 11:47:24.558478 328853 master_admin_service.cpp:301] Master Admin Metrics: role=leader, state=serving, service_ready=true, ...
+I1014 11:47:27.557325 328879 real_client.cpp:1935] Client HTTP server started on port 8291
 ```
 
 </Accordion>
 
 Select **H200 → Low-Latency** in Deployment, then enable **HiCache → Mooncake** in the Playground. Keep NEXTN inherited from the base. Docker commands use host networking so the SGLang container can reach these localhost services. Change the master and metadata endpoints in the **Env** dialog for a remote store.
 
-The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. To verify L3 round-trip: send a long prompt (thousands of tokens), wait for the server to go idle, flush with `curl -X POST http://localhost:30000/flush_cache -H 'Content-Type: application/json' -d '{}'`, then repeat the same prompt. The serve log shows one `HiCache prefetch success` line per TP rank with the restored token count:
+The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. To verify L3 round-trip: send a long prompt (thousands of tokens), wait for the server to go idle, flush with `curl -X POST http://localhost:30000/flush_cache -H 'Content-Type: application/json' -d '{}'`, then repeat the same prompt.
+
+<Accordion title="Verify L3 prefetch (serve log)">
 
 ```text Output
-[TP0] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
-[TP1] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
-... (all 8 TP ranks)
+[2026-10-14 11:59:25 TP0 EP0] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP1 EP1] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP2 EP2] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP7 EP7] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP6 EP6] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP5 EP5] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP4 EP4] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
+[2026-10-14 11:59:25 TP3 EP3] HiCache prefetch success req=2619007c50024156a9872f10ec14606a completed=5952 matched=0 loaded=5952 occupied=0
 ```
+
+</Accordion>
 
 <Note>
 `POST /flush_cache` is refused with 400 while any request is still in flight — the L3 write-through finishes after the response returns. Wait a few seconds of idle before flushing.

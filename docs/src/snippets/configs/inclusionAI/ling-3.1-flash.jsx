@@ -17,7 +17,7 @@ export const config = {
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
   },
   curl: "curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"model\":\"{{MODEL_NAME}}\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 15% of 240?\"}]}'",
-  dockerImages: { h200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-ling-3.1-flash" },
+  dockerImages: { "h20-3e": "lmsysorg/sglang:dev-ling-3.1-flash", h200: "lmsysorg/sglang:dev-ling-3.1-flash", h800: "lmsysorg/sglang:dev-ling-3.1-flash", h100: "lmsysorg/sglang:dev-ling-3.1-flash", b200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-ling-3.1-flash" },
   dockerHostNetworkWhen: (_sel, { flags }) =>
     flags.some((flag) => flag === "--hicache-storage-backend mooncake"),
   benchmarkCommands: {
@@ -35,8 +35,8 @@ export const config = {
             null,
             {
               value: 4,
-              disable: { hw: ["h200"] },
-              disableReason: "The FP8 H200 recipe requires eight GPUs for model capacity.",
+              disable: { hw: ["h200", "h20-3e", "h800", "h100"] },
+              disableReason: "This FP8 model requires eight GPUs on 80 GB-class hardware for model capacity.",
             },
             { value: 8, disable: { hw: ["gb300"] }, disableReason: "This single-node GB300 recipe has four GPUs." },
           ],
@@ -112,7 +112,7 @@ export const config = {
         { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
         {
           id: "dspark",
-          label: "DSpark — checkpoint pending",
+          label: "DSpark — no compatible draft",
           disable: true,
           disableReason: "A compatible Ling-3.1-flash draft checkpoint is required. The Ling-3.0-flash draft is incompatible.",
         },
