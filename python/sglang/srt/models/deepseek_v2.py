@@ -1044,6 +1044,13 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _normal_path_dispatch_info(self) -> Optional[ExpertLocationDispatchInfo]:
+        # Experts load in the physical layout whenever a dispatch algorithm is set
+        # (--enable-eplb or --init-expert-location); init_new returns None otherwise.
+        if self.is_nextn:
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1079,11 +1086,7 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._normal_path_dispatch_info()
 
         # router_logits: (num_tokens, n_experts)
         if _is_hip:
@@ -1243,11 +1246,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._normal_path_dispatch_info()
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
