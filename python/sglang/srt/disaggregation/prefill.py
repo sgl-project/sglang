@@ -596,9 +596,14 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def move_bootstrapped(self, dst: ReqList) -> List[Req]:
+    def move_bootstrapped(
+        self, dst: ReqList, polls: Optional[List[int]] = None
+    ) -> List[Req]:
         """Move the reqs which have finished bootstrapping into `dst`, and
-        return them."""
+        return them.
+
+        ``polls`` is a PP consensus poll of ``self.queue`` the caller already synced.
+        """
 
         bootstrapped_reqs = []
 
@@ -607,7 +612,9 @@ class PrefillBootstrapQueue:
 
         # The polls are reduced across ranks in this order.
         queue = list(self.queue)
-        if self.pp_size > 1:
+        if polls is not None:
+            pass
+        elif self.pp_size > 1:
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -1568,12 +1575,67 @@ class SchedulerDisaggregationPrefillMixin:
         Returns True if bootstrap is finished."""
         if not req.pending_bootstrap:
             return True
+        if get_parallel().pp_size > 1:
+            # A stage-local poll would let PP stages diverge on this request;
+            # it resolves after prefill in move_bootstrapped_and_resolve_parked_pp.
+            return False
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def move_bootstrapped_and_resolve_parked_pp(
+        self: Scheduler, dst: ReqList
+    ) -> List[Req]:
+        """Move bootstrapped requests into `dst` and resolve parked ones on one
+        PP consensus poll.
+
+        One poll sync per loop iteration: pp_poll_send_window keeps the PP
+        loop's depth of iterations un-waited, and a second sync per iteration
+        would halve that depth and tie the stages together again.
+        """
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        parked = [
+            req for req in self.disagg_prefill_transfer_queue if req.pending_bootstrap
+        ]
+        reqs = list(bootstrap_queue.queue) + parked
+        if not reqs:
+            return []
+        polls = poll_and_all_reduce_prefill_pp(
+            [req.disagg_kv_sender for req in reqs],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            self.pp_group,
+            bootstrap_queue.pp_rank,
+            bootstrap_queue.pp_size,
+            bootstrap_queue.pp_poll_send_window,
+        )
+        assert len(polls) == len(reqs), (
+            f"PP stages disagree on bootstrapping requests: {len(polls)} polls "
+            f"for {len(reqs)} requests"
+        )
+        num_queued = len(bootstrap_queue.queue)
+        bootstrapped = bootstrap_queue.move_bootstrapped(
+            dst, polls=polls[:num_queued]
+        )
+        self._resolve_parked_bootstrap(parked=parked, polls=polls[num_queued:])
+        return bootstrapped
+
+    def _resolve_parked_bootstrap(
+        self: Scheduler, *, parked: List[Req], polls: List[int]
+    ) -> None:
+        """Finalize or fail parked requests on a PP consensus poll.
+
+        Finalizing re-checkpoints the request into the radix cache, so every PP
+        stage must act on the same poll in the same loop iteration. A failed
+        request leaves the transfer queue through the retirer.
+        """
+        for req, poll in zip(parked, polls, strict=True):
+            if self.handle_pending_bootstrap(req, poll):
+                self.send_kv_chunk(req, last_chunk=True)
 
     def process_prefill_chunk(
         self: Scheduler,
