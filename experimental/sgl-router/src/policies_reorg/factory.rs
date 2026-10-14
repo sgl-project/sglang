@@ -11,7 +11,8 @@ use crate::buckets_reorg::{
     Bucket, BucketGroups, BucketResolver, EngineGroup, SloPreference, TokenLimits,
 };
 use crate::config::{
-    AffinityConfig, DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, SessionAffinityMode,
+    AffinityConfig, AffinityMode, BalancedBy, DecodePolicyKind, FilterKind, ModelConfig,
+    PolicyKind, SessionAffinityMode,
 };
 use crate::discovery::WorkerId;
 use crate::state::kv_events::RadixTreePrefixProvider;
@@ -54,7 +55,8 @@ pub struct BucketSpec {
 }
 
 /// Omitted fields mean every engine of the role and `--policy` (power-of-two on
-/// decode); admission limits left unset take `--max-in-flight` / `--max-kv-usage`.
+/// decode); admission limits left unset take `--max-in-flight` / `--max-kv-usage`,
+/// and affinity settings left unset take `--affinity-*`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -63,6 +65,56 @@ pub struct GroupSpec {
     pub worker_services: Option<HashSet<String>>,
     pub policy: Option<PolicyKind>,
     pub admission: Option<AdmissionLimits>,
+    pub affinity: Option<AffinitySpec>,
+}
+
+/// Per-group `--affinity-mode`, `--affinity-balanced-by` and `--affinity-load-*`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AffinitySpec {
+    pub mode: Option<AffinityMode>,
+    pub balanced_by: Option<BalancedBy>,
+    pub load_factor: Option<f64>,
+    pub load_gap: Option<u64>,
+}
+
+impl AffinitySpec {
+    /// Balanced-only fields need balanced `mode`; a set load factor must be at least 1.
+    pub(crate) fn validate(&self, mode: AffinityMode) -> Result<()> {
+        ensure!(
+            mode == AffinityMode::Balanced
+                || (self.balanced_by.is_none()
+                    && self.load_factor.is_none()
+                    && self.load_gap.is_none()),
+            "--affinity-balanced-by and --affinity-load-* (group balanced_by and load_*) require balanced mode"
+        );
+        ensure!(
+            (self.load_factor).is_none_or(|factor| factor.is_finite() && factor >= 1.0),
+            "--affinity-load-factor (group load_factor) must be finite and at least 1"
+        );
+        Ok(())
+    }
+
+    /// `defaults` with each set field replaced, validated like the CLI flags.
+    fn or(&self, defaults: &AffinityConfig) -> Result<AffinityConfig> {
+        let balanced_by = self.balanced_by.unwrap_or(defaults.balanced_by);
+        let config = AffinityConfig {
+            mode: self.mode.unwrap_or(defaults.mode),
+            balanced_by,
+            load_factor: self.load_factor.unwrap_or(defaults.load_factor),
+            // A CLI gap is in the CLI metric's unit; another metric uses its own default.
+            load_gap: (self.load_gap).or(defaults
+                .load_gap
+                .filter(|_| balanced_by == defaults.balanced_by)),
+            ..defaults.clone()
+        };
+        ensure!(
+            matches!(config.mode, AffinityMode::Prefer | AffinityMode::Balanced),
+            "group affinity mode must be prefer or balanced"
+        );
+        self.validate(config.mode)?;
+        Ok(config)
+    }
 }
 
 impl BucketsConfig {
@@ -254,6 +306,14 @@ impl Groups<'_> {
             .map_or(defaults.clone(), |a| a.or(defaults));
         admission.validate()?;
         let admission = Arc::new(admission);
+        ensure!(
+            spec.affinity.is_none() || kind != PolicyKind::PowerOfTwo,
+            "bucket {bucket:?} {stage:?} sets affinity on a power_of_two group"
+        );
+        let affinity = match &spec.affinity {
+            Some(spec) => spec.or(&self.affinity)?,
+            None => self.affinity.clone(),
+        };
         let load = self.state.engine_reported_load();
         let policy: Arc<dyn Policy> = match kind {
             PolicyKind::PowerOfTwo => {
@@ -264,11 +324,11 @@ impl Groups<'_> {
             PolicyKind::SessionAware => {
                 let mut policy = SessionAwarePolicy::new(self.store(), load);
                 policy.admission = admission;
-                policy.config = self.affinity.clone();
+                policy.config = affinity;
                 Arc::new(policy)
             }
             PolicyKind::CacheAware => {
-                let mut policy = CacheAwarePolicy::new(self.source(), load, self.affinity.clone())?;
+                let mut policy = CacheAwarePolicy::new(self.source(), load, affinity)?;
                 policy.admission = admission;
                 Arc::new(policy)
             }
@@ -306,5 +366,27 @@ impl Groups<'_> {
                 )),
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_metric_change_drops_the_cli_gap() {
+        let cli = AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(2_048),
+            ..Default::default()
+        };
+        let by_requests: AffinitySpec =
+            serde_json::from_str(r#"{"balanced_by": "running_requests"}"#).unwrap();
+        let group = by_requests.or(&cli).unwrap();
+        assert_eq!(
+            (group.mode, group.balanced_by, group.load_gap()),
+            (AffinityMode::Balanced, BalancedBy::RunningRequests, 4)
+        );
+        assert_eq!(AffinitySpec::default().or(&cli).unwrap().load_gap(), 2_048);
     }
 }

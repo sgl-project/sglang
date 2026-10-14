@@ -126,6 +126,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     final_norm_eps: float = 1e-5
     qkv_checkpoint_grouped: bool = True
     checkpoint_uses_diffusers_layout: bool = False
+    checkpoint_qkv_layout: str | None = None
     adaln_affine_input_dim: int | None = None
     has_gate_compress: bool = False
     # VDN-H3: None for the dense model; set from transformer/config.json
