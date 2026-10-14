@@ -29,6 +29,7 @@ from .utils import (
     convert_video_to_comfy_video,
     get_image_path,
     is_empty_image,
+    resolve_video_path,
 )
 
 
@@ -694,7 +695,9 @@ class SGLDiffusionGenerateVideo:
             response = sgld_client.generate_video(
                 **request_params, **_comfy_job_hooks()
             )
-            video_path = response.get("file_path", "")
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
             # The server may have resolved a different size than requested
             # (e.g. to match an image-to-video input's aspect ratio).
             resolved_size = response.get("size", "")
@@ -950,12 +953,14 @@ class SGLDiffusionGenerateH3:
             response = sgld_client.generate_video(
                 **request_params, **_comfy_job_hooks()
             )
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
         except comfy.model_management.InterruptProcessingException:
             raise
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 
-        video_path = response.get("file_path", "")
         # H3 aligns the canvas server-side, so the resolved size is only known
         # from the response; short_edge and aspect_ratio cannot reconstruct it
         resolved_size = response.get("size", "")
