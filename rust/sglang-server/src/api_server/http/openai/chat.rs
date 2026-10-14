@@ -191,11 +191,7 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // V4 prefills <think>, so the generated stream has no opening marker.
-    let starts_in_reasoning = matches!(
-        reasoning_parser.as_deref(),
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
-    ) && prompt.ends_with("<think>");
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
     let mut prompt = Some(prompt);
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -850,12 +846,21 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4 and GLM-5.3 prefill `<think>` when thinking, so the generated stream has
+/// no opening marker.
+fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45")
+    ) && prompt.ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        merge_template_stops, starts_in_reasoning, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
@@ -869,6 +874,21 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prefilled_think_starts_in_reasoning() {
+        let glm = Some("glm45");
+        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
+        assert!(!starts_in_reasoning(
+            glm,
+            "<|user|>hi<|assistant|><think></think>"
+        ));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v4"),
+            "<｜Assistant｜><think>"
+        ));
+        assert!(!starts_in_reasoning(None, "<think>"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
