@@ -794,7 +794,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.start_layer = 0
         self.end_layer = self.num_stages
         use_multi_stream = (
-            (envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() or envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            (
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            )
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
             and (_is_npu or torch.cuda.is_available())
         )

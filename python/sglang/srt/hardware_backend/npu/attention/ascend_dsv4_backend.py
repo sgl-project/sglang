@@ -16,16 +16,19 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend,ForwardMetadata
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+    ForwardMetadata,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -153,7 +156,6 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
 
 
 class CompressorAscendBackendMixin:
-
     def _dspark_ragged_verify_layout(self, forward_batch: ForwardBatch):
         if not self._is_dspark_algorithm:
             return None
@@ -1600,7 +1602,7 @@ class DeepseekV4AscendAttnBackend(
                     # reusable spec_info does not carry live_seq_lens_cpu.
                     # Recover the committed/live prefix from the expanded KV lengths.
                     live_seq_lens_cpu = torch.clamp(
-                        final_seq_lens_cpu  - int(tokens_per_bs),
+                        final_seq_lens_cpu - int(tokens_per_bs),
                         min=0,
                     )
 
@@ -1612,11 +1614,14 @@ class DeepseekV4AscendAttnBackend(
                     ).flatten()
 
                     live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                    num_live_rows = min(raw_bs if ragged_layout is not None else bs,
-                        explicit_live_cpu.numel(),)
+                    num_live_rows = min(
+                        raw_bs if ragged_layout is not None else bs,
+                        explicit_live_cpu.numel(),
+                    )
                     if num_live_rows > 0:
                         live_seq_lens_cpu[:num_live_rows].copy_(
-                            explicit_live_cpu[:num_live_rows])
+                            explicit_live_cpu[:num_live_rows]
+                        )
 
                 if ragged_layout is not None:
                     # Query rows beyond raw_bs are graph-tier ghosts. Keep their
@@ -1624,10 +1629,7 @@ class DeepseekV4AscendAttnBackend(
                     # compressor state for them.
                     effective_verify_lens_cpu = verify_lens_cpu.clone()
                     effective_verify_lens_cpu[raw_bs:].zero_()
-                    final_seq_lens_cpu = (
-                            live_seq_lens_cpu
-                            + effective_verify_lens_cpu
-                    )
+                    final_seq_lens_cpu = live_seq_lens_cpu + effective_verify_lens_cpu
             else:
                 # EAGLE and the other uniform verify callers keep
                 # seq_lens_cpu at the committed/live prefix length.

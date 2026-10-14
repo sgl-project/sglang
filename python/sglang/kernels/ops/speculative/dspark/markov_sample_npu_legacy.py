@@ -25,6 +25,7 @@ _IDX_SENTINEL = tl.constexpr(2147483647)
 _reported = False
 logger = logging.getLogger(__name__)
 
+
 @triton.jit
 def _online_partial_kernel(
     logits_ptr,
@@ -82,7 +83,9 @@ def _online_combine_kernel(
         partial_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL
     )
     global_max = tl.max(tile_max, axis=0)
-    shifted = tl.where(global_max != -float("inf"), tile_max - global_max, -float("inf"))
+    shifted = tl.where(
+        global_max != -float("inf"), tile_max - global_max, -float("inf")
+    )
     rescaled = keys * tl.exp(shifted)
     rescaled = tl.where(mask, rescaled, -1.0)
     best = tl.max(rescaled, axis=0)
@@ -174,7 +177,9 @@ def sample_markov_step_npu(
     if step_dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise ValueError(f"Unsupported step-logit dtype: {step_dtype}")
     if vocab_start != 0:
-        raise ValueError("This compatibility sampler supports a single full-vocabulary rank only.")
+        raise ValueError(
+            "This compatibility sampler supports a single full-vocabulary rank only."
+        )
     if gather is not None and gather_logits is None:
         raise ValueError("A sharded head must provide gather_logits.")
     if rows == 0:
@@ -211,14 +216,18 @@ def sample_markov_step_npu(
     if has_sampled_rows is False:
         greedy_mask = torch.ones(rows, dtype=torch.int32, device=value.device)
         safe_temperatures = torch.ones(rows, dtype=torch.float32, device=value.device)
-        exp_noise = torch.ones(step_logits.shape, dtype=torch.float32, device=value.device)
+        exp_noise = torch.ones(
+            step_logits.shape, dtype=torch.float32, device=value.device
+        )
     else:
         greedy_rows = temperatures.eq(0)
         greedy_mask = greedy_rows.to(torch.int32)
         safe_temperatures = torch.where(
             greedy_rows, 1.0, temperatures.float().clamp_min(1e-5)
         )
-        exp_noise = torch.empty(step_logits.shape, dtype=torch.float32, device=value.device)
+        exp_noise = torch.empty(
+            step_logits.shape, dtype=torch.float32, device=value.device
+        )
         exp_noise.exponential_(1.0)
     if not _reported:
         logger.info(

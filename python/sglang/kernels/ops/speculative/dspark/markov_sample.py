@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -264,11 +265,11 @@ class MarkovSampleStep:
             from sglang.kernels.ops.speculative.dspark.markov_sample_npu_legacy import (
                 sample_markov_step_npu,
             )
+
             return sample_markov_step_npu(**kwargs)
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
-
 
     @staticmethod
     def _check(
