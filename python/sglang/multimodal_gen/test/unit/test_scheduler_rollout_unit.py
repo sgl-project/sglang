@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+import sglang.multimodal_gen.runtime.post_training.flow_rollout_controller as rl_mixin_module
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     SchedulerRLMixin,
 )
 
