@@ -65,6 +65,8 @@ class RolloutDenoisingMixin:
                 debug_mode=batch.rollout_debug_mode,
                 sde_step_indices=batch.rollout_sde_step_indices,
                 generator=batch.generator,
+                return_dit_trajectory=batch.rollout_return_dit_trajectory,
+                return_step_indices=batch.rollout_return_step_indices,
                 shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
                     batch=batch, latents=latents
                 )[0],
@@ -91,7 +93,6 @@ class RolloutDenoisingMixin:
             batch.rollout_trajectory_data.rollout_debug_tensors = (
                 rollout.collect_rollout_debug_tensors()
             )
-        batch.rollout_controllers = {}
 
     def _postprocess_rollout_outputs(
         self,
@@ -111,8 +112,7 @@ class RolloutDenoisingMixin:
         # Append final denoised latent as the (T+1)-th entry (step_index=T),
         # routed through the same filter so rollout_return_step_indices can
         # include/exclude it.
-        self._maybe_append_dit_trajectory_step(
-            batch=batch,
+        batch.rollout_controllers["visual"]._maybe_append_dit_trajectory_step(
             latents=latents,
             timestep_value=final_timestep,
             step_index=num_inference_steps,
@@ -121,6 +121,7 @@ class RolloutDenoisingMixin:
             batch=batch,
             pipeline_config=server_args.pipeline_config,
         )
+        batch.rollout_controllers = {}
 
     def _maybe_init_denoising_env_collection(
         self,
@@ -155,33 +156,9 @@ class RolloutDenoisingMixin:
 
         batch._rollout_denoising_env_state = {
             "env": env,
-            "step_latents": [],
-            "step_latent_indices": [],
-            "step_timesteps": [],
             "pos_cond_kwargs_src": pos_src,
             "neg_cond_kwargs_src": neg_src,
         }
-
-    def _maybe_append_dit_trajectory_step(
-        self,
-        batch,
-        latents: torch.Tensor,
-        timestep_value: torch.Tensor,
-        step_index: int,
-    ) -> None:
-        if not batch.rollout or not batch.rollout_return_dit_trajectory:
-            return
-        state = getattr(batch, "_rollout_denoising_env_state", None)
-        if state is None:
-            return
-
-        state["step_timesteps"].append(timestep_value.detach().cpu())
-        return_step_indices = getattr(batch, "rollout_return_step_indices", None)
-        if return_step_indices is not None and step_index not in return_step_indices:
-            return
-
-        state["step_latents"].append(latents.detach())
-        state["step_latent_indices"].append(step_index)
 
     def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
         state = getattr(batch, "_rollout_denoising_env_state", None)
@@ -189,25 +166,23 @@ class RolloutDenoisingMixin:
             return
 
         env: RolloutDenoisingEnv | None = state["env"]
-        step_latents: list[torch.Tensor] = state["step_latents"]
-        step_timesteps: list[torch.Tensor] = state["step_timesteps"]
+        rollout = batch.rollout_controllers["visual"]
+        step_latents: list[torch.Tensor] = rollout.step_latents
+        step_timesteps: list[torch.Tensor] = rollout.step_timesteps
 
         if batch.rollout_trajectory_data is None:
             batch.rollout_trajectory_data = RolloutTrajectoryData()
 
         if step_latents and batch.rollout_return_dit_trajectory:
-            step_latents_tensor = torch.stack(step_latents, dim=1)
-            step_latents_tensor = gather_stacked_latents_for_sp(
-                pipeline_config=pipeline_config,
-                batch=batch,
-                stacked_latents=step_latents_tensor,
+            step_latents_tensor = rollout.gather_for_sp(
+                torch.stack(step_latents, dim=1)
             )
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
-                sigmas=batch.scheduler.sigmas.detach().cpu().clone(),
+                sigmas=rollout.sigmas.detach().cpu().clone(),
                 latent_step_indices=torch.tensor(
-                    state["step_latent_indices"], dtype=torch.long
+                    rollout.step_latent_indices, dtype=torch.long
                 ),
             )
 

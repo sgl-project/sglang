@@ -2178,18 +2178,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             t_host,
                             timesteps_cpu,
                         )
-                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
-                        # x_{t_i} for rollout trajectory collection. Must run
-                        # BEFORE _run_denoising_step so ctx.latents is still the
-                        # pre-step value. Gated on batch.rollout to keep the
-                        # non-rollout path strictly untouched.
-                        if collect_trajectory and batch.rollout:
-                            self._maybe_append_dit_trajectory_step(
-                                batch=batch,
-                                latents=ctx.latents,
-                                timestep_value=step.t_host,
-                                step_index=step_index,
-                            )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         if collect_trajectory:
                             self._record_trajectory(ctx, step, batch, server_args)
