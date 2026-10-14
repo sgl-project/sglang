@@ -14,13 +14,19 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import EmbeddingReqInput  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats  # noqa: E402
+from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCrossEncoderBatchTokenization(CustomTestCase):
     def setUp(self):
+        # The tokenizer manager reads its config from the published runtime context.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.tokenizer = BertTokenizerFast(
             vocab={
                 "[PAD]": 0,
@@ -39,7 +45,9 @@ class TestCrossEncoderBatchTokenization(CustomTestCase):
         self.manager.async_dynamic_batch_tokenizer = None
         self.manager.is_generation = False
         self.manager.model_config = SimpleNamespace(
-            is_embedding_gemma=False, vocab_size=len(self.tokenizer)
+            is_embedding_gemma=False,
+            vocab_size=len(self.tokenizer),
+            joint_head_config=None,
         )
         self.manager.context_len = 32
         self.manager.num_reserved_tokens = 0
