@@ -382,12 +382,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
     def _sample_draft_proposal(self, ret, bs: int):
-        """Draw from the final q and retain it for acceptance and correction."""
+        """Draw from the final q, written into this step's draft_probs slot."""
         buffers = self.buffers
-        probs, ret.topk_p, ret.topk_index = sample_draft_proposal(
-            self._select_step_logits(ret, bs), buffers.sampling_params.slice(bs)
+        _, ret.topk_p, ret.topk_index = sample_draft_proposal(
+            self._select_step_logits(ret, bs),
+            buffers.sampling_params.slice(bs),
+            out=buffers.draft_probs[:bs, self.step],
         )
-        buffers.draft_probs[:bs, self.step].copy_(probs)
 
     def _run_step_body(self, forward_batch: ForwardBatch, num_tokens: int, bs: int):
         """One draft step's body: model forward + chain-hidden write + top-k.

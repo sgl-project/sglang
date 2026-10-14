@@ -64,9 +64,7 @@ class TestDraftSampling(unittest.TestCase):
             # The request's own top-k/top-p never reach the draft; only an
             # override does, and a disabling value (-1, 1.0) reads as unset.
             apply_top_k, apply_top_p = top_k not in (None, -1), top_p not in (None, 1.0)
-            self.assertEqual(
-                (draft.apply_top_k, draft.apply_top_p), (apply_top_k, apply_top_p)
-            )
+            self.assertEqual(draft.flags, (apply_top_k, apply_top_p, temperature == 0))
             k = top_k if apply_top_k else TOP_K_ALL
             self.assertEqual(draft.top_ks.tolist(), [1 if g else k for g in greedy])
             expected_t = [0.5, 1.5, 1.0] if not temperature else [temperature] * 3
@@ -101,10 +99,11 @@ class TestDraftSampling(unittest.TestCase):
         q, sampled_probs, tokens = sample_draft_proposal(
             logits, params([1.0, 1.0], [1, 1], [1.0, 1.0], cutoffs=False)
         )
-        # q is the point mass the row proposed from, not the softmax.
+        # q stays the softmax: the verify's one-hot target makes the accept
+        # test exact for a request-greedy row whatever q says.
         self.assertEqual(tokens.flatten().tolist(), [0, 1])
-        torch.testing.assert_close(q, torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
-        torch.testing.assert_close(sampled_probs, torch.ones(2, 1))
+        torch.testing.assert_close(q, torch.softmax(logits, dim=-1))
+        torch.testing.assert_close(sampled_probs, q.gather(1, tokens))
 
     def test_draft_temperature_zero_hands_verify_a_point_mass(self):
         """A sampling request drafted greedily by the temperature override keeps

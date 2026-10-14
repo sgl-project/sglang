@@ -45,6 +45,24 @@ class TestDraftSamplingCUDA(unittest.TestCase):
                 self.assertTrue(torch.equal(proposal > 0, target > 0))
                 torch.testing.assert_close(proposal, target, atol=1e-6, rtol=1e-5)
 
+    def test_out_slot_takes_the_fused_softmax_without_touching_neighbours(self):
+        # A graph runner hands over one step's slot of [bs, steps, vocab]; the
+        # fused no-cutoff path must honour that row stride.
+        torch.manual_seed(3)
+        logits = torch.randn(4, 8192, device="cuda")
+        params = DraftSamplingParams(
+            torch.tensor([0.7, 1.0, 1.5, 1.0], device="cuda"),
+            torch.full((4,), TOP_K_ALL, dtype=torch.int32, device="cuda"),
+            torch.ones(4, device="cuda"),
+        )
+        buffer = torch.full((4, 3, 8192), -1.0, device="cuda")
+        out = build_draft_probs(logits, params, out=buffer[:, 1])
+        self.assertEqual(out.data_ptr(), buffer[:, 1].data_ptr())
+        torch.testing.assert_close(
+            out, build_draft_probs(logits, params), atol=1e-6, rtol=1e-5
+        )
+        self.assertTrue(bool((buffer[:, [0, 2]] == -1.0).all()))
+
 
 if __name__ == "__main__":
     unittest.main()

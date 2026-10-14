@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling import top_k_renorm_probs, top_p_renorm_probs
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.multi_layer_eagle import wide_row_softmax_triton
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 
@@ -62,6 +63,9 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
     top_ps: torch.Tensor
     apply_top_k: bool = False
     apply_top_p: bool = False
+    # Draft temperature 0: every row proposes its argmax while the target keeps
+    # the request's p, so q must be that point mass (see sample_draft_proposal).
+    greedy_override: bool = False
 
     @property
     def greedy_mask(self) -> torch.Tensor:
@@ -75,6 +79,7 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
         *,
         apply_top_k: bool = False,
         apply_top_p: bool = False,
+        greedy_override: bool = False,
     ) -> DraftSamplingParams:
         return cls(
             temperatures=torch.ones(batch_size, dtype=torch.float32, device=device),
@@ -82,6 +87,7 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
             top_ps=torch.ones(batch_size, dtype=torch.float32, device=device),
             apply_top_k=apply_top_k,
             apply_top_p=apply_top_p,
+            greedy_override=greedy_override,
         )
 
     @classmethod
@@ -93,6 +99,7 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
             device,
             apply_top_k=overrides.top_k is not None,
             apply_top_p=overrides.top_p is not None,
+            greedy_override=overrides.temperature == 0,
         )
 
     @classmethod
@@ -103,12 +110,13 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
         place; the request's own top-k/top-p never reach the draft. Graph-safe:
         no host reads of per-request values."""
         overrides = DraftOverrides.from_spec()
-        apply_top_k = overrides.top_k is not None
-        apply_top_p = overrides.top_p is not None
+        flags = dict(
+            apply_top_k=overrides.top_k is not None,
+            apply_top_p=overrides.top_p is not None,
+            greedy_override=overrides.temperature == 0,
+        )
         if sampling_info is None:
-            return cls.greedy(
-                batch_size, device, apply_top_k=apply_top_k, apply_top_p=apply_top_p
-            )
+            return cls.greedy(batch_size, device, **flags)
         bs = len(sampling_info.top_ks) if batch_size is None else batch_size
         temperatures = sampling_info.temperatures.reshape(-1)[:bs].float()
         greedy = sampling_info.top_ks.reshape(-1)[:bs] <= 1
@@ -121,13 +129,11 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
         top_ks.masked_fill_(greedy, 1)
         top_p = 1.0 if overrides.top_p is None else overrides.top_p
         top_ps = torch.full_like(temperatures, top_p)
-        return cls(
-            temperatures=temperatures,
-            top_ks=top_ks,
-            top_ps=top_ps,
-            apply_top_k=apply_top_k,
-            apply_top_p=apply_top_p,
-        )
+        return cls(temperatures=temperatures, top_ks=top_ks, top_ps=top_ps, **flags)
+
+    @property
+    def flags(self) -> tuple[bool, bool, bool]:
+        return (self.apply_top_k, self.apply_top_p, self.greedy_override)
 
     def slice(self, batch_size: int) -> DraftSamplingParams:
         return DraftSamplingParams(
@@ -136,6 +142,7 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
             top_ps=self.top_ps[:batch_size],
             apply_top_k=self.apply_top_k,
             apply_top_p=self.apply_top_p,
+            greedy_override=self.greedy_override,
         )
 
     def copy_from(self, sampling_info, bs: int) -> None:
@@ -144,22 +151,25 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
         params = self.from_sampling_info(
             sampling_info, batch_size=bs, device=self.top_ks.device
         )
-        assert (params.apply_top_k, params.apply_top_p) == (
-            self.apply_top_k,
-            self.apply_top_p,
-        ), "draft sampling buffers predate the server's draft cutoff options"
+        assert params.flags == self.flags, (
+            "draft sampling buffers predate the server's draft options"
+        )
         self.temperatures[:bs].copy_(params.temperatures)
         self.top_ks[:bs].copy_(params.top_ks)
         self.top_ps[:bs].copy_(params.top_ps)
 
 
 def build_draft_probs(
-    logits: torch.Tensor, params: DraftSamplingParams
+    logits: torch.Tensor,
+    params: DraftSamplingParams,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """q = softmax(logits / T) over the last dim, cut by top-k then top-p where
     the server sets a draft override. ``logits`` is [bs, ..., support]; all
     rows of a request share its params. Greedy rows are the caller's: only
-    candidate_probs needs them as point masses."""
+    candidate_probs needs them as point masses. ``out`` receives q when given:
+    the no-cutoff CUDA path writes it there in one fused pass (a graph's
+    draft_probs slot), any other path copies into it."""
     if logits.shape[0] != params.top_ks.shape[0]:
         raise ValueError("Draft logits and sampling params batch sizes differ")
     if logits.numel() == 0:
@@ -167,6 +177,9 @@ def build_draft_probs(
     flat = logits.reshape(-1, logits.shape[-1]).float()
     rows = flat.shape[0] // logits.shape[0]
     temperatures, top_ks, top_ps = params.temperatures, params.top_ks, params.top_ps
+    fused = out is not None and rows == 1 and flat.is_cuda
+    if fused and not params.apply_top_k and not params.apply_top_p:
+        return wide_row_softmax_triton(flat, temperatures, out)
     if rows != 1:
         temperatures, top_ks, top_ps = (
             x.repeat_interleave(rows) for x in (temperatures, top_ks, top_ps)
@@ -176,7 +189,11 @@ def build_draft_probs(
         probs = top_k_renorm_probs(probs, top_ks)
     if params.apply_top_p:
         probs = top_p_renorm_probs(probs, top_ps)
-    return probs.view(logits.shape)
+    probs = probs.view(logits.shape)
+    if out is None:
+        return probs
+    out.copy_(probs)
+    return out
 
 
 def candidate_probs(

@@ -156,25 +156,30 @@ def renorm_draft_probs(next_token_logits: torch.Tensor) -> torch.Tensor:
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     sampling_params: DraftSamplingParams,
+    *,
+    out: Optional[torch.Tensor] = None,
 ):
     """Leviathan draft proposal: q from the draft policy, X ~ q; returns
     (q, q(X), X). The accept test coin*q(X) < p(X) is unbiased only against
-    this exact q, so callers hand it to the verify rather than a recomputed one.
+    this exact q, so callers hand it to the verify rather than a recomputed one;
+    ``out`` lets a graph runner receive q in its own draft_probs slot.
 
     A greedy row (``top_k == 1``) proposes its argmax: sampling a sharp q still
-    leaves the argmax often enough to cost accept length. Its q is the point
-    mass at that argmax, the distribution X came from: a row made greedy only by
-    the draft temperature override meets the target's full p at the verify, and
-    handing it the softmax would over-accept the argmax.
+    leaves the argmax often enough to cost accept length. A request-greedy row
+    keeps the softmax as q: eagle_sample renormalises the target by the same
+    ``top_ks``, so p is one-hot there and the accept test is exact whatever q
+    says. Under the draft temperature override every row is greedy while the
+    target keeps the request's p, so q must be the point mass X came from;
+    handing the softmax over there over-accepts the argmax.
     """
-    probs = build_draft_probs(next_token_logits, sampling_params)
+    probs = build_draft_probs(next_token_logits, sampling_params, out=out)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     greedy = sampling_params.greedy_mask.view(-1, 1)
     topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
     topk_p = probs.gather(1, topk_index)
-    topk_p = torch.where(greedy, torch.ones_like(topk_p), topk_p)
-    probs.masked_fill_(greedy, 0.0)
-    probs.scatter_(1, topk_index, topk_p)
+    if sampling_params.greedy_override:
+        probs.zero_().scatter_(1, topk_index, 1.0)
+        topk_p = torch.ones_like(topk_p)
     return probs, topk_p, topk_index
 
 
