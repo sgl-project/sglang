@@ -1357,19 +1357,84 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    },
+)
+def mhc_post_split_tilelang(
+    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 512
+):
+    # The mhc_post_tilelang arithmetic with one CTA per (token, hidden block).
+    # Each output element gets the same operations, so the output is identical.
+    n = T.dynamic("num_tokens")
+    h = hidden
+
+    h_blk = math.gcd(hidden, h_blk)
+    a: T.Tensor((n, hc, hc), T.float32)
+    b: T.Tensor((n, hc, h), T.bfloat16)
+    c: T.Tensor((n, hc), T.float32)
+    d: T.Tensor((n, h), T.bfloat16)
+    x: T.Tensor((n, hc, h), T.bfloat16)
+
+    ENABLE_PDL = is_arch_support_pdl()
+    with T.Kernel(n, T.ceildiv(h, h_blk), threads=n_thr) as (i_n, i0_h):
+        if ENABLE_PDL:
+            T.pdl_sync()
+
+        x_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        d_shared = T.alloc_shared(h_blk, T.bfloat16)
+
+        x_local = T.alloc_fragment((hc, h_blk), T.float32)
+        b_local = T.alloc_fragment((hc, h_blk), T.float32)
+        d_local = T.alloc_fragment(h_blk, T.float32)
+
+        a_local = T.alloc_fragment((hc, hc), T.float32)
+        c_local = T.alloc_fragment(hc, T.float32)
+        T.copy(a[i_n, 0, 0], a_local)
+        T.copy(c[i_n, 0], c_local)
+
+        T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
+        T.copy(d[i_n, i0_h * h_blk], d_shared)
+
+        T.copy(b_shared, b_local)
+        T.copy(d_shared, d_local)
+        for i_hco, i1_h in T.Parallel(hc, h_blk):
+            x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+            for i_hci in T.serial(hc):
+                x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+        T.copy(x_local, x_shared)
+
+        T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
+
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
+# Conservative cap for mhc_post_split_tilelang. On B200 with hc_mult=4 and
+# hidden_size=4096, mhc_post_tilelang becomes faster between 1024 and 2048 tokens.
+_MHC_POST_SPLIT_MAX_TOKENS = 256
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+    *,
+    split_hidden: bool = False,
 ) -> torch.Tensor:
     if is_dsa_prefill_cp_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
+    kernel = mhc_post_split_tilelang if split_hidden else mhc_post_tilelang
     out = torch.empty_like(residual)
-    mhc_post_tilelang(
+    kernel(
         comb_res_mix,
         residual,
         post_layer_mix.squeeze(-1),
@@ -2057,7 +2122,13 @@ def _mhc_post_dispatch(
 
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    return mhc_post(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        split_hidden=x.shape[0] <= _MHC_POST_SPLIT_MAX_TOKENS,
+    )
 
 
 def hc_pre(
