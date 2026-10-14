@@ -57,7 +57,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    materialize_multimodal_features,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -617,8 +620,10 @@ class Glm4vForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in GLM-V, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = materialize_multimodal_features(
+            [item.feature for item in items],
+            device=self.visual.device,
+            dtype=self.visual.dtype,
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
@@ -633,8 +638,10 @@ class Glm4vForConditionalGeneration(nn.Module):
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in GLM-V, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = materialize_multimodal_features(
+            [item.feature for item in items],
+            device=self.visual.device,
+            dtype=self.visual.dtype,
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
 
