@@ -341,6 +341,7 @@ def test_unified_graph_tables_use_current_lengths(
     device, in_capture, prefix_lens, mode
 ):
     """Refresh every live page before replay, despite stale captured lengths."""
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -372,6 +373,28 @@ def test_unified_graph_tables_use_current_lengths(
     )
     translator._full_page_multiplier = 4
     translator._swa_page_multiplier = 6
+    translator._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, id(translator)),
+            write=lambda ids: (
+                translator._full_v2p_table[ids // PAGE_SIZE]
+                * translator._full_page_multiplier
+                * PAGE_SIZE
+                + ids % PAGE_SIZE
+            ),
+            read_v2p=translator._full_v2p_table * translator._full_page_multiplier,
+        ),
+        IdSpaceKind.SLIDING_WINDOW: IdSpace(
+            key=(IdSpaceKind.SLIDING_WINDOW, id(translator)),
+            write=lambda ids: (
+                translator._swa_v2p_table[ids // PAGE_SIZE]
+                * translator._swa_page_multiplier
+                * PAGE_SIZE
+                + ids % PAGE_SIZE
+            ),
+            read_v2p=translator._swa_v2p_table * translator._swa_page_multiplier,
+        ),
+    }
     # Bind real, capture-stable full and SWA destinations without allocating K/V.
     for source in (
         backend.decode_cuda_graph_metadata,
@@ -418,6 +441,18 @@ def test_unified_graph_tables_use_current_lengths(
         out_cache_loc=None,
     )
     original_lens = fb.seq_lens.clone()
+
+    def refresh_iteration_plan():
+        # Each iteration plans its reads through the speculative window.
+        fb.kv_loc_plan = translator.plan(
+            req_pool_indices=fb.req_pool_indices,
+            seq_lens=fb.seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=max(offsets),
+        )
+
+    refresh_iteration_plan()
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
     metadata = backend.forward_metadata
     full_ptr, swa_ptr = (
@@ -436,6 +471,7 @@ def test_unified_graph_tables_use_current_lengths(
     metadata.cache_seqlens_int32.fill_(1)
     metadata.page_table.fill_(-7)
     metadata.swa_page_table.fill_(-7)
+    refresh_iteration_plan()
     backend.init_forward_metadata_out_graph(fb, in_capture=in_capture)
     if graph is not None:
         graph.replay()

@@ -519,10 +519,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip install "cuda-python>=13,<14"
 
 # Keep SGLang's pins and resolve inflect with Dynamo's typeguard dependency.
-# grpcio-tools 1.82.0rc2 emits Protobuf 7 code despite allowing Protobuf 6.
+# grpcio-tools 1.84.0 supports the Protobuf 7 dependency set.
 ARG INSTALL_DYNAMO=1
 RUN --mount=type=cache,target=/root/.cache/uv \
-    set -- "grpcio-tools==1.81.1" \
+    set -- "grpcio-tools==1.84.0" \
     && if [ "$INSTALL_DYNAMO" = "1" ]; then set -- "$@" ai-dynamo inflect; fi \
     && uv pip install -c /sgl-workspace/constraints.txt \
         --prerelease=allow --index-strategy unsafe-best-match \
