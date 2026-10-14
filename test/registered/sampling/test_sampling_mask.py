@@ -203,8 +203,8 @@ class TestSamplingMaskCapture(CustomTestCase):
                         simple_sampling_case=False,
                     )
                 output = self._materialize(sampled, capture, requested_rows=[0, 1])
-                support = output.next_token_sampling_mask_idx[0].tolist()
-                sampling_logprobs = output.next_token_sampling_logprobs[0].tolist()
+                support = output.next_token_sampling_mask_idx[0][0].tolist()
+                sampling_logprobs = output.next_token_sampling_logprobs[0][0].tolist()
                 self.assertEqual(set(support), {0, 1, 3})
                 self.assertIn(int(sampled[0]), support)
                 expected = original[0, sampled[0]] - original[0, support].logsumexp(0)
@@ -213,7 +213,7 @@ class TestSamplingMaskCapture(CustomTestCase):
                     expected.item(),
                     places=5,
                 )
-                self.assertIn(2, output.next_token_sampling_mask_idx[1])
+                self.assertIn(2, output.next_token_sampling_mask_idx[1][0])
 
     @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
     def test_flashinfer_joint_cutoff_ties_match_capture(self):
@@ -281,11 +281,11 @@ class TestSamplingMaskCapture(CustomTestCase):
         output = self._materialize(sampled, capture, requested_rows)
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
         self.assertEqual(
-            set(output.next_token_sampling_mask_idx[1].tolist()), {0, 1, 2}
+            set(output.next_token_sampling_mask_idx[1][0].tolist()), {0, 1, 2}
         )
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
         self.assertEqual(
-            set(output.next_token_sampling_mask_idx[3].tolist()), {0, 1, 2}
+            set(output.next_token_sampling_mask_idx[3][0].tolist()), {0, 1, 2}
         )
         self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertIsNotNone(output.next_token_sampling_logprobs[1])
@@ -309,7 +309,7 @@ class TestSamplingMaskCapture(CustomTestCase):
         for batch_row in requested_rows:
             self.assertIn(
                 int(sampled[batch_row]),
-                output.next_token_sampling_mask_idx[batch_row],
+                output.next_token_sampling_mask_idx[batch_row][0],
             )
             self.assertIsNotNone(output.next_token_sampling_logprobs[batch_row])
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
@@ -720,14 +720,14 @@ class TestSamplingMaskPacking(CustomTestCase):
         )
         self.assertEqual(
             [
-                None if row is None else row.tolist()
+                None if row is None else row[0].tolist()
                 for row in output.next_token_sampling_mask_idx
             ],
             [[3], None, [5]],
         )
         self.assertEqual(
             [
-                None if row is None else row.tolist()
+                None if row is None else row[0].tolist()
                 for row in output.next_token_sampling_logprobs
             ],
             [[0.0], None, [0.0]],
