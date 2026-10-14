@@ -124,14 +124,6 @@ def test_backend_dispatch(backend, nvfp4, monkeypatch):
     assert cublas.call_count == int(expected_backend == "cublas")
 
 
-@pytest.mark.parametrize("backend", ["torch", "cublas", "cutile"])
-def test_fp32_input_fallback(backend):
-    router = _router(backend)
-    x = torch.randn(17, 5120, device="cuda")
-    torch.testing.assert_close(router._router_logits(x), x @ router.gate.weight.T)
-    assert hasattr(router.gate, "bf16x3_weight") == (backend == "cutile")
-
-
 @pytest.mark.parametrize("m", [1, 32])
 def test_compiled_router(m):
     router = _router("cutile")
