@@ -28,6 +28,23 @@ from .utils import (
 )
 
 
+class SGLDH3DistilledSigmas:
+    """The checkpoint's trained rectified-flow grid, independent of scheduler presets."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model_type": (["fast_h3", "vdn_h3"],)}}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "build"
+    CATEGORY = "SGLDiffusion"
+
+    def build(self, model_type):
+        from .executors.minimax_h3 import distilled_h3_sigmas
+
+        return (torch.tensor(distilled_h3_sigmas(model_type)),)
+
+
 class SGLDOptions:
     @classmethod
     def INPUT_TYPES(cls):
@@ -39,9 +56,12 @@ class SGLDOptions:
                         "auto-detect",
                         "qwen_image",
                         "qwen_image_edit",
+                        "qwen_image21",
                         "flux",
                         "lumina2",
                         "minimax_h3",
+                        "fast_h3",
+                        "vdn_h3",
                     ],
                     {"default": "auto-detect"},
                 ),
@@ -90,6 +110,8 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
+                "runtime_model_path": ("STRING", {"default": ""}),
+                "attention_backend_config": ("STRING", {"default": ""}),
                 "transformer_weights_path": (
                     "STRING",
                     {
@@ -122,6 +144,8 @@ class SGLDOptions:
         enable_cache_dit: bool = False,
         quantization: str = "",
         transformer_weights_path: str = "",
+        runtime_model_path: str = "",
+        attention_backend_config: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -159,6 +183,14 @@ class SGLDOptions:
             # Same selector as `sglang serve --transformer-weights-path`:
             # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
             options["transformer_weights_path"] = transformer_weights_path
+
+        for key, value in (
+            ("runtime_model_path", runtime_model_path),
+            # Same format as --attention-backend-config; ServerArgs parses it.
+            ("attention_backend_config", attention_backend_config),
+        ):
+            if value.strip():
+                options[key] = value.strip()
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}
@@ -213,9 +245,17 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
-        # call the SGLang Diffusion API
-        model.model.diffusion_model.set_lora(**lora_input)
-        return (model,)
+        targets = set(lora_input["target"])
+        if "all" in targets and len(targets) > 1:
+            # set_lora groups adapters per target string; "all" overlapping a
+            # named target makes the worker keep only one group on that module.
+            raise ValueError(
+                "Chained SGLDLoraLoader nodes mix target 'all' with "
+                f"{sorted(targets - {'all'})}; use the same target on every node"
+            )
+        # The shared worker is bound to the selected MODEL at sampling time.
+        bi.model_options["sgld_lora_input"] = lora_input
+        return (bi,)
 
 
 class SGLDUNETLoader:
@@ -964,6 +1004,7 @@ class SGLDiffusionServerUnsetLora:
 
 # Register nodes
 NODE_CLASS_MAPPINGS = {
+    "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
