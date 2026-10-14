@@ -635,10 +635,9 @@ class SGLDiffusionGenerator:
             self.get_comfyui_model(detect_path, model_options)
         )
         if _looks_like_gguf(model_path):
-            # detect_path is the BF16 companion used only so ComfyUI's
-            # architecture detect has keys to read; the weights that
-            # actually land in VRAM are the (much smaller, quantized) GGUF
-            # file, so size them from that file instead of the companion.
+            # Detection sizes tensors by their logical (unpacked) shapes, but
+            # the weights that land in VRAM are the quantized GGUF file, so
+            # size them from the file itself.
             try:
                 model_size_bytes = os.path.getsize(
                     sgld_options["transformer_weights_path"]
