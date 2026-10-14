@@ -607,6 +607,7 @@ class TpModelWorker(BaseTpWorker):
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
                 kv_loc_plan=forward_batch.kv_loc_plan if return_kv_loc_plan else None,
+                kv_weight_version_record=out.kv_weight_version_record,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
