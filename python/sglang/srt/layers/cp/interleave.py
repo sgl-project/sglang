@@ -164,6 +164,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
+        # TODO(At1a8): noqa, temporary work-around for the gfx950 aiter MXFP8 GEMM NaN
+        # it can be safely removed later, once the aiter kernel is fixed
         if _is_hip and seq_len < cp_size * _HIP_MIN_TOKENS_PER_RANK:
             return False
         return seq_len > 0 and seq_len >= cp_size and cp_size > 1
