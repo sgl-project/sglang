@@ -648,6 +648,13 @@ class PipelineConfig:
             )
 
             if resolve_sequence_shard(self, None):
+                if batch.enable_sequence_shard is False:
+                    raise ValueError(
+                        f"Latent time dim {time_dim} is not divisible by SP degree "
+                        f"{sp_world_size}, but sequence sharding is explicitly "
+                        "disabled. Enable sequence sharding or use a compatible "
+                        "number of frames."
+                    )
                 logger.info(
                     "Latent time dim %d is not divisible by SP degree %d; "
                     "using the token-level sequence shard instead of the "

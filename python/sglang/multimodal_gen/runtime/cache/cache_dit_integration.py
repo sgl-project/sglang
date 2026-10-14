@@ -7,6 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
+from functools import wraps
 from typing import List, Optional
 
 import torch
@@ -56,6 +57,97 @@ except ImportError:
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 _original_similarity = None
+
+
+def _install_modelslim_precision_guard(transformer):
+    modules = getattr(transformer, "modules", None)
+    if modules is None:
+        return
+    policies = []
+    for module in modules():
+        attention = getattr(module, "attention_quant_scheme", None)
+        if attention in ("FP8", "MXFP4"):
+            policies.append(
+                (module.attention_quant_description, "fa", attention, False)
+            )
+        linear = getattr(module, "scheme", None)
+        if hasattr(linear, "is_dual_scale"):
+            policies.append(
+                (linear.quant_config, "w4a4_linear", "W4A4", not linear.is_dual_scale)
+            )
+    if not policies or getattr(transformer.forward, "_sglang_precision_guard", False):
+        return
+
+    from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+        default_mxfp4_policy,
+        resolve_precision,
+    )
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        get_forward_context_or_none,
+    )
+
+    original_forward = transformer.forward
+    previous_signature = previous_batch = previous_step = force_step = None
+
+    @wraps(original_forward)
+    def guarded_forward(*args, **kwargs):
+        nonlocal previous_signature, previous_batch, previous_step, force_step
+        context = get_forward_context_or_none()
+        if context is None:
+            return original_forward(*args, **kwargs)
+        batch, step = context.forward_batch, context.current_timestep
+        num_steps = getattr(batch, "num_inference_steps", 0)
+        if batch is not previous_batch or (
+            previous_step is not None and step < previous_step
+        ):
+            previous_signature = force_step = None
+        default_policy = default_mxfp4_policy(num_steps)
+        signature = tuple(
+            resolve_precision(
+                description, target, default, default_policy if mixed else None
+            )
+            for description, target, default, mixed in policies
+        )
+        contexts = [
+            transformer._context_manager.get_context(name)
+            for name in transformer._context_names
+        ]
+        changed = previous_signature is not None and signature != previous_signature
+        if previous_signature is None or changed:
+            # Drop both CFG histories without restarting the expert's local step counter.
+            for cached_context in contexts:
+                cached_context.clear_buffers()
+                for calibrator in (
+                    *cached_context.get_calibrators(),
+                    *cached_context.get_cfg_calibrators(),
+                ):
+                    if calibrator is not None:
+                        calibrator.reset_cache()
+            force_step = step
+            if changed:
+                logger.info(
+                    "ModelSlim step=%d precision changed; invalidating legacy residuals",
+                    step,
+                )
+        previous_signature, previous_batch, previous_step = signature, batch, step
+        force = (
+            step == force_step or step < 2 or (num_steps > 0 and step >= num_steps - 2)
+        )
+        masks = [c.cache_config.steps_computation_mask for c in contexts]
+        if force:
+            for cached_context in contexts:
+                # SCM takes precedence over similarity, including static reuse policies.
+                cached_context.cache_config.steps_computation_mask = [1] * max(
+                    num_steps, cached_context.executed_steps + 1
+                )
+        try:
+            return original_forward(*args, **kwargs)
+        finally:
+            for cached_context, mask in zip(contexts, masks):
+                cached_context.cache_config.steps_computation_mask = mask
+
+    guarded_forward._sglang_precision_guard = True
+    transformer.forward = guarded_forward
 
 
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
@@ -669,6 +761,7 @@ def enable_cache_on_transformer(
 
             context_manager._sglang_tp_sp_group = tp_sp_group
 
+    _install_modelslim_precision_guard(transformer)
     return transformer
 
 
@@ -881,6 +974,8 @@ def enable_cache_on_dual_transformer(
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
 
+    _install_modelslim_precision_guard(transformer)
+    _install_modelslim_precision_guard(transformer_2)
     return transformer, transformer_2
 
 
