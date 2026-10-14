@@ -9,6 +9,15 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+)
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -35,11 +44,6 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-)
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
 )
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -429,6 +433,75 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         self.assertEqual(req[0].sampling_logprobs_mode, "selected")
         self.assertEqual(req[1].sampling_logprobs_mode, "support")
+
+    def test_bootstrap_batch_lengths_are_validated_before_expansion(self):
+        """Reject mismatched routing lists before splitting or repeating prompts."""
+        for field_name in (
+            "bootstrap_host",
+            "bootstrap_port",
+            "bootstrap_room",
+            "bootstrap_pair_key",
+            "decode_tp_size",
+        ):
+            for n in (1, 3):
+                for length in (0, 1, 3):
+                    with self.subTest(field=field_name, n=n, length=length):
+                        req = GenerateReqInput(
+                            text=["Hello", "World"],
+                            sampling_params={"n": n},
+                            **{field_name: [None] * length},
+                        )
+                        with self.assertRaisesRegex(ValueError, field_name):
+                            req.normalize_batch_and_arguments()
+
+    def test_bootstrap_fields_stay_aligned_with_parallel_samples(self):
+        fields = {
+            "bootstrap_host": ["prefill-a", "prefill-b"],
+            "bootstrap_port": [8998, 8999],
+            "bootstrap_room": [10, 20],
+            "bootstrap_pair_key": ["pair-a", "pair-b"],
+            "decode_tp_size": [2, 4],
+        }
+        req = GenerateReqInput(
+            text=["Hello", "World"], sampling_params={"n": 3}, **fields
+        )
+        req.normalize_batch_and_arguments()
+        for i, text in enumerate(["Hello", "World"] * 3):
+            with self.subTest(i=i):
+                self.assertEqual(req[i].text, text)
+                for field_name, values in fields.items():
+                    self.assertEqual(getattr(req[i], field_name), values[i % 2])
+
+    def test_scalar_bootstrap_room_allocates_distinct_parallel_rooms(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params={"n": 3},
+            bootstrap_host="prefill",
+            bootstrap_room=10,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[i].bootstrap_room for i in range(6)], list(range(10, 16)))
+        self.assertEqual([req[i].bootstrap_host for i in range(6)], ["prefill"] * 6)
+        self.assertEqual([req[i].bootstrap_port for i in range(6)], [None] * 6)
+
+    def test_per_choice_bootstrap_lists_are_not_expanded_again(self):
+        """PD routers can supply one room per choice, including a single prompt."""
+        for text, num in (("Hello", 3), (["Hello", "World"], 6)):
+            with self.subTest(text=text):
+                fields = {
+                    "bootstrap_host": [f"prefill-{i}" for i in range(num)],
+                    "bootstrap_port": list(range(8998, 8998 + num)),
+                    "bootstrap_room": list(range(10, 10 + num)),
+                    "bootstrap_pair_key": [f"pair-{i}" for i in range(num)],
+                    "decode_tp_size": [2] * num,
+                }
+                req = GenerateReqInput(text=text, sampling_params={"n": 3}, **fields)
+                req.normalize_batch_and_arguments()
+                for field_name, values in fields.items():
+                    self.assertEqual(getattr(req, field_name), values)
+                    self.assertEqual(
+                        [getattr(req[i], field_name) for i in range(num)], values
+                    )
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
