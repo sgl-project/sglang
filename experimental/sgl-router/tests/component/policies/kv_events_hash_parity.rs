@@ -3,8 +3,8 @@
 
 //! Cross-implementation parity test for the KV-event block-hash algorithm.
 //!
-//! The Rust implementation at `src/policies/kv_events/hash.rs` must produce
-//! the same i64 block hashes as SGLang's `radix_cache::RadixKey.hash_page`
+//! The Rust implementation at `src/state/kv_events/hash.rs` must produce
+//! the same i64 block hashes as SGLang's `compute_node_event_hash_values`
 //! followed by `hash_str_to_int64`.  Hard-coded `cross_language_golden_*`
 //! values inside `hash.rs` are correct but brittle: if either side's
 //! algorithm changes, the comments don't get regenerated and the tests
@@ -19,7 +19,9 @@
 //! whatever fixture is checked in.
 
 use serde::Deserialize;
-use sgl_router::state::kv_events::compute_block_hashes;
+use sgl_router::state::kv_events::{
+    compute_block_hashes_bigram_with_salt, compute_block_hashes_with_salt,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +29,10 @@ struct ParityCase {
     name: String,
     tokens: Vec<u32>,
     block_size: usize,
+    #[serde(default)]
+    cache_salt: Option<String>,
+    #[serde(default)]
+    bigram: bool,
     expected_i64_hashes: Vec<i64>,
 }
 
@@ -65,7 +71,12 @@ fn rust_block_hashes_match_python_radix_cache() {
         // doesn't include a 0 case, so unwrap is safe.
         let block_size = std::num::NonZeroUsize::new(case.block_size)
             .unwrap_or_else(|| panic!("case {} has block_size=0 which is invalid", case.name));
-        let got = compute_block_hashes(&case.tokens, block_size.get());
+        let hash = if case.bigram {
+            compute_block_hashes_bigram_with_salt
+        } else {
+            compute_block_hashes_with_salt
+        };
+        let got = hash(&case.tokens, block_size.get(), case.cache_salt.as_deref());
         assert_eq!(
             got, case.expected_i64_hashes,
             "case {}: tokens={:?} block_size={} — Rust produced {:?}, fixture says {:?}",

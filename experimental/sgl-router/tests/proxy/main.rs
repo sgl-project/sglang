@@ -12,6 +12,7 @@ mod common;
 
 mod bucket_routing;
 mod cache_aware_input_ids;
+mod cache_salt_routing;
 mod chat_routing;
 mod dp_rank_routing;
 mod embeddings_routing;

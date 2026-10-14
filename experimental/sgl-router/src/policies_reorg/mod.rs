@@ -34,6 +34,7 @@ pub struct PickRequest<'a> {
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
+    pub cache_salt: Option<&'a str>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
 }
@@ -49,6 +50,7 @@ impl<'a> PickRequest<'a> {
             expected_peak_tokens: None,
             prefix: None,
             token_ids: None,
+            cache_salt: None,
             session_key: None,
             routing_key: None,
         }

@@ -17,7 +17,9 @@ use crate::policies::{Policy, PrefixLookupResult};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::state::kv_events::{
+    compute_block_hashes_bigram_with_salt, compute_block_hashes_with_salt,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use axum::body::Body;
@@ -420,6 +422,10 @@ fn pick_prefill_worker(
         request_input_tokens: request.input_token_count as u64,
         request_sequence_tokens: request.sequence_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_salt: request
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.cache_salt.as_deref()),
         external_prefix: routing.prefix_matches.as_ref(),
         load_snapshot: routing.load_snapshot.as_ref(),
         workers: candidates,
@@ -486,9 +492,17 @@ async fn lookup_prefix_matches(
         // Remote indexer: hash tokens into blocks and match against the KV index.
         (Some(index), Some(tokens), Some(block_size)) => {
             let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+                compute_block_hashes_bigram_with_salt(
+                    &tokens.ids,
+                    block_size as usize,
+                    tokens.cache_salt.as_deref(),
+                )
             } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
+                compute_block_hashes_with_salt(
+                    &tokens.ids,
+                    block_size as usize,
+                    tokens.cache_salt.as_deref(),
+                )
             };
             let query_blocks = hashes.len();
             let outcome = if hashes.is_empty() {
@@ -507,7 +521,9 @@ async fn lookup_prefix_matches(
             .radix_tree_prefix_provider
             .as_ref()
             .zip(request.tokens.as_ref())
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+            .and_then(|(provider, tokens)| {
+                provider.match_request_tokens(&tokens.ids, tokens.cache_salt.as_deref())
+            }),
     };
     Ok(signal)
 }

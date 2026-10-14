@@ -264,6 +264,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         expected_peak_tokens: Some(20),
         token_ids: None,
         session_key: None,
+        cache_salt: None,
         routing_key: None,
         excluded: &[],
     };
@@ -288,6 +289,7 @@ async fn excluded_engines_are_never_offered() {
         total_input_tokens: 10,
         expected_peak_tokens: None,
         token_ids: None,
+        cache_salt: None,
         session_key: None,
         routing_key: None,
         excluded,
@@ -462,6 +464,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
                 assert_eq!(request.input_tokens, 2);
                 assert_eq!(request.expected_peak_tokens, Some(12));
                 assert_eq!(request.token_ids, Some([7, 9].as_slice()));
+                assert_eq!(request.cache_salt, Some("tenant-a"));
                 assert_eq!(request.session_key, Some("session"));
                 assert_eq!(request.routing_key, Some("routing"));
                 Ok(Pick {
@@ -486,6 +489,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
         session_key: Some("session"),
+        cache_salt: Some("tenant-a"),
         routing_key: Some("routing"),
         excluded: &[],
     };

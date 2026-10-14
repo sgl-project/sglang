@@ -32,6 +32,8 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
+    /// Normalized namespace for the single prompt's KV-event hashes.
+    pub cache_salt: Option<String>,
     /// Whether the IDs came from rendered chat messages.
     /// Forwarding also requires the request safety guard.
     pub rendered_from_chat: bool,
@@ -53,12 +55,27 @@ pub fn request_tokens_for(
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
+    let cache_salt = match value.get("cache_salt") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(salt)) => (!salt.is_empty()).then(|| salt.clone()),
+        // Parallel sampling (n > 1) accepts one salt per input prompt and
+        // repeats it for each sample. A singleton array still names one
+        // namespace; keep its tokens for both cache lookup and length checks.
+        Some(serde_json::Value::Array(salts)) if salts.len() == 1 => {
+            let salt = salts[0].as_str()?;
+            (!salt.is_empty()).then(|| salt.to_owned())
+        }
+        // Multiple salts have no single routing namespace. Leave validation
+        // of unsupported shapes/sampling combinations to the engine.
+        _ => return None,
+    };
     if has_caller_input_ids(value) {
         // A flat u32 array (empty included) supplies routing tokens; anything
         // else yields none, leaving validation to the engine.
         let ids = serde::Deserialize::deserialize(&value["input_ids"]).ok()?;
         return Some(RequestTokens {
             ids,
+            cache_salt,
             rendered_from_chat: false,
         });
     }
@@ -68,6 +85,7 @@ pub fn request_tokens_for(
         if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
             return Some(RequestTokens {
                 ids,
+                cache_salt,
                 rendered_from_chat: true,
             });
         }
@@ -76,6 +94,7 @@ pub fn request_tokens_for(
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
+        cache_salt,
         rendered_from_chat: false,
     })
 }
@@ -166,6 +185,7 @@ pub struct SelectionContext<'a> {
     candidate_range_id: &'a str,
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
+    cache_salt: Option<&'a str>,
     external_prefix: Option<&'a PrefixLookupResult>,
     load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
@@ -183,6 +203,7 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
+            cache_salt: None,
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
@@ -204,6 +225,7 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
+            cache_salt: None,
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
@@ -215,6 +237,11 @@ impl<'a> SelectionContext<'a> {
     /// Attaches ingress-computed routing tokens.
     pub fn with_request_tokens(mut self, request_tokens: Option<&'a [u32]>) -> Self {
         self.request_tokens = request_tokens;
+        self
+    }
+
+    pub fn with_cache_salt(mut self, cache_salt: Option<&'a str>) -> Self {
+        self.cache_salt = cache_salt;
         self
     }
 
@@ -301,6 +328,10 @@ impl<'a> SelectionContext<'a> {
 
     pub fn external_prefix(&self) -> Option<&PrefixLookupResult> {
         self.external_prefix
+    }
+
+    pub fn cache_salt(&self) -> Option<&str> {
+        self.cache_salt
     }
 
     pub fn load_snapshot(&self) -> Option<&EngineReportedLoadSnapshot> {
@@ -595,6 +626,36 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn request_tokens_normalize_single_prompt_salt() {
+        let tokenizers = TokenizerRegistry::default();
+        let model = ModelId("tiny".into());
+        for (salt, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(""), None),
+            (serde_json::json!("tenant-a"), Some("tenant-a")),
+            (serde_json::json!([""]), None),
+            (serde_json::json!(["tenant-a"]), Some("tenant-a")),
+            (serde_json::json!(["租户-B"]), Some("租户-B")),
+        ] {
+            let value = serde_json::json!({"input_ids": [1, 2, 3], "cache_salt": salt});
+            let tokens = request_tokens_for(&tokenizers, &model, &value).unwrap();
+            assert_eq!(tokens.ids, [1, 2, 3]);
+            assert_eq!(tokens.cache_salt.as_deref(), expected);
+        }
+        for salt in [
+            serde_json::json!([]),
+            serde_json::json!(["tenant-a", "tenant-b"]),
+            serde_json::json!([null]),
+            serde_json::json!([42]),
+            serde_json::json!(42),
+            serde_json::json!({}),
+        ] {
+            let value = serde_json::json!({"input_ids": [1, 2, 3], "cache_salt": salt});
+            assert!(request_tokens_for(&tokenizers, &model, &value).is_none());
+        }
+    }
 
     /// #34608 `LoadStat` aggregate used by policy tests.
     #[derive(Clone, Default)]

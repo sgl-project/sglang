@@ -29,6 +29,46 @@ use crate::common::mock_worker::MockWorker;
 const RANK: &str = "x-data-parallel-rank";
 const KEY: &str = "x-conversation-id";
 
+#[tokio::test]
+async fn cache_salt_selects_the_rank_in_the_request_namespace() {
+    use sgl_router::state::kv_events::compute_block_hashes_with_salt;
+
+    let worker = MockWorker::start(vec![]).await;
+    let tree = Arc::new(HashTree::new());
+    let tokens = [1, 2, 3, 4];
+    for (rank, salt) in [(0, None), (1, Some("tenant-a")), (2, Some("tenant-b"))] {
+        tree.insert(
+            &KvWorkerId::new(worker.url.clone(), rank),
+            None,
+            &compute_block_hashes_with_salt(&tokens, 1, salt),
+        );
+    }
+    let mut cfg = config();
+    cfg.model.dp_aware = true;
+    let app = router(cfg, &[(&worker, WorkerMode::Plain, 3)], tree);
+    for (salt, expected_rank) in [("tenant-a", 1), ("tenant-b", 2), ("", 0)] {
+        let body = json!({"model": MODEL, "messages": [], "input_ids": tokens, "cache_salt": salt});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            worker.captured.lock().unwrap().headers.get(RANK),
+            Some(&expected_rank.to_string())
+        );
+        let forwarded = worker.captured_json().await;
+        assert_eq!(forwarded["routed_dp_rank"], expected_rank);
+        assert_eq!(forwarded["cache_salt"], salt);
+    }
+}
+
 fn sticky_config() -> Config {
     let mut cfg = config();
     cfg.model.dp_aware = true;

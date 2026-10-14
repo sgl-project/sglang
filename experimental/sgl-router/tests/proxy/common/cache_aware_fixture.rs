@@ -126,6 +126,18 @@ fn radix_router_with(
     tree: HashTree,
     openai: Option<Arc<OpenAiSettings>>,
 ) -> axum::Router {
+    build_router(Arc::new(radix_context_with(workers, tree, openai)))
+}
+
+pub fn radix_context(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> AppContext {
+    radix_context_with(workers, tree, None)
+}
+
+fn radix_context_with(
+    workers: &[(&MockWorker, WorkerMode)],
+    tree: HashTree,
+    openai: Option<Arc<OpenAiSettings>>,
+) -> AppContext {
     let cfg = radix_config();
     let (tree, oracle) = (Arc::new(tree), BlockSizeOracle::new());
     oracle.try_set(1).unwrap();
@@ -139,7 +151,7 @@ fn radix_router_with(
     );
     ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(tree, Arc::clone(&oracle)));
     ctx.block_size_oracle = oracle;
-    build_router(Arc::new(ctx))
+    ctx
 }
 
 /// [`radix_router`] on the bucket-first (reorg) selection path, over `state`'s tree.

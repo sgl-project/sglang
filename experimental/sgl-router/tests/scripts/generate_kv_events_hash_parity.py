@@ -6,10 +6,10 @@ Two modes:
   python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py
       Regenerate the committed JSON fixture from the locally-replicated
       algorithm. Run this when changing block-hash logic or adding new
-      shape coverage. CI's drift-check step runs this in --check mode.
+      shape coverage. CI regenerates and diffs the fixture.
 
   python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py --validate-against-sglang
-      Import the real `sglang.srt.mem_cache.radix_cache.RadixKey.hash_page`
+      Import the real `compute_node_event_hash_values`
       and assert it agrees with the locally-replicated algorithm on every
       fixture case. This is the only place the replica and the real
       SGLang implementation are checked against each other. Run it
@@ -18,7 +18,8 @@ Two modes:
 # Authority
 
 Source-of-truth implementation:
-  - `python/sglang/srt/mem_cache/radix_cache.py::RadixKey.hash_page`
+  - `python/sglang/srt/mem_cache/utils.py::compute_node_event_hash_values`
+  - `python/sglang/srt/mem_cache/cpp_utils/hash_binding.cpp`
   - `python/sglang/srt/mem_cache/utils.py::hash_str_to_int64`
 
 `hash_page_chain` below replicates that algorithm verbatim (no `import
@@ -30,7 +31,7 @@ can be audited at a glance. The algorithm is intentionally tiny:
 
 If SGLang ever changes the algorithm, update both the SGLang side AND
 this script in the same commit; the Rust port in
-`src/policies/kv_events/hash.rs` will then need the corresponding
+`src/state/kv_events/hash.rs` will then need the corresponding
 update. The nightly `--validate-against-sglang` job is the safety net
 that catches an SGLang-side change the human forgot to mirror here.
 
@@ -54,9 +55,14 @@ import pathlib
 import sys
 
 
-def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
+def hash_page_chain(
+    tokens: list[int],
+    block_size: int,
+    cache_salt: str | None = None,
+    bigram: bool = False,
+) -> list[int]:
     """Compute the i64-truncated block hashes for `tokens` using SGLang's
-    `RadixKey.hash_page` algorithm + `hash_str_to_int64`.
+    event hash algorithm + `hash_str_to_int64`.
 
     Returns one i64 per full or partial block.  A partial last block (when
     `len(tokens) % block_size != 0`) chains against the previous block's
@@ -67,7 +73,11 @@ def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
 
     out: list[int] = []
     prior_digest: bytes | None = None
-    n = len(tokens)
+    if cache_salt:
+        prior_digest = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
+        ).digest()
+    n = max(0, len(tokens) - int(bigram))
     if n == 0:
         return out
     # Walk every page boundary, including a trailing partial page.
@@ -77,8 +87,12 @@ def hash_page_chain(tokens: list[int], block_size: int) -> list[int]:
         hasher = hashlib.sha256()
         if prior_digest is not None:
             hasher.update(prior_digest)
-        for t in tokens[start:end]:
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+        for i in range(start, end):
+            hasher.update(tokens[i].to_bytes(4, byteorder="little", signed=False))
+            if bigram:
+                hasher.update(
+                    tokens[i + 1].to_bytes(4, byteorder="little", signed=False)
+                )
         digest = hasher.digest()
         prior_digest = digest
         # hash_str_to_int64: first 16 hex chars (top 64 bits) -> signed i64.
@@ -135,28 +149,63 @@ CASES: list[dict] = [
     },
 ]
 
+# Keep the original unsalted cases unchanged; exercise salt normalization,
+# UTF-8, namespace isolation, signed truncation and partial pages in both modes.
+for salt in (None, "", "tenant-a", "tenant-b", "租户-A", "a\0b"):
+    for bigram in (False, True):
+        CASES.append(
+            {
+                "name": f"namespace_{salt!r}_bigram_{bigram}",
+                "tokens": [0, 1, 2**32 - 1, 3, 4, 5],
+                "block_size": 2,
+                "cache_salt": salt,
+                "bigram": bigram,
+            }
+        )
+for tokens in ([], [1]):
+    for bigram in (False, True):
+        CASES.append(
+            {
+                "name": f"salted_short_{len(tokens)}_bigram_{bigram}",
+                "tokens": tokens,
+                "block_size": 1,
+                "cache_salt": "tenant-a",
+                "bigram": bigram,
+            }
+        )
+
 
 def _materialize_cases() -> list[dict]:
     return [
         {
-            "name": c["name"],
-            "tokens": c["tokens"],
-            "block_size": c["block_size"],
-            "expected_i64_hashes": hash_page_chain(c["tokens"], c["block_size"]),
+            **c,
+            "expected_i64_hashes": hash_page_chain(
+                c["tokens"],
+                c["block_size"],
+                c.get("cache_salt"),
+                c.get("bigram", False),
+            ),
         }
         for c in CASES
     ]
 
 
 def _validate_against_sglang() -> int:
-    """Import the real SGLang `RadixKey.hash_page` and compare its output
+    """Import the real SGLang event hashing path and compare its output
     case-by-case against the locally-replicated `hash_page_chain`. Exits
     non-zero (and prints a diff-friendly summary) on any mismatch.
 
     Returns 0 on success. This is the parity safety net for nightly CI.
     """
     try:
+        from array import array
+        from types import SimpleNamespace
+
         from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.utils import (
+            compute_node_event_hash_values,
+            hash_str_to_int64,
+        )
     except ImportError as e:
         print(
             f"--validate-against-sglang: cannot import sglang ({e}). "
@@ -167,25 +216,23 @@ def _validate_against_sglang() -> int:
 
     failures: list[str] = []
     for c in CASES:
-        local = hash_page_chain(c["tokens"], c["block_size"])
-        if c["block_size"] == 0 or not c["tokens"]:
-            # `RadixKey.hash_page` requires a non-empty page; the local
-            # replica handles edge cases (empty input → empty list)
-            # which the SGLang oracle would refuse. Skip these cases
-            # under validation — the replica owns the boundary semantics.
+        local = hash_page_chain(
+            c["tokens"], c["block_size"], c.get("cache_salt"), c.get("bigram", False)
+        )
+        key = RadixKey(
+            array("I", c["tokens"]),
+            cache_salt=c.get("cache_salt"),
+            is_bigram=c.get("bigram", False),
+        )
+        if len(key) == 0:
+            # Empty radix nodes do not emit stored blocks.
+            assert local == []
             continue
-        sglang_hashes: list[int] = []
-        prior_hex: str | None = None
-        for start in range(0, len(c["tokens"]), c["block_size"]):
-            page = c["tokens"][start : start + c["block_size"]]
-            key = RadixKey(token_ids=page, extra_key=None)
-            hex_digest = key.hash_page(prior_hex)
-            # SGLang's hash_page returns the hex digest; truncate to i64
-            # the same way `hash_str_to_int64` does.
-            uint64_val = int(hex_digest[:16], 16)
-            i64 = uint64_val - (1 << 64) if uint64_val >= (1 << 63) else uint64_val
-            sglang_hashes.append(i64)
-            prior_hex = hex_digest
+        node = SimpleNamespace(key=key, parent=None, event_hash_value=None)
+        sglang_hashes = [
+            hash_str_to_int64(h)
+            for h in compute_node_event_hash_values(node, c["block_size"])
+        ]
         if sglang_hashes != local:
             failures.append(f"case {c['name']}: local={local} sglang={sglang_hashes}")
 

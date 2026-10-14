@@ -66,6 +66,10 @@ pub(super) async fn select_workers(
         total_input_tokens: request.input_token_count as u64,
         expected_peak_tokens,
         token_ids: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_salt: request
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.cache_salt.as_deref()),
         session_key: ctx
             .config
             .model

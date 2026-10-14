@@ -9,7 +9,7 @@
 //!
 //! - [`wire`] — msgpack types and [`decode_event_batch`]; the contract
 //!   with the SGLang publisher. Pure decoding; no I/O.
-//! - [`hash`] — block-hash compute mirroring SGLang `RadixKey.hash_page`.
+//! - [`hash`] — block-hash compute mirroring SGLang's KV-event hash chain.
 //! - [`tree`] — hash-keyed radix tree consumed by the routing path,
 //!   tracking the storage tier each worker holds a block on.
 //! - [`tally`] — per-(kind, medium) counters of the events the pump applied.
@@ -36,7 +36,10 @@ pub use block_size_oracle::BlockSizeOracle;
 pub use bootstrap::{BootstrapState, BootstrapTracker, PeerRegistry, WireWorker};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
-pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
+pub use hash::{
+    compute_block_hashes, compute_block_hashes_bigram, compute_block_hashes_bigram_with_salt,
+    compute_block_hashes_with_salt, sha256_to_i64,
+};
 pub use index::{KvEventIndex, KvIndexMetrics};
 pub use pending::PendingPrefixes;
 pub use prefix_provider::{PrefixLookupResult, RadixTreePrefixProvider};
