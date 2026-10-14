@@ -36,6 +36,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -164,7 +165,9 @@ class EncoderBootstrapServer:
                     except (asyncio.CancelledError, Exception):
                         pass
 
-        self.app = FastAPI(lifespan=lifespan, openapi_url=None)
+        self.app = FastAPI(
+            lifespan=lifespan, openapi_url=None, **fastapi_telemetry_disabled_kwargs()
+        )
 
         @self.app.get("/health")
         async def _health() -> Response:
