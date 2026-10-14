@@ -504,18 +504,13 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+    def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
-        allocator = self.cache.req_to_token_pool.mamba_allocator
-        slot = allocator.alloc(1)
+        slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            slot = allocator.alloc(1)
-        return slot
-
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        slot = self._try_alloc_mamba_slot()
-        assert slot is not None, "Can not alloc mamba cache"
+            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -721,9 +716,7 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         if phase == LinkerTransferPhase.LOAD:
-            transfer.device_indices = self._try_alloc_mamba_slot()
-            if transfer.device_indices is None:
-                return None
+            transfer.device_indices = self._alloc_mamba_slot()
         return transfer
 
     def update_external_linker_load(
@@ -782,7 +775,10 @@ class MambaComponent(TreeComponent):
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
-        dst = self._try_alloc_mamba_slot()
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is not None:
             req.kv.mamba_pool_idx = dst[0]
         return dst

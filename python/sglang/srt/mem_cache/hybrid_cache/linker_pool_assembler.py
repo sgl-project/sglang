@@ -443,18 +443,6 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
-def _require_contiguous_rows(name: PoolName, buffers: Sequence[torch.Tensor]) -> None:
-    # A page is copied as one byte range per buffer, so rows must be dense.
-    for buffer in buffers:
-        row_bytes = buffer.nbytes // buffer.shape[0]
-        dense = buffer.stride(0) * buffer.element_size() == row_bytes
-        if not dense or not buffer[0].is_contiguous():
-            raise ValueError(
-                f"The direct external linker needs dense rows in pool {name}; "
-                f"got shape={tuple(buffer.shape)}, stride={buffer.stride()}."
-            )
-
-
 def _mha_device_pool_entry(
     name: PoolName, pool: Any, layer_mapping: dict[int, int], page_size: int
 ) -> DevicePoolEntry:
@@ -463,13 +451,11 @@ def _mha_device_pool_entry(
             "The direct external linker does not support scaled KV caches yet."
         )
     num_layers = len(pool.k_buffer)
-    buffers = [*pool.k_buffer, *pool.v_buffer]
-    _require_contiguous_rows(name, buffers)
     return DevicePoolEntry(
         name=name,
         indices_from_pool=name,
         device_pool=pool,
-        components=[buffers],
+        components=[[*pool.k_buffer, *pool.v_buffer]],
         layer_mapping={
             layer: (index, num_layers + index) for layer, index in layer_mapping.items()
         },
@@ -509,9 +495,6 @@ def _mamba_device_pool_entry(
         for state in (mamba_cache.temporal, *mamba_cache.conv)
         if state.numel() > 0
     ]
-    _require_contiguous_rows(
-        PoolName.MAMBA, [buffer for group in components for buffer in group]
-    )
     return DevicePoolEntry(
         name=PoolName.MAMBA,
         indices_from_pool=PoolName.MAMBA,
