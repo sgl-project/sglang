@@ -115,7 +115,7 @@ def test_backend_dispatch(backend, nvfp4, monkeypatch):
         patch(
             "sglang.kernels.ops.gemm.router_gemm_cutile.router_gemm_bf16x3_cutile",
         ) as cutile,
-        patch("sglang.srt.models.beam.router_gemm_bf16x3") as cublas,
+        patch("sglang.srt.models.beam.router_gemm_bf16x3_cublas") as cublas,
     ):
         router = _router(backend, nvfp4)
         assert router.use_cutile_router == (expected_backend == "cutile")
