@@ -31,6 +31,9 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
         if numa_node is not None:
             # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
             numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if numactl_args is not None and not _can_set_mempolicy():
+                numactl_args = _strip_memory_args(numactl_args)
+                _log_cpu_only_binding(numa_node)
             if numactl_args is not None:
                 # Verify numactl can actually apply the binding before we exec it
                 # in front of the interpreter; relax the memory policy if not.
@@ -122,18 +125,14 @@ def _get_nvml_device_index(device_id: int) -> int:
     return get_nvml_device_index(device_id)
 
 
-def get_numa_node_if_available(
-    server_args: ServerArgs, gpu_id: int, cpu_only_ok: bool = False
-) -> Optional[int]:
+def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
     """
     Returns the NUMA node for the given GPU id. If it is not set in the server_args, it will try to query the NUMA node for the GPU.
-    If the NUMA node is not available, has already been configured externally, or the user lacks permission to set NUMA affinity, it will return None.
+    If the NUMA node is not available or has already been configured externally, it will return None.
 
     Args:
         server_args: The server arguments.
         gpu_id: The GPU id.
-        cpu_only_ok: Also return the node when NUMA memory policy is not
-            permitted, so the caller can still bind CPUs (no privilege needed).
 
     Returns:
         The NUMA node for the given GPU id or None if it is not available.
@@ -142,7 +141,7 @@ def get_numa_node_if_available(
         return server_args.numa_node[gpu_id]
     if not envs.SGLANG_AUTO_NUMA_BIND.get():
         return None
-    if _is_numa_available(require_mempolicy=not cpu_only_ok):
+    if _is_numa_available():
         queried_numa_node = _query_numa_node_for_gpu(gpu_id)
         if len(queried_numa_node) == 0:
             return None
@@ -187,10 +186,19 @@ def numa_bind_to_node(node: int):
         os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-    # Without memory-policy permission, CPU affinity alone keeps first-touch
-    # allocations on the node.
+    # Without memory policy, CPU affinity alone keeps first-touch allocations local;
+    # measured on FLUX.1 TP2 on GB300, run-to-run spread fell from 26-60% to 6-8%.
     if _can_set_mempolicy():
         libnuma.numa_set_preferred(ctypes.c_int(node))
+    else:
+        _log_cpu_only_binding(node)
+
+
+def _log_cpu_only_binding(node: int) -> None:
+    logger.info(
+        f"NUMA memory policy not permitted; binding CPUs only to NUMA node {node}. "
+        "If using docker, --cap-add SYS_NICE also binds host memory."
+    )
 
 
 class _Bitmask(ctypes.Structure):
@@ -366,11 +374,10 @@ def _can_set_mempolicy() -> bool:
         return False
 
 
-def _is_numa_available(require_mempolicy: bool = True) -> bool:
+def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
-    ``require_mempolicy=False`` accepts a host where only CPU affinity can be set
-    (a container without SYS_NICE).
+    A host where only CPU affinity can be set (a container without SYS_NICE) counts.
     """
     if not (_is_cuda or _is_xpu):
         return False
@@ -382,18 +389,6 @@ def _is_numa_available(require_mempolicy: bool = True) -> bool:
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
         logger.debug(
             "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
-        )
-        return False
-
-    if not _can_set_mempolicy():
-        if not require_mempolicy:
-            logger.info(
-                "User lacks permission to set NUMA memory policy; binding CPUs only. "
-                "If using docker, --cap-add SYS_NICE also binds host memory."
-            )
-            return True
-        logger.warning(
-            "User lacks permission to set NUMA affinity, skipping NUMA node configuration for GPU. If using docker, try adding --cap-add SYS_NICE to your docker run command."
         )
         return False
 
