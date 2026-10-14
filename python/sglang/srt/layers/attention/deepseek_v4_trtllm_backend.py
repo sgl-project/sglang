@@ -384,8 +384,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     ) -> torch.Tensor:
         """Drive the decode kernel as varlen prefill with one table row per token.
 
-        ``seq_lens`` includes cached prefixes; the kernel derives causal SWA
-        validity from it. This path runs eagerly.
+        ``seq_lens`` controls causal SWA validity, independently of the explicit
+        compressed indices. Bounded tails use lengths relative to their SWA
+        floor. This path runs eagerly, including at a break inside BCG.
         """
 
         assert q.ndim == 3, f"{q.shape=}"
@@ -395,7 +396,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # Build VarSeq metadata from the same extend lengths as the sparse tables.
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            tail = self.forward_metadata.late_layer_tail
+            extend_seq_lens_cpu = (
+                tail.extend_seq_lens_cpu
+                if tail is not None
+                else forward_batch.extend_seq_lens_cpu
+            )
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             batch_size = len(extend_seq_lens_cpu)
             cum_lens = [0] * (batch_size + 1)
@@ -404,7 +410,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = cum_lens[-1]
             max_q_len = max(int(x) for x in extend_seq_lens_cpu)
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+            # TRT-LLM masks SWA by causal length, not by the table's -1
+            # sentinels. Late layers wrote only the tail, so their effective
+            # SWA sequence starts at its floor. Compressed KV still uses the
+            # full-context indices and lengths published by the source layers.
+            seq_lens_i32 = (
+                tail.extend_seq_lens if tail is not None else forward_batch.seq_lens
+            ).to(torch.int32)
             assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (
                 self._move_to_device(cum_lens),
