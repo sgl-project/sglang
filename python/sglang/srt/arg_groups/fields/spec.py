@@ -119,19 +119,20 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_draft_temperature: A[
         Optional[float],
-        "Draft proposal temperature; 0 makes proposals greedy. Defaults to each "
-        "request's temperature. Applies only where the draft samples its proposal "
-        "(see the speculative decoding docs).",
+        "Draft proposal temperature; 0 makes proposals greedy. Unset, the draft "
+        "samples at each request's temperature. Applies only where the draft "
+        "samples its proposal (see the speculative decoding docs).",
     ] = None
     speculative_draft_top_k: A[
         Optional[int],
-        "Draft proposal top-k; -1 disables it. Defaults to each request's top_k. "
-        "Greedy requests stay greedy.",
+        "Draft proposal top-k. Unset or -1, the draft applies no top-k cutoff "
+        "(the request's top_k still applies at verification). Greedy requests "
+        "stay greedy.",
     ] = None
     speculative_draft_top_p: A[
         Optional[float],
-        "Draft proposal top-p in (0, 1]; 1 disables it. Defaults to each "
-        "request's top_p.",
+        "Draft proposal top-p in (0, 1]. Unset or 1, the draft applies no top-p "
+        "cutoff (the request's top_p still applies at verification).",
     ] = None
     speculative_use_block_verification: A[
         bool,

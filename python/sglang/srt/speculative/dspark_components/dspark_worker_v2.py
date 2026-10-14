@@ -323,7 +323,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
-        self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        # A draft temperature of 0 asks for the same argmax draft.
+        self._greedy_draft = (
+            envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+            or get_spec().speculative_draft_temperature == 0
+        )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,

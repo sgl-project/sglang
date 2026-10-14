@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.environ import envs
+from sglang.srt.sampling import draft_sampling
 from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
@@ -20,11 +21,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def params(temperatures, top_ks, top_ps):
+def params(temperatures, top_ks, top_ps, *, cutoffs=True):
     return DraftSamplingParams(
         torch.tensor(temperatures, dtype=torch.float32),
         torch.tensor(top_ks, dtype=torch.int32),
         torch.tensor(top_ps, dtype=torch.float32),
+        apply_top_k=cutoffs,
+        apply_top_p=cutoffs,
+    )
+
+
+def _spec(temperature=None, top_k=None, top_p=None):
+    return SimpleNamespace(
+        speculative_draft_temperature=temperature,
+        speculative_draft_top_k=top_k,
+        speculative_draft_top_p=top_p,
     )
 
 
@@ -41,30 +52,41 @@ class TestDraftSampling(unittest.TestCase):
         )
         target_top_ks = info.top_ks.clone()
         for temperature, top_k, top_p in itertools.product(
-            (None, 0.0, 0.7), (None, -1, 1, 3), (None, 0.6)
+            (None, 0.0, 0.7), (None, -1, 1, 3), (None, 1.0, 0.6)
         ):
-            spec = SimpleNamespace(
-                speculative_draft_temperature=temperature,
-                speculative_draft_top_k=top_k,
-                speculative_draft_top_p=top_p,
-            )
+            spec = _spec(temperature, top_k, top_p)
             with (
                 self.subTest(temperature=temperature, top_k=top_k, top_p=top_p),
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec),
             ):
                 draft = DraftSamplingParams.from_sampling_info(info)
-            expected_ks = target_top_ks.tolist()
-            if top_k is not None:
-                k = TOP_K_ALL if top_k == -1 else top_k
-                expected_ks = [1 if t <= 1 else k for t in expected_ks]
-            if temperature == 0:
-                expected_ks = [1, 1, 1]
-            self.assertEqual(draft.top_ks.tolist(), expected_ks)
+            greedy = [True] * 3 if temperature == 0 else [False, False, True]
+            # The request's own top-k/top-p never reach the draft; only an
+            # override does, and a disabling value (-1, 1.0) reads as unset.
+            apply_top_k, apply_top_p = top_k not in (None, -1), top_p not in (None, 1.0)
+            self.assertEqual(
+                (draft.apply_top_k, draft.apply_top_p), (apply_top_k, apply_top_p)
+            )
+            k = top_k if apply_top_k else TOP_K_ALL
+            self.assertEqual(draft.top_ks.tolist(), [1 if g else k for g in greedy])
             expected_t = [0.5, 1.5, 1.0] if not temperature else [temperature] * 3
             torch.testing.assert_close(draft.temperatures, torch.tensor(expected_t))
-            expected_p = [0.8, 1.0, 1.0] if top_p is None else [top_p] * 3
-            torch.testing.assert_close(draft.top_ps, torch.tensor(expected_p))
+            p = top_p if apply_top_p else 1.0
+            torch.testing.assert_close(draft.top_ps, torch.full((3,), p))
             self.assertTrue(torch.equal(info.top_ks, target_top_ks))
+
+    def test_unset_cutoffs_run_no_renorm_kernel(self):
+        logits = torch.tensor([[0.4, 0.3, 0.2, 0.1]]).log()
+        with (
+            patch.object(
+                draft_sampling, "top_k_renorm_probs", side_effect=AssertionError
+            ),
+            patch.object(
+                draft_sampling, "top_p_renorm_probs", side_effect=AssertionError
+            ),
+        ):
+            q = build_draft_probs(logits, params([2.0], [2], [0.5], cutoffs=False))
+        torch.testing.assert_close(q, torch.softmax(logits / 2.0, dim=-1))
 
     def test_top_k_precedes_top_p(self):
         logits = torch.tensor([[0.4, 0.3, 0.2, 0.1]]).log()
@@ -74,14 +96,16 @@ class TestDraftSampling(unittest.TestCase):
             torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
         )
 
-    def test_greedy_rows_propose_the_first_argmax_with_point_mass_q(self):
+    def test_greedy_rows_propose_the_first_argmax(self):
         logits = torch.tensor([[2.0, 2.0, 1.0], [0.2, 0.8, 0.6]])
         q, sampled_probs, tokens = sample_draft_proposal(
-            logits, params([1.0, 1.0], [1, 1], [1.0, 1.0])
+            logits, params([1.0, 1.0], [1, 1], [1.0, 1.0], cutoffs=False)
         )
-        torch.testing.assert_close(q, torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+        # q stays the softmax: the verify's one-hot target makes the accept
+        # test exact for a greedy row whatever q says.
         self.assertEqual(tokens.flatten().tolist(), [0, 1])
-        torch.testing.assert_close(sampled_probs, torch.ones(2, 1))
+        torch.testing.assert_close(q, torch.softmax(logits, dim=-1))
+        torch.testing.assert_close(sampled_probs, q.gather(1, tokens))
 
     def test_sample_frequencies_match_returned_truncated_q(self):
         torch.manual_seed(100)

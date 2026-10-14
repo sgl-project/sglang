@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -22,6 +23,8 @@ def _params(temperatures, top_ks, top_ps=None):
         torch.tensor(temperatures, dtype=torch.float32),
         torch.tensor(top_ks, dtype=torch.int32),
         torch.ones(len(top_ks)) if top_ps is None else torch.tensor(top_ps),
+        apply_top_k=True,
+        apply_top_p=True,
     )
 
 
@@ -416,7 +419,12 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     # A deterministic draft still needs proposal verification against a random
     # target. Only the target's greedy status controls whether q is staged.
     worker._selector_sampling_enabled = True
-    with get_context().override_server_args(speculative_draft_temperature=0.0):
+    greedy_draft = SimpleNamespace(
+        speculative_draft_temperature=0.0,
+        speculative_draft_top_k=None,
+        speculative_draft_top_p=None,
+    )
+    with mock.patch("sglang.srt.runtime_context.get_spec", return_value=greedy_draft):
         worker_mod.DFlashWorkerV2._propose_selector_block(
             worker,
             draft_logits_output=draft_logits_output,
@@ -426,7 +434,9 @@ def test_disabled_selector_sampling_forces_greedy_draft():
             sampling_info=sampling_info,
         )
     assert observed["params"].greedy_mask.tolist() == [True]
-    torch.testing.assert_close(observed["params"].top_ps, torch.tensor([0.9]))
+    # The request's own top-p never reaches the draft.
+    torch.testing.assert_close(observed["params"].top_ps, torch.tensor([1.0]))
+    assert not observed["params"].apply_top_p
     assert worker._selector_sample is not None
 
 

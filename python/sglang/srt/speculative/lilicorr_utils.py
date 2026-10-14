@@ -270,7 +270,7 @@ class LiLiCorrDraftSampler:
             assert token_table.shape[0] == embed_tokens.org_vocab_size_padded
         self.token_table = token_table
 
-        self.sampling_params = DraftSamplingParams.greedy(self.max_bs, device)
+        self.sampling_params = DraftSamplingParams.buffers(self.max_bs, device)
         self.uniforms = torch.zeros(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
         )

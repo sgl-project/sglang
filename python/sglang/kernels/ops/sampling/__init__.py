@@ -86,18 +86,64 @@ register_kernel(
 )
 
 
+def _renorm_backend(probs: torch.Tensor) -> str:
+    import torch
+
+    # CUDA: the sgl_kernel/FlashInfer op. ROCm: the Triton fallback. MUSA and
+    # XPU: their sgl_kernel builds. Else (CPU, declined NPU rows): torch.
+    if probs.is_cuda:
+        return "triton" if torch.version.hip is not None else "aot"
+    if probs.device.type in ("musa", "xpu"):
+        return "sgl_kernel"
+    return "torch"
+
+
 def top_k_renorm_probs(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
-    """Renormalize ``probs`` by top-k thresholding."""
-    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(probs, top_k)
+    """Renormalize ``probs`` by top-k thresholding, on any device."""
+    backend = _renorm_backend(probs)
+    if backend == "aot":
+        return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(
+            probs, top_k
+        )
+    if backend == "triton":
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_k_renorm_probs_triton,
+        )
+
+        return top_k_renorm_probs_triton(probs, top_k)
+    if backend == "sgl_kernel":
+        from sgl_kernel import top_k_renorm_prob
+
+        return top_k_renorm_prob(probs, top_k)
+    from sglang.kernels.ops.sampling.renorm_torch import top_k_renorm_probs_torch
+
+    return top_k_renorm_probs_torch(probs, top_k)
 
 
 def top_p_renorm_probs(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
-    """Renormalize ``probs`` by top-p thresholding."""
-    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(probs, top_p)
+    """Renormalize ``probs`` by top-p thresholding, on any device."""
+    backend = _renorm_backend(probs)
+    if backend == "aot":
+        return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(
+            probs, top_p
+        )
+    if backend == "triton":
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+        )
+
+        return top_p_renorm_probs_triton(probs, top_p)
+    if backend == "sgl_kernel":
+        from sgl_kernel import top_p_renorm_prob
+
+        return top_p_renorm_prob(probs, top_p)
+    from sglang.kernels.ops.sampling.renorm_torch import top_p_renorm_probs_torch
+
+    return top_p_renorm_probs_torch(probs, top_p)
 
 
 __all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]

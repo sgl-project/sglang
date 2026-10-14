@@ -959,10 +959,10 @@ def eagle_sample(
             sampling_fn = tree_speculative_sampling_target_only
 
         if not _is_npu:
-            from sglang.srt.sampling.probability_transforms import (
+            from sglang.kernels.ops.sampling import (
                 top_k_renorm_probs as top_k_renorm_prob,
             )
-            from sglang.srt.sampling.probability_transforms import (
+            from sglang.kernels.ops.sampling import (
                 top_p_renorm_probs as top_p_renorm_prob,
             )
 

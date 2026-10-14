@@ -14,6 +14,7 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
+    DraftParams,
     draft_markov_block,
     sample_draft_block,
 )
@@ -39,6 +40,11 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         anchor = torch.randint(0, VOCAB, (BS,), device=DEVICE)
         temperatures = torch.rand(BS, device=DEVICE) + 0.3
         temperatures[::2] = 0.0
+        params = DraftParams(
+            temperatures=temperatures.clamp_min(1e-5),
+            greedy_mask=temperatures == 0,
+            step_temperatures=temperatures,
+        )
         noise = DraftNoise(
             key=11, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
@@ -51,7 +57,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
                 base_logits=base,
                 anchor_tokens=anchor,
                 draft_hidden=None,
-                step_temperatures=temperatures,
+                params=params,
                 noise=noise,
                 tp_sync=SimpleNamespace(sync=lambda site, value: value),
                 logits_out=logits_out,
@@ -95,7 +101,11 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
                 base_logits=base,
                 anchor_tokens=anchor,
                 draft_hidden=None,
-                step_temperatures=torch.zeros(1, device=DEVICE),
+                params=DraftParams(
+                    temperatures=torch.ones(1, device=DEVICE),
+                    greedy_mask=torch.ones(1, dtype=torch.bool, device=DEVICE),
+                    step_temperatures=torch.zeros(1, device=DEVICE),
+                ),
                 noise=noise,
                 tp_sync=SimpleNamespace(sync=lambda site, value: value),
                 greedy_draft=True,

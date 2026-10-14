@@ -63,13 +63,7 @@ class DsparkDraftSampler:
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay.
-        self.params = DraftParams(
-            temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
-            greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),
-            step_temperatures=torch.zeros(
-                (self.max_bs,), dtype=torch.float32, device=device
-            ),
-        )
+        self.params = DraftParams.allocate(self.max_bs, device)
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
@@ -109,7 +103,7 @@ class DsparkDraftSampler:
             base_logits=base_logits,
             anchor_tokens=anchor,
             draft_hidden=sample_hidden,
-            step_temperatures=self.params.step_temperatures[:bs],
+            params=self.params.slice(bs),
             noise=self._noise,
             tp_sync=self._tp_sync,
             logits_out=None

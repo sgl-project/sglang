@@ -24,6 +24,8 @@ class TestDraftSamplingCUDA(unittest.TestCase):
                     torch.tensor([0.7, 1.0, 1.5], device="cuda"),
                     torch.tensor([7, 12, TOP_K_ALL], dtype=torch.int32, device="cuda"),
                     torch.tensor([0.7, 0.95, 1.0], device="cuda"),
+                    apply_top_k=True,
+                    apply_top_p=True,
                 )
                 info = SimpleNamespace(
                     temperatures=params.temperatures[:, None],

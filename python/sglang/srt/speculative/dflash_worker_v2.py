@@ -259,7 +259,7 @@ class _SelectorDraftSampler:
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
-        self.sampling_params = DraftSamplingParams.greedy(max_bs, device)
+        self.sampling_params = DraftSamplingParams.buffers(max_bs, device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device

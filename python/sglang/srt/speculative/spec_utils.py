@@ -157,9 +157,21 @@ def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     sampling_params: DraftSamplingParams,
 ):
-    """Return (q, q(X), X) with X ~ q. Verification must use this exact q."""
+    """Leviathan draft proposal: q from the draft policy, X ~ q; returns
+    (q, q(X), X). The accept test coin*q(X) < p(X) is unbiased only against
+    this exact q, so callers hand it to the verify rather than a recomputed one.
+
+    A greedy row (``top_k == 1``) proposes its argmax: sampling a sharp q still
+    leaves the argmax often enough to cost accept length. Its q need not be
+    one-hot because eagle_sample renormalises the target by the same ``top_ks``,
+    so p is one-hot there: the target argmax accepts, anything else rejects onto
+    the residual (p - q)+, which is p itself. Drop that renorm and this fails.
+    """
     probs = build_draft_probs(next_token_logits, sampling_params)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
+    greedy = sampling_params.greedy_mask.view(-1, 1)
+    topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
+    topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 

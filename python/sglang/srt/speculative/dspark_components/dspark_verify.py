@@ -30,6 +30,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.draft_sampling import build_draft_probs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -925,11 +926,17 @@ def accept_draft_tokens(
         draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
     else:
         bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-        draft_probs = SoftmaxTemp.execute(
-            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-            temperatures=draft_block.temperatures,
-            rows_per_request=gamma_rows,
-        ).view(bs, gamma_rows, vocab)
+        if draft_block.cutoffs is None:
+            draft_probs = SoftmaxTemp.execute(
+                logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+                temperatures=draft_block.temperatures,
+                rows_per_request=gamma_rows,
+            ).view(bs, gamma_rows, vocab)
+        else:
+            # The draft drew from the cut-off q; rebuild that exact q here.
+            draft_probs = build_draft_probs(
+                draft_block.corrected_logits, draft_block.cutoffs
+            )
         expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
