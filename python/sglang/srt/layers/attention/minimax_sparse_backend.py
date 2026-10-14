@@ -41,9 +41,10 @@ def _index_topk_groups(
 ) -> tuple[dict[int, int], dict[int, bool], bool]:
     """Decide which sparse layers share one top-k search.
 
-    pattern is a list of group sizes, such as ("2", "3"). The first layer in
-    a group runs the search. The other layers in that group reuse it. An
-    empty pattern uses a fixed group size of freq.
+    pattern is a list of group sizes, such as ("2", "3"), ("3", "4"), or
+    ("4", "5"). The first layer in a group runs the search. The other layers
+    in that group reuse it. Any longer list works the same way. An empty
+    pattern uses a fixed group size of freq.
     """
     groups: dict[int, int] = {}
     sources: dict[int, bool] = {}
