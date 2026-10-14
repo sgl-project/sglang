@@ -35,7 +35,7 @@ use std::thread;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sgl_router::policies::kv_events::tree::{HashTree, KvWorkerId};
+use sgl_router::state::kv_events::tree::{HashTree, KvWorkerId};
 
 fn build_tree(num_workers: usize, blocks_per_worker: usize, seed: u64) -> HashTree {
     let tree = HashTree::new();

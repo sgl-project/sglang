@@ -80,7 +80,7 @@ class TestDSV4DecodeCapacity(CustomTestCase):
             ),
         )
         tree_cache = SimpleNamespace(
-            is_chunk_cache=lambda: False,
+            supports_prefix_sharing=lambda: True,
             evict=MagicMock(side_effect=evict),
         )
 
@@ -254,7 +254,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             pp_cache_group=None,
         )
         mappings = assembler._DeepSeekV4LayerMappings(
-            transfer_layer_num=1,
+            transfer_layer_id_max=1,
             full={0: 0},
             swa={},
             c4={0: 0},

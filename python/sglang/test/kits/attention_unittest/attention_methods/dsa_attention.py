@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -318,11 +317,7 @@ class DSAMockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
         self._kernel_warmed_up = True
-        self.dp_size = 1
-        self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -346,7 +341,6 @@ class DSAMockModelRunner(ModelRunner):
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
@@ -405,7 +399,6 @@ class DSAMockModelRunner(ModelRunner):
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -1216,6 +1209,13 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             return False, f"aiter unavailable: {exc}"
         return True, ""
 
+    if impl == "triton_sparse_mla":
+        if is_hip():
+            return False, "triton_sparse_mla is a CUDA-only prefill backend"
+        if major < 9:
+            return False, f"{impl} requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
     if impl == "flashmla_auto":
         # `flashmla_auto` resolves to flashmla_sparse / flashmla_kv at
         # forward time depending on `dsa_kv_cache_store_fp8`; both leaf
@@ -1234,6 +1234,7 @@ DSA_PREFILL_IMPL_VARIANTS: tuple[str, ...] = (
     "tilelang",
     "trtllm",
     "aiter",
+    "triton_sparse_mla",
 )
 DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "flashmla_sparse",
@@ -1250,7 +1251,7 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
 # flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
     {"flashmla_kv", "flashmla_auto"}

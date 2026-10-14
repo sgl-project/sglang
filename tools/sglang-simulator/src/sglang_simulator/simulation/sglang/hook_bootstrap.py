@@ -9,7 +9,6 @@ import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,
     hicache_storage,
-    hiradix_cache,
     mem_cache_allocator,
     mem_pool_host,
     model_runner,
@@ -46,7 +45,6 @@ def install_simulator_hooks() -> None:
             hicache_storage.C_StorageBackendFactory,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,
-            hiradix_cache.C_HiRadixCacheHook,
             unified_radix_cache.C_UnifiedRadixCacheHook,
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_MHATokenToKVPoolHostHook,
