@@ -8,8 +8,8 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.ops import mfma_bf16, rsrc, traced
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import lds_row
+from sglang.experimental.monokernels.hip.common.ops import mfma_bf16, rsrc, traced
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, fp8x8_bf16, mfma_scaled, pow2, tile_map
 

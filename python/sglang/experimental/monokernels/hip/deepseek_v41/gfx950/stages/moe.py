@@ -12,7 +12,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.mx import (
+from sglang.experimental.monokernels.hip.common.mx import (
     FP4,
     FP8,
     FP8_MAX,
@@ -24,7 +24,7 @@ from sglang.experimental.monokernels.common.hip.mx import (
     rcp_pow2,
     scale_index,
 )
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     CM_NT,
     _hw_f32,
@@ -46,23 +46,25 @@ from sglang.experimental.monokernels.common.hip.ops import (
     sum_partials,
     traced,
 )
-from sglang.experimental.monokernels.common.hip.plan import (
+from sglang.experimental.monokernels.hip.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
     first_task,
     pair_layout,
 )
-from sglang.experimental.monokernels.common.hip.sync import (
+from sglang.experimental.monokernels.hip.common.sync import (
     preg,
     publish,
     sreg,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages import moe_plan as mplan
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.dims import UG_PART
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages import (
+    moe_plan as mplan,
+)
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.dims import UG_PART
 
 # FlyDSL keys a build by the source of same-directory functions it names: import helpers by name
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ROWS,
     TILE,
     gemv_fp8_loads,
@@ -75,20 +77,20 @@ from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import (
     tile_rows,
     token_tiles,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.moe_shape import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.moe_shape import (
     MASK_WORDS,
     MoeBuild,
     route_shape,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.router import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.router import (
     PARTS as ROUTER_PARTS,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.router import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.router import (
     router_tile_mfma,
     router_weight_loads,
     router_x_loads,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.seam import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.seam import (
     HIDDEN,
     attn_peer_bytes,
 )

@@ -48,8 +48,8 @@ from typing import Any
 
 import torch
 
-from sglang.experimental.monokernels.common.hip.plan import BLOCKS
-from sglang.experimental.monokernels.deepseek_v41 import HF_CONFIG
+from sglang.experimental.monokernels.hip.common.plan import BLOCKS
+from sglang.experimental.monokernels.hip.deepseek_v41 import HF_CONFIG
 from sglang.experimental.monokernels.spec import (
     DeviceLimits,
     Feature,
@@ -262,7 +262,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.attention.plan import Dims
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.attention.plan import (
+        Dims,
+    )
     from sglang.srt.runtime_context import get_parallel
 
     heads = Dims(get_parallel().tp_size).heads
@@ -352,7 +354,7 @@ def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
 
 
 def _codes(copies: dict, i: int, name: str, lin) -> torch.Tensor:
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.weights import e8m0
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.weights import e8m0
 
     return _keep(
         copies,
@@ -365,13 +367,15 @@ def _codes(copies: dict, i: int, name: str, lin) -> torch.Tensor:
 
 def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     """Layer i's tensors as the launches read them."""
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.attention.plan import Dims
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.attention.plan import (
+        Dims,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         FFNWeights,
         K1Weights,
         K2Weights,
     )
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.weights import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.weights import (
         mxfp8_exact,
         rope_table,
     )
@@ -567,7 +571,7 @@ class _Built:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
     from sglang.srt.runtime_context import get_parallel

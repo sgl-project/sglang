@@ -10,8 +10,8 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.ops import mfma_bf16, rsrc
-from sglang.experimental.monokernels.common.hip.plan import WAVES
+from sglang.experimental.monokernels.hip.common.ops import mfma_bf16, rsrc
+from sglang.experimental.monokernels.hip.common.plan import WAVES
 
 HIDDEN = 5120
 ROWS = 16  # a tile's rows: the MFMA's M

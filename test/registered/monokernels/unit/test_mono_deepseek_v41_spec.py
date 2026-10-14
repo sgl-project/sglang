@@ -5,8 +5,8 @@ per-output bounds and its refusal reasons."""
 from types import SimpleNamespace
 
 from sglang.experimental.monokernels import spec as registry
-from sglang.experimental.monokernels.deepseek_v41 import HF_CONFIG
-from sglang.experimental.monokernels.deepseek_v41 import spec as dsv41
+from sglang.experimental.monokernels.hip.deepseek_v41 import HF_CONFIG
+from sglang.experimental.monokernels.hip.deepseek_v41 import spec as dsv41
 from sglang.experimental.monokernels.spec import NumericsKind, SpanPoint
 from sglang.test.ci.ci_register import register_cpu_ci
 

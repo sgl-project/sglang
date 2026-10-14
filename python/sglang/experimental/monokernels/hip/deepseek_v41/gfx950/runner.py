@@ -10,8 +10,8 @@ from pathlib import Path
 
 import torch
 
-from sglang.experimental.monokernels.common.hip import guard
-from sglang.experimental.monokernels.common.hip.plan import BLOCKS
+from sglang.experimental.monokernels.hip.common import guard
+from sglang.experimental.monokernels.hip.common.plan import BLOCKS
 
 from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
 from .layer import (
@@ -254,7 +254,7 @@ class DSV41MonoRunner:
 
     def __init__(self, tp: int, rank: int, group, device: torch.device | str = "cuda"):
         _ensure_writable_flydsl_cache()
-        from sglang.experimental.monokernels.common.hip.peer import PeerBuffer
+        from sglang.experimental.monokernels.hip.common.peer import PeerBuffer
 
         self.tp, self.rank = tp, rank
         self.d = Dims(tp)

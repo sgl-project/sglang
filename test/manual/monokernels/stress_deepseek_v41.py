@@ -87,11 +87,11 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.layer import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
         MonoBuild,
         build_mono_k1,
     )
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
 

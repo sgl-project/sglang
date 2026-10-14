@@ -5,7 +5,7 @@
 # atom/models/deepseek_v41/mono/moe_plan.py
 """Which MoE ug flags (UGF) and MID rows the ug stage writes and the down stage reads, defined once."""
 
-from sglang.experimental.monokernels.common.hip.plan import cdiv, imin
+from sglang.experimental.monokernels.hip.common.plan import cdiv, imin
 
 TILE = 16  # picks a pick tile: an MFMA's N
 

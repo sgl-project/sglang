@@ -48,7 +48,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     CM_SYS,
     load_ptr64,

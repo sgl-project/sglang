@@ -10,18 +10,18 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.mx import (
+from sglang.experimental.monokernels.hip.common.mx import (
     UNIT_SCALE,
     mfma_scaled,
 )
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_NT,
     fresh,
     rsrc,
     traced,
 )
-from sglang.experimental.monokernels.common.hip.plan import WAVES
-from sglang.experimental.monokernels.common.hip.sync import POLL_MAX
+from sglang.experimental.monokernels.hip.common.plan import WAVES
+from sglang.experimental.monokernels.hip.common.sync import POLL_MAX
 
 ROWS = 16  # GEMV rows a task
 TILE = 16  # an MFMA's N: the tokens a GEMV pass takes (``token_tiles``)

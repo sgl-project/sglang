@@ -9,9 +9,9 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.epoch import gstore
-from sglang.experimental.monokernels.common.hip.mx import clamp_fp8
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.epoch import gstore
+from sglang.experimental.monokernels.hip.common.mx import clamp_fp8
+from sglang.experimental.monokernels.hip.common.ops import (
     bf16_round,
     butterfly,
     fp8_pack4,
@@ -22,8 +22,8 @@ from sglang.experimental.monokernels.common.hip.ops import (
     traced,
     xshfl,
 )
-from sglang.experimental.monokernels.common.hip.plan import first_task
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import (
+from sglang.experimental.monokernels.hip.common.plan import first_task
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
     plus,

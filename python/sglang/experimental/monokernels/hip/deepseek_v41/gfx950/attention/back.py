@@ -25,8 +25,8 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.experimental.monokernels.common.hip.mx import clamp_fp8
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.mx import clamp_fp8
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     bf16_round,
     bf_hi,
@@ -42,13 +42,13 @@ from sglang.experimental.monokernels.common.hip.ops import (
     traced,
     xshfl,
 )
-from sglang.experimental.monokernels.common.hip.plan import (
+from sglang.experimental.monokernels.hip.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
     first_task,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
 )

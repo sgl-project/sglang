@@ -32,10 +32,10 @@ def _build(publish: bool, fault_site=None, stop=False):
     from flydsl.expr import const_expr
     from flydsl.expr.typing import Int64
 
-    from sglang.experimental.monokernels.common.hip import guard
-    from sglang.experimental.monokernels.common.hip.ops import CM_DEV, rsrc
-    from sglang.experimental.monokernels.common.hip.plan import THREADS
-    from sglang.experimental.monokernels.common.hip.sync import Mailbox, sreg
+    from sglang.experimental.monokernels.hip.common import guard
+    from sglang.experimental.monokernels.hip.common.ops import CM_DEV, rsrc
+    from sglang.experimental.monokernels.hip.common.plan import THREADS
+    from sglang.experimental.monokernels.hip.common.sync import Mailbox, sreg
 
     name = f"mono_guard_test_p{int(publish)}_f{fault_site or 0}_s{int(stop)}"
 
@@ -59,7 +59,7 @@ def _build(publish: bool, fault_site=None, stop=False):
 
 
 def _epoch(deadline_s):
-    from sglang.experimental.monokernels.common.hip import guard
+    from sglang.experimental.monokernels.hip.common import guard
 
     e = torch.zeros(64, dtype=torch.int32, device="cuda")
     ticks = guard.deadline_ticks(deadline_s)
@@ -70,7 +70,7 @@ def _epoch(deadline_s):
 
 
 def _words(e):
-    from sglang.experimental.monokernels.common.hip import guard
+    from sglang.experimental.monokernels.hip.common import guard
 
     return [int(e[i]) for i in guard.ERROR_WORDS]
 

@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sglang.experimental.monokernels.deepseek_v41.spec import NUMERICS
+from sglang.experimental.monokernels.hip.deepseek_v41.spec import NUMERICS
 
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
@@ -181,7 +181,9 @@ def make_weights(tp, rank, dev, seed=0):
 
 
 def mono_weights(w):
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import FFNWeights
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
+        FFNWeights,
+    )
 
     return FFNWeights(
         hc_ffn_fn=w["hc_fn"], hc_ffn_scale=w["hc_scale"], hc_ffn_base=w["hc_base"],
@@ -279,8 +281,10 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.layer import scratch_layout
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
+        scratch_layout,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
 

@@ -9,7 +9,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from sglang.experimental.monokernels.deepseek_v41.spec import NUMERICS
+from sglang.experimental.monokernels.hip.deepseek_v41.spec import NUMERICS
 from sglang.test.monokernels.deepseek_v41.check_ffn import (
     HC,
     HC_EPS,
@@ -74,7 +74,7 @@ def rope_table(dev):
 
 def check_wqkv_route(M):
     """Return whether SGLang's wqkv_a config at M is the one K1 implements."""
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.attention.plan import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.attention.plan import (
         wqkv_order,
     )
     from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as mx
@@ -128,12 +128,12 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.layer import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
         MonoBuild,
         build_mono_k1,
         scratch_layout,
     )
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
     from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla

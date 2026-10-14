@@ -13,14 +13,14 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.experimental.monokernels.common.hip.guard import GUARD_WORDS
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.guard import GUARD_WORDS
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     rsrc,
     traced,
 )
-from sglang.experimental.monokernels.common.hip.plan import BLOCKS
-from sglang.experimental.monokernels.common.hip.sync import _spin
+from sglang.experimental.monokernels.hip.common.plan import BLOCKS
+from sglang.experimental.monokernels.hip.common.sync import _spin
 
 
 def kernel_symbol(stem, **params):

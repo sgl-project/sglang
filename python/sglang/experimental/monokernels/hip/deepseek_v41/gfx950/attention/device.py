@@ -11,9 +11,9 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.experimental.monokernels.common.hip.epoch import _gptr
-from sglang.experimental.monokernels.common.hip.ops import bf16_pair, rsrc
-from sglang.experimental.monokernels.common.hip.sync import _spin
+from sglang.experimental.monokernels.hip.common.epoch import _gptr
+from sglang.experimental.monokernels.hip.common.ops import bf16_pair, rsrc
+from sglang.experimental.monokernels.hip.common.sync import _spin
 
 # The execution model: one CTA a CU of an MI355X, all resident.
 BLOCKS = 256

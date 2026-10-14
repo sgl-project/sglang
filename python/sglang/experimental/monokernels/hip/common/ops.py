@@ -17,7 +17,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.experimental.monokernels.common.hip.plan import THREADS, WAVES
+from sglang.experimental.monokernels.hip.common.plan import THREADS, WAVES
 
 # gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
 CM_DEV = 16

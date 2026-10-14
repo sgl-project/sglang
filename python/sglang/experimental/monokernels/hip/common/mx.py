@@ -10,7 +10,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip.ops import CM_NT
+from sglang.experimental.monokernels.hip.common.ops import CM_NT
 
 FP8_MAX = 448.0
 # the f8f6f4 MFMA's operand formats (cbsz / blgp)

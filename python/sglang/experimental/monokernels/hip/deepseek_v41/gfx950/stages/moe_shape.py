@@ -9,18 +9,20 @@ from dataclasses import dataclass
 
 import flydsl.expr as fx
 
-from sglang.experimental.monokernels.common.hip.plan import BLOCKS, WAVES
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages import moe_plan as mplan
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.dims import (
+from sglang.experimental.monokernels.hip.common.plan import BLOCKS, WAVES
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages import (
+    moe_plan as mplan,
+)
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.dims import (
     UG_PART,
     Dims,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.gemv import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ROWS,
     TILE,
     token_tiles,
 )
-from sglang.experimental.monokernels.deepseek_v41.gfx950.stages.router import (
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.router import (
     PARTS as ROUTER_PARTS,
 )
 

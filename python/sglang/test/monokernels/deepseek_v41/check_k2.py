@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sglang.experimental.monokernels.deepseek_v41.spec import NUMERICS
+from sglang.experimental.monokernels.hip.deepseek_v41.spec import NUMERICS
 from sglang.test.monokernels.deepseek_v41.check_ffn import (
     HIDDEN,
     bf16_ulps,
@@ -142,7 +142,7 @@ def attention_xo(q, swa_keys, comp_keys, lists, sink, pos, cos_sin):
 def pushed_partials(runner, rows, tp):
     """[tp, rows, 5120] bf16: every rank's wo_b partial as the last K2 pushed it into this
     rank's ATTN region (bf16 pairs next to their tags, ``seam.attn_region_pair``)."""
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.layer import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
         peer_half_bytes,
     )
 
@@ -180,9 +180,13 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.attention.plan import Dims
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.layer import scratch_layout
-    from sglang.experimental.monokernels.deepseek_v41.gfx950.runner import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.attention.plan import (
+        Dims,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
+        scratch_layout,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
         K2Weights,
     )

@@ -7,7 +7,7 @@
 
 from dataclasses import dataclass
 
-from sglang.experimental.monokernels.common.hip.plan import Shard, padded
+from sglang.experimental.monokernels.hip.common.plan import Shard, padded
 
 # the model's full widths
 MOE_INTER = 2304  # a routed expert's intermediate width

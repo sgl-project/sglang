@@ -8,12 +8,13 @@ unsupported setup with every reason, set the decode capture sizes), then
 ``load_tensor``, ``attach``, ``route`` and ``kernel`` in each process
 (``runtime``). ``spec`` holds what a model declares, and the registry.
 
-``common/hip/`` is the shared HIP device runtime. Each model's directory holds
-its spec and glue (``<model>/spec.py``) and its kernels and runner per ISA
-(``<model>/<isa>/``, e.g. ``deepseek_v41/gfx950/``).
+One directory per vendor: ``hip/`` holds the shared HIP device runtime
+(``hip/common/``) and one directory per model, with its spec and glue
+(``hip/<model>/spec.py``) and its kernels and runner per ISA
+(``hip/<model>/<isa>/``, e.g. ``hip/deepseek_v41/gfx950/``).
 
 A failed wait stops its launch and flags every peer, whose waits stop too
-(``common/hip/guard.py``): a rank finishes a step only with every peer's data for
+(``hip/common/guard.py``): a rank finishes a step only with every peer's data for
 it, so no token of a failed step is sent and SGLang stops the process tree.
 """
 

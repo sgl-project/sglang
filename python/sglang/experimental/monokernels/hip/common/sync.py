@@ -13,8 +13,8 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.experimental.monokernels.common.hip import guard
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common import guard
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     CM_SYS,
     bf16_pair,

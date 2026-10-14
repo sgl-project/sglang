@@ -11,16 +11,16 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from sglang.experimental.monokernels.common.hip import guard
-from sglang.experimental.monokernels.common.hip.epoch import (
+from sglang.experimental.monokernels.hip.common import guard
+from sglang.experimental.monokernels.hip.common.epoch import (
     EPOCH_MARKS,
     epoch_begin,
     epoch_end,
     gstore,
     kernel_symbol,
 )
-from sglang.experimental.monokernels.common.hip.mx import clamp_fp8
-from sglang.experimental.monokernels.common.hip.ops import (
+from sglang.experimental.monokernels.hip.common.mx import clamp_fp8
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
     butterfly,
     fp8_pack4,
@@ -28,14 +28,14 @@ from sglang.experimental.monokernels.common.hip.ops import (
     rsrc,
     traced,
 )
-from sglang.experimental.monokernels.common.hip.plan import (
+from sglang.experimental.monokernels.hip.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
     first_task,
     key_tuple,
 )
-from sglang.experimental.monokernels.common.hip.sync import Mailbox, preg, publish, sreg
+from sglang.experimental.monokernels.hip.common.sync import Mailbox, preg, publish, sreg
 
 from .attention import back as mb_back
 from .attention import front as mb_front
