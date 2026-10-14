@@ -1346,9 +1346,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
-        # Both context bounds participate in the schedule-time DP vote. A
-        # backend-only rejection could leave idle peers replaying collectives
-        # while the rank with the long request falls back to eager.
+        # Vote on both bounds so DP ranks agree on graph versus eager.
         for context_limit in (self.max_context_size, self.max_seq_len):
             if context_limit is not None and (
                 batch_max_context_len is None or batch_max_context_len > context_limit

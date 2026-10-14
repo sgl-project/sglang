@@ -273,9 +273,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     for batch in (schedule_batch, None)
                 ]
                 self.assertEqual(votes, [expected, True])
-                # MAX_LEN padding fabricates a short extend on the idle rank.
-                # Both ranks must honor the reduced vote even though that
-                # fabricated request fits the graph's context bound.
+                # The padded idle request fits; it must still honor the vote.
                 idle = self._make_forward_batch(4)
                 for batch in (active, idle):
                     batch.global_num_tokens_cpu = [4, 4]

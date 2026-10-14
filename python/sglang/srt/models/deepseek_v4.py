@@ -2466,8 +2466,7 @@ class MQALayer(MqaAttentionBase):
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
-                    # TRT-LLM can consume FP8 Q but returns BF16 activations.
-                    # The bridge feeds inverse RoPE and the output projection.
+                    # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
                 bcg_deepseek_v4_attention_with_output(

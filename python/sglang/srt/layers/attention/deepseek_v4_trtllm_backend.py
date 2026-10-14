@@ -382,12 +382,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Drive the decode kernel as varlen prefill with one table row per token.
-
-        ``seq_lens`` controls causal SWA validity, independently of the explicit
-        compressed indices. Bounded tails use lengths relative to their SWA
-        floor. This path runs eagerly, including at a break inside BCG.
-        """
+        """Run varlen prefill eagerly, including at BCG breaks."""
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
@@ -410,10 +405,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = cum_lens[-1]
             max_q_len = max(int(x) for x in extend_seq_lens_cpu)
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            # TRT-LLM masks SWA by causal length, not by the table's -1
-            # sentinels. Late layers wrote only the tail, so their effective
-            # SWA sequence starts at its floor. Compressed KV still uses the
-            # full-context indices and lengths published by the source layers.
+            # SWA masking uses causal lengths, not -1 sentinels: make them
+            # tail-relative while keeping compressed KV indices full-context.
             seq_lens_i32 = (
                 tail.extend_seq_lens if tail is not None else forward_batch.seq_lens
             ).to(torch.int32)
