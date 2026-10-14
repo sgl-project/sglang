@@ -1964,6 +1964,11 @@ class Envs:
     # Dequantize Quark MXFP4 shared experts to BF16 at load so they join the
     # fused Kimi-K3 MoE front on ROCm.
     SGLANG_OPT_HIP_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
+    # Route the merged Kimi-K3 MoE front GEMM through AITER's tuned BF16 GEMM for
+    # batches in this token window.
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(

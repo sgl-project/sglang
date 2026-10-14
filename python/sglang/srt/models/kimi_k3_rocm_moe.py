@@ -18,6 +18,7 @@ Shared ``kimi_k3.py`` only keeps ``_is_hip`` hooks into this module. These
 functions take the ``KimiK3MoE`` module as ``self``.
 """
 
+import functools
 from typing import Optional
 
 import torch
@@ -33,6 +34,38 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFP4
 from sglang.srt.runtime_context import get_parallel
+
+# Merged front widths at TP8: BF16 [shared gate-up | router | latent down] and the
+# Quark partial [router | latent down]; AITER's tuned BF16 GEMM table covers both.
+_TUNED_FRONT_SHAPES = ((6016, 7168), (4480, 7168))
+
+
+@functools.cache
+def _tuned_front_window() -> Optional[tuple[int, int]]:
+    if not (
+        envs.SGLANG_USE_AITER.get() and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
+    ):
+        return None
+    return (
+        envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get(),
+        envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get(),
+    )
+
+
+def _front_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """The merged front GEMM, through AITER's tuned BF16 GEMM inside its window."""
+    from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+    window = _tuned_front_window()
+    if (
+        window is not None
+        and window[0] <= hidden_states.shape[0] <= window[1]
+        and tuple(weight.shape) in _TUNED_FRONT_SHAPES
+    ):
+        from aiter.tuned_gemm import tgemm
+
+        return tgemm.mm(hidden_states, weight, None, otype=hidden_states.dtype)
+    return _k3_bf16_gemm(hidden_states, weight)
 
 
 def init_moe_rocm_state(self) -> None:
@@ -321,13 +354,11 @@ def _try_preroute_front(self, hidden_states: torch.Tensor):
 def _run_front(self, hidden_states: torch.Tensor):
     """Return (gate_up, router_logits, routed_input, shared_is_preactivated);
     gate_up is None when the shared experts run on their own quantized kernels."""
-    from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
-
     preroute = _try_preroute_front(self, hidden_states)
     if preroute is not None:
         routed_input, gate_up, router_logits, shared_is_preactivated = preroute
         return gate_up, router_logits, routed_input, shared_is_preactivated
-    fused = _k3_bf16_gemm(hidden_states, self._front_w)
+    fused = _front_gemm(hidden_states, self._front_w)
     if self._partial_fused_front:
         router_logits, routed_input = torch.split(fused, self._front_sizes, dim=-1)
         return None, router_logits, routed_input, False
