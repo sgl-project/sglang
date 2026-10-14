@@ -20,6 +20,9 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
+        // SGLang response extensions (`x-sglext-return-input-ids`, ...), which
+        // the engine reads on requests the router passes through.
+        || n.starts_with("x-sglext-")
 }
 
 #[cfg(test)]
@@ -50,6 +53,12 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-request-id-extra"
+        )));
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "x-sglext-return-input-ids"
+        )));
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "x-sglext-return-output-ids"
         )));
 
         // Stripped headers
@@ -118,6 +127,11 @@ mod tests {
         assert!(
             !should_forward_request_header(&HeaderName::from_static("foo-x-sgl-bar")),
             "foo-x-sgl-bar (substring, not prefix) must not forward",
+        );
+        // `x-sglext` with no hyphen after it is not in the family.
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("x-sglextra")),
+            "x-sglextra (no hyphen after x-sglext) must not forward",
         );
     }
 }
