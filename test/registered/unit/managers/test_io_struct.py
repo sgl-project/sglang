@@ -1408,5 +1408,12 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
             req.normalize_batch_and_arguments()
 
 
+class TestEmbeddingReqInputRid(CustomTestCase):
+    def test_str_rid_is_expanded_for_batch(self):
+        req = EmbeddingReqInput(text=["Hello", "World"], rid="my-rid")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid, ["my-rid_0", "my-rid_1"])
+
+
 if __name__ == "__main__":
     unittest.main()
