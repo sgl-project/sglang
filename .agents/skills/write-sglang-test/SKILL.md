@@ -388,9 +388,9 @@ A `register_*_ci(...)` under `python/sglang/` is rejected by the
 
 ## Eval Accuracy Mixins
 
-**Design philosophy**: Most test files don't care about eval logic — they only need a "does this feature break model output quality?" sanity check. The mixin pattern separates **what to test** (threshold) from **how to test** (run_eval, assertions, CI summary). Test classes declare thresholds as class attributes; the mixin provides the `test_*` method. Override when you need extra assertions (e.g. EAGLE accept length).
+**Design philosophy**: Most test files don't care about eval logic — they only need a "does this feature break model output quality?" sanity check. The mixin pattern separates **what to test** (threshold) from **how to test** (the eval call, assertions, CI summary). Test classes declare thresholds as class attributes; the mixin provides the `test_*` method. Override when you need extra assertions (e.g. EAGLE accept length).
 
-Available mixins in `python/sglang/test/kits/eval_accuracy_kit.py`: `MMLUMixin`, `HumanEvalMixin`, `MGSMEnMixin`, `GSM8KMixin`. Can be combined freely. Read the source for attrs and defaults.
+Available mixins in `python/sglang/test/kits/eval_accuracy_kit.py`: `MMLUMixin`, `HumanEvalMixin`, `MGSMEnMixin`, `GSM8KMixin`. Can be combined freely. Read the source for attrs and defaults. `MMLUMixin` already scores through sgl-eval; `GSM8KMixin` still defaults to the deprecated `run_eval` backend for existing tests, so new tests set `gsm8k_backend = "sgl_eval"`. The exception is a base or completion-only model: sgl-eval only sends chat requests, so those stay on the 5-shot completion backend.
 
 ```python
 class TestMyFeature(CustomTestCase, MMLUMixin):
