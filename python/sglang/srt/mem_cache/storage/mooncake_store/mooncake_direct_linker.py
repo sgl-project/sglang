@@ -53,7 +53,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         server_args,
         params: CacheInitParams,
         *,
-        components,
+        cache,
         storage=None,
     ):
         self.page_size = params.page_size
@@ -62,7 +62,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             kvcache=kvcache,
             page_size=self.page_size,
             params=params,
-            components=components,
+            components=set(cache.components),
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
@@ -374,7 +374,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(self, _node_id: int, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False

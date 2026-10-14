@@ -150,7 +150,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         server_args,
         params: CacheInitParams,
         *,
-        components,
+        cache,
         _storage=None,
     ):
         self.page_size = params.page_size
@@ -184,7 +184,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             kvcache=kvcache,
             page_size=self.page_size,
             params=params,
-            components=components,
+            components=set(cache.components),
         )
         rank_replicated = self.pool_group.rank_replicated
         self.pools = self.pool_group.entry_map
@@ -849,7 +849,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for start in range(0, self.num_layers, self.layer_group)
         ]
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(self, _node_id: int, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False

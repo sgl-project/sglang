@@ -211,13 +211,19 @@ def create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "lmcache":
+            from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_cache_linker import (
+                LMCacheUnifiedCacheLinker,
+            )
+
+            linker_cls = LMCacheUnifiedCacheLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"
             )
 
         cache.init_cache_linker(
-            linker_cls(server_args, params, components=set(cache.components))
+            linker_cls(server_args, params, cache=cache)
         )
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()

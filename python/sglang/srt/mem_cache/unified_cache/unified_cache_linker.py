@@ -208,7 +208,7 @@ class UnifiedCacheLinker(ABC):
         """Cancel a load that has not started yet."""
 
     @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(self, node_id: NodeId, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
     @abstractmethod
@@ -669,7 +669,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            queued = self.cache_linker.offload(node_id, transfers)
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise
