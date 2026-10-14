@@ -180,6 +180,9 @@ class CoordinatedScheduler:
                         )
                     if lengths:
                         self._rid_length = lengths.pop()
+                    if self.clock.run_id is None:
+                        # Dataset preparation before the first Ready is unbounded.
+                        start = time.monotonic()
                     self.clock.accept_ready(ready)
                     for op in ready.operations:
                         if isinstance(op, Cancel) and self.clock.is_cancelled(op.rid):

@@ -22,6 +22,7 @@ from sglang_simulator.simulation.coordinator import (
     encode_message,
 )
 from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.sglang import coordinated
 from sglang_simulator.simulation.sglang.coordinated import CoordinatedScheduler
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 
@@ -221,6 +222,27 @@ def harness(monkeypatch):
         instance.close()
         StateManager.reset()
         request_stats_manager.reset()
+
+
+def test_payload_timeout_excludes_pre_run_dataset_preparation(harness, monkeypatch):
+    wall_time = [0.0]
+    monkeypatch.setattr(
+        coordinated, "time", SimpleNamespace(monotonic=lambda: wall_time[0])
+    )
+
+    def receive_after_preparation():
+        wall_time[0] = 120.0
+        if harness.bridge.clock.run_id is not None:
+            return [TokenizedGenerateReqInput(rid(1))]
+        return []
+
+    def driver(control):
+        control.send(encode_message(Ready("run", 0, [Submit(rid(1))])))
+        return harness.bridge.receive(receive_after_preparation)
+
+    admitted = harness.run_driver(driver)
+    assert [request.rid for request in admitted] == [rid(1)]
+    assert harness.bridge.clock.now_ns == 0
 
 
 @pytest.mark.parametrize("payload_order", [(1, 2), (2, 1)])
