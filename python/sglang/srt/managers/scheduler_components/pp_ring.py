@@ -391,8 +391,6 @@ class PPRing:
         launch_result: GenerationBatchResult,
         pp_outputs: PPProxyTensors,
     ):
-        from sglang.srt.managers.scheduler import GenerationBatchResult
-
         logits_output = None
 
         if (
