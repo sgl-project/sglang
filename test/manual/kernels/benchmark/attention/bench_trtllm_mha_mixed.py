@@ -1,7 +1,8 @@
 """Compare split and unsplit mixed-extend attention on SM100-family GPUs.
 
-Times forward_extend with CUDA graphs, excluding projection, KV writes and
-metadata construction. Run from the repository root with PYTHONPATH=python.
+Times forward_extend with CUDA graphs and cold L2, excluding cache flushes,
+projection, KV writes and metadata construction. Run from the repository root
+with PYTHONPATH=python.
 """
 
 import argparse
@@ -10,8 +11,8 @@ import json
 import unittest
 
 import torch
-from triton.testing import do_bench_cudagraph
 
+from sglang.kernels.jit.benchmark import marker
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -86,7 +87,19 @@ def benchmark(args, num_decode):
         if not split:
             backend.forward_metadata.mixed_prefill_reqs = -1
         outputs[split] = run().clone()
-        timings[split] = do_bench_cudagraph(run, rep=200) * 1000
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        # Flush before each replay, not just before a graph of repeated calls.
+        timings[split] = (
+            marker.do_bench(
+                graph.replay,
+                use_cuda_graph=False,
+                estimated_time_ms=200,
+                disable_log_bandwidth=True,
+            ).times[0]
+            * 1e6
+        )
     torch.testing.assert_close(outputs[True], outputs[False], atol=1e-2, rtol=1e-2)
     delta = outputs[True].float() - outputs[False].float()
     return {
