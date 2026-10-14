@@ -262,8 +262,8 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         ]
         self.assertEqual(result["content"], expected_content)
 
-    def test_process_content_already_string(self):
-        """Test processing content that's already a string."""
+    def test_process_content_already_string_openai_format(self):
+        """Test a plain string against an openai-format template is wrapped into parts."""
         msg_dict = {"role": "user", "content": "Hello world"}
 
         image_data = []
@@ -275,7 +275,46 @@ class TestTemplateContentFormatDetection(CustomTestCase):
             msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
-        # Should pass through unchanged
+        self.assertEqual(result["content"], [{"type": "text", "text": "Hello world"}])
+        self.assertEqual(result["role"], "user")
+        self.assertEqual(len(image_data), 0)
+
+    def test_process_content_already_string_string_format(self):
+        """Test a plain string against a string-format template passes through unchanged."""
+        msg_dict = {"role": "user", "content": "Hello world"}
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        result = process_content_for_template_format(
+            msg_dict, "string", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(result["content"], "Hello world")
+        self.assertEqual(result["role"], "user")
+        self.assertEqual(len(image_data), 0)
+
+    def test_process_content_already_string_v32_encoding(self):
+        """Test a plain string stays a string under v32 encoding regardless of template format."""
+        msg_dict = {"role": "user", "content": "Hello world"}
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        result = process_content_for_template_format(
+            msg_dict,
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+            use_dpsk_v32_encoding=True,
+        )
+
         self.assertEqual(result["content"], "Hello world")
         self.assertEqual(result["role"], "user")
         self.assertEqual(len(image_data), 0)
