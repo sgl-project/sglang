@@ -7,7 +7,6 @@ as an independent oracle for the feature-owned byte-mask implementation.
 
 import math
 import sys
-from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -20,14 +19,10 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _apply_prepared_masks(bindings, masks, all_configs=False):
+def _apply_prepared_masks(bindings, masks):
     """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
     from sglang.srt.weight_sync.gpu_delta.apply import (
-        _CONFIGS,
         _compiled,
-        _grid,
-        _parameters,
-        _resident_ctas,
         plan_apply,
         prepare_status_check,
     )
@@ -44,33 +39,29 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.error = torch.zeros(1, dtype=torch.int32, device="cuda")
     prepared.timing_enabled = False
-    decoded = torch.empty(
-        size * (4 if all_configs else 1), dtype=torch.uint8, device="cuda"
-    )
+    decoded = torch.empty(size, dtype=torch.uint8, device="cuda")
     group, transformed = plan_apply(outputs)
     saved = [
         (value, value.clone()) for binding in bindings for value in binding.storage
     ]
     apply = None
     if group is not None:
-        tuned, _, _, reused, skipped = group.prepare(decoded, prepared.error)
-        if all_configs:
-            assert tuned or reused
-            assert not skipped
+        group.prepare_metadata(decoded.device.index)
+        group.bind(decoded)
         pointers = torch.tensor(
             list(group.pointer_rows(decoded.data_ptr())),
             dtype=torch.int64,
             device="cuda",
         )
-        apply = partial(group.launch, pointers, prepared.error)
-        # A second plan with identical compiled geometry reuses the device query.
-        misses = _resident_ctas.cache_info().misses
+        metadata = torch.tensor(group.metadata_rows, dtype=torch.int64, device="cuda")
+        apply = group.bind_launch(pointers, metadata, prepared.error)
+        misses = _compiled.cache_info().misses
         repeated, _ = plan_apply(outputs)
-        tuned, footprint, _, reused, skipped = repeated.prepare(decoded, prepared.error)
-        assert tuned == footprint == skipped == 0
-        assert reused == 1
-        assert repeated.kernel is group.kernel
-        assert _resident_ctas.cache_info().misses == misses
+        repeated.prepare_metadata(decoded.device.index)
+        repeated.bind(decoded)
+        assert repeated.kernels == group.kernels
+        assert repeated.metadata_rows == group.metadata_rows
+        assert _compiled.cache_info().misses == misses
     # Compilation and module loading must not execute against live weights.
     for value, before in saved:
         torch.testing.assert_close(
@@ -110,25 +101,6 @@ def _apply_prepared_masks(bindings, masks, all_configs=False):
     decoder.actual_sizes.fill_(size)
     decoder.enqueue()
     prepared._apply_batch(batch)
-    if all_configs:
-        expected = [value.clone() for value, _ in saved]
-        for config in _CONFIGS:
-            for value, before in saved:
-                value.copy_(before)
-            decoder.enqueue()
-            if group is not None:
-                kernel = _compiled(
-                    group.contracts, group.alignments, decoded.device.index, config
-                )
-                _, _, tiles = _parameters(group.contracts, group.alignments, config[0])
-                grid = _grid(tiles, kernel, decoded.device.index, config)
-                kernel[grid](pointers, prepared.error)
-            for xor, source in batch.transformed:
-                xor(source)
-            for (value, _), reference in zip(saved, expected):
-                torch.testing.assert_close(
-                    value.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
-                )
     return group
 
 
@@ -333,8 +305,8 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
     max_grid = (
         4 * device.multi_processor_count * device.max_threads_per_multi_processor // 128
     )
-    # Exceed even the thread-limited occupancy grid to exercise repeated tiles
-    # and descriptor boundaries, as well as byte-tail masking.
+    # A large heterogeneous grid exercises runtime descriptor boundaries and
+    # byte-tail masking alongside small/unaligned contracts.
     for index, size in enumerate(
         (1, 4095, 4096, 4097, 4100, 9001, (max_grid + 1) * 4096 + 17)
     ):
@@ -355,17 +327,19 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
     for dense_subset in (dense, dense[1:4]):
         selected = dense_subset + routed + [binding]
         masks = [
-            torch.zeros(
-                math.prod(b.shape) * b.torch_dtype.itemsize,
-                dtype=torch.uint8,
-                device="cuda",
-            )
-            if b.name in {item.name for item in routed}
-            else torch.randint(
-                256,
-                (math.prod(b.shape) * b.torch_dtype.itemsize,),
-                dtype=torch.uint8,
-                device="cuda",
+            (
+                torch.zeros(
+                    math.prod(b.shape) * b.torch_dtype.itemsize,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                if b.name in {item.name for item in routed}
+                else torch.randint(
+                    256,
+                    (math.prod(b.shape) * b.torch_dtype.itemsize,),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
             )
             for b in selected
         ]
@@ -374,11 +348,10 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
             ^ b.selected_bytes(mask).reshape(b.destinations[0].shape)
             for b, mask in zip(selected, masks)
         ]
-        group = _apply_prepared_masks(selected, masks, all_configs=True)
+        group = _apply_prepared_masks(selected, masks)
         assert len(group.sources) == len(selected)
         assert group.tiles == sum(
-            count * math.ceil(contract[0] / group.config[0])
-            for contract, count in group.contracts
+            count * math.ceil(contract[0] / 2048) for contract, count in group.contracts
         )
         if dense_subset is dense:
             assert group.word32_contracts > 0

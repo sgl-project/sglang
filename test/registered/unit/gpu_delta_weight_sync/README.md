@@ -54,6 +54,7 @@ python -m pytest -q test/registered/unit/gpu_delta_weight_sync \
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync/test_gpu_delta_layout_cuda.py
 python -m pytest -q test/manual/gpu_delta/test_codec.py
 python -m pytest -q test/manual/gpu_delta/test_host_cuda.py
+python -m pytest -q test/manual/gpu_delta/test_apply_cuda.py
 python -m pytest -q test/manual/gpu_delta/test_device_allocator_cuda.py
 ```
 
@@ -177,46 +178,45 @@ for its previous apply event, including consumption of that slot's size/status
 rows. Temporary DE workspace is shared because DE submissions are ordered.
 
 Preparation allocates small nvCOMP workspace, per-slot status/size rows and
-descriptor slabs, and uploads input metadata and raw targets on feature-owned
-streams. It also prepares relative output offsets, slot bounds and status-check
-callbacks. Temporary frame and raw-packing plans are then released; the decode
-plan retains the buffer leases and execution metadata.
+metadata slabs, and uploads decoder inputs and raw targets on feature-owned
+streams. It constructs immutable runtime apply records, loads the three fixed
+kernel families, queries each loaded kernel's device occupancy once, and binds
+metadata views and launch closures before pause. Membership, dimensions, counts,
+strides and alignment do not enter compilation-cache keys.
+
 After scheduler pause and its reader fence, decoded-mask slots are allocated and
-checked, output pointers are uploaded, and scratch-dependent apply setup/tuning
-runs. Slots are reused across layers and their dedicated CUDA allocations are freed
-before resume; the feature retains no large HBM lease during rollout.
-Host arena capacity and static CPU plans remain persistent.
-Preparation records the omitted frame gaps and tails. Only those byte ranges are
+checked. An aligned binding validates the actual source extent/base, patches
+source pointers in the prepared host slab and uploads it once. An unexpected
+misaligned base rebuilds only the runtime descriptors with conservative byte
+access; returning to an aligned base restores the prepared template. Slot and
+metadata leases are released before resume. Host arena capacity and static CPU
+plans remain persistent. Preparation never writes model/KV storage or allocates
+the large decoded-mask slots.
+
+Preparation records omitted frame gaps and tails. Only those byte ranges are
 zeroed before decode; a fully covered batch skips zeroing. One device kernel checks
 all decoded sizes/statuses and ORs failures into the sticky apply gate.
 
-Layer membership and normalized affine source/destination views are cached for
-the current active tensor set and layer count. Fresh compressed lengths, frame
-lists and arena offsets are prepared for each update. Singleton and adjacent
-contiguous axes are collapsed without changing byte order. All affine images in
-a streaming batch share one XOR launch. Its exact uniform contracts, counts and
-tile intervals are compile-time parameters, without model-name classification or
-a runtime geometry table. Only fresh source/destination pointers are uploaded.
-Proven four-byte alignment and
-row/tail geometry select uint32 XOR; other contracts use byte XOR in the same
-kernel. Contiguous inner tiles need only scalar base-address arithmetic. Irregular
-padded scales retain their explicit transform.
+Layer membership and normalized source/destination views are cached for the
+current active tensor set and layer count. Fresh compressed lengths, frame lists
+and arena offsets remain publication-specific. Singleton and adjacent contiguous
+axes are collapsed without changing byte order. Access modes are runtime record
+properties: affine (0), contiguous (1), and a block-divisible contiguous inner row
+(2). They are not model or tensor-name classifications.
 
-Paused setup loads the chosen module and queries CUDA's actual residency once per
-compiled kernel/device. A small first-use search compares one
-CTA per 2048-byte tile with a static grid of at most four resident waves. It uses
-the complete batch's geometry/counts and disjoint synthetic source/target regions
-in unused decoded scratch, never live weights or the decoder. One warmup and three
-timed trials per candidate use events on the paused apply stream. The sum of
-borrowed footprints is capped at 4 GiB per device; no additional weight-size
-allocation is made. Nonfitting batches or an exhausted budget use the measured
-naive policy. Fitting depends on the selected grouping and scratch capacity.
-Both measured and fixed
-choices are cached in-process by complete geometry, counts, proven alignment and
-device. Warm plan reuse performs no fitting check, occupancy query or tuning.
-Cold tuning is included in the pause; warm geometry reuses its cached choice.
-No configuration selection, counter reset or dynamic work stealing occurs in the
-layer loop.
+Each batch uses up to three fixed kernel families: packed contiguous/two-axis
+word access, contiguous-source word-affine targets, and general byte/affine
+fallback. Original contracts and byte extents are validated before conversion;
+word-affine descriptor coordinates use four-byte units, while lengths, tile ranges
+and pointer offsets remain bytes. Family tables preserve original pointer order
+and start at 16-byte boundaries. Irregular backend-specific padded scale views
+retain their existing explicit transform.
+
+The fixed policy uses a full tile grid for word-affine and at most four resident
+waves for packed/general. Occupancy is cached per loaded module and device.
+There is no online autotuning, synthetic scratch fitting, geometry-specific
+compilation or configuration selection during pause. Custom grid overrides in
+`bind_launch` exist for correctness validation only.
 
 DE0 is submitted first; the small raw-target apply can overlap it. Apply i is
 queued before submission of DE i+1 because nvCOMP's Async call may wait for earlier
@@ -368,8 +368,14 @@ precedes local payload preparation and tensor planning. Its
 `host_prepare_s`, not `host_tensor_prepare_s`.
 `host_metadata_prepare_s` covers small GPU input setup and
 status-callback preparation, including its own stream waits (`host_metadata_wait_s`).
+Its `host_apply_kernel_prepare_s` subspan includes record construction and fixed
+module loading/cache lookup. CPU slab construction and launch prebinding are
+outside that subspan. `apply_kernel_cache_misses` counts Python module-cache misses,
+not compiler executions; a miss may load a module from the disk cache.
 `paused_setup_host_s` includes decoded-slot allocation, output-pointer binding and
-uploads, and scratch-dependent apply setup; `paused_apply_tune_s` isolates cold tuning.
+uploads and actual-source binding. `apply_descriptor_h2d_bytes` is the reserved
+descriptor portion of `apply_metadata_h2d_bytes`; it is a subset, not an extra
+transfer. These host spans and CUDA stream intervals overlap and must not be added.
 `paused_apply_host_wall_s` includes setup, the decode/apply pipeline, completion
 and scratch release, but the scheduler's full `blocked_s` remains the pause metric.
 
@@ -380,8 +386,8 @@ directly by DE; these traffic categories are not a throughput estimate.
 `decoded_scratch_bytes` is their total allocation;
 `decoder_workspace_bytes` is temporary DE workspace. Neither is peak HBM usage.
 `decoded_zero_ranges`/`decoded_zero_bytes` count omitted canonical bytes cleared
-before decode. Batch/group/contract/grid and cold tuning counters retain their
-ordinary meanings. `host_batch_plan_reused` reports cached active tensor geometry.
+before decode. Batch/group/contract/grid counts describe the runtime work;
+`apply_kernel_cache_reused` is a per-rank boolean, not a number of reused groups. `host_batch_plan_reused` reports cached active tensor geometry.
 
 With `GPU_DELTA_TIMING=1`, events report decode on the DE stream and layout apply,
 raw apply and derived refresh on the apply stream. `paused_gpu_pipeline` excludes

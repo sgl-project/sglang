@@ -388,6 +388,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         prepared.device, prepared.stream = torch.device("cpu"), object()
         prepared.timing_enabled = False
         prepared.batches, prepared.status_checks = [], []
+        prepared.apply_bindings, prepared.apply_source_patches = [], []
+        prepared.apply_fallback_groups = set()
         prepared.matrix_tensor_count, prepared.raw_tensor_count = 0, 1
         prepared.derived = plan.derived
         prepared.timings, prepared.h2d_bytes, prepared.target_version = {}, 0, 1

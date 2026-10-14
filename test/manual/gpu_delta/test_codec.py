@@ -245,6 +245,8 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     output_refs = [weakref.ref(output) for output in decoded]
     prepared.batches = prepared_batches
     prepared.status_checks = []
+    prepared.apply_bindings, prepared.apply_source_patches = [], []
+    prepared.apply_fallback_groups = set()
     prepared.raw_copies = {}
     prepared.decoded = decoded
     prepared.workspace = workspace

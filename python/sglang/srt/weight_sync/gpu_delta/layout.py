@@ -15,7 +15,6 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import partial
 from itertools import chain
 from typing import Callable
 
@@ -338,6 +337,9 @@ class PreparedDelta:
         self.batches, self.raw_copies = [], {}
         self.events, self.timings = {}, {}
         self.status_checks = []
+        self.apply_bindings, self.apply_source_patches = [], []
+        self.apply_fallback_groups = set()
+        self.apply_host_view = None
         self.backend, self.device = backend, backend.device
         self.decode_stages = backend.decode_stages
         preparation_started = time.perf_counter()
@@ -412,7 +414,7 @@ class PreparedDelta:
         self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
 
         # Pack the small complete-target bypass once on the host. Decoded-mask
-        # storage and cold tuning still wait for the actual serving pause.
+        # storage waits for the actual serving pause; kernel warmup is below.
         raw_started = time.perf_counter()
         raw_targets, raw_h2d_bytes = [], 0
         for binding, entry in raw_entries:
@@ -476,9 +478,25 @@ class PreparedDelta:
                 targets.append(target)
                 sources.append(source)
             self.error = torch.zeros(1, dtype=torch.int32, device=self.device)
+            from sglang.srt.weight_sync.gpu_delta.apply import _compiled
+
+            compile_started = time.perf_counter()
+            cache_before = _compiled.cache_info()
+            for _, _, group, _ in self.static_plans:
+                if group is not None:
+                    group.prepare_metadata(self.device.index)
+            cache_after = _compiled.cache_info()
+            self.timings.update(
+                host_apply_kernel_prepare_s=time.perf_counter() - compile_started,
+                apply_kernel_cache_misses=cache_after.misses - cache_before.misses,
+                apply_kernel_cache_reused=int(
+                    cache_after.hits > cache_before.hits
+                    and cache_after.misses == cache_before.misses
+                ),
+            )
             self.apply_host_metadata = torch.empty(
                 sum(
-                    2 * len(group.sources)
+                    2 * len(group.sources) + group.metadata_size
                     for _, _, group, _ in self.static_plans
                     if group is not None
                 ),
@@ -488,6 +506,7 @@ class PreparedDelta:
             self.apply_metadata = torch.empty(
                 self.apply_host_metadata.numel(), dtype=torch.int64, device=self.device
             )
+            self._prepare_apply_bindings()
         self.workspace = self.decode_plan = None
         if self.static_plans:
             inner_codec = self.codec.removesuffix("-zstd")
@@ -512,7 +531,8 @@ class PreparedDelta:
                     for decode in self.decode_plan.batches
                 ]
         # PREPARED includes small input transfers, never output-slot allocation,
-        # DE execution, cold scratch tuning or synchronization with rollout.
+        # DE execution or synchronization with rollout. The fixed apply kernel
+        # is already compiled/loaded; membership never specializes its code.
         ready = [torch.cuda.Event(), torch.cuda.Event()]
         ready[0].record(self.stream)
         ready[1].record(self.de_stream)
@@ -523,10 +543,72 @@ class PreparedDelta:
             host_metadata_prepare_s=time.perf_counter() - started,
             host_metadata_wait_s=time.perf_counter() - waiting,
             decoder_metadata_h2d_bytes=frame_table.nbytes,
-            decoder_workspace_bytes=self.workspace.temporary.numel()
-            if self.workspace
-            else 0,
+            decoder_workspace_bytes=(
+                self.workspace.temporary.numel() if self.workspace else 0
+            ),
         )
+
+    def _prepare_apply_bindings(self):
+        """Prepare fixed descriptors, target pointers and source-index patches."""
+        self.apply_host_view = self.apply_host_metadata.numpy()
+        indices = [[] for _ in range(self.decode_stages)]
+        offsets = [[] for _ in range(self.decode_stages)]
+        position = 0
+        for index, (_, _, group, _) in enumerate(self.static_plans):
+            if group is None:
+                self.apply_bindings.append(None)
+                continue
+            count = 2 * len(group.sources)
+            start, stop = position + count, position + count + group.metadata_size
+            self.apply_host_view[position:start] = list(group.pointer_rows(0))
+            self.apply_host_view[start:stop] = group.metadata_rows
+            pointers = self.apply_metadata[position:start]
+            metadata = self.apply_metadata[start:stop]
+            self.apply_bindings.append(
+                (
+                    start,
+                    stop,
+                    pointers,
+                    metadata,
+                    group.bind_launch(pointers, metadata, self.error),
+                )
+            )
+            slot = index % self.decode_stages
+            indices[slot].extend(position + i for i in group.source_indices)
+            offsets[slot].extend(group.sources)
+            position = stop
+        if position != self.apply_host_metadata.numel():
+            raise RuntimeError("GPU delta apply metadata slab capacity mismatch")
+        self.apply_source_patches = [
+            (np.asarray(i, dtype=np.int64), np.asarray(o, dtype=np.int64))
+            for i, o in zip(indices, offsets)
+        ]
+
+    def _bind_apply_metadata(self):
+        """Patch only actual source bases; misalignment retains the generic path."""
+        groups, calls = [], []
+        for index, (_, _, group, _) in enumerate(self.static_plans):
+            if group is None:
+                calls.append(None)
+                continue
+            start, stop, pointers, metadata, prepared_call = self.apply_bindings[index]
+            aligned = group.bind(self.decoded[index % self.decode_stages])
+            if not aligned or index in self.apply_fallback_groups:
+                self.apply_host_view[start:stop] = group.metadata_rows
+            if aligned:
+                self.apply_fallback_groups.discard(index)
+                call = prepared_call
+            else:
+                self.apply_fallback_groups.add(index)
+                call = group.bind_launch(pointers, metadata, self.error)
+            groups.append(group)
+            calls.append(call)
+        for slot, (indices, offsets) in enumerate(self.apply_source_patches):
+            if indices.size:
+                # Each group's constant-time bound check above proves no int64
+                # overflow before this vectorized patch. Targets are untouched.
+                self.apply_host_view[indices] = offsets + self.decoded[slot].data_ptr()
+        return groups, calls
 
     def _allocate_paused(self):
         """Allocate reusable decoded outputs, then bind their pointers."""
@@ -548,36 +630,13 @@ class PreparedDelta:
             decoders = (
                 self.decode_plan.bind_outputs(self.decoded) if self.decode_plan else []
             )
-            pointer_rows = []
-            tune_totals = [0, 0, 0.0, 0, 0]
-            apply_groups = []
-            for index, (_, _, group, _) in enumerate(self.static_plans):
-                if group is not None:
-                    scratch = self.decoded[index % self.decode_stages]
-                    tune_totals = [
-                        total + value
-                        for total, value in zip(
-                            tune_totals, group.prepare(scratch, self.error)
-                        )
-                    ]
-                    pointer_rows.extend(group.pointer_rows(scratch.data_ptr()))
-                    apply_groups.append(group)
-            self.apply_host_metadata.numpy()[:] = pointer_rows
+            apply_groups, apply_calls = self._bind_apply_metadata()
             self.apply_metadata.copy_(self.apply_host_metadata, non_blocking=True)
-            position = 0
             for index, ((_, _, group, transformed), decode) in enumerate(
                 zip(self.static_plans, decoders)
             ):
                 scratch = self.decoded[index % self.decode_stages]
-                apply = None
-                if group is not None:
-                    count = 2 * len(group.sources)
-                    apply = partial(
-                        group.launch,
-                        self.apply_metadata[position : position + count],
-                        self.error,
-                    )
-                    position += count
+                apply = apply_calls[index]
                 self.batches.append(
                     _PreparedBatch(
                         decode,
@@ -598,20 +657,17 @@ class PreparedDelta:
                 )
         self.timings.update(
             paused_setup_host_s=time.perf_counter() - started,
-            paused_apply_tune_s=tune_totals[2],
-            apply_tuned_batches=tune_totals[0],
-            apply_tune_bytes=tune_totals[1],
-            apply_tune_cache_hits=tune_totals[3],
-            apply_tune_skipped_batches=tune_totals[4],
             decoder_metadata_uploads=2 * int(bool(decoders)),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
+            apply_descriptor_h2d_bytes=sum(
+                group.metadata_size * 8 for group in apply_groups
+            ),
             apply_groups=len(apply_groups),
-            apply_grid_ctas=sum(group.grid[0] for group in apply_groups),
+            apply_grid_ctas=sum(group.grid_ctas for group in apply_groups),
             apply_contracts=sum(len(group.contracts) for group in apply_groups),
             apply_word32_contracts=sum(
                 group.word32_contracts for group in apply_groups
             ),
-            apply_static_groups=sum(group.config[2] for group in apply_groups),
             transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
             decoded_buffers=len(self.decoded),
             decoded_scratch_bytes=len(self.decoded) * self.max_decoded,
@@ -648,7 +704,7 @@ class PreparedDelta:
             self._allocate_paused()
             with torch.cuda.stream(self.stream):
                 with self._phase("paused_gpu_pipeline"):
-                    # Setup/tuning may touch every slot. This one fence also
+                    # Paused setup may touch every slot. This one fence also
                     # places the enclosing timing event before initial DE.
                     if self.batches:
                         self.de_stream.wait_stream(self.stream)
@@ -737,6 +793,10 @@ class PreparedDelta:
         self.batches.clear()
         self.status_checks.clear()
         self.raw_copies.clear()
+        self.apply_bindings.clear()
+        self.apply_source_patches.clear()
+        self.apply_fallback_groups.clear()
+        self.apply_host_view = None
         self.apply_metadata = self.apply_host_metadata = None
         self.decoded = self.raw_device = self.error = self.workspace = (
             self.decode_plan
