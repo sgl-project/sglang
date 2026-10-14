@@ -50,6 +50,7 @@ def make_payload(*, rust, storage=False, rank=None, count=2):
         get_cached_tokens_details=lambda req: (
             SchedulerOutputStreamer.get_cached_tokens_details(cache, req)
         ),
+        is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
         rust_server_mode=rust,
     )

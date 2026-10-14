@@ -206,7 +206,7 @@ impl CoreOutput {
             meta.cached_tokens = Some(metadata.cached_tokens);
             meta.cached_tokens_details = metadata.cached_tokens_details.as_deref().cloned();
             meta.reasoning_tokens = Some(metadata.reasoning_tokens);
-            meta.num_retractions = Some(metadata.num_retractions);
+            meta.num_retractions = Some(metadata.retraction_count);
             meta.dp_rank = metadata.dp_rank;
         }
         let Some(extras) = self.extras.as_deref() else {
@@ -400,7 +400,7 @@ mod tests {
                 ..Default::default()
             })),
             reasoning_tokens: 4,
-            num_retractions: 2,
+            retraction_count: 2,
             dp_rank: Some(1),
         };
         let mut accumulated = CoreOutput::default();

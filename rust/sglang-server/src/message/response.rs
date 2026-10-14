@@ -201,7 +201,7 @@ pub struct SchedulerMetadata {
     pub cached_tokens: u64,
     pub cached_tokens_details: Option<Box<CachedTokensDetails>>,
     pub reasoning_tokens: u64,
-    pub num_retractions: u64,
+    pub retraction_count: u64,
     pub dp_rank: Option<u32>,
 }
 
@@ -507,7 +507,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 cached_tokens: metadata.cached_tokens[i],
                 cached_tokens_details: metadata.cached_tokens_details[i].take(),
                 reasoning_tokens: metadata.reasoning_tokens[i],
-                num_retractions: metadata.retraction_counts[i],
+                retraction_count: metadata.retraction_counts[i],
                 dp_rank: metadata.dp_ranks[i],
             }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
@@ -718,7 +718,7 @@ mod tests {
                     storage_backend: Some("test".into()),
                 })),
                 reasoning_tokens: 4,
-                num_retractions: 2,
+                retraction_count: 2,
                 dp_rank: Some(1),
             })
         );
