@@ -655,7 +655,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        prompt: Optional[Union[str, List[str], List[Dict], List[List[Dict]]]] = None,
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
@@ -666,6 +666,9 @@ class Engine(EngineScoreMixin, EngineBase):
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        # The token ids for the prompt; one can either specify prompt or input_ids.
+        # Required when the engine runs with skip_tokenizer_init=True.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -673,6 +676,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = EmbeddingReqInput(
             text=prompt,
+            input_ids=input_ids,
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
@@ -690,7 +694,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
     async def async_encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        prompt: Optional[Union[str, List[str], List[Dict], List[List[Dict]]]] = None,
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
@@ -701,6 +705,9 @@ class Engine(EngineScoreMixin, EngineBase):
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        # The token ids for the prompt; one can either specify prompt or input_ids.
+        # Required when the engine runs with skip_tokenizer_init=True.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -710,6 +717,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = EmbeddingReqInput(
             text=prompt,
+            input_ids=input_ids,
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
