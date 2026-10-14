@@ -359,7 +359,8 @@ def _add3(
 
     if not add3.covered(a, b, c):
         return (a + b) + c
-    return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
+    # ROCm reuses `a` as the output to skip a full [M, D] scratch at large prefill M.
+    return add3.add3(a, b, c, out=a if _is_hip else None, prefetch_bc=prefetch_bc)
 
 
 # One-shot log guard: proves the merged front is live (see _ep_front).

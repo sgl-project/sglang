@@ -76,6 +76,16 @@ def select_front_modules(self) -> Optional[list]:
     return None
 
 
+def _keep_correction_bias_in_logit_dtype(self) -> None:
+    # AITER's router reads the correction bias in the gate-logit dtype and casts
+    # it on every call otherwise; both ways round it to the same values.
+    from sglang.srt.layers.moe.topk import _use_aiter
+
+    bias = self.gate.e_score_correction_bias
+    if _use_aiter and bias is not None and bias.dtype != self.gate.weight.dtype:
+        bias.data = bias.data.to(self.gate.weight.dtype)
+
+
 def prepare_moe_rocm(self) -> None:
     """Post-load ROCm packing; runs after the shared front merge."""
     from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -90,6 +100,7 @@ def prepare_moe_rocm(self) -> None:
     )
     _prepare_preroute_fp8(self)
     _prepare_latent_tail_fp8(self)
+    _keep_correction_bias_in_logit_dtype(self)
 
 
 def _dense_weight(linear: torch.nn.Module) -> torch.Tensor:
