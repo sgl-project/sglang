@@ -45,9 +45,17 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // Always forward max_new_tokens so that an unset wire field maps to
+            // Python None rather than SamplingParams' default of 128. The
+            // scheduler treats None as "no explicit cap" and applies its own
+            // soft upper bound (memory / max_req_len). Omitting the key here
+            // causes gRPC callers to silently cap at 128.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map(|v| serde_json::json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
@@ -667,6 +675,51 @@ mod tests {
             mapped["sampling_params"]["regex"],
             serde_json::json!("(?:a\\+b|x\\.y)")
         );
+    }
+
+    #[test]
+    fn sampling_params_forward_max_new_tokens_when_unset() {
+        // An unset max_new_tokens on the wire must propagate as JSON null so
+        // that the Python side sees `None` (the scheduler's "no explicit cap"
+        // path), NOT SamplingParams' default of 128.
+        let params = proto::SamplingParams::default();
+        let mapped = sampling_params_to_map(&Some(params)).unwrap();
+        let obj = mapped.as_object().unwrap();
+        assert_eq!(
+            obj.get("max_new_tokens"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn sampling_params_forward_max_new_tokens_when_set() {
+        let params = proto::SamplingParams {
+            max_new_tokens: Some(2048),
+            ..Default::default()
+        };
+        let mapped = sampling_params_to_map(&Some(params)).unwrap();
+        let obj = mapped.as_object().unwrap();
+        assert_eq!(obj.get("max_new_tokens"), Some(&serde_json::json!(2048)));
+    }
+
+    #[test]
+    fn generate_dicts_forward_max_new_tokens_when_unset() {
+        // Regression test for the full request path: both text and tokenized
+        // gRPC requests with no max_new_tokens must carry JSON null through to
+        // the Python-side sampling_params dict, rather than silently inheriting
+        // SamplingParams' 128 default.
+        let text_req = proto::TextGenerateRequest::default();
+        let token_req = proto::GenerateRequest::default();
+
+        for mapped in [
+            build_text_generate_dict("t", &text_req).unwrap(),
+            build_generate_dict("g", &token_req).unwrap(),
+        ] {
+            assert_eq!(
+                mapped["sampling_params"]["max_new_tokens"],
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
