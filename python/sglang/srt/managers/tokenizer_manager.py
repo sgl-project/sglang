@@ -1335,6 +1335,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
+        # A session request may leave its whole prompt to the session history.
+        session_id = (
+            obj.session_params.get("id")
+            if isinstance(obj, GenerateReqInput)
+            and isinstance(obj.session_params, dict)
+            else None
+        )
+        if input_ids is not None and len(input_ids) == 0 and not session_id:
+            raise ValueError(
+                "The input is empty (0 tokens). The prompt must contain at least one token."
+            )
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
