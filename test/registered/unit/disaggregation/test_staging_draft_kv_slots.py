@@ -9,6 +9,8 @@ draft pool exists.
 
 import unittest
 
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     build_transfer_entry_pairs,
@@ -49,6 +51,15 @@ class TestStagingDraftKvSlots(CustomTestCase):
         self.assertEqual(v_buffers, ["tV87", "tV91", "dV92"])
         self.assertEqual(slot_ids, [87, 91, 92, 87, 91, 92])
         self.assertNotEqual(slot_ids, _kv_layer_ids(target, draft))
+
+    def test_every_backend_setter_accepts_slot_layer_ids(self):
+        # Shared staging init passes slot_layer_ids to every backend's setter.
+        for backend in (MooncakeKVManager, NixlKVManager):
+            with self.subTest(backend=backend.__name__):
+                manager = object.__new__(backend)
+                manager.set_kv_buffer_tensors(
+                    ["tK87"], ["tV87"], 16, slot_layer_ids=[87, 87]
+                )
 
     def test_without_draft_matches_kv_layer_ids(self):
         # The two orders coincide with no draft pool, so every deployment that

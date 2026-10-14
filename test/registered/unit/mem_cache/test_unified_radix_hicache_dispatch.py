@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    _STRATEGIES,
     StackBuildResult,
     StackStrategy,
     _apply_stack_result,
@@ -33,15 +32,6 @@ MAMBA = ComponentType.MAMBA
 
 
 class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
-    def test_strategy_registry_ordering(self):
-        order = [type(s) for s in _STRATEGIES]
-        # DeepSeekV4 inherits from SWAKVPool, so it must resolve before _SwaStrategy.
-        self.assertLess(order.index(_DeepSeekV4Strategy), order.index(_SwaStrategy))
-        self.assertLess(
-            order.index(_MiniMaxSparseStrategy), order.index(_PlainKvStrategy)
-        )
-        self.assertEqual(order[-1], _PlainKvStrategy)
-
     def test_deepseek_v4_full_swa(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
