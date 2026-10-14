@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from .attention.plan import HEAD_DIM, Q_RANK, Dims
+from .attention.plan import HEAD_DIM, KEYS, Q_RANK, Dims
 from .common.plan import BLOCKS
 from .layer import (
     EPOCH_WORDS,
@@ -18,6 +18,7 @@ from .layer import (
     MAX_TOKENS,
     MonoBuild,
     build_mono_ffn,
+    build_mono_k2,
     peer_half_bytes,
     scratch_bytes,
 )
@@ -137,6 +138,10 @@ class DSV41MonoLayer:
         self.q = torch.zeros(
             MAX_TOKENS, self.d.heads, HEAD_DIM, dtype=torch.bfloat16, device=dev
         )
+        self.kt = torch.zeros(MAX_TOKENS * KEYS, dtype=torch.int32, device=dev)
+        self.klen = torch.zeros(2 * MAX_TOKENS, dtype=torch.int32, device=dev)
+        self.dummy = torch.zeros(4, dtype=torch.int32, device=dev)
+        self.zero_record = torch.zeros(1024, dtype=torch.uint8, device=dev)
         # K1's outputs: the attention seam's residual and mixes
         self.res_mid = torch.zeros(
             MAX_TOKENS, HC, HIDDEN, dtype=torch.bfloat16, device=dev
@@ -151,8 +156,12 @@ class DSV41MonoLayer:
         self._first_pre = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self._first_pre[:, 0] = 1.0
         # unread when K1's seam does not fold (the pending x and the comb)
-        self.unread_x = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
-        self.unread_comb = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
+        self.unread_x = torch.zeros(
+            MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev
+        )
+        self.unread_comb = torch.zeros(
+            MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev
+        )
         self.peer = PeerBuffer(2 * peer_half_bytes(tp), group, rank, tp, dev)
         self.peer.bytes.zero_()
         self._kernels: dict = {}
@@ -177,6 +186,15 @@ class DSV41MonoLayer:
         if key not in self._kernels:
             no_capture(f"FFN launch width {tokens}")
             self._kernels[key] = build_mono_ffn(MonoBuild(tokens, self.tp))
+        return self._kernels[key]
+
+    def k2_kernel(self, tokens: int, ratio: int, index: bool):
+        key = (tokens, "k2", ratio, index)
+        if key not in self._kernels:
+            no_capture(f"K2 width {tokens}, ratio {ratio}, index {index}")
+            self._kernels[key] = build_mono_k2(
+                MonoBuild(tokens, self.tp, ratio, index=index)
+            )
         return self._kernels[key]
 
     @staticmethod

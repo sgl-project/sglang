@@ -7,7 +7,11 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import rsrc, traced
+from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
+    row_sum as row_sum,
+    rsrc,
+    traced,
+)
 from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, mfma_scaled, tile_map

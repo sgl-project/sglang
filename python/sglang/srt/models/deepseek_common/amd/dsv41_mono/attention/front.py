@@ -33,6 +33,7 @@ from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.gemv import (
 from .device import (
     BLOCKS,
     CM_DEV,
+    THREADS,
     Mailbox,
     ceil_exp,
     div_rn,
@@ -59,12 +60,15 @@ from .plan import (
     HALF,
     HEAD_DIM,
     HIDDEN,
+    KEYS,
     KV_DIM,
     NOPE,
     Q_RANK,
     QKV_ROWS,
     ROPE,
     ROWS,
+    TOPK,
+    WINDOW,
     WQKV_KPARTS,
     WQKV_TASKS,
     Dims,
@@ -84,6 +88,7 @@ KGROUPS = KSTEPS * 4
 class FrontBuild:
     tokens: int
     tp: int
+    ratio: int = 0
 
 
 @traced
@@ -102,6 +107,50 @@ def await_flags(c, region, n, index):
     if tid < n:
         c["mb"].poll([(region, index(fx.min(tid, n - 1)), 1)])
     gpu.barrier()
+
+
+# ---------------------------------------------------------------- key table
+
+
+@traced
+def stage_kt(c, t):
+    """Build K2's key table from SGLang's physical compressed and SWA slots."""
+    tid = c["tid"]
+    a = c["args"]
+    ratio = c["ratio"]
+    cm = CM_DEV if const_expr(c.get("dev", False)) else 0
+    slot = ld_i32(a["slot"], 2 * t)
+    live = slot >= 0
+    nswa = fx.min(
+        live.select(ld_i32(a["swa_lens"], t), fx.Int32(0)), fx.Int32(WINDOW)
+    )
+    ntopk = (
+        fx.min(
+            live.select(ld_i32(a["topk_lens"], t), fx.Int32(0)),
+            fx.Int32(TOPK),
+        )
+        if const_expr(ratio > 0)
+        else fx.Int32(0)
+    )
+    kv_len = ntopk + nswa
+    for i in range_constexpr((KEYS + THREADS - 1) // THREADS):
+        k = tid + THREADS * i
+        sidx = fx.min(fx.max(k - ntopk, 0), fx.max(nswa - 1, 0))
+        swa_slot = ld_i32(
+            a["swa_idx"], t * fx.Int32(a["swa_idx_stride"]) + sidx
+        )
+        value = (k < kv_len).select(swa_slot, fx.Int32(-1))
+        if const_expr(ratio > 0):
+            comp_slot = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
+            comp_value = (comp_slot >= 0).select(
+                comp_slot | fx.Int32(-2147483648), fx.Int32(-1)
+            )
+            value = (k < ntopk).select(comp_value, value)
+        if k < KEYS:
+            bo.buffer_store(value, rsrc(a["kt"]), t * KEYS + k, cache_modifier=cm)
+    if tid == 0:
+        bo.buffer_store(kv_len, rsrc(a["klen"]), t, cache_modifier=cm)
+        bo.buffer_store(ntopk, rsrc(a["klen"]), c["S"] + t, cache_modifier=cm)
 
 
 # ---------------------------------------------------------------- wqkv_a
@@ -352,6 +401,7 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
         "qxsl": lds.qxsl.ptr,
         "mb": Mailbox(tag),
         "d": d,
+        "ratio": key.ratio,
         "ldbf": lambda ptr, i: fx.Float32(
             fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))
         ),
@@ -442,6 +492,10 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
             bops = wqb_weights()
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(c, task, accs, slots, order, t0, n, has_wqkv)
+
+    if const_expr(not c.get("index", False)):
+        for t in range(first_task(bid, 0), s, BLOCKS):
+            stage_kt(c, t)
 
     # ---- q / kv norms, KV insert
     for t in range(first_task(bid, QKV0), s, BLOCKS):

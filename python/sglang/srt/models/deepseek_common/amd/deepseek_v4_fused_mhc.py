@@ -609,6 +609,13 @@ def forward_hc_pre_from_prev_fused_boundary(
                 positions=positions,
                 forward_batch=forward_batch,
             )
+        if k1.k2_enabled:
+            x, residual, post, comb, pre = k1.k2(
+                positions, forward_batch, q, residual, post, comb, pre
+            )
+            if defer_post:
+                return None, pre, (x, residual, post, comb)
+            return layer.hc_post(x, residual, post, comb), pre, None
         mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
         with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = layer.self_attn(

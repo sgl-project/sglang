@@ -10,13 +10,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
+from .attention import back as mb_back
 from .attention import front as mb_front
-from .attention.plan import Dims, front_scratch
+from .attention.plan import Dims, back_scratch, front_scratch
 from .common.epoch import EPOCH_MARKS, epoch_begin, epoch_end, gstore, kernel_symbol
 from .common.mx import clamp_fp8
 from .common.ops import CM_DEV, butterfly, fp8_pack4, peer_bases, rsrc, traced
 from .common.plan import BLOCKS, THREADS, WAVES, first_task, key_tuple
-from .common.sync import Mailbox, publish, sreg
+from .common.sync import Mailbox, preg, publish, sreg
 from .sources import SOURCES
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
@@ -41,6 +42,8 @@ EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
 class MonoBuild:
     tokens: int
     tp: int
+    ratio: int = 0
+    timeline: bool = False
     # K1's seam folds the previous layer's output into the residual. Off when
     # the residual arrives settled: the broadcast embedding, or after an Engram.
     fold: bool = True
@@ -54,7 +57,11 @@ def _moe_key(key: MonoBuild) -> MoeBuild:
 
 
 def _front_key(key: MonoBuild):
-    return mb_front.FrontBuild(key.tokens, key.tp)
+    return mb_front.FrontBuild(key.tokens, key.tp, key.ratio)
+
+
+def _back_key(key: MonoBuild):
+    return mb_back.BackBuild(key.tokens, key.tp, key.ratio)
 
 
 def scratch_layout(s: int, tp: int) -> dict:
@@ -74,11 +81,13 @@ def scratch_layout(s: int, tp: int) -> dict:
 
     place(front_scratch(s, d))
     place(seam.scratch_layout(s))
+    place(back_scratch(s, d, start=0))
     regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp))).items()
     mr = {n: v for n, v in regions if n not in COUNTERS}
     lo = min(o for o, _ in mr.values())
     place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
     place({"normed": (0, s * HIDDEN * 2), "xrdy_moe": (s * HIDDEN * 2 + 256, s * 8)})
+    place({"krdy": (0, s * 8)})
     return out
 
 
@@ -153,7 +162,12 @@ def build_mono_k1(key: MonoBuild):
         front: FrontLds  # type: ignore[valid-type]
 
     name = kernel_symbol(
-        "dsv41_mono_k1", s=s, tp=tp, f=int(key.fold), i=int(key.index)
+        "dsv41_mono_k1",
+        s=s,
+        tp=tp,
+        r=key.ratio,
+        f=int(key.fold),
+        i=int(key.index),
     )
     keyed = key_tuple(key, SOURCES)
 
@@ -185,6 +199,13 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
+        swa_idx: Int64,
+        swa_idx_stride: Int32,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        kt: Int64,
+        klen: Int64,
         normed_out: Int64,
         qr_out: Int64,
         scratch: Int64,
@@ -212,6 +233,13 @@ def build_mono_k1(key: MonoBuild):
             "swa_stride": swa_stride,
             "swa_block": swa_block,
             "q": q,
+            "swa_idx": swa_idx,
+            "swa_idx_stride": swa_idx_stride,
+            "swa_lens": swa_lens,
+            "topk": topk,
+            "topk_lens": topk_lens,
+            "kt": kt,
+            "klen": klen,
             "qr_out": qr_out,
         }
         flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
@@ -305,6 +333,13 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
+        swa_idx: Int64,
+        swa_idx_stride: Int32,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        kt: Int64,
+        klen: Int64,
         normed_out: Int64,
         qr_out: Int64,
         scratch: Int64,
@@ -339,10 +374,317 @@ def build_mono_k1(key: MonoBuild):
             swa_stride,
             swa_block,
             q,
+            swa_idx,
+            swa_idx_stride,
+            swa_lens,
+            topk,
+            topk_lens,
+            kt,
+            klen,
             normed_out,
             qr_out,
             scratch,
             epoch,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+def build_mono_k2(key: MonoBuild):
+    s, tp = key.tokens, key.tp
+    assert 1 <= s <= MAX_TOKENS
+    layout = scratch_layout(s, tp)
+    bkey = _back_key(key)
+    mkey = _moe_key(key)
+    rs = route_shape(mkey)
+    assert rs.experts // 64 in SORT_NETS
+    BackM = mb_back.back_lds_members(s, Dims(tp))
+    SplitLds, GemvLds = BackM["split"], BackM["gemv"]
+    MoeLds = moe.moe_smem(s, rs)
+    half = peer_half_bytes(tp)
+    assert SLICES + 2 * s <= BLOCKS
+    SeamLds = _seam_lds(s)
+
+    @fx.union
+    class K2Lds:
+        split: SplitLds  # type: ignore[valid-type]
+        gemv: GemvLds  # type: ignore[valid-type]
+        seam: SeamLds  # type: ignore[valid-type]
+        moe: MoeLds  # type: ignore[valid-type]
+
+    name = kernel_symbol(
+        "dsv41_mono_k2", s=s, tp=tp, r=key.ratio, tl=key.timeline, i=key.index
+    )
+    keyed = key_tuple(key, SOURCES)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k2(
+        q: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        comp: Int64,
+        comp_stride: Int64,
+        comp_block: Int32,
+        kt: Int64,
+        klen: Int64,
+        slot: Int64,
+        swa_idx: Int64,
+        swa_idx_stride: Int32,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        pos: Int64,
+        sink: Int64,
+        qk_scale: Int32,
+        cos_sin: Int64,
+        woa: Int64,
+        woa_s: Int64,
+        wob: Int64,
+        wob_s: Int64,
+        zrec: Int64,
+        res_in: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        ffn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        gate_w: Int64,
+        bias: Int64,
+        w13: Int64,
+        w13_s: Int64,
+        w2: Int64,
+        w2_s: Int64,
+        sgu: Int64,
+        sgu_s: Int64,
+        sw2: Int64,
+        sw2_s: Int64,
+        out: Int64,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        tl: Int64,
+    ):
+        _ = keyed
+        bid = fx.block_idx.x
+        lds = fx.SharedAllocator().allocate(K2Lds)
+        ep = _epoch(epoch)
+        tag = (ep << 1) + 2
+        par = fx.Int64(ep & 1) * fx.Int64(half)
+        bases = [b + par for b in peer_bases(peers, tp)]
+        own = sym + par
+        bargs = {
+            "q": q,
+            "swa": swa,
+            "swa_stride": swa_stride,
+            "swa_block": swa_block,
+            "comp": comp,
+            "comp_stride": comp_stride,
+            "comp_block": comp_block,
+            "kt": kt,
+            "klen": klen,
+            "pos": pos,
+            "sink": sink,
+            "qk_scale": qk_scale,
+            "cos_sin": cos_sin,
+            "woa": woa,
+            "woa_s": woa_s,
+            "wob": wob,
+            "wob_s": wob_s,
+            "out": 0,
+            "out_stride": 0,
+            "zrec": zrec,
+        }
+        blayout = {n: layout[n] for n in back_scratch(s, Dims(tp), start=0)}
+        views = {"split": lds.split.peek(), "gemv": lds.gemv.peek()}
+        c = mb_back.back_context(bkey, views, bargs, scratch, tag, blayout)
+        amb = Mailbox(tag)
+
+        def push(t, col, v0, v1):
+            # this rank's bf16 partial pair to every rank's ATTN region
+            for p in range_constexpr(tp):
+                dst = preg(bases[p], 0, "attn")
+                amb.put_bf(dst, 2 * seam.attn_region_pair(rank, t, s, col), [v0, v1])
+
+        c["wob_out"] = push
+        if const_expr(key.timeline):
+            c["tl"], c["tl_points"] = tl, mb_back.BACK_POINTS
+        mb_back.epoch_begin(c, epoch, ep)
+        if const_expr(key.index):
+            # the key table, from the top-k vLLM's indexer selected after K1,
+            # on the last CTAs: each split task waits on its token's
+            ckt = {
+                "S": s,
+                "tid": c["tid"],
+                "dev": True,
+                "ratio": key.ratio,
+                "args": {
+                    "slot": slot,
+                    "swa_idx": swa_idx,
+                    "swa_idx_stride": swa_idx_stride,
+                    "swa_lens": swa_lens,
+                    "topk": topk,
+                    "topk_lens": topk_lens,
+                    "kt": kt,
+                    "klen": klen,
+                },
+            }
+            c["krdy"] = sreg(scratch, layout["krdy"][0], "krdy")
+            for t in range(first_task(bid, BLOCKS - s), s, BLOCKS):
+                mb_front.stage_kt(ckt, t)
+                mb_back.publish(c, c["krdy"], t)
+        mb_back.run_back(c, bkey, bid)
+        gpu.barrier()
+
+        ffn = dict(
+            res_in=res_in,
+            post_in=post_in,
+            comb_in=comb_in,
+            pre_in=pre_in,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            ffn_w=ffn_w,
+            res_out=res_out,
+            post_out=post_out,
+            comb_out=comb_out,
+            pre_out=pre_out,
+            gate_w=gate_w,
+            bias=bias,
+            w13=w13,
+            w13_s=w13_s,
+            w2=w2,
+            w2_s=w2_s,
+            sgu=sgu,
+            sgu_s=sgu_s,
+            sw2=sw2,
+            sw2_s=sw2_s,
+            out=out,
+            scratch=scratch,
+            epoch=epoch,
+        )
+        run_ffn(key, lds, ffn, amb, bases, own, rank, ep)
+
+    @flyc.jit
+    def launch(
+        q: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        comp: Int64,
+        comp_stride: Int64,
+        comp_block: Int32,
+        kt: Int64,
+        klen: Int64,
+        slot: Int64,
+        swa_idx: Int64,
+        swa_idx_stride: Int32,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        pos: Int64,
+        sink: Int64,
+        qk_scale: Int32,
+        cos_sin: Int64,
+        woa: Int64,
+        woa_s: Int64,
+        wob: Int64,
+        wob_s: Int64,
+        zrec: Int64,
+        res_in: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        ffn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        gate_w: Int64,
+        bias: Int64,
+        w13: Int64,
+        w13_s: Int64,
+        w2: Int64,
+        w2_s: Int64,
+        sgu: Int64,
+        sgu_s: Int64,
+        sw2: Int64,
+        sw2_s: Int64,
+        out: Int64,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        tl: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k2(
+            q,
+            swa,
+            swa_stride,
+            swa_block,
+            comp,
+            comp_stride,
+            comp_block,
+            kt,
+            klen,
+            slot,
+            swa_idx,
+            swa_idx_stride,
+            swa_lens,
+            topk,
+            topk_lens,
+            pos,
+            sink,
+            qk_scale,
+            cos_sin,
+            woa,
+            woa_s,
+            wob,
+            wob_s,
+            zrec,
+            res_in,
+            post_in,
+            comb_in,
+            pre_in,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            ffn_w,
+            res_out,
+            post_out,
+            comb_out,
+            pre_out,
+            gate_w,
+            bias,
+            w13,
+            w13_s,
+            w2,
+            w2_s,
+            sgu,
+            sgu_s,
+            sw2,
+            sw2_s,
+            out,
+            scratch,
+            sym,
+            peers,
+            rank,
+            epoch,
+            tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

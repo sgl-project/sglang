@@ -13,12 +13,28 @@ NOPE = 448
 ROPE = 64
 HALF = ROPE // 2
 N_HEADS = 64
+O_GROUPS = 8
+O_RANK = 1024
+# Plain decode has 128 SWA slots. DSpark target verify appends its draft block
+# and pads the row to 192 slots, so the fused key table must cover either form.
+WINDOW = 192
+TOPK = 512
 EPS = 1e-20
 
 ROWS = 16  # GEMV rows a task
+TILE = 16
+HEAD_TILE = 16
+WOA_ROWS = 32
+MAX_TOKENS = 48
 
 # KV record (V4 fp8_ds_mla): 576 B rows (448 e4m3, 64 bf16), then 8 B of scales a token
 DATA = 576
+SCALE_BYTES = 8
+
+BK = 16
+SPLITS = 64
+COLS = 32
+GROUPS = HEAD_DIM // COLS
 
 PAIR = 8  # a mailbox (value, tag) pair
 
@@ -43,6 +59,22 @@ class Dims:
         return N_HEADS // self.tp
 
     @property
+    def head_tiles(self) -> int:
+        return self.heads // HEAD_TILE
+
+    @property
+    def groups(self) -> int:
+        return O_GROUPS // self.tp
+
+    @property
+    def group_k(self) -> int:
+        return self.heads // self.groups * HEAD_DIM
+
+    @property
+    def o_rows(self) -> int:
+        return self.groups * O_RANK
+
+    @property
     def q_rows(self) -> int:
         return self.heads * HEAD_DIM
 
@@ -50,9 +82,26 @@ class Dims:
     def wqb_tasks(self) -> int:
         return self.q_rows // ROWS
 
+    @property
+    def woa_tasks(self) -> int:
+        return self.o_rows // WOA_ROWS
+
+    @property
+    def wob_tasks(self) -> int:
+        return HIDDEN // ROWS
+
 
 WQKV_TASKS = QKV_ROWS // ROWS  # 112
 WQKV_KPARTS = 2  # X8's K halves (a flag each); an LDS window of the wqkv GEMV
+KEYS = TOPK + WINDOW
+
+
+def token_tiles(s):
+    return [(t0, min(TILE, s - t0)) for t0 in range(0, s, TILE)]
+
+
+def tile_rows(s):
+    return min(s, TILE)
 
 
 def wqkv_order(s):
@@ -86,3 +135,31 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qrdy", s * PAIR),
         ]
     )
+
+
+def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
+    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+    nchunk = cdiv(KEYS, ck)
+    return byte_layout(
+        [
+            ("part", s * nchunk * d.heads * HEAD_DIM * 2),
+            ("pstat", s * nchunk * d.heads * 8),
+            ("srdy", s * nchunk * PAIR),
+            ("xo", s * d.q_rows),
+            ("xos", s * d.q_rows // 32 * 4),
+            ("crdy", s * d.heads // 8 * PAIR),
+            ("x8b", s * d.o_rows),
+            ("x8bs", s * d.o_rows // 32 * 4),
+            ("ardy", d.woa_tasks * PAIR),
+        ],
+        start=start,
+    )
+
+
+def front_end(s: int, d: Dims) -> int:
+    return round_up(max(o + n for o, n in front_scratch(s, d).values()), 256)
+
+
+def scratch_bytes(s: int, d: Dims) -> int:
+    b = back_scratch(s, d, start=front_end(s, d))
+    return round_up(max(o + n for o, n in b.values()), 4096)

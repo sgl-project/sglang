@@ -180,14 +180,15 @@ def k1_variant_cases():
 
     old_decode = os.environ.get("SGLANG_ROCM_MONO_DECODE")
     old_k1 = os.environ.get("SGLANG_ROCM_MONO_K1")
+    old_k2 = os.environ.get("SGLANG_ROCM_MONO_K2")
     unsupported = m._unsupported
     unsupported_k1 = m._unsupported_k1
     mono_ffn, mono_k1 = m.MonoFfn, m.MonoK1
     seen = []
 
     class K1:
-        def __init__(self, layer, fold=True, index=False):
-            self.fold, self.index = fold, index
+        def __init__(self, layer, ratio, fold=True, index=False, k2=False):
+            self.ratio, self.fold, self.index, self.k2 = ratio, fold, index, k2
 
     def layer(layer_id, *, engram=False, index=False):
         attn = types.SimpleNamespace(
@@ -207,6 +208,7 @@ def k1_variant_cases():
     try:
         os.environ["SGLANG_ROCM_MONO_DECODE"] = "1"
         os.environ["SGLANG_ROCM_MONO_K1"] = "1"
+        os.environ["SGLANG_ROCM_MONO_K2"] = "1"
         m._unsupported = lambda config: None
         m._unsupported_k1 = lambda attn: None
         m.MonoFfn = lambda layer: object()
@@ -229,6 +231,7 @@ def k1_variant_cases():
         for key, value in (
             ("SGLANG_ROCM_MONO_DECODE", old_decode),
             ("SGLANG_ROCM_MONO_K1", old_k1),
+            ("SGLANG_ROCM_MONO_K2", old_k2),
         ):
             if value is None:
                 os.environ.pop(key, None)

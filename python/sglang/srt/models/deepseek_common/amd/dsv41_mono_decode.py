@@ -157,13 +157,108 @@ def _unsupported_k1(attn) -> Optional[str]:
     return None
 
 
+# Checkpoint fp8 wo_a (weight, scale), keyed by the name seen before dequant.
+# The loader turns wo_a into bf16 unless the fp8 GEMM flag is on. K2 still reads fp8.
+_fp8_wo_a: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _install_wo_a_capture() -> None:
+    """Remember each fp8 wo_a pair as the loader dequantizes it to bf16."""
+    if not envs.SGLANG_ROCM_MONO_K2.get():
+        return
+    import sglang.srt.models.deepseek_v4 as dsv4
+
+    current = dsv4._dequant_fp8_wo_a_streaming
+    if getattr(current, "_mono_captures_wo_a", False):
+        return
+
+    def streaming(weights):
+        pending: dict[str, dict[str, torch.Tensor]] = {}
+
+        def watch(stream):
+            for name, tensor in stream:
+                kind = None
+                if name.endswith(".wo_a.weight"):
+                    kind, prefix = "weight", name[: -len(".weight")]
+                elif name.endswith(".wo_a.scale"):
+                    kind, prefix = "scale", name[: -len(".scale")]
+                if kind is not None:
+                    bucket = pending.setdefault(prefix, {})
+                    bucket[kind] = tensor.detach().clone()
+                    if "weight" in bucket and "scale" in bucket:
+                        _fp8_wo_a[prefix] = (bucket["weight"], bucket["scale"])
+                        pending.pop(prefix, None)
+                yield name, tensor
+
+        return current(watch(weights))
+
+    streaming._mono_captures_wo_a = True
+    dsv4._dequant_fp8_wo_a_streaming = streaming
+
+
+def _shard_dim0(tensor: torch.Tensor, local_rows: int, rank: int, tp: int, what: str):
+    rows = tensor.shape[0]
+    if rows == local_rows:
+        shard = tensor
+    elif tp > 1 and rows == local_rows * tp:
+        shard = tensor.narrow(0, rank * local_rows, local_rows)
+    else:
+        raise RuntimeError(
+            f"K2: {what} has {rows} rows, this rank wants {local_rows} at TP {tp}"
+        )
+    return shard.contiguous()
+
+
+def _local_fp8_wo_a(layer) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's fp8 wo_a weight and its block scales, captured before dequant."""
+    attn = layer.self_attn
+    layer_id = str(attn.layer_id)
+
+    def matches(key: str) -> bool:
+        parts = key.split(".")
+        if "mtp" in parts or parts[-1] != "wo_a":
+            return False
+        try:
+            i = parts.index("layers")
+        except ValueError:
+            return False
+        return i + 1 < len(parts) and parts[i + 1] == layer_id
+
+    hits = [key for key in _fp8_wo_a if matches(key)]
+    if len(hits) != 1:
+        raise RuntimeError(
+            f"K2: layer {layer_id} fp8 wo_a stash is {hits or 'missing'}"
+        )
+    weight, scale = _fp8_wo_a.pop(hits[0])
+    if weight.dtype != torch.float8_e4m3fn or scale.dim() != 2:
+        raise RuntimeError(
+            f"K2: stashed wo_a {tuple(weight.shape)} {weight.dtype}, "
+            f"scale {tuple(scale.shape)} {scale.dtype}"
+        )
+    local_rows = attn.n_local_groups * attn.o_lora_rank
+    tp, rank = attn.attn_tp_size, attn.attn_tp_rank
+    if scale.shape[0] % tp != 0:
+        raise RuntimeError(
+            f"K2: wo_a scale rows {scale.shape[0]} do not divide across TP {tp}"
+        )
+    device = attn.wqkv_a.weight.device
+    weight = _shard_dim0(weight, local_rows, rank, tp, "wo_a").to(device=device)
+    scale = _shard_dim0(
+        scale, scale.shape[0] // tp, rank, tp, "wo_a scale"
+    ).to(device=device)
+    return weight, scale
+
+
 def init_layer(layer) -> None:
     """Attach the layer's FFN launch and K1 launch (or None); an opt-in the deployment cannot serve raises."""
+    _install_wo_a_capture()
     layer.mono_ffn = layer.mono_k1 = None
     if not envs.SGLANG_ROCM_MONO_DECODE.get():
-        if envs.SGLANG_ROCM_MONO_K1.get():
-            raise ValueError("SGLANG_ROCM_MONO_K1 needs SGLANG_ROCM_MONO_DECODE=1.")
+        if envs.SGLANG_ROCM_MONO_K1.get() or envs.SGLANG_ROCM_MONO_K2.get():
+            raise ValueError("SGLANG_ROCM_MONO_K1/K2 need SGLANG_ROCM_MONO_DECODE=1.")
         return
+    if envs.SGLANG_ROCM_MONO_K2.get() and not envs.SGLANG_ROCM_MONO_K1.get():
+        raise ValueError("SGLANG_ROCM_MONO_K2 needs SGLANG_ROCM_MONO_K1=1.")
     # draft layers (DSpark stages, next-n layers) keep the normal path
     if layer.mlp.is_nextn:
         return
@@ -184,10 +279,12 @@ def init_layer(layer) -> None:
         ):
             layer.mono_k1 = MonoK1(
                 layer,
+                ratio=a.compress_ratio,
                 fold=not (
                     a.layer_id == 0 or getattr(layer, "engram", None) is not None
                 ),
                 index=a.indexer is not None,
+                k2=envs.SGLANG_ROCM_MONO_K2.get(),
             )
 
 
@@ -292,9 +389,9 @@ _k1_kernels: dict = {}
 _k1_tables: list = []
 
 
-def _k1_kernel(rows: int, tp: int, fold: bool = True, index: bool = False):
+def _k1_kernel(rows: int, tp: int, ratio: int, fold: bool = True, index: bool = False):
     """K1 for ``rows`` rows at TP ``tp``. ``fold`` and ``index`` select the build."""
-    key = (rows, tp, fold, index)
+    key = (rows, tp, ratio, fold, index)
     k = _k1_kernels.get(key)
     if k is None:
         from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import (
@@ -305,11 +402,12 @@ def _k1_kernel(rows: int, tp: int, fold: bool = True, index: bool = False):
 
         no_capture(f"K1 width {rows}")
         k = _k1_kernels[key] = build_mono_k1(
-            MonoBuild(rows, tp, fold=fold, index=index)
+            MonoBuild(rows, tp, ratio, fold=fold, index=index)
         )
         logger.info(
-            "DeepSeek-V4.1 mono decode: K1 runs steps of %d rows (fold=%s, index=%s)",
+            "DeepSeek-V4.1 mono decode: K1 runs steps of %d rows (ratio=%d, fold=%s, index=%s)",
             rows,
+            ratio,
             fold,
             index,
         )
@@ -340,21 +438,106 @@ def _e8m0(scale: torch.Tensor) -> torch.Tensor:
     return (bits >> 23).to(torch.uint8)
 
 
+def _gemv_e8m0(scale: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+    """Return the 32x32 E8M0 scale grid consumed by the mono GEMV.
+
+    The attention output projections use AITER's 128x128 scale grid. Each
+    coarse scale applies uniformly to its sixteen 32x32 sub-blocks, so expand
+    that grid without changing the represented weight.
+    """
+    target = (shape[0] // 32, shape[1] // 32)
+    if scale.dtype == getattr(torch, "float8_e8m0fnu", None):
+        scale = scale.view(torch.uint8)
+    codes = scale.contiguous() if scale.dtype == torch.uint8 else _e8m0(scale)
+    if codes.numel() == target[0] * target[1]:
+        return codes.reshape(target).contiguous()
+    coarse = (shape[0] // 128, shape[1] // 128)
+    if codes.numel() == coarse[0] * coarse[1]:
+        return (
+            codes.reshape(coarse)
+            .repeat_interleave(4, dim=0)
+            .repeat_interleave(4, dim=1)
+            .contiguous()
+        )
+    raise RuntimeError(
+        f"K1: scales {tuple(scale.shape)} {scale.dtype}, want {target} or {coarse}"
+    )
+
+
+def _check_sparse_metadata(
+    swa_idx: torch.Tensor,
+    swa_lens: torch.Tensor,
+    topk: torch.Tensor,
+    topk_lens: torch.Tensor,
+    rows: int,
+    ratio: int,
+) -> int:
+    """Validate the physical-slot tables read by K1/K2 and return the SWA row stride."""
+    from sglang.srt.models.deepseek_common.amd.dsv41_mono.attention.plan import (
+        TOPK,
+        WINDOW,
+    )
+
+    if not (
+        swa_idx.dtype == torch.int32
+        and swa_idx.dim() == 2
+        and swa_idx.shape[0] >= rows
+        and swa_idx.stride(1) == 1
+        and swa_idx.shape[1] <= swa_idx.stride(0) <= WINDOW
+        and swa_lens.dtype == torch.int32
+        and swa_lens.numel() >= rows
+    ):
+        raise RuntimeError(
+            f"K1: SWA indices {swa_idx.dtype} {tuple(swa_idx.shape)} "
+            f"{swa_idx.stride()}, lengths {swa_lens.dtype} {tuple(swa_lens.shape)}"
+        )
+    if ratio and not (
+        topk.dtype == torch.int32
+        and topk.dim() == 2
+        and topk.shape[0] >= rows
+        and topk.stride(1) == 1
+        and topk.stride(0) == TOPK
+        and topk_lens.dtype == torch.int32
+        and topk_lens.numel() >= rows
+    ):
+        raise RuntimeError(
+            f"K1: sparse indices {topk.dtype} {tuple(topk.shape)} "
+            f"{topk.stride()}, lengths {topk_lens.dtype} {tuple(topk_lens.shape)}"
+        )
+    return swa_idx.stride(0)
+
+
 class MonoK1:
-    """One layer's K1 launch: the attention mHC seam and the attention front.
+    """One layer's K1 launch, with an optional K2 attention back.
 
     ``fold`` is false when the residual arrives settled (layer 0, after an Engram).
     ``index`` is true on an index source: K1 also stores the normed input and bf16 qr.
     """
 
-    def __init__(self, layer, fold: bool = True, index: bool = False):
+    def __init__(
+        self,
+        layer,
+        ratio: int,
+        fold: bool = True,
+        index: bool = False,
+        k2: bool = False,
+    ):
         self.layer = layer
+        self.ratio = ratio
         self.fold = fold
         self.index = index
+        self.k2_enabled = k2
         self._weights = None
-        # (wqkv_a, wq_b) as loaded, from stash_k1_weights
+        # (wqkv_a, wq_b, wo_a, wo_b) as loaded, from stash_k1_weights
         self.plain = None
+        # fp8 wo_a block scales, when the loader dequantized the module weight to bf16
+        self.wo_a_scale = None
         self.cos_sin = _cos_sin(layer.self_attn.freqs_cis)
+        self.qk_scale = (
+            torch.tensor([512**-0.5 * 1.4426950408889634], dtype=torch.float32)
+            .view(torch.int32)
+            .item()
+        )
 
     def weights(self):
         if self._weights is not None:
@@ -364,13 +547,18 @@ class MonoK1:
         if self.plain is None:
             raise RuntimeError("stash_k1_weights did not run after loading")
 
-        def fp8(lin, plain, shape):
+        def fp8(lin, plain, shape, scale=None):
             # the FP8 linear method may rewrite the weight in place; K1 reads the row-major copy
             shuffled = getattr(lin, "aiter_bpreshuffled", False) or getattr(
                 lin, "mxfp8_native_ready", False
             )
-            w = plain if shuffled else lin.weight
-            s = _e8m0(lin.weight_scale_inv)
+            if scale is None:
+                w = plain if shuffled else lin.weight
+                scale = lin.weight_scale_inv
+            else:
+                # the module weight was dequantized to bf16; plain is the fp8 copy
+                w = plain
+            s = _gemv_e8m0(scale, shape)
             if not (
                 tuple(w.shape) == shape
                 and w.dtype == torch.float8_e4m3fn
@@ -384,7 +572,17 @@ class MonoK1:
 
         wqkv, wqkv_s = fp8(a.wqkv_a, self.plain[0], (1792, 5120))
         wqb, wqb_s = fp8(a.wq_b, self.plain[1], (heads * 512, 1280))
-        # free the copies K1 does not read
+        groups = a.n_local_groups
+        if self.wo_a_scale is not None or hasattr(a.wo_a, "weight_scale_inv"):
+            woa, woa_s = fp8(
+                a.wo_a, self.plain[2], (groups * 1024, 4096), self.wo_a_scale
+            )
+        elif self.k2_enabled:
+            raise RuntimeError("K2: wo_a has no fp8 weight scale")
+        else:
+            woa = self.plain[2]
+            woa_s = torch.empty(0, dtype=torch.uint8, device=woa.device)
+        wob, wob_s = fp8(a.wo_b, self.plain[3], (5120, groups * 1024))
         self.plain = None
         self._weights = dict(
             hc_fn=layer.hc_attn_fn,
@@ -397,6 +595,11 @@ class MonoK1:
             kv_norm=a.kv_norm.weight,
             wqb=wqb,
             wqb_s=wqb_s,
+            woa=woa,
+            woa_s=woa_s,
+            wob=wob,
+            wob_s=wob_s,
+            sink=a._local_attn_sink(heads).contiguous(),
             cos_sin=self.cos_sin,
         )
         w = self._weights
@@ -436,7 +639,8 @@ class MonoK1:
             raise RuntimeError(
                 f"K1: q buffer {tuple(r.q.shape)}, {self.layer.self_attn.n_local_heads} heads"
             )
-        slot = get_attn_backend().get_swa_out_cache_loc(forward_batch)
+        backend = get_attn_backend()
+        slot = backend.get_swa_out_cache_loc(forward_batch)
         # K1 writes through raw pointers: a layout it does not expect would corrupt memory, not fault
         if not (1 <= M <= MAX_ROWS and slot.shape[0] >= M and positions.shape[0] >= M):
             raise RuntimeError(
@@ -465,6 +669,18 @@ class MonoK1:
                 slot[:M].to(torch.int64).contiguous(),
             )
         _, pos, slot = meta
+        metadata = backend.forward_metadata
+        core = metadata.core_attn_metadata
+        swa_idx = core.swa_page_indices
+        swa_lens = core.swa_topk_lengths
+        if self.ratio:
+            topk = core.sparse_page_indices(self.ratio)
+            topk_lens = core.sparse_topk_lengths(self.ratio)
+        else:
+            topk = topk_lens = r.dummy
+        swa_idx_stride = _check_sparse_metadata(
+            swa_idx, swa_lens, topk, topk_lens, M, self.ratio
+        )
         pool = get_token_to_kv_pool()
         if pool.request_window is not None or pool.uniform_fp8:
             raise RuntimeError("K1 needs the paged V4 SWA pool")
@@ -479,7 +695,7 @@ class MonoK1:
             raise RuntimeError(
                 f"K1: SWA cache {swa.dtype} {tuple(swa.shape)} {swa.stride()}, page {block} x 584 B"
             )
-        _k1_kernel(M, r.tp, self.fold, self.index)(
+        _k1_kernel(M, r.tp, self.ratio, self.fold, self.index)(
             residual.data_ptr(),
             x.data_ptr(),
             post.data_ptr(),
@@ -506,6 +722,13 @@ class MonoK1:
             swa.stride(0),
             block,
             r.q.data_ptr(),
+            swa_idx.data_ptr(),
+            swa_idx_stride,
+            swa_lens.data_ptr(),
+            topk.data_ptr(),
+            topk_lens.data_ptr(),
+            r.kt.data_ptr(),
+            r.klen.data_ptr(),
             r.normed.data_ptr(),
             r.qr.data_ptr(),
             r.scratch(M).data_ptr(),
@@ -524,17 +747,132 @@ class MonoK1:
             qr,
         )
 
+    def k2(self, positions, forward_batch, q, residual, post, comb, pre):
+        """Run attention from K1's query through wo_b, then the FFN launch."""
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        M = q.shape[0]
+        r = _get_runner(q.device)
+        aw = self.weights()
+        fw = self.layer.mono_ffn.weights()
+        backend = get_attn_backend()
+        core = backend.forward_metadata.core_attn_metadata
+        _, pos, slot = forward_batch._mono_k1_meta
+        swa_idx = core.swa_page_indices
+        swa_lens = core.swa_topk_lengths
+        pool = get_token_to_kv_pool()
+        lid = self.layer.self_attn.layer_id
+        swa = pool.get_swa_raw_buffer(lid)
+        swa_block = pool.get_swa_key_page_size()
+        if self.ratio:
+            comp = pool.get_extra_key_buffer(lid)
+            comp_block = pool.get_extra_key_page_size(lid)
+            topk = core.sparse_page_indices(self.ratio)
+            topk_lens = core.sparse_topk_lengths(self.ratio)
+        else:
+            comp = topk = topk_lens = r.dummy
+            comp_block = 1
+        swa_idx_stride = _check_sparse_metadata(
+            swa_idx, swa_lens, topk, topk_lens, M, self.ratio
+        )
+        comp_stride = comp.stride(0) if comp.dim() > 1 else 0
+        outs = r._outs(M, residual)
+        out, res_out, post_out, comb_out, pre_out = outs
+        r.k2_kernel(M, self.ratio, self.index)(
+            q.data_ptr(),
+            swa.data_ptr(),
+            swa.stride(0),
+            swa_block,
+            comp.data_ptr(),
+            comp_stride,
+            comp_block,
+            r.kt.data_ptr(),
+            r.klen.data_ptr(),
+            slot.data_ptr(),
+            swa_idx.data_ptr(),
+            swa_idx_stride,
+            swa_lens.data_ptr(),
+            topk.data_ptr(),
+            topk_lens.data_ptr(),
+            pos.data_ptr(),
+            aw["sink"].data_ptr(),
+            self.qk_scale,
+            aw["cos_sin"].data_ptr(),
+            aw["woa"].data_ptr(),
+            aw["woa_s"].data_ptr(),
+            aw["wob"].data_ptr(),
+            aw["wob_s"].data_ptr(),
+            r.zero_record.data_ptr(),
+            residual.data_ptr(),
+            post.data_ptr(),
+            comb.data_ptr(),
+            pre.data_ptr(),
+            fw.hc_ffn_fn.data_ptr(),
+            fw.hc_ffn_scale.data_ptr(),
+            fw.hc_ffn_base.data_ptr(),
+            fw.ffn_norm.data_ptr(),
+            res_out.data_ptr(),
+            post_out.data_ptr(),
+            comb_out.data_ptr(),
+            pre_out.data_ptr(),
+            fw.gate_w.data_ptr(),
+            fw.bias.data_ptr(),
+            fw.w13.data_ptr(),
+            fw.w13_s.data_ptr(),
+            fw.w2.data_ptr(),
+            fw.w2_s.data_ptr(),
+            fw.sgu.data_ptr(),
+            fw.sgu_s.data_ptr(),
+            fw.sw2.data_ptr(),
+            fw.sw2_s.data_ptr(),
+            out.data_ptr(),
+            r.scratch(M).data_ptr(),
+            r.peer.local,
+            r.peer.addresses.data_ptr(),
+            r.rank,
+            r.epoch.data_ptr(),
+            0,
+            stream=torch.cuda.current_stream(),
+        )
+        return out, res_out, post_out.view(M, -1), comb_out, pre_out
+
 
 def stash_k1_weights(layers) -> None:
-    """Copy the K1 layers' row-major wqkv_a and wq_b weights before the FP8 linear method rewrites them."""
+    """Copy the K1 layers' row-major weights before the FP8 linear method rewrites them.
+
+    wo_a is copied from the fp8 checkpoint pair when the loader already turned
+    the module weight into bf16. wo_b stays on the module, which keeps its scale.
+    """
     for layer in layers:
         k1 = getattr(layer, "mono_k1", None)
-        if k1 is not None:
-            a = layer.self_attn
-            k1.plain = (
-                a.wqkv_a.weight.detach().clone(),
-                a.wq_b.weight.detach().clone(),
+        if k1 is None:
+            continue
+        a = layer.self_attn
+        if a.wo_a.weight.dtype == torch.float8_e4m3fn:
+            wo_a = a.wo_a.weight.detach().clone()
+            k1.wo_a_scale = None
+        elif k1.k2_enabled:
+            wo_a, k1.wo_a_scale = _local_fp8_wo_a(layer)
+        else:
+            wo_a = a.wo_a.weight.detach().clone()
+            k1.wo_a_scale = None
+        if k1.k2_enabled and (
+            a.wo_b.weight.dtype != torch.float8_e4m3fn
+            or not hasattr(a.wo_b, "weight_scale_inv")
+        ):
+            raise RuntimeError(
+                f"K2: wo_b is {a.wo_b.weight.dtype} with no fp8 scale"
             )
+        k1.plain = (
+            a.wqkv_a.weight.detach().clone(),
+            a.wq_b.weight.detach().clone(),
+            wo_a,
+            a.wo_b.weight.detach().clone(),
+        )
+    _fp8_wo_a.clear()
 
 
 def k1_arguments(k1, hidden_states, pending_post, prev_pre):
