@@ -500,12 +500,19 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
             return self.forward_native(
                 branch, residual, sandwich_weight, out_weight, eps, scales
             )
+        from sglang.kernels.jit.utils import is_arch_support_pdl
         from sglang.kernels.ops.layernorm.beam_fused import (
             fused_sandwich_residual_rmsnorm,
         )
 
         return fused_sandwich_residual_rmsnorm(
-            branch, residual, sandwich_weight, out_weight, eps, *scales
+            branch,
+            residual,
+            sandwich_weight,
+            out_weight,
+            eps,
+            *scales,
+            enable_pdl=is_arch_support_pdl(),
         )
 
 
@@ -653,5 +660,20 @@ register_kernel(
         op="layernorm.rms_normalize_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.rmsnorm_fanout",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.layernorm.rmsnorm_fanout:rmsnorm_fanout",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=_NORM_DTYPES,
+            description="Three weighted RMSNorm outputs sharing a single-CTA row reduction.",
+        ),
     )
 )

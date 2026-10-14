@@ -12,7 +12,6 @@
 //! a `PyObject`.
 
 mod api_server;
-mod frontend;
 mod message;
 mod multi_modality;
 mod tokenizer_manager;
@@ -22,8 +21,8 @@ pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RustServerServerArgs, ServerArgs,
 };
-pub use message::multimodal::MmItem;
-pub use message::request::{MmData, ProcessorExtensions};
+pub use message::multimodal::{MediaHints, MmItem};
+pub use message::request::MmData;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
@@ -39,7 +38,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
-use crate::utils::startup::{listen_addr, value_error};
+use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
@@ -151,6 +150,11 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
     Ok((buffer.name, value))
 }
 
+/// Wraps the HTTP app before it serves: an embedding package's own middleware
+/// or routes ([`Server::start_with_http_layer`]). It wraps every route but the
+/// PD bootstrap registry's, inside the access log.
+pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
+
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
 #[pyclass]
@@ -183,29 +187,15 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
     ) -> PyResult<Self> {
-        // `server_args` already arrived typed (pyo3 rejected any missing/extra/
-        // mistyped field when Python constructed it); only value checks remain.
-        server_args
-            .validate()
-            .map_err(|e| value_error("server_args", e))?;
-        // The host and base port come from `server_args`; DP ranks only supply
-        // their offset so this boundary has one source of truth for the address.
-        let http_addr = listen_addr(&server_args, port_offset)
-            .map_err(|e| value_error("bad listen address", e))?;
-
-        let cfg = RuntimeConfig {
-            rust_server_args: RustServerServerArgs {
-                http_addr,
-                http_api_worker_num: server_args.http_api_worker_num(),
-                to_scheduler_cap,
-                from_scheduler_cap,
-                stage_channel_cap,
-                cores,
-            },
-            server_args: std::sync::Arc::new(server_args),
-        };
-        let rt = runtime::start(cfg).map_err(|e| value_error("runtime start failed", e))?;
-        Ok(Self { rt })
+        Self::start_with_http_layer(
+            server_args,
+            port_offset,
+            to_scheduler_cap,
+            from_scheduler_cap,
+            stage_channel_cap,
+            cores,
+            None,
+        )
     }
 
     /// Non-blocking drain of the to_scheduler channel: one [`IngressRequest`]
@@ -291,6 +281,47 @@ impl Server {
 }
 
 impl Server {
+    /// [`Server::start`], with `http_layer` wrapping the HTTP app (see
+    /// [`HttpLayer`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_http_layer(
+        server_args: ServerArgs,
+        port_offset: Option<u16>,
+        to_scheduler_cap: usize,
+        from_scheduler_cap: usize,
+        stage_channel_cap: usize,
+        cores: Option<Vec<usize>>,
+        http_layer: Option<HttpLayer>,
+    ) -> PyResult<Self> {
+        // `server_args` already arrived typed (pyo3 rejected any missing/extra/
+        // mistyped field when Python constructed it); only value checks remain.
+        server_args
+            .validate()
+            .map_err(|e| value_error("server_args", e))?;
+        // The host and base port come from `server_args`; DP ranks only supply
+        // their offset so this boundary has one source of truth for the address.
+        let http_addr = listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad listen address", e))?;
+        let grpc_addr = grpc_listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad gRPC listen address", e))?;
+
+        let cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr,
+                grpc_addr,
+                http_api_worker_num: server_args.http_api_worker_num(),
+                to_scheduler_cap,
+                from_scheduler_cap,
+                stage_channel_cap,
+                cores,
+            },
+            server_args: std::sync::Arc::new(server_args),
+        };
+        let rt =
+            runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;
+        Ok(Self { rt })
+    }
+
     /// Start the shared worker pool with a processor supplied by an external
     /// model package. The default Python API retains the built-in Qwen path.
     /// `feature_shm` is the package's own `_use_feature_shm` answer: place

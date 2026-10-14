@@ -31,7 +31,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
@@ -40,7 +40,7 @@ if is_xpu():
     from sglang.kernels.ops.speculative.reconstruct_tree import (
         reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
     )
-elif is_cuda():
+elif is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 else:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
@@ -101,7 +101,6 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = self.model_runner.tp_rank
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth

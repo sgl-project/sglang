@@ -11,6 +11,7 @@ from sglang.srt.function_call.response_template_structural_tag import (
     supports_tool_call_structural_tag,
     tool_call_structural_tag,
 )
+from sglang.srt.parser.chat_parsing.content_parsers import parse_content
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -71,6 +72,7 @@ def _build(
     parallel=True,
     thinking=True,
     answer=False,
+    sorted_arguments=False,
 ):
     loaded = load_response_template(template)
     return tool_call_structural_tag(
@@ -79,6 +81,7 @@ def _build(
         parallel_tool_calls=parallel,
         thinking=loaded.fields["thinking"] if thinking else None,
         answer=loaded.fields["content"] if answer else None,
+        sorted_arguments=sorted_arguments,
     )
 
 
@@ -414,6 +417,96 @@ class TestToolCallStructuralTag(CustomTestCase):
         self.assertFalse(_accepts(_build(tools=[_tool(parameters)]), off_schema))
         self.assertTrue(_accepts(_build(tools=[_tool(None)]), _call()))
         self.assertFalse(_accepts(_build(tools=[_tool(None)]), _call(("a", "x"))))
+
+    def test_strict_arguments_follow_declared_or_sorted_order(self):
+        parameters = {
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path"],
+        }
+        # Calls, and whether they are accepted without and with sorted arguments.
+        cases = [
+            (_call(("path", "a"), ("content", "b")), True, True),
+            (_call(("content", "b"), ("path", "a")), False, True),
+            (_call(("path", "a")), True, True),
+            (_call(("content", "b")), False, False),
+            (_call(("path", "a"), ("path", "c")), False, False),
+            (_call(("path", "a"), ("mode", "c")), False, False),
+        ]
+        tags = [
+            _build(tools=[_tool(parameters)], sorted_arguments=sorted_arguments)
+            for sorted_arguments in (False, True)
+        ]
+        for text, *expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual([_accepts(tag, text) for tag in tags], expected)
+
+    def test_values_end_where_a_lookahead_end_does(self):
+        template = copy.deepcopy(TEMPLATE)
+        content_args = template["fields"]["tool_calls"]["content_args"]
+        content_args["tag_pattern"] = (
+            r'<arg name="(?P<key>[^"]+)">(?P<value>.*?)\n(?:</arg>|(?=<arg name="))'
+        )
+        # Bodies, and whether a loose and a strict tool accept them.
+        cases = [
+            ('<arg name="city">Paris\n</arg>\n<arg name="days">3\n</arg>', True, True),
+            ('<arg name="city">Paris\n<arg name="days">3\n</arg>', True, True),
+            ('<arg name="days">3\n<arg name="city">Paris\n</arg>', True, False),
+            ('<arg name="city">Paris\n<arg name="city">Lyon\n</arg>', True, False),
+            ('<arg name="city">Paris\n<arg name="hours">3\n</arg>', True, False),
+            ('<arg name="city">Paris\n<arg name="', False, False),
+            ('<arg name="city">Paris\n<arg name="days\n</arg>', False, False),
+            ('<arg name="city">a <arg name="b"> c\n</arg>', True, True),
+        ]
+        parameters = WEATHER["function"]["parameters"]
+        tags = [
+            _build(template, tools=[_tool(parameters, strict=strict)])
+            for strict in (False, True)
+        ]
+
+        self.assertEqual(
+            parse_content(cases[1][0], "xml-inline", content_args),
+            {"city": "Paris", "days": "3"},
+        )
+        for body, *expected in cases:
+            with self.subTest(body=body):
+                call = f'<call name="f">{body}</call>'
+                self.assertEqual([_accepts(tag, call) for tag in tags], expected)
+
+    def test_last_parameter_follows_every_required_one(self):
+        template = copy.deepcopy(TEMPLATE)
+        template["fields"]["tool_calls"]["content_args"]["tag_pattern"] = (
+            r'<arg name="(?P<key>[^"]+)">(?P<value>.*?)\n(?:</arg>|(?=<arg name="))'
+        )
+        parameters = {
+            "properties": {key: {"type": "string"} for key in "abcde"},
+            "required": ["b"],
+        }
+        tag = _build(template, tools=[_tool(parameters)])
+
+        def call(keys: str, lookahead: bool) -> str:
+            ends = ["\n" if lookahead else "\n</arg>"] * (len(keys) - 1) + ["\n</arg>"]
+            body = "".join(f'<arg name="{k}">x{e}' for k, e in zip(keys, ends))
+            return f'<call name="f">{body}</call>'
+
+        # Parameters in call order, and whether the call is accepted.
+        cases = [
+            ("b", True),
+            ("ab", True),
+            ("bc", True),
+            ("bd", True),
+            ("be", True),
+            ("abde", True),
+            ("bcde", True),
+            ("", False),
+            ("a", False),
+            ("acd", False),
+            ("bdc", False),
+            ("bcc", False),
+        ]
+        for keys, expected in cases:
+            for lookahead in (False, True):
+                with self.subTest(keys=keys, lookahead=lookahead):
+                    self.assertIs(_accepts(tag, call(keys, lookahead)), expected)
 
     def test_required_argument_without_schema_is_still_required(self):
         """A required entry that is no name leaves the tool to the generic JSON

@@ -53,6 +53,7 @@ VAE_COMPONENT_NAMES = frozenset(
         "audio_vae",
         "vocoder",
         "spatial_upsampler",
+        "latent_upscaler",
         "condition_image_encoder",
         "delight_vae",
         "diffusion_decoder",

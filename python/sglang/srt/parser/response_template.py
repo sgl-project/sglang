@@ -32,6 +32,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.response_template_structural_tag import (
+    holds_arguments,
     message_start_anchors,
     message_start_openers,
     typed_parameters,
@@ -40,6 +41,7 @@ from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
+    ResponseTemplateField,
     load_response_template,
 )
 
@@ -109,6 +111,12 @@ def configure_response_template_request(request: Any) -> None:
     template_kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
     template_kwargs["spaces_between_special_tokens"] = False
     request.chat_template_kwargs = template_kwargs
+
+
+def grammar_holds_calls(tool_grammar: bool, grammar_start: str | None) -> bool:
+    """Whether a template grammar holds the output's calls: the tool-call
+    grammar, or the JSON answer's, which admits calls before the answer."""
+    return tool_grammar or grammar_start == GRAMMAR_AT_ANSWER
 
 
 def _load_serving_template(
@@ -193,9 +201,12 @@ class ResponseTemplateStreamAdapter:
         prefix: str = "",
         grammar_start: str | None = None,
         constrained: bool = False,
+        held_by: ResponseTemplateField | None = None,
     ):
         self._template = template
         self._constrained = constrained
+        # Only constrained parsing reads held values as JSON.
+        self._held_by = held_by if constrained else None
         self._prefix = prefix
         self._parser: ResponseParser | None = None
         self._prefix_end = 0
@@ -219,7 +230,10 @@ class ResponseTemplateStreamAdapter:
             self._template,
             prefix=self._prefix,
             tools=[
-                _typed_tool(tool if isinstance(tool, dict) else tool.model_dump())
+                _typed_tool(
+                    tool if isinstance(tool, dict) else tool.model_dump(),
+                    self._held_by,
+                )
                 for tool in tools or []
             ],
             constrained=self._constrained,
@@ -413,6 +427,7 @@ class ResponseTemplateReasoningDetector:
     _default_think_end = ""
     thinks_internally = False
     reasoning_default = "explicit_enable_thinking"
+    strict_arguments = False
 
     def __init__(
         self,
@@ -475,6 +490,7 @@ class ResponseTemplateReasoningDetector:
             prefix=self._prefix,
             grammar_start=self._grammar_start,
             constrained=self._constrained,
+            held_by=self._tool_field if self.strict_arguments else None,
         )
 
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
@@ -568,6 +584,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     response_template: dict | None = None
     constrains_every_turn = False
     forwards_unknown_tools = False
+    strict_arguments = False
 
     def __init__(
         self,
@@ -588,8 +605,8 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self._prefix = prefix
         self._tools = tools
         self._constrained = constrained
-        self._adapter = self._new_adapter()
         self._tool_field = loaded.fields[_TOOL_FIELD]
+        self._adapter = self._new_adapter()
         self._thinking_field = loaded.fields.get(_THINKING_FIELD)
         self._content_field = loaded.fields.get(_CONTENT_FIELD)
         self._message_start = message_start_anchors(loaded)
@@ -601,7 +618,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
     def _new_adapter(self) -> ResponseTemplateStreamAdapter:
         return ResponseTemplateStreamAdapter(
-            self._template, prefix=self._prefix, constrained=self._constrained
+            self._template,
+            prefix=self._prefix,
+            constrained=self._constrained,
+            held_by=self._tool_field if self.strict_arguments else None,
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -611,15 +631,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             for event in adapter.parse(text)
         )
 
-    def _forward_unknown_tools(self) -> bool:
-        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-
     def admits_undeclared_tools(self) -> bool:
-        """Whether grammars may let automatic calls name undeclared tools."""
-        return (
-            self._forward_unknown_tools()
-            and envs.SGLANG_TOOL_STRICT_LEVEL.get() < ToolStrictLevel.FUNCTION
-        )
+        """Whether automatic calls may name undeclared tools, which parsing
+        then forwards."""
+        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
 
     def _to_tool_call_item(
         self, value: Any, tool_indices: dict[str, int], tool_index: int
@@ -638,7 +653,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         if name not in tool_indices:
             logger.warning("Model attempted to call undefined function: %s", name)
-            if not self._forward_unknown_tools():
+            if not self.admits_undeclared_tools():
                 return None
 
         if not isinstance(arguments, str):
@@ -750,7 +765,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         ordered_parts: list[str | ToolCallItem] = []
 
         def on_open(name: str) -> bool:
-            if name not in tool_indices and not self._forward_unknown_tools():
+            if name not in tool_indices and not self.admits_undeclared_tools():
                 return False
             self._emit_tool_name(name, pending_calls)
             ordered_parts.append(pending_calls[-1])
@@ -829,15 +844,22 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         )
 
 
-def _typed_tool(tool: dict) -> dict:
-    """`tool`, in either API's shape, as template grammars constrain it."""
+def _typed_tool(tool: dict, held_by: ResponseTemplateField | None = None) -> dict:
+    """`tool`, in either API's shape, as template grammars constrain it, strict
+    where `held_by` holds its arguments."""
     function = tool.get("function", tool)
     if not isinstance(function, dict):
         return tool
     function = dict(function)
-    if isinstance(function.get("parameters"), dict):
-        function["parameters"] = typed_parameters(function["parameters"])
-    if envs.SGLANG_TOOL_STRICT_LEVEL.get() >= ToolStrictLevel.PARAMETER:
+    parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        function["parameters"] = parameters = typed_parameters(parameters)
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() >= ToolStrictLevel.PARAMETER or (
+        held_by is not None
+        and not function.get("strict")
+        and isinstance(parameters, dict)
+        and holds_arguments(held_by, parameters)
+    ):
         function["strict"] = True
     return {**tool, "function": function} if "function" in tool else function
 

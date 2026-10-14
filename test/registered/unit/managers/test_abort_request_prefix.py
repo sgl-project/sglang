@@ -12,6 +12,7 @@ the flag, because batch requests derive child rids as ``f"{rid}_{i}"``.
 import asyncio
 import types
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -221,6 +222,7 @@ class FakeReq:
         self.rid = rid
         self.mamba_pool_idx = None
         self.to_finish = None
+        self.finished_reason = None
         self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self.weight_version_events = []
         self.output_ids = []
@@ -240,6 +242,7 @@ def _make_scheduler(
     sched.chunked_req = FakeReq(chunked_rid) if chunked_rid is not None else None
     sched.waiting_queue = [FakeReq(rid) for rid in waiting_rids]
     sched.enable_hicache_storage = False
+    sched.enable_hisparse = False
     sched.dllm_config = None  # abort_request reads it since the dLLM rework (#27877)
     sched.disaggregation_mode = DisaggregationMode.NULL
     sched.grammar_manager = MagicMock()
@@ -252,6 +255,11 @@ def _make_scheduler(
     # abort_request collects in-flight reqs from (running_batch, last_batch) on
     # the pp_size == 1 path since the v0.5.16 rebase.
     sched.last_batch = None
+    sched.enable_continuous_input_polling = False
+    sched.result_queue = deque()
+    sched._collect_inflight_batches = types.MethodType(
+        Scheduler._collect_inflight_batches, sched
+    )
     sched.collect_inflight_reqs = types.MethodType(
         Scheduler.collect_inflight_reqs, sched
     )

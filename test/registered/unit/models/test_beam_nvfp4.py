@@ -146,6 +146,8 @@ class TestBeamNvfp4(CustomTestCase):
                     moe_ep_rank=0,
                 ),
                 override_platform(is_blackwell=True),
+                # The compressed-tensors scheme check reads the CUDA capability.
+                patch("torch.cuda.get_device_capability", return_value=(10, 0)),
                 patch(
                     "sglang.srt.layers.moe.topk.biased_grouped_topk",
                     wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,

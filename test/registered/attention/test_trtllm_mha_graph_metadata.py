@@ -101,21 +101,7 @@ def test_xqa_mask_not_allocated_when_unused(make_xqa_backend, draft_len, is_xqa)
     assert make_xqa_backend(draft_len, is_xqa)._xqa_spec_dec_mask is None
 
 
-@pytest.mark.parametrize("splits", [1, 2, 8])
-@pytest.mark.parametrize(
-    "is_xqa,mode,width,masked",
-    [
-        (True, ForwardMode.TARGET_VERIFY, 8, True),
-        (False, ForwardMode.TARGET_VERIFY, 8, False),
-        (True, ForwardMode.TARGET_VERIFY, 1, False),
-        (True, ForwardMode.DRAFT_EXTEND_V2, 1, False),
-    ],
-)
-def test_xqa_verify_mask_forwarding(
-    make_xqa_backend, monkeypatch, splits, is_xqa, mode, width, masked
-):
-    backend = make_xqa_backend(width, is_xqa)
-    backend.decode_seq_len_splits = splits
+def _run_decode_mode_extend(backend, monkeypatch, *, mode, width, decode):
     bs = 5
     seq_lens = torch.tensor([30, 10, 50, 20, 40], dtype=torch.int32)
     page_table = torch.arange(bs, dtype=torch.int32)[:, None]
@@ -128,19 +114,6 @@ def test_xqa_verify_mask_forwarding(
     backend._get_bmm_scales = lambda *a: (1.0, 1.0)
     backend._get_layer_page_table = lambda *a: page_table
     monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
-    calls = []
-
-    def decode(**kwargs):
-        calls.append(kwargs)
-        group_bs = kwargs["seq_lens"].numel()
-        mask = kwargs.get("mask")
-        if masked:
-            assert mask.shape == (group_bs, width, 2)
-            assert mask.data_ptr() == backend._xqa_spec_dec_mask.data_ptr()
-        else:
-            assert mask is None
-        return kwargs["query"] + 1
-
     monkeypatch.setattr(
         trtllm_mha_backend,
         "flashinfer",
@@ -163,8 +136,70 @@ def test_xqa_verify_mask_forwarding(
     )
     fb = SimpleNamespace(out_cache_loc=None, forward_mode=mode, batch_size=bs)
     out = backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+    return q, out
+
+
+@pytest.mark.parametrize("splits", [1, 2, 8])
+@pytest.mark.parametrize(
+    "is_xqa,mode,width,masked",
+    [
+        (True, ForwardMode.TARGET_VERIFY, 8, True),
+        (False, ForwardMode.TARGET_VERIFY, 8, False),
+        (True, ForwardMode.TARGET_VERIFY, 1, False),
+        (True, ForwardMode.DRAFT_EXTEND_V2, 1, False),
+        (True, ForwardMode.DRAFT_EXTEND_V2, 8, True),
+    ],
+)
+def test_xqa_verify_mask_forwarding(
+    make_xqa_backend, monkeypatch, splits, is_xqa, mode, width, masked
+):
+    """XQA needs the draft-block mask whenever q_len > 1, draft extend included."""
+    backend = make_xqa_backend(width, is_xqa)
+    backend.decode_seq_len_splits = splits
+    calls = []
+
+    def decode(**kwargs):
+        calls.append(kwargs)
+        group_bs = kwargs["seq_lens"].numel()
+        mask = kwargs.get("mask")
+        if masked:
+            assert mask.shape == (group_bs, width, 2)
+            assert mask.data_ptr() == backend._xqa_spec_dec_mask.data_ptr()
+        else:
+            assert mask is None
+        return kwargs["query"] + 1
+
+    q, out = _run_decode_mode_extend(
+        backend, monkeypatch, mode=mode, width=width, decode=decode
+    )
     torch.testing.assert_close(out, (q + 1).view(-1, 8))
-    assert len(calls) == min(splits, bs)
+    assert len(calls) == min(splits, q.shape[0] // width)
+
+
+@pytest.mark.parametrize(
+    "is_xqa,mode,expected_q_dtype",
+    [
+        (True, ForwardMode.TARGET_VERIFY, torch.bfloat16),
+        (True, ForwardMode.DRAFT_EXTEND_V2, torch.bfloat16),
+        (False, ForwardMode.DRAFT_EXTEND_V2, torch.float8_e4m3fn),
+    ],
+)
+def test_decode_mode_query_dtype_with_fp8_kv(
+    make_xqa_backend, monkeypatch, is_xqa, mode, expected_q_dtype
+):
+    """With FP8 KV, XQA verify and draft extend keep Q bf16; trtllm-gen casts to FP8."""
+    width = 8
+    backend = make_xqa_backend(width, is_xqa)
+    backend.data_type = torch.float8_e4m3fn
+    backend.decode_seq_len_splits = 1
+    query_dtypes = []
+
+    def decode(**kwargs):
+        query_dtypes.append(kwargs["query"].dtype)
+        return torch.zeros(kwargs["query"].shape, dtype=kwargs["out_dtype"])
+
+    _run_decode_mode_extend(backend, monkeypatch, mode=mode, width=width, decode=decode)
+    assert query_dtypes == [expected_q_dtype]
 
 
 @pytest.mark.parametrize(
@@ -306,6 +341,7 @@ def test_unified_graph_tables_use_current_lengths(
     device, in_capture, prefix_lens, mode
 ):
     """Refresh every live page before replay, despite stale captured lengths."""
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -337,6 +373,28 @@ def test_unified_graph_tables_use_current_lengths(
     )
     translator._full_page_multiplier = 4
     translator._swa_page_multiplier = 6
+    translator._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, id(translator)),
+            write=lambda ids: (
+                translator._full_v2p_table[ids // PAGE_SIZE]
+                * translator._full_page_multiplier
+                * PAGE_SIZE
+                + ids % PAGE_SIZE
+            ),
+            read_v2p=translator._full_v2p_table * translator._full_page_multiplier,
+        ),
+        IdSpaceKind.SLIDING_WINDOW: IdSpace(
+            key=(IdSpaceKind.SLIDING_WINDOW, id(translator)),
+            write=lambda ids: (
+                translator._swa_v2p_table[ids // PAGE_SIZE]
+                * translator._swa_page_multiplier
+                * PAGE_SIZE
+                + ids % PAGE_SIZE
+            ),
+            read_v2p=translator._swa_v2p_table * translator._swa_page_multiplier,
+        ),
+    }
     # Bind real, capture-stable full and SWA destinations without allocating K/V.
     for source in (
         backend.decode_cuda_graph_metadata,
@@ -383,6 +441,18 @@ def test_unified_graph_tables_use_current_lengths(
         out_cache_loc=None,
     )
     original_lens = fb.seq_lens.clone()
+
+    def refresh_iteration_plan():
+        # Each iteration plans its reads through the speculative window.
+        fb.kv_loc_plan = translator.plan(
+            req_pool_indices=fb.req_pool_indices,
+            seq_lens=fb.seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=max(offsets),
+        )
+
+    refresh_iteration_plan()
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
     metadata = backend.forward_metadata
     full_ptr, swa_ptr = (
@@ -401,6 +471,7 @@ def test_unified_graph_tables_use_current_lengths(
     metadata.cache_seqlens_int32.fill_(1)
     metadata.page_table.fill_(-7)
     metadata.swa_page_table.fill_(-7)
+    refresh_iteration_plan()
     backend.init_forward_metadata_out_graph(fb, in_capture=in_capture)
     if graph is not None:
         graph.replay()
