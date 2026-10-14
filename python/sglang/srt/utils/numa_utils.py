@@ -122,7 +122,9 @@ def _get_nvml_device_index(device_id: int) -> int:
     return get_nvml_device_index(device_id)
 
 
-def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
+def get_numa_node_if_available(
+    server_args: ServerArgs, gpu_id: int, cpu_only_ok: bool = False
+) -> Optional[int]:
     """
     Returns the NUMA node for the given GPU id. If it is not set in the server_args, it will try to query the NUMA node for the GPU.
     If the NUMA node is not available, has already been configured externally, or the user lacks permission to set NUMA affinity, it will return None.
@@ -130,6 +132,8 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     Args:
         server_args: The server arguments.
         gpu_id: The GPU id.
+        cpu_only_ok: Also return the node when NUMA memory policy is not
+            permitted, so the caller can still bind CPUs (no privilege needed).
 
     Returns:
         The NUMA node for the given GPU id or None if it is not available.
@@ -138,7 +142,7 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
         return server_args.numa_node[gpu_id]
     if not envs.SGLANG_AUTO_NUMA_BIND.get():
         return None
-    if _is_numa_available():
+    if _is_numa_available(require_mempolicy=not cpu_only_ok):
         queried_numa_node = _query_numa_node_for_gpu(gpu_id)
         if len(queried_numa_node) == 0:
             return None
@@ -183,7 +187,10 @@ def numa_bind_to_node(node: int):
         os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    # Without memory-policy permission, CPU affinity alone keeps first-touch
+    # allocations on the node.
+    if _can_set_mempolicy():
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 class _Bitmask(ctypes.Structure):
@@ -359,9 +366,11 @@ def _can_set_mempolicy() -> bool:
         return False
 
 
-def _is_numa_available() -> bool:
+def _is_numa_available(require_mempolicy: bool = True) -> bool:
     """
     Check if NUMA is available and not already configured externally.
+    ``require_mempolicy=False`` accepts a host where only CPU affinity can be set
+    (a container without SYS_NICE).
     """
     if not (_is_cuda or _is_xpu):
         return False
@@ -377,6 +386,12 @@ def _is_numa_available() -> bool:
         return False
 
     if not _can_set_mempolicy():
+        if not require_mempolicy:
+            logger.info(
+                "User lacks permission to set NUMA memory policy; binding CPUs only. "
+                "If using docker, --cap-add SYS_NICE also binds host memory."
+            )
+            return True
         logger.warning(
             "User lacks permission to set NUMA affinity, skipping NUMA node configuration for GPU. If using docker, try adding --cap-add SYS_NICE to your docker run command."
         )

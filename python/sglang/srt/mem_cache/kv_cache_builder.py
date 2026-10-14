@@ -61,6 +61,7 @@ from sglang.srt.utils import ceil_align, is_hip
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import BaseTpWorker
+    from sglang.srt.mem_cache.events import LoRANameTable
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -231,7 +232,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 req_pool, allocator = tp_worker.get_memory_pool()
                 kv_pool = allocator.get_kvcache()
                 min_tokens = decode_retraction_max_tokens(req_pool, kv_pool)
-                if disagg.disaggregation_decode_host_receive_threshold > 0:
+                if disagg.disaggregation_decode_host_receive_threshold < 1:
                     # One request can receive while another is retracted.
                     min_tokens *= 2
                 ratio = max(ratio, min_tokens / kv_pool.size)
@@ -255,6 +256,8 @@ def build_kv_cache(
     enable_kv_cache_events: bool,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
+    dynamo_kv_event_format: bool = False,
+    kv_event_lora_names: Optional[LoRANameTable] = None,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -346,6 +349,8 @@ def build_kv_cache(
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
@@ -356,6 +361,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
 
     tree_context = TreeCacheBuildContext(
@@ -367,7 +373,6 @@ def build_kv_cache(
         is_dsa=is_dsa,
         enable_hierarchical_cache=enable_hierarchical_cache,
         disable_radix_cache=disable_radix_cache,
-        effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=tp_worker,
         model_config=model_config,
         tp_size=parallel.tp_size,
