@@ -12,6 +12,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
+from sglang.srt.runtime_context import get_context, get_model
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -232,6 +233,13 @@ def score_and_pool(
     )
 
 
+def _disable_normalize_embedding() -> bool:
+    # Pooler is also built offline, before any server context is published.
+    if not get_context().is_config_namespace_published("model"):
+        return False
+    return get_model().disable_normalize_embedding
+
+
 class Pooler(nn.Module):
     """A layer that pools specific information from hidden states.
     This layer does the following:
@@ -246,6 +254,8 @@ class Pooler(nn.Module):
     def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
+        if normalize and _disable_normalize_embedding():
+            normalize = False
         self.normalize = normalize
 
     def forward(
