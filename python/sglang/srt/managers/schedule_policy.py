@@ -164,12 +164,19 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    # Use the admission match span, including the logprob boundary. A full-key
+    # priority match can otherwise reconcile an in-flight restore against a
+    # different anchor and abandon the request's still-valid ticket.
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    key_limit = max_len
+
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if reprefill_tail:
+        key_limit = min(key_limit, max(0, len(token_ids) - reprefill_tail))
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -204,7 +211,6 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
-    max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )

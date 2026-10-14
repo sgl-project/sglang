@@ -105,6 +105,11 @@ class CacheHarness(HiCacheLifecycleMixin):
 
 
 class SchedulerHarness:
+    _is_prefill_abort_quarantined = source_definition(
+        "disaggregation/prefill.py",
+        "_is_prefill_abort_quarantined",
+        "SchedulerDisaggregationPrefillMixin",
+    )
     _release_aborted_request = source_definition(
         "managers/scheduler.py",
         "_release_aborted_request",

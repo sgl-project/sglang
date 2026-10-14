@@ -63,6 +63,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kv_compression.types import BufferDrainError
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -496,6 +497,13 @@ class PrefillBootstrapQueue:
             )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            if any(
+                held is req
+                for held in getattr(
+                    self.scheduler, "_compression_quarantined_waiting", ()
+                )
+            ):
+                continue
             if poll is None:
                 continue
 
@@ -997,6 +1005,9 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if self._is_prefill_abort_quarantined(req):
+                undone_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1125,24 +1136,73 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
+    def _is_prefill_abort_quarantined(self: Scheduler, req: Req) -> bool:
+        return any(
+            held is req
+            for held in getattr(self, "_compression_quarantined_waiting", ())
+        )
+
+    def _quarantine_prefill_abort(self: Scheduler, req: Req, exc: Exception) -> None:
+        # Keep the same ownership container used by the admission failure path.
+        # Finishing the response does not finish the cache handle, free KV or
+        # metadata, acknowledge a drained abort, or clear the pending-send gate.
+        retained = getattr(self, "_compression_quarantined_waiting", None)
+        if retained is None:
+            retained = self._compression_quarantined_waiting = []
+        if self._is_prefill_abort_quarantined(req):
+            return
+        retained.append(req)
+        logger.error(
+            "Retaining prefill request %s after undrained abort: %s", req.rid, exc
+        )
+        if not req.finished():
+            if req.to_finish is not None:
+                req.update_finish_state()
+            else:
+                prepare_abort(
+                    req,
+                    "KV transfer abort did not drain; restart both workers",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+        self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _abort_prefill_sender(self: Scheduler, req: Req) -> bool:
+        if self._is_prefill_abort_quarantined(req):
+            return False
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is not None and hasattr(sender, "abort"):
+            try:
+                sender.abort()
+            except BufferDrainError as exc:
+                self._quarantine_prefill_abort(req, exc)
+                return False
+        return True
+
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
-        self.clear_pending_chunk_send(req)
+        if self._is_prefill_abort_quarantined(req):
+            return False
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
         if not owns_resources:
             # A bootstrap failure or earlier abort already retired it.
+            self.clear_pending_chunk_send(req)
             return False
 
         sender = req.disagg_kv_sender
         if sender is not None:
             try:
                 sender.abort()
+            except BufferDrainError as exc:
+                self._quarantine_prefill_abort(req, exc)
+                return False
             except Exception:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+
+        self.clear_pending_chunk_send(req)
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()

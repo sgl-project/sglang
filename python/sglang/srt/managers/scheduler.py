@@ -3864,6 +3864,8 @@ class Scheduler(
                 pending.append(self.chunked_req)
             self.chunked_req = None
         for req in pending:
+            if any(held is req for held in retained):
+                continue
             retained.append(req)
             prepare_abort(req, reason, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
             self.output_streamer.stream_output([req], req.return_logprob)
@@ -5087,6 +5089,8 @@ class Scheduler(
         handler = getattr(transfer, "staging_handler", None)
         if getattr(handler, "is_quarantined", lambda: False)():
             return "KV restoration is quarantined; restart worker"
+        if getattr(self, "_compression_quarantined_waiting", None):
+            return "KV compression request resources are quarantined; restart worker"
         return None
 
     def is_fully_idle(self, for_health_check=False) -> bool:
@@ -5117,6 +5121,7 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
+            idle &= not getattr(self, "_compression_quarantined_waiting", None)
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5559,6 +5564,12 @@ class Scheduler(
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
+            req = self.waiting_queue[i]
+            if self.disaggregation_mode == DisaggregationMode.PREFILL and (
+                req.pending_bootstrap or self._is_prefill_abort_quarantined(req)
+            ):
+                if not self._abort_prefill_sender(req):
+                    continue
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
@@ -5572,17 +5583,9 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
 
             # For mamba radix cache
             if (
@@ -5616,10 +5619,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    if not self._abort_prefill_sender(req):
+                        continue
                     self._release_aborted_request(req)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
                     if get_parallel().pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
 
@@ -5627,8 +5629,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                    self._abort_prefill_sender(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
