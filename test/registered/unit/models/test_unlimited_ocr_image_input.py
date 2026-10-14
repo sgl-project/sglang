@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
+from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,6 +85,44 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
             _pixel_values_to_embedding=self._encoder,
         )
         result = UnlimitedOCRForCausalLM._process_image_input(encoder, [bundled])
+        torch.testing.assert_close(result, torch.tensor([[1.0], [12.0], [12.0], [2.0]]))
+
+    def test_separated_page_offsets_split_spatial_metadata(self):
+        """HF's [1,pages,2] crop metadata must split with [pages,C,H,W]."""
+        first, second = self._item(1.0, 2, False), self._item(2.0, 2, True)
+        processor = UnlimitedOCRProcessor.__new__(UnlimitedOCRProcessor)
+        processor.ATTR_NAME_TO_MODALITY = {
+            key: Modality.IMAGE
+            for key in (
+                "pixel_values",
+                "images_crop",
+                "images_spatial_crop",
+                "has_local_crops",
+            )
+        }
+        processor.FEATURE_NAMES = ["pixel_values"]
+        bundled = processor.collect_mm_items_from_processor_output(
+            {
+                "pixel_values": torch.cat((first.feature, second.feature)),
+                "images_crop": torch.cat((first.images_crop, second.images_crop)),
+                "images_spatial_crop": torch.stack(
+                    (first.images_spatial_crop, second.images_spatial_crop), dim=1
+                ),
+                "has_local_crops": [False, True],
+            }
+        )
+        bundled[0].offsets = [(1, 273), (275, 547)]
+        items = get_new_expanded_mm_items(bundled)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(
+            [tuple(item.images_spatial_crop.shape) for item in items], [(1, 2), (1, 2)]
+        )
+        encoder = SimpleNamespace(
+            vision_model=SimpleNamespace(dtype=torch.float32),
+            _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
+            _pixel_values_to_embedding=self._encoder,
+        )
+        result = UnlimitedOCRForCausalLM._process_image_input(encoder, items)
         torch.testing.assert_close(result, torch.tensor([[1.0], [12.0], [12.0], [2.0]]))
 
 
