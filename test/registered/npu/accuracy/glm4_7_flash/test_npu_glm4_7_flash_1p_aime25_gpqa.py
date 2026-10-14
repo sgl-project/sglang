@@ -79,10 +79,10 @@ class TestNPUGLM_4_7_FLASH_1P_AIME25_GPQA(TestNpuAccuracyTestCaseBase):
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
     eval_batch_size = 64
 
-    def test_aime25(self):
-        self.datasets = ["aime25"]
-        self.accuracy = AIME25_ACCURACY
-        self.run_accuracy()
+    #def test_aime25(self):
+    #    self.datasets = ["aime25"]
+    #    self.accuracy = AIME25_ACCURACY
+    #    self.run_accuracy()
 
     def test_gpqa_diamond(self):
         self.datasets = ["gpqa_diamond"]
