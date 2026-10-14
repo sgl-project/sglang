@@ -4,19 +4,28 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+)
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_with_staging,
+)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -71,7 +80,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
-        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
@@ -80,6 +90,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
+        )
+        queue._allocatable_token_budgets = MagicMock(
+            side_effect=lambda **_: physical_available
         )
         queue._swa_tail_allocatable_token_budget = MagicMock(
             side_effect=lambda **_: physical_available
@@ -104,6 +117,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         req = SimpleNamespace(
             rid="abort-prealloc",
             bootstrap_room=42,
+            kv=ReqKvInfo(),
             finished_reason=None,
             return_logprob=False,
         )
@@ -120,6 +134,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = []
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -163,6 +181,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         req = SimpleNamespace(
             rid="abort-shared",
             finished_reason=FINISH_ABORT("aborted"),
+            kv=ReqKvInfo(),
             return_logprob=False,
         )
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
@@ -175,6 +194,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -200,6 +223,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         req = SimpleNamespace(
             rid="swa-reclaim-failed",
             origin_input_ids=[1, 2, 3],
+            kv=ReqKvInfo(),
             output_ids=[],
             finished_reason=None,
             return_logprob=False,
@@ -234,8 +258,16 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock()
+        # SWA tail pre-allocation runs on a paged pool.
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.tree_cache = MagicMock()
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
@@ -379,7 +411,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         mock_prepare_abort.assert_called_once()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
         receiver = FakeReceiver()
@@ -398,8 +430,40 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
+
+        receiver = MagicMock()
+        decode_req.kv_receiver = receiver
+        decode_req.host_staged = True
+        queue.enable_host_receive = True
+        queue.enable_deferred_kv_release = False
+        queue._defer_release = MagicMock()
+        queue.queue = [decode_req]
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        self.assertEqual(queue.pop_transferred(), [])
+        receiver.abort.assert_called_once_with()
+        queue._defer_release.assert_called_once_with(decode_req)
+        receiver.clear.assert_not_called()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+
+        queue.queue = [decode_req]
+        decode_req.req.finished_reason = FINISH_ABORT("cancelled")
+        with (
+            patch.object(
+                queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.discard_kv_cache_backup"
+            ) as discard,
+        ):
+            self.assertEqual(queue.pop_transferred(), [])
+            discard.assert_called_once_with(req, queue.tree_cache, "host_pool")
+        receiver.clear.assert_called_once_with()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        mock_release_kv_cache.assert_not_called()
 
     def test_fake_receiver_initializes_deferred_release_state(self):
         manager = MagicMock()
@@ -407,6 +471,50 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_failed_fake_transfer_releases_at_once_under_deferred_release(
+        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
+    ):
+        # A health-check request gets a FakeKVReceiver over the real transfer
+        # manager, so a failed one reaches the deferred-release path.
+        receiver = FakeKVReceiver(MagicMock(enable_deferred_decode_kv_release=True), "")
+        req = SimpleNamespace(
+            rid="health-check", bootstrap_room=0, return_logprob=False
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=3,
+            hicache_restore_status=HiCacheRestoreResult.READY,
+        )
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.enable_staging = False
+        queue.enable_host_receive = False
+        queue.enable_deferred_kv_release = True
+        queue._defer_release = MagicMock()
+        queue.gloo_group = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tp_rank = 0
+        queue.tree_cache = MagicMock()
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        queue.spec_algorithm = MagicMock()
+        queue.spec_algorithm.is_none.return_value = True
+        queue._clean_hicache_prefetch_resources = MagicMock()
+        queue.scheduler = MagicMock(enable_decode_hicache=False, enable_hisparse=False)
+        queue.scheduler.metrics_reporter.enable_metrics = False
+        mock_poll.return_value = [KVPoll.Failed]
+
+        self.assertEqual(queue.pop_transferred(), [])
+        self.assertFalse(receiver.abort_notified)
+        queue._defer_release.assert_not_called()
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, checkpoint=False
+        )
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -418,7 +526,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
-        scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
@@ -430,8 +537,154 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
 
         self.assertFalse(scheduler.is_fully_idle())
+
+
+class _GateReceiver:
+    def __init__(self, poll):
+        self._poll = poll
+        self.require_staging = False
+
+    def poll(self):
+        return self._poll
+
+    def clear(self):
+        pass
+
+    def failure_exception(self):
+        raise KVTransferError(
+            7, "Failed due to an unknown reason from another rank", True
+        )
+
+
+def _gated_decode_req(poll, restore_status):
+    return SimpleNamespace(
+        req=SimpleNamespace(rid="r", bootstrap_room=7, return_logprob=False),
+        kv_receiver=_GateReceiver(poll),
+        metadata_buffer_index=3,
+        hicache_restore_status=restore_status,
+    )
+
+
+class TestDecodeHiCacheRestoreGate(CustomTestCase):
+    def test_gate_folds_restore_outcome_into_terminal_poll_only(self):
+        cases = [
+            (KVPoll.Success, HiCacheRestoreResult.READY, KVPoll.Success),
+            (KVPoll.Success, HiCacheRestoreResult.PENDING, KVPoll.Transferring),
+            (KVPoll.Success, HiCacheRestoreResult.FAILED, KVPoll.Failed),
+            (KVPoll.Transferring, HiCacheRestoreResult.FAILED, KVPoll.Transferring),
+            (
+                KVPoll.WaitingForInput,
+                HiCacheRestoreResult.FAILED,
+                KVPoll.WaitingForInput,
+            ),
+            (KVPoll.Failed, HiCacheRestoreResult.PENDING, KVPoll.Failed),
+        ]
+        for poll, status, expected in cases:
+            with self.subTest(poll=poll, status=status):
+                gated = HiCacheRestoreGatedKVReceiver(_gated_decode_req(poll, status))
+                self.assertEqual(gated.poll(), expected)
+
+    def test_failed_restore_keeps_reserving_admission_budget(self):
+        def dr(status, lock):
+            return SimpleNamespace(
+                prefix_match=SimpleNamespace(restore_token_count=3000),
+                hicache_restore_status=status,
+                hicache_restore_lock=lock,
+            )
+
+        prealloc = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc.scheduler = SimpleNamespace(enable_decode_hicache=True)
+        prealloc.transfer_queue = SimpleNamespace(
+            queue=[
+                dr(HiCacheRestoreResult.PENDING, None),
+                dr(HiCacheRestoreResult.FAILED, None),
+                dr(HiCacheRestoreResult.PENDING, object()),
+                dr(HiCacheRestoreResult.READY, object()),
+            ]
+        )
+        self.assertEqual(prealloc._hicache_pending_restore_tokens(), 6000)
+
+    def test_staging_poll_uses_gated_pollers(self):
+        decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.PENDING)
+        with patch(
+            "sglang.srt.disaggregation.utils._all_reduce_polls",
+            side_effect=lambda polls, group: polls,
+        ):
+            polls = poll_and_all_reduce_with_staging(
+                [decode_req],
+                staging_handler=MagicMock(),
+                gloo_group=MagicMock(),
+                pollers=[HiCacheRestoreGatedKVReceiver(decode_req)],
+            )
+        self.assertEqual(polls, [KVPoll.Transferring])
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_pop_transferred_branches_on_reduced_poll_only(
+        self, mock_prepare_abort, mock_release_kv_cache
+    ):
+        def make_queue(decode_req, peer_poll):
+            queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            queue.queue = [decode_req]
+            queue.enable_staging = False
+            queue.enable_host_receive = False
+            queue.enable_deferred_kv_release = False
+            queue.gloo_group = MagicMock()
+            queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+            queue.tp_rank = 0
+            queue.tree_cache = MagicMock()
+            queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+            queue._clean_hicache_prefetch_resources = MagicMock()
+            queue._commit_transfer_to_req = MagicMock()
+            queue._record_transfer_failure = MagicMock()
+            scheduler = MagicMock()
+            scheduler.enable_decode_hicache = True
+            scheduler.enable_hisparse = False
+            scheduler.metrics_reporter.enable_metrics = False
+            queue.scheduler = scheduler
+
+            def reduce_with_peer(
+                pollers, group, decode_reqs=None, metadata_buffers=None
+            ):
+                return [min(int(p.poll()), int(peer_poll)) for p in pollers]
+
+            patcher = patch(
+                "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+                side_effect=reduce_with_peer,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            return queue
+
+        decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.FAILED)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
+        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.queue, [])
+        queue._commit_transfer_to_req.assert_not_called()
+        queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
+        mock_prepare_abort.assert_called_once()
+
+        mock_prepare_abort.reset_mock()
+        decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.READY)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
+        self.assertEqual(queue.pop_transferred(), [])
+        queue._commit_transfer_to_req.assert_not_called()
+        queue._record_transfer_failure.assert_called_once_with(
+            "Failed due to an unknown reason from another rank"
+        )
+        mock_prepare_abort.assert_called_once()
+
+        mock_prepare_abort.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Success)
+        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.queue, [decode_req])
+        mock_prepare_abort.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
 
 
 if __name__ == "__main__":

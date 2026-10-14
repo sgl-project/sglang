@@ -42,13 +42,13 @@ Thread 0x0000fff873f6f120 (most recent call first):
 (SGLangEngine pid=3872176) [ERROR] 2026-04-14-12:14:41 (PID:3874122, Device:0, RankID:-1) ERR00100 PTA call acl api failed
 (SGLangEngine pid=3872176) [Error]: An internal error occurs in the runtime module on the host.
 (SGLangEngine pid=3872176) Rectify the fault based on the error information in the ascend log.
-(SGLangEngine pid=3872176) [PID: 3874122] 2026-04-14-12:14:41.897.548 AclNN_Runtime_Error(EZ9903): aclrtLaunchKerneWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176) [PID: 3874122] 2026-04-14-12:14:41.897.548 AclNN_Runtime_Error(EZ9903): aclrtLaunchKernelWithHostArgs failed, return: 507000
 (SGLangEngine pid=3872176)  Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 (SGLangEngine pid=3872176)  TraceBack (most recent call last):
 (SGLangEngine pid=3872176)  Check kernel task failed, stream_id=2028, task_id=48, retCode=0x7080005.[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]
 (SGLangEngine pid=3872176)  rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]
 (SGLangEngine pid=3872176)  rtsLaunchKernelWithHostArgs failed, runtime result = 507000.[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]
-(SGLangEngine pid=3872176)  aclrtLaunchKerneWWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176)  aclrtLaunchKernelWithHostArgs failed, return: 507000
 (SGLangEngine pid=3872176)  Launch kernel failed.
 (SGLangEngine pid=3872176)  #### KernelLaunch failed: /home/850b160/cann-8.5.8/opp/built-in/op_impl/ai_core/tbe//kernel/ascend910_93/ops_legacy/fill/Fill_41dadce325bOf810d03359af2a38990b_high_performance.o
 (SGLangEngine pid=3872176)  Kernel Run failed. opType: 18, Fill
@@ -109,7 +109,7 @@ prefill 7.log:3094:RuntimeError: ACL stream synchronize failed, error code:50703
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.705 davinci kernel task.cc:14241170327 GetArasInfo:[AIC INFO] aras(0 to 9) after execute:0x3fffffb9000, 0, 0, 0x12c9323ff600, 0x12c93231ee00, 0x12c93f1d8800,0x12c93f3ff600,0x12c958200000,0x100000003, 0xaaaa00000001.
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.710 [davinci kernel task.cc:1427]170327 GetArgsInfo:tilingKey = 0, print 1 Times totalLen=(10*8), argsSize=80, blockDim=3
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.717 [davinci kernel task.cc:1468]170327 PrintErrorInfoForDavinciTask:[AIC INFO] after execute:arqs print end
-[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.751 davinci kernel task.cc:14981170327 PrintErrorInfoForDavinciTask:[DFX INFO]Aicore kernel execute failed, device id=13, stream id=43, report stream id=43, task id=13145, flip num=56, fault kernel_name=alloc_extend _kernel_18, fault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.751 davinci kernel task.cc:14981170327 PrintErrorInfoForDavinciTask:[DFX INFO]Aicore kernel execute failed, device id=13, stream id=43, report stream id=43, task id=13145, flip num=56, fault kernel_name=alloc_extend_kernel_18, fault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
 [ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.823 [dump manager.cpp:41][tid:170327] An exception callback message is received.
 [ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.971 [kernel info collector.cpp:384][tid:170327] Get error register information. coreNum=0
 [ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.981 kernel info collector.cpp:4771tid:1703271 It is Non-SuperKernel. functionCount=1, qlobalCount=1
@@ -119,7 +119,7 @@ prefill 7.log:3094:RuntimeError: ACL stream synchronize failed, error code:50703
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.911 [stream.cc:1335]170327 GetError:AIV Kernel happen error, retCode=0x31.
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.929 [stream.cc:1335]170327 GetError:[AIC_INFO] after execute:args print end
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.936 stream.cc:13351170327 GetError: DFX INFO1Aicore kernel execute failed, device id=13, stream id=43, report stream id=43, task id=13145, tlip num=56,
- fault kernel_name=alloc_extend_kernel_18, ault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
+ fault kernel_name=alloc_extend_kernel_18, fault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.943 [stream.cc:3549]170327 EnterFailureAbort:stream id=43 enter failure abort.
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.973 [stars_engine.cc:1427]170327 StarsResumeRtsa:stop scheduling in abort failure mode: stream id=43, sq id=6,sq head=801, task id=13145, taskType=66.
 [ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.972 [stream.cc:1463]164629 SynchronizeExecutedTask:context is abort, status=0x715005e.

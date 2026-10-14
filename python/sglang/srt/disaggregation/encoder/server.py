@@ -35,12 +35,14 @@ from sglang.srt.disaggregation.encoder.receiver import (
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
-    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention_flags,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -590,11 +592,29 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(
-            tensor_model_parallel_size=get_parallel().tp_size,
-            attention_context_model_parallel_size=get_parallel().attn_cp_size,
+        # The encoder uses a separate WORLD with tensor and attention-CP parallelism.
+        parallel = get_parallel()
+        attn_cp_size = parallel.attn_cp_size
+        attn_tp_size = parallel.tp_size // attn_cp_size
+        attn_cp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+        parallel.override_permanently(
+            tp_rank=rank,
+            pp_size=1,
+            pp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=attn_tp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_dcp_size=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_dp_size=1,
+            moe_tp_size=parallel.tp_size,
         )
-        initialize_dp_attention(server_args, self.model_config)
+        initialize_model_parallel()
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(self.model_config)
 
         self.model = load_model(
             model_config=self.model_config,
@@ -650,11 +670,8 @@ class MMEncoder:
                 get_mm().mm_global_cache_backend,
             )
             self.mm_global_cache = EmbeddingCacheController(
-                rank,
-                get_parallel().tp_size,
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
-                tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
                 dtype=self._embedding_dtype,
             )
@@ -1275,7 +1292,7 @@ class MMEncoder:
         layout_digest: tuple[int, int],
     ) -> List[torch.Tensor]:
         """Raise the same preparation error on every TP rank."""
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         error_code = (
             int(
                 local_error.code
@@ -2314,10 +2331,13 @@ class MMEncoder:
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
         cond = await _get_receive_condition(req_id)
+        failure: Optional[str] = None
+        failure_code = HTTPStatus.BAD_GATEWAY
 
         try:
             while True:
                 if state.release_requested:
+                    # An upstream abort, not a delivery failure.
                     break
 
                 async with rid_lock:
@@ -2346,9 +2366,11 @@ class MMEncoder:
                     break
                 remaining = timeout - (asyncio.get_running_loop().time() - start_time)
                 if remaining <= 0:
-                    logger.error(
-                        f"[{req_id}] Timeout! Sent {len(sent_urls)}/{expected_count}"
+                    failure = (
+                        f"timed out after {timeout}s with "
+                        f"{len(sent_urls)}/{expected_count} destination(s) initiated"
                     )
+                    failure_code = HTTPStatus.GATEWAY_TIMEOUT
                     break
 
                 async with cond:
@@ -2364,13 +2386,25 @@ class MMEncoder:
                 tasks_only = [t[0] for t in all_tasks]
                 results = await asyncio.gather(*tasks_only, return_exceptions=True)
 
-                # Process results and log errors
+                failed = []
                 for i, result in enumerate(results):
                     url = all_tasks[i][1]  # Retrieve URL associated with the task
-                    if isinstance(result, Exception):
-                        logger.error(f"Failed to send to {url}: {result}")
+                    # A cancelled send delivered nothing, and CancelledError
+                    # is not an Exception; outer cancellation re-raises out of
+                    # gather rather than landing here.
+                    if isinstance(result, BaseException):
+                        logger.error(f"Failed to send to {url}: {result!r}")
+                        failed.append(url)
                     else:
                         logger.debug(f"Successfully sent to {url}")
+                if failed and failure is None:
+                    failure = f"delivery failed for {failed}"
+
+            if failure is not None:
+                raise MMError(
+                    f"[{req_id}] embedding delivery failed: {failure}",
+                    code=failure_code,
+                )
 
             logger.info(f"All tasks completed for req_id: {req_id}")
 

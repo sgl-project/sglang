@@ -3,28 +3,28 @@
 
 //! Tokenize-once at ingress under the STICKY policy. The engine-tokenization
 //! offload (`input_ids` forwarding) is a property of the MODEL — does it have a
-//! chat encoder? — not of the routing policy, so a sticky-routed request on a
-//! chat-encoder model must forward `input_ids` exactly like cache-aware does,
+//! chat formatter? — not of the routing policy, so a sticky-routed request on a
+//! chat-formatter model must forward `input_ids` exactly like cache-aware does,
 //! while still pinning sessions O(1) by header.
 //!
 //! Asserts through the real chat handler + `MockWorker` backends:
 //!
 //! * A plain text chat request forwards `input_ids` AND retains `messages`,
 //!   even though sticky never consults the tokens for routing.
-//! * A request carrying `tools` / multimodal content omits `input_ids` — the
+//! * A request carrying multimodal content omits `input_ids` — the
 //!   same safe-to-forward predicate applies regardless of policy.
 //! * Same-session-header requests still pin to a single worker (O(1) sticky
 //!   routing is unchanged by the added tokenization).
 //!
 //! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches
-//! the built-in V4 chat encoder — the engine-equivalent path — without a
+//! the built-in V4 chat formatter — the engine-equivalent path — without a
 //! template fixture.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -53,10 +53,15 @@ fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: MODEL.into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
+            dp_aware: false,
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
@@ -71,25 +76,26 @@ fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
 /// Build an `AppContext` running the sticky policy over the given workers.
 /// The tokenizer registry is loaded from config (real tiny tokenizer + the
-/// auto-attached V4 chat encoder) so the ingress can tokenize — the sticky
+/// auto-attached V4 chat formatter) so the ingress can tokenize — the sticky
 /// policy itself holds no tokenizer.
 fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+        tokenizers.has_chat_formatter(MODEL),
+        "deepseek-v4 model id must auto-attach the built-in chat formatter"
     );
     let registry = Arc::new(WorkerRegistry::default());
     for (i, url) in worker_urls.iter().enumerate() {
@@ -98,7 +104,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             url: url.clone(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: None,
+            ..Default::default()
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
@@ -155,55 +161,6 @@ async fn sticky_plain_chat_forwards_input_ids_and_keeps_messages() {
     assert!(
         body.get("messages").is_some(),
         "messages must be retained alongside input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn sticky_tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(std::slice::from_ref(&mock.url));
-    let status = send(
-        ctx,
-        "alice",
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids even under sticky; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn sticky_thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode the router's
-    // encoder renders in the default mode only — the safe-to-forward predicate
-    // is policy-independent, so sticky must omit ids here too.
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(std::slice::from_ref(&mock.url));
-    let status = send(
-        ctx,
-        "alice",
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids under sticky; got {body}"
     );
 }
 

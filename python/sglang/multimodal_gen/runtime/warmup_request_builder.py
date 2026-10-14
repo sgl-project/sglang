@@ -365,12 +365,11 @@ def _resolve_warmup_num_frames(
     if num_frames is None:
         return num_frames
 
-    # Breakable CUDA graph replays only exact latent shapes: the warmup
-    # request must run the full serving frame count so its captured graphs
-    # match serving signatures (mirrors the uncapped-steps rule in
-    # _resolve_warmup_steps).
+    # explicit frame counts and breakable CUDA graphs must keep the requested
+    # latent shape; only default server warmup applies the bounded frame cap
     if (
         not server_based_warmup
+        or isinstance(explicit_num_frames, int)
         or getattr(server_args, "enable_breakable_cuda_graph", False) is True
     ):
         warmup_num_frames = num_frames
@@ -615,6 +614,7 @@ def build_warmup_reqs(
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
+            task_type=task_type,
             data_type=task_type.data_type(),
             width=width,
             height=height,

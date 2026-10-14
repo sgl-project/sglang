@@ -295,7 +295,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         if available_pages() >= num_pages:
             return True
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return False
 
         while available_pages() < num_pages:
@@ -544,7 +544,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
         self.release_c128_pages(row[row > 0])
         row.zero_()
-        self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
+        self.get_kvcache().clear_request_scoped_state(int(req_pool_idx))
 
     def available_size(self):
         return min(

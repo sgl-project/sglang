@@ -14,12 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -81,12 +83,17 @@ def _can_enable_t1_fused_qk_norm_rope(
     tp_size: int,
     sp_size: int,
     is_compiled: bool,
+    hidden_size: int = 0,
 ) -> bool:
     if is_compiled:
         return False
     if is_blackwell:
         return True
-    return is_hopper and hidden_act != "relu2" and tp_size == 1 and sp_size == 1
+    if not is_hopper or sp_size != 1:
+        return False
+    if tp_size == 1:
+        return hidden_act != "relu2" or hidden_size == 2048
+    return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
 # -----------------------------------------------------------------------------
@@ -368,7 +375,6 @@ class DomainAwareLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
         self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
         nn.init.xavier_uniform_(
@@ -540,8 +546,17 @@ class Cosmos3DenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, _ = self.up_proj(x)
-        up = F.relu(up)
-        out, _ = self.down_proj(up * up)
+        if (
+            up.is_cuda
+            and up.dtype == torch.bfloat16
+            and up.is_contiguous()
+            and not torch.is_grad_enabled()
+        ):
+            up = relu2(up, fast_math=False)
+        else:
+            up = F.relu(up)
+            up = up * up
+        out, _ = self.down_proj(up)
         return out
 
 
@@ -564,6 +579,27 @@ def _build_mlp(
 # -----------------------------------------------------------------------------
 # Cosmos3 UND Causal Attention
 # -----------------------------------------------------------------------------
+
+
+def _initialize_attention_projections(module, prefix, quant_config):
+    module.q_size = module.num_attention_heads * module.head_dim
+    module.kv_size = module.num_key_value_heads * module.head_dim
+    module.to_qkv = MergedColumnParallelLinear(
+        module.hidden_size,
+        [module.q_size, module.kv_size, module.kv_size],
+        bias=False,
+        gather_output=False,
+        quant_config=quant_config,
+        prefix=add_prefix("to_qkv", prefix),
+    )
+    module.to_out = RowParallelLinear(
+        module.q_size,
+        module.hidden_size,
+        bias=False,
+        input_is_parallel=True,
+        quant_config=quant_config,
+        prefix=add_prefix("to_out", prefix),
+    )
 
 
 class Cosmos3CausalAttention(nn.Module):
@@ -601,24 +637,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         # Per-head QK norm (optional; some backbones omit it on text).
         if qk_norm:
@@ -737,24 +756,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
@@ -815,7 +817,6 @@ class Cosmos3CrossAttention(nn.Module):
         use_fused_kv_pack = (
             use_fused_qk_norm_rope
             and q.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
             and self.norm_q.weight.dtype == q.dtype
@@ -1083,6 +1084,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
 
+    @cached_conditioning
     def forward(
         self,
         text_ids: torch.Tensor,
@@ -1710,13 +1712,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._ensure_cache_dicts()
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
-        # single-GPU Hopper Nano (SwiGLU) workload, while the Hopper
-        # Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
-        # path because that shape regresses with the fusion.
+        # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
+        # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
+        # workload remains on the split path because that shape regresses.
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
             hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),
             sp_size=get_sp_world_size(),
             is_compiled=self._gen_layers_torch_compiled,
@@ -1784,7 +1787,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         use_fused_qk_norm_rope = T > 1 or (
             enable_t1_fused_qk_norm_rope
             and hidden_gen.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,
