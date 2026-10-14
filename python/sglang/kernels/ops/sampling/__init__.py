@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -62,88 +63,67 @@ def softmax(
     return torch.softmax(logits, dim=-1)
 
 
-register_kernel(
-    KernelSpec(
-        op="sampling.top_k_renorm_probs",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.sampling:top_k_renorm_probs",
-        format_signature=FormatSignature(
-            description="renormalize probs by top-k thresholding; returns tensor"
-        ),
-        description="Top-k probability renormalization (sgl_kernel wheel).",
-    )
+_CPU = CapabilityRequirement(device=DeviceType.CPU)
+_RENORM_BACKENDS = (
+    # The sgl_kernel wheel ships the op for CUDA only; ROCm takes the Triton
+    # port, and CPU plus the NPU rows the vendor path declines take torch.
+    (KernelBackend.AOT, "sgl_kernel.sampling:{name}", {CapabilityRequirement.CUDA}),
+    (
+        KernelBackend.TRITON,
+        "sglang.kernels.ops.sampling.renorm_triton:{name}_triton",
+        {CapabilityRequirement.HIP},
+    ),
+    (
+        KernelBackend.TORCH,
+        "sglang.kernels.ops.sampling.renorm_torch:{name}_torch",
+        {_CPU, CapabilityRequirement.NPU},
+    ),
 )
-register_kernel(
-    KernelSpec(
-        op="sampling.top_p_renorm_probs",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.sampling:top_p_renorm_probs",
-        format_signature=FormatSignature(
-            description="renormalize probs by top-p thresholding; returns tensor"
-        ),
-        description="Top-p probability renormalization (sgl_kernel wheel).",
-    )
-)
+for _name, _cutoff in (
+    ("top_k_renorm_probs", "top-k"),
+    ("top_p_renorm_probs", "top-p"),
+):
+    for _backend, _target, _capabilities in _RENORM_BACKENDS:
+        register_kernel(
+            KernelSpec(
+                op=f"sampling.{_name}",
+                backend=_backend,
+                target=_target.format(name=_name),
+                capabilities=frozenset(_capabilities),
+                format_signature=FormatSignature(
+                    description=f"renormalize probs by {_cutoff} thresholding; returns tensor"
+                ),
+                description=f"{_cutoff} probability renormalization ({_backend.value}).",
+            )
+        )
 
 
-def _renorm_backend(probs: torch.Tensor) -> str:
-    import torch
-
-    # CUDA: the sgl_kernel/FlashInfer op. ROCm: the Triton fallback. MUSA and
-    # XPU: their sgl_kernel builds. Else (CPU, declined NPU rows): torch.
-    if probs.is_cuda:
-        return "triton" if torch.version.hip is not None else "aot"
-    if probs.device.type in ("musa", "xpu"):
-        return "sgl_kernel"
-    return "torch"
+def _vendor_sgl_kernel(probs: torch.Tensor) -> bool:
+    # TODO(RFC #29630): drop once DeviceType grows MUSA / XPU; the platform
+    # probe reads them as CPU and would resolve to the torch reference.
+    return probs.device.type in ("musa", "xpu")
 
 
 def top_k_renorm_probs(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
-    """Renormalize ``probs`` by top-k thresholding, on any device."""
-    backend = _renorm_backend(probs)
-    if backend == "aot":
-        return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(
-            probs, top_k
-        )
-    if backend == "triton":
-        from sglang.kernels.ops.sampling.renorm_triton import (
-            top_k_renorm_probs_triton,
-        )
-
-        return top_k_renorm_probs_triton(probs, top_k)
-    if backend == "sgl_kernel":
+    """Renormalize ``probs`` by top-k thresholding."""
+    if _vendor_sgl_kernel(probs):
         from sgl_kernel import top_k_renorm_prob
 
         return top_k_renorm_prob(probs, top_k)
-    from sglang.kernels.ops.sampling.renorm_torch import top_k_renorm_probs_torch
-
-    return top_k_renorm_probs_torch(probs, top_k)
+    return get_kernel("sampling.top_k_renorm_probs")(probs, top_k)
 
 
 def top_p_renorm_probs(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
-    """Renormalize ``probs`` by top-p thresholding, on any device."""
-    backend = _renorm_backend(probs)
-    if backend == "aot":
-        return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(
-            probs, top_p
-        )
-    if backend == "triton":
-        from sglang.kernels.ops.sampling.renorm_triton import (
-            top_p_renorm_probs_triton,
-        )
-
-        return top_p_renorm_probs_triton(probs, top_p)
-    if backend == "sgl_kernel":
+    """Renormalize ``probs`` by top-p thresholding."""
+    if _vendor_sgl_kernel(probs):
         from sgl_kernel import top_p_renorm_prob
 
         return top_p_renorm_prob(probs, top_p)
-    from sglang.kernels.ops.sampling.renorm_torch import top_p_renorm_probs_torch
-
-    return top_p_renorm_probs_torch(probs, top_p)
+    return get_kernel("sampling.top_p_renorm_probs")(probs, top_p)
 
 
 __all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
