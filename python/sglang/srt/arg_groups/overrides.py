@@ -554,6 +554,7 @@ def _check_dsa_backend_constraints(
     *,
     hip: bool,
     dcp_size: int = 1,
+    raw_fp8_nope: bool = False,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -568,7 +569,14 @@ def _check_dsa_backend_constraints(
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
-    if prefill_backend != "tilelang" or decode_backend != "tilelang":
+    native_raw_nope = (
+        raw_fp8_nope
+        and prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+    )
+    if not native_raw_nope and (
+        prefill_backend != "tilelang" or decode_backend != "tilelang"
+    ):
         raise ValueError(
             "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
             "raw and scaled FP8 KV layouts cannot be mixed."
@@ -579,6 +587,8 @@ def _check_dsa_backend_constraints(
     import torch
 
     major, minor = torch.cuda.get_device_capability()
+    if native_raw_nope and major != 9:
+        raise ValueError("Native raw FP8 NoPE sparse prefill requires SM90.")
     if (major, minor) < (8, 9):
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
@@ -733,6 +743,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        raw_fp8_nope=(
+            model_arch == "Glm5NextForConditionalGeneration"
+            and model_config_of(view).qk_rope_head_dim == 0
+            and model_config_of(view).kv_lora_rank == 512
+        ),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

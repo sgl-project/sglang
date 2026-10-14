@@ -3236,10 +3236,10 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
-    # validation requires both consumers to use the same TileLang layout.
+    # CUDA TileLang uses raw FP8 rows without per-block scales. The validated
+    # SM90 GLM NoPE Q8-prefill adapter consumes the same raw 512-byte layout.
     if (
-        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "flashmla_sparse_q8")
         and get_exec().kernel.dsa_decode_backend == "tilelang"
     ):
         return kv_cache_dim

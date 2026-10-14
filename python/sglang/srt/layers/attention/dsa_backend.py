@@ -2352,6 +2352,23 @@ class DeepseekSparseAttnBackend(
             "flashmla_sparse_q8",
             "triton_sparse_mla",
         ):
+            if (
+                dsa_impl == "flashmla_sparse_q8"
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and not self.dsa_kv_cache_store_fp8
+                and kv_cache.shape[-1] == 512
+            ):
+                # Raw GLM KPool indices address physical FP8 rows, not the
+                # ragged current-token KV used by scaled DeepSeek layouts.
+                return self._forward_flashmla_sparse_q8kv8(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_bf16=kv_cache.view(-1, 1, 512),
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer_id=layer.layer_id,
+                )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
                 page_table_1 = topk_indices
@@ -3019,6 +3036,18 @@ class DeepseekSparseAttnBackend(
             sparse_mla_q8kv8_prefill_fwd,
         )
 
+        # Preserve KPool live-tail indices while padding to SM90's 128-slot
+        # tiles. Invalid slots are masked; real tail tokens are not truncated.
+        padding = (-page_table_1.shape[-1]) % 128
+        if padding:
+            page_table_1 = torch.cat(
+                (
+                    page_table_1,
+                    page_table_1.new_full((*page_table_1.shape[:-1], padding), -1),
+                ),
+                dim=-1,
+            )
+
         num_tokens, num_heads, d_nope = q_nope.shape
         head_dim = d_nope + q_rope.shape[-1]
         dev = q_nope.device
@@ -3058,6 +3087,24 @@ class DeepseekSparseAttnBackend(
         # concat + .to(fp8)); it requires power-of-two head/dim counts (a
         # tl.arange constraint), so non-power-of-two head counts fall back to
         # the generic concat + cast.
+        elif q_rope.shape[-1] == 0:
+            # NoPE has no RoPE channels: do not compile tl.arange(0, 0)
+            # in the concat kernel. Copy/cast only the real query heads.
+            padded_heads = required_padding if need_padding else num_heads
+            buf = self._q8kv8_qpad_buf
+            if (
+                buf is None
+                or buf.shape[0] < num_tokens
+                or buf.shape[1:] != (padded_heads, head_dim)
+            ):
+                buf = torch.zeros(
+                    (num_tokens, padded_heads, head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=dev,
+                )
+                self._q8kv8_qpad_buf = buf
+            q_fp8 = buf[:num_tokens]
+            q_fp8[:, :num_heads].copy_(q_nope)
         elif need_padding:
             if required_padding % num_heads != 0:
                 raise ValueError(
