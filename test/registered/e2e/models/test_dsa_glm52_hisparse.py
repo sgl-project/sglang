@@ -14,14 +14,11 @@ register_cuda_ci(
     est_time=700,
     stage="extra-b",
     runner_config="8-gpu-b300",
-    disabled="Temporarily disabled: NaN in EAGLE verify target logits on B300.",
 )
 
 GLM52_NVFP4_MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
 
-# Also skip selective reruns, which bypass the registry's disabled marker.
-@unittest.skip("Temporarily disabled: NaN in EAGLE verify target logits on B300")
 class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     """1P1D GLM-5.2 MTP with HiSparse target KV and dense draft KV transfer."""
 
