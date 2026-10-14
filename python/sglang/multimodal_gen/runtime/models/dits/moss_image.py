@@ -32,6 +32,7 @@
 
 # Adapted from OpenMOSS-Team/MOSS-Image-Base, revision 355120bd6b44ff67b8df18f57e40b928fc886cd3.
 
+import msgspec
 import torch
 from torch import nn
 
@@ -78,6 +79,13 @@ def validate_skip_layers(skip_layers, num_layers):
             f"skip_layers must contain integer indices in [0, {num_layers})."
         )
     return skip_layers
+
+
+class MOSSImageConditioning(msgspec.Struct, frozen=True):
+    """Refined text and RoPE owned by one request and one CFG branch."""
+
+    spatial_shape: tuple[int, int]
+    samples: tuple[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], ...]
 
 
 class _RMSNorm(nn.Module):
@@ -468,12 +476,26 @@ class MOSSImageTransformer(BaseDiT):
         )
         return text, rope
 
+    def prepare_conditioning(
+        self, encoder_hidden_states, encoder_attention_mask, height, width, dtype
+    ):
+        # Neither the text refinement blocks nor RoPE depend on the timestep.
+        contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
+        return MOSSImageConditioning(
+            spatial_shape=(height, width),
+            samples=tuple(
+                self._prepare_sample_conditioning(context, height, width, dtype)
+                for context in contexts
+            ),
+        )
+
     def forward(
         self,
         hidden_states,
         timestep,
         encoder_hidden_states,
         encoder_attention_mask=None,
+        prepared_conditioning: MOSSImageConditioning | None = None,
         skip_layers=(),
     ):
         skip_layers = validate_skip_layers(skip_layers, self.config.num_layers)
@@ -485,7 +507,15 @@ class MOSSImageTransformer(BaseDiT):
         batch, _, height, width = hidden_states.shape
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[0] != batch:
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-        contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
+        if prepared_conditioning is None:
+            contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
+        elif (
+            prepared_conditioning.spatial_shape != (height, width)
+            or len(prepared_conditioning.samples) != batch
+        ):
+            raise ValueError(
+                "Prepared conditioning must match the latent batch and size."
+            )
         times = torch.as_tensor(
             timestep, device=hidden_states.device, dtype=torch.float32
         ).reshape(-1)
@@ -512,9 +542,13 @@ class MOSSImageTransformer(BaseDiT):
             video = self.video_embedder(
                 video.to(self.video_embedder.weight.dtype).contiguous()
             )
-            text, rope = self._prepare_sample_conditioning(
-                contexts[index], height, width, video.dtype
-            )
+            if prepared_conditioning is None:
+                # Match the activation dtype under fp32 weights + autocast.
+                text, rope = self._prepare_sample_conditioning(
+                    contexts[index], height, width, video.dtype
+                )
+            else:
+                text, rope = prepared_conditioning.samples[index]
             x = torch.cat((video, text), 1)
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip_layers:

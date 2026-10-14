@@ -35,6 +35,10 @@ import math
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    prefer_conditioning_cache,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -45,6 +49,24 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+
+
+class MOSSImageDenoisingStage(DenoisingStage):
+    def _before_denoising_loop(self, ctx, batch, server_args):
+        super()._before_denoising_loop(ctx, batch, server_args)
+        self._manage_dit_use_site(self.transformer, "transformer", batch)
+        height, width = ctx.latents.shape[-2:]
+        with set_forward_context(0, None):
+            for branch in ctx.cfg_policy.branches:
+                kwargs = branch.kwargs
+                kwargs["prepared_conditioning"] = self.transformer.prepare_conditioning(
+                    kwargs["encoder_hidden_states"],
+                    kwargs.get("encoder_attention_mask"),
+                    height,
+                    width,
+                    ctx.target_dtype,
+                )
 
 
 class MOSSImageBeforeDenoisingStage(PipelineStage):
@@ -59,9 +81,11 @@ class MOSSImageBeforeDenoisingStage(PipelineStage):
             ComponentUse(
                 self._component_stage_name(stage_name),
                 "text_encoder",
+                start_at_stage_entry=False,
             )
         ]
 
+    @torch.no_grad()
     def _encode_prompt(self, prompts, device, max_sequence_length=4096):
         rows = []
         for prompt in prompts:
@@ -76,10 +100,32 @@ class MOSSImageBeforeDenoisingStage(PipelineStage):
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_sequence_length,
-            ).to(device)
-            with set_forward_context(0, None):
-                output = self.text_encoder(**inputs, use_cache=False, return_dict=True)
-            rows.append(output.last_hidden_state[0])
+            )
+
+            def encode_row():
+                self.begin_declared_component_use(
+                    component_name="text_encoder", module=self.text_encoder
+                )
+                with set_forward_context(0, None):
+                    output = self.text_encoder(
+                        **inputs.to(device), use_cache=False, return_dict=True
+                    )
+                return output.last_hidden_state[0]
+
+            rows.append(
+                cached_encoder_call(
+                    self.text_encoder,
+                    (dict(inputs),),
+                    {"device": str(device)},
+                    encode_row,
+                    namespace=self,
+                    nested=False,
+                    share_in_group=True,
+                )
+            )
+        self.finish_unused_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        )
         length = max(row.shape[0] for row in rows)
         embeds = rows[0].new_zeros(len(rows), length, rows[0].shape[-1])
         mask = torch.zeros(len(rows), length, dtype=torch.bool, device=device)
@@ -131,27 +177,22 @@ class MOSSImageBeforeDenoisingStage(PipelineStage):
 
     def _prepare_prompt_embeddings(self, batch, prompts, device, max_length):
         count = batch.num_outputs_per_prompt
-        with self.use_declared_component(
-            component_name="text_encoder", module=self.text_encoder
-        ) as encoder:
-            self.text_encoder = encoder
-            embeds, mask = self._encode_prompt(prompts, device, max_length)
-            batch.prompt_embeds = [embeds.repeat_interleave(count, 0)]
-            batch.prompt_attention_mask = mask.repeat_interleave(count, 0)
-            if batch.do_classifier_free_guidance:
-                negative = (
-                    batch.negative_prompt if batch.negative_prompt is not None else ""
-                )
-                negative = (
-                    [negative] * len(prompts) if isinstance(negative, str) else negative
-                )
-                if len(negative) != len(prompts):
-                    raise ValueError(
-                        "negative_prompt must match the prompt batch size."
-                    )
+        embeds, mask = self._encode_prompt(prompts, device, max_length)
+        batch.prompt_embeds = [embeds.repeat_interleave(count, 0)]
+        batch.prompt_attention_mask = mask.repeat_interleave(count, 0)
+        if batch.do_classifier_free_guidance:
+            negative = (
+                batch.negative_prompt if batch.negative_prompt is not None else ""
+            )
+            negative = (
+                [negative] * len(prompts) if isinstance(negative, str) else negative
+            )
+            if len(negative) != len(prompts):
+                raise ValueError("negative_prompt must match the prompt batch size.")
+            with prefer_conditioning_cache():
                 embeds, mask = self._encode_prompt(negative, device, max_length)
-                batch.negative_prompt_embeds = [embeds.repeat_interleave(count, 0)]
-                batch.negative_attention_mask = mask.repeat_interleave(count, 0)
+            batch.negative_prompt_embeds = [embeds.repeat_interleave(count, 0)]
+            batch.negative_attention_mask = mask.repeat_interleave(count, 0)
 
     @staticmethod
     def _prepare_latents(batch, *, batch_size, latent_channels, device):

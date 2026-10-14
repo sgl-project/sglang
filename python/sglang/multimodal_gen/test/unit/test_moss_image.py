@@ -389,6 +389,231 @@ def test_request_shift_and_text_limit_do_not_leak(monkeypatch):
     assert limits == [128, 128]
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_prepared_rope_matches_original_rotation(dtype):
+    from sglang.multimodal_gen.runtime.models.dits.moss_image import (
+        _prepare_rope,
+        _rotate,
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 15, 2, 32).to(dtype)
+    packed = _RoPE(32, 10000)(3, 4, 3, torch.device("cpu")).to(dtype)
+    sin, cos = packed.chunk(2, -1)
+    a, b = x.chunk(2, -1)
+    expected = torch.cat(
+        (
+            a * cos.unsqueeze(-2) - b * sin.unsqueeze(-2),
+            b * cos.unsqueeze(-2) + a * sin.unsqueeze(-2),
+        ),
+        -1,
+    )
+    assert torch.equal(_rotate(x, _prepare_rope(packed)), expected)
+
+
+@pytest.fixture
+def small_model():
+    config = MOSSImageDiTConfig(
+        arch_config=MOSSImageArchConfig(
+            dim=64,
+            ffn_dim=128,
+            num_heads=2,
+            num_layers=2,
+            text_dim=32,
+            freq_dim=16,
+            latent_channels=8,
+        )
+    )
+    return MOSSImageTransformer(config).eval()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_prepared_conditioning_matches_steps_and_requests(
+    small_model, dtype, monkeypatch
+):
+    model = small_model.to(dtype)
+    torch.manual_seed(0)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A denoising step repeated static conditioning work")
+
+    # Different requests, spatial shapes and non-prefix masks must stay independent.
+    for height, width in [(2, 3), (3, 2), (2, 3)]:
+        text = torch.randn(2, 5, 32).to(dtype)
+        mask = torch.tensor([[1, 0, 1, 0, 0], [0, 1, 1, 1, 1]])
+        with torch.no_grad(), set_forward_context(0, None):
+            prepared = model.prepare_conditioning(text, mask, height, width, dtype)
+            saved = [
+                tensor.clone()
+                for item in prepared.samples
+                for tensor in (item[0], *item[1])
+            ]
+            for timestep in (938.0, 24.0):
+                latents = torch.randn(2, 8, height, width)
+                expected = model(latents, timestep, text, mask)
+                with monkeypatch.context() as patch:
+                    patch.setattr(model, "_unpad_text", unexpected)
+                    patch.setattr(model, "_prepare_sample_conditioning", unexpected)
+                    actual = model(latents, timestep, text, mask, prepared)
+                assert torch.equal(actual, expected)
+            current = [
+                tensor for item in prepared.samples for tensor in (item[0], *item[1])
+            ]
+            assert all(torch.equal(a, b) for a, b in zip(saved, current))
+
+
+@pytest.mark.parametrize(
+    "mask", [torch.zeros(1, 3), torch.tensor([[1.0, 0.5, 0.0]]), torch.ones(1, 2)]
+)
+def test_prepare_conditioning_rejects_invalid_masks(small_model, mask):
+    with torch.no_grad(), set_forward_context(0, None), pytest.raises(ValueError):
+        small_model.prepare_conditioning(
+            torch.randn(1, 3, 32), mask, 2, 3, torch.float32
+        )
+
+
+@pytest.mark.parametrize("shape", [(1, 8, 3, 2), (2, 8, 2, 3)])
+def test_prepared_conditioning_requires_matching_latents(small_model, shape):
+    text = torch.randn(1, 3, 32)
+    with torch.no_grad(), set_forward_context(0, None):
+        prepared = small_model.prepare_conditioning(text, None, 2, 3, torch.float32)
+        with pytest.raises(ValueError, match="latent batch and size"):
+            small_model(
+                torch.randn(shape),
+                630.0,
+                text.expand(shape[0], -1, -1),
+                prepared_conditioning=prepared,
+            )
+
+
+@pytest.mark.parametrize("use_cfg", [False, True])
+def test_denoising_stage_prepares_actual_cfg_branches(
+    small_model, use_cfg, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
+        MOSSImageDenoisingStage,
+    )
+
+    batch = SimpleNamespace(
+        do_classifier_free_guidance=use_cfg,
+        sampling_params=SimpleNamespace(cfg_gate_step=1.0),
+    )
+    latents = torch.randn(1, 8, 2, 3)
+    pos = {"encoder_hidden_states": torch.randn(1, 3, 32)}
+    neg = {"encoder_hidden_states": torch.randn(1, 2, 32)}
+    ctx = SimpleNamespace(
+        cfg_policy=CFGPolicy().build(batch, {}, pos, neg),
+        pos_cond_kwargs=pos,
+        neg_cond_kwargs=neg,
+        latents=latents,
+        target_dtype=torch.float32,
+        scheduler=MOSSImageScheduler(),
+        timesteps=torch.tensor([938.0, 24.0]),
+        extra={},
+    )
+    stage = object.__new__(MOSSImageDenoisingStage)
+    stage.transformer = small_model
+    uses = []
+    monkeypatch.setattr(stage, "_manage_dit_use_site", lambda *args: uses.append(args))
+    with torch.no_grad(), set_forward_context(0, None):
+        stage._before_denoising_loop(
+            ctx, batch, SimpleNamespace(enable_cfg_parallel=False)
+        )
+        assert uses == [(small_model, "transformer", batch)]
+        assert len(ctx.cfg_policy.branches) == (2 if use_cfg else 1)
+        for branch in ctx.cfg_policy.branches:
+            assert "prepared_conditioning" in branch.kwargs
+            expected = small_model(
+                latents, 938.0, branch.kwargs["encoder_hidden_states"]
+            )
+            actual = small_model(latents, 938.0, **branch.kwargs)
+            assert torch.equal(actual, expected)
+
+
+@pytest.fixture
+def text_stage():
+    from transformers import BatchEncoding
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
+        MOSSImageBeforeDenoisingStage,
+    )
+
+    class Tokenizer:
+        prefix = ""
+        token_offset = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            return self.prefix + messages[0]["content"]
+
+        def __call__(self, prompt, **kwargs):
+            ids = [ord(char) % 13 + 1 + self.token_offset for char in prompt] + [2]
+            ids = torch.tensor([ids[: kwargs["max_length"]]], dtype=torch.long)
+            return BatchEncoding(
+                {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            )
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.arange(1, 5, dtype=torch.float32))
+            self.calls = 0
+
+        def forward(self, input_ids, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                last_hidden_state=input_ids.to(self.scale.dtype).unsqueeze(-1)
+                * self.scale
+            )
+
+    return MOSSImageBeforeDenoisingStage(
+        Encoder().eval(), Tokenizer(), MOSSImageScheduler()
+    )
+
+
+def test_conditioning_cache_preserves_padding_and_request_ownership(
+    text_stage,
+):
+    from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+
+    stage = text_stage
+    prompts = ["short", "short", "a longer negative"]
+    device = torch.device("cpu")
+    expected, expected_mask = stage._encode_prompt(prompts, device)
+    stage.text_encoder.calls = 0
+    cache = ConditioningCache(max_bytes=1024 * 1024)
+    with cache.scope():
+        first, mask = stage._encode_prompt(prompts, device)
+        first.add_(1000)
+        actual, _ = stage._encode_prompt(prompts, device)
+    assert stage.text_encoder.calls == 2
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(mask, expected_mask)
+
+
+@pytest.mark.parametrize("change", ["template", "vocabulary", "truncation"])
+def test_conditioning_cache_keys_actual_tokens(text_stage, change):
+    from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+
+    stage = text_stage
+    device = torch.device("cpu")
+    cache = ConditioningCache(max_bytes=1024 * 1024)
+    with cache.scope():
+        stage._encode_prompt(["negative"], device)
+        limit = 4096
+        if change == "template":
+            stage.tokenizer.prefix = "prefix: "
+        elif change == "vocabulary":
+            stage.tokenizer.token_offset = 1
+        else:
+            limit = 3
+        actual, mask = stage._encode_prompt(["negative"], device, limit)
+        assert stage.text_encoder.calls == 2
+    expected, expected_mask = stage._encode_prompt(["negative"], device, limit)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(mask, expected_mask)
+
+
 @pytest.mark.parametrize(
     "guidance,expected_cfg", [(0.0, True), (0.5, True), (1.0, False), (5.0, True)]
 )

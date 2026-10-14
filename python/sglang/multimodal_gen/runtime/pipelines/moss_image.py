@@ -4,6 +4,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
     MOSSImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
     MOSSImageBeforeDenoisingStage,
+    MOSSImageDenoisingStage,
 )
 
 
@@ -47,7 +49,15 @@ class MOSSImagePipeline(ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
             )
         )
-        self.add_standard_denoising_stage()
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: MOSSImageDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                pipeline=self,
+            ),
+            "denoising_stage",
+        )
         self.add_standard_decoding_stage()
 
 
