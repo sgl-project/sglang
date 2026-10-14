@@ -79,6 +79,9 @@ _KV_PROJECT_INTO_FUSION = BitExactFusionGate(
 _QKV_PACK_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
 )
+_QKV_PACK_CONVROT_INT8_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 packed convrot_int8 Q/K/V projection over one ConvRot quantisation"
+)
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
@@ -223,6 +226,101 @@ def project_into(layer, x, out):
     rows = x.shape[0] * x.shape[1]
     torch.mm(x.reshape(rows, x.shape[-1]), layer.weight.t(), out=out.view(rows, -1))
     return out
+
+
+def can_pack_bf16_projection(layer):
+    """A plain bf16 unquantized ColumnParallelLinear that can join a packed storage."""
+    return (
+        type(layer) is ColumnParallelLinear
+        and isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and layer.bias is None
+        and not layer.gather_output
+        and layer.weight.is_cuda
+        and layer.weight.dtype is torch.bfloat16
+        and layer.weight.dim() == 2
+        and layer.weight.is_contiguous()
+    )
+
+
+def can_pack_convrot_int8_projection(layer):
+    """A resident convrot_int8 ColumnParallelLinear with a 2-D int8 weight and row scale.
+
+    Layerwise offload leaves a flat placeholder in place of both, hence the dim
+    checks -- same reason ``can_project_into`` and ``packed_qkv_weight`` guard.
+    """
+    from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+        ConvRotInt8ComfyKitchenLinearMethod,
+    )
+
+    scale = getattr(layer, "weight_scale", None)
+    return (
+        type(layer) is ColumnParallelLinear
+        and isinstance(layer.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
+        and layer.bias is None
+        and not layer.gather_output
+        and layer.weight.dim() == 2
+        and scale is not None
+        and scale.dim() == 2
+        and layer.weight.is_cuda
+        and layer.weight.dtype is torch.int8
+        and layer.weight.is_contiguous()
+        and scale.is_contiguous()
+    )
+
+
+def can_pack_convrot_int8_qkv(layers):
+    """All three are packable convrot_int8 projections sharing one ConvRot group size.
+
+    A single fused call takes exactly one group size, so projections with
+    different group sizes cannot share a packed weight.
+    """
+    return (
+        all(can_pack_convrot_int8_projection(layer) for layer in layers)
+        and len({layer.quant_method.group_size for layer in layers}) == 1
+    )
+
+
+def share_slices(layers, names, rows):
+    """Re-home each attribute on ``layers`` onto one cat'ed [n * rows, ...] storage.
+
+    The parameters keep their names, shapes and values; only their storage
+    moves. No reference to the shared storage is kept, so offloading the
+    parameters still frees it.
+    """
+    for name in names:
+        packed = torch.cat([getattr(layer, name).data for layer in layers], dim=0)
+        for index, layer in enumerate(layers):
+            getattr(layer, name).data = packed[index * rows : (index + 1) * rows]
+
+
+def consecutive_slices_view(tensors):
+    """``[n * rows, ...]`` view over equal-shaped consecutive slices of one storage, else None.
+
+    No reference to the storage is kept, so offloading the parameters still
+    frees it.
+    """
+    first = tensors[0]
+    if not all(
+        t.is_cuda
+        and t.is_contiguous()
+        and t.shape == first.shape
+        and t.dtype is first.dtype
+        for t in tensors
+    ):
+        return None
+    base = first.untyped_storage().data_ptr()
+    stride = first.numel()
+    if not (
+        all(t.untyped_storage().data_ptr() == base for t in tensors)
+        and all(
+            t.storage_offset() == first.storage_offset() + index * stride
+            for index, t in enumerate(tensors)
+        )
+    ):
+        return None
+    return first.as_strided(
+        (len(tensors) * first.shape[0], *first.shape[1:]), first.stride()
+    )
 
 
 class PrefixPad:
@@ -409,30 +507,27 @@ class QwenImage21Attention(nn.Module):
         re-derives the [3C, C] view from the parameters, so offloading them
         frees the whole buffer. Layers that are not plain bf16 unquantized
         projections are left alone and the packed path stays off.
+
+        convrot_int8 projections pack the same way, plus the matching [3C, 1]
+        fp32 row scales, so one ConvRot covers all three projections.
         """
         layers = (self.to_q, self.to_k, self.to_v)
         if self.packed_qkv_weight() is not None:
             return
-        if not all(
-            type(layer) is ColumnParallelLinear
-            and isinstance(layer.quant_method, UnquantizedLinearMethod)
-            and layer.bias is None
-            and not layer.gather_output
-            and layer.weight.is_cuda
-            and layer.weight.dtype is torch.bfloat16
-            and layer.weight.dim() == 2
-            and layer.weight.is_contiguous()
-            and layer.weight.shape == self.to_q.weight.shape
-            for layer in layers
+        if self.packed_convrot_int8_qkv_weight() is not None:
+            return
+        if can_pack_convrot_int8_qkv(layers):
+            share_slices(layers, ("weight", "weight_scale"), self.to_q.weight.shape[0])
+            return
+        if not (
+            all(can_pack_bf16_projection(layer) for layer in layers)
+            and all(layer.weight.shape == self.to_q.weight.shape for layer in layers)
         ):
             return
-        packed = torch.cat([layer.weight.data for layer in layers], dim=0)
-        rows = self.to_q.weight.shape[0]
-        for index, layer in enumerate(layers):
-            layer.weight.data = packed[index * rows : (index + 1) * rows]
+        share_slices(layers, ("weight",), self.to_q.weight.shape[0])
 
     def packed_qkv_weight(self):
-        """The [3C, C] view over to_q/to_k/to_v when they are consecutive slices of one storage, else None."""
+        """The [3C, C] bf16 view over to_q/to_k/to_v when they are consecutive slices of one storage, else None."""
         # LoRA wrappers keep the projection, and its quant method, in base_layer.
         if not all(
             isinstance(
@@ -445,35 +540,22 @@ class QwenImage21Attention(nn.Module):
         ):
             return None
         q, k, v = self.to_q.weight, self.to_k.weight, self.to_v.weight
-        # Layerwise offload leaves a flat placeholder in place of each weight.
-        if q.dim() != 2:
+        # Layerwise offload leaves a flat placeholder in place of each weight,
+        # and the packed view is bf16 only.
+        if q.dim() != 2 or q.dtype is not torch.bfloat16:
             return None
-        rows, cols = q.shape
-        if not (
-            q.is_cuda
-            and q.dtype is torch.bfloat16
-            and k.dtype is q.dtype
-            and v.dtype is q.dtype
-            and k.shape == q.shape
-            and v.shape == q.shape
-            and q.is_contiguous()
-            and k.is_contiguous()
-            and v.is_contiguous()
-        ):
+        return consecutive_slices_view([q, k, v])
+
+    def packed_convrot_int8_qkv_weight(self):
+        """The ([3C, C] int8, [3C, 1] fp32) views over packed convrot_int8 Q/K/V, else None."""
+        layers = (self.to_q, self.to_k, self.to_v)
+        if not can_pack_convrot_int8_qkv(layers):
             return None
-        base = q.untyped_storage().data_ptr()
-        if not (
-            k.untyped_storage().data_ptr() == base
-            and v.untyped_storage().data_ptr() == base
-        ):
+        weight = consecutive_slices_view([layer.weight for layer in layers])
+        scale = consecutive_slices_view([layer.weight_scale for layer in layers])
+        if weight is None or scale is None:
             return None
-        stride = rows * cols
-        if not (
-            k.storage_offset() == q.storage_offset() + stride
-            and v.storage_offset() == k.storage_offset() + stride
-        ):
-            return None
-        return q.as_strided((3 * rows, cols), (cols, 1))
+        return weight, scale
 
     def _apply(self, fn, recurse=True):
         # .to() and CPU offload rebuild every parameter in its own storage;
@@ -597,6 +679,60 @@ class QwenImage21Attention(nn.Module):
                 return None
         return q, k, v, k_out, v_out
 
+    def _project_qkv_packed_convrot_int8(self, x, layouts, caches):
+        """convrot_int8 twin of ``_project_qkv_packed``: one ConvRot + IMMA GEMM for Q/K/V.
+
+        ConvRot quantises the activation independently of the output columns, so
+        the single [3C, C] GEMM is bit-exact against the three [C, C] ones while
+        skipping two redundant activation quantisations per block. K/V stay plain
+        views here: ``_pack_kv_cuda`` allocates its prefix-padded buffers itself,
+        exactly as it does on the unfused path. The first call still compares
+        every slice against the module forwards.
+        """
+        # Storage-identity checks and the one-shot verification cannot be traced;
+        # a compiled graph keeps the plain projections instead of breaking here.
+        if torch.compiler.is_compiling():
+            return None
+        packed = self.packed_convrot_int8_qkv_weight()
+        if not (
+            packed is not None
+            and x.shape[0] == 1
+            and len(layouts) == 1
+            and get_sp_world_size() == 1
+            and _QKV_PACK_CONVROT_INT8_FUSION.can_attempt_once()
+        ):
+            return None
+        from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+            int8_linear,
+        )
+
+        weight, scale = packed
+        seq = x.shape[1]
+        rows = weight.shape[0] // 3
+        # Judge the row split on the per-projection width, so the packed call
+        # issues exactly the split the separate calls would have.
+        projected = int8_linear(
+            x.view(seq, x.shape[-1]),
+            weight,
+            scale,
+            self.to_q.quant_method.group_size,
+            split_out_features=rows,
+        )
+        q = projected[:, :rows].view(1, seq, self.heads, self.head_dim)
+        k = projected[:, rows : 2 * rows].view(1, seq, self.heads, self.head_dim)
+        v = projected[:, 2 * rows :].view(1, seq, self.heads, self.head_dim)
+        if not _QKV_PACK_CONVROT_INT8_FUSION.verified:
+            reference = tuple(
+                layer(x)[0].unflatten(-1, (self.heads, self.head_dim))
+                for layer in (self.to_q, self.to_k, self.to_v)
+            )
+            accepted = _QKV_PACK_CONVROT_INT8_FUSION.accept_or_fallback(
+                (q, k, v), reference, equal=tensors_equal, logger=logger
+            )
+            if accepted is reference:
+                return None
+        return q, k, v, None, None
+
     def _project_kv_into_buffers(self, x, layouts, caches):
         """Project K/V straight into ``[1, P+S, H, D]`` buffers; ``None`` keeps the plain path."""
         if not (
@@ -712,6 +848,8 @@ class QwenImage21Attention(nn.Module):
     def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
+        if packed is None:
+            packed = self._project_qkv_packed_convrot_int8(x, layouts, caches)
         if packed is not None:
             q, k, v, k_out, v_out = packed
         else:
