@@ -35,6 +35,7 @@ if _is_hip:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
     )
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
         post_attention_norm,
@@ -586,6 +587,50 @@ def forward_hc_pre_from_prev_fused_boundary(
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
+    k1 = dsv41_mono_decode.k1_launch(
+        layer, forward_batch, pending_post, prev_pre, hidden_states
+    )
+    if k1 is not None:
+        # K1 runs this boundary and the attention front; the attention starts from its q.
+        # An index source's compressor and indexer run on K1's normed input and bf16 qr.
+        x_in, residual, post, comb, pre = dsv41_mono_decode.k1_arguments(
+            k1, hidden_states, pending_post, prev_pre
+        )
+        q, residual, post, comb, pre, normed, qr = k1(
+            positions, forward_batch, x_in, residual, post, comb, pre
+        )
+        if normed is not None:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            get_attn_backend().forward_low_ratio_sources(
+                layer=layer.self_attn,
+                x=normed,
+                q_lora=qr,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        if k1.k2_enabled:
+            x, residual, post, comb, pre = k1.k2(
+                positions, forward_batch, q, residual, post, comb, pre
+            )
+            if defer_post:
+                return None, pre, (x, residual, post, comb)
+            return layer.hc_post(x, residual, post, comb), pre, None
+        mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+        with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = layer.self_attn(
+                x=residual[:, 0],
+                positions=positions,
+                forward_batch=forward_batch,
+                defer_all_reduce=True,
+                mono_q=q,
+            )
+        if not isinstance(x, AttnOutput):
+            raise RuntimeError("mono K1: the attention reduced wo_b itself")
+        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
+        if defer_post:
+            return None, pre, (x, residual, post, comb)
+        return layer.hc_post(x, residual, post, comb), pre, None
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
     residual, x, attn_coefficients = hc_boundary(
@@ -600,15 +645,28 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
+    mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-        mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
+        mhc = (
+            None
+            if mono is not None
+            else attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
+        )
         x = layer.self_attn(
             x=x,
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-            defer_all_reduce=mhc is not None,
+            defer_all_reduce=mhc is not None or mono is not None,
         )
+    if mono is not None:
+        if not isinstance(x, AttnOutput):
+            raise RuntimeError("mono FFN launch: the attention reduced wo_b itself")
+        pre, post, comb = attn_coefficients.tensors()
+        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
+        if defer_post:
+            return None, pre, (x, residual, post, comb)
+        return layer.hc_post(x, residual, post, comb), pre, None
     if mhc is not None:
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.
