@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -231,12 +232,20 @@ class NanbeigeDecoderLayer(nn.Module):
         )
         # Each loop runs the physical layers as one stack: the model folds the
         # residual back in and re-enters at layer 0.
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: NanbeigeConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(sparse=False, next_layer_sparse=False),
         )
 
     def forward(
@@ -305,6 +314,7 @@ class NanbeigeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(decoder_layer_type.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

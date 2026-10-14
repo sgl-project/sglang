@@ -29,8 +29,8 @@ from sglang.srt.runtime_context import (
     get_flags,
 )
 from sglang.srt.utils import (
+    ceil_align,
     get_cuda_graph_batch_size_alignment,
-    get_cuda_graph_max_batch_size,
 )
 
 if TYPE_CHECKING:
@@ -63,7 +63,10 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, captured_req_width: int = 1
+    model_runner: ModelRunner,
+    captured_req_width: int = 1,
+    *,
+    gathered_buffer_required: Optional[bool] = None,
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -77,7 +80,9 @@ def get_batch_sizes_to_capture(
     if dllm_config is not None and dllm_config.requires_separate_context_encoding:
         num_max_requests = min(num_max_requests, dllm_config.max_running_requests)
 
-    mul_base = get_cuda_graph_batch_size_alignment()
+    mul_base = get_cuda_graph_batch_size_alignment(
+        gathered_buffer_required=gathered_buffer_required
+    )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
@@ -85,7 +90,7 @@ def get_batch_sizes_to_capture(
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
+    num_max_requests = ceil_align(num_max_requests, mul_base)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
