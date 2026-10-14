@@ -21,19 +21,14 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        MetricsSink,
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        SchedulerServices,
     )
     from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
         NewTokenRatioTracker,
     )
-    from sglang.srt.managers.scheduler_components.output_streamer import (
-        SchedulerOutputStreamer,
-    )
     from sglang.srt.managers.utils import GenerationBatchResult
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
 class DllmManager:
@@ -49,9 +44,8 @@ class DllmManager:
         self,
         *,
         dllm_config: DllmConfig,
-        tree_cache: BasePrefixCache,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        kv: KvResources,
+        services: SchedulerServices,
         policy: SchedulePolicy,
         new_token_ratio_tracker: NewTokenRatioTracker,
         page_size: int,
@@ -65,11 +59,14 @@ class DllmManager:
         get_num_allocatable_reqs: Callable[[int], int],
         build_extend_step: Callable[..., ScheduleBatch],
         build_sampling_info: Callable,
-        metrics_sink: MetricsSink,
-        output_streamer: SchedulerOutputStreamer,
         release_aborted_request: Callable[[Req], None],
         send_abort_output: Callable[[Req], None],
     ):
+        tree_cache = kv.tree_cache
+        req_to_token_pool = kv.req_to_token_pool
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
+        metrics_sink = services.metrics_sink
+        output_streamer = services.output_streamer
         self.dllm_config = dllm_config
         self.tree_cache = tree_cache
         self.req_to_token_pool = req_to_token_pool

@@ -40,10 +40,11 @@ from sglang.srt.utils.flatten import (
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +75,14 @@ class RustServer:
 
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
-    def _start_multimodal(self, scheduler: Scheduler) -> None:
+    def _start_multimodal(
+        self, *, server_args: ServerArgs, model_config: ModelConfig, processor
+    ) -> None:
         """Start the model's Rust workers and retain their scheduler-side state."""
         mm_host = RustMmProcessor(
-            server_args=scheduler.server_args,
-            model_config=scheduler.model_config,
-            processor=scheduler.processor,
+            server_args=server_args,
+            model_config=model_config,
+            processor=processor,
         )
         mm_spec = mm_host.resolve_spec()
         if mm_spec is None:
@@ -88,7 +91,7 @@ class RustServer:
             )
             raise RuntimeError(
                 "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
-                f"model_type={scheduler.model_config.hf_config.model_type!r} "
+                f"model_type={model_config.hf_config.model_type!r} "
                 f"(supported: {', '.join(supported)}; "
                 "images only). Unset SGLANG_RUST_SERVER to serve this model."
             )
@@ -110,7 +113,15 @@ class RustServer:
         )
 
     @classmethod
-    def launch(cls, scheduler: Scheduler) -> RustServer:
+    def launch(
+        cls,
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        processor,
+        tokenizer_path: str,
+        max_total_num_tokens: int,
+    ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
@@ -139,14 +150,20 @@ class RustServer:
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
-                if scheduler.model_config.is_multimodal
+                if model_config.is_multimodal
                 else 0
             )
         )
 
         extension = cls._load_extension()
         server = extension.Server(
-            _build_server_args(scheduler, extension=extension),
+            _build_server_args(
+                server_args=server_args,
+                model_config=model_config,
+                tokenizer_path=tokenizer_path,
+                max_total_num_tokens=max_total_num_tokens,
+                extension=extension,
+            ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
@@ -155,7 +172,7 @@ class RustServer:
 
         # Multimodal models must have a Rust pipeline — there is no Python
         # fallback.
-        if scheduler.model_config.is_multimodal:
+        if model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread still holds the full mask. Narrow it first so every MM thread
             # created below (the processor's executors, the Rust MM workers) stays
@@ -168,7 +185,9 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
-            instance._start_multimodal(scheduler)
+            instance._start_multimodal(
+                server_args=server_args, model_config=model_config, processor=processor
+            )
             instance._multimodal_enabled = True
 
         # Narrow the scheduler thread only after the server threads are launched.

@@ -257,7 +257,9 @@ class TestChecksumMismatchRelease(unittest.TestCase):
             holds_rows=lambda req: True,
             request_finished=lambda req: events.append(("hisparse", req.rid)),
         )
-        processor = SimpleNamespace(hisparse_coordinator=hisparse, tree_cache=None)
+        processor = SimpleNamespace(
+            hisparse_coordinator=hisparse, kv=SimpleNamespace(tree_cache=None)
+        )
         owner = decode_owner_shell(
             kv_checksum_computer=SimpleNamespace(compute=lambda pages, states: 1),
             tree_cache=None,

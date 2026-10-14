@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent import futures
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -20,25 +20,35 @@ from sglang.srt.sampling.sampling_params import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
 class GrammarManager:
-    def __init__(self, scheduler: Scheduler):
-        self.scheduler = scheduler
-        self.server_args = scheduler.server_args
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        tokenizer,
+        model_config: ModelConfig,
+        dp_tp_group: GroupCoordinator,
+        pp_group: Optional[GroupCoordinator],
+    ):
+        self.model_config = model_config
+        self.server_args = server_args
         self.grammar_queue: List[Req] = []
         if not get_serving().skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,
-                scheduler.tokenizer,
-                scheduler.model_config.vocab_size,
-                scheduler.model_config.hf_eos_token_id,
-                think_end_ids=scheduler.model_config.think_end_ids,
+                tokenizer,
+                model_config.vocab_size,
+                model_config.hf_eos_token_id,
+                think_end_ids=model_config.think_end_ids,
             )
         else:
             self.grammar_backend = None
@@ -49,13 +59,13 @@ class GrammarManager:
             else False
         )
 
-        self.grammar_sync_group = scheduler.dp_tp_cpu_group
-        self.grammar_sync_size = scheduler.dp_tp_group.world_size
-        self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
-        self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+        self.grammar_sync_group = dp_tp_group.cpu_group
+        self.grammar_sync_size = dp_tp_group.world_size
+        self.grammar_sync_entry = dp_tp_group.first_rank
+        self.is_grammar_sync_entry = dp_tp_group.is_first_rank
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
-        self.pp_group = scheduler.pp_group
+        self.pp_group = pp_group
         self.grammar_pp_sync_work_list = []
 
         self.SGLANG_GRAMMAR_POLL_INTERVAL = envs.SGLANG_GRAMMAR_POLL_INTERVAL.get()
@@ -131,7 +141,7 @@ class GrammarManager:
         think_end_ids = get_request_reasoning_end_token_ids(
             req.sampling_params.custom_params,
             allowed_sequences=getattr(
-                self.scheduler.model_config,
+                self.model_config,
                 "request_selectable_think_end_id_sequences",
                 None,
             ),

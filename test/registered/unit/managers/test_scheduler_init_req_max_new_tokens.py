@@ -8,8 +8,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, get_schedule
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -43,6 +44,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
+        enter_scope(self, published_topology())
         # Tests use an unsharded topology unless they explicitly override it.
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
@@ -57,10 +59,11 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
-        scheduler.max_total_num_tokens = max_total_num_tokens
-        scheduler.page_size = page_size
-        scheduler.kv_shard_widening = kv_shard_widening
-        scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        get_context().override("test", page_size=page_size)
+        scheduler.capacity = SimpleNamespace(
+            widened_max_total_num_tokens=max_total_num_tokens * kv_shard_widening,
+            kv_shard_widening=kv_shard_widening,
+        )
         scheduler.sliding_window_size = None
         scheduler.chunked_prefill_size = None
         scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -90,17 +93,17 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_new_tokens = req.sampling_params.max_new_tokens
 
         input_len = len(req.origin_input_ids)
-        page_size = scheduler.page_size
-        shard_widening = scheduler.kv_shard_widening
+        page_size = get_schedule().page_size
+        shard_widening = scheduler.capacity.kv_shard_widening
         paged_input_len = -(-input_len // page_size) * page_size
-        limit = scheduler.max_new_tokens_limit
+        limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
-                < scheduler.max_total_num_tokens * shard_widening
+                < scheduler.capacity.widened_max_total_num_tokens
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -251,7 +254,6 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         scheduler.sliding_window_size = 4
         scheduler.chunked_prefill_size = 4
-        scheduler.max_new_tokens_limit = None
         for prompt_len in (4, 5, 6, 7):
             with self.subTest(prompt_len=prompt_len):
                 req = self._new_req(max_new_tokens=1, input_len=prompt_len)

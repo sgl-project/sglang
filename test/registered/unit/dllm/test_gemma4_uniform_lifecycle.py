@@ -90,11 +90,20 @@ def _manager(*, fdfo, block_size=4, context_len=128):
             first_done_first_out_mode=fdfo,
             requires_separate_context_encoding=True,
         ),
-        tree_cache=object(),
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=SimpleNamespace(
-            free_group_begin=Mock(),
-            free_group_end=Mock(),
+        kv=SimpleNamespace(
+            tree_cache=object(),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=Mock(),
+                free_group_end=Mock(),
+            ),
+        ),
+        services=SimpleNamespace(
+            metrics_sink=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=Mock(),
+            ),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
         ),
         policy=None,
         new_token_ratio_tracker=None,
@@ -109,11 +118,6 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         get_num_allocatable_reqs=None,
         build_extend_step=None,
         build_sampling_info=None,
-        metrics_sink=SimpleNamespace(
-            num_generated_tokens=0,
-            report_prefill_stats=Mock(),
-        ),
-        output_streamer=SimpleNamespace(stream_output=Mock()),
         release_aborted_request=Mock(),
         send_abort_output=Mock(),
     )
@@ -374,7 +378,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
         from sglang.srt.runtime_context import get_context, get_parallel
 
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)

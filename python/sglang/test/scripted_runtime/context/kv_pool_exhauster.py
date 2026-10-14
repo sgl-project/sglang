@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List
 
+from sglang.srt.runtime_context import get_schedule
+
 if TYPE_CHECKING:
     import torch
 
@@ -16,7 +18,7 @@ class ScriptedKvPoolExhauster:
     def exhaust(self, *, leave_pages: int) -> None:
         allocator = self.scheduler.token_to_kv_pool_allocator
 
-        leave_tokens = leave_pages * self.scheduler.page_size
+        leave_tokens = leave_pages * get_schedule().page_size
         need = allocator.available_size() - leave_tokens
         if need <= 0:
             return

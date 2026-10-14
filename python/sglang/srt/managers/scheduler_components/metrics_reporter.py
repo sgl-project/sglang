@@ -31,8 +31,11 @@ from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
     get_context,
     get_disagg,
+    get_lora,
+    get_memory,
     get_observability,
     get_parallel,
+    get_schedule,
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
@@ -986,7 +989,7 @@ class SchedulerMetricsReporter:
                     num_write_bytes_per_gpu=write_bytes,
                 )
 
-            priority_enabled = self.scheduler.enable_priority_scheduling
+            priority_enabled = get_schedule().enable_priority_scheduling
             effective_input_tokens = (
                 prefill_stats.log_input_tokens
                 - prefill_stats.reprocessed_log_input_tokens
@@ -1212,7 +1215,7 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
+            self._update_decode_queue_stats(get_schedule().enable_priority_scheduling)
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode.prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             lists = self.scheduler.request_lists()
             msg += f"#prealloc-req: {len(lists['prealloc'].reqs)}, "
@@ -1263,7 +1266,7 @@ class SchedulerMetricsReporter:
         if self.metrics_sink.is_stats_logging_rank:
             logger.info(msg)
         if self.metrics_sink.current_scheduler_metrics_enabled:
-            priority_enabled = self.scheduler.enable_priority_scheduling
+            priority_enabled = get_schedule().enable_priority_scheduling
 
             # Basics
             self.metrics_sink.stats.num_running_reqs = QueueCount.from_reqs(
@@ -1384,7 +1387,7 @@ class SchedulerMetricsReporter:
 
         These are pushed to Prometheus by SchedulerMetricsCollector.log_stats().
         """
-        if not self.scheduler.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             return
 
         host_pool = getattr(
@@ -1399,7 +1402,7 @@ class SchedulerMetricsReporter:
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
-        if not self.scheduler.enable_lora:
+        if not get_lora().enable_lora:
             return
 
         try:
@@ -1500,7 +1503,7 @@ class SchedulerMetricsReporter:
             self.scheduler.pool_stats_observer.session_held_tokens()
         )
 
-        priority_enabled = self.scheduler.enable_priority_scheduling
+        priority_enabled = get_schedule().enable_priority_scheduling
         self.metrics_sink.stats.num_running_reqs = QueueCount.from_reqs(
             self.scheduler.lists.decoding, priority_enabled
         )

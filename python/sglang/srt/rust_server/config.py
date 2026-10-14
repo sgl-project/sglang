@@ -20,14 +20,20 @@ from sglang.srt.runtime_context import (
 from sglang.version import __version__
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.rust_extensions._server import ServerArgs
+    from sglang.srt.server_args import ServerArgs as SglServerArgs
 
 logger = logging.getLogger(__name__)
 
 
 def _build_server_args(
-    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+    *,
+    server_args: SglServerArgs,
+    model_config: ModelConfig,
+    tokenizer_path: str,
+    max_total_num_tokens: int,
+    extension: Optional[ModuleType] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -40,8 +46,8 @@ def _build_server_args(
 
     ext = extension or load_rust_extension("sglang.srt.rust_extensions._server")
 
-    sa = resolving_view(scheduler.server_args)
-    mc = scheduler.model_config
+    sa = resolving_view(server_args)
+    mc = model_config
     disaggregation_mode = {
         "null": ext.DisaggregationMode.Null,
         "prefill": ext.DisaggregationMode.Prefill,
@@ -55,7 +61,7 @@ def _build_server_args(
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
-        tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        tokenizer_path=tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -105,7 +111,7 @@ def _build_server_args(
         # scheduler_info / the package — stamped here so the rust endpoint
         # can serve them statically (no scheduler round-trip).
         version=__version__,
-        max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_total_num_tokens=max_total_num_tokens,
     )
 
 

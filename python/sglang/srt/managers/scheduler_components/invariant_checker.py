@@ -40,8 +40,10 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+    from sglang.srt.managers.scheduler_components.engine_state import (
+        EngineFlags,
+        LaunchCounters,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -483,28 +485,42 @@ class SchedulerInvariantChecker:
             self.tree_cache.sanity_check()
 
 
-def create_scheduler_watchdog(
-    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-) -> WatchdogRaw:
-    def dump_info() -> str:
-        if scheduler.flags.is_initializing:
-            return ""
-        _, messages = scheduler.invariant_checker._check_all_pools(
-            scheduler.pool_stats_observer.get_pool_stats(),
-        )
-        return (
-            f"{scheduler.counters.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.counters.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
+class SchedulerWatchdog:
+    """Fires when the launch counter stalls while the scheduler initializes or
+    runs a step. Its stall dump reads the pools through the invariant checker,
+    which the scheduler attaches before initialization ends."""
+
+    def __init__(
+        self,
+        *,
+        counters: LaunchCounters,
+        flags: EngineFlags,
+        watchdog_timeout: float,
+        soft: bool = False,
+    ):
+        self.counters = counters
+        self.flags = flags
+        self.invariant_checker: Optional[SchedulerInvariantChecker] = None
+        self.raw = WatchdogRaw(
+            debug_name="Scheduler",
+            get_counter=lambda: counters.forward_ct,
+            is_active=lambda: (
+                flags.is_initializing or counters.cur_batch_for_debug is not None
+            ),
+            watchdog_timeout=watchdog_timeout,
+            soft=soft,
+            dump_info=self._dump_info,
         )
 
-    return WatchdogRaw(
-        debug_name="Scheduler",
-        get_counter=lambda: scheduler.counters.forward_ct,
-        is_active=lambda: (
-            scheduler.flags.is_initializing
-            or scheduler.counters.cur_batch_for_debug is not None
-        ),
-        watchdog_timeout=watchdog_timeout,
-        soft=soft,
-        dump_info=dump_info,
-    )
+    def _dump_info(self) -> str:
+        if self.flags.is_initializing:
+            return ""
+        checker = self.invariant_checker
+        _, messages = checker._check_all_pools(
+            checker.pool_stats_observer.get_pool_stats(),
+        )
+        batch = self.counters.cur_batch_for_debug
+        return (
+            f"scheduler.cur_batch_for_debug.batch_size()={batch.batch_size()!r}\n"
+            f"scheduler.cur_batch_for_debug.reqs={batch.reqs!r}\n" + "\n".join(messages)
+        )

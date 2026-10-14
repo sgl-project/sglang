@@ -9,6 +9,7 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -462,9 +463,9 @@ class TestSpanlessAbortPaths(CustomTestCase):
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
         sent = []
+        enter_scope(self, published_topology())
+        get_context().override("test", abort_on_priority_when_disabled=True)
         scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda obj, req_arg: sent.append(obj)

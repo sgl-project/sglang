@@ -25,10 +25,10 @@ from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -159,6 +159,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
 class TestSharedPrefillAdmission(unittest.TestCase):
     def _new_admission(self, page_size, pool_pages, *, ignore_eos=False):
+        enter_scope(self, published_topology())
         allocator = _shared_allocator(
             page_size=page_size, pool_tokens=pool_pages * page_size
         )
@@ -173,9 +174,10 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = 16 * page_size
-        scheduler.max_total_num_tokens = allocator.size_full
-        scheduler.page_size = page_size
-        scheduler.max_new_tokens_limit = None
+        scheduler.capacity = SimpleNamespace(
+            widened_max_total_num_tokens=allocator.size_full, kv_shard_widening=1
+        )
+        get_context().override("test", page_size=page_size)
         scheduler.sliding_window_size = page_size
         scheduler.chunked_prefill_size = page_size
         scheduler.token_to_kv_pool_allocator = allocator

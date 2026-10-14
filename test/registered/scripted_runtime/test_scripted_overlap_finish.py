@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
 )
+from sglang.srt.runtime_context import get_schedule
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -164,12 +165,12 @@ def _finish_and_check(t: ScriptedContext, r, req, baseline, *, case, check_tree)
 
 
 def _script_length(t: ScriptedContext):
-    assert t.scheduler.enable_overlap, "overlap schedule is off"
+    assert not get_schedule().disable_overlap_schedule, "overlap schedule is off"
     yield from _reference(t)
 
 
 def _script_stop_token(t: ScriptedContext, check_tree: bool):
-    assert t.scheduler.enable_overlap, "overlap schedule is off"
+    assert not get_schedule().disable_overlap_schedule, "overlap schedule is off"
     ref, tokenizer, eos = yield from _reference(t)
     baseline = _pool_baseline(t)
     k = _pick_stop_token(ref, _eos_ids(tokenizer, eos))
@@ -186,7 +187,7 @@ def _script_stop_token(t: ScriptedContext, check_tree: bool):
 
 
 def _script_stop_str(t: ScriptedContext, check_tree: bool):
-    assert t.scheduler.enable_overlap, "overlap schedule is off"
+    assert not get_schedule().disable_overlap_schedule, "overlap schedule is off"
     ref, tokenizer, eos = yield from _reference(t)
     baseline = _pool_baseline(t)
     k, stop_str = _pick_stop_str(ref, _eos_ids(tokenizer, eos), tokenizer)
@@ -202,7 +203,7 @@ def _script_stop_str(t: ScriptedContext, check_tree: bool):
 
 
 def _script_abort(t: ScriptedContext, check_tree: bool):
-    assert t.scheduler.enable_overlap, "overlap schedule is off"
+    assert not get_schedule().disable_overlap_schedule, "overlap schedule is off"
     ref, _, _ = yield from _reference(t)
     baseline = _pool_baseline(t)
 

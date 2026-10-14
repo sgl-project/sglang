@@ -59,11 +59,11 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.disaggregation_mode = disaggregation_mode
-        scheduler.enable_priority_scheduling = True
-        scheduler.schedule_low_priority_values_first = False
-        scheduler.abort_on_priority_when_disabled = False
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_unified_cache_external_linker = False
+        get_context().override("test", enable_priority_scheduling=True)
+        get_context().override("test", schedule_low_priority_values_first=False)
+        get_context().override("test", abort_on_priority_when_disabled=False)
+        get_context().override("test", enable_hierarchical_cache=False)
+        get_context().override("test", enable_unified_cache_external_linker=False)
         scheduler.counters.processed_tokens_counter = 0
         scheduler.lists.waiting_queue = []
         scheduler._prefetch_kvcache = MagicMock()
@@ -132,8 +132,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def test_priority_disabled_abort_validation_applies_to_decode_mode(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
-        scheduler.enable_priority_scheduling = False
-        scheduler.abort_on_priority_when_disabled = True
+        get_context().override("test", enable_priority_scheduling=False)
+        get_context().override("test", abort_on_priority_when_disabled=True)
         req = self._new_req(priority=10)
 
         with patch(
@@ -150,8 +150,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         for mode in DisaggregationMode:
             with self.subTest(mode=mode):
                 scheduler = self._new_scheduler(mode)
-                scheduler.enable_priority_scheduling = False
-                scheduler.abort_on_priority_when_disabled = True
+                get_context().override("test", enable_priority_scheduling=False)
+                get_context().override("test", abort_on_priority_when_disabled=True)
                 scheduler.tree_cache = MagicMock(spec=["finish"])
                 req = self._new_req(priority=10)
 
@@ -589,7 +589,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.enable_decode_hicache = False
         queue.enable_lora = True
         scheduler = MagicMock()
-        scheduler.enable_lora_overlap_loading = False
+        get_context().override("test", enable_lora_overlap_loading=False)
         scheduler.lora_drainer = None
         manager = LoRAManager.__new__(LoRAManager)
         manager.max_loras_per_batch = 5

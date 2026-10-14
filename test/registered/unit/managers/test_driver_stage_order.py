@@ -40,6 +40,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (  # noqa: E4
 )
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -307,6 +308,9 @@ class _Shell:
                 lambda step: self.log("schedule_time"),
             ),
         ):
+            get_context().override(
+                "test", disable_overlap_schedule=not self.s.enable_overlap
+            )
             self.s.init_mode_stages()
             try:
                 _dispatch_event_loop_once(self.s)

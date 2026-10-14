@@ -32,10 +32,18 @@ def _manager(**deps):
             first_done_first_out_mode=True,
             requires_separate_context_encoding=False,
         ),
-        tree_cache=None,
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=SimpleNamespace(
-            free_group_begin=Mock(), free_group_end=Mock()
+        kv=SimpleNamespace(
+            tree_cache=None,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=Mock(), free_group_end=Mock()
+            ),
+        ),
+        services=SimpleNamespace(
+            metrics_sink=SimpleNamespace(
+                num_generated_tokens=0, report_prefill_stats=Mock()
+            ),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
         ),
         policy=SimpleNamespace(calc_priority=Mock()),
         new_token_ratio_tracker=None,
@@ -50,10 +58,6 @@ def _manager(**deps):
         get_num_allocatable_reqs=lambda running_bs: 64,
         build_extend_step=_Step,
         build_sampling_info=Mock(),
-        metrics_sink=SimpleNamespace(
-            num_generated_tokens=0, report_prefill_stats=Mock()
-        ),
-        output_streamer=SimpleNamespace(stream_output=Mock()),
         release_aborted_request=Mock(),
         send_abort_output=Mock(),
     )

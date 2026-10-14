@@ -94,18 +94,22 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
         is_generation=True,
         enable_overlap=True,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
+        kv=SimpleNamespace(
+            token_to_kv_pool_allocator=MagicMock(),
+            tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
+            req_to_token_pool=None,
+        ),
+        services=SimpleNamespace(
+            metrics_sink=metrics_sink,
+            output_streamer=MagicMock(),
+        ),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
-        req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_sink=metrics_sink,
         draft_worker=None,
         model_worker=MagicMock(),
         logprob_result_processor=None,
-        output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
         pending=PendingSteps(),
     )
@@ -558,7 +562,7 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             ) as release,
         ):
             processor.process_batch_result_prefill(prefill_step, result)
-        return req, processor.tree_cache, release
+        return req, processor.kv.tree_cache, release
 
     def test_running_request_checkpoint(self):
         for pending_tracks in (True, False):

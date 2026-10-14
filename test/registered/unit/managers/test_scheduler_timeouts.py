@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -66,8 +67,6 @@ def _scheduler(waiting_queue, decoding=(), chunked_req=None):
     s = Scheduler.__new__(Scheduler)
     s.lists = CoreLists()
     s.lists.waiting_queue = waiting_queue
-    s.enable_hierarchical_cache = False
-    s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     s.lists.decoding = list(decoding)
@@ -83,6 +82,7 @@ def _scheduler(waiting_queue, decoding=(), chunked_req=None):
 
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
+        enter_scope(self, published_topology())
         patcher = patch(
             "sglang.srt.managers.scheduler.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
@@ -98,9 +98,12 @@ class TestQueuedLimitAbort(CustomTestCase):
 
         s = _scheduler([candidate])
         s.max_queued_requests = 1
-        s.enable_priority_scheduling = True
-        s.schedule_low_priority_values_first = False
-        s.enable_hierarchical_cache = True
+        get_context().override(
+            "test",
+            enable_priority_scheduling=True,
+            schedule_low_priority_values_first=False,
+            enable_hierarchical_cache=True,
+        )
         s.tree_cache = MagicMock(spec=["finish"])
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
@@ -112,6 +115,9 @@ class TestQueuedLimitAbort(CustomTestCase):
 
 
 class TestWaitingTimeout(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_emits_only_reqs_past_the_deadline_and_keeps_queue_intact(self):
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)

@@ -40,12 +40,13 @@ _FROZEN = ["KvResources", "KvCapacity", "Streams", "IpcChannels", "Workers"]
 _DECLARED = {
     **{node: [] for node in _SHARED + _FROZEN},
     "StageMetrics": [],
+    "SchedulerServices": ["MetricsSink", "OutputStreamer", "StageMetrics"],
     "MetricsSink": [],
     "StepCounters": [],
     "SessionController": ["KvResources"],
     "FutureMap": ["KvResources"],
     "BeamCoordinator": ["KvResources", "FutureMap"],
-    "GrammarManager": ["Workers"],
+    "GrammarManager": [],
     "SchedulePolicy": ["KvResources"],
     "NewTokenRatioTracker": [],
     "HiSparse": ["KvResources"],
@@ -67,12 +68,8 @@ _DECLARED = {
     "ProfilerManager": ["LaunchCounters"],
     "OutputStreamer": ["IpcChannels", "KvResources"],
     "MMReceiver": ["Workers", "MetricsSink"],
-    "Watchdog": [
-        "LaunchCounters",
-        "EngineFlags",
-        "InvariantChecker",
-        "PoolStatsObserver",
-    ],
+    # The invariant checker is attached once both are built.
+    "Watchdog": ["LaunchCounters", "EngineFlags", "InvariantChecker"],
     "PPSpecForward": ["Workers", "FutureMap", "KvResources", "Streams"],
     "RequestRetirer": [
         "BeamCoordinator",
@@ -298,6 +295,7 @@ _PARAM = {
     "KvResources": ("kv",),
     "KvCapacity": ("capacity",),
     "Streams": ("streams",),
+    "SchedulerServices": ("services",),
     "IpcChannels": ("ipc_channels",),
     "StageMetrics": ("scheduler_stage_metrics",),
     "MetricsSink": ("metrics_sink",),
@@ -347,6 +345,14 @@ _BUILT = {
         "SchedulerLoadPublisher",
     ),
     "MetricsSink": ("managers/scheduler_components/metrics_reporter.py", "MetricsSink"),
+    "KvResources": ("managers/scheduler_components/bundles.py", "KvResources"),
+    "KvCapacity": ("managers/scheduler_components/bundles.py", "KvCapacity"),
+    "Streams": ("managers/scheduler_components/bundles.py", "Streams"),
+    "SchedulerServices": (
+        "managers/scheduler_components/bundles.py",
+        "SchedulerServices",
+    ),
+    "GrammarManager": ("constrained/grammar_manager.py", "GrammarManager"),
 }
 
 # The modules whose classes sit below ModeOwners.
@@ -379,30 +385,12 @@ _SCHEDULER_REFS = {
     # The actor process that hosts a scheduler.
     ("ray/scheduler_actor.py", "SchedulerActor.__init__", "import"): 1,
     # To be removed.
-    ("constrained/grammar_manager.py", "", "import"): 1,
-    ("constrained/grammar_manager.py", "GrammarManager.__init__", "annotation"): 1,
-    ("disaggregation/encoder/receiver.py", "", "import"): 1,
-    ("disaggregation/encoder/receiver.py", "MMReceiverBase.__init__", "annotation"): 1,
-    ("disaggregation/encoder/receiver.py", "MMReceiverGrpc.__init__", "annotation"): 1,
-    ("disaggregation/encoder/receiver.py", "MMReceiverHTTP.__init__", "annotation"): 1,
-    ("disaggregation/encoder/receiver.py", "create_mm_receiver", "annotation"): 1,
-    ("managers/scheduler_components/invariant_checker.py", "", "import"): 1,
-    (
-        "managers/scheduler_components/invariant_checker.py",
-        "create_scheduler_watchdog",
-        "annotation",
-    ): 1,
     ("managers/scheduler_components/metrics_reporter.py", "", "import"): 1,
     (
         "managers/scheduler_components/metrics_reporter.py",
         "SchedulerMetricsReporter",
         "annotation",
     ): 1,
-    ("rust_server/config.py", "", "import"): 1,
-    ("rust_server/config.py", "_build_server_args", "annotation"): 1,
-    ("rust_server/server.py", "", "import"): 1,
-    ("rust_server/server.py", "RustServer._start_multimodal", "annotation"): 1,
-    ("rust_server/server.py", "RustServer.launch", "annotation"): 1,
 }
 
 # R2: (Scheduler method, callee, keyword, kind).
@@ -480,7 +468,6 @@ _CALLBACK_SITES = {
         "record_weight_version_change",
         _BOUND,
     ): 1,
-    ("maybe_init_rust_server", "self.get_rust_server_class().launch", "", _SELF): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (
         "init_dp_attn_adapter",
@@ -540,16 +527,6 @@ _CALLBACK_SITES = {
     ("maybe_init_dllm", "DllmManager", "release_aborted_request", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "send_abort_output", _BOUND): 1,
     ("init_metrics_reporter", "SchedulerMetricsReporter", "scheduler", _SELF): 1,
-    ("init_soft_watchdog", "create_scheduler_watchdog", "", _SELF): 1,
-    (
-        "init_watch_dog_memory_saver_input_blocker",
-        "create_scheduler_watchdog",
-        "",
-        _SELF,
-    ): 1,
-    ("init_disaggregation", "create_mm_receiver", "scheduler", _SELF): 1,
-    ("init_disaggregation", "unified_memory_disagg_move_gate", "", _SELF): 1,
-    ("init_grammar_manager", "GrammarManager", "", _SELF): 1,
 }
 
 # R4: (module under srt/, class, parameter).

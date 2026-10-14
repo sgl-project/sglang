@@ -25,11 +25,15 @@ class TestRustServerExtension(CustomTestCase):
             def _load_extension(cls):
                 return extension
 
-            def _start_multimodal(self, scheduler):
+            def _start_multimodal(self, **_kwargs):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
-        scheduler = SimpleNamespace(
+        launch_config = dict(
+            server_args=SimpleNamespace(),
             model_config=SimpleNamespace(is_multimodal=True),
+            processor=None,
+            tokenizer_path="tokenizer",
+            max_total_num_tokens=1024,
         )
         with (
             patch.object(
@@ -68,9 +72,15 @@ class TestRustServerExtension(CustomTestCase):
                 server_module, "_build_server_args", return_value=sentinel.args
             ) as build_args,
         ):
-            instance = ModelServer.launch(scheduler)
+            instance = ModelServer.launch(**launch_config)
 
-        build_args.assert_called_once_with(scheduler, extension=extension)
+        build_args.assert_called_once_with(
+            server_args=launch_config["server_args"],
+            model_config=launch_config["model_config"],
+            tokenizer_path="tokenizer",
+            max_total_num_tokens=1024,
+            extension=extension,
+        )
         extension.Server.assert_called_once_with(
             sentinel.args, cores=None, port_offset=1
         )

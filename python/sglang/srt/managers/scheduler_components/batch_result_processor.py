@@ -59,14 +59,12 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        SchedulerServices,
+    )
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
-    )
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        MetricsSink,
-    )
-    from sglang.srt.managers.scheduler_components.output_streamer import (
-        SchedulerOutputStreamer,
     )
     from sglang.srt.managers.scheduler_components.pending_steps import (
         PendingStep,
@@ -77,9 +75,6 @@ if TYPE_CHECKING:
         EmbeddingBatchResult,
         GenerationBatchResult,
     )
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -198,17 +193,14 @@ class SchedulerBatchResultProcessor:
     is_generation: bool
     enable_overlap: bool
     model_config: ModelConfig
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    tree_cache: BasePrefixCache
+    kv: KvResources
+    services: SchedulerServices
     hisparse_coordinator: Optional[HiSparseCoordinator]
-    req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
-    metrics_sink: MetricsSink
     draft_worker: BaseTpWorker
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
-    output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
     pending: PendingSteps
@@ -236,7 +228,7 @@ class SchedulerBatchResultProcessor:
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,
-            req_to_token_pool=self.req_to_token_pool,
+            req_to_token_pool=self.kv.req_to_token_pool,
             start_len=start_len,
         )
 
@@ -266,7 +258,7 @@ class SchedulerBatchResultProcessor:
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,
-            req_to_token_pool=self.req_to_token_pool,
+            req_to_token_pool=self.kv.req_to_token_pool,
         )
 
     def _maybe_collect_customized_info(
@@ -366,7 +358,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
-        self.token_to_kv_pool_allocator.free_group_begin()
+        self.kv.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
             logits_output, next_token_ids, auxiliary_output_starts = (
@@ -472,7 +464,7 @@ class SchedulerBatchResultProcessor:
                     elif not is_decode_row:
                         checkpoint_kv_cache(
                             req,
-                            self.tree_cache,
+                            self.kv.tree_cache,
                             publish=not self._mamba_lazy_keep_pending_write(req),
                         )
                         if get_memory().enable_hisparse:
@@ -557,7 +549,7 @@ class SchedulerBatchResultProcessor:
                 ):
                     req.to_finish = req.discard_output_reason
                     req.update_finish_state(0)
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    release_kv_cache(req, self.kv.tree_cache, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -571,16 +563,16 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache, checkpoint=True)
+                        release_kv_cache(req, self.kv.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
-                        checkpoint_kv_cache(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.kv.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.token_to_kv_pool_allocator.free_group_end()
-        self.output_streamer.stream_output(
+        self.kv.token_to_kv_pool_allocator.free_group_end()
+        self.services.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
@@ -908,7 +900,7 @@ class SchedulerBatchResultProcessor:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        self.output_streamer._stream_output_generation(
+        self.services.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
@@ -946,9 +938,9 @@ class SchedulerBatchResultProcessor:
 
         batch_size = batch.batch_size()
         num_generated_tokens = result.get_num_generated_tokens(batch_size)
-        self.metrics_sink.num_generated_tokens += num_generated_tokens
+        self.services.metrics_sink.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
-            self.metrics_sink.update_spec_metrics(
+            self.services.metrics_sink.update_spec_metrics(
                 batch_size,
                 num_generated_tokens - batch_size * result.num_non_draft_tokens_per_req,
                 num_accept_tokens=num_generated_tokens,
@@ -960,7 +952,7 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+        self.kv.token_to_kv_pool_allocator.free_group_begin()
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1059,11 +1051,11 @@ class SchedulerBatchResultProcessor:
                 auxiliary_output_starts,
             )
 
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
+        self.services.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.kv.token_to_kv_pool_allocator.free_group_end()
 
-        self.metrics_sink.forward_ct_decode = (
-            self.metrics_sink.forward_ct_decode + 1
+        self.services.metrics_sink.forward_ct_decode = (
+            self.services.metrics_sink.forward_ct_decode + 1
         ) % (1 << 30)
         return num_generated_tokens
 
@@ -1318,7 +1310,7 @@ class SchedulerBatchResultProcessor:
         hisparse = self.hisparse_coordinator
         if hisparse is not None and hisparse.holds_rows(req):
             hisparse.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        release_kv_cache(req, self.kv.tree_cache, checkpoint=checkpoint)
 
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
@@ -1513,7 +1505,7 @@ class SchedulerBatchResultProcessor:
         is detected by comparing the accepted seq_len range against interval
         boundaries.
         """
-        interval = mamba_track_grid(self.tree_cache.page_size)
+        interval = mamba_track_grid(self.kv.tree_cache.page_size)
 
         if batch.spec_algorithm.is_none():
             if batch.mamba_track_mask_cpu is not None and batch.mamba_track_mask_cpu[i]:

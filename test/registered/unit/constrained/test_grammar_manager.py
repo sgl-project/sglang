@@ -74,9 +74,20 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.dp_tp_group.world_size = 1
     scheduler.dp_tp_group.first_rank = 0
     scheduler.dp_tp_group.is_first_rank = True
+    scheduler.dp_tp_group.cpu_group = scheduler.dp_tp_cpu_group
     scheduler.pp_group = None
 
     return scheduler
+
+
+def _grammar_manager(scheduler) -> GrammarManager:
+    return GrammarManager(
+        server_args=scheduler.server_args,
+        tokenizer=scheduler.tokenizer,
+        model_config=scheduler.model_config,
+        dp_tp_group=scheduler.dp_tp_group,
+        pp_group=scheduler.pp_group,
+    )
 
 
 def _make_req(
@@ -113,14 +124,14 @@ class TestGrammarManagerInit(unittest.TestCase):
 
     def test_init_skip_tokenizer(self):
         scheduler = _make_scheduler(skip_tokenizer=True)
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         self.assertIsNone(mgr.grammar_backend)
 
     @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
     def test_len_and_has_waiting(self, mock_create):
         mock_create.return_value = None
         scheduler = _make_scheduler()
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         self.assertEqual(len(mgr), 0)
         self.assertFalse(mgr.has_waiting_grammars())
 
@@ -128,7 +139,7 @@ class TestGrammarManagerInit(unittest.TestCase):
     def test_clear_no_backend(self, mock_create):
         mock_create.return_value = None
         scheduler = _make_scheduler()
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.clear()  # Should not raise
 
 
@@ -144,7 +155,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
@@ -258,7 +269,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = None
 
         req = _make_req(json_schema='{"type": "object"}')
@@ -326,7 +337,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
 
     def test_cache_hit_applies_only_request_selected_terminator(self):
         mgr = self._make_mgr()
-        mgr.scheduler.model_config.request_selectable_think_end_id_sequences = [
+        mgr.model_config.request_selectable_think_end_id_sequences = [
             [2, 3],
             [8, 9],
         ]
@@ -385,7 +396,7 @@ class TestAbortRequests(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
@@ -469,7 +480,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         # Use very short poll interval for tests
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
@@ -753,7 +764,7 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         # Override ranks after the server-args override rebuilds the config bags.
         enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
         scheduler.pp_group = pp_group
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
@@ -818,7 +829,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
+        mgr = _grammar_manager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         mgr._enable_strict_thinking = True
         return mgr

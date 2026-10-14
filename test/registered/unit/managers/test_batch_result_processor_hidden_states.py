@@ -38,17 +38,21 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         is_generation=True,
         enable_overlap=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=Mock(),
-        tree_cache=None,
+        kv=SimpleNamespace(
+            token_to_kv_pool_allocator=Mock(),
+            tree_cache=None,
+            req_to_token_pool=None,
+        ),
+        services=SimpleNamespace(
+            metrics_sink=metrics_sink,
+            output_streamer=Mock(),
+        ),
         hisparse_coordinator=None,
-        req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_sink=metrics_sink,
         draft_worker=None,
         model_worker=Mock(),
         logprob_result_processor=None,
-        output_streamer=Mock(),
         beam_coordinator=Mock(),
         abort_request=lambda *args, **kwargs: None,
         pending=PendingSteps(),
@@ -301,7 +305,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             processor.process_batch_result_prefill(batch, result)
 
         self.assertEqual(req.output_ids, [])
-        processor.output_streamer.stream_output.assert_called_once_with(
+        processor.services.output_streamer.stream_output.assert_called_once_with(
             [req], False, req
         )
 
@@ -333,8 +337,10 @@ class TestDecodeWithoutLogits(CustomTestCase):
             processor.process_batch_result_decode(batch, result)
 
         self.assertEqual(req.output_ids, [8])
-        self.assertEqual(processor.metrics_sink.num_generated_tokens, 1)
-        processor.output_streamer.stream_output.assert_called_once_with([req], False)
+        self.assertEqual(processor.services.metrics_sink.num_generated_tokens, 1)
+        processor.services.output_streamer.stream_output.assert_called_once_with(
+            [req], False
+        )
 
 
 class TestSamplingMaskStatusErrors(CustomTestCase):
@@ -366,8 +372,10 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         self.assertEqual(req.output_ids, [7])
         self.assertEqual(req.to_finish.status_code, 400)
         req.update_finish_state.assert_called_once_with(0)
-        release.assert_called_once_with(req, processor.tree_cache, checkpoint=False)
-        processor.output_streamer.stream_output.assert_called_once_with([req], False)
+        release.assert_called_once_with(req, processor.kv.tree_cache, checkpoint=False)
+        processor.services.output_streamer.stream_output.assert_called_once_with(
+            [req], False
+        )
 
     def test_overflow_and_invalid_have_distinct_http_errors(self):
         processor = _make_processor(self)

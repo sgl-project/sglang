@@ -2,7 +2,11 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -14,6 +18,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -38,12 +43,13 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     in-flight requests)."""
 
     def _new_scheduler(self) -> Scheduler:
+        enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.flags._engine_paused = True
-        scheduler.enable_overlap = False
+        get_context().override("test", disable_overlap_schedule=True)
         scheduler.cur_batch = None
         scheduler.lists.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
@@ -57,9 +63,9 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.decode_offload_manager = None
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_lmcache = False
-        scheduler.enable_hisparse = False
+        get_context().override("test", enable_hierarchical_cache=False)
+        get_context().override("test", enable_lmcache=False)
+        get_context().override("test", enable_hisparse=False)
         scheduler.tree_cache = MagicMock()
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()

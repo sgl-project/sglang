@@ -145,6 +145,12 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import SchedulePolicy
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvCapacity,
+        KvResources,
+        SchedulerServices,
+        Streams,
+    )
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
@@ -158,10 +164,6 @@ if TYPE_CHECKING:
     from sglang.srt.observability.metrics_collector import (
         SchedulerMetricsCollector,
     )
-    from sglang.srt.observability.scheduler_stage_metrics import (
-        SchedulerStageMetricsRecorder,
-    )
-    from sglang.srt.sampling.penalties import PenaltyStore
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -3129,18 +3131,14 @@ class DisaggDecode:
         server_args: ServerArgs,
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
-        req_to_token_pool: ReqToTokenPool,
-        penalty_store: PenaltyStore,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        draft_token_to_kv_pool: Optional[KVCache],
-        tree_cache: BasePrefixCache,
-        max_total_num_tokens: int,
+        kv: KvResources,
+        capacity: KvCapacity,
+        streams: Streams,
+        services: SchedulerServices,
         transfer_backend: TransferBackend,
         attn_cp_cpu_group: Any,
         attn_tp_cpu_group: Any,
         is_hybrid_swa: bool,
-        swa_max_total_num_tokens: Optional[int],
-        max_token_pool_size: int,
         kv_cache_dtype_str: str,
         sliding_window_size: Optional[int],
         enable_hisparse: bool,
@@ -3150,9 +3148,7 @@ class DisaggDecode:
         can_schedule_lora_req: Callable[[Req, Set[Optional[str]]], bool],
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
-        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
-        output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         update_reasoning_tokens: Callable[[Req, int], None],
@@ -3165,15 +3161,25 @@ class DisaggDecode:
         core_lists: CoreLists,
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
         policy: SchedulePolicy,
-        max_running_requests: int,
-        device: str,
         enable_overlap: bool,
-        schedule_stream: Any,
-        forward_stream: Any,
         future_map: Any,
         ngram_embedding_manager: Any,
-        scheduler_stage_metrics: SchedulerStageMetricsRecorder,
     ):
+        req_to_token_pool = kv.req_to_token_pool
+        penalty_store = kv.penalty_store
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
+        draft_token_to_kv_pool = kv.draft_token_to_kv_pool
+        tree_cache = kv.tree_cache
+        max_total_num_tokens = capacity.max_total_num_tokens
+        swa_max_total_num_tokens = capacity.swa_max_total_num_tokens
+        max_token_pool_size = capacity.max_token_pool_size
+        max_running_requests = capacity.max_running_requests
+        device = streams.device
+        schedule_stream = streams.schedule_stream
+        forward_stream = streams.forward_stream
+        metrics_sink = services.metrics_sink
+        output_streamer = services.output_streamer
+        scheduler_stage_metrics = services.scheduler_stage_metrics
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.req_to_token_pool = req_to_token_pool
@@ -3339,6 +3345,24 @@ class DisaggDecode:
         """Release the drained failed transfers; they leave releasing."""
         for req in self.transfer_queue.resolve_deferred_releases(self.releasing):
             self.releasing.remove(req)
+
+    def unified_memory_move_gate(self) -> bool:
+        """Whether unified-memory compaction may move pages: only when no KV
+        transfer can be in flight, so it never relocates a page the transfer
+        engine writes. A page is exposed from the moment its address reaches
+        the peer until the transfer concludes; `pop_preallocated` publishes one
+        request's destinations and keeps allocating for the next, whose
+        allocation can urgently flush the peer sub-allocator, and the batch
+        reaches the transfer queue only after the loop."""
+        decode_offload_manager = self.decode_offload_manager
+        return not (
+            self.transfer_queue.queue
+            or self.prealloc_queue.has_published_destinations
+            or (
+                decode_offload_manager is not None
+                and decode_offload_manager.has_inflight_device_transfer()
+            )
+        )
 
     def lists(self) -> List[RequestList]:
         """The PD decode lists, from preallocation to the release of the KV."""

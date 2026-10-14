@@ -122,6 +122,7 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
+            scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True

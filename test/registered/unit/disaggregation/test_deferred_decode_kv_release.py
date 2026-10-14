@@ -1045,7 +1045,8 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         q.release_finished_req = MethodType(
             SchedulerBatchResultProcessor.release_finished_req,
             SimpleNamespace(
-                hisparse_coordinator=q.hisparse_coordinator, tree_cache=q.tree_cache
+                hisparse_coordinator=q.hisparse_coordinator,
+                kv=SimpleNamespace(tree_cache=q.tree_cache),
             ),
         )
         entry = _make_failed_req(mgr, room=11, idx=2, abort_notified=False)

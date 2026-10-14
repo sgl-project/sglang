@@ -17,6 +17,7 @@ from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.runtime_context import get_context
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -30,9 +31,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.counters = LaunchCounters()
         s.scheduler_stage_metrics = None
         s.scripted_scheduler_hook = None
-        s.enable_hierarchical_cache = True
-        s.enable_unified_cache_external_linker = False
-        s.enable_lmcache = False
+        enter_scope(self, published_topology())
+        self._override_flags()
         self.storage_enabled = enter_scope(
             self,
             patch(
@@ -55,13 +55,17 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.disagg_decode = None
         s.dllm = None
         s.hisparse_coordinator = None
-        s.enable_overlap = False
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         s._arm_prefill_decode_interval = Mock()
         s.enable_fpm = False
         self.running_batch = SimpleNamespace(
             batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
+        )
+
+    def _override_flags(self):
+        get_context().override(
+            "test", enable_hierarchical_cache=True, disable_overlap_schedule=True
         )
 
     def test_feature_gates(self):
@@ -81,13 +85,16 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 ),
                 patch(
                     "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(enable_flexkv=flexkv),
+                    return_value=SimpleNamespace(
+                        enable_flexkv=flexkv,
+                        enable_hierarchical_cache=hierarchical,
+                        enable_unified_cache_external_linker=linker,
+                        enable_lmcache=False,
+                    ),
                 ),
             ):
                 self.calls.reset_mock()
                 s = self.scheduler
-                s.enable_hierarchical_cache = hierarchical
-                s.enable_unified_cache_external_linker = linker
                 self.storage_enabled.return_value = storage
                 s._process_hicache_events()
                 expected = [call.drain()] if hierarchical or flexkv or linker else []
@@ -120,7 +127,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._abort_on_running_timeout = Mock()
         s.disagg_prefill = None
         s.lists.chunked_req = None
-        s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer
         s._should_defer_prefill.return_value = True
@@ -142,6 +148,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def test_pp_prefill_drains_before_admission(self):
         s = self.scheduler
         enter_scope(self, published_topology(pp_size=2))
+        self._override_flags()
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         s.world_group = s.attn_tp_group = s.device = s.device_module = None
         s.schedule_stream = s.forward_stream = s.copy_stream = None

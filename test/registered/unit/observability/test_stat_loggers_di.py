@@ -47,7 +47,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 
 class _BoundRecordingMetric:
@@ -243,6 +243,7 @@ def _empty_decode_lists():
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
+        enter_scope(self, published_topology())
         self.labels = {
             "model_name": "test",
             "engine_type": "decode",
@@ -300,7 +301,6 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             lists=SimpleNamespace(decoding=[], waiting_queue=[]),
             queued_reqs=lambda: [],
             grammar_manager=[],
-            enable_priority_scheduling=False,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
@@ -383,7 +383,6 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             lists=SimpleNamespace(decoding=batch.reqs, waiting_queue=[]),
             queued_reqs=lambda: [],
             grammar_manager=[],
-            enable_priority_scheduling=False,
             max_total_num_tokens=1,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             pool_stats_observer=SimpleNamespace(

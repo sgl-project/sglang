@@ -550,7 +550,6 @@ class TestIdleMetrics(CustomTestCase):
         self.reporter.metrics_sink.metrics_collector = collector
         self.reporter.metrics_sink.current_scheduler_metrics_enabled = True
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        self.scheduler.enable_priority_scheduling = True
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)
             for priority in (1, 2)
@@ -570,7 +569,8 @@ class TestIdleMetrics(CustomTestCase):
             collector.increment_decode_host_receive_reqs()
 
         with get_context().override_server_args(
-            disaggregation_decode_host_receive_threshold=0.8
+            disaggregation_decode_host_receive_threshold=0.8,
+            enable_priority_scheduling=True,
         ):
             for waiting in (True, False):
                 for req in host_reqs:

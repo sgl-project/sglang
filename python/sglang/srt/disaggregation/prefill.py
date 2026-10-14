@@ -102,15 +102,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
-    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        MetricsSink,
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvCapacity,
+        KvResources,
+        SchedulerServices,
+        Streams,
     )
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.observability.metrics_collector import (
@@ -599,12 +601,10 @@ class DisaggPrefill:
         server_args: ServerArgs,
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        draft_token_to_kv_pool: Optional[KVCache],
-        req_to_token_pool: ReqToTokenPool,
-        tree_cache: BasePrefixCache,
-        max_running_requests: int,
-        max_total_num_tokens: int,
+        kv: KvResources,
+        capacity: KvCapacity,
+        streams: Streams,
+        services: SchedulerServices,
         kv_cache_dtype_str: str,
         rust_http_port: Optional[int],
         transfer_backend: TransferBackend,
@@ -615,10 +615,6 @@ class DisaggPrefill:
         tp_cpu_group: Any,
         sliding_window_size: Optional[int],
         enable_overlap: bool,
-        forward_stream: Any,
-        scheduler_stage_metrics: SchedulerStageMetricsRecorder,
-        output_streamer: SchedulerOutputStreamer,
-        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
@@ -626,6 +622,16 @@ class DisaggPrefill:
         release_aborted_request: Callable[[Req], None],
         maybe_send_health_check_signal: Callable[[], None],
     ):
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
+        draft_token_to_kv_pool = kv.draft_token_to_kv_pool
+        req_to_token_pool = kv.req_to_token_pool
+        tree_cache = kv.tree_cache
+        max_running_requests = capacity.max_running_requests
+        max_total_num_tokens = capacity.effective_max_total_num_tokens
+        forward_stream = streams.forward_stream
+        scheduler_stage_metrics = services.scheduler_stage_metrics
+        output_streamer = services.output_streamer
+        metrics_sink = services.metrics_sink
         self.num_kv_heads = model_config.num_key_value_heads
         self.spec_algorithm = spec_algorithm
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -709,6 +715,15 @@ class DisaggPrefill:
             req.disagg = DisaggReqState()
         self.bootstrap_queue.add(req, self.num_kv_heads)
         req.time_stats.set_prefill_bootstrap_queue_entry_time()
+
+    def unified_memory_move_gate(self) -> bool:
+        """Whether unified-memory compaction may move pages: only when no KV
+        transfer can be in flight, so it never relocates a page the transfer
+        engine reads. A page is exposed from the moment its address reaches the
+        peer until the transfer concludes; scheduling the final chunk clears
+        `chunked_req` while earlier chunks may still be draining, and the
+        request reaches the transfer list only later, in the result path."""
+        return not (self.transfer or self.pending_chunk_rids)
 
     def lists(self) -> List[RequestList]:
         """The PD prefill lists: bootstrapping, prefilling, and sending the KV."""

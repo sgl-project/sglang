@@ -603,9 +603,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
             releasing=list(releasing),
         )
         scheduler.decode_offload_manager = None
-        scheduler.enable_hisparse = False
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_lmcache = False
         return scheduler
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):

@@ -40,7 +40,6 @@ class TestHiSparseStagingList(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.disagg_prefill = None
         scheduler.disagg_decode = None
-        scheduler.enable_hisparse = True
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=None
         )

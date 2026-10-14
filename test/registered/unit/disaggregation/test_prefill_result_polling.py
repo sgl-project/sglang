@@ -45,7 +45,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -249,9 +249,11 @@ class _Scheduler:
         self._sched_idled = False
         self.counters = LaunchCounters()
         self.flags = EngineFlags()
+        # Config leaves, applied to the bags once a topology is published.
         self.enable_overlap = True
+        self.enable_hierarchical_cache = False
+        self.enable_unified_cache_external_linker = False
         self.require_mlp_sync = False
-        self.enable_unified_memory = False
         self.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=Mock())
         self.hisparse_coordinator = None
         self.ngram_embedding_manager = SimpleNamespace(
@@ -291,6 +293,16 @@ class _Scheduler:
         self._arm_prefill_decode_interval = Mock()
         self.disagg_prefill = _Owner(self)
         self.disagg_decode = None
+
+    def apply_config(self):
+        get_context().override(
+            "test",
+            disable_overlap_schedule=not self.enable_overlap,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_unified_cache_external_linker=(
+                self.enable_unified_cache_external_linker
+            ),
+        )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
         pass
@@ -403,6 +415,7 @@ def _run_loop(scheduler, enabled=True, **topology):
         ),
     ):
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.apply_config()
         scheduler.init_mode_stages()
         try:
             _dispatch_event_loop_once(scheduler)
@@ -743,7 +756,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.prefetch_ready = False
                     scheduler.enable_hierarchical_cache = readiness_source == "cache"
                     scheduler.enable_unified_cache_external_linker = False
-                    scheduler.enable_lmcache = False
 
                     def drain_cache_events():
                         # Readiness is visible only after the real cache-drain path.
@@ -762,14 +774,16 @@ class TestPrefillResultPolling(CustomTestCase):
                         )
                         with published_topology(skip_tokenizer_init=True):
                             scheduler.grammar_manager = GrammarManager(
-                                SimpleNamespace(
-                                    server_args=SimpleNamespace(),
-                                    dp_tp_cpu_group=None,
-                                    dp_tp_group=SimpleNamespace(
-                                        world_size=1, first_rank=0, is_first_rank=True
-                                    ),
-                                    pp_group=None,
-                                )
+                                server_args=SimpleNamespace(),
+                                tokenizer=None,
+                                model_config=None,
+                                dp_tp_group=SimpleNamespace(
+                                    cpu_group=None,
+                                    world_size=1,
+                                    first_rank=0,
+                                    is_first_rank=True,
+                                ),
+                                pp_group=None,
                             )
                         scheduler.grammar_manager.grammar_backend = Mock(
                             spec=["set_cache"]
@@ -1319,6 +1333,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         return_value=True,
                     ) as check_support,
                 ):
+                    scheduler.apply_config()
                     scheduler.init_mode_stages()
                     _dispatch_event_loop_once(scheduler)
                 run_loop.assert_called_once_with()
