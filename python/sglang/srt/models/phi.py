@@ -200,8 +200,8 @@ class PhiModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if inputs_embeds is not None:
