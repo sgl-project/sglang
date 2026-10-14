@@ -12,7 +12,7 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
-from typing import Any
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import PIL.Image
@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -93,6 +94,40 @@ COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
 # Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
 COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
+
+
+def _get_video_total_frames(video_path: str) -> int:
+    """Read the source video frame count using FFmpeg RAW mode."""
+    import cv2
+
+    # RAW mode skips normal decoder initialization.
+    capture = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG, [cv2.CAP_PROP_FORMAT, -1])
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Cannot open source video: {video_path!r}")
+        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    if total_frames <= 0:
+        raise ValueError(f"No frames decoded from video: {video_path!r}")
+    return total_frames
+
+
+def _load_video_frames_accvlab(
+    reader: Any,
+    video_path: str,
+    frame_indexes: Sequence[int],
+) -> Iterator[torch.Tensor]:
+    """Yield borrowed CUDA RGB frames, valid until the next reader decode."""
+    for frame_id in frame_indexes:
+        try:
+            decoded = reader.DecodeN12ToRGB([video_path], [frame_id], False)
+        except RuntimeError as exc:
+            # ACCV-Lab reports a request past the video's end with this error.
+            if str(exc) == "a frame after the last keyframe is currently not supported":
+                break
+            raise
+        yield torch.as_tensor(decoded[0])
 
 
 def _inject_caption_metadata(
@@ -388,9 +423,13 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             return batch
 
         if isinstance(video_path, str) and video_path:
-            frames = load_video(video_path)
-            if not frames:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+            use_accv_gpu_preprocess = (
+                envs.SGLANG_USE_COSMOS3_ACCVLAB_GPU_PREPROCESS.get()
+            )
+            if not use_accv_gpu_preprocess:
+                frames = load_video(video_path)
+                if not frames:
+                    raise ValueError(f"No frames decoded from video: {video_path!r}")
 
             keep = (
                 getattr(batch.sampling_params, "condition_video_keep", "first")
@@ -408,21 +447,63 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             # to noise.
             num_source_frames = max(cond_indexes) * 4 + 1
             num_target_frames = batch.num_frames
-            if keep == "last":
-                frames = frames[-num_source_frames:]
+            if use_accv_gpu_preprocess:
+                from sglang.kernels.ops.mm.process.lanczos import (
+                    resize_crop_normalize_rgb,
+                )
+
+                if keep == "last":
+                    total_frames = _get_video_total_frames(video_path)
+                    frame_indexes = range(
+                        max(total_frames - num_source_frames, 0), total_frames
+                    )
+                else:
+                    frame_indexes = range(num_source_frames)
+                reader = getattr(self, "_accvlab_reader", None)
+                if reader is None:
+                    import accvlab.on_demand_video_decoder as nvc
+
+                    reader = nvc.CreateSampleReader(
+                        num_of_set=1, num_of_file=1, iGpu=torch.cuda.current_device()
+                    )
+                    # The SDK keeps at most one video's reader state. Reuse the
+                    # decoder across requests without retaining processed frames.
+                    self._accvlab_reader = reader
+                try:
+                    frames = []
+                    for rgb in _load_video_frames_accvlab(
+                        reader, video_path, frame_indexes
+                    ):
+                        frames.append(
+                            resize_crop_normalize_rgb(rgb, target_h, target_w)
+                        )
+                        # Consume the borrowed pixels before the next decode
+                        # reuses the SDK buffer. Only processed frames are kept.
+                        torch.cuda.current_stream().synchronize()
+                except Exception:
+                    self._accvlab_reader = None
+                    raise
+                if not frames:
+                    raise ValueError(f"No frames decoded from video: {video_path!r}")
             else:
-                frames = frames[:num_source_frames]
+                if keep == "last":
+                    frames = frames[-num_source_frames:]
+                else:
+                    frames = frames[:num_source_frames]
             if len(frames) < num_source_frames:
                 frames = frames + [frames[-1]] * (num_source_frames - len(frames))
             if len(frames) < num_target_frames:
                 frames = frames + [frames[-1]] * (num_target_frames - len(frames))
 
-            processed = [
-                _pil_to_normalized_tensor(
-                    _resize_crop_pil(f.convert("RGB"), target_w, target_h)
-                )
-                for f in frames
-            ]
+            if use_accv_gpu_preprocess:
+                processed = frames
+            else:
+                processed = [
+                    _pil_to_normalized_tensor(
+                        _resize_crop_pil(f.convert("RGB"), target_w, target_h)
+                    )
+                    for f in frames
+                ]
             video_tensor = torch.stack(processed, dim=1).unsqueeze(0).contiguous()
             batch.preprocessed_video = video_tensor
             self.log_info(

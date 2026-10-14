@@ -18,6 +18,18 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="mm.resize_crop_normalize_rgb",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mm.process.lanczos:resize_crop_normalize_rgb",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description=(
+            "CUDA uint8 RGB Lanczos resize, center crop and float32 normalization."
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="mm.normalize_and_patchify",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.mm.process.image:_normalize_and_patchify_torch",
