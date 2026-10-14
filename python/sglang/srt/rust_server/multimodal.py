@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple, Union
 
 import msgspec
-
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 
@@ -56,6 +55,31 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
+class RustStep3VlSpec(msgspec.Struct, frozen=True, kw_only=True):
+    family: str
+    feature_shm: bool
+    image_token_id: int
+    image_start_id: int
+    image_end_id: int
+    patch_start_id: int
+    patch_end_id: int
+    patch_newline_id: int
+    image_size: int
+    patch_size: int
+    image_feature_tokens: int
+    patch_feature_tokens: int
+    image_mean: Tuple[float, ...]
+    image_std: Tuple[float, ...]
+
+    def rust_json(self) -> str:
+        return msgspec.json.encode(
+            {f: getattr(self, f) for f in self.__struct_fields__}
+        ).decode()
+
+
+AnyRustMmSpec = Union[RustMmSpec, RustStep3VlSpec]
+
+
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     """The Python half of one Rust MM family (an arm of
     `sglang_mm::registry::pipeline_from_spec`): which models it serves.
@@ -98,6 +122,12 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
             "Qwen2VLImageProcessorFast": "aten_u8",
             "Qwen2VLImageProcessorPil": "pil",
         },
+    ),
+    RustMmFamily(
+        name="step3_vl",
+        mm_processor="sglang.srt.multimodal.processors.step3_vl:Step3VLImageProcessor",
+        model_types=frozenset(("step5_vl",)),
+        image_processors={},
     ),
 )
 
@@ -235,7 +265,7 @@ class RustMmProcessor:
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
 
-    def resolve_spec(self) -> Optional[RustMmSpec]:
+    def resolve_spec(self) -> Optional[AnyRustMmSpec]:
         """The :class:`RustMmSpec` for this model, or ``None`` when it has no
         Rust pipeline (the launch gate turns that into a hard error).
 
@@ -254,6 +284,8 @@ class RustMmProcessor:
         )
         if family is None:
             return None
+        if family.name == "step3_vl":
+            return self._resolve_step3_vl_spec(hf_config)
         image_processor = getattr(self._processor, "image_processor", None)
         resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
@@ -304,6 +336,25 @@ class RustMmProcessor:
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
+    def _resolve_step3_vl_spec(self, hf_config: Any) -> Optional[RustStep3VlSpec]:
+        from sglang.srt.multimodal.processors.step3_vl import (
+            Step3VLProcessor,
+            step3_vl_rust_spec,
+        )
+
+        if get_mm().mm_process_config:
+            return None
+        fields = step3_vl_rust_spec(Step3VLProcessor(hf_config, self._processor))
+        if fields is None:
+            return None
+        spec = RustStep3VlSpec(
+            family="step3_vl",
+            feature_shm=False,
+            **{k: tuple(v) if isinstance(v, list) else v for k, v in fields.items()},
+        )
+        logger.info("rust server: Rust MM pipeline enabled (family=step3_vl)")
+        return spec
+
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
 
@@ -329,7 +380,7 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec, buffers):
+    def wrap_encoded(spec: AnyRustMmSpec, buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
         the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
@@ -350,7 +401,6 @@ class RustMmProcessor:
         running request's inter-token latency."""
         import msgspec
         import torch
-
         from sglang.srt.managers.schedule_batch import (
             MultimodalProcessorOutput,
         )
@@ -373,6 +423,10 @@ class RustMmProcessor:
             if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
                 for item in items:
                     item.set_pad_value()
+            if isinstance(spec, RustStep3VlSpec):
+                return MultimodalProcessorOutput(
+                    mm_items=items, im_token_id=spec.image_token_id
+                )
             output = MultimodalProcessorOutput(
                 mm_items=items,
                 im_token_id=spec.image_token_id,
@@ -394,7 +448,6 @@ class RustMmProcessor:
     def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
         import numpy as np
         import torch
-
         from sglang.srt.managers.mm_utils import ShmPointerMMData
         from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
@@ -420,13 +473,24 @@ class RustMmProcessor:
             )
             stubs.append(stub)
             feature = stub
-        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        if "num_patches" in item["model_specific_data"]:
+            model_specific_data = {
+                "num_patches": torch.tensor(
+                    [item["model_specific_data"]["num_patches"]], dtype=torch.long
+                ),
+                "patch_pixel_values": torch.from_numpy(
+                    buffers[f"mm.aux.{index}.patch_pixel_values"]
+                ),
+            }
+        else:
+            t, h, w = item["model_specific_data"]["image_grid_thw"]
+            model_specific_data = {
+                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+            }
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
             offsets=[tuple(span) for span in item["offsets"]],
-            model_specific_data={
-                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-            },
+            model_specific_data=model_specific_data,
         )

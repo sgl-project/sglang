@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 /*
- * Fused MoE finalize + shared-output add (bf16 output, SM>=90 for PDL).
+ * Fused MoE finalize + shared-output add (BF16/FP32 output, SM>=90 for PDL).
  *
  * Forked from flashinfer's ``finalizeKernel`` and ``finalizeKernelVecLoad``
  * (trtllm_fused_moe_dev_kernel.cu:639 and :803), stripped of the MoE
@@ -29,6 +29,10 @@
  * For each token t, computes:
  *     out[t] = Σ_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]
  *            + shared_output[t]                      // if non-null
+ *
+ * Optional RoundRouted preserves a BF16 routed-output store before the
+ * shared addition, independently of the final output dtype. Existing callers
+ * keep the original full-FP32 accumulation followed by one BF16 output store.
  *
  * Eliminates the native PyTorch ``routed + shared_output`` add (and the
  * separate ``*= routed_scaling_factor`` kernel when applicable) from
@@ -64,7 +68,7 @@ constexpr int MAX_TOPK = 64;
 // General kernel — one CTA per (hidden_chunk, token). Picks up small-to-mid
 // workloads where the block count fits in a few waves.
 // ---------------------------------------------------------------------------
-template <typename TypeExpW>
+template <typename TypeExpW, typename TypeOut = BF16, bool RoundRouted = false>
 __global__ void moeFinalizeKernel(
     int numTokens,
     int hiddenDim,
@@ -74,7 +78,7 @@ __global__ void moeFinalizeKernel(
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
     BF16 const* __restrict__ sharedBiasPtr,
-    BF16* __restrict__ outPtr) {
+    TypeOut* __restrict__ outPtr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
@@ -93,10 +97,13 @@ __global__ void moeFinalizeKernel(
         float const val = static_cast<float>(inPtr[permutedIdx * hiddenDimPadded + hiddenIdx]);
         acc += scale * val;
       }
+      if constexpr (RoundRouted) {
+        acc = static_cast<float>(static_cast<BF16>(acc));
+      }
       if (sharedBiasPtr != nullptr) {
         acc += static_cast<float>(sharedBiasPtr[tokenIdx * hiddenDim + hiddenIdx]);
       }
-      outPtr[tokenIdx * hiddenDim + hiddenIdx] = static_cast<BF16>(acc);
+      outPtr[tokenIdx * hiddenDim + hiddenIdx] = static_cast<TypeOut>(acc);
     }
   }
 
@@ -134,7 +141,7 @@ struct IdxPackedTraits<4> {
   using Packed = int4;
 };
 
-template <typename TypeExpW, int TopKUnrollFactor>
+template <typename TypeExpW, int TopKUnrollFactor, typename TypeOut = BF16, bool RoundRouted = false>
 __global__ void moeFinalizeKernelVecLoad(
     int numTokens,
     int hiddenDim,
@@ -144,7 +151,7 @@ __global__ void moeFinalizeKernelVecLoad(
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
     BF16 const* __restrict__ sharedBiasPtr,
-    BF16* __restrict__ outPtr) {
+    TypeOut* __restrict__ outPtr) {
   static_assert(
       TopKUnrollFactor == 1 || TopKUnrollFactor == 2 || TopKUnrollFactor == 4, "TopKUnrollFactor must be 1, 2, or 4");
   using IdxPackedType = typename IdxPackedTraits<TopKUnrollFactor>::Packed;
@@ -154,7 +161,7 @@ __global__ void moeFinalizeKernelVecLoad(
   // 128 bits per thread → 8 bf16 elements.
   constexpr int FINALIZE_ELEM_PER_THREAD = 8;
   using InputElem = cutlass::Array<BF16, FINALIZE_ELEM_PER_THREAD>;
-  using OutputElem = cutlass::Array<BF16, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<TypeOut, FINALIZE_ELEM_PER_THREAD>;
   using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
 
   int64_t const tokenIdx = blockIdx.x;
@@ -178,7 +185,7 @@ __global__ void moeFinalizeKernelVecLoad(
     }
   }
 
-  BF16* outputPtr = outPtr + tokenIdx * hiddenDim;
+  TypeOut* outputPtr = outPtr + tokenIdx * hiddenDim;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(inPtr);
   auto const* sharedElemPtr =
@@ -223,6 +230,12 @@ __global__ void moeFinalizeKernelVecLoad(
       }
     }
 
+    if constexpr (RoundRouted) {
+#pragma unroll
+      for (int e = 0; e < FINALIZE_ELEM_PER_THREAD; ++e) {
+        threadOutput[e] = static_cast<float>(static_cast<BF16>(threadOutput[e]));
+      }
+    }
     if (sharedElemPtr != nullptr) {
       float4 shared = vectorizedLoadPtx(reinterpret_cast<float4 const*>(&sharedElemPtr[elemIndex]));
       InputElem sharedElem = *reinterpret_cast<InputElem const*>(&shared);
@@ -234,8 +247,8 @@ __global__ void moeFinalizeKernelVecLoad(
       }
     }
 
-    cutlass::NumericArrayConverter<BF16, float, FINALIZE_ELEM_PER_THREAD> toBF16;
-    outElemPtr[elemIndex] = toBF16(threadOutput);
+    cutlass::NumericArrayConverter<TypeOut, float, FINALIZE_ELEM_PER_THREAD> toOutput;
+    outElemPtr[elemIndex] = toOutput(threadOutput);
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -246,7 +259,7 @@ __global__ void moeFinalizeKernelVecLoad(
 // ---------------------------------------------------------------------------
 // Typed dispatch
 // ---------------------------------------------------------------------------
-template <typename TypeExpW>
+template <typename TypeExpW, typename TypeOut = BF16, bool RoundRouted = false>
 void dispatchFinalize(
     int numTokens,
     int hiddenDim,
@@ -256,7 +269,7 @@ void dispatchFinalize(
     int const* expandedIdxPtr,
     void const* weightsPtrVoid,
     BF16 const* sharedPtr,
-    BF16* outPtr,
+    TypeOut* outPtr,
     bool useVecLoad,
     cudaStream_t stream,
     cudaLaunchAttribute const* attrs,
@@ -277,7 +290,7 @@ void dispatchFinalize(
 
     cudaLaunchKernelEx(
         &config,
-        moeFinalizeKernel<TypeExpW>,
+        moeFinalizeKernel<TypeExpW, TypeOut, RoundRouted>,
         numTokens,
         hiddenDim,
         hiddenDimPadded,
@@ -301,7 +314,7 @@ void dispatchFinalize(
     config.attrs = const_cast<cudaLaunchAttribute*>(attrs);
     cudaLaunchKernelEx(
         &config,
-        moeFinalizeKernelVecLoad<TypeExpW, UNROLL>,
+        moeFinalizeKernelVecLoad<TypeExpW, UNROLL, TypeOut, RoundRouted>,
         numTokens,
         hiddenDim,
         hiddenDimPadded,
@@ -332,7 +345,8 @@ void moe_finalize_fuse_shared(
     TensorView expert_weights,
     TensorView shared_output,
     int64_t top_k,
-    bool enable_pdl) {
+    bool enable_pdl,
+    bool round_routed) {
   TVM_FFI_ICHECK_EQ(out.ndim(), 2) << "out must be 2-D [numTokens, hiddenDim]";
   TVM_FFI_ICHECK_EQ(gemm2_out.ndim(), 2) << "gemm2_out must be 2-D [totalNumPaddedTokens, hiddenDimPadded]";
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.ndim(), 1);
@@ -356,7 +370,8 @@ void moe_finalize_fuse_shared(
   auto const* inPtr = static_cast<BF16 const*>(gemm2_out.data_ptr());
   auto const* expandedIdxPtr = static_cast<int const*>(expanded_idx_to_permuted_idx.data_ptr());
   auto const* sharedPtr = hasShared ? static_cast<BF16 const*>(shared_output.data_ptr()) : nullptr;
-  auto* outPtr = static_cast<BF16*>(out.data_ptr());
+  TVM_FFI_ICHECK(out.dtype() == (DLDataType{kDLBfloat, 16, 1}) ||
+                 out.dtype() == (DLDataType{kDLFloat, 32, 1}));
 
   cudaSetDevice(out.device().device_id);
   cudaStream_t const stream = get_stream(out.device());
@@ -373,37 +388,30 @@ void moe_finalize_fuse_shared(
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
 
+  // Output precision and the routed BF16 boundary are independent contracts.
+  // Defaults preserve the original BF16 finalize used by existing models.
+  auto launch = [&](auto weight_tag, auto output_tag, auto round_tag) {
+    using Weight = decltype(weight_tag);
+    using Output = decltype(output_tag);
+    dispatchFinalize<Weight, Output, decltype(round_tag)::value>(
+        numTokens, hiddenDim, hiddenDimPadded, int(top_k), inPtr, expandedIdxPtr,
+        expert_weights.data_ptr(), sharedPtr, static_cast<Output*>(out.data_ptr()),
+        useVecLoad, stream, attrs, 1);
+  };
+  auto dispatchOutput = [&](auto weight_tag) {
+    if (out.dtype() == (DLDataType{kDLFloat, 32, 1})) {
+      if (round_routed) launch(weight_tag, float{}, std::true_type{});
+      else launch(weight_tag, float{}, std::false_type{});
+    } else {
+      if (round_routed) launch(weight_tag, BF16{}, std::true_type{});
+      else launch(weight_tag, BF16{}, std::false_type{});
+    }
+  };
   auto ew_dtype = expert_weights.dtype();
-  if (ew_dtype == DLDataType{kDLFloat, 32, 1}) {
-    dispatchFinalize<float>(
-        numTokens,
-        hiddenDim,
-        hiddenDimPadded,
-        int(top_k),
-        inPtr,
-        expandedIdxPtr,
-        expert_weights.data_ptr(),
-        sharedPtr,
-        outPtr,
-        useVecLoad,
-        stream,
-        attrs,
-        1);
-  } else if (ew_dtype == DLDataType{kDLBfloat, 16, 1}) {
-    dispatchFinalize<BF16>(
-        numTokens,
-        hiddenDim,
-        hiddenDimPadded,
-        int(top_k),
-        inPtr,
-        expandedIdxPtr,
-        expert_weights.data_ptr(),
-        sharedPtr,
-        outPtr,
-        useVecLoad,
-        stream,
-        attrs,
-        1);
+  if (ew_dtype == (DLDataType{kDLFloat, 32, 1})) {
+    dispatchOutput(float{});
+  } else if (ew_dtype == (DLDataType{kDLBfloat, 16, 1})) {
+    dispatchOutput(BF16{});
   } else {
     TVM_FFI_ICHECK(false) << "expert_weights dtype must be float32 or bfloat16";
   }

@@ -585,11 +585,19 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
-def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """A host list on ``device``; staged in pinned memory so the copy is enqueued
-    on the current stream instead of synchronizing like a pageable copy."""
+def async_h2d(
+    args: List | np.ndarray, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Stage host values in pinned memory and enqueue a copy on the current stream."""
     pin = is_pin_memory_available(device)
-    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+    if isinstance(args, np.ndarray):
+        # torch.tensor(ndarray, pin_memory=True) is unsupported. Allocate the
+        # staging tensor first; copy_ also handles the requested dtype conversion.
+        host = torch.empty(args.shape, dtype=dtype, pin_memory=pin)
+        host.copy_(torch.from_numpy(args))
+    else:
+        host = torch.tensor(args, dtype=dtype, pin_memory=pin)
+    return host.to(device, non_blocking=pin)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:

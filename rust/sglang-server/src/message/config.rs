@@ -483,9 +483,14 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
-    ) -> Self {
+    ) -> pyo3::PyResult<Self> {
         use sglang_mm::registry::PipelineSpec;
         let pipeline = match family {
+            MmFamily::Step3Vl => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "MmFamily.Step3Vl is built with MmSpec.step3_vl(...)",
+                ));
+            }
             MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
                 image_token_id,
                 patch_size,
@@ -498,9 +503,62 @@ impl MmSpec {
                 resample: resample.into(),
             }),
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (*,
+        feature_shm,
+        image_token_id,
+        image_start_id,
+        image_end_id,
+        patch_start_id,
+        patch_end_id,
+        patch_newline_id,
+        image_size,
+        patch_size,
+        image_feature_tokens,
+        patch_feature_tokens,
+        image_mean,
+        image_std,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn step3_vl(
+        feature_shm: bool,
+        image_token_id: i64,
+        image_start_id: i64,
+        image_end_id: i64,
+        patch_start_id: i64,
+        patch_end_id: i64,
+        patch_newline_id: i64,
+        image_size: usize,
+        patch_size: usize,
+        image_feature_tokens: usize,
+        patch_feature_tokens: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+    ) -> Self {
+        Self {
+            feature_shm,
+            pipeline: sglang_mm::registry::PipelineSpec::Step3Vl(
+                sglang_mm::step3_vl::Step3VlSpec {
+                    image_token_id,
+                    image_start_id,
+                    image_end_id,
+                    patch_start_id,
+                    patch_end_id,
+                    patch_newline_id,
+                    image_size,
+                    patch_size,
+                    image_feature_tokens,
+                    patch_feature_tokens,
+                    image_mean,
+                    image_std,
+                },
+            ),
         }
     }
 }
@@ -517,6 +575,7 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    Step3Vl,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see

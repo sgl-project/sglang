@@ -4,8 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
-
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -19,6 +17,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +367,7 @@ def _preflight_check_workspace_memory(
         )
         local_ok = False
 
-    flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
+    flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
 
     logger.debug(
@@ -701,6 +700,7 @@ def _sync_allreduce_unavailable_across_tp():
         flag = torch.tensor(
             [1 if _flashinfer_allreduce_unavailable else 0],
             dtype=torch.int32,
+            device="cpu",
         )
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
         if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
@@ -943,6 +943,8 @@ def can_use_flashinfer_allreduce(
     # Dynamo, so statically-off configs must short-circuit before reaching them
     # (same ordering rule as flashinfer_ar_fusion_applies).
     token_num, hidden_dim = input_.shape
+    if token_num == 0:
+        return False
 
     # MNNVL hard-fails instead of falling back when the width is not float4-aligned
     # (FlashInfer csrc/trtllm_mnnvl_allreduce.cu).

@@ -9,7 +9,6 @@ from typing import (
 )
 
 import msgspec
-
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
@@ -92,6 +91,7 @@ class Disagg(msgspec.Struct):
     disaggregation_decode_retraction_backup: A[
         Optional[str],
         Arg(
+            resolvable=True,
             help=(
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "

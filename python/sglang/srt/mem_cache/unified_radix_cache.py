@@ -1133,8 +1133,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # sliding window of live SWA and the match after the insert rejects it.
             # The insert stops at page_floor(len(radix_key)), and a bigram key is
             # one shorter than the tokens it spans, so measure the key.
+            insert_boundary = len(radix_key.page_aligned(self.page_size))
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                comp.free_out_of_window_slots(req, insert_boundary, insert_params)
 
         if effective_cache_len <= 0:
             for comp in self._components_tuple:
@@ -1357,7 +1358,29 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        # The eviction tracker may also include orphaned device slots removed
+        # while deleting tombstone ancestors. Count only actual host frees.
+        host_evicted = (
+            {
+                comp: sum(v.numel() for v in values)
+                for comp, values in result.host_frees.items()
+            }
+            if self.metrics_collector is not None
+            else {}
+        )
         self._free_values(result.device_frees, result.host_frees)
+        if self.metrics_collector is not None:
+            trigger = (
+                "kv"
+                if component_type == BASE_COMPONENT_TYPE
+                else component_type.name.lower()
+            )
+            for comp, count in host_evicted.items():
+                if count > 0:
+                    pool = "kv" if comp == BASE_COMPONENT_TYPE else comp.name.lower()
+                    self.metrics_collector.increment_host_evicted_tokens(
+                        num_tokens=count, pool=pool, trigger=trigger
+                    )
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----

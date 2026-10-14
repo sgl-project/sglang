@@ -833,6 +833,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif pool_name == PoolName.STEP5_COMPRESSED_INDEX_KEY:
+            # Page-packed like the DSA indexer, but Step5 is MHA: every TP rank
+            # backs up its own copy, so the key must carry the rank.
+            suffixes = [f"_{self.mha_suffix}_{pool_name}"]
         elif pool_name == PoolName.SWA:
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
                 # Ordinary MHA SWA mirrors a K/V pool.

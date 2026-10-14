@@ -11,7 +11,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
-
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -78,6 +77,9 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+    STEP5_COMPRESSED_INDEX_KEY = "step5_compressed_index_key"
+    STEP5_FP8_K_SCALE = "step5_fp8_k_scale"
+    STEP5_FP8_V_SCALE = "step5_fp8_v_scale"
 
     # Draft KV pool
     DRAFT = "draft"

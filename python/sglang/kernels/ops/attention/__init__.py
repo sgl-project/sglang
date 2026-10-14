@@ -408,3 +408,35 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+# Fresh Step5 region arithmetic. Registration is metadata-only; importing this
+# namespace must not import Torch or the Triton backend.
+register_kernel(
+    KernelSpec(
+        op="attention.step5_csa_region",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5.csa:step5_csa_region",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            in_place=True,
+            supported_dtypes=("bfloat16",),
+            description="BF16 K/Z [N,8,256] -> caller uint8 E4M3 [N,256]",
+        ),
+        description="Fresh complete-region CSA with explicit Step5 rounding boundaries.",
+    )
+)
+
+
+def step5_csa_region(
+    index_key: "torch.Tensor",
+    compression_logits: "torch.Tensor",
+    *,
+    out: "torch.Tensor",
+) -> "torch.Tensor":
+    """Write compressed index keys into caller-owned logical bytes."""
+    return get_kernel("attention.step5_csa_region")(
+        index_key, compression_logits, out=out
+    )
+
+
+__all__.append("step5_csa_region")

@@ -12,7 +12,7 @@ use crate::think::{ReasoningOptions, ThinkDetector, think_config};
 /// does not know fall back to its non-forced basic parser.
 fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
     let name = match server_name {
-        "deepseek-r1" | "step3p5" => "deepseek_r1",
+        "deepseek-r1" | "step3p5" | "step5" => "deepseek_r1",
         "kimi_k2" => "kimi_k25",
         "gpt-oss" => "gpt_oss",
         "nemotron_3" => "nemotron3",
