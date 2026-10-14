@@ -87,6 +87,14 @@ def tail_covered(shared: torch.Tensor, prefix: Optional[torch.Tensor]) -> bool:
     )
 
 
+def _partial_args(bank_partial, rows, placeholder):
+    """(acc, ms, given) kernel args of a read's bank partials ([T, H], [T, 2] fp32)."""
+    if bank_partial is None:
+        return placeholder, placeholder, False
+    acc, ms = bank_partial
+    return acc[:rows], ms[:rows], True
+
+
 def gather_tail_attn_res_read(
     part: torch.Tensor,
     sq: torch.Tensor,
@@ -102,16 +110,20 @@ def gather_tail_attn_res_read(
     comm: LLComm,
     *,
     write_bank: bool = False,
+    bank_partial: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(rmsnorm(mix(bank[:, :nvb], stream)) * ow, stream) with stream the
     all-gather of every rank's [T, H / 8] column slice (rank r holds columns
     [r * H / 8, (r + 1) * H / 8)), finished from the column tail's partials
     (k3_latent_tail_partials of its up_proj rows):
     bf16(bf16(sum_k part[k] / rms) + shared[:, cols] [+ prefix[:, cols]]).
-    cw and ow are fp32 [H]; write_bank also stores the stream into bank[:, nvb]."""
+    cw and ow are fp32 [H]; write_bank also stores the stream into bank[:, nvb].
+    bank_partial: (acc, ms), bank[:, :nvb]'s softmax partials for cw computed
+    ahead (kimi_k3_route_sort.BankPartials), read instead of the bank."""
     rows = bank.shape[0]
     stream = bank.new_empty((rows, HIDDEN_SIZE))
     out = bank.new_empty((rows, HIDDEN_SIZE))
+    acc, ms, partial_given = _partial_args(bank_partial, rows, cw)
     _module().run(
         comm.comm._ptr,
         prefix if prefix is not None else shared,
@@ -124,9 +136,12 @@ def gather_tail_attn_res_read(
         part,
         sq,
         shared,
+        acc,
+        ms,
         nvb,
         prefix is not None,
         write_bank,
+        partial_given,
         float(score_eps),
         float(out_eps),
         float(tail_eps),
@@ -184,14 +199,17 @@ def all_reduce_attn_res_read(
     score_eps: float,
     out_eps: float,
     comm: LLComm,
+    bank_partial: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(rmsnorm(mix(bank[:, :nvb], stream)) * ow, stream) with stream =
     bf16(residual + all-reduce(partial)) over TP8 (residual None: the sum
     alone); partial and residual are [T, H] bf16, cw and ow fp32 [H]. The
-    caller checked all_reduce_covered()."""
+    caller checked all_reduce_covered(). bank_partial as in
+    gather_tail_attn_res_read."""
     rows = partial.shape[0]
     stream = partial.new_empty((rows, HIDDEN_SIZE))
     out = partial.new_empty((rows, HIDDEN_SIZE))
+    acc, ms, partial_given = _partial_args(bank_partial, rows, cw)
     _module().ar_run(
         comm.comm._ptr,
         partial,
@@ -205,9 +223,12 @@ def all_reduce_attn_res_read(
         comm.ar_pushed,
         comm.ar2_epochs,
         comm.ar2_done,
+        acc,
+        ms,
         nvb,
         residual is not None,
         rows not in AR_READ_ROWS,
+        partial_given,
         float(score_eps),
         float(out_eps),
     )

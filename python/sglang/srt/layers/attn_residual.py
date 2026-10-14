@@ -460,6 +460,18 @@ class StagedRead(msgspec.Struct, frozen=True):
     wrote_bank: bool
 
 
+class BankPartial(msgspec.Struct, frozen=True):
+    """A read's bank softmax partials, computed ahead of it with the bank as it
+    then was (kimi_k3_route_sort.BankPartials), waiting for the read with this
+    score_proj."""
+
+    score_proj: Any
+    nvb: int
+    rows: int
+    acc: torch.Tensor  # [>= rows, H] fp32
+    ms: torch.Tensor  # [>= rows, 2] fp32
+
+
 class AttnResidual:
     """Snapshot bank + aggregation of one K3 attention-residual stream,
     backed by the capability-dispatched kernels above.
@@ -485,6 +497,8 @@ class AttnResidual:
         self.written_on_slice = False
         # A read staged by gather_read for the next forward() of its prefix.
         self.staged: Optional[StagedRead] = None
+        # Bank partials for the next attention-side (0) and FFN-side (1) read.
+        self.bank_partials: dict[int, BankPartial] = {}
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -585,6 +599,23 @@ class AttnResidual:
             self.write(prefix, rows)
         return normed, prefix
 
+    def stage_bank_partial(self, side: int, partial: BankPartial) -> None:
+        """Hand the next read of this side (0 attention, 1 FFN) its bank partials."""
+        self.bank_partials[side] = partial
+
+    def _take_bank_partial(
+        self, side: int, score_proj, rows: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        partial = self.bank_partials.pop(side, None)
+        if (
+            partial is None
+            or partial.score_proj is not score_proj
+            or partial.nvb != self.num_valid_blocks
+            or partial.rows != rows
+        ):
+            return None
+        return partial.acc, partial.ms
+
     def gather_covers(self, num_tokens: int, slice_width: int, write: bool) -> bool:
         """Whether gather_read takes [num_tokens, slice_width] column slices."""
         from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
@@ -628,6 +659,7 @@ class AttnResidual:
             out_norm.variance_epsilon,
             comm,
             write_bank=write,
+            bank_partial=self._take_bank_partial(0, score_proj, part.shape[1]),
         )
         self.staged = StagedRead(stream, score_proj, normed, write)
         return stream
@@ -665,6 +697,7 @@ class AttnResidual:
             score_norm.variance_epsilon,
             out_norm.variance_epsilon,
             comm,
+            bank_partial=self._take_bank_partial(1, score_proj, hidden_states.shape[0]),
         )
 
     def forward_sp_all_gather(
