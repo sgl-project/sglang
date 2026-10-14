@@ -19,6 +19,7 @@ Keep module scope limited to the standard library and import-neutral types.
 
 from __future__ import annotations
 
+import io
 import logging
 import pickle
 import sys
@@ -78,6 +79,24 @@ def _warn_if_runtime_imported_early() -> None:
     )
 
 
+def _restore_config_tensor(data: bytes):
+    import torch
+
+    return torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+
+
+class _ConfigPickler(pickle.Pickler):
+    def reducer_override(self, obj):
+        import torch
+
+        if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
+            # Tensor's pickle reducer uses legacy torch.save, which warns on NPU.
+            buffer = io.BytesIO()
+            torch.save(obj, buffer, _use_new_zipfile_serialization=True)
+            return _restore_config_tensor, (buffer.getvalue(),)
+        return NotImplemented
+
+
 @dataclass(frozen=True, slots=True)
 class ServerArgsPayload:
     """A deferred ``ServerArgs`` snapshot safe to unpickle before bootstrap."""
@@ -86,7 +105,9 @@ class ServerArgsPayload:
 
     @classmethod
     def capture(cls, server_args: ServerArgs) -> ServerArgsPayload:
-        return cls(pickle.dumps(server_args, protocol=pickle.HIGHEST_PROTOCOL))
+        buffer = io.BytesIO()
+        _ConfigPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(server_args)
+        return cls(buffer.getvalue())
 
     def materialize(self) -> ServerArgs:
         # Importing ServerArgs pulls in pipeline configuration modules. This

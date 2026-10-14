@@ -90,7 +90,8 @@ def process_model_weights_after_loading(
         )
         if quantized_only and unquantized:
             continue
-        if is_npu() and not unquantized:
+        # A5 uses explicit ACLNN casts and rejects the global internal-format flag.
+        if is_npu() and not unquantized and torch.npu.get_soc_version() < 260:
             torch.npu.config.allow_internal_format = True
         if process_device is None:
             method.process_weights_after_loading(module)

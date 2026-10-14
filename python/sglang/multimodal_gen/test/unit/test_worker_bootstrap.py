@@ -333,5 +333,31 @@ class TestOfflineScriptImportContract(unittest.TestCase):
         )
 
 
+class TestConfigTensorSerialization(unittest.TestCase):
+    def test_wan_config_round_trip_avoids_legacy_tensor_pickle(self):
+        import torch
+
+        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        config = WanVAEArchConfig()
+        config.latents_std = tuple(2 * value for value in config.latents_std)
+        config.__post_init__()
+        args = ServerArgs.__new__(ServerArgs)
+        args.pipeline_config = SimpleNamespace(vae=config)
+
+        with patch(
+            "torch.storage._load_from_bytes",
+            side_effect=AssertionError("legacy tensor serialization was used"),
+        ):
+            restored = worker_bootstrap.ServerArgsPayload.capture(args).materialize()
+
+        actual = restored.pipeline_config.vae
+        torch.testing.assert_close(actual.scaling_factor, config.scaling_factor)
+        torch.testing.assert_close(actual.shift_factor, config.shift_factor)
+        self.assertEqual(actual.latents_std, config.latents_std)
+        self.assertEqual(actual.scaling_factor.device.type, "cpu")
+
+
 if __name__ == "__main__":
     unittest.main()

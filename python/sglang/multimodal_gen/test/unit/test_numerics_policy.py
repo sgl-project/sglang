@@ -8,6 +8,7 @@ tier's contract depend on the build. The policy sets both explicitly.
 
 import sys
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -17,6 +18,12 @@ from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_p
 
 class TestNumericsPolicy(unittest.TestCase):
     def setUp(self):
+        cuda_platform = patch(
+            "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_cuda",
+            return_value=True,
+        )
+        cuda_platform.start()
+        self.addCleanup(cuda_platform.stop)
         self._cudnn_tf32 = torch.backends.cudnn.allow_tf32
         self._bf16_reduction = (
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
@@ -54,6 +61,31 @@ class TestNumericsPolicy(unittest.TestCase):
         self.assertFalse(
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         )
+
+    def test_npu_does_not_apply_or_advertise_cuda_settings(self):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_cuda",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_rocm",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.utils.numerics_policy.logger"
+            ) as logger,
+        ):
+            apply_numerics_policy(
+                allow_cudnn_tf32=False, allow_bf16_reduced_precision_reduction=False
+            )
+        self.assertTrue(torch.backends.cudnn.allow_tf32)
+        self.assertTrue(
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        )
+        logger.info_once.assert_not_called()
 
 
 if __name__ == "__main__":

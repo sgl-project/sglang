@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -34,6 +35,9 @@ def apply_numerics_policy(
     *, allow_cudnn_tf32: bool, allow_bf16_reduced_precision_reduction: bool
 ) -> None:
     """Set both approximate-numerics switches and log what this worker runs."""
+    if not (current_platform.is_cuda() or current_platform.is_rocm()):
+        return
+
     torch.backends.cudnn.allow_tf32 = allow_cudnn_tf32
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
         allow_bf16_reduced_precision_reduction

@@ -199,11 +199,10 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
                 f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
             ) from e
 
-    generator = DiffGenerator.from_pretrained(
+    with DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args, local_mode=True
-    )
-
-    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+    ) as generator:
+        results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
     prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
