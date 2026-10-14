@@ -1778,14 +1778,6 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            if batch.rollout:
-                # Capture the pre-step x_{t_i} before the scheduler advances it.
-                self._maybe_append_dit_trajectory_step(
-                    batch=batch,
-                    latents=latents,
-                    timestep_value=t,
-                    step_index=i,
-                )
             latents = scheduler.step(
                 noise_pred,
                 t,
