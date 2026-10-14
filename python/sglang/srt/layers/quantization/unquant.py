@@ -796,6 +796,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache sizing.
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
         if self.use_flashinfer_cutlass:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,

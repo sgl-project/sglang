@@ -25,7 +25,25 @@ from .utils import (
     convert_video_to_comfy_video,
     get_image_path,
     is_empty_image,
+    resolve_video_path,
 )
+
+
+class SGLDH3DistilledSigmas:
+    """The checkpoint's trained rectified-flow grid, independent of scheduler presets."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model_type": (["fast_h3", "vdn_h3"],)}}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "build"
+    CATEGORY = "SGLDiffusion"
+
+    def build(self, model_type):
+        from .executors.minimax_h3 import distilled_h3_sigmas
+
+        return (torch.tensor(distilled_h3_sigmas(model_type)),)
 
 
 class SGLDOptions:
@@ -39,9 +57,12 @@ class SGLDOptions:
                         "auto-detect",
                         "qwen_image",
                         "qwen_image_edit",
+                        "qwen_image21",
                         "flux",
                         "lumina2",
                         "minimax_h3",
+                        "fast_h3",
+                        "vdn_h3",
                     ],
                     {"default": "auto-detect"},
                 ),
@@ -90,6 +111,8 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
+                "runtime_model_path": ("STRING", {"default": ""}),
+                "attention_backend_config": ("STRING", {"default": ""}),
                 "transformer_weights_path": (
                     "STRING",
                     {
@@ -122,6 +145,8 @@ class SGLDOptions:
         enable_cache_dit: bool = False,
         quantization: str = "",
         transformer_weights_path: str = "",
+        runtime_model_path: str = "",
+        attention_backend_config: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -159,6 +184,14 @@ class SGLDOptions:
             # Same selector as `sglang serve --transformer-weights-path`:
             # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
             options["transformer_weights_path"] = transformer_weights_path
+
+        for key, value in (
+            ("runtime_model_path", runtime_model_path),
+            # Same format as --attention-backend-config; ServerArgs parses it.
+            ("attention_backend_config", attention_backend_config),
+        ):
+            if value.strip():
+                options[key] = value.strip()
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}
@@ -631,7 +664,9 @@ class SGLDiffusionGenerateVideo:
         # Call API
         try:
             response = sgld_client.generate_video(**request_params)
-            video_path = response.get("file_path", "")
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
             video = convert_video_to_comfy_video(video_path, height, width)
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
@@ -839,10 +874,12 @@ class SGLDiffusionGenerateH3:
 
         try:
             response = sgld_client.generate_video(**request_params)
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 
-        video_path = response.get("file_path", "")
         # H3 aligns the canvas server-side, so the resolved size is only known
         # from the response; short_edge and aspect_ratio cannot reconstruct it
         resolved_size = response.get("size", "")
@@ -972,6 +1009,7 @@ class SGLDiffusionServerUnsetLora:
 
 # Register nodes
 NODE_CLASS_MAPPINGS = {
+    "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,

@@ -304,6 +304,17 @@ pub struct SamplingParams {
     /// the number of returned sequences (n \<= beam_width).
     #[prost(int64, optional, tag = "26")]
     pub beam_width: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "27")]
+    pub watermark: ::core::option::Option<WatermarkRequestConfig>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatermarkRequestConfig {
+    #[prost(bool, optional, tag = "1")]
+    pub enabled: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "2")]
+    pub key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "3")]
+    pub context_window: ::core::option::Option<i64>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
@@ -535,6 +546,15 @@ pub struct MediaRef {
     /// Video: also decode the audio track.
     #[prost(bool, optional, tag = "14")]
     pub use_audio: ::core::option::Option<bool>,
+    /// GLM-Image external AR uses grids with input_ids to compute MRoPE positions.
+    #[prost(message, optional, tag = "15")]
+    pub image_grid_thw: ::core::option::Option<ImageGridThw>,
+}
+/// One (t, h, w) row per image; the processor validates row arity.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImageGridThw {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<Int64List>,
 }
 /// One media item. JSON: a bare string is the source; an object is a MediaRef.
 #[derive(Clone, PartialEq, ::prost::Message)]

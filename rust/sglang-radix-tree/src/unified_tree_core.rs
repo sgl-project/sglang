@@ -53,6 +53,18 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
+/// A node's position and FULL value length on a root-to-node path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreePathNodeInfo {
+    pub node_id: NodeId,
+    pub parent_id: NodeId,
+    /// Half-open offsets from the root, in tokens (or bigrams for bigram keys).
+    pub path_start: usize,
+    pub path_end: usize,
+    /// Logical FULL device indices; None when absent.
+    pub full_value_len: Option<usize>,
+}
+
 /// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
 #[derive(Default)]
 pub struct IncLockRefResult {
@@ -660,6 +672,91 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
+    /// Adjust the component's evictable or protected count of reclaimable tokens.
+    /// The caller updates backing and size together, and restores backing on error.
+    /// This changes counters only; roots and device tombstones are ignored.
+    pub fn adjust_component_size(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        delta: i64,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        if self.components_by_type[component_type.idx()].is_none() {
+            return Err(TreeCoreRuntimeError::ComponentNotEnabled { component_type });
+        }
+        let node = self.arena.node(node_idx);
+        if node.is_root() || !node.has_device_value(component_type) {
+            return Ok(());
+        }
+        let protected = node.device_lock_ref(component_type) > 0;
+        let state = self.component_state_mut(component_type);
+        let size = if protected {
+            &mut state.protected_size
+        } else {
+            &mut state.evictable_size
+        };
+        let updated = usize::try_from(delta.unsigned_abs())
+            .ok()
+            .and_then(|magnitude| {
+                if delta >= 0 {
+                    size.checked_add(magnitude)
+                } else {
+                    size.checked_sub(magnitude)
+                }
+            })
+            .ok_or(TreeCoreRuntimeError::InvalidComponentSizeDelta {
+                node_id,
+                component_type,
+                current: *size,
+                delta,
+                protected,
+            })?;
+        *size = updated;
+        Ok(())
+    }
+
+    /// Copy root-to-node paths in input order, keeping duplicates and excluding roots.
+    /// An invalid node id fails the whole call.
+    pub fn collect_path_info(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Vec<TreePathNodeInfo>>, TreeCoreRuntimeError> {
+        node_ids
+            .iter()
+            .map(|&node_id| {
+                let mut current = self.arena.resolve(node_id)?;
+                let mut path = Vec::new();
+                loop {
+                    let node = self.arena.node(current);
+                    if node.is_root() {
+                        break;
+                    }
+                    let parent = node.parent();
+                    path.push(TreePathNodeInfo {
+                        node_id: node.id,
+                        parent_id: self.arena.node(parent).id,
+                        path_start: 0,
+                        path_end: node.key.atom_len(),
+                        full_value_len: node
+                            .has_device_value(FULL)
+                            .then(|| node.device_value_len(FULL)),
+                    });
+                    current = parent;
+                }
+                path.reverse();
+                let mut start = 0;
+                for info in &mut path {
+                    let length = info.path_end;
+                    info.path_start = start;
+                    start += length;
+                    info.path_end = start;
+                }
+                Ok(path)
+            })
+            .collect()
+    }
+
     /// Build a tree core for the given component types with a fresh arena.
     /// Fresh per-slot LRU lists.
     pub(crate) fn new_lru_lists() -> [UnifiedLRUList; NUM_VALUE_SLOTS] {

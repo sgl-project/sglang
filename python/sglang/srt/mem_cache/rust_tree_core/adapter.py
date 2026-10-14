@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import get_eviction_strategy
@@ -1137,6 +1138,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
         return self._binding.write_back_duplicate_reclaim_digest()
+
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        self._binding.adjust_component_size(node_id, int(component_type), delta)
+
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = self._binding.collect_path_info(list(end_node_ids))
+        return tuple(tuple(TreePathNodeInfo(*node) for node in path) for path in paths)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
