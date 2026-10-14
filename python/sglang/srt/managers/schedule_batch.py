@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     from sglang.srt.dllm.req_state import DllmReqState
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -2261,18 +2262,13 @@ def commit_step_counters(step: ScheduleBatch) -> None:
     extend or decode step count and, without speculation, a decode row's
     committed KV (a speculative verify commits its accepted run in
     _resolve_spec_v2_tokens)."""
-    if not (step.forward_mode.is_decode() or step.forward_mode.is_extend()):
-        return
-    first_decode_row = (
-        0 if step.forward_mode.is_decode() else len(step.reqs) - step.num_decode_rows
-    )
     commit_kv = step.spec_algorithm.is_none()
     # A finished row (an overshoot row of an earlier commit) or a retracted one
     # advances nothing.
-    for req in step.reqs[:first_decode_row]:
+    for req in step.prefill_reqs():
         if not (req.finished() or req.is_retracted):
             req.extend_batch_idx += 1
-    for req in step.reqs[first_decode_row:]:
+    for req in step.decode_reqs():
         if req.finished() or req.is_retracted:
             continue
         req.decode_batch_idx += 1
@@ -2281,12 +2277,19 @@ def commit_step_counters(step: ScheduleBatch) -> None:
 
 
 def new_tokens_required_next_decode(
-    reqs: List[Req], page_size: int, spec_algorithm: SpeculativeAlgorithm
+    reqs: List[Req],
+    page_size: int,
+    spec_algorithm: SpeculativeAlgorithm,
+    pending: PendingSteps,
 ) -> int:
     if spec_algorithm.is_none():
-        # The next decode writes at the allocated end; steps in flight
-        # allocated their tokens already.
-        new_pages = sum(1 for r in reqs if r.kv.kv_allocated_len % page_size == 0)
+        # The next decode writes after the KV of every launched step, the
+        # pending ones included.
+        new_pages = sum(
+            1
+            for r in reqs
+            if (r.kv.kv_committed_len + pending.num_inflight_kv(r)) % page_size == 0
+        )
         return new_pages * page_size + num_beam_member_rows(reqs)
 
     # Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation.
@@ -2306,6 +2309,7 @@ def check_decode_mem(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     spec_algorithm: SpeculativeAlgorithm,
+    pending: PendingSteps,
 ) -> bool:
     """Whether one decode step of reqs fits in the KV pool. The ALLOCATOR owns
     the capacity gate (eviction + any per-step reservations of its own) —
@@ -2313,7 +2317,7 @@ def check_decode_mem(
     shortfalls retract gracefully instead of tripping fail-loud alloc
     errors."""
     num_tokens = new_tokens_required_next_decode(
-        reqs, token_to_kv_pool_allocator.page_size, spec_algorithm
+        reqs, token_to_kv_pool_allocator.page_size, spec_algorithm, pending
     )
     return token_to_kv_pool_allocator.check_decode_capacity(
         num_tokens=num_tokens,
@@ -2331,6 +2335,7 @@ def retract_decode(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     spec_algorithm: SpeculativeAlgorithm,
+    pending: PendingSteps,
 ) -> Tuple[List[Req], List[Req], List[Req]]:
     """Release decoding requests until the rest fit one decode step.
 
@@ -2345,6 +2350,7 @@ def retract_decode(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             spec_algorithm=spec_algorithm,
+            pending=pending,
         )
 
     def release(req: Req, remaining: int, offload_kv: bool = True) -> bool:
@@ -2800,6 +2806,14 @@ class ScheduleBatch:
         if not self.forward_mode.is_extend():
             return []
         return self.reqs[: len(self.reqs) - self.num_decode_rows]
+
+    def decode_reqs(self) -> List[Req]:
+        """The requests this step decodes one token of."""
+        if self.forward_mode.is_decode():
+            return self.reqs
+        if not self.forward_mode.is_extend():
+            return []
+        return self.reqs[len(self.reqs) - self.num_decode_rows :]
 
     def grammar_needs_sync(self) -> bool:
         """Whether grammar forces this batch onto the synchronous path, i.e. the
