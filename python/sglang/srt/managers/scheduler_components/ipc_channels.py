@@ -4,12 +4,23 @@ from typing import TYPE_CHECKING, Optional, Union
 import zmq
 
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
+    )
+
+
+def is_entry_rank() -> bool:
+    """Whether this rank talks to the tokenizer side: attention TP and CP rank 0
+    of the first pipeline stage."""
+    return (
+        get_parallel().pp_rank == 0
+        and get_parallel().attn_tp_rank == 0
+        and get_parallel().attn_cp_rank == 0
     )
 
 

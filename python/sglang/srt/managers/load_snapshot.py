@@ -52,7 +52,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
 from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
 logger = logging.getLogger(__name__)
@@ -649,6 +649,21 @@ def create_load_snapshot_writer(
     return ShmLoadSnapshotWriter(
         shm_path_for(port_args.instance_id), dp_size, dp_rank, publish_interval
     )
+
+
+def create_load_snapshot_writer_or_none(port_args):
+    """The writer for this DP rank, or None when it cannot be created."""
+    dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
+    try:
+        return create_load_snapshot_writer(
+            port_args,
+            get_parallel().num_dp_ranks,
+            dp_rank,
+            publish_interval=get_observability().load_snapshot_publish_interval,
+        )
+    except Exception as e:
+        logger.warning("load snapshot writer init failed: %s", e)
+        return None
 
 
 def create_load_snapshot_reader(port_args, caller: str):

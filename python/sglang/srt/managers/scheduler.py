@@ -179,7 +179,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import create_load_snapshot_writer_or_none
 from sglang.srt.managers.min_free_slots_delayer import create_min_free_slots_delayer
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -233,7 +233,10 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     SchedulerWatchdog,
 )
-from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
+from sglang.srt.managers.scheduler_components.ipc_channels import (
+    SchedulerIpcChannels,
+    is_entry_rank,
+)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
@@ -348,7 +351,6 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     freeze_gc,
-    get_bool_env_var,
     is_cuda,
     is_hip,
     kill_itself_when_parent_died,
@@ -393,11 +395,125 @@ class Scheduler:
         # dedicated methods instead of adding inline blocks here.
         self.init_startup_timing_begin()
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
-        self.counters = LaunchCounters()
-        self.flags = EngineFlags()
+        self.init_engine_state()
         self.init_soft_watchdog()
 
-        # Parse args
+        # Config, and the process's distributed runtime
+        self.init_server_args(server_args, port_args)
+        self.init_component_classes()
+        self.init_model_config()
+        # ZBAL switches the allocator, so it precedes any torch allocation.
+        self.init_zbal_on_npu()
+        self.init_parallel_runtime()
+
+        # Metrics, IPC, tokenizer and kernel configs
+        self.init_metrics_collector()
+        self.init_ipc_channels(port_args)
+        self.init_load_snapshot_writer(port_args)
+        self.init_idle_sleeper()
+        self.init_tokenizer()
+        self.init_moe_gemm_config()
+        self.init_mamba_backend()
+
+        # Workers. PR-fix reverts patch targets (e.g. _init_pools) that run
+        # inside init_model_worker, so they apply first.
+        maybe_revert_pr_fix()
+        self.init_model_worker()
+        self.init_worker_info()
+        self.init_process_groups()
+        self.init_startup_memory()
+        self.maybe_stall_for_test()
+
+        # KV cache and the mode owners over it
+        self.init_kv_event_lora_names()
+        self.init_kv_cache()
+        self.init_penalty_store()
+        self.emit_metrics_constants()
+        self.maybe_init_hccl_dp_prewarm()
+        self.init_kv_bundles()
+        self.init_kv_canary()
+        self.init_mode_owners()
+        self.init_hisparse_coordinator()
+        self.maybe_init_decode_offload_manager()
+
+        # Scheduling state and policy
+        self.init_running_status()
+        self.init_session_controller()
+        self.init_chunked_prefill()
+        self.maybe_init_dynamic_chunk_sizer()
+        self.init_metrics_sink()
+        self.init_schedule_policy()
+        self.maybe_init_prefill_delayer()
+        self.init_new_token_ratio_tracker()
+        self.init_watchdog()
+        self.init_memory_saver_adapter()
+        self.init_recv_skipper()
+        self.init_gc_logger()
+        self.init_profiler()
+
+        # Start the embedded Rust frontend (rank 0). Must precede
+        # init_disaggregation: on PD prefill the rust api listener also serves
+        # the KV bootstrap registry, and the KVManagers built there register to
+        # it synchronously. (The listener is bound synchronously inside launch,
+        # so the registry is accepting once this returns.) Must also precede
+        # the request receiver, which takes the rust server as its ingress.
+        self.maybe_init_rust_server()
+        self.init_disaggregation()
+        self.maybe_init_mm_receiver()
+
+        # Streams: the schedule stream settles before anything that waits on it.
+        self.init_overlap()
+        self.finalize_schedule_stream()
+        self.init_streams()
+        self.maybe_init_pp_spec_forward()
+        self.maybe_init_ngram_embedding()
+        self.init_truncation_align()
+
+        # Components, each built after the ones it takes
+        self.init_lora_admission()
+        self.init_grammar_manager()
+        self.maybe_init_scripted_scheduler_hook()
+        self.init_output_streamer()
+        self.init_request_receiver()
+        self.init_step_builder()
+        self.init_dp_attn_adapter()
+        self.init_pool_stats_observer()
+        self.init_invariant_checker()
+        self.init_watchdog_diagnostics()
+        self.init_kv_events_publisher()
+        self.init_load_publisher()
+        self.init_services()
+        self.init_beam_coordinator()
+        self.init_batch_result_processor()
+        self.init_request_retirer()
+        self.init_request_registry()
+        self.maybe_init_dllm()
+        self.maybe_init_disagg_prefill()
+        self.maybe_init_disagg_decode()
+        self.init_request_intake()
+        self.init_step_planner()
+        self.maybe_init_disagg_move_gate()
+        self.init_mode_stages()
+        self.init_step_launcher()
+        # Built after the request registry and the mode owners, which they read.
+        self.init_weight_updater()
+        self.init_flush_wrapper()
+        self.init_request_dispatcher()
+        self.init_step_counters()
+        self.init_load_inquirer()
+        self.init_metrics_reporter()
+        self.init_rank_consensus_checker()
+
+        self.flags.is_initializing = False
+        self.init_startup_timing_summary()
+        # Reads the startup time.
+        self.init_internal_state()
+
+    def init_engine_state(self) -> None:
+        self.counters = LaunchCounters()
+        self.flags = EngineFlags()
+
+    def init_server_args(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
         # Read once: the tokenizer init and the IPC channels gate on the same
@@ -407,179 +523,18 @@ class Scheduler:
             get_spec().speculative_algorithm
         )
         reject_modes_without_pipeline_support()
-        self.init_component_classes()
 
-        # Init model configs
-        self.init_model_config()
-
-        # Init ZBAL, switch allocator should before any torch alloc action
-        self.init_zbal_on_npu()
-
+    def init_parallel_runtime(self) -> None:
         bootstrap.init_parallel_runtime(
-            server_args=server_args,
+            server_args=self.server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
 
-        # Init metrics stats
-        self.init_metrics_collector()
-
-        # Init inter-process communication
-        self.init_ipc_channels(port_args)
-        self.init_idle_sleeper()
-
-        # Init tokenizer
-        self.init_tokenizer()
-
-        # Init moe config and GEMM config (FP8 GEMM, etc.)
-        self.init_moe_gemm_config()
-
-        # Init mamba backend
-        self.init_mamba_backend()
-
-        # Must precede init_model_worker: revert targets like _init_pools run during it,
-        # so patching them afterwards is a no-op.
-        maybe_revert_pr_fix()
-
-        # Launch a model worker and draft model worker if using speculative decoding
-        self.init_model_worker()
-        self.init_worker_info()
-        self.init_process_groups()
-        self.init_startup_memory()
-
+    def maybe_stall_for_test(self) -> None:
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
-
-        # Init cache and memory pool
-        self.init_kv_event_lora_names()
-        self.init_kv_cache()
-        self.init_penalty_store()
-        self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
-        self.init_kv_bundles()
-        self.init_kv_canary()
-
-        self.init_mode_owners()
-        self.init_hisparse_coordinator()
-        self.maybe_init_decode_offload_manager()
-
-        # Init running status
-        self.init_running_status()
-
-        # Init chunked prefill
-        self.init_chunked_prefill()
-        self.maybe_init_dynamic_chunk_sizer()
-
-        self.init_metrics_sink()
-        self.scheduler_stage_metrics = self.metrics_sink.scheduler_stage_metrics
-        self.enable_fpm = self.metrics_sink.enable_fpm
-
-        # Init schedule policy and new token estimation
-        self.init_schedule_policy()
-        self.maybe_init_prefill_delayer()
-        self.init_new_token_ratio_tracker()
-
-        # Init watchdog, memory saver, input blocker and recv skipper
-        self.init_watch_dog_memory_saver_input_blocker()
-
-        # Init profiler
-        self.init_profiler()
-
-        # Start the embedded Rust frontend (rank 0). Must precede
-        # init_disaggregation: on PD prefill the rust api listener also serves
-        # the KV bootstrap registry, and the KVManagers built there register to
-        # it synchronously. (The listener is bound synchronously inside launch,
-        # so the registry is accepting once this returns.) Must also precede
-        # the request receiver, which reads self.recv_from_tokenizer to pick
-        # its ingress transport.
-        self.maybe_init_rust_server()
-
-        # Init prefill-decodedisaggregation
-        self.init_disaggregation()
-        self.maybe_init_mm_receiver()
-
-        # Init overlap schedule
-        self.init_overlap()
-        self.finalize_schedule_stream()
-        self.init_streams()
-
-        # Init the speculative forward of a PP stage
-        self.maybe_init_pp_spec_forward()
-
-        # Init Ngram Embedding
-        self.maybe_init_ngram_embedding()
-
-        # Init prefill kv split size when deterministic inference is enabled with various attention backends
-        self.init_truncation_align()
-
-        # Init LoRA admission: the drainer and the overlap loader
-        self.init_lora_admission()
-
-        # Init the grammar backend for constrained generation
-        self.init_grammar_manager()
-
-        self.maybe_init_scripted_scheduler_hook()
-
-        self.init_output_streamer()
-        self.init_request_receiver()
-
-        self.init_step_builder()
-
-        self.init_dp_attn_adapter()
-
-        self.init_pool_stats_observer()
-
-        self.init_invariant_checker()
-        self.init_watchdog_diagnostics()
-
-        self.init_kv_events_publisher()
-
-        self.init_load_publisher()
-
-        self.init_services()
-
-        self.init_batch_result_processor()
-
-        self.init_request_retirer()
-
-        self.init_request_registry()
-
-        self.maybe_init_dllm()
-
-        self.maybe_init_disagg_prefill()
-
-        self.maybe_init_disagg_decode()
-
-        self.init_request_intake()
-
-        self.init_step_planner()
-
-        self.maybe_init_disagg_move_gate()
-
-        self.init_mode_stages()
-
-        # Init the launch of a step: its forward and its result's copy to host
-        self.init_step_launcher()
-
-        # Built after the request registry and the mode owners, which they read.
-        self.init_weight_updater()
-        self.init_flush_wrapper()
-
-        # Init request dispatcher
-        self.init_request_dispatcher()
-
-        self.init_step_counters()
-        self.init_load_inquirer()
-        self.init_metrics_reporter()
-
-        self.init_rank_consensus_checker()
-
-        self.flags.is_initializing = False
-        self.init_startup_timing_summary()
-
-        # Reads the startup time.
-        self.init_internal_state()
 
     def init_component_classes(self) -> None:
         self.component_classes = ComponentClasses(
@@ -633,14 +588,9 @@ class Scheduler:
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
-        is_rank_zero = (
-            get_parallel().pp_rank == 0
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
-        )
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
-            is_rank_zero=is_rank_zero,
+            is_rank_zero=is_entry_rank(),
             # The snapshot taken at construction, not a second bag read: this
             # scheduler gates its tokenizer init on the same value, and the two
             # must not be able to disagree.
@@ -653,31 +603,13 @@ class Scheduler:
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
-        self.load_snapshot_writer = None
-        self.recv_from_tokenizer = None
-
-        if not is_rank_zero:
-            return
-
-        self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
-        dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
-        try:
-            self.load_snapshot_writer = create_load_snapshot_writer(
-                port_args,
-                get_parallel().num_dp_ranks,
-                dp_rank,
-                publish_interval=get_observability().load_snapshot_publish_interval,
-            )
-        except Exception as e:
-            logger.warning("load snapshot writer init failed: %s", e)
+    def init_load_snapshot_writer(self, port_args: PortArgs) -> None:
+        self.load_snapshot_writer = (
+            create_load_snapshot_writer_or_none(port_args) if is_entry_rank() else None
+        )
 
     def init_idle_sleeper(self) -> None:
-        if (
-            get_parallel().pp_rank == 0
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
-            and get_device().sleep_on_idle
-        ):
+        if is_entry_rank() and get_device().sleep_on_idle:
             self.idle_sleeper = IdleSleeper(
                 sockets=[
                     self.ipc_channels.recv_from_tokenizer,
@@ -1052,8 +984,10 @@ class Scheduler:
         self.flat_slot = ScheduleSlot()
         # The launched steps whose results are not committed yet.
         self.pending = PendingSteps()
-        self.session_controller = SessionController(self.tree_cache)
         self._deferred_input_requests: List = []
+
+    def init_session_controller(self) -> None:
+        self.session_controller = SessionController(self.tree_cache)
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = resolve_chunked_prefill_size(self.model_config)
@@ -1085,6 +1019,8 @@ class Scheduler:
             metrics_collector=self.metrics_collector,
             device=self.device,
         )
+        self.scheduler_stage_metrics = self.metrics_sink.scheduler_stage_metrics
+        self.enable_fpm = self.metrics_sink.enable_fpm
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -1137,28 +1073,22 @@ class Scheduler:
                 soft=True,
             )
 
-    def init_watch_dog_memory_saver_input_blocker(self):
-        # Start watchdog thread
+    def init_watchdog(self) -> None:
         self.watchdog = SchedulerWatchdog(
             counters=self.counters,
             flags=self.flags,
             watchdog_timeout=get_device().watchdog_timeout,
         )
 
-        # Init memory saver, profiler and metric stats
+    def init_memory_saver_adapter(self) -> None:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
         )
 
-        # Init recv skipper and input blocker
+    def init_recv_skipper(self) -> None:
         self.recv_skipper = SchedulerRecvSkipper.maybe_create()
-        self.input_blocker = (
-            SchedulerInputBlocker(noop=get_parallel().attn_tp_rank != 0)
-            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
-            else None
-        )
 
-        # Configure GC logger
+    def init_gc_logger(self) -> None:
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
@@ -1471,7 +1401,6 @@ class Scheduler:
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
         )
-        self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
     def init_truncation_align(self):
         self.truncation_align_size = resolve_truncation_align_size(
@@ -2150,11 +2079,7 @@ class Scheduler:
         """Whether this scheduler rank embeds the Rust server (rank 0 only) —
         and with it the server-process duties a Python ``TokenizerManager``
         would otherwise own (e.g. serving the PD KV bootstrap registry)."""
-        return envs.SGLANG_RUST_SERVER.get() and (
-            get_parallel().pp_rank == 0
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
-        )
+        return envs.SGLANG_RUST_SERVER.get() and is_entry_rank()
 
     def maybe_init_rust_server(self) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
@@ -2175,9 +2100,6 @@ class Scheduler:
             max_total_num_tokens=self.max_total_num_tokens,
         )
         self.rust_server = rust_server
-        # The rust server *is* the ingress source: SchedulerRequestReceiver
-        # drains its request ring (rust_server_mode) instead of a zmq socket.
-        self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server, flags=self.flags)
 
@@ -2186,10 +2108,16 @@ class Scheduler:
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.recv_from_tokenizer,
+            # The rust server *is* the ingress source: SchedulerRequestReceiver
+            # drains its request ring (rust_server_mode) instead of a zmq socket.
+            recv_from_tokenizer=(
+                self.rust_server
+                if self.rust_server is not None
+                else self.ipc_channels.recv_from_tokenizer
+            ),
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
-            input_blocker=self.input_blocker,
+            input_blocker=SchedulerInputBlocker.maybe_create(),
             mm_receiver=self.mm_receiver,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -2399,7 +2327,6 @@ class Scheduler:
         )
 
     def init_batch_result_processor(self) -> None:
-        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             enable_overlap=(not get_schedule().disable_overlap_schedule),
