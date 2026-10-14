@@ -304,6 +304,7 @@ class RayStorageMetricsCollector(StorageMetricsCollector):
     """``StorageMetricsCollector`` that emits via Ray's metric system."""
 
     _counter_cls = RayCounterWrapper
+    _gauge_cls = RayGaugeWrapper
     _histogram_cls = RayHistogramWrapper
 
 
