@@ -520,13 +520,24 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Keep SGLang's pins and resolve inflect with Dynamo's typeguard dependency.
 # grpcio-tools 1.84.0 supports the Protobuf 7 dependency set.
+# Pin a stable Dynamo release without allowing prereleases: an unbounded
+# request silently resolved to the empty ai-dynamo==0.0.0a0 placeholder.
+# ai-dynamo-runtime caps pydantic below the frozen pin, so release only the
+# pydantic pins for this solve and record the versions it selects.
 ARG INSTALL_DYNAMO=1
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -- "grpcio-tools==1.84.0" \
-    && if [ "$INSTALL_DYNAMO" = "1" ]; then set -- "$@" ai-dynamo inflect; fi \
+    && if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        set -- "$@" "ai-dynamo==1.5.1" inflect \
+        && sed -i -E '/^pydantic(-core)?==/d' /sgl-workspace/constraints.txt; \
+    fi \
     && uv pip install -c /sgl-workspace/constraints.txt \
-        --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://pypi.nvidia.com/ "$@"
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://pypi.nvidia.com/ "$@" \
+    && if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        uv pip freeze | grep -E '^pydantic(-core)?==' >> /sgl-workspace/constraints.txt \
+        && python3 -c "import dynamo.runtime, inflect"; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
