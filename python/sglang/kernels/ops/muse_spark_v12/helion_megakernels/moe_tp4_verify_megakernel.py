@@ -16,12 +16,6 @@ Roots (j / f: the routed experts in ascending order, ``slots`` bound):
 
 FC2 follows FlashInfer: the FC2 input scale is folded into ``up_alpha`` and
 ``out_alpha``, so z is quantized with a unit global scale.
-
-The tail is a second launch: the unpooler on this rank's N/W rows in C-column
-blocks, then the post-FFN RMSNorm, the gated residual and the next layer's
-pre-attention RMSNorm. Each block's BF16 rows and four per-token moments
-(|v|^2, |a s|^2, <a s, b v>, |b v|^2) cross ranks once; outputs are replicated.
-Its last root is the next layer's QKV GEMV on that attention input.
 """
 
 from __future__ import annotations
@@ -44,9 +38,6 @@ TOPK = 8
 MMA_M = 128
 TILE_M = 256
 TILE_K = 256  # e2m1x2 bytes per K step
-C_BLOCK = 16
-N_BLOCKS = 16
-QKV_ROWS = 32
 
 
 def _or(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -354,146 +345,6 @@ def _muse_moe_tp4_verify_megakernel(
     return y
 
 
-def _muse_moe_tail_verify_megakernel(
-    y: torch.Tensor,  # [T, K] bf16, replicated expert output
-    wu: torch.Tensor,  # [N / W / C, C, K] bf16, this rank's unpooler rows
-    stream: torch.Tensor,  # [T, W, N / W / C, C] fp32
-    alpha: torch.Tensor,  # [W, N / W / C, C] fp32
-    beta: torch.Tensor,  # [W, N / W / C, C] fp32
-    post_w: torch.Tensor,  # [W, N / W / C, C] bf16
-    pre_w: torch.Tensor,  # [W, N / W / C, C] bf16
-    rows: torch.Tensor,  # [T, N / W / C, C] bf16 symm
-    moments: torch.Tensor,  # [N / W / C, T, 4] fp32 symm
-    new_stream: torch.Tensor,  # [T, W, N / W / C, C] fp32
-    attn_in: torch.Tensor,  # [T, W, N / W / C, C] bf16
-    wq: torch.Tensor,  # [Nq / CQ, CQ, N] bf16, the next layer's QKV rows
-    qkv: torch.Tensor,  # [T, Nq / CQ, CQ] bf16
-    group_name: hl.ProcessGroupName,
-    rank: hl.constexpr,
-    post_eps: hl.constexpr,
-    pre_eps: hl.constexpr,
-) -> torch.Tensor:
-    hl.specialize(y.size())
-    hl.specialize(y.stride())
-    hl.specialize(wu.size())
-    hl.specialize(wu.stride())
-    hl.specialize(stream.size())
-    hl.specialize(stream.stride())
-    hl.specialize(alpha.size())
-    hl.specialize(alpha.stride())
-    hl.specialize(beta.size())
-    hl.specialize(beta.stride())
-    hl.specialize(post_w.size())
-    hl.specialize(post_w.stride())
-    hl.specialize(pre_w.size())
-    hl.specialize(pre_w.stride())
-    hl.specialize(rows.size())
-    hl.specialize(rows.stride())
-    hl.specialize(moments.size())
-    hl.specialize(moments.stride())
-    hl.specialize(new_stream.size())
-    hl.specialize(new_stream.stride())
-    hl.specialize(attn_in.size())
-    hl.specialize(attn_in.stride())
-    hl.specialize(wq.size())
-    hl.specialize(wq.stride())
-    hl.specialize(qkv.size())
-    hl.specialize(qkv.stride())
-
-    tokens = y.size(0)
-    k_u = y.size(1)
-    n_blocks = wu.size(0)
-    c_block = wu.size(1)
-    world = stream.size(1)
-    hidden = world * n_blocks * c_block
-    k_blk = hl.register_block_size(k_u)
-    q_blk = hl.register_block_size(hidden)
-    x = attn_in.view(tokens, hidden)
-    remote_rows = torch.ops.symm_mem.get_remote_tensors(rows, group_name)
-    remote_moments = torch.ops.symm_mem.get_remote_tensors(moments, group_name)
-
-    hl.pdl_wait()
-    # Trigger at entry: the next kernel's CTAs land on SMs this grid frees early,
-    # and its own wait still orders it after this grid.
-    hl.pdl_launch_dependents()
-    # Stock: the unpooler GEMM (post_expert_proj via gemm_local, this rank's rows).
-    for u_b in hl.tile(n_blocks, block_size=1):
-        acc = hl.zeros([c_block, tokens], dtype=torch.float32)
-        for u_k in hl.tile(k_u, block_size=k_blk):
-            acc = hl.dot(
-                hl.load(wu, [u_b.begin, slice(None), u_k]),
-                y[:, u_k].permute(1, 0),
-                acc=acc,
-            )
-        post = post_w[rank, u_b.begin, :].to(torch.float32)
-        gated_stream = (
-            alpha[rank, u_b.begin, :][None, :] * stream[:, rank, u_b.begin, :]
-        )
-        beta_c = beta[rank, u_b.begin, :]
-        unpooled = acc.permute(1, 0).to(torch.bfloat16)
-        rows[:, u_b.begin, :] = unpooled
-        # MuseSpark1xRMSNormWithInputScale multiplies in BF16.
-        scaled = (unpooled.to(torch.float32) * post[None, :]).to(torch.bfloat16)
-        scaled = scaled.to(torch.float32)
-        gated_branch = beta_c[None, :] * scaled
-        m = hl.arange(4)[None, :]
-        moments[u_b.begin, :, :] = (
-            torch.where(m == 0, torch.sum(scaled * scaled, dim=-1)[:, None], 0.0)
-            + torch.where(
-                m == 1, torch.sum(gated_stream * gated_stream, dim=-1)[:, None], 0.0
-            )
-            + torch.where(
-                m == 2, torch.sum(gated_stream * gated_branch, dim=-1)[:, None], 0.0
-            )
-            + torch.where(
-                m == 3, torch.sum(gated_branch * gated_branch, dim=-1)[:, None], 0.0
-            )
-        )
-
-    # Stock: FusedPostNormResidualPreNorm.forward_with_ag (unpooler all-gather,
-    # post-FFN norm, gated residual, next layer's pre-attention norm).
-    for n_t, n_b in hl.tile([tokens, n_blocks], block_size=[1, N_BLOCKS]):
-        owner = hl.arange(world)[:, None, None]
-        post = post_w[:, n_b, :].to(torch.float32)
-        gated_stream = alpha[:, n_b, :] * stream[n_t.begin, :, n_b, :]
-        beta_c = beta[:, n_b, :]
-        pre = pre_w[:, n_b, :].to(torch.float32)
-        total = hl.zeros([4], dtype=torch.float32)
-        # Rank order, so every rank and tile derives the same scalars.
-        for peer_moments in remote_moments:
-            total = total + torch.sum(peer_moments[:, n_t.begin, :], dim=0)
-        branch = hl.zeros([world, n_b, c_block], dtype=torch.float32)
-        for peer, peer_rows in enumerate(remote_rows):
-            branch = torch.where(
-                owner == peer,
-                peer_rows[n_t.begin, n_b, :].to(torch.float32)[None, :, :],
-                branch,
-            )
-        m = hl.arange(4)
-        post_sq = torch.sum(torch.where(m == 0, total, 0.0))
-        stream_sq = torch.sum(torch.where(m == 1, total, 0.0))
-        cross = torch.sum(torch.where(m == 2, total, 0.0))
-        branch_sq = torch.sum(torch.where(m == 3, total, 0.0))
-        post_rstd = torch.rsqrt(post_sq / hidden + post_eps)
-        pre_var = (
-            stream_sq + 2.0 * post_rstd * cross + post_rstd * post_rstd * branch_sq
-        ) / hidden
-        pre_rstd = torch.rsqrt(pre_var + pre_eps)
-        scaled = (branch * post).to(torch.bfloat16).to(torch.float32)
-        normed = (scaled * post_rstd).to(torch.bfloat16).to(torch.float32)
-        updated = gated_stream + beta_c * normed
-        new_stream[n_t.begin, :, n_b, :] = updated
-        attn_in[n_t.begin, :, n_b, :] = (updated * pre_rstd * pre).to(torch.bfloat16)
-
-    # Stock: the next layer's QKVG GEMM (qkv_proj also holds the output-gate rows).
-    for q_b in hl.tile(wq.size(0), block_size=1):
-        acc = hl.zeros([wq.size(1), tokens], dtype=torch.float32)
-        for q_k in hl.tile(hidden, block_size=q_blk):
-            acc = hl.dot(wq[q_b.begin, :, q_k], x[:, q_k].permute(1, 0), acc=acc)
-        qkv[:, q_b.begin, :] = acc.permute(1, 0).to(torch.bfloat16)
-    return attn_in
-
-
 def make_config(
     *,
     num_warps: int = 4,
@@ -522,39 +373,14 @@ def make_config(
     )
 
 
-def make_tail_config(
-    *,
-    k_blk: int = 512,
-    q_blk: int = 512,
-    num_warps: int = 2,
-    num_stages: int = 5,
-    pipeline: str = "dynamic",
-    pid_type: str = "persistent_blocked",
-    **extra: object,
-) -> helion.Config:
-    return helion.Config(
-        block_sizes=[k_blk, q_blk],
-        cross_loop_pipeline=pipeline,
-        indexing="pointer",
-        num_stages=num_stages,
-        num_warps=num_warps,
-        pid_type=pid_type,
-        **extra,
-    )
-
-
-def _build(fn: object, config: helion.Config) -> object:
+def build_kernel(config: helion.Config) -> object:
     return helion.kernel(
-        fn,
+        _muse_moe_tp4_verify_megakernel,
         config=config,
         static_shapes=True,
         backend="triton",
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
-
-
-def build_kernel(config: helion.Config) -> object:
-    return _build(_muse_moe_tp4_verify_megakernel, config)
 
 
 class MoeTp4VerifyBank(msgspec.Struct, frozen=True):
@@ -745,94 +571,6 @@ class MuseMoeTp4VerifyMegakernel:
         return y
 
 
-class MuseMoeTailVerifyMegakernel:
-    """Per-rank symmetric buffers and call for the verify MoE tail.
-
-    The call takes the first T rows of y, this rank's unpooler rows, the FFN
-    boundary's [hidden] weights and optionally the next layer's QKV weight, and
-    returns the new
-    stream, the next attention input and its QKV (or None), replicated on every
-    rank.
-    """
-
-    def __init__(
-        self,
-        device: torch.device,
-        group: object,
-        *,
-        tokens: int,
-        post_eps: float,
-        pre_eps: float,
-        config: helion.Config | None = None,
-        hidden: int = 8192,
-    ):
-        import torch.distributed._symmetric_memory as symm_mem
-
-        self.kernel = _build(
-            _muse_moe_tail_verify_megakernel, config or make_tail_config()
-        )
-        self.group_name = group.group_name
-        self.world = group.size()
-        self.tokens = tokens
-        self.hidden = hidden
-        n_blocks = hidden // self.world // C_BLOCK
-        self.rows = symm_mem.empty(
-            tokens, n_blocks, C_BLOCK, dtype=torch.bfloat16, device=device
-        )
-        self.moments = symm_mem.empty(
-            n_blocks, tokens, 4, dtype=torch.float32, device=device
-        )
-        for buffer in (self.rows, self.moments):
-            symm_mem.rendezvous(buffer, self.group_name)
-        # Without a next layer, the QKV root runs on one throwaway block.
-        self.no_qkv = torch.zeros(
-            1, QKV_ROWS, hidden, dtype=torch.bfloat16, device=device
-        )
-        self.constants = (group.rank(), post_eps, pre_eps)
-
-    def __call__(
-        self,
-        *,
-        expert_output: torch.Tensor,
-        unpool_weight: torch.Tensor,
-        stream: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        post_weight: torch.Tensor,
-        pre_weight: torch.Tensor,
-        next_qkv_weight: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        world, tokens = self.world, self.tokens
-        device = stream.device
-        new_stream = torch.empty_like(stream)
-        attn_in = torch.empty(stream.shape, dtype=torch.bfloat16, device=device)
-        wq = (
-            self.no_qkv
-            if next_qkv_weight is None
-            else next_qkv_weight.view(-1, QKV_ROWS, self.hidden)
-        )
-        qkv = torch.empty(tokens, *wq.shape[:2], dtype=torch.bfloat16, device=device)
-        self.kernel(
-            expert_output,
-            unpool_weight.view(-1, C_BLOCK, unpool_weight.size(1)),
-            stream.view(tokens, world, -1, C_BLOCK),
-            alpha.view(world, -1, C_BLOCK),
-            beta.view(world, -1, C_BLOCK),
-            post_weight.view(world, -1, C_BLOCK),
-            pre_weight.view(world, -1, C_BLOCK),
-            self.rows,
-            self.moments,
-            new_stream.view(tokens, world, -1, C_BLOCK),
-            attn_in.view(tokens, world, -1, C_BLOCK),
-            wq,
-            qkv,
-            self.group_name,
-            *self.constants,
-        )
-        next_qkv = None if next_qkv_weight is None else qkv.view(tokens, -1)
-        return new_stream, attn_in, next_qkv
-
-
 _INSTANCES: dict[tuple[int, object, float], MuseMoeTp4VerifyMegakernel] = {}
 
 
@@ -857,10 +595,8 @@ __all__ = [
     "MOE_TOKENS",
     "MoeTp4VerifyBank",
     "MoeVerifyInputs",
-    "MuseMoeTailVerifyMegakernel",
     "MuseMoeTp4VerifyMegakernel",
     "build_moe_tp4_verify_bank",
     "get_moe_tp4_verify_megakernel",
     "make_config",
-    "make_tail_config",
 ]

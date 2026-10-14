@@ -1,7 +1,6 @@
-"""The spec-decode verify (T = 8 and 16) expert-TP4 NVFP4 MoE megakernel and its
-post-FFN tail against full-expert references: FP64 GEMMs, FlashInfer's static
-FC2 requant recipe, the stock weight-first post-expert norm finalize, and the
-stock post-FFN norm, gated residual and next pre-attention norm.
+"""The spec-decode verify (T = 8 and 16) expert-TP4 NVFP4 MoE megakernel against
+full-expert references: FP64 GEMMs, FlashInfer's static FC2 requant recipe and
+the stock weight-first post-expert norm finalize.
 
 Run with ``python <this file>``; it relaunches itself under torchrun on 4 GPUs.
 """
@@ -37,7 +36,6 @@ else:
     )
     from sglang.kernels.ops.muse_spark_v12.helion_megakernels.moe_tp4_verify_megakernel import (
         MoeTp4VerifyBank,
-        MuseMoeTailVerifyMegakernel,
         MuseMoeTp4VerifyMegakernel,
         build_moe_tp4_verify_bank,
     )
@@ -55,9 +53,7 @@ pytestmark = [
 ]
 
 EXPERTS, HIDDEN, INTERMEDIATE, TOPK = 256, 4096, 4096, 8
-MODEL_HIDDEN = 8192
-QKV_OUT = 4608  # one rank's Q, K, V and gate rows
-NORM_EPS, POST_EPS, PRE_EPS = 1e-8, 1e-8, 1e-5
+NORM_EPS = 1e-8
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 FC2_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 BF16_MAX = torch.finfo(torch.bfloat16).max
@@ -122,18 +118,6 @@ class Case(msgspec.Struct, frozen=True):
     draws: list[Draw]
 
 
-class Boundary(msgspec.Struct, frozen=True):
-    """Post-FFN boundary tensors, identical on every rank."""
-
-    unpool: torch.Tensor  # [D, H] bf16
-    stream: torch.Tensor  # [T, D] f32
-    alpha: torch.Tensor
-    beta: torch.Tensor
-    post_weight: torch.Tensor
-    pre_weight: torch.Tensor
-    qkv: torch.Tensor  # [Nq, D] bf16, the next layer's QKV rows
-
-
 @functools.cache
 def _init_group_once() -> dist.ProcessGroup:
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -151,17 +135,6 @@ def _megakernel_once(tokens: int) -> MuseMoeTp4VerifyMegakernel:
         _init_group_once(),
         tokens=tokens,
         norm_eps=NORM_EPS,
-    )
-
-
-@functools.cache
-def _tail_once(tokens: int) -> MuseMoeTailVerifyMegakernel:
-    return MuseMoeTailVerifyMegakernel(
-        torch.device("cuda", torch.cuda.current_device()),
-        _init_group_once(),
-        tokens=tokens,
-        post_eps=POST_EPS,
-        pre_eps=PRE_EPS,
     )
 
 
@@ -278,23 +251,6 @@ def _pack_routes(topk_ids: torch.Tensor, seed: int) -> torch.Tensor:
     scores = (raw / raw.sum(-1, keepdim=True)).bfloat16().view(torch.int16)
     expert = topk_ids.to(torch.int32).cuda()
     return (expert << 16) | (scores.to(torch.int32) & 0xFFFF)
-
-
-def _boundary(tokens: int) -> Boundary:
-    g = torch.Generator(device="cuda").manual_seed(11)
-
-    def randn(*shape: int) -> torch.Tensor:
-        return torch.randn(*shape, device="cuda", generator=g)
-
-    return Boundary(
-        unpool=(randn(MODEL_HIDDEN, HIDDEN) / 64.0).bfloat16(),
-        stream=randn(tokens, MODEL_HIDDEN) * 4.0,
-        alpha=1.0 + 0.1 * randn(MODEL_HIDDEN),
-        beta=0.5 + 0.1 * randn(MODEL_HIDDEN),
-        post_weight=(1.0 + 0.1 * randn(MODEL_HIDDEN)).bfloat16(),
-        pre_weight=(1.0 + 0.1 * randn(MODEL_HIDDEN)).bfloat16(),
-        qkv=(randn(QKV_OUT, MODEL_HIDDEN) / 90.0).bfloat16(),
-    )
 
 
 def _dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -451,23 +407,8 @@ def _finalize(
     return (weights[..., None] * rows * rstd).sum(1).float().bfloat16()
 
 
-def _stock_tail(fin: torch.Tensor, b: Boundary) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stock post-FFN per token: BF16 unpool GEMM, input-scale post norm, gate,
-    pre norm. Returns (new stream FP32, next attention input BF16)."""
-
-    branch = (fin.double() @ b.unpool.double().T).bfloat16()
-    v = (branch.float() * b.post_weight.float()).bfloat16().float()
-    normed = (v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + POST_EPS)).bfloat16()
-    stream = b.alpha * b.stream + b.beta * normed.float()
-    pre_rstd = torch.rsqrt(stream.pow(2).mean(-1, keepdim=True) + PRE_EPS)
-    return stream, (stream * pre_rstd * b.pre_weight.float()).bfloat16()
-
-
-def _run(
-    case: Case, draw: Draw, b: Boundary, unpool: torch.Tensor
-) -> dict[str, torch.Tensor]:
-    """One MoE launch on the input slot's first T rows and one tail launch on
-    its output, as served."""
+def _run(case: Case, draw: Draw) -> dict[str, torch.Tensor]:
+    """One MoE launch on the input slot's first T rows, as served."""
 
     tokens = len(draw.packed)
     mk = _megakernel_once(tokens)
@@ -487,18 +428,7 @@ def _run(
         output2_scale_scalar=case.alphas[2],
         norm_weight=case.norm_weight,
     )
-    gemm2 = mk.gemm2_ws.clone()
-    stream, attn, qkv = _tail_once(tokens)(
-        expert_output=y,
-        unpool_weight=unpool,
-        stream=b.stream,
-        alpha=b.alpha,
-        beta=b.beta,
-        post_weight=b.post_weight,
-        pre_weight=b.pre_weight,
-        next_qkv_weight=b.qkv,
-    )
-    return {"y": y, "gemm2": gemm2, "stream": stream, "attn": attn, "qkv": qkv}
+    return {"y": y, "gemm2": mk.gemm2_ws.clone()}
 
 
 def _rrmse(got: torch.Tensor, expected: torch.Tensor) -> float:
@@ -512,28 +442,19 @@ def _cosine(got: torch.Tensor, expected: torch.Tensor) -> float:
     ).item()
 
 
-def _metrics(
-    case: Case, draw: Draw, out: dict[str, torch.Tensor], b: Boundary
-) -> dict[str, float]:
-    """Kernel vs reference errors; the tail is checked on the kernel's own y."""
+def _metrics(case: Case, draw: Draw, out: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Kernel vs reference errors."""
 
     rank, world = dist.get_rank(), dist.get_world_size()
     refs = _gemm2_refs(case, draw)
     fins = {m: _finalize(g, draw.packed, case.norm_weight) for m, g in refs.items()}
     cols = slice(rank * HIDDEN // world, (rank + 1) * HIDDEN // world)
-    tail_stream, tail_attn = _stock_tail(out["y"], b)
-    _, e2e_attn = _stock_tail(fins["static"], b)
     return {
         "gemm2": _rrmse(out["gemm2"], refs["static"][:, cols]),
         "y": _rrmse(out["y"], fins["static"]),
         "y_cos": _cosine(out["y"], fins["static"]),
         "y_vs_exact": _rrmse(out["y"], fins["exact"]),
         "full_row_vs_exact": _rrmse(fins["full_row"], fins["exact"]),
-        "stream": _rrmse(out["stream"], tail_stream),
-        "attn": _rrmse(out["attn"], tail_attn),
-        "attn_cos": _cosine(out["attn"], tail_attn),
-        "attn_e2e": _rrmse(out["attn"], e2e_attn),
-        "qkv": _rrmse(out["qkv"], out["attn"].double() @ b.qkv.double().T),
     }
 
 
@@ -555,18 +476,13 @@ def _failures(
     no_worse = m["y_vs_exact"] <= 1.05 * m["full_row_vs_exact"]
     if not (close and no_worse):
         failures.append(f"r{rank} {draw.kind}: MoE {m}")
-    if m["stream"] > 5e-4 or m["attn"] > 2e-3 or m["attn_cos"] < 0.99999:
-        failures.append(f"r{rank} {draw.kind}: tail {m}")
-    if m["qkv"] > 3e-3:
-        failures.append(f"r{rank} {draw.kind}: next-layer QKV {m}")
-    for key in ("y", "stream", "attn", "qkv"):
-        last = _bits(runs[-1][key])
-        if not all(torch.equal(_bits(run[key]), last) for run in runs):
-            failures.append(f"r{rank} {draw.kind}: {key} differs across calls")
-        peers = [torch.empty_like(last) for _ in range(world)]
-        dist.all_gather(peers, last)
-        if not all(torch.equal(p, peers[0]) for p in peers):
-            failures.append(f"r{rank} {draw.kind}: ranks disagree on {key}")
+    last = _bits(runs[-1]["y"])
+    if not all(torch.equal(_bits(run["y"]), last) for run in runs):
+        failures.append(f"r{rank} {draw.kind}: y differs across calls")
+    peers = [torch.empty_like(last) for _ in range(world)]
+    dist.all_gather(peers, last)
+    if not all(torch.equal(p, peers[0]) for p in peers):
+        failures.append(f"r{rank} {draw.kind}: ranks disagree on y")
     return failures
 
 
@@ -585,20 +501,16 @@ def test_moe_tp4_verify_matches_full_expert_reference(
     tokens: int, kinds: tuple[str, ...]
 ) -> None:
     group = _init_group_once()
-    rank, world = group.rank(), group.size()
     case = _make_case(kinds, group, tokens)
-    b = _boundary(tokens)
-    rows = MODEL_HIDDEN // world
-    unpool = b.unpool[rank * rows : (rank + 1) * rows].contiguous()
     runs = [[] for _ in case.draws]
     # Repeat, and alternate draws, to cycle the cross-launch state.
     for _ in range(REPEATS):
         for i, draw in enumerate(case.draws):
-            runs[i].append(_run(case, draw, b, unpool))
+            runs[i].append(_run(case, draw))
     torch.cuda.synchronize()
     failures = []
     for draw, draw_runs in zip(case.draws, runs):
-        metrics = _metrics(case, draw, draw_runs[-1], b)
+        metrics = _metrics(case, draw, draw_runs[-1])
         failures += _failures(draw, metrics, draw_runs)
     _assert_all_ranks_pass(failures)
 
