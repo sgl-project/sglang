@@ -387,7 +387,7 @@ def _engram_table(rows):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
         torch.device("cuda"),
     ):
-        embed = EngramEmbedding(rows, 128, layer_id=1)
+        embed = EngramEmbedding(rows, 128, layer_id=1, bounds=(0, rows))
     embed.weight.weight_loader(embed.weight, weight)
     embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
     embed.finish_load(label="test")
