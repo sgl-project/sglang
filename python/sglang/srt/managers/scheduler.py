@@ -592,9 +592,10 @@ class Scheduler:
         self.full_tokens_per_layer = result.full_tokens_per_layer
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
-        self.req_to_token_pool.penalty_store = PenaltyStore(
+        self.penalty_store = PenaltyStore(
             self.model_config.vocab_size, self.req_to_token_pool.device
         )
+        self.req_to_token_pool.register_on_free_slot(self.penalty_store.free)
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
@@ -1559,6 +1560,7 @@ class Scheduler:
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
             req_to_token_pool=self.req_to_token_pool,
+            penalty_store=self.penalty_store,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             draft_token_to_kv_pool=(
                 self.draft_worker.primary_draft_kv_pool
@@ -4571,7 +4573,7 @@ class Scheduler:
         # (re)sets a penalized request's history row from its outputs.
         for req in can_run_list:
             req.admit_prefill_chunk(self.device)
-            self.req_to_token_pool.penalty_store.alloc(req)
+            self.penalty_store.alloc(req)
         new_batch.admit_mamba_track()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
@@ -4641,7 +4643,7 @@ class Scheduler:
         if not reqs:
             return None
         slots = [r.kv.req_pool_idx for r in reqs]
-        row_of_slot = self.req_to_token_pool.penalty_store.row_of_slot
+        row_of_slot = self.penalty_store.row_of_slot
         penalty_rows = [row_of_slot.get(s) for s in slots]
         rows = self.decode_rows
         if (
@@ -4672,7 +4674,7 @@ class Scheduler:
             reqs,
             self.model_config.vocab_size,
             self.device,
-            self.req_to_token_pool.penalty_store,
+            self.penalty_store,
         )
 
     def _retract_decode_reqs(

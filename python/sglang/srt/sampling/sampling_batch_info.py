@@ -2,7 +2,7 @@
 
 API:
 - `SamplingBatchInfo.build(reqs, vocab_size, device, penalty_store=None)`
-  builds a step's info; `penalty_store` (the slot pool's `PenaltyStore`) is
+  builds a step's info; `penalty_store` (the scheduler's `PenaltyStore`) is
   required when a request uses a penalty.
 - The sampling path reads penalties with `logit_penalties()` (also through
   `apply_logits_bias`) and, right after sampling, on the same stream, writes

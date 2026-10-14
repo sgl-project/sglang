@@ -1,8 +1,9 @@
 """Penalty history in per-request rows, keyed by req_pool_idx.
 
 API:
-- `PenaltyStore(vocab_size, device)`: one per `ReqToTokenPool`, as its
-  `penalty_store`; `ReqToTokenPool.free` calls `free` for the slot.
+- `PenaltyStore(vocab_size, device)`: one per scheduler, keyed by the slots of
+  its `ReqToTokenPool`; registered as the pool's free-slot hook, so freeing a
+  request's slot calls `free`.
 - `PenaltyStore.alloc(req) -> None`: whenever `req` enters an extend step (each
   prefill chunk, readmission after retract, PD decode admission), after its
   slot is assigned; (re)sets its row to the history of `req.output_ids`.

@@ -37,7 +37,7 @@ def _new_scheduler() -> Scheduler:
     s.token_to_kv_pool_allocator = MagicMock(page_size=1)
     s.token_to_kv_pool_allocator.check_decode_capacity.return_value = True
     s.new_token_ratio_tracker = MagicMock()
-    s.req_to_token_pool = SimpleNamespace(penalty_store=PenaltyStore(8, "cpu"))
+    s.penalty_store = PenaltyStore(8, "cpu")
     s._build_sampling_info = MagicMock(side_effect=lambda reqs: object())
     s._build_decode_step = MagicMock(
         side_effect=lambda reqs, indices: SimpleNamespace(
@@ -93,7 +93,7 @@ class TestDecodeRowsReuse(CustomTestCase):
 
     def test_readmitted_request_in_the_same_slot_with_a_new_penalty_row(self):
         s = _new_scheduler()
-        store = s.req_to_token_pool.penalty_store
+        store = s.penalty_store
         req_a = _make_req("a", 1, frequency_penalty=0.5)
         req_b = _make_req("b", 2, frequency_penalty=0.5)
         store.alloc(req_a)

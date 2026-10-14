@@ -10,6 +10,8 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.sampling.penalties import PenaltyStore
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -82,6 +84,39 @@ def test_request_pool_clear_keeps_row_generations_monotonic(pool_cls, pool_kwarg
 
     assert start_request() == row
     assert pool.req_generation[row].item() != stored_generation
+
+
+@pytest.mark.parametrize(
+    "make_pool",
+    [
+        lambda: ReqToTokenPool(
+            size=1, max_context_len=4, device="cpu", enable_memory_saver=False
+        ),
+        lambda: _init_decode_pool(DecodeReqToTokenPool.__new__(DecodeReqToTokenPool)),
+        lambda: _init_decode_pool(
+            HybridMambaDecodeReqToTokenPool.__new__(HybridMambaDecodeReqToTokenPool)
+        ),
+    ],
+    ids=["ReqToTokenPool", "DecodeReqToTokenPool", "HybridMambaDecodeReqToTokenPool"],
+)
+def test_request_pool_free_releases_penalty_row(make_pool):
+    """Freeing a request's slot frees its penalty row through the free-slot hook;
+    the hybrid decode pool borrows the decode __init__ but inherits free."""
+    pool = make_pool()
+    store = PenaltyStore(vocab_size=8, device="cpu")
+    pool.register_on_free_slot(store.free)
+    req = SimpleNamespace(
+        kv=ReqKvInfo(),
+        output_ids=[3],
+        sampling_params=SamplingParams(frequency_penalty=0.5),
+    )
+    req.kv.req_pool_idx = slot = pool.free_slots[0]
+    store.alloc(req)
+    assert slot in store.row_of_slot
+
+    pool.free(req)
+
+    assert slot not in store.row_of_slot
 
 
 if __name__ == "__main__":

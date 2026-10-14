@@ -196,10 +196,9 @@ class DecodeReqToTokenPool:
     #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
     """
 
-    # Mirrors ReqToTokenPool.register_on_alloc_rows.
+    # Mirror ReqToTokenPool.register_on_alloc_rows and register_on_free_slot.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
-    # Mirrors ReqToTokenPool.penalty_store.
-    penalty_store: Optional[PenaltyStore] = None
+    _on_free_slot: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -278,8 +277,8 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
-        if self.penalty_store is not None:
-            self.penalty_store.free(req.kv.req_pool_idx)
+        if self._on_free_slot is not None:
+            self._on_free_slot(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
@@ -290,6 +289,10 @@ class DecodeReqToTokenPool:
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
         self._on_alloc_rows = hook
+
+    def register_on_free_slot(self, hook: Callable[[int], None]) -> None:
+        assert self._on_free_slot is None
+        self._on_free_slot = hook
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -3096,6 +3099,7 @@ class DisaggDecode:
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
         req_to_token_pool: ReqToTokenPool,
+        penalty_store: PenaltyStore,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         tree_cache: BasePrefixCache,
@@ -3142,6 +3146,7 @@ class DisaggDecode:
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.req_to_token_pool = req_to_token_pool
+        self.penalty_store = penalty_store
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.tree_cache = tree_cache
         self.attn_cp_cpu_group = attn_cp_cpu_group
@@ -3635,7 +3640,7 @@ class DisaggDecode:
                 req.disagg.rebootstrap_in_progress = False
             # Admission into the slot: the history row replays the prefill
             # node's output token.
-            self.req_to_token_pool.penalty_store.alloc(req)
+            self.penalty_store.alloc(req)
 
         if self.enable_overlap:
             # A finished request can still have one redundant forward in flight.

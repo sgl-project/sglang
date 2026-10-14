@@ -101,7 +101,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
-    from sglang.srt.sampling.penalties import PenaltyStore
 
 
 logger = logging.getLogger(__name__)
@@ -380,11 +379,10 @@ class ReqToTokenPool:
     # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
     # positive value. Declared here so callers can read it without getattr.
     pre_alloc_size: int = 0
-    # Class default: some decode pools borrow another __init__ (see
-    # DecodeReqToTokenPool) but inherit alloc_rows.
+    # Class defaults: some decode pools borrow another __init__ (see
+    # DecodeReqToTokenPool) but inherit alloc_rows and free.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
-    # Penalty history rows keyed by this pool's slots; freed with the slot.
-    penalty_store: Optional[PenaltyStore] = None
+    _on_free_slot: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -462,8 +460,8 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
-        if self.penalty_store is not None:
-            self.penalty_store.free(req.kv.req_pool_idx)
+        if self._on_free_slot is not None:
+            self._on_free_slot(req.kv.req_pool_idx)
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
 
@@ -482,6 +480,10 @@ class ReqToTokenPool:
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
         self._on_alloc_rows = hook
+
+    def register_on_free_slot(self, hook: Callable[[int], None]) -> None:
+        assert self._on_free_slot is None
+        self._on_free_slot = hook
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:

@@ -910,6 +910,7 @@ class TestDecodeAdmission(unittest.TestCase):
             enable_priority_scheduling=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             req_to_token_pool=MagicMock(size=1),
+            penalty_store=MagicMock(),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=MagicMock(),
             enable_overlap=enable_overlap,
@@ -1022,7 +1023,7 @@ class TestDecodeAdmission(unittest.TestCase):
         owner.schedule_stream.wait_stream.assert_called_once_with(owner.forward_stream)
         self.assertEqual(call_order, ["wait", "seed"])
         self.assertEqual(req.already_computed, 3)
-        owner.req_to_token_pool.penalty_store.alloc.assert_called_once_with(req)
+        owner.penalty_store.alloc.assert_called_once_with(req)
         owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
