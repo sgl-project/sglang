@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
