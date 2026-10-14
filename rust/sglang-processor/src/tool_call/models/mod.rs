@@ -2,6 +2,7 @@
 //! differently. Every other name goes to Dynamo.
 
 mod deepseek_v4;
+mod kimi_k3;
 
 use super::ToolDetector;
 
@@ -10,12 +11,19 @@ pub(crate) fn tool_detector(
     tool_parser: &str,
     tool_names: Vec<String>,
 ) -> Option<Box<dyn ToolDetector>> {
-    let detector = match tool_parser {
-        "deepseekv4" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS, tool_names),
-        "deepseekv41" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS_V41, tool_names),
+    Some(match tool_parser {
+        "deepseekv4" => Box::new(deepseek_v4::DsmlDetector::new(
+            deepseek_v4::DSML_TAGS,
+            tool_names,
+        )),
+        "deepseekv41" => Box::new(deepseek_v4::DsmlDetector::new(
+            deepseek_v4::DSML_TAGS_V41,
+            tool_names,
+        )),
+        // `KimiK3Detector` keeps calls to tools the request does not list.
+        "kimi_k3" => Box::new(kimi_k3::KimiK3Detector::default()),
         _ => return None,
-    };
-    Some(Box::new(detector))
+    })
 }
 
 #[cfg(test)]
