@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
     format_json_schema, lora_path, one, usage_flags, yes,
@@ -16,6 +17,7 @@ use super::wire::{
     stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use crate::py::python_json;
 use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
 
@@ -30,7 +32,24 @@ pub struct ChatModel {
     /// reasoning config to `special_case="always"`.
     #[serde(default)]
     pub always_thinks: bool,
+    /// `chat_encoding_spec`, the encoder SGLang renders the model with; the
+    /// OpenAI layer special-cases `"kimi_k3"`.
+    #[serde(default)]
+    pub chat_encoding_spec: Option<String>,
 }
+
+impl ChatModel {
+    fn is_kimi_k3(&self) -> bool {
+        self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+}
+
+/// `KimiK3Detector.eot_token`, which K3 requests with tools also stop on.
+const KIMI_K3_TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
+
+/// `_KIMI_K3_GENERATION_STUB_TOKENS`: K3's assistant generation stub is model
+/// input, but not reported as prompt tokens.
+const KIMI_K3_GENERATION_STUB_TOKENS: u64 = 3;
 
 /// `ChatCompletionRequest` with Pydantic's defaults, for the fields that reach
 /// `GenerateReqInput` or the response. A body this rejects goes to the engine.
@@ -188,6 +207,8 @@ pub fn lower_chat(
         return Err(Unsupported("tool_grammar"));
     }
     let tools = request_tools(&raw)?;
+    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
     let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
         (Some(parser), Some(names)) => {
             tool_detector(parser, names.clone()).ok_or(Unsupported("tool_parser"))?;
@@ -229,12 +250,30 @@ pub fn lower_chat(
     for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let thinking = parser.is_some()
-        && (model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true)));
+    let thinking = match parser.and_then(|config| config.default_thinking(&kwargs)) {
+        Some(thinking) => thinking,
+        None => {
+            parser.is_some()
+                && (model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true)))
+        }
+    };
+    // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
+    let kimi_k3 = model.is_kimi_k3();
+    if kimi_k3 || settings.reasoning_parser.as_deref() == Some("kimi_k3") {
+        request.skip_special_tokens = false;
+    }
     // `_process_messages`: tool output keeps the parser's special tokens.
     if tools.is_some() {
         request.skip_special_tokens = false;
     }
+    // K3 also stops on its tool parser's `eot_token`.
+    let tool_call_stop = match &tool_names {
+        Some((parser, _)) if kimi_k3 => match parser.as_str() {
+            "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
+            _ => return Err(Unsupported("tool_parser")),
+        },
+        _ => None,
+    };
     let previous_content = match request.messages.last() {
         Some(last)
             // Roles are compared lowercased, as Pydantic normalizes them.
@@ -252,9 +291,40 @@ pub fn lower_chat(
         _ => None,
     };
 
-    let lowered = generate_body(
+    let mut lowered = generate_body(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     );
+    // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
+    // its structural tag, unless the request is already constrained; Python
+    // tests the constraints by truthiness, so empty strings are unset.
+    let sampling = &mut lowered["sampling_params"];
+    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_names, &tool_definitions)
+        && tool_parser == "kimi_k3"
+        && ["regex", "ebnf", "json_schema"]
+            .iter()
+            .all(|key| sampling[*key].as_str().is_none_or(str::is_empty))
+    {
+        // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
+        let strip = parser
+            .map(|config| config.think_tokens())
+            .unwrap_or_default();
+        let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
+        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
+            sampling["structural_tag"] = python_json(&tag, true).into();
+        }
+    }
+    if let Some(stop) = tool_call_stop {
+        let sampling = &mut lowered["sampling_params"];
+        let mut stops = match sampling["stop"].take() {
+            Value::Array(stops) => stops,
+            Value::Null => Vec::new(),
+            single => vec![single],
+        };
+        if !stops.iter().any(|s| s == stop) {
+            stops.push(stop.into());
+        }
+        sampling["stop"] = stops.into();
+    }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let reasoning = parser
@@ -269,8 +339,25 @@ pub fn lower_chat(
                     == Some(&Value::Bool(true)),
             },
         });
+    let history_tool_calls = request
+        .messages
+        .iter()
+        .filter(|m| {
+            m["role"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
+        })
+        .filter_map(|m| m["tool_calls"].as_array())
+        .map(|calls| calls.len() as i64)
+        .sum();
     let responder = ChatResponder {
         model: request.model,
+        unreported_prompt_tokens: if kimi_k3 {
+            KIMI_K3_GENERATION_STUB_TOKENS
+        } else {
+            0
+        },
+        history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
         reasoning,
@@ -504,7 +591,7 @@ fn validate(
             return invalid;
         }
     }
-    format_json_schema(request.response_format.as_ref())?;
+    format_json_schema(request.response_format.as_ref(), false)?;
     Ok(())
 }
 
@@ -634,7 +721,9 @@ fn generate_body(
         "sampling_seed": request.seed,
         "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
     });
-    if let Ok(Some(schema)) = format_json_schema(request.response_format.as_ref()) {
+    if let Ok(Some(schema)) =
+        format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
+    {
         sampling["json_schema"] = schema.into();
     }
     json!({
@@ -687,6 +776,10 @@ struct ReasoningConfig {
 /// Builds the OpenAI chat response from the engine's `/generate` output.
 pub struct ChatResponder {
     model: String,
+    /// Prompt tokens `_reported_prompt_tokens` leaves out of usage.
+    unreported_prompt_tokens: u64,
+    /// `_get_history_tool_calls_cnt`, which numbers K3 tool-call ids.
+    history_tool_calls: i64,
     n: usize,
     logprobs: bool,
     reasoning: Option<ReasoningConfig>,
@@ -707,10 +800,13 @@ pub struct ChatResponder {
 impl ChatResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
     pub fn unary(self, body: &[u8]) -> Option<Reply> {
-        let ret = match serde_json::from_slice(body).ok()? {
+        let mut ret = match serde_json::from_slice(body).ok()? {
             Value::Array(items) => items,
             item => vec![item],
         };
+        for item in &mut ret {
+            self.report_prompt_tokens(&mut item["meta_info"]);
+        }
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
             let meta = &item["meta_info"];
@@ -738,7 +834,7 @@ impl ChatResponder {
                     let calls = calls
                         .iter()
                         .enumerate()
-                        .map(|(i, call)| tool_call(i as i64, call));
+                        .map(|(i, call)| self.tool_call(i as i64, call));
                     tool_calls = calls.collect();
                     if finish_reason["type"] == "stop" {
                         finish_reason["type"] = "tool_calls".into();
@@ -792,7 +888,9 @@ impl ChatResponder {
     fn stream_frame(&mut self, content: &Value) -> Vec<String> {
         let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
         let meta = &content["meta_info"];
-        self.stream.record(index, meta);
+        let mut reported = meta.clone();
+        self.report_prompt_tokens(&mut reported);
+        self.stream.record(index, &reported);
         let finish_reason = meta["finish_reason"].clone();
         let finish_type = finish_reason["type"].as_str().map(str::to_owned);
 
@@ -899,7 +997,7 @@ impl ChatResponder {
             }
             for call in calls {
                 self.has_tool_calls.insert(index);
-                let mut tool_call = tool_call(call.tool_index, &call);
+                let mut tool_call = self.tool_call(call.tool_index, &call);
                 // Python streams an id and name only for a non-empty name.
                 if call.name.is_empty() {
                     tool_call["id"] = Value::Null;
@@ -963,6 +1061,32 @@ impl ChatResponder {
         }
         events.push("data: [DONE]\n\n".into());
         events
+    }
+
+    /// `_reported_prompt_tokens`.
+    fn report_prompt_tokens(&self, meta: &mut Value) {
+        if self.unreported_prompt_tokens > 0 && meta.is_object() {
+            let prompt = meta_u64(meta, "prompt_tokens");
+            meta["prompt_tokens"] = prompt.saturating_sub(self.unreported_prompt_tokens).into();
+        }
+    }
+
+    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
+    fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
+        let id = match self.tools.as_ref().map(|(parser, _)| parser.as_str()) {
+            Some("kimi_k3") => format!(
+                "{}:{}",
+                call.name,
+                self.history_tool_calls + call.tool_index
+            ),
+            _ => tool_call_id(),
+        };
+        json!({
+            "id": id,
+            "index": index,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.parameters},
+        })
     }
 
     /// `build_sse_content`: msgspec drops a null `usage`, never a null choice field.
@@ -1043,16 +1167,6 @@ impl ChatResponder {
             .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32))
             .unwrap_or_else(|| text.as_bytes().to_vec())
     }
-}
-
-/// A `ToolCall` as Pydantic dumps it; `call_<24 hex>` ids as SGLang mints them.
-fn tool_call(index: i64, call: &ToolCallItem) -> Value {
-    json!({
-        "id": tool_call_id(),
-        "index": index,
-        "type": "function",
-        "function": {"name": call.name, "arguments": call.parameters},
-    })
 }
 
 #[cfg(test)]

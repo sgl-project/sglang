@@ -254,7 +254,7 @@ pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Each assistant tool call's `function.arguments`, absent ones as `null`.
-fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
     message
         .get_mut("tool_calls")

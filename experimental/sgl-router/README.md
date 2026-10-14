@@ -410,10 +410,11 @@ text, as does any model whose template fails to load or render.
 
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
-re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's and
-V4.1's native encoders and GLM-5.3's template are fixture-verified against SGLang's
-request normalization, so they forward every chat except multimodal ones and those with
-caller-provided `input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
+and Kimi-K3's native encoders and GLM-5.3's template are fixture-verified against
+SGLang's request normalization, so they forward every chat except multimodal ones
+and those with caller-provided `input_ids`. Renderers without that verification
+(HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
@@ -508,12 +509,13 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope, DeepSeek-V4, V4.1 and GLM-5.3 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`, `deepseek-v41`, `glm45`) or none, and no media yet. Tools are served with `tool_choice`
+(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
-parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
-tools take a constraint from the engine's xgrammar, so they go to the engine.
+parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`); `required`, named and strict
+tools take a constraint from the engine's xgrammar, so they go to the engine
+(`kimi_k3`'s `auto` tag is reproduced).
 With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
 grammar needs `ebnf_full_assistant`, which `/generate` does not accept.
 The router reads the model's `config.json` and `generation_config.json` beside
@@ -596,13 +598,13 @@ tools keep the engine's route (see above).
 
 ## Kimi-K3
 
-Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
-request semantics (reasoning controls, tools, `response_format`, continuations)
-and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
+Kimi-K3 renders through `rust/sglang-processor` (dynamo-render's XTML formatter
+with SGLang's request semantics) and is tokenized with the checkpoint's chunked
+tiktoken encoding; shapes the formatter renders differently go to the worker.
+`--tokenizer-path` accepts a
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
-An explicit null `thinking_effort` with thinking enabled is not representable
-in the pinned formatter and falls back to engine-side rendering.
+With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`.
 
 ## HTTP/2
 

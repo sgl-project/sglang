@@ -58,7 +58,7 @@ setting and picks one per request.
 select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<String>)
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
-ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(String, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3
+ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3
 DeepSeekV4Profile::from_checkpoint(profile_override, encoder_source) -> Result<DeepSeekV4Profile, String>
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
@@ -75,7 +75,8 @@ native formatters.
 | DeepSeek V4 | `models/deepseek_v4.rs` on Dynamo's V4 encoder |
 | DeepSeek V4.1 | `models/deepseek_v41.rs` on Dynamo's V4.1 encoder |
 | GLM-5.3, GLM-5.3-Flash | `models/glm53.rs` on the checkpoint's Jinja template, picked by the template |
-| DeepSeek V3.2, Kimi K3, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
+| Kimi K3 | `models/kimi_k3.rs` on Dynamo's K3 formatter |
+| DeepSeek V3.2, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
 | Everything else | `load_chat_formatter` |
 
 `load_chat_formatter` (`loader.rs`) follows Python's `template_manager.py`
@@ -93,7 +94,8 @@ with `encode_segments`.
 SGLang does. It returns the continuation prefix separately, since
 SGLang tokenizes it on its own. `default_kwargs` are the server's
 `--default-chat-template-kwargs`, which apply after the request's own values.
-On a DeepSeek formatter, `render_prompt` rebuilds the body from the trait.
+On a DeepSeek formatter, `render_prompt` rebuilds the body from the trait; on
+Kimi K3 it keeps Dynamo's request semantics, which typed hosts rely on.
 `from_checkpoint` lets a host that fetches model files itself, such as
 sgl-router, build `ChatFormatter::DeepSeekV4` directly. `requested_effort` and
 `requested_thinking` (`reasoning.rs`) port `protocol.py`'s `reasoning` handling
@@ -107,6 +109,7 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 | `models/deepseek_v41.rs` | the same, `encoding_dsv41.py` | Replaces the OAI formatter. On top of the V4 dump it keeps text parts lists, sends only the request tool fields the client set, and maps effort to the encoder's 1-100 budget, then calls `deepseek::v41::encode_messages`. Developer turns and media are left to the engine. |
 | `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
+| `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
@@ -142,7 +145,10 @@ is the port of SGLang's `BaseReasoningFormatDetector` they configure and
 needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
 `tool_call/models/mod.rs` check them against SGLang's `ReasoningParser` and
 `FunctionCallParser`. To port another model, add `think/models/<model>.rs` or
-`tool_call/models/<model>.rs` and its names in that `models/mod.rs`.
+`tool_call/models/<model>.rs` and its names in that `models/mod.rs`. A detector
+that overrides the base splitting, as Kimi-K3's does, is its own `ThinkConfig`
+variant. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
+`tests/fixtures/openai_parity/kimi-k3.json` checks it byte for byte.
 
 Pass-through for parsing:
 - Other reasoning parsers go through
