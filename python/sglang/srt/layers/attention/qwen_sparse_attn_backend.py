@@ -1222,7 +1222,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
         if row_req_pool_indices.numel() > 1:
             is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
+        anchor_rows = is_last.nonzero(as_tuple=True)[0]
         req_rows = row_req_pool_indices[anchor_rows]
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)

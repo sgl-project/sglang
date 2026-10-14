@@ -208,7 +208,9 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         batch_size = input_ids.shape[0]
         device = input_ids.device
 
-        image_token_indices = (input_ids == self.image_token_id).nonzero()
+        image_token_indices = (input_ids == self.image_token_id).nonzero(
+            as_tuple=True
+        )
 
         flat_eff_h = []
         flat_eff_w = []
@@ -235,7 +237,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         )
 
         frame_count = len(flat_eff_h)
-        image_token_count = len(image_token_indices)
+        image_token_count = len(image_token_indices[0])
         if frame_count != image_token_count:
             raise ValueError(
                 "Moss-VL vision metadata must map one-to-one to image tokens: "
@@ -254,9 +256,8 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         flat_eff_w = torch.tensor(flat_eff_w, device=device, dtype=torch.long)
         flat_vis_starts = torch.tensor(flat_vis_starts, device=device, dtype=torch.long)
 
-        target_indices = image_token_indices
-        batch_rows = target_indices[:, 0]
-        text_cols = target_indices[:, 1]
+        batch_rows = image_token_indices[0]
+        text_cols = image_token_indices[1]
 
         max_hw = torch.maximum(flat_eff_h, flat_eff_w)
         shifts = max_hw + 1

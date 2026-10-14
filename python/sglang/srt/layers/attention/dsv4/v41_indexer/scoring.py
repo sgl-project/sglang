@@ -297,7 +297,7 @@ def prefill_requests(
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
     for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
+        tok = (req == r).nonzero(as_tuple=True)[0]
         lens = compress_lens[tok]
         lc = int(lens.max().item())
         if lc == 0:
