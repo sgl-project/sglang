@@ -1,13 +1,13 @@
-"""Ascend PD role-switch service regression (requires two idle NPU dies).
+"""Ascend PD role-switch service regression (requires four idle NPU devices).
 
-Run inside the NPU container, after checking that the selected dies are idle:
-  ASCEND_RT_VISIBLE_DEVICES=8,9 SGLANG_TEST_PD_ROLE_SWITCH_MODEL=/path/to/model \
-    python3 test/manual/ascend/test_npu_pd_role_switch.py -v
+Run inside the configured NPU environment:
+  python3 test/manual/ascend/test_npu_pd_role_switch.py > pd-role-switch.log 2>&1
 
-The default model is Qwen3-0.6B. Each side uses TP1; set TP_SIZE and provide
-2 * TP_SIZE visible devices for pure-TP coverage. BASELINE_ONLY=1 runs fixed
-roles without --enable-pd-role-switch, including the disabled-flag rejection.
-Logs and JSON evidence go to a fresh SGLANG_TEST_PD_ROLE_SWITCH_LOG_DIR.
+The defaults below match the existing NPU PD tests: Qwen3-32B, TP2 per side,
+and devices 0,1,2,3. Environment overrides remain available for other setups.
+BASELINE_ONLY=1 runs fixed roles without --enable-pd-role-switch, including
+its disabled-flag rejection. Worker logs and JSON evidence go to a fresh
+temporary directory, whose path is printed in the test output.
 This test does not establish PLE, hybrid/Mamba, RDMA, or other topology support.
 """
 
@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -27,18 +28,25 @@ from pathlib import Path
 
 import requests
 
+from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
+
+# Default launch configuration for direct manual runs.
+MODEL_PATH = QWEN3_32B_WEIGHTS_PATH
+TP_SIZE = 2
+ASCEND_DEVICES = "0,1,2,3"
+MEM_FRACTION_STATIC = 0.9
+
 
 class TestNpuPdRoleSwitch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.root = Path(
-            os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_LOG_DIR", "pd-role-switch-logs")
+            os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_LOG_DIR")
+            or tempfile.mkdtemp(prefix="pd-role-switch-")
         )
-        cls.root.mkdir(parents=True, exist_ok=False)
-        cls.model = os.environ.get(
-            "SGLANG_TEST_PD_ROLE_SWITCH_MODEL", "/mnt/paas/weights/Qwen3-0.6B"
-        )
-        cls.tp = int(os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_TP_SIZE", "1"))
+        cls.root.mkdir(parents=True, exist_ok=True)
+        cls.model = os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_MODEL", MODEL_PATH)
+        cls.tp = int(os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_TP_SIZE", str(TP_SIZE)))
         cls.baseline_only = (
             os.environ.get("SGLANG_TEST_PD_ROLE_SWITCH_BASELINE_ONLY") == "1"
         )
@@ -47,17 +55,21 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
         cls.urls = [f"http://127.0.0.1:{cls.port + i}" for i in range(2)]
         cls.bootstrap_ports = [cls.port + 10, cls.port + 11]
         cls.log_paths = [cls.root / f"worker_{i}.log" for i in range(2)]
-        # Refuse to take a port held by another service. The launch wrapper also
-        # checks physical device occupancy immediately before starting this test.
-        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",")
+        # Refuse to take a port held by another service.
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ASCEND_DEVICES).split(",")
         if (
             cls.tp < 1
             or len(visible) != 2 * cls.tp
             or any(not x.isdigit() for x in visible)
         ):
             raise ValueError(
-                "Set ASCEND_RT_VISIBLE_DEVICES to exactly 2 * TP_SIZE physical dies"
+                "ASCEND_RT_VISIBLE_DEVICES must list exactly 2 * TP_SIZE NPU devices"
             )
+        print(
+            f"Model: {cls.model}; TP per side: {cls.tp}; "
+            f"ASCEND_RT_VISIBLE_DEVICES={','.join(visible)}; logs: {cls.root}",
+            flush=True,
+        )
         ports = [
             cls.port,
             cls.port + 1,
@@ -105,7 +117,7 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
                     "--chunked-prefill-size",
                     "512",
                     "--mem-fraction-static",
-                    "0.35",
+                    str(MEM_FRACTION_STATIC),
                     "--max-total-tokens",
                     "4096",
                     "--max-running-requests",
@@ -124,8 +136,11 @@ class TestNpuPdRoleSwitch(unittest.TestCase):
                     )
                 )
                 env = dict(
-                    os.environ, ASCEND_MF_STORE_URL=f"tcp://127.0.0.1:{cls.port + 30}"
+                    os.environ,
+                    ASCEND_RT_VISIBLE_DEVICES=",".join(visible),
+                    ASCEND_MF_STORE_URL=f"tcp://127.0.0.1:{cls.port + 30}",
                 )
+                print(f"Launching {role}: {shlex.join(args)}", flush=True)
                 log = cls.log_paths[i].open("w")
                 cls.files.append(log)
                 cls.records.append({"launch": args, "visible_dies": visible})
