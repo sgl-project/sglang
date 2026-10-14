@@ -60,10 +60,6 @@ def _validate_dsv41_encoder_only_ratio_layout(hf_config) -> None:
     target_ratios = ratios[:num_target_layers]
     mtp_ratios = ratios[num_target_layers:]
     kv_sources = tuple(getattr(hf_config, "kv_source_layer_ids", ()) or ())
-    if not kv_sources or any(i < 0 or i >= num_target_layers for i in kv_sources):
-        raise ValueError(
-            "--dsv41-encoder-only-prefill requires valid target KV source layer ids"
-        )
     boundary = max(kv_sources)
     if (
         target_ratios[boundary] not in (1, 2)

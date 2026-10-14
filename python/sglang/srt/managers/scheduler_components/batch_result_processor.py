@@ -115,15 +115,13 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
 
     @staticmethod
-    def _resolve_cache_only_rebootstrap_token(
-        batch: ScheduleBatch, req: Req, next_token_id: int
-    ) -> Tuple[int, bool]:
-        """Restore a previously emitted boundary after cache-only replay.
+    def _acknowledge_cache_only_rebootstrap(batch: ScheduleBatch, req: Req) -> bool:
+        """Commit recovery markers after the TP worker restores the boundary.
 
         A PD true-rebootstrap recomputes the prefix without the last emitted
         boundary token. Decode still runs the normal replay forward to rebuild
-        local state, but its newly sampled token must not replace or duplicate
-        that boundary. Return whether the token was restored so callers can
+        local state. The worker restores the boundary before token relay and
+        speculative bonus-state construction. Return whether callers should
         skip accounting already performed before retraction.
         """
         cache_only_rebootstrap = bool(
@@ -134,11 +132,10 @@ class SchedulerBatchResultProcessor:
             cache_only_rebootstrap and req.pd_rebootstrap_forced_output_id is not None
         )
         if replayed_boundary:
-            next_token_id = req.pd_rebootstrap_forced_output_id
             req.pd_rebootstrap_forced_output_id = None
         if cache_only_rebootstrap:
             req.pd_rebootstrap_in_progress = False
-        return next_token_id, replayed_boundary
+        return replayed_boundary
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -388,13 +385,9 @@ class SchedulerBatchResultProcessor:
                             req, up_to_tick=batch.forward_iter
                         )
                     else:
-                        next_token_id, replayed_boundary = (
-                            self._resolve_cache_only_rebootstrap_token(
-                                batch, req, next_token_id
-                            )
+                        replayed_boundary = self._acknowledge_cache_only_rebootstrap(
+                            batch, req
                         )
-                        if replayed_boundary:
-                            next_token_ids[i] = next_token_id
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
 

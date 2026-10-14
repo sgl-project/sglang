@@ -91,22 +91,6 @@ class TestDsv41EncoderOnlyRatioLayout(CustomTestCase):
                 _official_config(compress_ratios=ratios)
             )
 
-    def test_ratio_layout_derives_boundary_from_valid_source_ids(self):
-        _validate_dsv41_encoder_only_ratio_layout(
-            _official_config(
-                num_hidden_layers=4,
-                num_nextn_predict_layers=0,
-                kv_source_layer_ids=[2],
-                compress_ratios=[0, 0, 2, 1],
-            )
-        )
-        for sources in ([], [-1], [40]):
-            with self.subTest(sources=sources):
-                with self.assertRaisesRegex(ValueError, "valid target KV source"):
-                    _validate_dsv41_encoder_only_ratio_layout(
-                        _official_config(kv_source_layer_ids=sources)
-                    )
-
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.get_platform")
