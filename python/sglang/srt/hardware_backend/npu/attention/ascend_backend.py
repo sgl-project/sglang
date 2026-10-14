@@ -109,13 +109,15 @@ class ForwardMetadata:
 
 
 class AscendAttnMaskBuilder:
-    def __init__(self, model_runner: ModelRunner, device):
+    def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
         """
         Initialize the AscendAttnMaskBuilder class.
 
         :param model_runner: ModelRunner instance for model execution.
         :param device: Device to run the model on (e.g., 'cuda', 'npu').
+        :param use_fia: Boolean flag to indicate if environment variable ASCEND_USE_FIA is set to 1.
         """
+        self.use_fia = use_fia
         self.model_runner = model_runner
         self.device = device
 
@@ -377,7 +379,9 @@ class AscendAttnBackend(AttentionBackend):
                     int(self.speculative_num_draft_tokens), is_draft_worker=True
                 )
             )
-        self.ascend_attn_mask_builder = AscendAttnMaskBuilder(model_runner, self.device)
+        self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
+            model_runner, self.device, self.use_fia, self.use_mla
+        )
         self.mask, self.fia_mask, self.mtp_mask, self.mix_mask = (
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
