@@ -1630,10 +1630,8 @@ class Scheduler(
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
-        # A device wait pending in another HIP queue slows every dispatch of the
-        # forward graph running meanwhile, so speculative overlap schedules on the
-        # forward stream; without speculation there is no publish wait, and the
-        # separate schedule stream keeps overlapping the next batch's preparation.
+        # A wait pending in another HIP queue slows the running forward graph, so only
+        # speculative overlap, which waits on publish events, uses the forward stream.
         self.schedule_on_forward_stream = (
             _is_hip
             and self.enable_overlap
