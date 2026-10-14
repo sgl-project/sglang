@@ -295,12 +295,13 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
-        use_aiter_fused = (
+        use_aiter_fused = False
+        can_try_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
             and get_exec().deterministic.rl_on_policy_target is None
         )
-        if use_aiter_fused:
+        if can_try_aiter_fused:
             k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
             # The fused write targets the NHD layout in the activation dtype and
             # does not apply per-layer KV scales.
