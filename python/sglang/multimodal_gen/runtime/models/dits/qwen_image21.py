@@ -141,9 +141,8 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
 def apply_rope(x, rope):
     fused = None
     if (
-        ((_is_cuda and x.is_cuda) or (_is_npu and x.is_npu))
-        and _ROPE_FUSION.can_attempt_once()
-    ):
+        (_is_cuda and x.is_cuda) or (_is_npu and x.is_npu)
+    ) and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
         if _ROPE_FUSION.verified:
             return fused
