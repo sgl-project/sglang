@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -1253,12 +1254,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        intermediate_state_indices = self.verify_intermediate_state_indices
+        # Only PP spec reads the validity mask; building it is a launch per layer.
+        if pp_spec_stable_rows_enabled():
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -1501,8 +1505,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        # On gfx950 the ring writes beat the per-step snapshots at every batch
+        # the HIP gate below admits.
+        if (
+            replayssm_on
+            and not is_gfx95_supported()
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1513,7 +1524,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if is_hip() and not (
             is_gfx95_supported()
             and 1 <= batch_size <= 16
-            and draft_token_num in (6, 8)
+            and draft_token_num in (4, 6, 8)
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
         ):

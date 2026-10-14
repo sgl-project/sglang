@@ -38,6 +38,11 @@ _CASES += [
     # and a negative safe-gate lower bound.
     (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 9),
     (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
+    # Kimi-K3 TP8: 12 local heads and four-token EAGLE verification; one batch
+    # per gfx950 V tile (_k3_hip_block_v).
+    (1, 4, 12, 12, 128, 128, 4, False, -5.0, False, 11),
+    (4, 4, 12, 12, 128, 128, 4, False, -5.0, True, 12),
+    (16, 4, 12, 12, 128, 128, 4, False, -5.0, False, 13),
 ]
 
 # ReplaySSM ring-write cases add HV != H shapes, which exercise the
@@ -262,8 +267,8 @@ def test_matches_unfused_reference(case):
     _compare_case(case, num_warps=4)
 
 
-@pytest.mark.parametrize("case_index", [8, 9])
-def test_glm_fp32_weights_match_unfused_reference(case_index):
+@pytest.mark.parametrize("case_index", [8, 9, 10, 11, 12])
+def test_fp32_conv_weights_match_unfused_reference(case_index):
     _compare_case(_CASES[case_index], weight_dtype=torch.float32)
 
 
