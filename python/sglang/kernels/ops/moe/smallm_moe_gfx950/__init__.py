@@ -1,4 +1,4 @@
-"""gfx950 small-M MXFP4 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
+"""gfx950 small-M MXFP4/FP8 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
 
 Two HIP kernels (source `smallm_moe.hip` next to this file, compiled with hipcc at first use) replace
 aiter.fused_moe for small token counts:
@@ -36,8 +36,10 @@ MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # its GLM-5.3-Flash TP4 shape (8 or 9 slots) is dispatched up to 16 tokens, and its
 # Qwen3.5 TP2 shape (10 or 11) not at all.
 MAX_TOK_DISPATCH = {256: 40, 512: 16}
-# topk widths (routed + fused shared) dispatched per intermediate, each with a compiled p2
-DISPATCH_SLOTS = {256: (10, 11), 512: (8, 9)}
+MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
+# topk widths (routed + fused shared) dispatched per intermediate, each with a compiled p2.
+# Intermediate 128 is FP8 TP8 only.
+DISPATCH_SLOTS = {256: (10, 11), 512: (8, 9), 128: (10, 11)}
 
 _hip = None
 _kernels: dict = {}
@@ -121,7 +123,7 @@ class _Kernel:
             f"hipModuleGetFunction {name}",
         )
 
-    def launch(self, grid, args, stream):
+    def launch(self, grid, args, stream, block=256, shared=0):
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
             1,
@@ -136,10 +138,10 @@ class _Kernel:
                 grid,
                 1,
                 1,
-                256,
+                block,
                 1,
                 1,
-                0,
+                shared,
                 ctypes.c_void_p(stream),
                 None,
                 ctypes.cast(extra, ctypes.c_void_p),
@@ -164,9 +166,10 @@ def smallm_moe_enabled() -> bool:
     failure has disabled the kernel in this process. Numerics differ slightly from the aiter path (bf16 activations
     instead of MXFP4 a4w4); GSM8K matches within run-to-run noise.
 
-    Model coverage: hidden 4096. Per-rank intermediate 256 with 10 or 11 topk slots (Qwen3.5-397B-A17B MXFP4
-    at TP4, top-10 plus the optional fused shared expert) and intermediate 512 with 8 or 9 slots
-    (GLM-5.3-Flash MXFP4 at TP4, top-8 plus the optional fused shared expert). There is no model-name check;
+    Model coverage: hidden 4096. MXFP4 covers per-rank intermediate 256 with 10 or 11 topk slots
+    (Qwen3.5-397B-A17B at TP4) and intermediate 512 with 8 or 9 slots (GLM-5.3-Flash at TP4), top-k plus the
+    optional fused shared expert. FP8 block-scale covers Qwen3.5-397B-A17B at TP4/TP8 (intermediate 256 / 128,
+    10 or 11 slots). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
     if os.environ.get(_ENV, "1") == "0":
@@ -198,8 +201,8 @@ def _disable(reason):
     raise SmallMMoeUnavailable(reason)
 
 
-def _get_kernels(inter: int):
-    kk = _kernels.get(inter)
+def _get_kernels(inter: int, pre: str):
+    kk = _kernels.get((pre, inter))
     if kk is None:
         global _build_dir
         if _build_dir is None:
@@ -239,15 +242,15 @@ def _get_kernels(inter: int):
         mod = _kernels["_mod"]
         try:
             kk = {
-                "p1": _Kernel(mod, f"smallm_p1_i{inter}_c16"),
+                "p1": _Kernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
                 "p2": {
-                    sl: _Kernel(mod, f"smallm_p2_i{inter}_s{sl}")
+                    sl: _Kernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
                     for sl in DISPATCH_SLOTS[inter]
                 },
             }
         except RuntimeError as e:
             _disable(str(e))
-        _kernels[inter] = kk
+        _kernels[(pre, inter)] = kk
     return kk
 
 
@@ -280,6 +283,8 @@ def smallm_moe_supported(
     activation_is_silu,
     has_bias,
     a1_scale,
+    w13_scale=None,
+    w2_scale=None,
 ) -> bool:
     if not smallm_moe_enabled():
         return False
@@ -297,15 +302,30 @@ def smallm_moe_supported(
         or w2.element_size() != 1
     ):
         return False
-    inter = w2.shape[2] * 2
+    fp8 = w13.dtype == torch.float8_e4m3fn
+    caps = MAX_TOK_DISPATCH_FP8 if fp8 else MAX_TOK_DISPATCH
+    inter = w2.shape[2] * (1 if fp8 else 2)
     if (
-        inter not in MAX_TOK_DISPATCH
+        inter not in caps
         or w13.shape[1] != 2 * inter
-        or w13.shape[2] != DIM // 2
+        or w13.shape[2] != (DIM if fp8 else DIM // 2)
         or w2.shape[1] != DIM
     ):
         return False
-    if tok > min(MAX_TOK, MAX_TOK_DISPATCH[inter]):
+    if tok > min(MAX_TOK, caps[inter]):
+        return False
+    # FP8 is block-scale only: per-tensor/per-channel FP8 scales have other shapes
+    if fp8 and (
+        not getattr(w13, "is_shuffled", False)
+        or not getattr(w2, "is_shuffled", False)
+        or getattr(w13_scale, "shape", None)
+        != (w13.shape[0], 2 * inter // 128, DIM // 128)
+        or getattr(w2_scale, "shape", None) != (w13.shape[0], DIM // 128, inter // 128)
+        or w13_scale.dtype != torch.float32
+        or w2_scale.dtype != torch.float32
+        or not w13_scale.is_contiguous()
+        or not w2_scale.is_contiguous()
+    ):
         return False
     # 704 = MAX_TOK (64) * 11 slots: the kernels stage the whole topk_ids table in a
     # fixed-size LDS array (MAX_NSLOT in smallm_moe.hip); larger tables would overrun it.
@@ -338,14 +358,16 @@ def smallm_moe_fwd(
     """out[tok, 4096] (bf16) = sum_j w_tj * down_e(silu(gate_e(x_t)) * up_e(x_t)); e = topk_ids[t, j].
     swiglu_limit > 0 clamps as aiter does: gate = min(gate, L), up = clamp(up, -L, L).
     w13/w2: fp4x2 [E, 2*inter, 2048] / [E, 4096, inter/2] in aiter shuffle_weight((16,16)) layout;
-    w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture)."""
+    w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture).
+    FP8 block-scale: e4m3fn [E, 2*inter, 4096] / [E, 4096, inter], fp32 [E, 2*inter/128, 32] / [E, 32, inter/128]."""
     tok, slots = topk_ids.shape
     E = w13.shape[0]
-    inter = w2.shape[2] * 2
+    fp8 = w13.dtype == torch.float8_e4m3fn
+    inter = w2.shape[2] * (1 if fp8 else 2)
     ws = _workspace(hidden_states.device, slots, inter)
     if ws is None:
         return None
-    kk = _get_kernels(inter)
+    kk = _get_kernels(inter, "_f8" if fp8 else "")
     hbuf, acc, cnt = ws
     ids = (
         topk_ids
