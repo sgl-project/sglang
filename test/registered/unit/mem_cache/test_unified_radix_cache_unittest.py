@@ -4546,6 +4546,67 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(pipeline.is_idle())
         cache.sanity_check()
 
+    def test_buffer_only_write_backlog_throttle_holds_queued_writes_until_staged(
+        self,
+    ):
+        """With write_backlog_throttle on, the admission budget treats the
+        queued-but-unstaged backlog as held, lets go of it while the write
+        path is stalled (through the per-tick sync), and releases it once the
+        writes stage; off (the default) nothing is held."""
+        self._skip_unsupported_hicache_test()
+        for throttle in (False, True):
+            with self.subTest(throttle=throttle):
+                storage_dir = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                self._init_buffer_hicache(
+                    cache,
+                    storage_dir,
+                    storage_extra={"write_backlog_throttle": throttle},
+                )
+                pipeline = cache.buffer_pipeline
+                self.assertEqual(pipeline.write_backlog_throttle, throttle)
+                seq = self._buffer_swa_seq()
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                leaf = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).last_device_node
+                _write_backup(cache, leaf)
+                backlog = pipeline.write_backlog_tokens_
+                self.assertGreater(backlog, 0)
+                expected_hold = backlog if throttle else 0
+                self.assertEqual(cache.write_backlog_hold_tokens(), expected_hold)
+                adder = PrefillAdder(
+                    page_size=self.cfg.page_size,
+                    tree_cache=cache,
+                    token_to_kv_pool_allocator=allocator,
+                    running_batch=None,
+                    new_token_ratio=1.0,
+                    rem_input_tokens=100,
+                    rem_chunk_tokens=None,
+                )
+                self.assertEqual(
+                    adder.rem_total_tokens,
+                    allocator.available_size() + cache.evictable_size() - expected_hold,
+                )
+                if throttle:
+                    # A stalled write path (no launch or ack within the
+                    # timeout) releases the hold through the per-tick sync;
+                    # the launches that tick makes are progress again.
+                    pipeline._write_progress_at -= (
+                        pipeline.write_backlog_stall_timeout_s
+                    )
+                    with self.assertLogs(
+                        "sglang.srt.mem_cache.buffer_mode.pipeline", level="WARNING"
+                    ):
+                        cache.check_hicache_events()
+                    self.assertEqual(cache.write_backlog_hold_tokens(), 0)
+                    self.assertTrue(pipeline.write_path_alive())
+                    pipeline.set_write_path_alive(True)
+                self._drain_buffer_writes(cache)
+                self.assertEqual(cache.write_backlog_hold_tokens(), 0)
+                cache.sanity_check()
+
     def _drain_buffer_writes(self, cache):
         pipeline = cache.buffer_pipeline
         self._pump_hicache_until(

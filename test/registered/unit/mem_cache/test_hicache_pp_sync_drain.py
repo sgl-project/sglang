@@ -61,6 +61,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.linker = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
+        cache._pp_sync = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
@@ -141,6 +142,44 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+        # Every stage schedules on its own clock, so the write-path liveness
+        # slot (after the four queue sizes) is PP0's for all stages.
+        cache._pp_sync.assert_called_once()
+        synced = cache._pp_sync.call_args.args[0]
+        self.assertEqual(synced.tolist(), [1])
+        reduced = cache._all_reduce_attn_groups.call_args.args[0]
+        self.assertTrue(synced.data_ptr() == reduced[6:7].data_ptr())
+
+    def _storage_cache_mode_cache(self, pp_rank):
+        cache = self._make_cache(pp_rank, [True], [True])
+        cache.tree_core.enable_storage = True
+        cache._drain_storage_control_queues_impl = MagicMock()
+        cc = cache.cache_controller
+        for name in (
+            "prefetch_hit_queue",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        return cache
+
+    def test_storage_placeholder_matches_live_slot_layout(self):
+        """PP1+ in cache mode builds zero placeholders instead of reading its
+        queues; they must have exactly PP0's slot count (four queue sizes, the
+        extra pools, the write-path liveness bit) or the PP recv shape breaks."""
+        leader = self._storage_cache_mode_cache(0)
+        leader.check_hicache_events()
+        live = leader._all_reduce.call_args.args[0].tolist()
+        follower = self._storage_cache_mode_cache(1)
+        follower.check_hicache_events()
+        placeholder = follower._all_reduce.call_args.args[0].tolist()
+
+        self.assertEqual(len(live), len(placeholder))
+        # [write_acks, load_acks, 4 queue sizes, alive, digest, -digest]
+        self.assertEqual(len(live), 2 + 4 + 1 + 2)
+        self.assertEqual(live[6], 1)
+        self.assertEqual(placeholder[2:7], [0, 0, 0, 0, 0])
 
 
 if __name__ == "__main__":

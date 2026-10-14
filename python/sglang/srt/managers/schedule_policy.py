@@ -647,6 +647,12 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
+        # Evictable tokens whose L3 write is still queued (buffer-only
+        # throttle): charge them instead of letting admission evict them.
+        write_backlog_hold = tree_cache.write_backlog_hold_tokens()
+        if write_backlog_hold:
+            self.memory_budget.total_offset += write_backlog_hold
+            self.memory_budget.current_offset += write_backlog_hold
 
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
         # exposes the full SWA allocator interface.

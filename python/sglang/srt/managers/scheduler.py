@@ -1291,6 +1291,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # Buffer-only write-backlog hold charged when NO_TOKEN last set
+        # batch_is_full; admission reopens once the hold shrinks below it.
+        self._write_backlog_hold_at_full = 0
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -3982,6 +3985,16 @@ class Scheduler(
             # An empty batch never reaches update_running_batch, the only
             # other place that clears the flag, so admission would stay shut.
             running_batch.batch_is_full = False
+        if (
+            running_batch.batch_is_full
+            and self._write_backlog_hold_at_full
+            and self.tree_cache.write_backlog_hold_tokens()
+            < self._write_backlog_hold_at_full
+        ):
+            # A hold-induced NO_TOKEN set the flag; staged or swept writes
+            # shrank the hold, so budget may be back before a request finishes.
+            running_batch.batch_is_full = False
+            self._write_backlog_hold_at_full = 0
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -4170,6 +4183,9 @@ class Scheduler(
                     # Set batch_is_full after making sure there are requests that can be served
                     running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                         not running_batch.is_empty()
+                    )
+                    self._write_backlog_hold_at_full = (
+                        self.tree_cache.write_backlog_hold_tokens()
                     )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not

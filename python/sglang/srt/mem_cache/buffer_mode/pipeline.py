@@ -317,8 +317,12 @@ class BufferModePipeline:
         swa_window_pages: int,
         write_backlog_cap: int,
         max_context_len: int = 0,
+        write_backlog_throttle: bool = False,
     ):
         self._cache = cache
+        # Opt-in: the queued-but-unstaged backlog is charged to the prefill
+        # admission budget (see write_backlog_hold_tokens).
+        self.write_backlog_throttle = write_backlog_throttle
         # SWA window size in KV pages when the SWA component stages through
         # a host pool (0 = KV-only: no trailing window staged). Static after
         # pool assembly.
@@ -353,6 +357,11 @@ class BufferModePipeline:
                 "BufferModePipeline anchor_lock_cap_tokens=%d",
                 self.anchor_lock_cap_tokens,
             )
+        if write_backlog_throttle:
+            logger.info(
+                "BufferModePipeline write_backlog_throttle on: stall timeout %.0f s",
+                self.write_backlog_stall_timeout_s,
+            )
         self.reset()
 
     # Arbitrary: a deferral means the admission budget and the allocator disagree
@@ -361,6 +370,9 @@ class BufferModePipeline:
     # Arbitrary: one summary line per drop reason per interval keeps a
     # sustained drain deficit readable; the metric carries every span.
     backup_drop_log_interval_s: float = 10.0
+    # Arbitrary: longest gap between write launches/storage acks a draining
+    # store may show before the backlog throttle stops trusting it.
+    write_backlog_stall_timeout_s: float = 30.0
 
     def reset(self) -> None:
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
@@ -389,6 +401,11 @@ class BufferModePipeline:
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backup_drop_tallies: dict[str, _BackupDropTally] = {}
+        # Throttle liveness: local clock of the last write launch or storage
+        # ack, the local stall latch it feeds, and the rank-agreed verdict.
+        self._write_progress_at: Optional[float] = None
+        self._write_path_stalled = False
+        self._write_path_agreed_alive = True
         # Attempt-keyed locks stop stale completions from unlocking retries.
         self.anchor_locks: dict[CacheRequestHandle, _AnchorLock] = {}
         self.anchor_locked_tokens_ = 0
@@ -488,6 +505,57 @@ class BufferModePipeline:
         ack. A component that drops rows a pending write still reads asks
         here first; the pipeline pins the node only from D2H launch to ack."""
         return node_id in self.inflight_backup_pools
+
+    def write_backlog_hold_tokens(self) -> int:
+        """Device tokens the prefill admission budget must treat as held: the
+        whole queued-but-unstaged backlog while the throttle is on and the
+        write path is making progress. The whole backlog, not a capped share:
+        once a backlog exceeds a cap, each admission re-queues the spans it
+        evicted and the cap stops pacing. Rank-invariant: the queue drains
+        in lockstep and the liveness verdict is rank-agreed."""
+        if not self.write_backlog_throttle or not self._write_path_agreed_alive:
+            return 0
+        return self.write_backlog_tokens_
+
+    def write_path_alive(self) -> bool:
+        """This rank's verdict: a write launch or storage ack within the stall
+        timeout, or no backlog at all. Stalled latches until the next launch
+        or ack, so a dead store with a full window stays lapsed across sweeps
+        and new backlogs. Clocks are local, so the scheduler MIN-reduces the
+        verdicts before ``set_write_path_alive``."""
+        if self._write_path_stalled:
+            return False
+        if not self.pending_write_queue or self._write_progress_at is None:
+            return True
+        if (
+            time.monotonic() - self._write_progress_at
+            < self.write_backlog_stall_timeout_s
+        ):
+            return True
+        self._write_path_stalled = True
+        return False
+
+    def set_write_path_alive(self, alive: bool) -> None:
+        if alive == self._write_path_agreed_alive:
+            return
+        self._write_path_agreed_alive = alive
+        if alive:
+            logger.info("HiCache write backlog throttle re-engaged: writes progress")
+        else:
+            logger.warning(
+                "HiCache write backlog throttle released: no write launch or "
+                "storage ack for %.0f s with %d intents / %d tokens queued and "
+                "%d host tokens staged; admission proceeds and evicted spans "
+                "are dropped.",
+                self.write_backlog_stall_timeout_s,
+                len(self.pending_write_queue),
+                self.write_backlog_tokens_,
+                self.write_staged_tokens_,
+            )
+
+    def _note_write_progress(self) -> None:
+        self._write_progress_at = time.monotonic()
+        self._write_path_stalled = False
 
     def is_idle(self) -> bool:
         """No queued, staged, or in-flight buffer-mode work or anchor pins."""
@@ -814,6 +882,15 @@ class BufferModePipeline:
                 self._log_backup_dropped(intent_tokens, "oversize", node_id)
                 continue
             intent = _UnifiedBackupIntent(snapshot=snapshot, pool=pool, keys=list(keys))
+            if (
+                not self.pending_write_queue
+                and self.write_staged_tokens_ == 0
+                and not self.ongoing_write_through
+                and not self.ongoing_backup
+            ):
+                # A backlog on an idle write path gets the full stall timeout;
+                # one behind a still-held window keeps the last real progress.
+                self._note_write_progress()
             self.pending_write_queue.append(intent)
             self.inflight_backup_pools.setdefault(node_id, set()).add(pool)
             self._retain_queued_span(intent)
@@ -1168,6 +1245,7 @@ class BufferModePipeline:
         )
         self.write_staged_tokens_ += occupied_units
         self._release_queued_span(intent)
+        self._note_write_progress()
         return True
 
     def _aux_budget_blocked(self, kv_tokens: int, aux: list[PoolTransfer]) -> bool:
@@ -1263,6 +1341,7 @@ class BufferModePipeline:
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
         self._finish_inflight(entry.intent.snapshot.node_id, entry.intent.pool)
+        self._note_write_progress()
 
     def _free_staging_now(
         self, host_indices: torch.Tensor, aux_xfers: list[PoolTransfer]

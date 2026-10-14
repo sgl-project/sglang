@@ -191,6 +191,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             swa_evictable_size=lambda: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
+            write_backlog_hold_tokens=lambda: 0,
         )
         adder = PrefillAdder(
             page_size=page_size,
