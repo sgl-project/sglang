@@ -2430,7 +2430,7 @@ class Scheduler:
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
             memory_saver_adapter=self.memory_saver_adapter,
-            flush_cache=self.flush_cache,
+            flush_cache=self.step_planner.flush_cache,
             request_registry=self.request_registry,
             flags=self.flags,
             mode_owners=self.mode_owners,
@@ -2439,7 +2439,7 @@ class Scheduler:
 
     def init_flush_wrapper(self) -> None:
         self.flush_wrapper = SchedulerFlushWrapper(
-            flush_cache=self.flush_cache,
+            flush_cache=self.step_planner.flush_cache,
             request_registry=self.request_registry,
             ipc_channels=self.ipc_channels,
         )

@@ -416,7 +416,6 @@ _CALLBACK_SITES = {
         _SELF,
     ): 1,
     # To be removed.
-    ("init_weight_updater", "SchedulerWeightUpdaterManager", "flush_cache", _BOUND): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (
         "init_dp_attn_adapter",
@@ -424,7 +423,6 @@ _CALLBACK_SITES = {
         "get_require_mlp_sync",
         _LAMBDA,
     ): 1,
-    ("init_flush_wrapper", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
 }
 
 # R4: (module under srt/, class, parameter).
