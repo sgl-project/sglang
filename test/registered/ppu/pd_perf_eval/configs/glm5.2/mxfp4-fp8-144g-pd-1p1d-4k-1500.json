@@ -36,7 +36,7 @@
       "attention_backend": "dsa",
       "dsa_prefill_backend": "flashmla_sparse",
       "dsa_decode_backend": "flashmla_kv",
-      "dsa_prefill_cp_mode": "round-robin-split",
+      "cp_strategy": "interleave",
       "attn_cp_size": 8,
       "chunked_prefill_size": 32768,
       "mem_fraction_static": 0.85,
@@ -56,7 +56,7 @@
       "disable_overlap_schedule": true,
       "disable_custom_all_reduce": true,
       "disable_shared_experts_fusion": true,
-      "enable_dsa_prefill_context_parallel": true,
+      "enable_prefill_cp": true,
       "enable_cache_report": true,
       "enable_request_time_stats_logging": true,
       "enable_metrics": true

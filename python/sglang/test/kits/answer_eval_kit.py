@@ -130,7 +130,7 @@ SERVER_PARAMETER_STRINGS = (
     "decode_attention_backend",
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "reasoning_parser",
     "quantization",
 )
@@ -141,7 +141,7 @@ SERVER_PARAMETER_STORE_TRUE = (
     "disable_shared_experts_fusion",
     "disable_custom_all_reduce",
     "enforce_disable_flashinfer_allreduce_fusion",
-    "enable_dsa_prefill_context_parallel",
+    "enable_prefill_cp",
 )
 # Null means "leave the flag off entirely", which for these two is a reviewed
 # instruction rather than an omission: see the quantization comment below, and
@@ -152,7 +152,6 @@ SERVER_PARAMETER_NULLABLE = ("attention_backend", "quantization")
 DSA_SERVER_PARAMETERS = (
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
 )
 SUPPORTED_SERVER_PARAMETERS = (
     REQUIRED_SERVER_PARAMETERS
@@ -173,7 +172,7 @@ SERVER_PARAMETER_CLI_ORDER = (
     "decode_attention_backend",
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "attn_cp_size",
     "cuda_graph_max_bs",
     "chunked_prefill_size",
@@ -378,14 +377,18 @@ def validate_test_config(config: dict[str, Any]) -> None:
             "the dsa_* server parameters only apply to the sparse attention "
             "backend, so attention_backend must name it"
         )
-    if (
-        "dsa_prefill_cp_mode" in parameters
-        and parameters.get("enable_dsa_prefill_context_parallel") is not True
-    ):
+    if "cp_strategy" in parameters:
+        if parameters["cp_strategy"] not in ("zigzag", "interleave"):
+            raise AnswerEvalError(
+                "server.parameters.cp_strategy must be zigzag or interleave"
+            )
+        if parameters.get("enable_prefill_cp") is not True:
+            raise AnswerEvalError(
+                "server.parameters.cp_strategy requires enable_prefill_cp"
+            )
+    elif parameters.get("enable_prefill_cp") is True:
         raise AnswerEvalError(
-            "server.parameters.dsa_prefill_cp_mode describes how prefill context "
-            "parallelism splits a sequence, so it needs "
-            "enable_dsa_prefill_context_parallel"
+            "server.parameters.enable_prefill_cp requires an explicit cp_strategy"
         )
 
     # Optional, and empty is spelled by leaving it out: the variables here are

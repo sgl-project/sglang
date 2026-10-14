@@ -401,17 +401,62 @@ class TestPPUPerfEval(unittest.TestCase):
         with self.assertRaises(PerfEvalError):
             validate_test_config(config)
 
+    def test_prefill_cp_supports_dense_attention(self):
+        for strategy in ("zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                config = copy.deepcopy(self.test_config)
+                config["server"]["parameters"].update(
+                    attention_backend="fa3",
+                    enable_prefill_cp=True,
+                    cp_strategy=strategy,
+                    attn_cp_size=2,
+                )
+                validate_test_config(config)
+                args = build_perf_server_args(config)
+                self.assertIn(("--cp-strategy", strategy), list(zip(args, args[1:])))
+                self.assertIn("--enable-prefill-cp", args)
+                self.assertIn(("--attn-cp-size", "2"), list(zip(args, args[1:])))
+
+    def test_prefill_cp_rejects_incomplete_invalid_and_legacy_parameters(self):
+        cases = (
+            ({"cp_strategy": "interleave"}, "enable_prefill_cp"),
+            ({"enable_prefill_cp": True}, "cp_strategy"),
+            *(
+                ({"enable_prefill_cp": True, "cp_strategy": value}, "cp_strategy")
+                for value in (
+                    "round-robin-split",
+                    "in-seq-split",
+                    "invalid",
+                    "",
+                    None,
+                    1,
+                )
+            ),
+            (
+                {"dsa_prefill_cp_mode": "round-robin-split"},
+                "supported SGLang parameters",
+            ),
+            (
+                {"enable_dsa_prefill_context_parallel": True},
+                "supported SGLang parameters",
+            ),
+        )
+        for updates, message in cases:
+            with self.subTest(parameters=updates):
+                config = copy.deepcopy(self.test_config)
+                config["server"]["parameters"].update(
+                    attention_backend="dsa", attn_cp_size=2, **updates
+                )
+                with self.assertRaisesRegex(PerfEvalError, message):
+                    validate_test_config(config)
+
     def test_sparse_and_deepep_parameters_need_the_backends_that_read_them(self):
         validate_test_config(self.sparse_config)
         for mutate in (
             # dsa_* only applies under the sparse backend, so a config that
             # renamed the backend would be describing kernels no run consults.
             lambda c: c["server"]["parameters"].__setitem__("attention_backend", "fa3"),
-            # The cp mode describes how prefill context parallelism splits a
-            # sequence, which needs the feature enabled.
-            lambda c: c["server"]["parameters"].pop(
-                "enable_dsa_prefill_context_parallel"
-            ),
+            lambda c: c["server"]["parameters"].pop("enable_prefill_cp"),
             # deepep_mode is consulted only on the DeepEP dispatch path.
             lambda c: c["server"]["parameters"].__setitem__("moe_a2a_backend", "none"),
         ):
@@ -451,8 +496,8 @@ class TestPPUPerfEval(unittest.TestCase):
                 parameters["dsa_prefill_backend"],
                 "--dsa-decode-backend",
                 parameters["dsa_decode_backend"],
-                "--dsa-prefill-cp-mode",
-                parameters["dsa_prefill_cp_mode"],
+                "--cp-strategy",
+                parameters["cp_strategy"],
                 "--attn-cp-size",
                 str(parameters["attn_cp_size"]),
                 "--cuda-graph-max-bs",
@@ -476,7 +521,7 @@ class TestPPUPerfEval(unittest.TestCase):
                 "--disable-shared-experts-fusion",
                 "--disable-custom-all-reduce",
                 "--enforce-disable-flashinfer-allreduce-fusion",
-                "--enable-dsa-prefill-context-parallel",
+                "--enable-prefill-cp",
                 "--disable-radix-cache",
                 "--disable-overlap-schedule",
                 "--enable-metrics",

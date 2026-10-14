@@ -683,18 +683,63 @@ class TestPPUAnswerEval(unittest.TestCase):
                     with self.assertRaisesRegex(AnswerEvalError, field):
                         validate_test_config(invalid)
 
+    def test_prefill_cp_supports_dense_attention(self):
+        for strategy in ("zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                config = copy.deepcopy(self.test_config)
+                config["server"]["parameters"].update(
+                    attention_backend="fa3",
+                    enable_prefill_cp=True,
+                    cp_strategy=strategy,
+                    attn_cp_size=2,
+                )
+                validate_test_config(config)
+                args = build_answer_server_args(config)
+                self.assertIn(("--cp-strategy", strategy), list(zip(args, args[1:])))
+                self.assertIn("--enable-prefill-cp", args)
+                self.assertIn(("--attn-cp-size", "2"), list(zip(args, args[1:])))
+
+    def test_prefill_cp_rejects_incomplete_invalid_and_legacy_parameters(self):
+        cases = (
+            ({"cp_strategy": "interleave"}, "enable_prefill_cp"),
+            ({"enable_prefill_cp": True}, "cp_strategy"),
+            *(
+                ({"enable_prefill_cp": True, "cp_strategy": value}, "cp_strategy")
+                for value in (
+                    "round-robin-split",
+                    "in-seq-split",
+                    "invalid",
+                    "",
+                    None,
+                    1,
+                )
+            ),
+            (
+                {"dsa_prefill_cp_mode": "round-robin-split"},
+                "supported SGLang parameters",
+            ),
+            (
+                {"enable_dsa_prefill_context_parallel": True},
+                "supported SGLang parameters",
+            ),
+        )
+        for updates, message in cases:
+            with self.subTest(parameters=updates):
+                config = copy.deepcopy(self.test_config)
+                config["server"]["parameters"].update(
+                    attention_backend="dsa", attn_cp_size=2, **updates
+                )
+                with self.assertRaisesRegex(AnswerEvalError, message):
+                    validate_test_config(config)
+
     def test_sparse_attention_parameters_need_the_backend_that_reads_them(self):
-        # The GLM cases drive the sparse backend with a prefill kernel, a decode
-        # kernel and, on the context-parallel entry, a split mode.  All three are
-        # read only by that backend, so a config that named them alongside a dense
-        # one would state settings the run ignores.
         config = copy.deepcopy(self.test_config)
         parameters = config["server"]["parameters"]
         parameters["attention_backend"] = "dsa"
         parameters["dsa_prefill_backend"] = "flashmla_sparse"
         parameters["dsa_decode_backend"] = "flashmla_kv"
-        parameters["dsa_prefill_cp_mode"] = "round-robin-split"
-        parameters["enable_dsa_prefill_context_parallel"] = True
+        parameters["cp_strategy"] = "interleave"
+        parameters["enable_prefill_cp"] = True
         parameters["attn_cp_size"] = len(config["hardware"]["visible_devices"])
         validate_test_config(config)
 
@@ -709,28 +754,13 @@ class TestPPUAnswerEval(unittest.TestCase):
                 "flashmla_sparse",
                 "--dsa-decode-backend",
                 "flashmla_kv",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--cp-strategy",
+                "interleave",
                 "--attn-cp-size",
                 str(parameters["attn_cp_size"]),
             ],
         )
-        self.assertIn("--enable-dsa-prefill-context-parallel", args)
-        from sglang.srt.server_args import ServerArgs
-
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        choices = {
-            option: action.choices
-            for action in parser._actions
-            for option in action.option_strings
-        }
-        for name in (
-            "dsa_prefill_backend",
-            "dsa_decode_backend",
-            "dsa_prefill_cp_mode",
-        ):
-            self.assertIn(parameters[name], choices["--" + name.replace("_", "-")])
+        self.assertIn("--enable-prefill-cp", args)
 
         # `nsa` is accepted as the backend name because SGLang still accepts it,
         # so a config copied verbatim from an internal case is not rejected here.
@@ -743,14 +773,21 @@ class TestPPUAnswerEval(unittest.TestCase):
         with self.assertRaisesRegex(AnswerEvalError, "sparse attention"):
             validate_test_config(invalid)
 
-        # The split mode describes how prefill context parallelism divides a
-        # sequence, so without that switch it describes nothing.
-        invalid = copy.deepcopy(config)
-        del invalid["server"]["parameters"]["enable_dsa_prefill_context_parallel"]
-        with self.assertRaisesRegex(
-            AnswerEvalError, "enable_dsa_prefill_context_parallel"
-        ):
-            validate_test_config(invalid)
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        choices = {
+            option: action.choices
+            for action in parser._actions
+            for option in action.option_strings
+        }
+        for name in ("dsa_prefill_backend", "dsa_decode_backend", "cp_strategy"):
+            self.assertIn(parameters[name], choices["--" + name.replace("_", "-")])
+        parsed = parser.parse_args(["--model-path", config["model"]["path"], *args])
+        self.assertEqual(parsed.cp_strategy, parameters["cp_strategy"])
+        self.assertIs(parsed.enable_prefill_cp, True)
+        self.assertEqual(parsed.attn_cp_size, parameters["attn_cp_size"])
 
     def test_flag_parameters_are_only_ever_true(self):
         # These five render as bare flags, so `false` would state an intention the
@@ -782,7 +819,7 @@ class TestPPUAnswerEval(unittest.TestCase):
             "disable_shared_experts_fusion",
             "disable_custom_all_reduce",
             "enforce_disable_flashinfer_allreduce_fusion",
-            "enable_dsa_prefill_context_parallel",
+            "enable_prefill_cp",
         ):
             for value in (False, None, 1, "true"):
                 invalid = copy.deepcopy(self.test_config)
@@ -809,7 +846,7 @@ class TestPPUAnswerEval(unittest.TestCase):
             "chunked_prefill_size": 7488,
             "cuda_graph_max_bs": 16,
             "attn_cp_size": 4,
-            "dsa_prefill_cp_mode": "round-robin-split",
+            "cp_strategy": "interleave",
             "dsa_decode_backend": "flashmla_kv",
             "dsa_prefill_backend": "flashmla_sparse",
             "decode_attention_backend": "flashmla",
@@ -817,7 +854,7 @@ class TestPPUAnswerEval(unittest.TestCase):
             "attention_backend": "dsa",
             "pp_size": 2,
             "tp_size": 4,
-            "enable_dsa_prefill_context_parallel": True,
+            "enable_prefill_cp": True,
             "disable_piecewise_cuda_graph": True,
             "disable_shared_experts_fusion": True,
             "disable_custom_all_reduce": True,
@@ -842,8 +879,8 @@ class TestPPUAnswerEval(unittest.TestCase):
                 "flashmla_sparse",
                 "--dsa-decode-backend",
                 "flashmla_kv",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--cp-strategy",
+                "interleave",
                 "--attn-cp-size",
                 "4",
                 "--cuda-graph-max-bs",
@@ -872,7 +909,7 @@ class TestPPUAnswerEval(unittest.TestCase):
                 "--disable-shared-experts-fusion",
                 "--disable-custom-all-reduce",
                 "--enforce-disable-flashinfer-allreduce-fusion",
-                "--enable-dsa-prefill-context-parallel",
+                "--enable-prefill-cp",
                 "--served-model-name",
                 config["model"]["served_model_name"],
             ],

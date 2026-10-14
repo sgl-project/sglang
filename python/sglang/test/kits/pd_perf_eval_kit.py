@@ -440,14 +440,18 @@ def _validate_role(
             "the dsa_* server parameters only apply to the sparse attention "
             f"backend, so {role}.parameters.attention_backend must name it"
         )
-    if (
-        "dsa_prefill_cp_mode" in parameters
-        and parameters.get("enable_dsa_prefill_context_parallel") is not True
-    ):
+    if "cp_strategy" in parameters:
+        if parameters["cp_strategy"] not in ("zigzag", "interleave"):
+            raise PerfEvalError(
+                f"{role}.parameters.cp_strategy must be zigzag or interleave"
+            )
+        if parameters.get("enable_prefill_cp") is not True:
+            raise PerfEvalError(
+                f"{role}.parameters.cp_strategy requires enable_prefill_cp"
+            )
+    elif parameters.get("enable_prefill_cp") is True:
         raise PerfEvalError(
-            f"{role}.parameters.dsa_prefill_cp_mode describes how prefill context "
-            "parallelism splits a sequence, so it needs "
-            "enable_dsa_prefill_context_parallel"
+            f"{role}.parameters.enable_prefill_cp requires an explicit cp_strategy"
         )
     if "deepep_mode" in parameters and parameters.get("moe_a2a_backend") != "deepep":
         raise PerfEvalError(

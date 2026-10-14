@@ -121,7 +121,7 @@ SERVER_PARAMETER_STRINGS = (
     "decode_attention_backend",
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "reasoning_parser",
     "tool_call_parser",
     "quantization",
@@ -136,7 +136,7 @@ SERVER_PARAMETER_STORE_TRUE = (
     "disable_shared_experts_fusion",
     "disable_custom_all_reduce",
     "enforce_disable_flashinfer_allreduce_fusion",
-    "enable_dsa_prefill_context_parallel",
+    "enable_prefill_cp",
     # Prefix reuse across the ten identical prompts of one measurement would
     # turn nine prefills into cache hits and report a time to first token that
     # no first request ever saw.  The internal Qwen3.8 cases disable it for that
@@ -154,7 +154,6 @@ SERVER_PARAMETER_NULLABLE = ("attention_backend", "quantization")
 DSA_SERVER_PARAMETERS = (
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
 )
 SUPPORTED_SERVER_PARAMETERS = (
     REQUIRED_SERVER_PARAMETERS
@@ -179,7 +178,7 @@ SERVER_PARAMETER_CLI_ORDER = (
     "decode_attention_backend",
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "attn_cp_size",
     "page_size",
     "cuda_graph_max_bs",
@@ -456,14 +455,18 @@ def _validate_server(server: dict[str, Any], hardware: dict[str, Any]) -> None:
             "the dsa_* server parameters only apply to the sparse attention "
             "backend, so attention_backend must name it"
         )
-    if (
-        "dsa_prefill_cp_mode" in parameters
-        and parameters.get("enable_dsa_prefill_context_parallel") is not True
-    ):
+    if "cp_strategy" in parameters:
+        if parameters["cp_strategy"] not in ("zigzag", "interleave"):
+            raise PerfEvalError(
+                "server.parameters.cp_strategy must be zigzag or interleave"
+            )
+        if parameters.get("enable_prefill_cp") is not True:
+            raise PerfEvalError(
+                "server.parameters.cp_strategy requires enable_prefill_cp"
+            )
+    elif parameters.get("enable_prefill_cp") is True:
         raise PerfEvalError(
-            "server.parameters.dsa_prefill_cp_mode describes how prefill context "
-            "parallelism splits a sequence, so it needs "
-            "enable_dsa_prefill_context_parallel"
+            "server.parameters.enable_prefill_cp requires an explicit cp_strategy"
         )
     # deepep_mode names how the DeepEP dispatch runs, and SGLang consults it only
     # on that path, so stating it without the backend would describe a setting no

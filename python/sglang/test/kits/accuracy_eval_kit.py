@@ -185,7 +185,7 @@ SERVER_PARAMETER_STRINGS = (
     # notice.
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "reasoning_parser",
     "tool_call_parser",
     "quantization",
@@ -199,7 +199,7 @@ SERVER_PARAMETER_STORE_TRUE = (
     "disable_shared_experts_fusion",
     "disable_custom_all_reduce",
     "enforce_disable_flashinfer_allreduce_fusion",
-    "enable_dsa_prefill_context_parallel",
+    "enable_prefill_cp",
     "disable_radix_cache",
     "enable_metrics",
 )
@@ -209,7 +209,6 @@ SERVER_PARAMETER_NULLABLE = ("attention_backend", "quantization")
 DSA_SERVER_PARAMETERS = (
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
 )
 SUPPORTED_SERVER_PARAMETERS = (
     REQUIRED_SERVER_PARAMETERS
@@ -229,7 +228,7 @@ SERVER_PARAMETER_CLI_ORDER = (
     "decode_attention_backend",
     "dsa_prefill_backend",
     "dsa_decode_backend",
-    "dsa_prefill_cp_mode",
+    "cp_strategy",
     "attn_cp_size",
     "page_size",
     "stream_interval",
@@ -463,11 +462,22 @@ def _validate_server(server: Any, hardware: dict[str, Any]) -> None:
             f"{dsa_stated} configure the sparse attention backend and mean "
             "nothing without attention_backend 'dsa'"
         )
-    if parameters.get("enable_dsa_prefill_context_parallel") and not parameters.get(
-        "attn_cp_size"
-    ):
+    if "cp_strategy" in parameters:
+        if parameters["cp_strategy"] not in ("zigzag", "interleave"):
+            raise AccuracyEvalError(
+                "server.parameters.cp_strategy must be zigzag or interleave"
+            )
+        if parameters.get("enable_prefill_cp") is not True:
+            raise AccuracyEvalError(
+                "server.parameters.cp_strategy requires enable_prefill_cp"
+            )
+    elif parameters.get("enable_prefill_cp") is True:
         raise AccuracyEvalError(
-            "enable_dsa_prefill_context_parallel needs attn_cp_size to say over "
+            "server.parameters.enable_prefill_cp requires an explicit cp_strategy"
+        )
+    if parameters.get("enable_prefill_cp") and not parameters.get("attn_cp_size"):
+        raise AccuracyEvalError(
+            "enable_prefill_cp needs attn_cp_size to say over "
             "how many devices the prefill is split"
         )
     _validate_speculative(parameters)

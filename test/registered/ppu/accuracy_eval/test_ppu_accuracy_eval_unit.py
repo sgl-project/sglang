@@ -300,6 +300,66 @@ class TestConfigValidation(unittest.TestCase):
         self._refuses(lambda config: config["evaluation"].update(limit=0), "omit it")
 
 
+class TestPrefillCP(unittest.TestCase):
+    def setUp(self):
+        self.config = load_json(
+            CONFIG_DIR / "qwen3.5" / "397b-a17b-mxfp4-fp8-144g-gsm8k.json"
+        )
+
+    def test_prefill_cp_supports_dense_attention(self):
+        for strategy in ("zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                config = copy.deepcopy(self.config)
+                config["server"]["parameters"].update(
+                    enable_prefill_cp=True, cp_strategy=strategy, attn_cp_size=2
+                )
+                validate_test_config(config)
+                args = build_accuracy_server_args(config)
+                self.assertIn(("--cp-strategy", strategy), list(zip(args, args[1:])))
+                self.assertIn("--enable-prefill-cp", args)
+                self.assertIn(("--attn-cp-size", "2"), list(zip(args, args[1:])))
+
+    def test_prefill_cp_rejects_incomplete_invalid_and_legacy_parameters(self):
+        cases = (
+            ({"cp_strategy": "interleave"}, "enable_prefill_cp"),
+            ({"enable_prefill_cp": True}, "cp_strategy"),
+            *(
+                ({"enable_prefill_cp": True, "cp_strategy": value}, "cp_strategy")
+                for value in (
+                    "round-robin-split",
+                    "in-seq-split",
+                    "invalid",
+                    "",
+                    None,
+                    1,
+                )
+            ),
+            (
+                {"dsa_prefill_cp_mode": "round-robin-split"},
+                "which this schema does not model",
+            ),
+            (
+                {"enable_dsa_prefill_context_parallel": True},
+                "which this schema does not model",
+            ),
+        )
+        for updates, message in cases:
+            with self.subTest(parameters=updates):
+                config = copy.deepcopy(self.config)
+                config["server"]["parameters"].update(
+                    attention_backend="dsa", attn_cp_size=2, **updates
+                )
+                with self.assertRaisesRegex(AccuracyEvalError, message):
+                    validate_test_config(config)
+
+    def test_prefill_cp_still_requires_an_explicit_size(self):
+        self.config["server"]["parameters"].update(
+            enable_prefill_cp=True, cp_strategy="interleave"
+        )
+        with self.assertRaisesRegex(AccuracyEvalError, "attn_cp_size"):
+            validate_test_config(self.config)
+
+
 class TestServerCommandLine(unittest.TestCase):
     def setUp(self):
         self.config = load_json(GSM8K_CONFIG)

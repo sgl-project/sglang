@@ -421,5 +421,58 @@ class TestPPUPdPerfEval(unittest.TestCase):
         self.assertIn("- FAIL", summary)
 
 
+class TestPrefillCP(unittest.TestCase):
+    def setUp(self):
+        self.config = load_json(
+            CONFIG_DIR / "qwen3.5" / "397b-a17b-mxfp4-fp8-144g-pd-1p1d-4k-1500.json"
+        )
+
+    def test_prefill_cp_supports_dense_attention(self):
+        for strategy in ("zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                config = copy.deepcopy(self.config)
+                config["prefill"]["parameters"].update(
+                    enable_prefill_cp=True, cp_strategy=strategy, attn_cp_size=2
+                )
+                validate_pd_test_config(config)
+                args = build_pd_server_args(config, "prefill")
+                self.assertIn(("--cp-strategy", strategy), list(zip(args, args[1:])))
+                self.assertIn("--enable-prefill-cp", args)
+                self.assertIn(("--attn-cp-size", "2"), list(zip(args, args[1:])))
+
+    def test_prefill_cp_rejects_incomplete_invalid_and_legacy_parameters(self):
+        cases = (
+            ({"cp_strategy": "interleave"}, "enable_prefill_cp"),
+            ({"enable_prefill_cp": True}, "cp_strategy"),
+            *(
+                ({"enable_prefill_cp": True, "cp_strategy": value}, "cp_strategy")
+                for value in (
+                    "round-robin-split",
+                    "in-seq-split",
+                    "invalid",
+                    "",
+                    None,
+                    1,
+                )
+            ),
+            (
+                {"dsa_prefill_cp_mode": "round-robin-split"},
+                "supported SGLang parameters",
+            ),
+            (
+                {"enable_dsa_prefill_context_parallel": True},
+                "supported SGLang parameters",
+            ),
+        )
+        for updates, message in cases:
+            with self.subTest(parameters=updates):
+                config = copy.deepcopy(self.config)
+                config["prefill"]["parameters"].update(
+                    attention_backend="dsa", attn_cp_size=2, **updates
+                )
+                with self.assertRaisesRegex(PerfEvalError, message):
+                    validate_pd_test_config(config)
+
+
 if __name__ == "__main__":
     unittest.main()
