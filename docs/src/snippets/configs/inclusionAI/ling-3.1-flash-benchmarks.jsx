@@ -18,7 +18,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1 },
         ttft_ms: 256.95, tpot_ms: 5.14, tokens_per_sec_per_gpu: 224.9 },
     ],
-    accuracy: { gsm8k_pct: 97.0, stop_rate_pct: 100.0 },
-    notes: "NEXTN; acceptance length 2.59 (bench) / 2.40. Accuracy from the 100-question GSM8K smoke on this exact recipe (97/100, all stop).",
+    accuracy: { gsm8k_pct: 97.19, stop_rate_pct: 99.70 },
+    notes: "NEXTN; full 1319-question GSM8K on this exact recipe (1282/1319). Acceptance length 2.58 (full run) / 2.59 (bench).",
   },
 ];
