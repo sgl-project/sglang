@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
@@ -18,6 +19,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     BeamSearchOutput,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
@@ -335,6 +338,39 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
         self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
         self.assertIsNone(sent[0][1].spec_verify_ct)
+
+    def test_embedding_split_preserves_per_request_fields(self):
+        output = _make_batch_embedding_output()
+        output.retraction_counts = [0, 7]
+        output.cached_tokens_details = [{"radix": 0}, {"radix": 2}]
+        output.time_stats = wrap_as_pickle(["stats-0", "stats-1"])
+        output.pooled_hidden_states = [[1.0], [2.0]]
+
+        split = _handle_output_by_index(output, 1)
+
+        self.assertEqual(split.rids, ["embedding-rid-1"])
+        self.assertEqual(split.embeddings, [[0.3, 0.4]])
+        self.assertEqual(split.retraction_counts, [7])
+        self.assertEqual(split.cached_tokens_details, [{"radix": 2}])
+        self.assertEqual(unwrap_from_pickle(split.time_stats), ["stats-1"])
+        self.assertEqual(split.pooled_hidden_states, [[2.0]])
+
+    def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
+        output = _make_batch_embedding_output()
+        output.pooled_hidden_states = [torch.tensor([[1.0, 1.5], [2.0, 2.5]])]
+
+        for index, row in enumerate(([1.0, 1.5], [2.0, 2.5])):
+            split = _handle_output_by_index(output, index)
+            self.assertEqual(len(split.pooled_hidden_states), 1)
+            self.assertEqual(split.pooled_hidden_states[0].tolist(), row)
+
+    def test_embedding_split_keeps_absent_optional_fields_none(self):
+        split = _handle_output_by_index(_make_batch_embedding_output(), 0)
+
+        self.assertEqual(split.rids, ["embedding-rid-0"])
+        self.assertIsNone(split.retraction_counts)
+        self.assertIsNone(split.time_stats)
+        self.assertIsNone(split.pooled_hidden_states)
 
     def test_router_sends_embedding_output_per_request(self):
         output = _make_batch_embedding_output()
