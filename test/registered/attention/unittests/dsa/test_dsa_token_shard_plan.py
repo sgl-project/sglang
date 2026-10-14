@@ -101,26 +101,40 @@ class TestDsaTokenShardPlan(CustomTestCase):
             plan_dsa_token_shard([5], [105], 4, 4)
 
 
-class TestTokenShardRefusesDcp(CustomTestCase):
-    """DCP's DSA path all-gathers the query across the DCP group and expects
-    every token's head-sharded row; a token slice would be merged wrong."""
+class TestTokenShardUnderDcp(CustomTestCase):
+    """A DCP extend that gathers the query expects every token's head-sharded
+    row, so a token slice would be merged wrong; one that gathers the KV (it
+    carries ``attn_dcp_metadata``) leaves the query free to shard. The gathered
+    KV's lengths are cumulative, so several requests shard only crop-free."""
 
-    def _plan(self, dcp_enabled):
+    def _plan(self, dcp_enabled, gathers_kv=False, prefix_lens=(0,), index_topk=2048):
         batch = types.SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens_cpu=[16384],
-            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[16384] * len(prefix_lens),
+            extend_prefix_lens_cpu=list(prefix_lens),
+            attn_dcp_metadata=object() if gathers_kv else None,
         )
         with get_parallel().override(
             attn_tp_size=16, attn_tp_rank=3, dcp_enabled=dcp_enabled
         ):
-            return _build_dsa_token_shard_plan(batch)
+            return _build_dsa_token_shard_plan(batch, index_topk)
 
     def test_planned_without_dcp(self):
         self.assertIsNotNone(self._plan(dcp_enabled=False))
 
-    def test_refused_under_dcp(self):
+    def test_refused_when_dcp_gathers_the_query(self):
         self.assertIsNone(self._plan(dcp_enabled=True))
+
+    def test_planned_when_dcp_gathers_the_kv(self):
+        self.assertIsNotNone(self._plan(dcp_enabled=True, gathers_kv=True))
+
+    def test_multi_request_needs_every_prefix_past_index_topk(self):
+        self.assertIsNotNone(
+            self._plan(dcp_enabled=True, gathers_kv=True, prefix_lens=(2047, 4096))
+        )
+        self.assertIsNone(
+            self._plan(dcp_enabled=True, gathers_kv=True, prefix_lens=(2046, 4096))
+        )
 
 
 if __name__ == "__main__":

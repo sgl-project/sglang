@@ -39,7 +39,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD</code></td>
-      <td>In DSA prefill, each attention-TP rank computes sparse attention <br/> for every head on its own slice of the tokens, instead of <br/> its share of the heads for every token. Off under DCP.<br/> Set to <code>false</code> to keep the head split.</td>
+      <td>In DSA prefill, each attention-TP rank computes sparse attention <br/> for every head on its own slice of the tokens, instead of <br/> its share of the heads for every token. Under DCP, only on <br/> extends that gather the KV.<br/> Set to <code>false</code> to keep the head split.</td>
       <td><code>true</code></td>
     </tr>
     <tr>

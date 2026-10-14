@@ -1031,7 +1031,8 @@ class Envs:
     # queries, and the top-k is all-gathered.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
     # DSA prefill: each attention-TP rank computes every head for its slice of
-    # the tokens. Consumes no ranks. Off under DCP, which all-gathers the query.
+    # the tokens. Consumes no ranks. Under DCP, only on forwards whose extend
+    # gathers the KV; the query-gather path needs every head-sharded row.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
     # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
     # <= 0 gathers the whole prefix in one.

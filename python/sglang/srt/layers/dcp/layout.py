@@ -16,11 +16,12 @@
 the owner-rule local-index filter, and the NPU extend-gather plan."""
 
 import logging
-from typing import Dict, List, NamedTuple, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import print_info_once
 
 logger = logging.getLogger(__name__)
 
@@ -475,3 +476,28 @@ def _dcp_extend_gather_piece(
         index=torch.cat(index),
         scratch_rows=gathered_rows + extend_end - extend_start,
     )
+
+
+def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
+    """May this extend forward drop the operator's causal crop (sparse_mode 0)?
+
+    Only if every prefix reaches ``index_topk``: below it the top-k takes every
+    key, so the crop is what keeps the result causal. Cached per forward, and
+    the FIRST caller's ``index_topk`` wins -- the cache does not key on it.
+    """
+    cached = getattr(forward_batch, "npu_dcp_crop_free", None)
+    if cached is not None:
+        return cached
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    ok = bool(
+        index_topk is not None
+        and prefix_lens
+        and all(p + 1 >= index_topk for p in prefix_lens)
+    )
+    if not ok and index_topk is not None and prefix_lens:
+        print_info_once(
+            f"DCP extend keeps the operator's causal crop: a request here has a "
+            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)})"
+        )
+    forward_batch.npu_dcp_crop_free = ok
+    return ok

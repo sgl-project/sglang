@@ -408,7 +408,9 @@ def forward_dsa_prepare_npu(
 ):
     dynamic_scale = None
     # Resolved here so the core can read the cached plan back.
-    get_dsa_token_shard_plan(forward_batch)
+    get_dsa_token_shard_plan(
+        forward_batch, m.indexer.index_topk if m.indexer is not None else None
+    )
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -685,7 +687,8 @@ def forward_dsa_core_npu(
             m, forward_batch, k_nope, k_pe
         )
     attn_topk_indices = topk_indices
-    # Never set under DCP: the plan refuses it.
+    # Under DCP, set only for an extend that gathers the KV: the plan refuses
+    # the query gather.
     dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
     if dsa_token_shard_plan is not None:
         if topk_indices is None or m.attn_mqa_for_dsa_token_shard is None:

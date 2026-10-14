@@ -16,8 +16,8 @@
 
 Only the query path is sharded: after ``q_b_proj`` and the ``w_kc`` absorb a
 rank swaps "my heads for every token" for "every head for my tokens", and the
-swap is undone after attention, before ``w_vc``. The KV write and the indexer
-stay full width.
+swap is undone after attention, before ``w_vc``. The KV write, the DCP context
+gather and the indexer stay full width.
 
 Composes with the indexer's query sharding
 (``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``): the indexer derives its
@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
 )
+from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -62,36 +63,44 @@ _MISSING = object()
 
 def get_dsa_token_shard_plan(
     forward_batch: "ForwardBatch",
+    index_topk: Optional[int] = None,
 ) -> Optional[DsaTokenShardPlan]:
     """This forward's token slice for this rank, or None. Cached on the batch.
 
     Extend only: decode is already fast under graph capture. Every refusal is
     logged once, because a silent refusal looks the same as the feature running.
+    ``index_topk`` matters only to a multi-request DCP extend, and only the
+    first caller's counts: pass it from the first one.
     """
     if not envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get():
         return None
     cached = getattr(forward_batch, "npu_dsa_token_shard_plan", _MISSING)
     if cached is not _MISSING:
         return cached
-    plan = _build_dsa_token_shard_plan(forward_batch)
+    plan = _build_dsa_token_shard_plan(forward_batch, index_topk)
     forward_batch.npu_dsa_token_shard_plan = plan
     return plan
 
 
-def _build_dsa_token_shard_plan(forward_batch) -> Optional[DsaTokenShardPlan]:
+def _build_dsa_token_shard_plan(
+    forward_batch, index_topk: Optional[int]
+) -> Optional[DsaTokenShardPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
         print_info_once("DSA token-shard is off: attention TP size is 1")
         return None
 
-    if parallel.dcp_enabled:
-        # DCP's DSA path all-gathers the query across the DCP group, which
-        # expects every head-sharded query row, not this rank's token slice.
-        print_info_once("DSA token-shard is off: DCP all-gathers the attention query")
-        return None
-
     # The same modes the indexer query shard admits.
     if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+        return None
+
+    if parallel.dcp_enabled and forward_batch.attn_dcp_metadata is None:
+        # This extend all-gathers the query across the DCP group, which expects
+        # every head-sharded query row, not this rank's token slice. An extend
+        # that gathers the KV instead carries the metadata.
+        print_info_once(
+            "DSA token-shard is off for DCP extends that gather the attention query"
+        )
         return None
 
     if get_attn_tp_context().input_scattered:
@@ -116,6 +125,22 @@ def _build_dsa_token_shard_plan(forward_batch) -> Optional[DsaTokenShardPlan]:
         parallel.attn_tp_size,
         parallel.attn_tp_rank,
     )
+    num_requests = sum(1 for n in extend_lens if n > 0)
+    if (
+        parallel.dcp_enabled
+        and num_requests > 1
+        and not dcp_crop_free_extend(forward_batch, index_topk)
+    ):
+        # The gathered KV's lengths are cumulative, so shortening one request's
+        # to its last sharded token moves the next request's start. Without the
+        # crop the full lengths are only causal when the top-k cannot reach
+        # past a token's own position.
+        print_info_once(
+            f"DSA token-shard is off for multi-request DCP extends ({num_requests} "
+            "requests here) with a prefix under index_topk"
+        )
+        return None
+
     if plan.num_tokens < parallel.attn_tp_size:
         print_info_once(
             f"DSA token-shard is off for batches under {parallel.attn_tp_size} "
@@ -144,6 +169,20 @@ def dsa_token_shard_cumulative_query_lens(
             cumulative(plan.query_lens), dtype=torch.int32, device=device
         )
         forward_batch.npu_dsa_token_shard_cu_query_lens = cached
+    return cached
+
+
+def dsa_token_shard_cumulative_key_lens(
+    forward_batch: "ForwardBatch", plan: DsaTokenShardPlan, device: torch.device
+) -> torch.Tensor:
+    """Cumulative key lengths, for a KV layout whose lengths are cumulative (the
+    DCP-gathered TND one). Built once per forward, as the query lengths are."""
+    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_key_lens", None)
+    if cached is None:
+        cached = torch.tensor(
+            cumulative(plan.key_lens), dtype=torch.int32, device=device
+        )
+        forward_batch.npu_dsa_token_shard_cu_key_lens = cached
     return cached
 
 
