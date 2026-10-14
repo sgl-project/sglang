@@ -258,12 +258,12 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     mm_hashes: Optional[StringListOrList] = None
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
-    lora_path: Optional[str] = None
+    lora_path: Optional[OptionalStringOrList] = None
     routing_key: Optional[str] = None
     priority: Optional[int] = None
     require_reasoning: Optional[bool] = None
     max_thinking_tokens: Optional[int] = None
-    kv_hints: Optional[KvHintsEnvelope] = None
+    kv_hints: Optional[KvHintsEnvelopeOrList] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -716,6 +716,9 @@ MatchedTokens = List[int]
 # sglang.api.v1.FinishReason: JSON object tagged by its type key; unknown tags pass through as a dict.
 FinishReason = Union[FinishStop, FinishLength, FinishAbort, Dict[str, Any]]
 
+# sglang.api.v1.OptionalKvHintsEnvelope: JSON: the wrapped value itself, null when unset.
+OptionalKvHintsEnvelope = Optional[KvHintsEnvelope]
+
 # sglang.api.v1.SamplingParamsList: JSON bare array.
 SamplingParamsList = List[SamplingParams]
 
@@ -776,8 +779,14 @@ OptionalInt64OrList = Union[OptionalInt64, OptionalInt64List]
 # sglang.api.v1.Matched: JSON: the value's shape picks the arm.
 Matched = Union[int, str, MatchedTokens]
 
+# sglang.api.v1.KvHintsEnvelopeList: JSON bare array.
+KvHintsEnvelopeList = List[OptionalKvHintsEnvelope]
+
 # sglang.api.v1.SamplingParamsOrList: JSON: one value or an array of values.
 SamplingParamsOrList = Union[SamplingParams, SamplingParamsList]
+
+# sglang.api.v1.KvHintsEnvelopeOrList: JSON: one value or an array of values.
+KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 
 
 # ---- codecs: parsed JSON value <-> Python value ----
@@ -1307,7 +1316,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "audio_data":
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
         elif key == "lora_path":
-            kw["lora_path"] = None if x is None else _expect_str(x, expected="a string")
+            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
         elif key == "routing_key":
             kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "priority":
@@ -1317,7 +1326,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "max_thinking_tokens":
             kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_hints":
-            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelope(x)
+            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelopeOrList(x)
     return GenerateRequest(**kw)
 
 
@@ -1368,7 +1377,7 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
     if v.audio_data is not None:
         d["audio_data"] = encode_MediaInput(v.audio_data)
     if v.lora_path is not None:
-        d["lora_path"] = v.lora_path
+        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
     if v.routing_key is not None:
         d["routing_key"] = v.routing_key
     if v.priority is not None:
@@ -1378,8 +1387,36 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
     if v.max_thinking_tokens is not None:
         d["max_thinking_tokens"] = v.max_thinking_tokens
     if v.kv_hints is not None:
-        d["kv_hints"] = encode_KvHintsEnvelope(v.kv_hints)
+        d["kv_hints"] = encode_KvHintsEnvelopeOrList(v.kv_hints)
     return d
+
+
+def decode_KvHintsEnvelopeOrList(value: Any) -> KvHintsEnvelopeOrList:
+    if isinstance(value, list):
+        return decode_KvHintsEnvelopeList(value)
+    return decode_KvHintsEnvelope(_expect_map(value, expected="a value or an array of values for KvHintsEnvelopeOrList"))
+
+
+def encode_KvHintsEnvelopeOrList(v: KvHintsEnvelopeOrList) -> Any:
+    if isinstance(v, list):
+        return encode_KvHintsEnvelopeList(v)
+    return encode_KvHintsEnvelope(v)
+
+
+def decode_KvHintsEnvelopeList(value: Any) -> KvHintsEnvelopeList:
+    return [decode_OptionalKvHintsEnvelope(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_KvHintsEnvelopeList(v: KvHintsEnvelopeList) -> List[Any]:
+    return [encode_OptionalKvHintsEnvelope(e) for e in v]
+
+
+def decode_OptionalKvHintsEnvelope(value: Any) -> OptionalKvHintsEnvelope:
+    return None if value is None else decode_KvHintsEnvelope(value)
+
+
+def encode_OptionalKvHintsEnvelope(v: OptionalKvHintsEnvelope) -> Any:
+    return None if v is None else encode_KvHintsEnvelope(v)
 
 
 def decode_KvHintsEnvelope(value: Any) -> KvHintsEnvelope:

@@ -1827,8 +1827,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             if f_lora_path.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("lora_path"));
                             }
-                            f_lora_path =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_lora_path = Some(map.next_value::<Option<OptionalStringOrList>>()?);
                         }
                         "routing_key" => {
                             if f_routing_key.is_some() {
@@ -1863,7 +1862,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             if f_kv_hints.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("kv_hints"));
                             }
-                            f_kv_hints = Some(map.next_value::<Option<KvHintsEnvelope>>()?);
+                            f_kv_hints = Some(map.next_value::<Option<KvHintsEnvelopeOrList>>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
@@ -1903,6 +1902,79 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for KvHintsEnvelopeOrList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(kv_hints_envelope_or_list::Value::One(v)) => v.serialize(serializer),
+            Some(kv_hints_envelope_or_list::Value::Many(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintsEnvelopeOrList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvHintsEnvelopeOrList;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("a value or an array of values for KvHintsEnvelopeOrList")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let one = <KvHintsEnvelope as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(KvHintsEnvelopeOrList {
+                    value: Some(kv_hints_envelope_or_list::Value::One(one)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let many = <KvHintsEnvelopeList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(KvHintsEnvelopeOrList {
+                    value: Some(kv_hints_envelope_or_list::Value::Many(many)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for KvHintsEnvelopeList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintsEnvelopeList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(KvHintsEnvelopeList {
+            items: <::prost::alloc::vec::Vec<OptionalKvHintsEnvelope> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OptionalKvHintsEnvelope {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.envelope.serialize(serializer)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OptionalKvHintsEnvelope {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OptionalKvHintsEnvelope {
+            envelope: <Option<KvHintsEnvelope> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
     }
 }
 

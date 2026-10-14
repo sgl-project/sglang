@@ -378,11 +378,11 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
-    /// Orchestrator controls used by native gRPC clients such as Dynamo. These
-    /// are scalar per RPC item today; batch callers that need distinct values
-    /// should issue one Generate RPC per item.
-    #[prost(string, optional, tag = "23")]
-    pub lora_path: ::core::option::Option<::prost::alloc::string::String>,
+    /// Orchestrator controls used by native gRPC clients such as Dynamo.
+    /// `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
+    /// applies to every prompt, a list carries one (nullable) value per prompt.
+    #[prost(message, optional, tag = "23")]
+    pub lora_path: ::core::option::Option<OptionalStringOrList>,
     #[prost(string, optional, tag = "24")]
     pub routing_key: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(int64, optional, tag = "26")]
@@ -392,7 +392,32 @@ pub struct GenerateRequest {
     #[prost(uint64, optional, tag = "28")]
     pub max_thinking_tokens: ::core::option::Option<u64>,
     #[prost(message, optional, tag = "29")]
-    pub kv_hints: ::core::option::Option<KvHintsEnvelope>,
+    pub kv_hints: ::core::option::Option<KvHintsEnvelopeOrList>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KvHintsEnvelopeOrList {
+    #[prost(oneof = "kv_hints_envelope_or_list::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<kv_hints_envelope_or_list::Value>,
+}
+/// Nested message and enum types in `KvHintsEnvelopeOrList`.
+pub mod kv_hints_envelope_or_list {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        One(super::KvHintsEnvelope),
+        #[prost(message, tag = "2")]
+        Many(super::KvHintsEnvelopeList),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KvHintsEnvelopeList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OptionalKvHintsEnvelope>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OptionalKvHintsEnvelope {
+    #[prost(message, optional, tag = "1")]
+    pub envelope: ::core::option::Option<KvHintsEnvelope>,
 }
 /// Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
 /// payloads are JSON because each action type owns its own schema.

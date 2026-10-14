@@ -132,6 +132,7 @@ pub fn into_requests(
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
+    let lora_path = lora_path.and_then(wire::optional_string_or_list);
 
     if max_thinking_tokens.is_some() && !policy.enable_strict_thinking {
         return Err(Error::Validation(
@@ -139,17 +140,6 @@ pub fn into_requests(
                 .into(),
         ));
     }
-    let lora_id = lora_path
-        .as_deref()
-        .map(|name| {
-            policy.lora_ids.get(name).cloned().ok_or_else(|| {
-                Error::Validation(format!(
-                    "LoRA adapter '{name}' is not loaded; loaded adapters: {:?}",
-                    policy.lora_ids.keys().collect::<Vec<_>>()
-                ))
-            })
-        })
-        .transpose()?;
     let priority = priority.or_else(|| {
         policy
             .enable_priority_scheduling
@@ -349,20 +339,14 @@ pub fn into_requests(
 
     // Every column above is exactly `n` long, so zip them by value: each
     // request takes ownership of its cell, with no indexing or bounds checks.
-    let kv_hints = kv_hints.map(KvHintsEnvelope::try_from).transpose()?;
     if let Some(value) = &routing_key {
         check_broadcast_budget(value.len(), n, "routing_key")?;
     }
-    if let Some(value) = &lora_id {
-        check_broadcast_budget(value.len(), n, "lora_path")?;
-    }
-    if let Some(value) = &kv_hints {
-        let per_clone = serde_json::to_vec(value)
-            .expect("KvHintsEnvelope contains only JSON-serializable values")
-            .len()
-            .saturating_mul(JSON_TO_HEAP_FACTOR);
-        check_broadcast_budget(per_clone, n, "kv_hints")?;
-    }
+    let lora_ids = flatten_column(fan_out(lora_path, n, "lora_path")?)
+        .into_iter()
+        .map(|name| resolve_lora_id(name, policy))
+        .collect::<Result<Vec<_>, _>>()?;
+    let kv_hints = kv_hints_column(kv_hints, n)?;
     let mut requests: Vec<GenerateRequest> = izip!(
         rids,
         texts,
@@ -381,6 +365,8 @@ pub fn into_requests(
         images,
         videos,
         audios,
+        lora_ids,
+        kv_hints,
     )
     .map(
         |(
@@ -401,6 +387,8 @@ pub fn into_requests(
             image_data,
             video_data,
             audio_data,
+            lora_id,
+            kv_hints,
         )| {
             let mut sampling_params = sampling_params;
             if let Some(max_thinking_tokens) = max_thinking_tokens {
@@ -438,11 +426,11 @@ pub fn into_requests(
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
-                lora_id: lora_id.clone(),
+                lora_id,
                 routing_key: routing_key.clone(),
                 priority,
                 require_reasoning: require_reasoning.unwrap_or(false),
-                kv_hints: kv_hints.clone(),
+                kv_hints,
                 mm: pack_mm(image_data, video_data, audio_data),
                 mm_buffers: Vec::new(),
             }
@@ -793,6 +781,56 @@ pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> 
     Ok(())
 }
 
+/// Map a prompt's adapter name to its launch-time LoRA id. A missing or empty
+/// name runs the base model, as Python treats a falsy `lora_path`.
+fn resolve_lora_id(
+    name: Option<String>,
+    policy: &GenerationPolicy,
+) -> Result<Option<String>, Error> {
+    match name.as_deref() {
+        None | Some("") => Ok(None),
+        Some(name) => policy.lora_ids.get(name).cloned().map(Some).ok_or_else(|| {
+            Error::Validation(format!(
+                "LoRA adapter '{name}' is not loaded; loaded adapters: {:?}",
+                policy.lora_ids.keys().collect::<Vec<_>>()
+            ))
+        }),
+    }
+}
+
+/// Per-prompt `kv_hints`, following Python `_normalize_kv_hints`: one envelope
+/// applies to every prompt, a list carries one nullable envelope per prompt.
+fn kv_hints_column(
+    value: Option<api_v1::KvHintsEnvelopeOrList>,
+    n: usize,
+) -> Result<Vec<Option<KvHintsEnvelope>>, Error> {
+    use api_v1::kv_hints_envelope_or_list::Value;
+    match value.and_then(|v| v.value) {
+        None => Ok(vec![None; n]),
+        Some(Value::One(envelope)) => {
+            let envelope = KvHintsEnvelope::try_from(envelope)?;
+            let per_clone = serde_json::to_vec(&envelope)
+                .expect("KvHintsEnvelope contains only JSON-serializable values")
+                .len()
+                .saturating_mul(JSON_TO_HEAP_FACTOR);
+            check_broadcast_budget(per_clone, n, "kv_hints")?;
+            Ok(vec![Some(envelope); n])
+        }
+        Some(Value::Many(list)) => {
+            if list.items.len() != n {
+                return Err(Error::Validation(format!(
+                    "kv_hints list length {} does not match batch size {n}",
+                    list.items.len()
+                )));
+            }
+            list.items
+                .into_iter()
+                .map(|item| item.envelope.map(KvHintsEnvelope::try_from).transpose())
+                .collect()
+        }
+    }
+}
+
 fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
     value: Option<OneOrMany<T>>,
     n: usize,
@@ -934,12 +972,67 @@ mod tests {
                     "action_id": "a",
                     "action_type": "t",
                     "action_version": "1",
-                    "payload": serde_json::json!({"value": payload}).to_string()
+                    "payload": {"value": payload}
                 }]
             }
         });
         let error = requests(&body.to_string()).unwrap_err();
         assert!(error.to_string().contains("kv_hints"), "{error}");
+        assert!(error.to_string().contains("broadcast"), "{error}");
+    }
+
+    /// `lora_path` and `kv_hints` follow Python `GenerateReqInput`: a scalar
+    /// applies to every prompt, a list is one nullable value per prompt. The
+    /// Python server validates `/generate` against this same schema, so a
+    /// per-prompt list rejected here was a 400 there too.
+    #[test]
+    fn orchestrator_lists_are_per_prompt() {
+        let mut lora_ids = BTreeMap::new();
+        lora_ids.insert("adapter".into(), "stable-id".into());
+        let policy = GenerationPolicy {
+            lora_ids,
+            ..GenerationPolicy::default()
+        };
+        let envelope = serde_json::json!({
+            "protocol_version": "1",
+            "message_id": "m",
+            "actions": [{"action_id": "a", "action_type": "t", "action_version": "1", "payload": {}}]
+        });
+
+        let body = serde_json::json!({
+            "text": ["a", "b", "c", "d"],
+            "lora_path": ["adapter", null, "", "adapter"],
+            "kv_hints": [envelope, null, null, envelope]
+        });
+        let (requests, _) = requests_with_policy(&body.to_string(), &policy).unwrap();
+        let lora: Vec<_> = requests.iter().map(|r| r.lora_id.as_deref()).collect();
+        assert_eq!(lora, [Some("stable-id"), None, None, Some("stable-id")]);
+        let hints: Vec<_> = requests.iter().map(|r| r.kv_hints.is_some()).collect();
+        assert_eq!(hints, [true, false, false, true]);
+
+        let body =
+            serde_json::json!({"text": ["a", "b"], "lora_path": "adapter", "kv_hints": envelope});
+        let (requests, _) = requests_with_policy(&body.to_string(), &policy).unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.lora_id.as_deref() == Some("stable-id"))
+        );
+        assert!(requests.iter().all(|r| r.kv_hints.is_some()));
+
+        for field in ["lora_path", "kv_hints"] {
+            let value = if field == "lora_path" {
+                serde_json::json!(["adapter"])
+            } else {
+                serde_json::json!([envelope])
+            };
+            let body = serde_json::json!({"text": ["a", "b"], field: value});
+            let error = requests_with_policy(&body.to_string(), &policy).unwrap_err();
+            assert!(
+                error.to_string().contains("does not match batch size"),
+                "{field}: {error}"
+            );
+        }
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).

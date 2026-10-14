@@ -54,16 +54,34 @@ message GenerateRequest {
   optional MediaInput video_data = 21;
   optional MediaInput audio_data = 22;
 
-  // Orchestrator controls used by native gRPC clients such as Dynamo. These
-  // are scalar per RPC item today; batch callers that need distinct values
-  // should issue one Generate RPC per item.
-  optional string lora_path = 23;
+  // Orchestrator controls used by native gRPC clients such as Dynamo.
+  // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
+  // applies to every prompt, a list carries one (nullable) value per prompt.
+  OptionalStringOrList lora_path = 23;
   optional string routing_key = 24;
   reserved 25; // Trace-parent extraction is not implemented by the Rust frontend yet.
   optional int64 priority = 26;
   optional bool require_reasoning = 27;
   optional uint64 max_thinking_tokens = 28;
-  optional KvHintsEnvelope kv_hints = 29;
+  KvHintsEnvelopeOrList kv_hints = 29;
+}
+
+message KvHintsEnvelopeOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    KvHintsEnvelope one = 1;
+    KvHintsEnvelopeList many = 2;
+  }
+}
+
+message KvHintsEnvelopeList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OptionalKvHintsEnvelope items = 1;
+}
+
+message OptionalKvHintsEnvelope {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional KvHintsEnvelope envelope = 1;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
