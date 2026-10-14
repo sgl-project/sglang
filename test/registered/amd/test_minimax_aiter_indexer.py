@@ -52,6 +52,7 @@ class TestMiniMaxAiterIndexer(unittest.TestCase):
         backend.init_blocks = 0
         backend.local_blocks = 1
         backend.max_context_len = max_context
+        backend.aiter_sparse_pa = None
         backend._init_aiter_indexer(heads, max_query_len=query_len)
         return backend
 
