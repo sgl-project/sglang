@@ -10,7 +10,6 @@ import mmap
 import os
 import re
 import time
-from contextlib import nullcontext
 from typing import Optional, Protocol
 
 import msgspec
@@ -36,32 +35,21 @@ _is_hip = is_hip()
 
 
 class EngramTableLayout(str, enum.Enum):
-    """Which rows a rank can read. FULL_SHARED: the whole table, in place (one
-    host copy every rank maps, or device column shards in symmetric memory), so
-    the lookup needs no collective. ROW_SHARDED: only the rank's own rows; the
-    lookup zero-fills the rest and all-reduces."""
+    """What a rank stores and who reads it.
 
-    FULL_SHARED = "full_shared"
-    ROW_SHARDED = "row_sharded"
+    PRIVATE: its own shard, readable only by itself; the lookup zero-fills the
+    other rows and all-reduces. SHARED: its own shard, readable in place by every
+    rank (symmetric memory, or one host mapping holding all shards), so the
+    lookup needs no collective. REPLICATED: the whole table, read locally."""
+
+    PRIVATE = "private"
+    SHARED = "shared"
+    REPLICATED = "replicated"
 
     @staticmethod
-    def parse(use_host: bool, value: str) -> EngramTableLayout:
-        if not value:
-            value = "full_shared" if use_host else "row_sharded"
-        return EngramTableLayout(value)
-
-
-def column_shard(
-    bounds: tuple[int, ...], tp_size: int, tp_rank: int
-) -> tuple[int, int]:
-    """This rank's [start, end) rows: on the hash-column boundaries ``bounds``
-    when the columns divide evenly, so a rank owns whole per-head subtables,
-    else the equal-row split. Exactly one rank owns each row either way."""
-    num_cols, num_rows = len(bounds) - 1, bounds[-1]
-    if num_cols % tp_size == 0:
-        per_rank = num_cols // tp_size
-        return bounds[per_rank * tp_rank], bounds[per_rank * (tp_rank + 1)]
-    return num_rows * tp_rank // tp_size, num_rows * (tp_rank + 1) // tp_size
+    def parse(value: str) -> Optional[EngramTableLayout]:
+        """None for an empty value: create_engram_table picks the layout."""
+        return EngramTableLayout(value) if value else None
 
 
 class EngramGatherView(msgspec.Struct, frozen=True):
@@ -74,20 +62,92 @@ class EngramGatherView(msgspec.Struct, frozen=True):
     starts: tuple[int, ...]
 
 
-def _split_views(
-    raw: torch.Tensor, rows: int, dim: int, stride_rows: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``raw`` as [stride_rows * dim] fp8 rows, then [stride_rows * dim / 32]
-    e8m0 scales; the first ``rows`` of each."""
+class EngramStorage(msgspec.Struct, frozen=True, kw_only=True):
+    """The rows this rank stores and how a kernel reaches the rest: everything the
+    loader and the lookup read, nothing about how the memory was obtained."""
+
+    weight: torch.Tensor  # [num_rows, dim] fp8 e4m3
+    scale: torch.Tensor  # [num_rows, dim / 32] e8m0
+    row_start: int  # the first global row of weight / scale
+    ptrs: tuple[int, int]  # device addresses of weight / scale
+    load_rows: tuple[int, int]  # the global [start, end) the loader writes
+    # Every shard's addresses when the whole table is readable in place, else
+    # None; the rows behind them are valid once every rank's finish_load returns.
+    view: Optional[EngramGatherView] = None
+
+    @property
+    def num_rows(self) -> int:
+        return self.weight.size(0)
+
+
+def _make_storage(
+    raw: torch.Tensor,
+    dim: int,
+    *,
+    row_start: int,
+    num_rows: int,
+    load_rows: tuple[int, int],
+    is_full: bool,
+    device_ptr: Optional[int] = None,
+    device_peer_pairs: Optional[tuple[list[int], list[int]]] = None,
+    num_padded_rows: Optional[int] = None,
+) -> EngramStorage:
+    """``raw`` (device address ``device_ptr``) as [num_padded_rows * dim] fp8
+    values, then [num_padded_rows * dim / 32] e8m0 scales, the first ``num_rows``
+    of each. A buffer holding every row is readable in place as a world of one;
+    ``device_peer_pairs`` (every rank's buffer address and first row) makes the
+    peers' shards readable, each laid out alike so its scales sit at the same
+    offset."""
+    if device_ptr is None:
+        device_ptr = raw.data_ptr()
+    num_padded_rows = num_rows if num_padded_rows is None else num_padded_rows
     sdim = dim // FP8_BLOCK_SIZE
-    weight = raw[: rows * dim].view(torch.float8_e4m3fn).view(rows, dim)
-    base = stride_rows * dim
-    scale = raw[base : base + rows * sdim].view(torch.float8_e8m0fnu)
-    return weight, scale.view(rows, sdim)
+    weight = raw[: num_rows * dim].view(torch.float8_e4m3fn).view(num_rows, dim)
+    base = num_padded_rows * dim
+    scale = raw[base : base + num_rows * sdim].view(torch.float8_e8m0fnu)
+    ptrs = (device_ptr, device_ptr + base)
+    if is_full:
+        assert device_peer_pairs is None
+        view = EngramGatherView((ptrs[0],), (ptrs[1],), (0,))
+    elif device_peer_pairs is not None:
+        w_ptrs, starts = device_peer_pairs
+        s_ptrs = [p + base for p in w_ptrs]
+        view = EngramGatherView(tuple(w_ptrs), tuple(s_ptrs), tuple(starts))
+    else:
+        view = None
+    return EngramStorage(
+        weight=weight,
+        scale=scale.view(num_rows, sdim),
+        row_start=row_start,
+        ptrs=ptrs,
+        load_rows=load_rows,
+        view=view,
+    )
+
+
+def _shard_hash_columns_at(bounds: tuple[int, ...], *, rank: int, world: int):
+    """This rank's [start, end) rows on the hash-column boundaries ``bounds``:
+    the columns split evenly over the ranks, each owning whole per-head
+    subtables."""
+    num_hash_columns = len(bounds) - 1
+    assert num_hash_columns % world == 0
+    per_rank = num_hash_columns // world
+    return bounds[per_rank * rank], bounds[per_rank * (rank + 1)]
+
+
+def _shard_hash_columns(layout: EngramTableLayout, bounds: tuple[int, ...], group):
+    if layout == EngramTableLayout.REPLICATED:
+        return 0, bounds[-1]
+    assert layout in (EngramTableLayout.PRIVATE, EngramTableLayout.SHARED)
+    rank, world = group.rank_in_group, group.world_size
+    return _shard_hash_columns_at(bounds, rank=rank, world=world)
 
 
 def _table_nbytes(rows: int, dim: int) -> int:
-    return rows * (dim + dim // FP8_BLOCK_SIZE)
+    assert dim % FP8_BLOCK_SIZE == 0, "dim must be a multiple of the fp8 block size"
+    nbytes = rows * (dim + dim // FP8_BLOCK_SIZE)
+    assert nbytes > 0, "at least one row is needed to hold the table"
+    return nbytes
 
 
 _THP_DIR = "/sys/kernel/mm/transparent_hugepage"
@@ -200,8 +260,8 @@ def _registered_device_ptr(host_ptr: int) -> int:
 
 
 class _HostTablePosix:
-    """Host memory for one engram table: a memfd every rank maps (full_shared) or
-    a private anonymous mapping of the rank's rows (row_sharded).
+    """Host memory for one engram table: for the shared layout a memfd every rank
+    maps, else a private anonymous mapping collapsed onto huge pages.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
@@ -210,66 +270,71 @@ class _HostTablePosix:
     def __init__(
         self,
         layout: EngramTableLayout,
-        rows: int,
-        row_start: int,
+        bounds: tuple[int, ...],
         dim: int,
         name: str,
         group,
-    ):
-        self.layout = layout
-        self.row_start = row_start
-        # mmap requires storage even for an empty shard.
-        nbytes = max(1, _table_nbytes(rows, dim))
-        self.nbytes = nbytes
-        self.group = group
-        self.dirty = False
-        if layout == EngramTableLayout.FULL_SHARED:
-            self.fd = self._open_shared_fd(nbytes, name)
-            self.mm = mmap.mmap(
-                self.fd,
+    ) -> None:
+        load_rows = _shard_hash_columns(layout, bounds, group)
+        if layout == EngramTableLayout.SHARED:
+            start, end = 0, bounds[-1]  # each rank still hold full view
+            nbytes = _table_nbytes(end - start, dim)
+            fd = self._open_shared_fd(nbytes, name, group)
+            mm = mmap.mmap(
+                fd,
                 nbytes,
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
+            mm.madvise(mmap.MADV_HUGEPAGE)
+            # Every rank holds the fd before rank 0 continues; the /proc path only
+            # resolves while rank 0 keeps its descriptor.
+            group.barrier()
         else:
-            self.fd = None
-            self.mm = mmap.mmap(
+            start, end = load_rows
+            nbytes = _table_nbytes(end - start, dim)
+            fd = None
+            mm = mmap.mmap(
                 -1,
                 nbytes,
                 flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
-        # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
-        self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == EngramTableLayout.ROW_SHARDED:
+            mm.madvise(mmap.MADV_HUGEPAGE)
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == EngramTableLayout.FULL_SHARED:
-            # Every rank holds the fd before rank 0 continues; the /proc path only
-            # resolves while rank 0 keeps its descriptor.
-            group.barrier()
+            np.frombuffer(mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+
+        self.mm = mm
+        self.fd = fd
+        self.is_shared = layout == EngramTableLayout.SHARED
+        self.group = group
+        self.dirty = False
+        self.nbytes = nbytes
+        self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
         device_ptr = _registered_device_ptr(self.bytes.data_ptr())
-        self.weight, self.scale = _split_views(self.bytes, rows, dim, rows)
-        self.ptrs = (device_ptr, device_ptr + rows * dim)
-        self._view = _host_gather_view(layout, self.ptrs, group)
+        self.storage = _make_storage(
+            self.bytes,
+            dim,
+            row_start=start,
+            num_rows=end - start,
+            load_rows=load_rows,
+            is_full=layout != EngramTableLayout.PRIVATE,
+            device_ptr=device_ptr,
+        )
 
-    def gather_view(self) -> Optional[EngramGatherView]:
-        return self._view
-
-    def _open_shared_fd(self, nbytes: int, name: str) -> int:
+    def _open_shared_fd(self, nbytes: int, name: str, group) -> int:
         owner = None
-        if self.group.rank_in_group == 0:
+        if group.rank_in_group == 0:
             fd = os.memfd_create(name, 0)
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
-        pid, owner_fd = self.group.broadcast_object(owner, src=0)
-        if self.group.rank_in_group == 0:
+        pid, owner_fd = group.broadcast_object(owner, src=0)
+        if group.rank_in_group == 0:
             return fd
         try:
             return os.open(f"/proc/{pid}/fd/{owner_fd}", os.O_RDWR)
@@ -308,10 +373,10 @@ class _HostTablePosix:
         if not self.dirty:
             return
         self.dirty = False
-        if self.layout == EngramTableLayout.FULL_SHARED:
+        if self.is_shared:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == EngramTableLayout.ROW_SHARDED and huge_kb < mapped_kb * 0.98:
+        if not self.is_shared and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             _drop_checkpoint_page_cache()
@@ -319,16 +384,12 @@ class _HostTablePosix:
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
-            f"engram host table {label}: layout={self.layout}, "
+            f"engram host table {label}: {'shared' if self.is_shared else 'private'}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = (
-                "shmem_enabled"
-                if self.layout == EngramTableLayout.FULL_SHARED
-                else "enabled"
-            )
+            knob = "shmem_enabled" if self.is_shared else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -342,48 +403,49 @@ class _HostTablePosix:
 
 class _HostTableVMM:
     """Host memory for one engram table through CUDA VMM: pinned, 2MB-granular,
-    and for full_shared exported by fd so every rank maps one physical copy."""
+    and for the shared layout exported by fd so every rank maps one physical copy."""
 
     def __init__(
         self,
         layout: EngramTableLayout,
-        rows: int,
-        row_start: int,
+        bounds: tuple[int, ...],
         dim: int,
         name: str,
         group,
-    ):
-        self.group = group
-        self.layout = layout
-        self.row_start = row_start
-        nbytes = max(1, _table_nbytes(rows, dim))
-        if layout == EngramTableLayout.FULL_SHARED:
-            # Both sides close their fd once the mapping exists: SCM_RIGHTS copies
-            # are independent descriptors, so there is no keep-alive requirement.
+    ) -> None:
+        load_rows = _shard_hash_columns(layout, bounds, group)
+        if layout == EngramTableLayout.SHARED:
+            # One allocation holds the whole table; each rank writes its own shard.
+            start, end = 0, bounds[-1]
+            nbytes = _table_nbytes(end - start, dim)
             if group.rank_in_group == 0:
-                self.vmm = VMMHostMemory(nbytes)
-                size = group.broadcast_object(self.vmm.size(), src=0)
-                fd = exchange_fd(group, self.vmm.export_fd(), name=name)
+                vmm = VMMHostMemory(nbytes)
+                size = group.broadcast_object(vmm.size(), src=0)
+                fd = exchange_fd(group, vmm.export_fd(), name=name)
             else:
                 size = group.broadcast_object(None, src=0)
                 fd = exchange_fd(group, None, name=name)
-                self.vmm = VMMHostMemory(size, fd)
+                vmm = VMMHostMemory(size, fd)
             os.close(fd)
         else:
-            self.vmm = VMMHostMemory(nbytes)
-        # The mapping is host- and device-accessible at one address.
-        device_ptr = self.vmm.ptr()
-        raw = torch.frombuffer(
-            ctypes.cast(device_ptr, ctypes.POINTER(ctypes.c_uint8 * nbytes)).contents,
-            dtype=torch.uint8,
-        )
-        self.weight, self.scale = _split_views(raw, rows, dim, rows)
-        self.ptrs = (device_ptr, device_ptr + rows * dim)
-        self._view = _host_gather_view(layout, self.ptrs, group)
+            start, end = load_rows
+            nbytes = _table_nbytes(end - start, dim)
+            vmm = VMMHostMemory(nbytes)
+        device_ptr = vmm.ptr()
+        buffer = (ctypes.c_uint8 * nbytes).from_address(device_ptr)
+        self.vmm = vmm
+        self.group = group
         self.dirty = False
-
-    def gather_view(self) -> Optional[EngramGatherView]:
-        return self._view
+        self.is_shared = layout == EngramTableLayout.SHARED
+        self.storage = _make_storage(
+            torch.frombuffer(buffer, dtype=torch.uint8),
+            dim,
+            row_start=start,
+            num_rows=end - start,
+            load_rows=load_rows,
+            is_full=layout != EngramTableLayout.PRIVATE,
+            device_ptr=device_ptr,
+        )
 
     def mark_loaded(self):
         self.dirty = True
@@ -392,137 +454,140 @@ class _HostTableVMM:
         if not self.dirty:
             return
         self.dirty = False
+        if self.is_shared:
+            self.group.barrier()
+
+
+class _DeviceTableSymmMem:
+    """The shared layout on the device: the rank's column shard in symmetric
+    memory, which every peer reads in place. Every rank lays out the widest
+    shard, as the symmetric pool needs the same shapes on every rank."""
+
+    def __init__(
+        self, layout: EngramTableLayout, bounds: tuple[int, ...], dim: int, group
+    ) -> None:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        assert layout == EngramTableLayout.SHARED
+        start, end = load_rows = _shard_hash_columns(layout, bounds, group)
+        w = group.world_size
+        spans = [_shard_hash_columns_at(bounds, rank=r, world=w) for r in range(w)]
+        num_padded_rows = max(e - s for s, e in spans)
+        nbytes = _table_nbytes(num_padded_rows, dim)
+        # Built under the model's default-device context.
+        with symmetric_context(torch.get_default_device()):
+            self.buf = torch.empty(nbytes, dtype=torch.uint8)
+        handle = symm_mem.rendezvous(self.buf, group.device_group)
+        self.group = group
+        self.storage = _make_storage(
+            self.buf,
+            dim,
+            row_start=start,
+            num_rows=end - start,
+            load_rows=load_rows,
+            is_full=False,
+            num_padded_rows=num_padded_rows,
+            device_peer_pairs=(handle.buffer_ptrs, [start for start, _ in spans]),
+        )
+        self.dirty = False
+
+    def mark_loaded(self):
+        self.dirty = True
+
+    def finish_load(self, label: str):
+        if not self.dirty:
+            return
+        self.dirty = False
+        # Peers read this shard in place: the loader's copies must land first.
+        torch.cuda.current_stream().synchronize()
         self.group.barrier()
 
 
-def _host_gather_view(
-    layout: EngramTableLayout, ptrs: tuple[int, int], group
-) -> Optional[EngramGatherView]:
-    """A host table every rank maps whole is a world of one; a private shard is
-    readable only by its own rank."""
-    if layout == EngramTableLayout.FULL_SHARED or group.world_size == 1:
-        return EngramGatherView((ptrs[0],), (ptrs[1],), (0,))
-    return None
-
-
 class _DeviceTable:
-    """HBM for the rank's column shard. full_shared puts the shard in symmetric
-    memory so peers read it in place; row_sharded keeps it private."""
+    """The private or replicated layout on the device: the rank's column shard or
+    the whole table, in ordinary HBM."""
 
     def __init__(
-        self,
-        layout: EngramTableLayout,
-        spans: list[tuple[int, int]],
-        rank: int,
-        dim: int,
-        group,
-    ):
-        self.layout = layout
-        self.group = group
-        self.row_start, row_end = spans[rank]
-        rows = row_end - self.row_start
-        self._spans = spans
-        self._symmetric = layout == EngramTableLayout.FULL_SHARED and len(spans) > 1
-        # The symmetric pool wants the same shapes on every rank, and the column
-        # shards are ragged, so every rank lays out the widest one.
-        stride_rows = (
-            max(end - start for start, end in spans) if self._symmetric else rows
+        self, layout: EngramTableLayout, bounds: tuple[int, ...], dim: int, group
+    ) -> None:
+        assert layout != EngramTableLayout.SHARED
+        start, end = _shard_hash_columns(layout, bounds, group)
+        num_rows = end - start
+        self.buf = torch.empty(_table_nbytes(num_rows, dim), dtype=torch.uint8)
+        self.storage = _make_storage(
+            self.buf,
+            dim,
+            row_start=start,
+            num_rows=end - start,
+            load_rows=(start, end),
+            is_full=layout == EngramTableLayout.REPLICATED,
         )
-        device = torch.empty(0).device
-        ctx = symmetric_context(device) if self._symmetric else nullcontext()
-        with ctx:
-            self._buf = torch.empty(_table_nbytes(stride_rows, dim), dtype=torch.uint8)
-        self.weight, self.scale = _split_views(self._buf, rows, dim, stride_rows)
-        self._scale_offset = stride_rows * dim
-        self.ptrs = (self._buf.data_ptr(), self._buf.data_ptr() + self._scale_offset)
-        self._view: Optional[EngramGatherView] = None
-        if len(spans) == 1:
-            self._view = EngramGatherView((self.ptrs[0],), (self.ptrs[1],), (0,))
-
-    def gather_view(self) -> Optional[EngramGatherView]:
-        return self._view
 
     def mark_loaded(self):
-        pass
+        return
 
     def finish_load(self, label: str):
-        """Collective for a symmetric shard: exchanges the peers' addresses, once,
-        before any CUDA graph capture."""
-        if not self._symmetric or self._view is not None:
-            return
-        import torch.distributed._symmetric_memory as symm_mem
-
-        handle = symm_mem.rendezvous(self._buf, self.group.device_group)
-        self._view = EngramGatherView(
-            tuple(handle.buffer_ptrs),
-            tuple(p + self._scale_offset for p in handle.buffer_ptrs),
-            tuple(start for start, _ in self._spans),
-        )
+        return
 
 
 class Table(Protocol):
-    layout: EngramTableLayout
-    row_start: int  # the first global row this rank stores
-    weight: torch.Tensor  # [rows, dim] fp8 e4m3, where the loader writes
-    scale: torch.Tensor  # [rows, dim / 32] e8m0
-    ptrs: tuple[int, int]  # device addresses of weight and scale
+    storage: EngramStorage
 
-    def gather_view(self) -> Optional[EngramGatherView]:
-        """Every shard's addresses when this rank can read the whole table in
-        place, else None; final after `finish_load`."""
-        ...
-
-    def mark_loaded(self): ...
+    def mark_loaded(self):
+        """The loader wrote to the table."""
 
     def finish_load(self, label: str):
         """Collective: every rank calls it once its rows are loaded."""
-        ...
 
 
-def _check_device_full_shared(bounds: tuple[int, ...], dim: int, tp_size: int):
+def _device_share_blocker(bounds: tuple[int, ...], dim: int, world: int):
+    """Why the device table cannot take the shared layout, or None if it can."""
     num_cols = len(bounds) - 1
-    reasons = [
-        (not _is_cuda, "it needs CUDA symmetric memory"),
-        (
-            num_cols % tp_size != 0,
-            f"{num_cols} hash columns do not split over TP {tp_size}",
-        ),
-        (
-            num_cols != 24 or dim != 256,
-            "the gather kernel is built for 24 columns of 256",
-        ),
-        (bounds[-1] >= 2**31, "row ids must fit int32"),
-    ]
-    for failed, reason in reasons:
-        if failed:
-            raise ValueError(f"engram device table full_shared: {reason}")
+    if not _is_cuda:
+        return "it needs CUDA symmetric memory"
+    if num_cols != 24 or dim != 256:
+        return "the peer gather kernel is built for 24 hash columns of 256"
+    if world > 8:
+        return f"the peer gather kernel reads at most 8 shards, not {world}"
+    if bounds[-1] >= 2**31:
+        return "row ids must fit int32"
+    return None
 
 
 def create_engram_table(
     *,
     use_host: bool,
-    layout: EngramTableLayout,
+    layout: Optional[EngramTableLayout],
     bounds: tuple[int, ...],
     dim: int,
     name: str,
     group,
 ) -> Table:
-    """One layer's table; ``bounds`` are the prefix sums of its hash columns."""
-    tp_size, rank = group.world_size, group.rank_in_group
-    spans = [column_shard(bounds, tp_size, r) for r in range(tp_size)]
-    if not use_host:
-        if layout == EngramTableLayout.FULL_SHARED and tp_size > 1:
-            _check_device_full_shared(bounds, dim, tp_size)
-        return _DeviceTable(layout, spans, rank, dim, group)
-    if layout == EngramTableLayout.FULL_SHARED:
-        rows, row_start = bounds[-1], 0
-    else:
-        row_start, row_end = spans[rank]
-        rows = row_end - row_start
-    use_vmm = (
-        envs.SGLANG_OPT_DSV41_ENGRAM_HOST_TABLE_VMM.get()
-        and _is_cuda
-        and is_vmm_available()
-    )
-    cls = _HostTableVMM if use_vmm else _HostTablePosix
-    return cls(layout, rows, row_start, dim, name, group)
+    """One layer's table; ``bounds`` are the prefix sums of its hash columns.
+    ``layout`` None picks one: replicated at TP 1, else shared on the host, and
+    on the device shared where the peer gather supports it and custom all-reduce
+    has verified peer access, private otherwise."""
+    world = group.world_size
+    if world == 1:
+        # The only rank's shard is the whole table.
+        layout = EngramTableLayout.REPLICATED
+    if use_host:
+        use_vmm = (
+            envs.SGLANG_OPT_DSV41_ENGRAM_HOST_TABLE_VMM.get()
+            and _is_cuda
+            and is_vmm_available()
+        )
+        cls = _HostTableVMM if use_vmm else _HostTablePosix
+        return cls(layout or EngramTableLayout.SHARED, bounds, dim, name, group)
+    # device table:
+    blocker = _device_share_blocker(bounds, dim, world)
+    if layout is None:
+        # Custom all-reduce comes up only once a real peer read works.
+        can_p2p = group.ca_comm is not None and not group.ca_comm.disabled
+        use_shared = blocker is None and can_p2p
+        layout = EngramTableLayout.SHARED if use_shared else EngramTableLayout.PRIVATE
+    if layout != EngramTableLayout.SHARED:
+        return _DeviceTable(layout, bounds, dim, group)
+    if blocker is not None:
+        raise ValueError(f"engram device table, shared layout: {blocker}")
+    return _DeviceTableSymmMem(layout, bounds, dim, group)

@@ -1607,7 +1607,8 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # "row_sharded" | "full_shared"
+    # "private" | "shared" | "replicated"; empty picks replicated at TP 1, else
+    # shared on the host and, where the peer gather supports it, on the device.
     SGLANG_DSV41_ENGRAM_TABLE_LAYOUT = EnvStr("")
     # Back a CUDA host table with VMM (pinned, 2MB-granular, fd-shareable)
     # instead of memfd / anonymous mmap.
@@ -2040,9 +2041,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": _DeprecatedEnv(
         replacement="SGLANG_DSV41_ENGRAM_TABLE_LAYOUT",
-        transform=lambda v: {"shared": "full_shared", "per_rank": "row_sharded"}.get(
-            v, v
-        ),
+        transform=lambda v: {"per_rank": "private"}.get(v, v),
     ),
 }
 

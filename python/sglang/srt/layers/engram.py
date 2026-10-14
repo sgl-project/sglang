@@ -15,7 +15,10 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
-from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+from sglang.kernels.ops.embeddings.engram_gather import (
+    engram_gather_bf16,
+    engram_gather_triton,
+)
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
@@ -37,8 +40,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_gatherv_active,
 )
 from sglang.srt.layers.engram_table import (
+    EngramGatherView,
     EngramTableLayout,
-    column_shard,
     create_engram_table,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -517,12 +520,11 @@ class EngramHasher(nn.Module):
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Storage and visibility come from engram_table: device or host
-    (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE), full_shared or row_sharded
-    (SGLANG_DSV41_ENGRAM_TABLE_LAYOUT). A table whose rows every rank reads in
-    place is looked up without a collective; otherwise each rank fills its own
-    rows and the lookup all-reduces. Loading is sharded in every layout: a rank
-    writes only its own column shard.
+    Storage comes from engram_table: device or host
+    (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE), and a private, shared or replicated
+    layout (SGLANG_DSV41_ENGRAM_TABLE_LAYOUT). A table whose rows every rank
+    reads in place is looked up without a collective; a private one has each
+    rank fill its own rows and the lookup all-reduce.
     """
 
     def __init__(
@@ -537,24 +539,23 @@ class EngramEmbedding(nn.Module):
         self.use_host = envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
         self.table = create_engram_table(
             use_host=self.use_host,
-            layout=EngramTableLayout.parse(
-                self.use_host, envs.SGLANG_DSV41_ENGRAM_TABLE_LAYOUT.get()
-            ),
+            layout=EngramTableLayout.parse(envs.SGLANG_DSV41_ENGRAM_TABLE_LAYOUT.get()),
             bounds=bounds,
             dim=dim,
             name=f"sglang_engram_{layer_id}",
             group=parallel.tp_group,
         )
-        self.row_start = self.table.row_start
-        self.num_rows = self.table.weight.shape[0]
+        storage = self.table.storage
+        self.row_start = storage.row_start
+        self.num_rows = storage.weight.shape[0]
         self.row_end = self.row_start + self.num_rows
-        load_start, load_end = column_shard(bounds, self.tp_size, parallel.tp_rank)
+        load_start, load_end = storage.load_rows
         self._load_rows_global = slice(load_start, load_end)
         self._load_rows_local = slice(
             load_start - self.row_start, load_end - self.row_start
         )
-        self.weight = nn.Parameter(self.table.weight, requires_grad=False)
-        self.scale = nn.Parameter(self.table.scale, requires_grad=False)
+        self.weight = nn.Parameter(storage.weight, requires_grad=False)
+        self.scale = nn.Parameter(storage.scale, requires_grad=False)
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
@@ -563,7 +564,6 @@ class EngramEmbedding(nn.Module):
         self.table.mark_loaded()
 
     def finish_load(self, label: str):
-        """Collective: every rank calls it after loading."""
         self.table.finish_load(label)
 
     def forward(
@@ -573,9 +573,42 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        view = self.table.gather_view()
+        view = self.table.storage.view
         if view is not None:
-            return self._gather(indices, view)
+            return self._lookup_inplace(indices, view)
+        return self._lookup_private(indices, forward_batch, cp_all_tokens)
+
+    def _lookup_inplace(
+        self,
+        indices: torch.Tensor,
+        view: EngramGatherView,
+    ) -> torch.Tensor:
+        """Every row read in place: no collective, so each rank may pass its own
+        indices (DP attention, CP) and look up only those."""
+        if len(view.w_ptrs) == 1:
+            # This rank stores every row.
+            return self._lookup_local(indices)
+        out = indices.new_empty(*indices.shape, self.dim, dtype=torch.bfloat16)
+        if indices.shape[0] == 0:
+            # An idle DP-attention rank: nothing to read, and no collective owed.
+            return out
+        engram_gather_bf16(
+            indices.to(torch.int32),
+            out.view(indices.shape[0], -1),
+            view.w_ptrs,
+            view.s_ptrs,
+            view.starts,
+        )
+        return out
+
+    def _lookup_private(
+        self,
+        indices: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        cp_all_tokens: bool,
+    ) -> torch.Tensor:
+        """Each rank fills the rows it stores and the TP group sums them, so every
+        rank must hold the same indices: CP and DP attention gather them first."""
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
@@ -586,54 +619,20 @@ class EngramEmbedding(nn.Module):
             )
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
             start = parallel.attn_cp_rank * local_rows
-            return self._lookup(all_indices)[start : start + local_rows]
+            return self._lookup_and_reduce(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
-        return self._lookup(indices)
+        return self._lookup_and_reduce(indices)
 
-    def _gather(self, indices: torch.Tensor, view) -> torch.Tensor:
-        """Every row read in place: no collective, so each rank may pass its own
-        indices (DP attention, CP) and look up only those."""
-        if len(view.w_ptrs) == 1 and not _cuda_kernels(indices):
-            # One shard owning every row: the reference lookup, nothing to reduce.
-            return self._owned_rows(indices)
-        out = self._empty(indices)
+    def _lookup_and_reduce(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.shape[0] == 0:
-            return out
-        if len(view.w_ptrs) == 1:
-            engram_gather(
-                view.w_ptrs[0],
-                view.s_ptrs[0],
-                indices.reshape(-1),
-                out.view(-1, self.dim),
-                self.dim,
-                FP8_BLOCK_SIZE,
-            )
-            return out
-        from sglang.kernels.ops.embeddings.engram_peer_gather import (
-            engram_gather_bf16,
-        )
-
-        engram_gather_bf16(
-            indices.to(torch.int32),
-            out.view(indices.shape[0], -1),
-            view.w_ptrs,
-            view.s_ptrs,
-            view.starts,
-        )
-        return out
-
-    def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        """Lookup when every TP rank holds the same indices: the device and
-        per-rank host shards zero unowned rows and the all-reduce reassembles."""
-        if indices.shape[0] == 0:
-            return self._empty(indices)
-        values = self._owned_rows(indices)
+            return indices.new_empty(*indices.shape, self.dim, dtype=torch.bfloat16)
+        values = self._lookup_local(indices)
         if self.tp_size > 1:
-            values = self._reduce_owned_rows(values)
+            values = self._all_reduce(values)
         return values
 
-    def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(self, values: torch.Tensor) -> torch.Tensor:
         if _is_hip and values.is_cuda:
             # Integer addition preserves all BF16 bits because exactly one shard owns each row.
             inplace_all_reduce(
@@ -642,25 +641,24 @@ class EngramEmbedding(nn.Module):
             return values
         return tensor_model_parallel_all_reduce(values)
 
-    def _empty(self, indices: torch.Tensor) -> torch.Tensor:
-        return torch.empty(
-            *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
-        )
-
-    def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
-        """Rows of `indices` this rank's shard holds, zero for the rest."""
+    def _lookup_local(self, indices: torch.Tensor) -> torch.Tensor:
+        """Rows of ``indices`` this rank stores, dequantized; zero for the rest
+        (none when the rank stores the whole table)."""
+        out = indices.new_empty(*indices.shape, self.dim, dtype=torch.bfloat16)
+        if indices.numel() == 0:
+            return out
         if self.num_rows == 0:
-            return self._empty(indices).zero_()
+            return out.zero_()
         if not _cuda_kernels(indices):
+            del out  # NOTE: out not used in this path
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.num_rows)
             local = local.masked_fill(~owned, 0)
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
-        engram_gather(
-            *self.table.ptrs,
+        engram_gather_triton(
+            *self.table.storage.ptrs,
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
@@ -671,7 +669,9 @@ class EngramEmbedding(nn.Module):
         return out
 
     def _dp_sharded_lookup(
-        self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
+        self,
+        indices: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
@@ -682,8 +682,8 @@ class EngramEmbedding(nn.Module):
         # The MAX_LEN gather may zero its local input in place, hence the clone.
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
-            return self._empty(indices)
-        values = self._owned_rows(ids_global).view(rows, -1)
+            return indices.new_empty(*indices.shape, self.dim, dtype=torch.bfloat16)
+        values = self._lookup_local(ids_global).view(rows, -1)
         local = torch.empty(
             (indices.shape[0], values.shape[1]),
             dtype=values.dtype,
@@ -703,7 +703,7 @@ class EngramEmbedding(nn.Module):
             else:
                 dp_reduce_scatter_tensor(local, values)
         else:
-            dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
+            dp_scatter(local, self._all_reduce(values), forward_batch)
         return local.view(*indices.shape, self.dim)
 
 

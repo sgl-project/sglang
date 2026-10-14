@@ -61,7 +61,7 @@ struct GatherShape {
 };
 
 // Measured on H200: the 4-row warp never loses, and wins 7-14% at 1K-16K rows.
-using GatherShapeBf16 = GatherShape<1, 4>;
+using GatherShapeBF16 = GatherShape<1, 4>;
 
 template <uint32_t kWorldSize>
 struct GatherBf16Params {
@@ -178,7 +178,7 @@ struct EngramGather {
       params.w[r] = reinterpret_cast<const uint8_t*>(w_ptrs[r]) - shard_starts[r] * kHeadDim;
       params.s[r] = reinterpret_cast<const uint8_t*>(s_ptrs[r]) - shard_starts[r] * kScalesPerRow;
     }
-    using Shape = GatherShapeBf16;
+    using Shape = GatherShapeBF16;
     const auto num_warps = num_tokens * Shape::kWarpsPerToken;
     LaunchKernel(div_ceil(num_warps, Shape::kWarpsPerCTA), Shape::kCTASize, dev.unwrap())(
         gather_bf16_kernel<kWorldSize, Shape>, params);

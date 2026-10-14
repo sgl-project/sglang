@@ -7,8 +7,6 @@ import tvm_ffi
 from sglang.kernels.jit.utils.common import cache_once, lazy_register_class
 from sglang.kernels.jit.utils.compile import cuda_stubs_dir, load_jit
 
-__all__ = ["VMMHostMemory"]
-
 
 @cache_once
 def _jit_vmm_module() -> tvm_ffi.Module:

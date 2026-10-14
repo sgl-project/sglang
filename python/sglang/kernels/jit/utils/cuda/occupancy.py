@@ -8,8 +8,6 @@ from sglang.kernels.jit.utils.compile import load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-__all__ = ["NoSchedulableClustersError", "get_max_active_clusters"]
-
 
 class NoSchedulableClustersError(ValueError):
     """The occupancy query succeeded, but no cluster fits the requested shape."""
