@@ -100,90 +100,23 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
-# ComfyUI's detect_unet_config needs a BF16 safetensors' keys; GGUF only
-# overrides the DiT weights. Each architecture needs its own companion file,
-# never MiniMax-H3's regardless of what GGUF is actually being loaded.
-_GGUF_DETECT_COMPANIONS: dict[str, list[str]] = {
-    "minimax_h3": [
-        "minimax_h3_fl2va_bf16.safetensors",
-        "minimax_h3_ref2va_bf16.safetensors",
-    ],
-    "flux": [
-        "flux1-dev.safetensors",
-        "flux1-schnell.safetensors",
-    ],
-    "qwen_image": ["qwen_image_bf16.safetensors"],
-    "qwen_image_edit": ["qwen_image_edit_bf16.safetensors"],
-    "lumina2": ["z_image_turbo_bf16.safetensors"],
-}
-
-_GGUF_NAME_HINTS: dict[str, tuple[str, ...]] = {
-    "minimax_h3": ("minimax_h3", "minimax-h3"),
-    "qwen_image_edit": ("qwen_image_edit", "qwen-image-edit"),
-    "qwen_image": ("qwen_image", "qwen-image"),
-    "flux": ("flux",),
-    "lumina2": ("z_image", "z-image", "lumina", "zimage"),
-}
-
-
-def _infer_gguf_model_type(gguf_ref: str, model_type_hint: str | None) -> str | None:
-    if model_type_hint and model_type_hint in _GGUF_DETECT_COMPANIONS:
-        return model_type_hint
-    name = os.path.basename(gguf_ref).lower()
-    for model_type, needles in _GGUF_NAME_HINTS.items():
-        if any(needle in name for needle in needles):
-            return model_type
-    return None
-
-
-def _h3_detect_companion(gguf_ref: str, model_type_hint: str | None = None) -> str:
-    model_type = _infer_gguf_model_type(gguf_ref, model_type_hint)
-    if model_type is None:
-        raise ValueError(
-            f"Cannot tell which architecture GGUF {gguf_ref!r} is. Set "
-            "model_type on SGLDOptions (not 'auto-detect') so ComfyUI "
-            "architecture detect knows which BF16 safetensors to use."
-        )
-    candidates = list(_GGUF_DETECT_COMPANIONS[model_type])
-    name = os.path.basename(gguf_ref).lower()
-    if model_type == "minimax_h3" and "ref2va" in name:
-        candidates.sort(key=lambda c: "ref2va" not in c)
-    folders = (
-        [os.path.dirname(os.path.abspath(gguf_ref))]
-        if os.path.dirname(gguf_ref)
-        else []
-    )
-    try:
-        import folder_paths
-
-        folders.extend(folder_paths.get_folder_paths("diffusion_models"))
-    except Exception:
-        pass
-    seen: set[str] = set()
-    for folder in folders:
-        if not folder:
-            continue
-        for candidate in candidates:
-            path = os.path.join(folder, candidate)
-            if path in seen:
-                continue
-            seen.add(path)
-            if os.path.isfile(path):
-                return path
-    raise ValueError(
-        f"GGUF transformer for {model_type!r} needs a matching BF16 "
-        "safetensors in models/diffusion_models for ComfyUI architecture "
-        f"detect (looked for {candidates}). Keep --model-path / unet_name "
-        "on the BF16 file and pass the GGUF via transformer_weights_path."
-    )
-
-
 def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
-        raise ValueError(
-            f"Cannot detect architecture from GGUF {model_path!r}. "
-            "Use a MiniMax-H3 BF16 safetensors for detect."
+        # Same header-only trick as safetensors: tensor names and logical
+        # (unpacked) shapes are all detect_unet_config looks at.
+        if not os.path.isfile(model_path):
+            raise ValueError(
+                f"Cannot detect architecture from GGUF {model_path!r}: it must be "
+                "a local file"
+            )
+        from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+            read_gguf_tensor_meta,
         )
+
+        return {
+            name: _HeaderTensor(meta.logical_shape)
+            for name, meta in read_gguf_tensor_meta(model_path).items()
+        }
     if model_path.endswith(".safetensors"):
         from safetensors import safe_open
 
@@ -565,13 +498,6 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
-        if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(
-                sgld_options["transformer_weights_path"],
-                model_type_hint=(
-                    set_model_type if set_model_type != "auto-detect" else None
-                ),
-            )
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
