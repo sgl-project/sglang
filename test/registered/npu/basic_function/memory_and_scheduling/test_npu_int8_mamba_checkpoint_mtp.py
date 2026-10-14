@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from transformers import AutoTokenizer
 
+from sglang.test.ascend.test_ascend_utils import MODEL_WEIGHTS_DIR
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,11 +17,9 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=3600, suite="full-2-npu-a3", nightly=True)
-
-MODEL = os.environ.get("SGLANG_TEST_MODEL", "/mnt/paas/weights/Qwen3.6-35B-A3B")
-BASE_URL = f"http://127.0.0.1:{find_available_port(10000)}"
-BASE_GPU_ID = os.environ.get("BASE_GPU_ID")
+register_npu_ci(est_time=1200, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=1200, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=1200, suite="full-2-npu-a3", nightly=True)
 
 # The checkpoint pool has an explicit size (3x active slots), not the 2x default.
 MAX_MAMBA_CACHE_SIZE = 64
@@ -73,14 +72,14 @@ def _make_capacity_requests():
     return plan
 
 
-def _generate(payload):
-    response = requests.post(BASE_URL + "/generate", json=payload, timeout=600)
+def _generate(base_url, payload):
+    response = requests.post(base_url + "/generate", json=payload, timeout=600)
     response.raise_for_status()
     return response.json()
 
 
-def _flush_cache():
-    response = requests.post(BASE_URL + "/flush_cache", timeout=60)
+def _flush_cache(base_url):
+    response = requests.post(base_url + "/flush_cache", timeout=60)
     response.raise_for_status()
     time.sleep(1.5)
 
@@ -96,12 +95,12 @@ def _capacity_payload(input_ids):
     }
 
 
-def _generate_capacity_request(input_ids):
-    return _generate(_capacity_payload(input_ids))
+def _generate_capacity_request(base_url, input_ids):
+    return _generate(base_url, _capacity_payload(input_ids))
 
 
-def _measure_running_server(int8_enabled, mtp_enabled, plan, answer_prompt):
-    info_response = requests.get(BASE_URL + "/server_info", timeout=30)
+def _measure_running_server(base_url, int8_enabled, mtp_enabled, plan, answer_prompt):
+    info_response = requests.get(base_url + "/server_info", timeout=30)
     info_response.raise_for_status()
     server_info = info_response.json()
     assert server_info["max_mamba_cache_size"] == MAX_MAMBA_CACHE_SIZE
@@ -111,18 +110,25 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan, answer_prompt):
     has_draft_tokens = bool(server_info.get("speculative_num_draft_tokens"))
     assert has_draft_tokens is mtp_enabled
 
-    _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, answer_prompt)
+    _check_cached_output_matches_recompute(
+        base_url, int8_enabled, mtp_enabled, answer_prompt
+    )
 
     results = {}
     for K, (warm, probe) in plan.items():
-        _flush_cache()
+        _flush_cache(base_url)
         with ThreadPoolExecutor(PARALLEL) as executor:
-            list(executor.map(_generate_capacity_request, warm))
+            list(
+                executor.map(
+                    lambda ids: _generate_capacity_request(base_url, ids), warm
+                )
+            )
         with ThreadPoolExecutor(PARALLEL) as executor:
             metadata = [
                 response["meta_info"]
                 for response in executor.map(
                     lambda ids: _generate(
+                        base_url,
                         {
                             "input_ids": ids,
                             "sampling_params": {
@@ -130,7 +136,7 @@ def _measure_running_server(int8_enabled, mtp_enabled, plan, answer_prompt):
                                 "max_new_tokens": 1,
                                 "ignore_eos": True,
                             },
-                        }
+                        },
                     ),
                     probe,
                 )
@@ -192,7 +198,7 @@ def _make_answer_prompt(tokenizer):
     return prompt
 
 
-def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, prompt):
+def _check_cached_output_matches_recompute(base_url, int8_enabled, mtp_enabled, prompt):
     """Check a short answer after reuse and observe runtime MTP acceptance."""
     answer_request = {
         "text": prompt,
@@ -202,11 +208,11 @@ def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, prompt):
         },
     }
 
-    _flush_cache()
-    recompute = _generate(answer_request)
-    _flush_cache()
-    _generate(answer_request)
-    cached = _generate(answer_request)
+    _flush_cache(base_url)
+    recompute = _generate(base_url, answer_request)
+    _flush_cache(base_url)
+    _generate(base_url, answer_request)
+    cached = _generate(base_url, answer_request)
     assert cached["meta_info"]["cached_tokens"] > 0, (
         "the repeated prompt must hit the cache"
     )
@@ -234,7 +240,7 @@ def _check_cached_output_matches_recompute(int8_enabled, mtp_enabled, prompt):
                 "ignore_eos": True,
             },
         }
-        mtp_cached = _generate(long_request)
+        mtp_cached = _generate(base_url, long_request)
         meta = mtp_cached["meta_info"]
         assert meta["cached_tokens"] > 0, "MTP request must also use the cached prefix"
         assert meta.get("spec_accept_length", 0) > 1.0, (
@@ -267,74 +273,99 @@ def _collapse_point(results):
 class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
     """Exercise int8 checkpoint reuse with NPU MTP enabled and disabled."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.model = os.environ.get(
+            "SGLANG_TEST_MODEL",
+            os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.6-35B-A3B"),
+        )
+        cls.base_url = f"http://127.0.0.1:{find_available_port(10000)}"
+        cls.env = os.environ.copy()
+        cls.env.update(NPU_ENV)
+        cls.base_gpu_id = cls.env.get("BASE_GPU_ID")
+        cls.common_args = [
+            "--skip-server-warmup",
+            "--trust-remote-code",
+            "--device",
+            "npu",
+            "--tp-size",
+            "2",
+            "--attention-backend",
+            "ascend",
+            "--mem-fraction-static",
+            "0.8",
+            "--mamba-radix-cache-strategy",
+            "extra_buffer",
+            "--mamba-ssm-dtype",
+            "bfloat16",
+            "--max-mamba-cache-size",
+            str(MAX_MAMBA_CACHE_SIZE),
+        ]
+        if cls.base_gpu_id is not None:
+            cls.common_args += ["--base-gpu-id", cls.base_gpu_id]
+
     def test_checkpoint_capacity_and_cache_hit_correctness(self):
         plan = _make_capacity_requests()
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL, trust_remote_code=True, use_fast=True
+            self.model, trust_remote_code=True, use_fast=True
         )
         answer_prompt = _make_answer_prompt(tokenizer)
         measurements = {}
         for mtp_enabled in (False, True):
             for int8_enabled in (False, True):
-                # Start a single server for each feature combination, check its
-                # resolved configuration, and keep one capacity sweep per server.
-                if mtp_enabled:
-                    args = [
-                        "--speculative-algorithm",
-                        "NEXTN",
-                        "--speculative-num-steps",
-                        "3",
-                        "--speculative-eagle-topk",
-                        "1",
-                        "--speculative-num-draft-tokens",
-                        "4",
-                    ]
-                else:
-                    args = []
-                args += [
-                    # Exercise text requests directly; the generic multimodal
-                    # warmup uses a fake image and is unrelated to this test.
-                    "--skip-server-warmup",
-                    "--trust-remote-code",
-                    "--device",
-                    "npu",
-                    "--tp-size",
-                    "2",
-                    "--attention-backend",
-                    "ascend",
-                    "--mem-fraction-static",
-                    "0.8",
-                    "--mamba-radix-cache-strategy",
-                    "extra_buffer",
-                    "--mamba-ssm-dtype",
-                    "bfloat16",
-                    "--max-mamba-cache-size",
-                    str(MAX_MAMBA_CACHE_SIZE),
-                ]
-                if BASE_GPU_ID is not None:
-                    args += ["--base-gpu-id", BASE_GPU_ID]
-                if int8_enabled:
-                    args += [
-                        "--enable-int8-mamba-checkpoint",
-                        "--int8-mamba-ckpt-size",
-                        str(INT8_MAMBA_CKPT_SIZE),
-                    ]
+                with self.subTest(mtp=mtp_enabled, int8=int8_enabled):
+                    # Start one server per feature combination and keep a full
+                    # capacity sweep under that server configuration.
+                    other_args = [*self.common_args]
+                    if mtp_enabled:
+                        other_args += [
+                            "--speculative-algorithm",
+                            "NEXTN",
+                            "--speculative-num-steps",
+                            "3",
+                            "--speculative-eagle-topk",
+                            "1",
+                            "--speculative-num-draft-tokens",
+                            "4",
+                        ]
+                    if int8_enabled:
+                        other_args += [
+                            "--enable-int8-mamba-checkpoint",
+                            "--int8-mamba-ckpt-size",
+                            str(INT8_MAMBA_CKPT_SIZE),
+                        ]
 
-                process = popen_launch_server(
-                    MODEL,
-                    BASE_URL,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=args,
-                    env=NPU_ENV,
-                    device="npu",
-                )
-                try:
-                    measurements[(mtp_enabled, int8_enabled)] = _measure_running_server(
-                        int8_enabled, mtp_enabled, plan, answer_prompt
+                    process = popen_launch_server(
+                        self.model,
+                        self.base_url,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        other_args=other_args,
+                        env=self.env,
+                        device="npu",
                     )
-                finally:
-                    terminate_and_kill_process_tree(process, terminate_timeout=60)
-                    time.sleep(2)
+                    try:
+                        measurements[(mtp_enabled, int8_enabled)] = (
+                            _measure_running_server(
+                                self.base_url,
+                                int8_enabled,
+                                mtp_enabled,
+                                plan,
+                                answer_prompt,
+                            )
+                        )
+                    finally:
+                        terminate_and_kill_process_tree(process, terminate_timeout=60)
+                        time.sleep(2)
+
+        expected_combinations = {
+            (mtp_enabled, int8_enabled)
+            for mtp_enabled in (False, True)
+            for int8_enabled in (False, True)
+        }
+        if measurements.keys() != expected_combinations:
+            # Failed subtests are already recorded; compare capacity only when
+            # every server configuration completed successfully.
+            return
 
         for mtp_enabled in (False, True):
             off = measurements[(mtp_enabled, False)]
