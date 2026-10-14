@@ -33,7 +33,7 @@ jobs:
             );
             const match = pattern.exec(pr.title);
             const hardware = match?.[2];
-            // Acronyms/model identifiers are uppercase; brands retain their spelling.
+            // Hardware is uppercase except for these four canonical brand spellings.
             const brands = ['Intel', 'Apple', 'Huawei', 'Ascend'];
             const brand = brands.find(name => name.toLowerCase() === hardware?.toLowerCase());
             const validHardware = !hardware || hardware === (brand || hardware.toUpperCase());
@@ -45,7 +45,7 @@ jobs:
                 `Type must be one of: ${types.join(', ')}. ` +
                 'Scope is required and may be any module or model name, with unrestricted letter case ' +
                 '(letters, numbers, dots, underscores, slashes, or hyphens). ' +
-                'Hardware is optional; use a single tag without spaces. Use uppercase acronyms/model identifiers (AMD, NVIDIA, MI300X), or canonical brand spelling (Intel, Apple, Huawei, Ascend). ' +
+                'Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. ' +
                 'Reverts must use GitHub\'s default format: Revert "original title". ' +
                 'Use one space between fields and after the colon, with a non-empty title ' +
                 'and no leading or trailing whitespace. ' +

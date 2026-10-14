@@ -3,7 +3,7 @@
 <!-- PR title: [Type] scope: title, or [Type] [Hardware] scope: title.
 Type: Feat, Fix, Refactor, Perf, Doc, Test, CI, or Chore.
 Scope: any module or model name (no fixed list or letter-case restriction), e.g. attention, qwen3, or flash-attn.
-Hardware: optional single tag without spaces. Use uppercase acronyms/model identifiers (AMD, NVIDIA, MI300X), or canonical brand spelling (Intel, Apple, Huawei, Ascend).
+Hardware: optional single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend.
 Title: no letter-case restriction.
 Reverts: use GitHub's default title, Revert "original title".
 Examples: [Fix] attention: Fix KV cache indexing; [Perf] [AMD] flash-attn: Optimize decode performance. -->

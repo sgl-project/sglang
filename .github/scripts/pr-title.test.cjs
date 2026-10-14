@@ -8,8 +8,31 @@ const workflow = readFileSync(
   resolve(__dirname, '../workflows/pr-title.yml'),
   'utf8'
 );
-const script = workflow.split('          script: |\n')[1]
-  .split('\n').map(line => line.replace(/^ {12}/, '')).join('\n');
+function extractScript(source) {
+  const lines = source.split('\n');
+  const step = lines.findIndex(line => /^\s*- name: Validate PR title\s*$/.test(line));
+  assert.notEqual(step, -1, 'Missing PR title validation step');
+  const stepIndent = lines[step].match(/^ */)[0].length;
+  for (let i = step + 1; i < lines.length; i++) {
+    if (lines[i].trim() && lines[i].match(/^ */)[0].length <= stepIndent) break;
+    const header = /^( *)script: \|[-+]?\s*$/.exec(lines[i]);
+    if (!header) continue;
+    const body = [];
+    let indent;
+    for (const line of lines.slice(i + 1)) {
+      if (!line.trim()) { body.push(''); continue; }
+      const spaces = line.match(/^ */)[0].length;
+      if (spaces <= header[1].length) break;
+      indent ??= spaces;
+      assert.ok(spaces >= indent, 'Invalid script block indentation');
+      body.push(line.slice(indent));
+    }
+    assert.ok(body.some(line => line.trim()), 'Empty PR title validation script');
+    return body.join('\n').trimEnd();
+  }
+  assert.fail('Missing PR title validation script');
+}
+const script = extractScript(workflow);
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const checkTitle = new AsyncFunction('github', 'context', 'core', script);
 
@@ -39,6 +62,8 @@ const valid = [
   '[Feat] Qwen3.5: add model support',
   '[Fix] Flash-Attn: FIX OUTPUT',
   '[Fix] [Apple] MLX: fix output',
+  '[Fix] [HYGON] cpu: Fix output',
+  '[Fix] [QUALCOMM] cpu: Fix output',
   '[Fix] [Huawei] model/Qwen3: Fix output',
   '[Fix] [Ascend] attention: Fix output',
   '[Perf] [TPU] Attention: optimize decode',
@@ -61,6 +86,8 @@ const valid = [
 ];
 
 const invalid = [
+  '[Fix] [Hygon] cpu: Fix output',
+  '[Fix] [Qualcomm] cpu: Fix output',
   ...['amd', 'Amd', 'nvidia', 'Nvidia', 'intel', 'INTEL',
        'apple', 'APPLE', 'huawei', 'HUAWEI', 'ascend', 'ASCEND',
        'tpu', 'Tpu', 'mi300x', 'Mi300X']
@@ -114,5 +141,67 @@ for (const title of invalid) {
     assert.equal(failures.length, 1);
     assert.match(failures[0], /\[Type\] scope: title/);
     assert.match(failures[0], /\[Type\] \[Hardware\] scope: title/);
+  });
+}
+
+for (const indicator of ['|-', '|+']) {
+  test(`extract script with ${indicator}`, () => {
+    assert.equal(extractScript(workflow.replace('script: |', `script: ${indicator}`)), script);
+  });
+}
+test('extract script without absorbing later steps', () => {
+  const extended = workflow + '      - name: Later step\n        run: echo done\n';
+  assert.equal(extractScript(extended), script);
+});
+test('extract script with different indentation', () => {
+  const indented = workflow.split('\n').map(line => '  ' + line).join('\n');
+  assert.equal(extractScript(indented), script);
+});
+
+// Read the actual title templates without executing release scripts or creating PRs.
+function loadSource(path) {
+  return readFileSync(resolve(__dirname, '../..', path), 'utf8');
+}
+function expand(template, variables) {
+  return template.replace(/\$\{([A-Z_]+)\}/g, (_, name) => {
+    assert.ok(Object.hasOwn(variables, name), `Missing variable ${name}`);
+    return variables[name];
+  });
+}
+function titleTemplate(path) {
+  const match = /--title "([^"\n]+)"/.exec(loadSource(path));
+  assert.ok(match, `Missing title in ${path}`);
+  return match[1];
+}
+for (const versionType of ['SGLang', 'sgl-kernel', 'flashinfer', 'docs install']) {
+  test(`release helper title for ${versionType}`, async () => {
+    const title = expand(titleTemplate('scripts/release/commit_and_pr.sh'), {
+      VERSION_TYPE: versionType, NEW_VERSION: '1.2.3',
+    });
+    assert.deepEqual(await validate(title), []);
+  });
+}
+test('kernel sync helper title', async () => {
+  const title = expand(titleTemplate('scripts/release/commit_and_pr_kernel_to_sglang.sh'), {
+    KERNEL_VERSION: '1.2.3',
+  });
+  assert.deepEqual(await validate(title), []);
+});
+for (const path of ['.github/workflows/sync-lmsys-sglang-blogs.yml',
+                    '.github/workflows/weekly-update-est-time.yml']) {
+  test(`automated title in ${path}`, async () => {
+    assert.deepEqual(await validate(titleTemplate(path)), []);
+  });
+}
+const cherryPick = loadSource('.github/workflows/bot-cherry-pick.yml');
+const cherryPickTemplates = [...cherryPick.matchAll(/CHERRY_PICK_TITLE="([^"\n]+)"/g)];
+assert.equal(cherryPickTemplates.length, 2);
+for (const [i, match] of cherryPickTemplates.entries()) {
+  test(`cherry-pick title variant ${i}`, async () => {
+    const title = expand(match[1], {
+      TARGET_BRANCH: 'release/v0.5.7', PR_TITLE: 'Legacy title without a scope',
+      SOURCE_PR: '#123', SHORT_SHA: 'abcdef12',
+    });
+    assert.deepEqual(await validate(title), []);
   });
 }
