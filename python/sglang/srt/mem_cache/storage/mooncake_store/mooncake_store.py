@@ -157,7 +157,10 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
+            # Fall back to MOONCAKE_PROTOCOL (not its default) so an image or
+            # deployment that sets it, e.g. MOONCAKE_PROTOCOL=efa, is honored
+            # when the config file omits "protocol".
+            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
@@ -236,7 +239,8 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
+            # See from_file(): honor MOONCAKE_PROTOCOL when "protocol" is omitted.
+            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=extra_config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
