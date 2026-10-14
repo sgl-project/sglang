@@ -27,7 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing-subscriber = { workspace = true }
 dynamo-parsers = "=9.2.8"
 dynamo-protocols = "7.0.0"
-dynamo-renderer = "7.0.1"
+dynamo-renderer = "7.1.1"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "tokio"] }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
 regex-syntax = "=0.8.11"
