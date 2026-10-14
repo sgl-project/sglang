@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Callable, Union
+from typing import TYPE_CHECKING, Any, Callable, Union
 
 import torch
 
@@ -12,7 +12,17 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
 )
 
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
+
+def rollout_transition(batch: Req) -> Callable[..., torch.FloatTensor] | None:
+    """The ``transition`` to pass to ``scheduler.step`` for this request: the
+    visual-stream rollout controller, or None to keep the scheduler's own update."""
+    rollout = batch.rollout_controllers.get("visual")
+    return None if rollout is None else rollout.transition
 
 
 class FlowRolloutController:
@@ -30,6 +40,7 @@ class FlowRolloutController:
         log_prob_no_const: bool,
         debug_mode: bool,
         sde_step_indices: list[int] | None,
+        generator: Union[torch.Generator, list[torch.Generator]],
         shard_for_sp: Callable[[torch.Tensor], torch.Tensor],
         gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
@@ -40,6 +51,7 @@ class FlowRolloutController:
         self.log_prob_no_const = log_prob_no_const
         self.debug_mode = debug_mode
         self.sde_step_indices = sde_step_indices
+        self.generator = generator
         # Shard a full-shape tensor to this rank / gather [B, T, ...] stacks back.
         self.shard_for_sp = shard_for_sp
         self.gather_for_sp = gather_for_sp
@@ -108,6 +120,35 @@ class FlowRolloutController:
             rollout_prev_sample_means=prev_sample_means.cpu(),
             rollout_noise_std_devs=noise_std_devs.cpu(),
             rollout_model_outputs=model_outputs.cpu(),
+        )
+
+    def transition(
+        self,
+        *,
+        model_output: torch.FloatTensor,
+        sample: torch.FloatTensor,
+        current_sigma: torch.FloatTensor,
+        next_sigma: torch.FloatTensor,
+        dt: torch.FloatTensor,
+        generator: Any,
+        step_index: int,
+        timestep: Any,
+    ) -> torch.FloatTensor:
+        """Stand-in for ``scheduler._transition``, passed as ``step(transition=...)``;
+        ``sample`` arrives already upcast to fp32 by ``step()``.
+
+        Draws variance noise from the request generator captured at creation, so
+        the caller's ``generator`` argument is not used.
+        """
+        if current_sigma.dim() != 0:
+            raise ValueError("Rollout does not support per-token timesteps")
+        return self.flow_sde_sampling(
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            generator=self.generator,
+            step_index=step_index,
         )
 
     def _get_or_create_rollout_noise_buffer(
