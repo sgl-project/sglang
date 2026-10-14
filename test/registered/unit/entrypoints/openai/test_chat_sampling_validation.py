@@ -74,6 +74,7 @@ class TestChatSamplingValidation(CustomTestCase):
         for field, values in (
             ("n", (-1, 0, MAX_N + 1)),
             ("top_logprobs", (-1, 21)),
+            ("temperature", (-0.1, 2.1)),
         ):
             for value in values:
                 with self.subTest(field=field, value=value):
@@ -129,6 +130,20 @@ class TestChatSamplingValidation(CustomTestCase):
                 response = self._post(logprobs=logprobs, top_logprobs=top_logprobs)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["top_logprobs"], top_logprobs)
+
+    def test_temperature_boundaries_and_defaults_are_accepted(self):
+        for params in (
+            {},
+            {"temperature": None},
+            {"temperature": 0.0},
+            {"temperature": 2.0},
+        ):
+            with self.subTest(params=params):
+                response = self._post(**params)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["temperature"], params.get("temperature")
+                )
 
 
 if __name__ == "__main__":

@@ -885,7 +885,9 @@ class ChatCompletionRequest(PDRoutingFields):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(
+        default=None, ge=0.0, le=2.0, allow_inf_nan=False
+    )
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
