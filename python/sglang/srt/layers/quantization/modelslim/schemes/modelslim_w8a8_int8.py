@@ -108,6 +108,37 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         self.kernel.process_weights_after_loading(layer)
 
+    def get_cp_decode_slice_attrs(self, layer, *, row_parallel: bool):
+        """Describe the post-load [input, output] layout, not checkpoint axes."""
+        if not self.is_dynamic: # 测试的模型是动态w8a8，静态的可能不一样，未测试
+            raise ValueError("CP decode attention TP requires dynamic ModelSlim W8A8")
+
+        attrs = [(layer, "weight", 0 if row_parallel else 1)]
+        if not row_parallel:
+            # Scales/offsets are per output channel. Row shards still produce
+            # every output channel, so their scales/offsets must stay complete.
+            attrs.extend(
+                (layer, name, 0) for name in ("weight_scale", "weight_offset")
+            )
+        return attrs
+
+    def prepare_cp_decode_weight(self, weight, dim, rank, size):
+        from sglang.srt.hardware_backend.npu.utils import (
+            NPUACLFormat,
+            npu_format_cast,
+        )
+
+        # Narrow logical ND axes, then repack the local matrix for the GEMM.
+        # A view into a full FRACTAL_NZ tensor is not a packed local weight.
+        nd = torch.ops.npu.npu_format_cast(weight, NPUACLFormat.ACL_FORMAT_ND.value)
+        width = nd.shape[dim] // size
+        # A dim-0 shard can already be contiguous but still aliases a larger
+        # allocation. Own the local storage before converting its NZ descriptor.
+        local = nd.narrow(dim, rank * width, width).clone(
+            memory_format=torch.contiguous_format
+        )
+        return npu_format_cast(local, NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
