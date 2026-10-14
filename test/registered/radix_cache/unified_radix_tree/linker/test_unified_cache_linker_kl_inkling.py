@@ -1,9 +1,5 @@
-"""Bit-exact KL tests for the Mooncake direct linker on a FULL + SWA + Mamba model.
-
-The shrunken Inkling checkpoint scores every token identically in prefill and
-decode under deterministic inference, so a nonzero KL here means a state
-restored from Mooncake (KV, SWA window or Mamba checkpoint) is wrong.
-"""
+"""Bit-exact KL for the Mooncake direct linker on Inkling (FULL + SWA + Mamba):
+prefill and decode score identically, so any nonzero KL is a wrong restored state."""
 
 import os
 import unittest
@@ -27,12 +23,12 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=900, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
 
-# Measured 0; the floor only absorbs a stray ulp under the strict `<`.
+# Measured 0; the floor only absorbs the strict `<`.
 KL_DIV_THRESHOLD = 1e-9
 PAGE_SIZE = 128
 TRACK_INTERVAL = 128
@@ -83,13 +79,11 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
     def test_load_back_after_flush(self):
         """Every second-turn prefix comes back from Mooncake alone."""
         first_turn = [list(ids[:1024]) for ids in self.input_ids]
-        _flush_cache(self.base_url)
         histories = [
             ids + _generate(self.base_url, [ids], 256)[0]["output_ids"]
             for ids in first_turn
         ]
 
-        # Drop the device tree; Mooncake keeps what the first turn offloaded.
         _flush_cache(self.base_url)
         sequences, logprobs = [], []
         for history, suffix in zip(

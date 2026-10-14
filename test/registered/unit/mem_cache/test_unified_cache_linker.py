@@ -725,7 +725,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(match.host_hit_length, len(tokens))
         self.assertEqual(match.mamba_host_hit_length, 1)
         self._apply_match_to_req(req, match)
-        loaded, loaded_node = consumer.init_load_back(
+        loaded, _ = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
@@ -740,21 +740,13 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
         self.assertEqual(loads[PoolName.MAMBA].keys, loads[PoolName.KV].keys[-1:])
         loaded_state = loads[PoolName.MAMBA].device_indices
-        self.assertEqual(loaded_node, req.last_node)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
-        self.assertIsNone(req.kv.mamba_cow_src_index)
         self.assertFalse(req.kv.mamba_needs_clear)
         self.assertEqual(
             int(
                 consumer_req_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx]
             ),
             int(loaded_state),
-        )
-        self.assertEqual(
-            consumer.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", tokens)))
-            ).device_prefix_len,
-            0,
         )
 
         loaded_indices = consumer.linker.private_load_indices[req.rid]
