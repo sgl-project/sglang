@@ -365,7 +365,11 @@ class EagerReplayGraphs:
                 dsa_indexers=layers.dsa_indexers,
                 mha_companion_layers=layers.mha_companion_layers,
             ),
-            enable_breakable_cuda_graph(),
+            # Inside a prefill-graph step the flag is already set, and leaving a
+            # nested scope would clear it for the rest of that step.
+            nullcontext()
+            if is_in_breakable_cuda_graph()
+            else enable_breakable_cuda_graph(),
         ):
             yield
 

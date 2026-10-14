@@ -269,6 +269,35 @@ class TestLateConsumersInPrefillGraph(CustomTestCase):
         b.prefill_candidates.consume_prefill.assert_called_once_with("inputs", None)
 
 
+class TestBreakContextNesting(CustomTestCase):
+    def test_keeps_the_prefill_graph_flag_set_after_a_nested_run(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            context,
+        )
+
+        graphs = rg.EagerReplayGraphs(
+            name="test", model=None, run_layers=None, buckets=[128], tail_rows=True
+        )
+        graphs._layers = SimpleNamespace(
+            attention_layers=[],
+            moe_layers=[],
+            moe_fusions=[],
+            dsa_indexers=[],
+            mha_companion_layers=[],
+        )
+        with patch.object(
+            rg, "set_tc_piecewise_forward_context", lambda *a, **k: nullcontext()
+        ):
+            with context.enable_breakable_cuda_graph():
+                with graphs._break_context(SimpleNamespace()):
+                    self.assertTrue(rg.is_in_breakable_cuda_graph())
+                self.assertTrue(rg.is_in_breakable_cuda_graph())
+            self.assertFalse(rg.is_in_breakable_cuda_graph())
+            with graphs._break_context(SimpleNamespace()):
+                self.assertTrue(rg.is_in_breakable_cuda_graph())
+            self.assertFalse(rg.is_in_breakable_cuda_graph())
+
+
 class TestStepCaches(CustomTestCase):
     def test_off_under_the_prefill_graph_unless_in_a_replay_graph(self):
         for breakable, replay, allowed in (
