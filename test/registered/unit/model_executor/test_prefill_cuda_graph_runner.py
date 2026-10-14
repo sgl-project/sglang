@@ -753,8 +753,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
-    def _runner(counter):
+    def _runner(counter, is_full_backend=True):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = is_full_backend
         runner.model_runner = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
         )
@@ -778,6 +779,17 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
 
     def test_replay_without_a_layer_transfer_counter(self):
         self._runner(None)._wait_for_layer_loads()
+
+    def test_breakable_replay_keeps_per_layer_load_overlap(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        waiter = threading.Thread(
+            target=self._runner(counter, is_full_backend=False)._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
 
 
 if __name__ == "__main__":

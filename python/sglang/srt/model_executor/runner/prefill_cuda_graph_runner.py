@@ -2244,8 +2244,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _wait_for_layer_loads(self) -> None:
-        # Replay skips the per-layer waits in the pool accessors, so a HiCache or
-        # linker load into this batch must land on every layer before the graph reads it.
+        # Full replay skips the per-layer load waits in the pool accessors; breakable
+        # replay still runs them at its eager breaks.
+        if not self._is_full_backend:
+            return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:
             counter.wait_until(counter.num_layers - 1)
