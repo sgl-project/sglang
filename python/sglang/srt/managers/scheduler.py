@@ -1289,6 +1289,8 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Read on every prefill pass, so cache it.
+        self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3993,6 +3995,24 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _log_schedule_decision(
+        self,
+        can_run_list: List[Req],
+        running_batch: ScheduleBatch,
+        adder: PrefillAdder,
+    ) -> None:
+        # KV budget this pass saw: free now plus what eviction could reclaim.
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        logger.info(
+            f"Schedule prefill: #picked={len(can_run_list)}, "
+            f"#left-in-queue={len(self.waiting_queue)}, "
+            f"#running={len(running_batch.reqs)}, "
+            f"#preempted={len(adder.preempt_list)}, "
+            f"kv-free-tokens={pool_stats.full_available_size}, "
+            f"kv-evictable-tokens={pool_stats.full_evictable_size}, "
+            f"picked-rids={[req.rid for req in can_run_list]}"
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4226,6 +4246,9 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+            # Empty passes are the key signal for head-of-line blocking.
+            if self.log_schedule_decisions:
+                self._log_schedule_decision(can_run_list, running_batch, adder)
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4237,6 +4260,10 @@ class Scheduler(
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        # After the re-queue, so #left-in-queue is what the next pass sees.
+        if self.log_schedule_decisions:
+            self._log_schedule_decision(can_run_list, running_batch, adder)
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
