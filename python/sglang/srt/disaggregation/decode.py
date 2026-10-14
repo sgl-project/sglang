@@ -643,6 +643,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+            if (
+                envs.SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM.get()
+                and self.scheduler.enable_hisparse
+            ):
+                kv_args.local_shm_pool = transfer_kv_pool
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
