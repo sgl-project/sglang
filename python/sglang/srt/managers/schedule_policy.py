@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 import os
 import random
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
@@ -67,7 +67,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache.components import (
+    CacheTransferPhase,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -123,6 +129,11 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
+# Arbitrary; bounds per-round prefix work on the waiting queue.
+WAITING_QUEUE_PREFIX_MATCH_MAX = 128
+# Bound the walk cost using scheduling passes, which agree across TP ranks.
+WAITING_PREFIX_REFRESH_INTERVAL = 32
+
 
 def _ceil_div(value: int, divisor: int) -> int:
     return -(-value // divisor)
@@ -152,69 +163,6 @@ def estimate_prefill_extend_tile_metrics(
         "saved_q_tiles_per_head": saved_tiles,
         "saved_q_tile_ratio": saved_ratio,
     }
-
-
-def match_prefix_for_req(
-    tree_cache: BasePrefixCache,
-    req: Req,
-    token_ids: Optional[array[int]] = None,
-    *,
-    cow_mamba: bool = False,
-    include_req: bool = False,
-):
-    if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
-
-    # unified_kv SWA lives in a per-request ring that's not content-stable and is
-    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
-    # the match by the trailing sliding window so it gets re-prefilled, rewriting
-    # this request's SWA ring. No-op for other layouts.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
-            cow_mamba=cow_mamba,
-            req=req if include_req else None,
-        )
-    )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(
-            tree_cache, match_result, extra_key=req.extra_key
-        )
-    (
-        req.prefix_indices,
-        req.last_node,
-        req.last_host_node,
-        req.best_match_node,
-        req.host_hit_length,
-        req.swa_host_hit_length,
-        req.mamba_host_hit_length,
-    ) = (
-        match_result.device_indices,
-        match_result.last_device_node,
-        match_result.last_host_node,
-        match_result.best_match_node,
-        match_result.host_hit_length,
-        match_result.swa_host_hit_length,
-        match_result.mamba_host_hit_length,
-    )
-    max_len = req._compute_max_prefix_len(len(token_ids))
-    req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
-    )
-    req.swa_branching_seqlen = match_result.swa_branching_seqlen
-    if match_result.mamba_branching_seqlen is not None:
-        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
-    if match_result.cache_protected_len is not None:
-        req.kv.cache_protected_len = match_result.cache_protected_len
-    return match_result
 
 
 class CacheAwarePolicy(Enum):
@@ -253,6 +201,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        self._waiting_prefix_refresh_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -265,26 +214,22 @@ class SchedulePolicy:
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
-        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
-        # set it in _compute_prefix_matches; do the same full match for
-        # cache-agnostic policies when the radix supports it, so the load
-        # snapshot has it. Skip on decode (never prefills).
+        # Cache-agnostic policies sort without matching; match anyway so the load
+        # snapshot sees num_matched_prefix_tokens. Decode never prefills.
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r, include_req=True)
+                match_kv_cache(r, self.tree_cache)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return
-
-        if isinstance(policy, CacheAwarePolicy):
+        elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -328,6 +273,30 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
+        self._touch_waiting_prefixes(policy, waiting_queue)
+
+    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+        # Head last, so LRU evicts in reverse admission order; cache-aware policies
+        # already touch while matching, and other eviction strategies ignore recency.
+        if (
+            isinstance(policy, CacheAwarePolicy)
+            or not waiting_queue
+            or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+            or get_disagg().disaggregation_mode == "decode"
+            or get_memory().radix_eviction_policy.lower() != "lru"
+            or self.tree_cache.supports_fast_match_prefix()
+            or not self.tree_cache.supports_prefix_sharing()
+        ):
+            return
+        refresh = (
+            self._waiting_prefix_refresh_calls % WAITING_PREFIX_REFRESH_INTERVAL == 0
+        )
+        self._waiting_prefix_refresh_calls += 1
+        if not refresh:
+            return
+        for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
+            touch_waiting_prefix(r, self.tree_cache)
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
             self.policy
@@ -335,7 +304,7 @@ class SchedulePolicy:
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
             )
-            and len(waiting_queue) > 128
+            and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
@@ -373,10 +342,6 @@ class SchedulePolicy:
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> Set[int]:
-        """
-        Computes and caches the matching prefixes for requests in the waiting queue,
-            and handles in-batch prefix caching logic.
-        """
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
@@ -384,9 +349,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_prefix_for_req(
-                self.tree_cache, r, prefix_ids, include_req=True
-            )
+            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -395,7 +358,7 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
@@ -409,9 +372,8 @@ class SchedulePolicy:
                     match_result = zero_match_result(
                         self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
-                in_batch_matching_prefixes = match_result.device_indices
                 if (
-                    len(in_batch_matching_prefixes)
+                    match_result.device_prefix_len
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
                     temporary_deprioritized.add(r.rid)
@@ -458,9 +420,7 @@ class SchedulePolicy:
             or budget < 2 * page_size
         ):
             return None
-        remaining = len(chunked_req.full_untruncated_fill_ids) - len(
-            chunked_req.prefix_indices
-        )
+        remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -648,7 +608,14 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
-        self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
+        # Mamba checkpoints only land on page-aligned chunk ends.
+        self.exact_chunk_fill = (
+            _use_exact_chunk_fill()
+            and dllm_config is None
+            and not (
+                tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
+            )
+        )
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -690,8 +657,7 @@ class PrefillAdder:
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
-        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
-        # which would skip the reservation on the chunk-cache path.
+        # ALLOCATOR: the reservation holds with the radix cache disabled too.
         self._mamba_slot_cost = 0
         if isinstance(
             self.token_to_kv_pool_allocator,
@@ -786,12 +752,14 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        # Fixed-length requests cannot benefit from the early-EOS estimate.
+        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * self.new_token_ratio
+            * ratio
         )
 
     @property
@@ -829,20 +797,32 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
         )
 
-    def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+    def _mamba_gap_budget_for_req(
+        self, req: Req, *, include_host_hit: bool = False
+    ) -> int:
+        """Reserve full-token equivalents for shared-pool Mamba state slots.
 
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return self._mamba_slot_cost
-        return 0
+        Admission includes the host checkpoint before load-back binds the
+        request slot. Continuing chunks only need the request-state budget;
+        their host-hit metadata may still describe an already consumed hit.
+        Tracking buffers and radix CoW headroom are not included here.
+        """
+        if not self._mamba_slot_cost:
+            return 0
+        slots = int(not req.kv.holds_mamba)
+        if include_host_hit:
+            slots += req.mamba_host_hit_length
+        return slots * self._mamba_slot_cost
+
+    def _request_slot_reserve_for_req(
+        self, req: Req, *, extend_input_len: Optional[int] = None
+    ) -> int:
+        if extend_input_len is None:
+            extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        return self.token_to_kv_pool_allocator.request_slot_reserve(
+            has_req_pool_slot=req.kv.req_pool_idx is not None,
+            prefill_tokens=req.prefix_len + extend_input_len,
+        )
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -875,6 +855,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         compute_charge: Optional[int] = None,
     ):
@@ -900,15 +881,17 @@ class PrefillAdder:
             max_new_tokens,
             # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
-                mamba_gap_reserve + self.per_req_token_overhead - self.page_size
+                mamba_gap_reserve
+                + request_slot_reserve
+                + self.per_req_token_overhead
+                - self.page_size
             ),
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
+        # Debit every reserved state slot, including the load-back checkpoint.
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1007,9 +990,10 @@ class PrefillAdder:
 
         return trunc_len
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
+    def _add_dllm_req(self, req: Req):
+        prefix_len = req.prefix_len
         trunc_len = self._get_dllm_extend_len(req, prefix_len)
-        req.set_extend_range(prefix_len, prefix_len + trunc_len)
+        req.extend_end = prefix_len + trunc_len
 
         self.can_run_list.append(req)
 
@@ -1021,10 +1005,6 @@ class PrefillAdder:
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
         self._account_prefill_cache_admission(req, prefix_len)
-
-    def _req_inc_lock_ref(self, req: Req):
-        # Persist the release receipt.
-        req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
     def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
         """Reserve scratch or return False to defer; no-op when sharding is off.
@@ -1066,16 +1046,14 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if (
             self.dllm_config.requires_separate_context_encoding
             and req.is_dllm_prefill()
         ):
             cand_extend_input_len = min(
                 cand_extend_input_len,
-                req.dllm_block_offset - len(req.prefix_indices),
+                req.dllm_block_offset - req.prefix_len,
             )
         if (
             req.dllm_incomplete_ids
@@ -1087,7 +1065,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -1098,7 +1076,7 @@ class PrefillAdder:
         )
         self._update_prefill_budget(
             0,
-            req.extend_range.length,
+            req.extend_len,
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
@@ -1123,7 +1101,7 @@ class PrefillAdder:
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
                 # If no budget remains, use a full chunk to make progress.
-                prefix_len = len(req.prefix_indices)
+                prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
@@ -1144,9 +1122,7 @@ class PrefillAdder:
             assert self.chunked_req_limit > 0
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1156,17 +1132,31 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        request_slot_reserve = self._request_slot_reserve_for_req(
+            req, extend_input_len=new_len
+        )
+        if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
+            paged_input=(
+                self.ceil_paged_tokens(new_len)
+                + self.per_req_token_overhead
+                + request_slot_reserve
+            ),
+            extend_input_len=new_len,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=self.rem_chunk_tokens,
+        ):
+            return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
-            prefix_len=len(req.prefix_indices), extend_len=new_len
+            prefix_len=req.prefix_len, extend_len=new_len
         )
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
-            req.extend_range.length,
+            req.extend_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
@@ -1174,39 +1164,40 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
-            compute_charge=req.extend_range.length if self.exact_chunk_fill else None,
+            compute_charge=req.extend_len if self.exact_chunk_fill else None,
         )
 
         # Return if chunked prefill not finished
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode):
-        dec_lock_params = None
+    def _lock_node(self, last_node: TreeNode, *, lock_host: bool = False):
+        host_lock_params = (
+            self.tree_cache.inc_host_lock_ref(last_node).to_dec_params()
+            if lock_host
+            else None
+        )
         try:
-            result = self.tree_cache.inc_lock_ref(last_node)
-            if self.tree_cache.is_tree_cache():
-                # Replay the acquire's receipt (SWA boundary uuid, mamba flag)
-                # so release takes back exactly what this temporary lock took.
-                dec_lock_params = result.to_dec_params()
-            yield None
+            lock = self.tree_cache.lock(last_node)
+            try:
+                yield None
+            finally:
+                self.tree_cache.unlock(lock)
         finally:
-            if dec_lock_params is not None:
-                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
-            else:
-                self.tree_cache.dec_lock_ref(last_node)
+            if host_lock_params is not None:
+                self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
     def add_one_req_ignore_eos(self, req: Req):
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
+        paged_input += self._request_slot_reserve_for_req(req)
         fits = self.memory_budget.can_allocate_prefill(
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
@@ -1283,7 +1274,7 @@ class PrefillAdder:
             ) is not None:
                 return tile_stop
 
-            self._add_dllm_req(req, 0)
+            self._add_dllm_req(req)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -1295,23 +1286,20 @@ class PrefillAdder:
 
             # Non-chunked prefill — the whole sequence is committed this iter.
             if not self._kv_shard_reserve_scratch(
-                prefix_len=len(req.prefix_indices),
+                prefix_len=req.prefix_len,
                 extend_len=cand_extend_input_len,
             ):
                 return AddReqResult.OTHER
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            req.extend_end = len(req.full_untruncated_fill_ids)
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
-                req.extend_range.length,
+                req.extend_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                compute_charge=(
-                    req.extend_range.length if self.exact_chunk_fill else None
-                ),
+                request_slot_reserve=self._request_slot_reserve_for_req(req),
+                compute_charge=(req.extend_len if self.exact_chunk_fill else None),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1327,10 +1315,8 @@ class PrefillAdder:
             if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
                 return AddReqResult.OTHER
 
-            assert len(req.prefix_indices) == 0
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.prefix_indices) + trunc_len
-            )
+            assert req.prefix_len == 0
+            req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
@@ -1339,6 +1325,9 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(
+                    req, extend_input_len=trunc_len
+                ),
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
@@ -1360,16 +1349,23 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
-        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        # Read before `init_load_back` binds `req.mamba_pool_idx` — after that
-        # this returns 0, so the debit sites below reuse the value.
-        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        # Reserve request and load-back state slots before init_load_back binds
+        # the request slot. Reuse this reservation when committing admission.
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)
         total_tokens += mamba_gap_reserve
+        if self.rem_mamba_slots is not None:
+            required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
+            if required_mamba_slots > self.rem_mamba_slots:
+                if (
+                    isinstance(self.tree_cache, UnifiedRadixCache)
+                    and self.tree_cache.buffer_pipeline is not None
+                ):
+                    self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
+                return AddReqResult.NO_TOKEN
+        request_slot_reserve = self._request_slot_reserve_for_req(req)
+        total_tokens += request_slot_reserve
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
@@ -1398,18 +1394,59 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                promised_host_hit = req.host_hit_length
-                loaded = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                load_max_new = min(max_new, admission.max_new_tokens)
+                # Reclaim can write back device victims and evict host leaves.
+                # Pin the selected host/aux match until load-back owns its locks.
+                with (
+                    self._lock_node(req.best_match_node, lock_host=True)
+                    if isinstance(self.tree_cache, UnifiedRadixCache)
+                    else nullcontext()
+                ):
+                    full_load_tokens = req.host_hit_length
+                    if (
+                        self.memory_budget.load_back_needs_full_tokens
+                        and isinstance(self.tree_cache, UnifiedRadixCache)
+                        and self.tree_cache.buffer_pipeline is None
+                        and not (
+                            self.tree_cache.linker is not None
+                            and self.tree_cache.linker.has_hit(req.rid)
+                        )
+                    ):
+                        # Host hits can include resident FULL behind host-only aux.
+                        # Reuse the FULL transfer spec to count only new slots.
+                        full_transfer = (
+                            self.tree_cache.tree_core.build_hicache_transfers(
+                                ComponentType.FULL,
+                                req.best_match_node,
+                                CacheTransferPhase.LOAD_BACK,
+                            )[0]
+                        )
+                        full_load_tokens = len(full_transfer.host_indices)
+                    if not self.memory_budget.prepare_load_back(
+                        full_tokens=(
+                            full_load_tokens
+                            + admission.extend_len
+                            + load_max_new
+                            + self.page_size
+                            + mamba_gap_reserve
+                        ),
+                        extend_input_len=admission.extend_len,
+                        max_new_tokens=load_max_new,
+                        swa_host_hit_length=req.swa_host_hit_length,
+                        chunk_limit=self.rem_chunk_tokens,
+                    ):
+                        return AddReqResult.NO_TOKEN
+                    promised_host_hit = req.host_hit_length
+                    loaded = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
                     )
-                )
                 if loaded is None:
                     return AddReqResult.OTHER
-                new_indices, req.last_node = loaded
-                req.host_loaded_length = len(new_indices)
+                req.host_loaded_length, req.last_node = loaded
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "
@@ -1419,7 +1456,7 @@ class PrefillAdder:
                 if req.host_loaded_length > promised_host_hit:
                     # A load can expose resident FULL behind host-only aux state; its
                     # H2D is queued, so keep the approved budget and shrink the work.
-                    prefix_len = len(req.prefix_indices) + req.host_loaded_length
+                    prefix_len = req.prefix_len + req.host_loaded_length
                     extend_len = admission.extend_len
                     if self.dllm_config is None:
                         extend_len = min(
@@ -1448,8 +1485,9 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.kv.cache_protected_len = len(req.prefix_indices)
+                req.prefix_len += req.host_loaded_length
+                if self.tree_cache.load_back_is_cache_owned():
+                    req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
@@ -1473,7 +1511,7 @@ class PrefillAdder:
         has_chunked_req: bool = False,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
-        prefix_len = len(req.prefix_indices) + host_hit_length
+        prefix_len = req.prefix_len + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
@@ -1548,11 +1586,9 @@ class PrefillAdder:
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
-        assert len(req.prefix_indices) == admission.prefix_len
-        req.set_extend_range(
-            admission.prefix_len, admission.prefix_len + admission.extend_len
-        )
-        self._req_inc_lock_ref(req)
+        assert req.prefix_len == admission.prefix_len
+        req.extend_end = admission.prefix_len + admission.extend_len
+        req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
@@ -1562,6 +1598,9 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=mamba_gap_reserve,
+            request_slot_reserve=self._request_slot_reserve_for_req(
+                req, extend_input_len=admission.extend_len
+            ),
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )
@@ -1598,8 +1637,9 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
-            - len(req.prefix_indices)
+            - req.prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + self._request_slot_reserve_for_req(req)
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

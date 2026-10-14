@@ -19,6 +19,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from sglang.srt.entrypoints.openai.protocol import (
+    DecisionImage,
     DecisionText,
     RequiredDecisionText,
     check_option_names,
@@ -92,6 +93,8 @@ SystemOneQuestion = Annotated[
 class SystemOneRequest(BaseModel):
     # Unknown top-level fields are ignored, as the published schema allows.
     state: DecisionText
+    # SGLang extension, using the native chat image format or its url alone.
+    images: List[DecisionImage] = Field(default_factory=list)
     model: str
     questions: Dict[str, SystemOneQuestion] = Field(min_length=1)
     # SGLang extension, for chat templates whose reasoning toggle needs a kwarg.
