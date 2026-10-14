@@ -538,6 +538,59 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
 
 # ========================================================================
+# Score mixin: _build_token_id_inputs stacked path
+# ========================================================================
+
+
+def _stacked(n_rows: int, val: float = 1.0) -> torch.Tensor:
+    return torch.full((n_rows, HIDDEN_DIM), val, dtype=torch.float32)
+
+
+class TestBuildTokenIdInputsStacked(CustomTestCase):
+    def setUp(self):
+        self.mixin = _FakeMixin()
+
+    def test_single_item_stacked_none_slot(self):
+        stacked = _stacked(2, 5.0)
+        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked, None],
+        )
+        self.assertEqual(input_ids, [[50, 10, 20, 50], [50, 10, 30, 40]])
+        self.assertEqual(len(pe_overrides), 2)
+        self.assertIs(pe_overrides[0].embeds, stacked)
+        self.assertEqual(pe_overrides[0].positions, [0, 3])
+        self.assertIsNone(pe_overrides[1])
+
+    def test_multi_item_stacked_used_as_is(self):
+        # One fused sequence; placeholders: query pos 0, item[0] pos 4
+        # (query_len 2 + delim 1 + idx 1). item[1] has no placeholder.
+        stacked = _stacked(2, 9.0)
+        _, input_ids, pe_overrides, delim = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=True,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked],
+        )
+        self.assertEqual(
+            input_ids, [[50, 10, DELIM_TOKEN, 20, 50, DELIM_TOKEN, 30, 40, DELIM_TOKEN]]
+        )
+        self.assertEqual(len(pe_overrides), 1)
+        self.assertEqual(pe_overrides[0].positions, [0, 4])
+        self.assertIs(pe_overrides[0].embeds, stacked)
+
+
+# ========================================================================
 # Score mixin: score_request validation
 # ========================================================================
 
