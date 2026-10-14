@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 from sglang_simulator.simulation.manager.env import Envs
@@ -22,6 +23,7 @@ class ConfigManager:
     _platform_config: PlatformConfig | None = None
     _scheduler_config: SchedulerConfig | None = None
     _raw_config: dict | None = None
+    _memory_budget_metrics: dict | None = None
 
     @classmethod
     def _get_raw_config(cls) -> dict:
@@ -66,6 +68,19 @@ class ConfigManager:
         cls._model_info = None
         cls._platform_config = None
         cls._scheduler_config = None
+        cls._memory_budget_metrics = None
+
+    @classmethod
+    def get_memory_budget_config(cls):
+        return cls._get_raw_config().get("memory_budget")
+
+    @classmethod
+    def set_memory_budget_metrics(cls, metrics: dict | None):
+        cls._memory_budget_metrics = metrics
+
+    @classmethod
+    def get_memory_budget_metrics(cls):
+        return cls._memory_budget_metrics
 
     @classmethod
     def set_model_info(cls, model: ModelInfo):
@@ -125,6 +140,17 @@ class ConfigManager:
 
     @classmethod
     def set_scheduler_config(cls, config: SchedulerConfig):
+        cls._apply_scheduler_overrides(config)
+        cls._scheduler_config = config
+
+    @classmethod
+    def get_target_scheduler_config(cls, config: SchedulerConfig) -> SchedulerConfig:
+        target = replace(config)
+        cls._apply_scheduler_overrides(target)
+        return target
+
+    @classmethod
+    def _apply_scheduler_overrides(cls, config: SchedulerConfig):
         # The configuration from the external config file has higher priority.
         external_config = cls._get_raw_config().get("scheduler", {})
         for field_name in [
@@ -150,8 +176,6 @@ class ConfigManager:
             field_value = external_config.get(field_name)
             if field_value is not None:
                 setattr(config, field_name, DataType(field_value))
-
-        cls._scheduler_config = config
 
     @classmethod
     def get_kv_cache_bytes(cls) -> int:
