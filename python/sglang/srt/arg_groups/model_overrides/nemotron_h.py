@@ -84,16 +84,26 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend for "
                 f"{model_arch} with W4A16_NVFP4 MoE layers"
             )
+    elif (
+        uses_expert_remap
+        and cfg.moe_runner_backend == "auto"
+        and get_platform().is_sm100
+        and cfg.moe_a2a_backend == "none"
+    ):
+        # flashinfer_trtllm routes inside the kernel and cannot take the remap.
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend on sm100 for "
+            f"{model_arch} with EPLB or redundant experts"
+        )
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
         if get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
-            # flashinfer_trtllm routes inside the kernel and cannot take the remap.
-            runner = (
-                "flashinfer_trtllm_routed" if uses_expert_remap else "flashinfer_trtllm"
+            overrides["moe_runner_backend"] = "flashinfer_trtllm"
+            logger.info(
+                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
             )
-            overrides["moe_runner_backend"] = runner
-            logger.info(f"Use {runner} as MoE runner backend on sm100 for {model_arch}")
         elif (
             (
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
