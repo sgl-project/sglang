@@ -85,7 +85,7 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
   <tbody>
     <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>Revision <code>b426279f1833b8e097c7c3781d1efa08aba19309</code>, with BF16 <code>model.layers.72.eh_proj</code> excluded from quantization. Matched full GSM8K: NEXTN 96.89% vs standard 96.97%; stop rate 99.85% vs 99.77%. Acceptance length 2.61 on random tokens and 2.13 on real text.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4 + NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{GB300_NEXTN_SMOKE}}"}</code>; batch-size-1 speed: <code>{"{{GB300_NEXTN_BS1}}"}</code>.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{HICACHE_NEXTN_SMOKE}}"}</code>. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K smoke 98/100, stop rate 100%, acceptance length 2.29; Mooncake/TCP prefetch verified on all 8 TP ranks. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated; unverified by SGLang</td><td style={{padding: "9px 12px"}}>Tuned configurations are available upstream; hardware was unavailable for independent verification.</td></tr>
@@ -153,25 +153,66 @@ The `ling3` parser returns reasoning in `message.reasoning_content` and the fina
 
 <Accordion title="Thinking-on request (Python)">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```python Python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="Ling-3.1-flash",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+)
+print(response.choices[0].message.reasoning_content)
+print(response.choices[0].message.content)
+```
 
 </Accordion>
 
 <Accordion title="Example Output">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```json Output
+{
+  "message": {
+    "role": "assistant",
+    "content": "**36**\n\nHere's the calculation:\n- 15% = 0.15\n- 0.15 × 240 = 36\n\nOr break it down: 10% of 240 = 24, and 5% of 240 = 12, so 24 + 12 = **36**",
+    "reasoning_content": "15% of 240 = 0.15 × 240 = 36.\n\nQuick check: 10% of 240 = 24, 5% = 12, total 36. Correct.",
+    "tool_calls": null
+  },
+  "finish_reason": "stop",
+  "usage": { "prompt_tokens": 32, "completion_tokens": 147, "reasoning_tokens": 59 }
+}
+```
 
 </Accordion>
 
 <Accordion title="Thinking-off request (Python)">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```python Python
+response = client.chat.completions.create(
+    model="Ling-3.1-flash",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(response.choices[0].message.reasoning_content)  # None
+print(response.choices[0].message.content)
+```
 
 </Accordion>
 
 <Accordion title="Example Output">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```json Output
+{
+  "message": {
+    "role": "assistant",
+    "content": "15% of 240 is **36**.\n\nCalculation:\n- 10% of 240 = 24\n- 5% of 240 = 12\n- 24 + 12 = **36**\n\nOr directly: 240 × 0.15 = **36**",
+    "reasoning_content": null,
+    "tool_calls": null
+  },
+  "finish_reason": "stop",
+  "usage": { "prompt_tokens": 33, "completion_tokens": 81, "reasoning_tokens": 0 }
+}
+```
 
 </Accordion>
 
@@ -181,19 +222,68 @@ The `ling3` tool-call parser returns structured calls in `message.tool_calls`, w
 
 <Accordion title="Tool-calling request and follow-up (Python)">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```python Python
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name, e.g. Beijing"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="Ling-3.1-flash",
+    messages=[{"role": "user", "content": "What's the weather like in Hangzhou right now?"}],
+    tools=tools,
+    tool_choice="required",
+)
+call = response.choices[0].message.tool_calls[0]
+print(call.function.name, call.function.arguments)
+# Then call get_weather yourself and send the result back
+# with {"role": "tool", "tool_call_id": call.id, "content": ...}
+```
 
 </Accordion>
 
 <Accordion title="Example Output">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```json Output
+{
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "The user wants to know the current weather in Hangzhou. I'll call the get_weather function with city \"Hangzhou\". The unit parameter is optional - I'll use celsius as default since Hangzhou is in China.",
+    "tool_calls": [
+      {
+        "id": "call_2bae8419df9d44f2bb54c22f",
+        "index": 0,
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\": \"Hangzhou\", \"unit\": \"celsius\"}"
+        }
+      }
+    ]
+  },
+  "finish_reason": "tool_calls"
+}
+```
 
 </Accordion>
 
 ### 3.3 HiCache with Mooncake
 
-The H200 HiCache combination uses Mooncake as L3 prefix storage over TCP and is awaiting a current-revision NEXTN rerun: `{{HICACHE_NEXTN_SMOKE}}`. Start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
+The H200 HiCache combination is verified on the current checkpoint revision with NEXTN: GSM8K smoke 98/100 with stop rate 100%, acceptance length 2.29, and L3 prefetch hits on all 8 TP ranks. Mooncake runs as L3 prefix storage over TCP; start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
 
 <Accordion title="Start Mooncake services">
 
@@ -220,7 +310,15 @@ docker run --rm --network host --ipc=host \
 
 <Accordion title="Example Output">
 
-{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+```text Output
+Master service started on port 50171 ... role=leader, state=serving, service_ready=true
+Client HTTP server started on port 8291
+Starting real client service on 127.0.0.1:50172
+...
+[TP0] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
+[TP1] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
+... (all 8 TP ranks)
+```
 
 </Accordion>
 
