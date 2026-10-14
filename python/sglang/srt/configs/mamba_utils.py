@@ -111,6 +111,8 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
+    # False uses attention TP; True shards persistent state over attention CP.
+    state_shard_on_attn_cp: bool = False
 
     @property
     def mamba_cache_per_req(self) -> int:

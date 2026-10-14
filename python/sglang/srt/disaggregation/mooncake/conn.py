@@ -234,6 +234,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._mamba_state_cp_sharded = getattr(
+            args, "mamba_state_shard_on_attn_cp", False
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1577,7 +1580,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # structure about the state rows, so we don't split them across CP ranks
         # -- just let rank 0 send the whole thing (unless layer split already
         # shards it per rank).
-        if self._should_skip_cp_replicated_state_transfer():
+        # CP-sharded state needs all writers; maybe_send_extra routes each shard.
+        if (
+            self._should_skip_cp_replicated_state_transfer()
+            and not self._mamba_state_cp_sharded
+        ):
             skip_state = True
 
         if not self.is_hybrid_mla_backend:
@@ -1632,6 +1639,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if indices is None:
                 continue
+            if self._mamba_state_cp_sharded:
+                if st == StateType.MAMBA:
+                    dst_size = target_rank_registration_info.dst_attn_tp_size
+                    dst_rank = target_rank_registration_info.dst_tp_rank % dst_size
+                    # KDA heads follow CP; the other state pools are replicated.
+                    if self.attn_cp_size >= dst_size:
+                        if (
+                            self.attn_cp_rank // (self.attn_cp_size // dst_size)
+                            != dst_rank
+                        ):
+                            continue
+                    elif (
+                        dst_rank // (dst_size // self.attn_cp_size) != self.attn_cp_rank
+                    ):
+                        continue
+                elif self._should_skip_cp_replicated_state_transfer():
+                    continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
             src_dim_per_tensor = (
@@ -1695,7 +1719,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 if (
                     target_rank_registration_info is not None
-                    and self.attn_tp_size
+                    and (
+                        self.attn_cp_size
+                        if self._mamba_state_cp_sharded
+                        else self.attn_tp_size
+                    )
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
                     rc = (
@@ -2020,7 +2048,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_state_item_lens,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        if self._mamba_state_cp_sharded:
+            src_state_tp_size = self.attn_cp_size
+            local_tp_rank_in_group = self.attn_cp_rank
+        else:
+            src_state_tp_size = self.attn_tp_size
+            local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
@@ -2059,7 +2092,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=src_state_tp_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,

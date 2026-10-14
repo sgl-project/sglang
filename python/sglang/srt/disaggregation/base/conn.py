@@ -65,6 +65,8 @@ class KVArgs:
     aux_data_lens: List[int]
     aux_item_lens: List[int]
     state_types: List[StateType]
+    # Whether recurrent state is head-sharded over attention CP instead of TP.
+    mamba_state_shard_on_attn_cp: bool = False
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]

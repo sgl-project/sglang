@@ -334,6 +334,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
     def test_mooncake_uses_common_cp_state_policy(self):
         manager = object.__new__(MooncakeKVManager)
+        manager._mamba_state_cp_sharded = False
         manager.attn_cp_size = 8
         manager.attn_cp_rank = 3
         manager.is_hybrid_mla_backend = False

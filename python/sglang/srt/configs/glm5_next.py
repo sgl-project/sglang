@@ -267,9 +267,10 @@ class Glm5NextTextConfig(PretrainedConfig):
         # Shard the state by attn_cp_size instead so it fits the KV cache budget.
         from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
+        use_prefill_cp = is_dsa_enable_prefill_cp()
         head_shard_size = (
             get_parallel().attn_cp_size
-            if is_dsa_enable_prefill_cp()
+            if use_prefill_cp
             else get_parallel().attn_tp_size
         )
 
@@ -280,7 +281,11 @@ class Glm5NextTextConfig(PretrainedConfig):
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
 
-        return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+        return KimiLinearCacheParams(
+            shape=shape,
+            layers=self.linear_layer_ids,
+            state_shard_on_attn_cp=use_prefill_cp,
+        )
 
 
 class Glm5NextVisionConfig(GlmOcrVisionConfig):
