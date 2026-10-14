@@ -66,6 +66,9 @@ def test_wan_cross_launch_selection_cpu(monkeypatch):
         num_cus=256,
     )
     assert self_config.schedule == "wan_self"
+    assert self_config.llvm_fn_attrs == (
+        "amdgpu-sched-strategy=max-ilp,amdgpu-post-ra-direction=topdown"
+    )
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
@@ -154,6 +157,10 @@ def test_gluon_fav3_matches_aiter(
     )
     if expected_schedule == "wan_cross":
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=iterative-ilp"
+    elif expected_schedule == "wan_self":
+        assert config.llvm_fn_attrs == (
+            "amdgpu-sched-strategy=max-ilp,amdgpu-post-ra-direction=topdown"
+        )
     elif seqlen_k <= 512:
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=max-ilp"
     torch.testing.assert_close(
