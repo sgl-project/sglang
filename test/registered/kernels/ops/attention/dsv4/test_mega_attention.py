@@ -484,6 +484,45 @@ class TestMegaAttention(CustomTestCase):
         self.assertTrue(any("core_attn::fwd_kernel" in name for name in names))
         self.assertFalse(any("_dequantize_k_cache_paged" in name for name in names))
 
+        # DSpark's draft uses ordinary queries and supplies no fused RoPE table,
+        # even when the target's launch configuration selects MegaAttention.
+        from sgl_kernel.flash_mla import FlashMLASchedMeta, flash_mla_with_kvcache
+
+        backend.is_dsv41, backend.head_dim_v = True, 512
+        metadata.c1_flashmla_metadata = metadata.c2_flashmla_metadata = (
+            FlashMLASchedMeta()
+        )
+        batch.forward_mode = ForwardMode.DECODE
+        native_q = torch.randn_like(q)
+        draft = backend._forward_attention(
+            native_q,
+            None,
+            None,
+            SimpleNamespace(layer_id=0, tp_q_head_num=64),
+            batch,
+            compress_ratio=ratio,
+            save_kv_cache=False,
+            attn_sink=sink,
+        )
+        reference = flash_mla_with_kvcache(
+            q=native_q[:, None],
+            k_cache=paged_view(main, main_page, 528),
+            head_dim_v=512,
+            block_table=None,
+            cache_seqlens=None,
+            tile_scheduler_metadata=metadata.get_flashmla_metadata(ratio),
+            softmax_scale=512**-0.5,
+            is_fp8_kvcache=True,
+            indices=main_ids[:, None],
+            topk_length=main_lens,
+            attn_sink=sink,
+            extra_k_cache=paged_view(extra, extra_page, 288),
+            extra_indices_in_kvcache=extra_ids[:, None],
+            extra_topk_length=extra_lens,
+        )[0].squeeze(1)
+        self.assertIsInstance(draft, torch.Tensor)
+        torch.testing.assert_close(draft, reference, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

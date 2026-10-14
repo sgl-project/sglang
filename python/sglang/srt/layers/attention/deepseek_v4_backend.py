@@ -3727,6 +3727,7 @@ class DeepseekV4AttnBackend(
 
             use_mega_paged = (
                 self.mega_attn
+                and cos_sin_cache is not None
                 and extra_k_cache is not None
                 and extra_k_cache.shape[-1] == 288
                 and forward_batch.forward_mode.is_extend_without_speculative()
@@ -3768,7 +3769,7 @@ class DeepseekV4AttnBackend(
                     cos_sin_cache=cos_sin_cache,
                 )
 
-            if self.mega_attn:
+            if self.mega_attn and cos_sin_cache is not None:
                 from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
                 data, scale, _ = flash_mla_mega_decode(
@@ -3953,7 +3954,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if self.mega_attn:
+        if self.mega_attn and cos_sin_cache is not None:
             from sgl_kernel.flash_mla_mega import flash_mla_mega_prefill
 
             data, scale, _, _ = flash_mla_mega_prefill(
