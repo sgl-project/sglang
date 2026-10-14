@@ -93,3 +93,19 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+# Kimi-K3 ROCm fused collective + attention-residual kernels (HIP JIT).
+for _mod, _fn in [
+    ("k3_ar_agg_hip", "ar_agg"),
+    ("k3_ar_agg_hip", "ag_agg"),
+    ("k3_ag_one_barrier_hip", "all_gather_lastdim_add_1sync"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_mod}_{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.communication.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn
