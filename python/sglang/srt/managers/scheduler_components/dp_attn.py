@@ -10,6 +10,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.utils import is_fault_tolerance_enabled
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -261,6 +262,23 @@ class MLPSyncBatchInfo:
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        if (
+            is_fault_tolerance_enabled()
+            and get_exec().features.fault_tolerance_on_error_strategy == "pause"
+        ):
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            # PG can observe an idle failure without any EP forward running.
+            # Compare with the last installed topology so removed ranks do not
+            # trigger another pause after a successful scale-down.
+            if state is not None and bool(
+                (
+                    state.last_active_ranks.to(tp_active_ranks.device).bool()
+                    & ~tp_active_ranks.bool()
+                ).any()
+            ):
+                raise RuntimeError("PG membership loss detected after MLP sync")
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())

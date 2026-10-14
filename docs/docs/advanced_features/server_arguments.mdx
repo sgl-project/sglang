@@ -3262,6 +3262,45 @@ This option does not disable required attention or MoE collectives, including ex
   </tbody>
 </table>
 
+## Fault tolerance
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr>
+      <th>Argument</th>
+      <th>Description</th>
+      <th>Defaults</th>
+      <th>Options</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>`--enable-fault-tolerance`</td>
+      <td>Enable the DP-only fault-tolerance control plane.</td>
+      <td>`False`</td>
+      <td>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td>`--fault-tolerance-on-error-strategy`</td>
+      <td>Fault-tolerance strategy for scheduler exceptions.</td>
+      <td>`pause`</td>
+      <td>`pause`, `continue`</td>
+    </tr>
+    <tr>
+      <td>`--fault-tolerance-timeout`</td>
+      <td>Timeout in seconds for each fault-tolerance control phase.</td>
+      <td>`60`</td>
+      <td>Type: int</td>
+    </tr>
+    <tr>
+      <td>`--fault-tolerance-pause-timeout`</td>
+      <td>Fail-stop timeout in seconds for an unattended fault-tolerance pause.</td>
+      <td>`300`</td>
+      <td>Type: int</td>
+    </tr>
+  </tbody>
+</table>
+
 ## Configuration file support
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

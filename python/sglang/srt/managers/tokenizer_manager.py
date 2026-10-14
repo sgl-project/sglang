@@ -68,6 +68,9 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.manager import FaultToleranceManager
+from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
+from sglang.srt.fault_tolerance.utils import is_fault_tolerance_enabled
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -97,6 +100,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ProcessActiveRanksOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -527,6 +531,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
+        self.fault_tolerance: Optional[FaultToleranceManager] = None
         parallel = get_parallel()
         self.elastic_worker_count = parallel.num_dp_ranks
         self.attn_replica_size = attn_replica_size()
@@ -554,6 +559,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+
+        # Init fault tolerance state. Disabled FT keeps this as None.
+        self.init_fault_tolerance()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -669,6 +677,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
+        self._zmq_context = context
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
@@ -725,6 +734,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             not self.is_pause
             and not self.gracefully_exit
             and self.server_status == ServerStatus.Up
+        )
+
+    def init_fault_tolerance(self):
+        if not is_fault_tolerance_enabled():
+            return
+
+        # Scheduler commands reuse the primary DPC and its scheduler connections.
+        # Per-node DPC control only stops locally owned scheduler processes.
+        self.fault_tolerance = FaultToleranceManager(
+            server_args=get_parallel(),
+            zmq_context=self._zmq_context,
+            send_to_scheduler=self._async_dispatch_to_scheduler,
         )
 
     def init_request_logging_and_dumping(self):
@@ -894,9 +915,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ProcessActiveRanksOutput, self.update_process_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
+        if self.fault_tolerance is not None:
+            self._result_dispatcher += self.fault_tolerance.init_request_dispatcher()
         self.init_communicators()
 
         self.sampling_params_class = SamplingParams
@@ -932,6 +956,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
+        if self.fault_tolerance is not None:
+            routed_dp_rank = (
+                obj.routed_dp_rank if isinstance(obj, GenerateReqInput) else None
+            )
+            if error := self.fault_tolerance.admission_error(routed_dp_rank):
+                raise fastapi.HTTPException(status_code=503, detail=error)
 
         self._init_req_state(obj, request)
         request_states = {
@@ -2295,6 +2325,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
+    def fault_tolerance_status(self):
+        if self.fault_tolerance is None:
+            return 503, {"message": "fault_tolerance_disabled"}
+        return self.fault_tolerance.status()
+
+    def fault_tolerance_apply(self, obj: FaultToleranceApplyRequest):
+        if self.fault_tolerance is None:
+            return 503, {"message": "fault_tolerance_disabled"}
+        return self.fault_tolerance.submit(obj)
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -2456,6 +2496,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
+        if self.fault_tolerance is not None:
+            self.fault_tolerance.bind_event_loop(loop)
 
         # We only add signal handler when the tokenizer manager is in the main thread
         # due to the CPython limitation.
@@ -3651,6 +3693,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.fault_tolerance is not None:
+            ranks = self.fault_tolerance.observe_active_ranks(ranks)
+            if ranks is None:
+                return
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
@@ -3708,6 +3754,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None
         return responses[0]
+
+    def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
+        if self.fault_tolerance is not None:
+            active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
+            if active_ranks is not None:
+                self._dispatch_to_scheduler(active_ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

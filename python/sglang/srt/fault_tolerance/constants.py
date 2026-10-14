@@ -1,0 +1,2 @@
+FT_OPERATION_RETRY = "retry"
+FT_OPERATION_SCALE_DOWN = "scale_down"
