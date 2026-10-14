@@ -24,7 +24,9 @@ use crate::state::load_monitor::engine_reported_load::{
 };
 use crate::workers::Worker;
 
-use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::admission::{
+    partition_admitted, AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
+};
 use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
@@ -174,7 +176,7 @@ pub struct CacheAwarePolicy {
     engine_load: Arc<EngineReportedLoadTable>,
     config: AffinityConfig,
     pub admission: Arc<dyn EngineAdmission>,
-    /// This policy checks admission on the fallback's pick.
+    /// Picks among the engines this policy's admission accepts.
     pub fallback: Arc<dyn Policy>,
 }
 
@@ -336,6 +338,10 @@ impl Policy for CacheAwarePolicy {
                 })
                 .cloned()
                 .collect();
+            // The fallback samples only engines that pass admission.
+            let (pool, pool_rejections) =
+                partition_admitted(self.admission.as_ref(), &pool, &load)?;
+            rejections.extend(pool_rejections);
             if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
                 return Err(PickError::NoAdmissibleEngine(rejections));
             }
@@ -343,9 +349,6 @@ impl Policy for CacheAwarePolicy {
                 let mut pick = self.pick_fallback(&pool, request).await?;
                 if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
                     return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
-                }
-                if let Some(rejection) = self.check(&pick.engine, &load)? {
-                    return Err(PickError::AdmissionRejected(rejection));
                 }
                 pick.reason = if affinity.is_some() {
                     "affinity_load"
