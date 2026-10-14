@@ -10,24 +10,11 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use the Ling-3.1-flash image, which includes model support and the decode optimizations used by these recipes. Both images support multiple CPU architectures.
-
-<Tabs>
-<Tab title="H200">
+Use the Ling-3.1-flash image, which includes model support and the decode optimizations used by these recipes. The image supports multiple CPU architectures:
 
 ```bash Command
 docker pull lmsysorg/sglang:dev-ling-3.1-flash
 ```
-
-</Tab>
-<Tab title="GB300 (CUDA 13)">
-
-```bash Command
-docker pull lmsysorg/sglang:dev-ling-3.1-flash
-```
-
-</Tab>
-</Tabs>
 
 Select **Docker** in the command panel to launch the matching image. The **Python** command requires an environment with the same Ling-3.1-flash build. See the [installation guide](/docs/get-started/install#method-3-using-docker) for Docker setup.
 
@@ -35,7 +22,7 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding, on H200 or GB300.
+- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
