@@ -1777,7 +1777,8 @@ class DeepseekV2MoE(nn.Module):
             if gate_up.weight.shape[0] % 64 != 0 or gate_up.weight.shape[1] % 128 != 0:
                 return False, "gate_up weight shape unsupported by deepgemm"
         else:
-            return False, f"w8a8 linear backend {linear_fn.__name__} unsupported"
+            backend_name = getattr(linear_fn, "__name__", type(linear_fn).__name__)
+            return False, f"w8a8 linear backend {backend_name} unsupported"
         # Routed side: standard dispatcher + triton fused func with dynamic
         # per-token-group-128 fp8 activation quant.
         experts = self.experts
@@ -2019,6 +2020,9 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        self.dcp_size = (
+            1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2157,9 +2161,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * self.dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -2591,10 +2595,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
             )
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
-
-        self._stage_next_sparse = is_next_layer_sparse
+        self.is_layer_sparse = self._is_layer_sparse(
+            config, layer_id, is_nextn=is_nextn
+        )
 
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
@@ -2635,18 +2638,42 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+    @classmethod
+    def stage_facts(
+        cls,
+        config: PretrainedConfig,
+        layer_id: int,
+        *,
+        is_nextn: bool = False,
+        attn_output=None,
+        output=None,
+    ):
+        """The stages a layer of this class declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). ``attn_output`` and ``output``: the
+        attention's and the FFN's output transforms, if any."""
+        return (
+            declare_attn(output_transform=attn_output),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+                output_transform=output,
+            ),
+        )
+
     def _build_stages(
         self,
         *,
         input_layernorm: nn.Module,
         post_attention_layernorm: nn.Module,
         qkv_latent_func: Optional[Callable],
-        output=None,
-        attn_output=None,
+        **modules,
     ):
         """The stage boundaries for this layer's norms; they choose their
-        steps from them at construction. ``attn_output`` and ``output``: the
-        attention's and the FFN's output transforms, if any."""
+        steps from them at construction. ``modules``: what this class's
+        stage_facts binds the stages' output transforms to, if anything."""
         fusions = None
         if (
             not get_parallel().enable_prefill_cp
@@ -2657,21 +2684,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
+        attn, ffn = self.stage_facts(
+            self.config, self.layer_id, is_nextn=self.is_nextn, **modules
+        )
         attn_boundary, ffn_boundary = append_stages(
             (
-                declare_attn(output_transform=attn_output),
+                attn,
                 input_layernorm,
                 {"qkv_latent_func": qkv_latent_func, "fusions": fusions},
             ),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=self._stage_next_sparse,
-                    output_transform=output,
-                ),
-                post_attention_layernorm,
-                {"fusions": fusions},
-            ),
+            (ffn, post_attention_layernorm, {"fusions": fusions}),
         )
         return attn_boundary, ffn_boundary
 
@@ -2707,11 +2729,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             self._gfx95_quant_format = fmt
         return fmt
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     def forward(
@@ -2917,6 +2942,7 @@ class DeepseekV2Model(nn.Module):
                     else []
                 ),
             ),
+            stage_facts=lambda idx: DeepseekV2DecoderLayer.stage_facts(config, idx),
         )
 
         local_layer_ids = list(range(self.start_layer, self.end_layer))
@@ -3040,7 +3066,7 @@ class DeepseekV2Model(nn.Module):
         if not self.pp_group.is_first_rank:
             assert not (
                 not forward_batch.forward_mode.is_idle()
-                and hidden_states.shape[0] != 0
+                and positions.shape[0] != 0
                 and self.use_dsa
                 and dsa_forward_uses_topk
                 and dsa_layer_skips_topk(self.config, self.start_layer)
@@ -3049,7 +3075,7 @@ class DeepseekV2Model(nn.Module):
                 f"PP stage starting at layer {self.start_layer} requires DSA "
                 "topk_indices from the previous stage."
             )
-        device = hidden_states.device
+        device = positions.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
@@ -3420,7 +3446,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu:
+        if _is_npu or is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

@@ -83,6 +83,15 @@ impl TextTokenizer for DynamoTokenizer {
         segments: &[dynamo_tokenizers::EncodeSegment<'_>],
         add_special_tokens: bool,
     ) -> Result<Vec<i32>, Error> {
+        // Segments that all allow special tokens encode one by one, which keeps their
+        // boundaries on backends without segmented encoding, such as Hugging Face's.
+        if segments.iter().all(|segment| segment.allow_special) {
+            let mut ids = Vec::new();
+            for (index, segment) in segments.iter().enumerate() {
+                ids.extend(self.encode(segment.text, add_special_tokens && index == 0)?);
+            }
+            return Ok(ids);
+        }
         let encoding = if add_special_tokens {
             &self.with_specials
         } else {

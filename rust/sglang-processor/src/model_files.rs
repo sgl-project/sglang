@@ -45,7 +45,6 @@ fn model_directory(path: &str, revision: Option<&str>) -> Option<PathBuf> {
     if input.is_file() {
         return input.parent().map(Path::to_path_buf);
     }
-    let repo = cache_repo(path, revision);
     [
         "config.json",
         "tokenizer_config.json",
@@ -53,7 +52,7 @@ fn model_directory(path: &str, revision: Option<&str>) -> Option<PathBuf> {
         "tiktoken.model",
     ]
     .into_iter()
-    .find_map(|name| repo.get(name))
+    .find_map(|name| hub_file(path, revision, name))
     .and_then(|file| file.parent().map(Path::to_path_buf))
 }
 
@@ -132,12 +131,10 @@ fn is_supported_tokenizer_file(path: &Path) -> bool {
 /// Locate a file for an HF Hub repo id in the local cache. Offline —
 /// the scheduler pre-downloads the model. `None` if not cached.
 fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
-    cache_repo(repo_id, revision)
-        .get(filename)
-        .map(|p| p.to_string_lossy().into_owned())
+    hub_file(repo_id, revision, filename).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn cache_repo(repo_id: &str, revision: Option<&str>) -> hf_hub::CacheRepo {
+fn hub_file(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<PathBuf> {
     use hf_hub::{Cache, Repo, RepoType};
 
     // Python resolves the cache dir as HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE >
@@ -149,11 +146,20 @@ fn cache_repo(repo_id: &str, revision: Option<&str>) -> hf_hub::CacheRepo {
         .find_map(|var| std::env::var(var).ok())
         .map(|dir| Cache::new(dir.into()))
         .unwrap_or_else(Cache::from_env);
-    cache.repo(Repo::with_revision(
+    let repo = Repo::with_revision(
         repo_id.to_string(),
         RepoType::Model,
         revision.unwrap_or("main").to_string(),
-    ))
+    );
+    // hf-hub resolves only refs; like huggingface_hub, also find a pinned commit's snapshot.
+    let pinned = revision
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|commit| {
+            let snapshots = cache.path().join(repo.folder_name()).join("snapshots");
+            snapshots.join(commit).join(filename)
+        })
+        .filter(|path| path.is_file());
+    pinned.or_else(|| cache.repo(repo).get(filename))
 }
 
 #[cfg(test)]
