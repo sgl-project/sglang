@@ -235,8 +235,8 @@ by running requests:
 `"plain": {"affinity": {"mode": "balanced", "balanced_by": "running_requests"}}`.
 
 Both modes fall back within the group when affinity fails admission, excluding
-rejected engines. The fallback samples only engines that pass admission; when
-none does, the request advances to the next bucket. Session replacements are bound after admission during selection,
+rejected engines. The fallback winner must pass admission; failure advances to
+the next bucket. Session replacements are bound after admission during selection,
 not after dispatch. Reorg rejects legacy pressure guards, cache switch margins,
 and queue/saturation gates in favor of these shared affinity settings.
 

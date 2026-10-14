@@ -277,13 +277,12 @@ limits fail open; the in-flight count is always known. Policies attach the
 checker as `Arc<dyn EngineAdmission>` and decide where checking belongs in
 their selection algorithm; there is no placement setting or filtering wrapper.
 
-Power-of-two first checks admission on every candidate, then selects among
-the admitted ones, so an engine at a cap is never picked while another is
-admitted. When none is admitted it returns `NoAdmissibleEngine` with every
-rejection to the bucket loop. No candidates returns `NoCandidates` without
-invoking admission. A single admitted candidate is selected directly; otherwise
-two distinct admitted candidates are sampled uniformly, and the one with lower
-stage pressure wins. A complete tie keeps the first sampled engine.
+Power-of-two first selects an engine, then calls admission exactly once on that
+engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
+resample, choose the other sampled engine, or run a policy fallback. No candidates
+returns `NoCandidates` without invoking admission. A single candidate is selected
+directly; otherwise two distinct candidates are sampled uniformly, and the one
+with lower stage pressure wins. A complete tie keeps the first sampled engine.
 
 Power-of-two reuses the existing pure pressure-comparison functions. Plain and
 prefill stages compare estimated prefill queue time when both reports provide it,
@@ -294,8 +293,9 @@ lacks a fresh, complete native report with valid capacity, both are compared by
 router-local active requests instead. Basic reports from older publishers are
 still passed to admission when fresh, but do not supply native pressure metrics.
 
-Power-of-two captures one load snapshot per pick and uses it for both
-admission and selection.
+Power-of-two retains the selected engine's load record from selection and
+passes it to admission without another snapshot. A single candidate still has
+its load read for admission, even though selection needs no comparison.
 Neither the bucket nor HTTP handler supplies observations. Synchronous checks
 do not fetch telemetry over the network themselves.
 
@@ -326,7 +326,8 @@ Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
 use power-of-two without creating assignments. A new or out-of-group binding
-uses power-of-two over the engines the session policy's admission accepts. A concurrent live assignment wins,
+uses power-of-two with `AdmissionLimits::default()`, then the session policy
+checks its selected engine before binding. A concurrent live assignment wins,
 but is checked before returning it; rejection ends that attempt without
 rewriting the binding or retrying another engine. Existing bindings follow the
 shared affinity modes below. Session policies can be attached
@@ -371,8 +372,8 @@ set. Its responsibilities are:
 5. Apply the shared affinity mode. With no admitted prefix owner, fall back
    within the group, excluding rejected engines.
 
-Fallback samples two engines among those that pass admission, so it fails
-only when none does. Candidate limits apply only to prefix selection.
+Fallback samples two engines and checks the selected engine's admission; it
+does not resample on rejection. Candidate limits apply only to prefix selection.
 
 Memoize the prefix lookup once per request, including remote I/O. Each policy
 restricts those matches to its own candidates. A memoized lookup does not imply
