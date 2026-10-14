@@ -10,6 +10,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
     get_schedule,
 )
@@ -493,3 +494,23 @@ def _record_single_pass_result(
             output_reason=output.output_reason,
             actual_execution=actual_execution,
         )
+
+
+def create_prefill_delayer(
+    *, metrics_collector: Optional["SchedulerMetricsCollector"]
+) -> Optional[PrefillDelayer]:
+    """The delayer --enable-prefill-delayer asks for, or None."""
+    if not get_schedule().enable_prefill_delayer:
+        return None
+    if get_disagg().disaggregation_mode == "decode":
+        logger.info(
+            "Ignoring --enable-prefill-delayer on decode engine "
+            "(no prefill scheduling path; delayer would be a no-op)."
+        )
+        return None
+    return PrefillDelayer(
+        metrics_collector=metrics_collector,
+        max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
+        token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
+        debug_log_enabled=get_parallel().attn_tp_rank == 0,
+    )

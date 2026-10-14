@@ -416,3 +416,11 @@ class ChunkSizePredictor:
             return None
 
         return dynamic_chunk_size
+
+
+def fit_dynamic_chunk_sizer(**kwargs) -> Optional[DynamicChunkSizer]:
+    """A sizer whose latency model is fitted, or None when fitting failed."""
+    sizer = DynamicChunkSizer(**kwargs)
+    if sizer.profile_and_fit():
+        return sizer
+    return None

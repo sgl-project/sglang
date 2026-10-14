@@ -1494,3 +1494,11 @@ class PrefillAdder:
 
     def _num_running_reqs(self) -> int:
         return len(self.running_reqs) - len(self.preempt_list)
+
+
+def priority_preemption_enabled() -> bool:
+    # NOTE: preemption is enabled by default for priority scheduling.
+    return (
+        get_schedule().enable_priority_scheduling
+        and not get_schedule().disable_priority_preemption
+    )

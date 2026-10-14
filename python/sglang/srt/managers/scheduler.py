@@ -16,7 +16,6 @@
 import faulthandler
 import functools
 import logging
-import math
 import os
 import signal
 import time
@@ -32,7 +31,6 @@ from typing import (
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -73,7 +71,6 @@ except ImportError:
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    ModelImpl,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -183,18 +180,15 @@ from sglang.srt.managers.io_struct import (
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
-from sglang.srt.managers.min_free_slots_delayer import (
-    MinFreeSlotsDelayer,
-    resolve_min_free_slots,
-)
+from sglang.srt.managers.min_free_slots_delayer import create_min_free_slots_delayer
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
 )
 from sglang.srt.managers.prefill_delayer import (
-    PrefillDelayer,
     RecentPrefillBatchSizeTracker,
+    create_prefill_delayer,
 )
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
@@ -205,6 +199,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
+    priority_preemption_enabled,
 )
 from sglang.srt.managers.scheduler_components import worker_setup
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -220,6 +215,7 @@ from sglang.srt.managers.scheduler_components.bundles import (
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
+    fit_dynamic_chunk_sizer,
 )
 from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
@@ -279,6 +275,10 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing
 from sglang.srt.managers.scheduler_components.pp_spec_forward import PPSpecForward
+from sglang.srt.managers.scheduler_components.prefill_chunking import (
+    resolve_chunked_prefill_size,
+    resolve_truncation_align_size,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -319,7 +319,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -350,7 +349,6 @@ from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
     get_bool_env_var,
-    get_int_env_var,
     is_cuda,
     is_hip,
     kill_itself_when_parent_died,
@@ -479,6 +477,8 @@ class Scheduler:
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.maybe_init_prefill_delayer()
+        self.init_new_token_ratio_tracker()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -511,9 +511,7 @@ class Scheduler:
         self.maybe_init_ngram_embedding()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
-        self.init_deterministic_inference_config()
-        self.init_dsa_kpool_truncation_align()
-        self.check_truncation_align_fits_chunk()
+        self.init_truncation_align()
 
         # Init LoRA admission: the drainer and the overlap loader
         self.init_lora_admission()
@@ -866,18 +864,6 @@ class Scheduler:
             _,
             _,
         ) = (self.dllm_worker or self.tp_worker).get_worker_info()
-        # DFlash auto-enables the legacy formula; other workloads opt in via
-        # --min-free-slots-delay. Built independently of the prefill delayer.
-        self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
-        min_free_slots = resolve_min_free_slots(
-            get_schedule().min_free_slots_delay,
-            self.max_running_requests,
-            is_dflash_family=self.spec_algorithm.is_dflash_family(),
-        )
-        if min_free_slots is not None:
-            self.min_free_slots_delayer = MinFreeSlotsDelayer(
-                min_free_slots=min_free_slots
-            )
         worker_setup.set_default_pp_max_micro_batch_size(self.max_running_requests)
         set_random_seed(self.random_seed)
 
@@ -1070,24 +1056,7 @@ class Scheduler:
         self._deferred_input_requests: List = []
 
     def init_chunked_prefill(self):
-        self.chunked_prefill_size = get_schedule().chunked_prefill_size
-        self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
-        uses_transformers_backend = (
-            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
-        )
-        if (
-            self.chunked_prefill_size is not None
-            and self.chunked_prefill_size > 0
-            and self.model_config.is_multimodal
-            and uses_transformers_backend
-        ):
-            logger.warning(
-                "Chunked prefill is disabled for multimodal models with the "
-                "Transformers backend to avoid partial multimodal chunk mismatches."
-            )
-            self.chunked_prefill_size = None
-        elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
-            self.chunked_prefill_size = None
+        self.chunked_prefill_size = resolve_chunked_prefill_size(self.model_config)
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1097,7 +1066,7 @@ class Scheduler:
         self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
         if not (get_schedule().enable_dynamic_chunking and get_parallel().pp_size > 1):
             return
-        sizer = DynamicChunkSizer(
+        self.dynamic_chunk_sizer = fit_dynamic_chunk_sizer(
             model_runner=self.tp_worker.model_runner,
             model_config=self.model_config,
             tree_cache=self.tree_cache,
@@ -1109,8 +1078,6 @@ class Scheduler:
             page_size=get_schedule().page_size,
             device=self.device,
         )
-        if sizer.profile_and_fit():
-            self.dynamic_chunk_sizer = sizer
 
     def init_metrics_sink(self) -> None:
         self.metrics_sink = MetricsSink(
@@ -1149,34 +1116,15 @@ class Scheduler:
             get_schedule().enable_priority_scheduling,
             get_schedule().schedule_low_priority_values_first,
         )
-        self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
-            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
-        )
-        if get_schedule().enable_prefill_delayer:
-            if get_disagg().disaggregation_mode == "decode":
-                logger.info(
-                    "Ignoring --enable-prefill-delayer on decode engine "
-                    "(no prefill scheduling path; delayer would be a no-op)."
-                )
-            else:
-                self.prefill_delayer = PrefillDelayer(
-                    metrics_collector=(
-                        self.metrics_collector
-                        if self.metrics_sink.enable_metrics
-                        else None
-                    ),
-                    max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
-                    token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
-                    debug_log_enabled=get_parallel().attn_tp_rank == 0,
-                )
 
-        # NOTE: preemption is enabled by default for priority scheduling.
-        self.enable_priority_preemption = (
-            get_schedule().enable_priority_scheduling
-            and not get_schedule().disable_priority_preemption
+    def maybe_init_prefill_delayer(self) -> None:
+        self.prefill_delayer = create_prefill_delayer(
+            metrics_collector=(
+                self.metrics_collector if self.metrics_sink.enable_metrics else None
+            ),
         )
 
+    def init_new_token_ratio_tracker(self) -> None:
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def init_soft_watchdog(self):
@@ -1525,68 +1473,11 @@ class Scheduler:
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
-    def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
-        if not get_exec().deterministic.enable_deterministic_inference:
-            self.truncation_align_size = None
-            return
-
-        # Only flashinfer needs chunks on its prefill split tiles; triton tiles
-        # keys at absolute positions (align_window_kv_to_tiles).
-        backend_sizes = {
-            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-        }
-        prefill_backend, _ = attention_backends()
-        env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
-
-    def init_dsa_kpool_truncation_align(self):
-        """Kpool compress-write asserts chunked extends start on pool boundaries.
-        Use the LCM to preserve any existing deterministic-inference alignment."""
-        from sglang.srt.configs.model_config import (
-            get_dsa_index_kpool,
-            is_deepseek_dsa,
-        )
-
-        if not is_deepseek_dsa(self.model_config.hf_config):
-            return
-
-        dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
-        if dsa_index_kpool <= 1:
-            return
-
-        if self.truncation_align_size is None:
-            self.truncation_align_size = dsa_index_kpool
-        else:
-            self.truncation_align_size = math.lcm(
-                self.truncation_align_size, dsa_index_kpool
-            )
-
-    def check_truncation_align_fits_chunk(self):
-        """A chunk shorter than the alignment truncates to zero tokens, so a prompt
-        longer than the chunk would wait in the queue forever."""
-        align = self.truncation_align_size
-        chunk = self.chunked_prefill_size
-        if align is None or chunk is None or chunk >= align:
-            return
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # A decode server never prefills a prompt.
-            return
-        attn_dp_size = get_parallel().attn_dp_size
-        dp_note = (
-            f" (--chunked-prefill-size is split across {attn_dp_size} DP attention ranks)"
-            if attn_dp_size > 1
-            else ""
-        )
-        raise ValueError(
-            f"Chunked prefill is aligned to {align} tokens, but each rank's "
-            f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
-            f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
-            f"to at least {align * attn_dp_size}, or, with the flashinfer backend "
-            f"under deterministic inference, lower "
-            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE."
+    def init_truncation_align(self):
+        self.truncation_align_size = resolve_truncation_align_size(
+            hf_config=self.model_config.hf_config,
+            chunked_prefill_size=self.chunked_prefill_size,
+            disaggregation_mode=self.disaggregation_mode,
         )
 
     def init_request_dispatcher(self):
@@ -2345,17 +2236,25 @@ class Scheduler:
             mode_owners=self.mode_owners,
             request_intake=self.request_intake,
             prefill_delayer=self.prefill_delayer,
-            prefill_bs_tracker=self.prefill_bs_tracker,
-            min_free_slots_delayer=self.min_free_slots_delayer,
+            prefill_bs_tracker=RecentPrefillBatchSizeTracker(
+                window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
+            ),
+            # DFlash auto-enables the legacy formula; other workloads opt in via
+            # --min-free-slots-delay. Built independently of the prefill delayer.
+            min_free_slots_delayer=create_min_free_slots_delayer(
+                get_schedule().min_free_slots_delay,
+                self.max_running_requests,
+                is_dflash_family=self.spec_algorithm.is_dflash_family(),
+            ),
             dynamic_chunk_sizer=self.dynamic_chunk_sizer,
             spec_algorithm=self.spec_algorithm,
             is_hybrid_swa=self.is_hybrid_swa,
             require_mlp_sync=self.require_mlp_sync,
             chunked_prefill_size=self.chunked_prefill_size,
             is_mixed_chunk=self.is_mixed_chunk,
-            prefill_decode_interval=self.prefill_decode_interval,
+            prefill_decode_interval=get_schedule().prefill_decode_interval or 0,
             max_prefill_tokens=self.max_prefill_tokens,
-            enable_priority_preemption=self.enable_priority_preemption,
+            enable_priority_preemption=priority_preemption_enabled(),
             truncation_align_size=self.truncation_align_size,
         )
 
@@ -2543,7 +2442,7 @@ class Scheduler:
             priority_scheduling_preemption_threshold=(
                 get_schedule().priority_scheduling_preemption_threshold
             ),
-            enable_priority_preemption=self.enable_priority_preemption,
+            enable_priority_preemption=priority_preemption_enabled(),
             enable_priority_scheduling=get_schedule().enable_priority_scheduling,
             truncation_align_size=self.truncation_align_size,
             context_len=self.model_config.context_len,
