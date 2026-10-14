@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the non-RDMA MockTransferEngine fallback.
+
+Guards the one property disaggregated diffusion actually depends on when
+Mooncake is unavailable (e.g. its wheel links libcudart and there is no CUDA
+runtime, as on Intel XPU hosts): bytes written at a given offset on the
+sender land at the exact matching offset in the receiver's registered
+buffer, and writes outside that buffer are rejected rather than corrupting
+unrelated memory.
+"""
+
+import unittest
+from unittest.mock import patch
+
+import torch
+
+from sglang.multimodal_gen.runtime.disaggregation.transport import engine as engine_module
+from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
+    MockTransferEngine,
+    MooncakeDiffusionEngine,
+    create_transfer_engine,
+)
+
+
+class TestMockTransferEngine(unittest.TestCase):
+    def test_round_trip_delivers_bytes_at_matching_offset(self):
+        sender_pool = torch.zeros(4096, dtype=torch.uint8)
+        receiver_pool = torch.zeros(4096, dtype=torch.uint8)
+
+        sender = MockTransferEngine(hostname="127.0.0.1")
+        receiver = MockTransferEngine(hostname="127.0.0.1")
+        self.addCleanup(sender.deregister_buffer, sender_pool.data_ptr())
+        self.addCleanup(receiver.deregister_buffer, receiver_pool.data_ptr())
+
+        sender.register_buffer(sender_pool.data_ptr(), sender_pool.numel())
+        receiver.register_buffer(receiver_pool.data_ptr(), receiver_pool.numel())
+
+        payload = torch.arange(256, dtype=torch.uint8)
+        src_offset, dst_offset = 128, 512
+        sender_pool[src_offset : src_offset + len(payload)] = payload
+
+        ret = sender.transfer_sync(
+            receiver.session_id,
+            sender_pool.data_ptr() + src_offset,
+            receiver_pool.data_ptr() + dst_offset,
+            len(payload),
+        )
+
+        self.assertEqual(ret, 0)
+        torch.testing.assert_close(
+            receiver_pool[dst_offset : dst_offset + len(payload)], payload
+        )
+        self.assertTrue(torch.all(receiver_pool[:dst_offset] == 0))
+        self.assertTrue(torch.all(receiver_pool[dst_offset + len(payload) :] == 0))
+
+    def test_write_outside_registered_buffer_is_rejected(self):
+        sender_pool = torch.zeros(64, dtype=torch.uint8)
+        receiver_pool = torch.zeros(64, dtype=torch.uint8)
+
+        sender = MockTransferEngine(hostname="127.0.0.1")
+        receiver = MockTransferEngine(hostname="127.0.0.1")
+        self.addCleanup(sender.deregister_buffer, sender_pool.data_ptr())
+        self.addCleanup(receiver.deregister_buffer, receiver_pool.data_ptr())
+
+        sender.register_buffer(sender_pool.data_ptr(), sender_pool.numel())
+        receiver.register_buffer(receiver_pool.data_ptr(), receiver_pool.numel())
+
+        ret = sender.transfer_sync(
+            receiver.session_id,
+            sender_pool.data_ptr(),
+            receiver_pool.data_ptr() + receiver_pool.numel(),  # one past the end
+            16,
+        )
+
+        self.assertNotEqual(ret, 0)
+
+    def test_auto_backend_falls_back_to_mock_without_mooncake(self):
+        engine = create_transfer_engine(hostname="127.0.0.1", backend="auto")
+        self.addCleanup(engine.deregister_buffer, 0)
+        self.assertIsInstance(engine, MockTransferEngine)
+        self.assertFalse(engine.supports_gpu_direct)
+
+    def test_auto_backend_prefers_mooncake_once_it_imports(self):
+        """Pins the forward-compat direction: once a Mooncake build imports
+        cleanly on a host (e.g. a future XPU-capable release), "auto" must
+        route back to it, not stay on the mock fallback.
+        """
+        with (
+            patch.object(engine_module, "_check_mooncake", return_value=True),
+            patch.object(MooncakeDiffusionEngine, "__init__", return_value=None),
+        ):
+            engine = create_transfer_engine(hostname="127.0.0.1", backend="auto")
+        self.assertIsInstance(engine, MooncakeDiffusionEngine)
+
+
+if __name__ == "__main__":
+    unittest.main()

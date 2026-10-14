@@ -525,6 +525,7 @@ class SchedulerDisaggMixin:
             hostname=hostname,
             gpu_id=physical_gpu_id,
             ib_device=ib_device,
+            backend=sa.disagg_transfer_backend,
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
