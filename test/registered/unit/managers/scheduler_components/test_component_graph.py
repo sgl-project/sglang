@@ -116,13 +116,12 @@ _DECLARED = {
     ],
     "DllmManager": [
         "KvResources",
+        "SchedulerServices",
         "SchedulePolicy",
         "NewTokenRatioTracker",
         "BeamCoordinator",
         "StepBuilder",
         "RequestRetirer",
-        "MetricsSink",
-        "OutputStreamer",
     ],
     "ModeOwners": ["DisaggPrefill", "DisaggDecode", "DllmManager", "HiSparse"],
     "RequestEnqueuer": [
@@ -361,6 +360,7 @@ _BUILT = {
     "StepCounters": ("managers/scheduler_components/step_counters.py", "StepCounters"),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
     "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
+    "DllmManager": ("dllm/manager.py", "DllmManager"),
     "ModeOwners": ("managers/scheduler_components/mode_owners.py", "ModeOwners"),
     "RequestRegistry": (
         "managers/scheduler_components/request_registry.py",
