@@ -392,6 +392,9 @@ class BeamMoE(nn.Module):
         )
 
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Prefer tiny FP32 GEMM for small batches outside torch.compile.
+        # Use cuTile for remaining batches when enabled.
+        # Otherwise, fall back to the existing GEMV/cuBLAS path.
         if (
             not self.use_fast_router
             or (torch.compiler.is_compiling() and not self.use_cutile_router)
