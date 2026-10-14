@@ -266,7 +266,7 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if get_parallel().dcp_enabled:
+                if self.dcp_size > 1:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
@@ -299,8 +299,16 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
+        key_value_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=False,
+            key_value_num_tokens=key_value_num_tokens,
+        )
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
@@ -422,7 +430,10 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch, gate)
+        # K and V cover every token of the sequences, the cached prefix too.
+        return self.forward_normal_core(
+            q, k, v, forward_batch, gate, key_value_num_tokens=k.shape[0]
+        )
 
     def _fused_prefix_extend_attn_mha(
         self: DeepseekV2AttentionMLA,
