@@ -3831,7 +3831,6 @@ dependencies = [
  "dynamo-tokenizers",
  "flume",
  "futures",
- "hf-hub",
  "http",
  "itertools",
  "minijinja",

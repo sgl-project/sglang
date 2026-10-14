@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
-use hf_hub::{Cache, Repo, RepoType};
+use hf_hub::{Repo, RepoType};
 use serde_json::Value;
+use sglang_processor::hf_cache;
 
 use crate::preprocessing::{resolve_model_file, resolve_tokenizer_file};
 use crate::{RendererConfig, RendererLimits, RendererRuntimeConfig, SamplingDefaults, serve};
@@ -402,15 +403,6 @@ async fn download_file(repo: &ApiRepo, repo_id: &str, filename: &str) -> Result<
     repo.get(filename).await.map_err(|error| {
         format!("downloading {filename:?} for Hugging Face model {repo_id:?} failed: {error}")
     })
-}
-
-fn hf_cache() -> Cache {
-    ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(PathBuf::from)
-        .map(Cache::new)
-        .unwrap_or_else(Cache::from_env)
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {

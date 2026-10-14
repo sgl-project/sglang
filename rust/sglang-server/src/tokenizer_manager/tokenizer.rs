@@ -11,8 +11,9 @@
 //! already carries `input_ids` it skips tokenization (handled upstream in the
 //! TokenizerManager `classify`); otherwise the prompt text is encoded here.
 
-use std::path::Path;
 use std::sync::Arc;
+
+use sglang_processor::resolve_model_file;
 
 use crate::message::request::{Request, RequestKind};
 use crate::message::types::TokenIds;
@@ -60,49 +61,6 @@ pub fn load_tokenizer(
     .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
     Ok(Some(tokenizer))
-}
-
-/// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
-/// its sibling, else an HF Hub repo id → the local cache. `None` if not found.
-pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
-    let p = Path::new(path);
-    if p.is_dir() {
-        let f = p.join(filename);
-        return f.is_file().then(|| f.to_string_lossy().into_owned());
-    }
-    if p.is_file() {
-        // `path` is a file (e.g. `tokenizer.json`); look for the sibling.
-        let f = p.parent()?.join(filename);
-        return f.is_file().then(|| f.to_string_lossy().into_owned());
-    }
-    // Not a local path → HF Hub repo id (offline cache lookup).
-    resolve_from_hub_cache(path, revision, filename)
-}
-
-/// Locate a file for an HF Hub repo id in the local cache. Offline —
-/// the scheduler pre-downloads the model. `None` if not cached.
-fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
-    use hf_hub::{Cache, Repo, RepoType};
-
-    // Python resolves the cache dir as HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE >
-    // HF_HOME/hub > ~/.cache/huggingface/hub; the hf-hub crate only knows
-    // HF_HOME. Honor the explicit cache-dir overrides first, or the Rust
-    // server misses models the Python scheduler already downloaded.
-    let cache = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
-        .iter()
-        .find_map(|var| std::env::var(var).ok())
-        .map(|dir| Cache::new(dir.into()))
-        .unwrap_or_else(Cache::from_env);
-
-    let rev = revision.unwrap_or("main");
-    cache
-        .repo(Repo::with_revision(
-            repo_id.to_string(),
-            RepoType::Model,
-            rev.to_string(),
-        ))
-        .get(filename)
-        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
