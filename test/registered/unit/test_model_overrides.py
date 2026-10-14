@@ -2318,6 +2318,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {"speculative_moe_runner_backend": "triton"},
         )
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None,
+                        moe_runner_backend="flashinfer_megamoe",
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "flashinfer_trtllm"},
+        )
         # user-set draft backend survives
         self.assertEqual(
             _speculative_moe_runner_default(
@@ -2735,7 +2746,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _deepseek_spec_moe_resolution(
                         _view(
-                            speculative_moe_runner_backend="triton",
+                            speculative_moe_runner_backend="flashinfer_trtllm",
                             speculative_moe_a2a_backend="none",
                         )
                     ),

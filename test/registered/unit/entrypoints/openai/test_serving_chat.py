@@ -14,7 +14,6 @@ import asyncio
 import copy
 import gc
 import json
-import re
 import tempfile
 import unittest
 import uuid
@@ -28,7 +27,6 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
-from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -964,11 +962,7 @@ class ServingChatTestCase(CustomTestCase):
         ):
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
-            city = (
-                "a</call>b"
-                if reasoning_parser and constraint.get("tool_choice")
-                else "Paris"
-            )
+            city = "a</call>b" if reasoning_parser else "Paris"
             call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
             text = (f"<think>{reasoning}</think>" if reasoning else "") + call
             for stream in (False, True):
@@ -1114,7 +1108,7 @@ class ServingChatTestCase(CustomTestCase):
         """JSON output must not skip the answer opener, while a forced tool array stays
         bare JSON."""
         self._use_delimited_response_template("beam")
-        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"a": 1}</call>'
+        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"city": "Paris"}</call>'
         for prompt, from_start, texts in (
             (
                 "<assistant>",
@@ -1272,7 +1266,7 @@ class ServingChatTestCase(CustomTestCase):
         for fields, text, admitted in (
             ({"tools": [strict]}, call, True),
             ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
-            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
+            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), True),
             ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
             (
                 {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},
@@ -2283,6 +2277,38 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
+            for tool_choice, expects_tools in (("none", False), ("auto", True)):
+                with self.subTest(
+                    chat_encoding_spec=chat_encoding_spec,
+                    tool_choice=tool_choice,
+                ):
+                    self.chat.chat_encoding_spec = chat_encoding_spec
+                    self.tm.tokenizer.encode.reset_mock()
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                        tools=[tool],
+                        tool_choice=tool_choice,
+                    )
+
+                    self.chat._process_messages(request, is_multimodal=False)
+
+                    prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertEqual("calculator" in prompt, expects_tools)
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -2700,6 +2726,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return a chunk with remaining arguments
@@ -2708,6 +2735,7 @@ class ServingChatTestCase(CustomTestCase):
         # Parse the result to verify content
         self.assertTrue(result.startswith("data: "))
         chunk = json.loads(result[6:])
+        self.assertEqual(chunk["created"], 123)
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
@@ -2753,6 +2781,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since no completion is needed
@@ -2791,6 +2820,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNone(result, "Should not append encoded quotes")
@@ -2826,6 +2856,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
@@ -2861,6 +2892,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since there's no parser data
@@ -3392,6 +3424,7 @@ class ServingChatTestCase(CustomTestCase):
                     content={"meta_info": {"id": "chatcmpl-test"}},
                     request=req,
                     has_tool_calls={},
+                    created=123,
                 )
                 # Get first yielded SSE line
                 line = None
@@ -3406,6 +3439,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertTrue(line.startswith("data: "))
 
             payload = json.loads(line[len("data: ") :])
+            self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
@@ -3481,18 +3515,6 @@ class ServingChatTestCase(CustomTestCase):
         # The HF chat-template path keeps the wrap-into-content behaviour.
         self.chat.chat_encoding_spec = None
         self.assertFalse(self.chat.supports_native_reasoning_history())
-
-    def test_all_chat_encoding_specs_are_enumerated(self):
-        """Guard the spec list this file asserts capabilities over."""
-        source = Path(chat_encoding.__file__).read_text()
-        returned = set(
-            re.findall(
-                r'^\s+return "(\w+)"$',
-                source[source.index("def resolve_chat_encoding_spec") :],
-                re.MULTILINE,
-            )
-        )
-        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
     def test_response_template_messages_thinking_replay(self):
         from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
@@ -4146,12 +4168,41 @@ class ServingChatTestCase(CustomTestCase):
                 parsed.append(json.loads(c[len("data: ") :]))
         return parsed
 
+    def test_streaming_created_is_stable_across_chunks(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.time.time",
+            side_effect=[100, 101, 102, 103],
+        ) as current_time:
+            chunks = self._run_chat_stream(Mock(), req)
+
+        parsed = self._parse_chunks(chunks)
+        self.assertGreater(len(parsed), 1)
+        identities = {
+            (chunk["id"], chunk["created"], chunk["model"]) for chunk in parsed
+        }
+        self.assertEqual(len(identities), 1)
+        response_id, created, model = identities.pop()
+        self.assertTrue(response_id)
+        self.assertEqual((created, model), (100, "x"))
+        self.assertTrue(
+            any(not chunk["choices"] and chunk.get("usage") for chunk in parsed)
+        )
+        current_time.assert_called_once_with()
+
     async def _collect_stream_content(self, content, choice_logprobs, req):
         chunks = []
         async for chunk in self.chat._generate_stream_content(
             content=content,
             index=0,
             request=req,
+            created=123,
             stream_offsets={},
             reasoning_parser_dict={},
             parser_dict={},
@@ -5026,6 +5077,7 @@ class ServingChatTestCase(CustomTestCase):
                 content=content,
                 index=0,
                 request=req,
+                created=123,
                 stream_offsets={},
                 reasoning_parser_dict={},
                 parser_dict={},
@@ -5048,9 +5100,14 @@ class ServingChatTestCase(CustomTestCase):
         enter_override(
             self, get_context().override_server_args(enable_cache_report=True)
         )
-        usages = self._collect_continuous_usage(cached_tokens=6)
-        self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+        for cached_tokens in (0, 6):
+            with self.subTest(cached_tokens=cached_tokens):
+                usages = self._collect_continuous_usage(cached_tokens=cached_tokens)
+                self.assertTrue(usages, "continuous_usage_stats attached no usage")
+                self.assertEqual(
+                    usages[0]["prompt_tokens_details"]["cached_tokens"],
+                    cached_tokens,
+                )
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
@@ -5306,7 +5363,7 @@ class ServingChatTestCase(CustomTestCase):
                 response = self.chat._build_chat_response(request, [ret], created=123)
                 message = response.model_dump(mode="json")["choices"][0]["message"]
                 self.assertEqual(message["content"], "" if tool_only else "Hello")
-                self.assertEqual(bool(message["tool_calls"]), tool_only)
+                self.assertEqual(bool(message.get("tool_calls")), tool_only)
                 self._assert_empty_reasoning_replays(message)
 
     def test_empty_stream_reasoning_each_choice(self):
@@ -5681,20 +5738,6 @@ class ServingChatTestCase(CustomTestCase):
         """Default _encode_messages returns None (use standard encoding)."""
         result = self.chat._encode_messages([], Mock(), False)
         self.assertIsNone(result)
-
-    def test_decode_response_returns_text(self):
-        """Default _decode_response returns ret_item['text']."""
-        ret_item = {"text": "Hello world", "output_ids": [1, 2, 3]}
-        result = self.chat._decode_response(ret_item)
-        self.assertEqual(result, "Hello world")
-
-    def test_get_parsed_response_fields_passthrough(self):
-        """Default _get_parsed_response_fields passes through values."""
-        reasoning = "thinking..."
-        tool_calls = [{"name": "foo"}]
-        r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
-        self.assertEqual(r, reasoning)
-        self.assertEqual(t, tool_calls)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

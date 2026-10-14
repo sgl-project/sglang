@@ -168,6 +168,41 @@ class TestBeamResponseTemplate(CustomTestCase):
                     {"city": "Paris"},
                 )
 
+    def test_value_ends_before_an_opener_on_the_next_line(self):
+        tools = [
+            _tool("write", {"path": {"type": "string"}, "content": {"type": "string"}})
+        ]
+        generation = _continuation_call(
+            "write",
+            '<rfl:parameter name="content">\nprint(1)\n\n' + _parameter("path", "a.py"),
+        )
+        expected = {"content": "print(1)\n", "path": "a.py"}
+        for level in ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER:
+            with (
+                self.subTest(level=level.name),
+                envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value),
+            ):
+                parser, streaming = (
+                    FunctionCallParser(
+                        tools=tools, tool_call_parser="beam", prefix=PREFIX
+                    )
+                    for _ in range(2)
+                )
+                _, tag = parser.get_structure_constraint("required")
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+                _, calls = parser.parse_non_stream(generation)
+                streamed = []
+                for char in generation:
+                    streamed += streaming.parse_stream_chunk(char)[1]
+                streamed += streaming.parse_stream_end()[1]
+
+                self.assertTrue(_is_grammar_accept_string(grammar, generation))
+                self.assertEqual(json.loads(calls[0].parameters), expected)
+                self.assertEqual(
+                    json.loads("".join(call.parameters for call in streamed)), expected
+                )
+
     def test_tool_call_requires_constraint_marker(self):
         parser = FunctionCallParser(
             tools=[_tool()],
@@ -382,8 +417,11 @@ class TestBeamResponseTemplate(CustomTestCase):
         )
         for tool in (note, place):
             tool.function.strict = True
+        spot = _tool("set_spot", {"loc": {"type": "object", "properties": strings}})
+        weather = _tool()
+        weather.function.parameters["additionalProperties"] = True
         parser = FunctionCallParser(
-            tools=[_tool(), note, place],
+            tools=[weather, note, place, spot],
             tool_call_parser="beam",
             prefix=PREFIX,
             constrained=True,
@@ -433,6 +471,11 @@ class TestBeamResponseTemplate(CustomTestCase):
                 "set_place",
                 _parameter("loc", '{"mark": "a<|end|>b"}'),
                 {"loc": {"mark": "a<|end|>b"}},
+            ),
+            (
+                "set_spot",
+                _parameter("loc", '{"x": "a<|end|><|start|>assistantb"}'),
+                {"loc": {"x": "a<|end|><|start|>assistantb"}},
             ),
         ]
 
@@ -563,6 +606,36 @@ class TestBeamResponseTemplate(CustomTestCase):
         for text, expected in cases:
             with self.subTest(text=text):
                 self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+
+    def test_automatic_calls_hold_declared_arguments_beside_any_other_name(self):
+        """At any strict level, declared arguments are held where they can be,
+        while calls may name undeclared tools with any arguments."""
+        count = _tool("set_count", {"count": {"type": "integer"}})
+        unheld = _tool("find", {"q": {"type": "string"}})
+        unheld.function.parameters["minProperties"] = 1
+        any_arguments = _parameter("x", "1") + _parameter("x", "y")
+        cases = [
+            (_continuation_call("get_weather", _parameter("city", "P")), True),
+            (_continuation_call("get_weather", _parameter("town", "P")), False),
+            (_continuation_call("set_count", _parameter("count", "1")), True),
+            (_continuation_call("set_count", _parameter("count", "x")), False),
+            (_continuation_call("find", any_arguments), True),
+            (_continuation_call("search_files", any_arguments), True),
+            (_continuation_call("set_coun", any_arguments), True),
+            (_continuation_call("set_counts", any_arguments), True),
+        ]
+
+        for level in (ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER):
+            with envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value):
+                tools = [_tool(), count] + ([unheld] if not level else [])
+                parser = FunctionCallParser(tools=tools, tool_call_parser="beam")
+                tag = parser.detector.get_structural_tag(
+                    tools=parser.structural_tag_tools(), tool_choice="auto"
+                )
+            grammar = Grammar.from_structural_tag(tag.model_dump_json())
+            for text, expected in cases:
+                with self.subTest(level=level, text=text):
+                    self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 
     def test_forced_call_with_unencodable_tool_name_is_rejected(self):
         parser = FunctionCallParser(

@@ -167,10 +167,14 @@ def test_beam_residual_cancellation(norms):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("with_norms", [False, True])
-def test_beam_custom_op_contracts(with_norms):
+def test_beam_custom_op_contracts(with_norms, enable_pdl):
+    from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.kernels.ops.layernorm.beam_fused import _fused_sandwich_residual_rmsnorm
 
+    if enable_pdl and not is_arch_support_pdl():
+        pytest.skip("PDL needs SM90 or newer")
     # Sliced rows cover real/fake output strides as well as optional norm outputs.
     x = torch.randn(8, 5120, device="cuda", dtype=torch.bfloat16)[::2]
     weight = torch.ones(5120, device="cuda", dtype=x.dtype) if with_norms else None
@@ -186,6 +190,7 @@ def test_beam_custom_op_contracts(with_norms):
             0.968,
             torch.empty_like(x) if with_norms else None,
             torch.empty_like(x),
+            enable_pdl,
         ),
     )
 

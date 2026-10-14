@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,6 +38,12 @@ def _load_megamoe_module(monkeypatch):
         "sglang.srt.layers.moe.token_dispatcher": types.ModuleType(
             "sglang.srt.layers.moe.token_dispatcher"
         ),
+        "sglang.srt.layers.dp_attention": types.ModuleType(
+            "sglang.srt.layers.dp_attention"
+        ),
+        "sglang.srt.layers.logits_processor": types.ModuleType(
+            "sglang.srt.layers.logits_processor"
+        ),
         "sglang.srt.runtime_context": types.ModuleType("sglang.srt.runtime_context"),
         "deep_gemm": types.ModuleType("deep_gemm"),
         "deep_gemm.utils": types.ModuleType("deep_gemm.utils"),
@@ -55,6 +62,12 @@ def _load_megamoe_module(monkeypatch):
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
+    runtime_context.get_parallel = lambda: types.SimpleNamespace(dp_size=4)
+    dp_attention = fake_modules["sglang.srt.layers.dp_attention"]
+    dp_attention.get_is_extend_in_batch = lambda: False
+    dp_attention.get_dp_global_num_tokens = lambda: None
+    logits_processor = fake_modules["sglang.srt.layers.logits_processor"]
+    logits_processor.get_in_autotune_dummy_run = lambda: False
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -69,6 +82,7 @@ def _load_megamoe_module(monkeypatch):
     for name, module in fake_modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
+    _load_autotune_module(monkeypatch)
     module_path = (
         Path(__file__).resolve().parents[5]
         / "python/sglang/srt/layers/moe/flashinfer_megamoe.py"
@@ -82,6 +96,269 @@ def _load_megamoe_module(monkeypatch):
     return module
 
 
+def _load_autotune_module(monkeypatch):
+    name = "sglang.srt.layers.moe.flashinfer_megamoe_autotune"
+    path = (
+        Path(__file__).resolve().parents[5]
+        / "python/sglang/srt/layers/moe/flashinfer_megamoe_autotune.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
+    from dataclasses import dataclass
+
+    module = _load_autotune_module(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    tuner = types.SimpleNamespace(
+        get_namespaced_records=lambda _: {},
+        publish_namespaced_records=lambda *_: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.autotuner",
+        types.SimpleNamespace(AutoTuner=types.SimpleNamespace(get=lambda: tuner)),
+    )
+
+    @dataclass
+    class Tensors:
+        hidden_states: torch.Tensor
+        topk_ids: torch.Tensor
+        topk_weights: torch.Tensor
+        fc1_alpha: torch.Tensor
+        scales: torch.Tensor | None = None
+
+        @property
+        def num_tokens(self):
+            return self.hidden_states.shape[0]
+
+    @dataclass
+    class Config:
+        knobs: str | None = None
+        kernel_name: str = "test_backend"
+        input_norm_const: float = 1.0
+
+    @dataclass
+    class Fleet:
+        max_tokens_per_rank: int = 4
+        num_experts: int = 4
+        token_hidden_size: int = 4
+
+    @dataclass
+    class Backend:
+        megakernel: Config
+        transformed_weights: object
+        preprocess_weights: bool = False
+
+    tensors = Tensors(
+        torch.ones(num_tokens, 4, dtype=torch.bfloat16),
+        torch.arange(num_tokens * 2, dtype=torch.int32).reshape(num_tokens, 2) % 4,
+        torch.full((num_tokens, 2), 0.5, dtype=torch.float32),
+        torch.ones(4, dtype=torch.float32),
+    )
+    forward = module.MegaMoeTunedForward(
+        types.SimpleNamespace(world_size=world_size, rank=0, process_group=None),
+        Fleet(),
+        Backend(Config(), object()),
+    )
+    calls = []
+
+    class Mega:
+        supports_output_view = False
+
+        def forward(self, inputs, **kwargs):
+            calls.append((inputs, kwargs.get("workspace")))
+            return inputs.hidden_states
+
+    return module, forward, tensors, Mega(), calls
+
+
+@pytest.mark.parametrize(
+    "decode_tokens,expected", [(3, [1, 2, 3, 128]), (8, [1, 2, 4, 8, 128])]
+)
+def test_megamoe_startup_profiles_are_prepared_once(
+    monkeypatch, decode_tokens, expected
+):
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch, num_tokens=96)
+    prepared = []
+
+    def prepare(layer, inputs, capacity):
+        prepared.append(capacity)
+        forward.workspaces[capacity] = object()
+
+    monkeypatch.setattr(forward, "_prepare_profile", prepare)
+    with module.megamoe_autotune_context(decode_tokens, prefill_num_tokens=128):
+        assert forward(mega, tensors) is tensors.hidden_states
+    # Bounds may exceed the bootstrap fleet. A large initial dummy must not
+    # create intermediate prefill profiles.
+    assert prepared == expected
+    assert calls[-1][1] is forward.workspaces[128]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    for count, selected in ((2, 2), (decode_tokens, decode_tokens), (32, 128)):
+        inputs = module._profile_inputs(tensors, count, num_experts=4)
+        forward(mega, inputs)
+        assert prepared == expected
+        assert calls[-1][1] is forward.workspaces[selected]
+    with pytest.raises(ValueError, match="exceeding its prepared"):
+        forward(mega, module._profile_inputs(tensors, 129, num_experts=4))
+
+
+@pytest.mark.parametrize("local_tokens", [0, 3])
+def test_megamoe_profile_selection_uses_all_dp_ranks(monkeypatch, local_tokens):
+    module, forward, tensors, mega, calls = _profile_fixture(
+        monkeypatch, world_size=4, num_tokens=local_tokens
+    )
+    dp = types.ModuleType("sglang.srt.layers.dp_attention")
+    dp.get_dp_global_num_tokens = lambda: [0, 1, 3, 7]
+    monkeypatch.setitem(sys.modules, dp.__name__, dp)
+    forward.workspaces = {1: object(), 4: object(), 8: object(), 128: object()}
+    forward._profile_capacities = tuple(forward.workspaces)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    forward(mega, tensors)
+    assert calls[-1][1] is forward.workspaces[8]
+
+
+def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch)
+    forward(mega, tensors)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    forward(mega, tensors)
+    assert [workspace for _, workspace in calls] == [None, None]
+
+
+@pytest.mark.parametrize("new_process", [False, True])
+def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
+    import json
+    import os
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
+    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    events = []
+    staged = []
+    native_paths = []
+    require_all_ranks = module.MegaMoeTunedForward._require_all_ranks
+    readiness = Mock()
+
+    def require(self, success, message):
+        readiness(success)
+        require_all_ranks(self, success, message)
+
+    monkeypatch.setattr(module.MegaMoeTunedForward, "_require_all_ranks", require)
+
+    class Mega:
+        supports_output_view = True
+
+        def __init__(self, **kwargs):
+            self.auto = kwargs.get("backend", first.backend).megakernel.knobs == "auto"
+
+        def warmup(self, inputs, workspace=None):
+            if self.auto:
+                events.append("tune")
+                Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
+                    json.dumps(payload)
+                )
+            else:
+                assert workspace is self.workspace
+                events.append("warmup")
+
+        def destroy(self):
+            events.append("destroy")
+
+        def create_workspace(self, capacity):
+            assert capacity == 1
+            path = Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"])
+            native_paths.append(path)
+            staged.append(json.loads(path.read_text()))
+            self.workspace = object()
+            events.append("create")
+            return self.workspace
+
+        def forward(self, inputs, *, workspace, return_workspace_view=False):
+            assert workspace is self.workspace
+            assert return_workspace_view
+            return inputs.hidden_states
+
+    fake_moe = types.ModuleType("flashinfer.moe_ep")
+    fake_moe.MoEEpMegaLayer = Mega
+    fake_autotuner = types.ModuleType("flashinfer.autotuner")
+    records = {}
+    tuner = types.SimpleNamespace(
+        get_namespaced_records=Mock(
+            side_effect=lambda namespace: records.get(namespace, {}).copy()
+        ),
+        publish_namespaced_records=Mock(
+            side_effect=lambda namespace, values: records.__setitem__(
+                namespace, values.copy()
+            )
+        ),
+    )
+    fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
+
+    owners = []
+    for phase in range(2):
+        if owners:
+            if new_process:
+                module._session_winners.clear()  # Only the loaded cache survives.
+            else:
+                records.clear()  # A new cache context must preserve pooled choices.
+        with module.megamoe_autotune_context(
+            decode_num_tokens=1,
+            prefill_num_tokens=1,
+        ):
+            for scale in (1.0, 2.0):
+                backend = replace(
+                    first.backend,
+                    megakernel=replace(
+                        first.backend.megakernel, input_norm_const=scale
+                    ),
+                )
+                forward = module.MegaMoeTunedForward(
+                    first.bootstrap, first.fleet_params, backend
+                )
+                mega = Mega()
+                assert forward(mega, tensors) is tensors.hidden_states
+                owners.append(mega)
+            assert readiness.call_count == phase + 1
+            assert native_paths[-2] == native_paths[-1]
+            assert native_paths[-1].is_file()
+        assert not native_paths[-1].exists()
+        assert os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] == "original-cache.json"
+        assert list(records["sglang_flashinfer_megamoe"].values()) == [payload]
+        assert tuner.get_namespaced_records.call_count == phase + 1
+
+    assert tuner.publish_namespaced_records.call_count == (1 if new_process else 2)
+    assert events == ["tune", "destroy"] + ["create", "warmup"] * 4
+    assert staged == [payload] * 4
+    assert len({id(owner.workspace) for owner in owners}) == 4
+
+
+@pytest.mark.parametrize("tokens,capacity", [(0, 8), (3, 8), (3, 1)])
+def test_megamoe_profile_inputs_retain_runtime_scales(monkeypatch, tokens, capacity):
+    module, _, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=tokens)
+    tensors.scales = torch.ones(tokens, 2)
+    profile = module._profile_inputs(tensors, capacity, num_experts=4)
+    assert profile.hidden_states.shape == (capacity, 4)
+    assert profile.topk_ids.shape == profile.topk_weights.shape == (capacity, 2)
+    assert profile.hidden_states.dtype == torch.bfloat16
+    assert profile.topk_ids.dtype == torch.int32
+    assert profile.topk_weights.dtype == torch.float32
+    assert profile.fc1_alpha is tensors.fc1_alpha
+    assert profile.scales.shape == (capacity, 2)
+    assert torch.all(profile.scales == 1)
+    assert torch.all((profile.topk_ids >= 0) & (profile.topk_ids < 4))
+
+
 def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
@@ -90,6 +367,51 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     runtime_context = sys.modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
     assert module._resolve_max_tokens_per_rank() == 1024
+
+
+def test_decode_workspace_is_chosen_only_when_every_rank_fits(monkeypatch):
+    """MegaMOE is a cross-rank collective: every EP rank must pick the same
+    workspace, and the small one only when no rank's padded batch exceeds it."""
+    module = _load_megamoe_module(monkeypatch)
+    dp_attention = sys.modules["sglang.srt.layers.dp_attention"]
+
+    def mega(capacity):
+        return types.SimpleNamespace(
+            _fleet_params=types.SimpleNamespace(max_tokens_per_rank=capacity)
+        )
+
+    large, small = mega(4608), mega(160)
+    quant_info = module.FlashInferMegaMoeQuantInfo(
+        mega=large, mega_forward=object(), mega_decode=small
+    )
+
+    def select(*, is_extend, global_num_tokens):
+        monkeypatch.setattr(dp_attention, "get_is_extend_in_batch", lambda: is_extend)
+        monkeypatch.setattr(
+            dp_attention, "get_dp_global_num_tokens", lambda: global_num_tokens
+        )
+        return module._select_mega_for_forward(quant_info)
+
+    assert select(is_extend=False, global_num_tokens=[160, 0, 37, 160]) is small
+    # Any rank extending, even with a decode-sized batch.
+    assert select(is_extend=True, global_num_tokens=[1, 1, 1, 1]) is large
+    # Decode above the small capacity on one rank only.
+    assert select(is_extend=False, global_num_tokens=[12, 161, 12, 12]) is large
+    # A prefill-sized forward can still publish extend=False.
+    assert select(is_extend=False, global_num_tokens=[4108] * 4) is large
+    # Under DP a singleton list is this rank's count only.
+    assert select(is_extend=False, global_num_tokens=[8]) is large
+    assert select(is_extend=False, global_num_tokens=None) is large
+
+
+def test_decode_capacity_at_or_above_main_capacity_is_disabled(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    envs = sys.modules["sglang.srt.environ"].envs
+    for configured, expected in ((0, 0), (160, 160), (4608, 0), (8192, 0)):
+        envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = (
+            types.SimpleNamespace(get=lambda v=configured: v)
+        )
+        assert module._resolve_decode_max_tokens_per_rank(4608) == expected
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
@@ -112,7 +434,7 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     output = torch.randn_like(hidden_states)
 
     class Mega:
-        _workspace = object()
+        supports_output_view = False
 
         def forward(self, tensors):
             self.tensors = tensors
@@ -140,7 +462,8 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     assert result.hidden_states is output
 
 
-def test_adapter_requests_workspace_output_view(monkeypatch):
+@pytest.mark.parametrize("supports_output_view", [False, True])
+def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_view):
     module = _load_megamoe_module(monkeypatch)
 
     class FakeMoEEpTensors:
@@ -160,15 +483,13 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     output = torch.randn_like(hidden_states)
 
     class Mega:
-        supports_output_view = True
-        _workspace = object()
-
         def forward(self, tensors, *, return_workspace_view=False):
             self.tensors = tensors
             self.return_workspace_view = return_workspace_view
             return output
 
     mega = Mega()
+    mega.supports_output_view = supports_output_view
     dispatch_output = types.SimpleNamespace(
         hidden_states=hidden_states,
         topk_output=types.SimpleNamespace(
@@ -186,7 +507,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     assert result.hidden_states is output
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
-    assert mega.return_workspace_view is True
+    assert mega.return_workspace_view is supports_output_view
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
@@ -215,6 +536,4 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
 
 
 if __name__ == "__main__":
-    import pytest
-
     sys.exit(pytest.main([__file__, "-v"]))

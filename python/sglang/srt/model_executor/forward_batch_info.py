@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from functools import total_ordering
+from functools import lru_cache, total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -634,6 +635,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
     defer_logits_to_eager: bool = False
+    # Full prefill graph capture uses a fixed request axis whose inactive slots
+    # must not participate in data-dependent row selection.
+    full_prefill_cuda_graph_capture: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -727,6 +731,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
+
+    # LLaDA-Image conditioning text lengths, declared so batch rebuilds
+    # carry them to the llada2_cfg_flashinfer backend
+    llada_image_conditioning_text_lens_cpu: Optional[List[int]] = None
 
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
@@ -2111,10 +2119,27 @@ def enable_num_token_non_padded():
 
     # Elastic joiners also need graph padding masked after joining WORLD; a
     # customized A2A backend consumes the count whatever the EP size.
-    return (
+    if (
         get_parallel().moe_ep_size > 1
         or world_dp_gather_enabled()
         or get_moe_a2a_backend().is_customized()
+    ):
+        return True
+    # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
+    # so the model needs the real count to zero the pad rows (see
+    # deepseek_v4 _run_moe_ffn_dp_sync).
+    return _dp_tp_moe_masks_pad_rows()
+
+
+@lru_cache(maxsize=1)
+def _dp_tp_moe_masks_pad_rows() -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return (
+        _is_hip
+        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
+        and get_parallel().attn_dp_size > 1
+        and get_moe_a2a_backend().is_none()
     )
 
 

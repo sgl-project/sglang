@@ -204,9 +204,7 @@ class TestBeamLoRATargets(CustomTestCase):
                 parent.add_module(part, nn.Module())
                 parent = getattr(parent, part)
             if as_linear:
-                linear = MergedColumnParallelLinear(
-                    8, [8, 8], bias=False, tp_rank=0, tp_size=1
-                )
+                linear = MergedColumnParallelLinear(8, [8, 8], bias=False)
                 parent.add_module(leaf, linear)
             else:
                 parent.register_parameter(leaf, nn.Parameter(torch.zeros(2, 16, 8)))

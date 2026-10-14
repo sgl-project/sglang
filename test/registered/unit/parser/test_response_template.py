@@ -713,7 +713,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             ([], call, False),
             (declared, "<call:get_time>{}</call>", False),
             (declared, call + '<answer>{"a": 1}', False),
-            (declared, '<call:get_weather>{"city": "<answer>Paris"}</call>', True),
+            (declared, '<call:get_weather>{"location": "<answer>Paris"}</call>', True),
         ]
 
         self.assertEqual(detector.think_end_token, "</think>")

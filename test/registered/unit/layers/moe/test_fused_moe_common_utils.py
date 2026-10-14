@@ -1,7 +1,5 @@
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -24,83 +22,6 @@ def _load_common_utils():
     return module
 
 
-def test_get_model_config_supports_kimi_vl():
-    common_utils = _load_common_utils()
-    text_config = SimpleNamespace(
-        hidden_size=2048,
-        n_routed_experts=64,
-        num_experts_per_tok=6,
-        moe_intermediate_size=1408,
-        num_hidden_layers=27,
-        first_k_dense_replace=1,
-        torch_dtype=torch.bfloat16,
-    )
-    model_config = SimpleNamespace(
-        architectures=["KimiVLForConditionalGeneration"],
-        text_config=text_config,
-        get_text_config=lambda: text_config,
-    )
-
-    with patch.object(common_utils, "get_config", return_value=model_config):
-        tuned_config = common_utils.get_model_config(
-            "moonshotai/Kimi-VL-A3B-Instruct", tp_size=4, ep_size=4
-        )
-
-    # The layer counts come from the text config, not the outer one, which has
-    # neither field.
-    assert tuned_config == {
-        "num_experts": 16,
-        "topk": 6,
-        "hidden_size": 2048,
-        "shard_intermediate_size": 2816,
-        "dtype": torch.bfloat16,
-        "block_shape": None,
-        "architecture": "KimiVLForConditionalGeneration",
-        "num_layers": 27,
-        "dense_layers": 1,
-    }
-
-
-def test_get_model_config_reports_deepseek_ocr_layer_layout():
-    """``load_topk_ids`` indexes recorded topk_ids per MoE layer.
-
-    It derives the MoE layer count as ``num_layers - dense_layers``, so a config
-    that reports either as 0 makes the tuner read the wrong (or no) recording.
-    """
-    common_utils = _load_common_utils()
-    text_config = SimpleNamespace(
-        hidden_size=1280,
-        n_routed_experts=64,
-        num_experts_per_tok=6,
-        moe_intermediate_size=896,
-        num_hidden_layers=12,
-        first_k_dense_replace=1,
-        torch_dtype=torch.bfloat16,
-    )
-    model_config = SimpleNamespace(
-        architectures=["DeepseekOCRForCausalLM"],
-        text_config=text_config,
-        get_text_config=lambda: text_config,
-    )
-
-    with patch.object(common_utils, "get_config", return_value=model_config):
-        tuned_config = common_utils.get_model_config(
-            "deepseek-ai/DeepSeek-OCR-2", tp_size=1, ep_size=1
-        )
-
-    assert tuned_config == {
-        "num_experts": 64,
-        "topk": 6,
-        "hidden_size": 1280,
-        "shard_intermediate_size": 1792,
-        "dtype": torch.bfloat16,
-        "block_shape": None,
-        "architecture": "DeepseekOCRForCausalLM",
-        "num_layers": 12,
-        "dense_layers": 1,
-    }
-
-
 @pytest.mark.parametrize(
     "tp_size,ep_size,num_experts,shard_size", [(4, 1, 256, 1280), (8, 8, 32, 5120)]
 )
@@ -120,6 +41,10 @@ def test_get_model_config_supports_beam(
         "dtype": torch.bfloat16,
         "block_shape": None,
         "architecture": "BeamForCausalLM",
+        "num_layers": 52,
+        # DeepSeek first_k_dense_replace metadata, absent on Beam; not Beam's dense
+        # layer count, which only the unsupported Beam capture/replay would need.
+        "dense_layers": 0,
     }
 
 

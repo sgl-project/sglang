@@ -1,5 +1,6 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
+import contextlib
 import itertools
 import math
 import os
@@ -27,7 +28,10 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.beam import (
@@ -39,6 +43,7 @@ from sglang.srt.models.beam import (
     apply_ssmax,
     compute_ssmax_scale,
     depth_scaled_residual,
+    get_beam_quantization,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.hf_transformers import get_context_length
@@ -125,8 +130,11 @@ class AddLayer(torch.nn.Module):
         batch,
         next_weight,
         ssmax_scale,
-        moe_all_reduce_comm=None,
-        attention_all_reduce_comm=None,
+        attention_beam_ar_comm=None,
+        attention_flashinfer_ar=None,
+        mlp_beam_ar_topk_comm=None,
+        mlp_beam_ar_comm=None,
+        mlp_flashinfer_ar=None,
     ):
         hidden = self.forward(positions, residual, batch, ssmax_scale)
         return hidden * next_weight, hidden
@@ -142,7 +150,16 @@ def stub_beam_model(layers, norm, layers_to_capture):
     model.start_layer, model.end_layer = 0, len(layers)
     model.layers_to_capture = layers_to_capture
     model.has_full_attention = False
+    model._flashinfer_ar_tokens = None
+    model._flashinfer_ar = None
+    model._mlp_has_single_tp_sum = True
     return model
+
+
+# MegaMOE requires TP == DP == EP: four attention-DP ranks, experts split four ways.
+_DP4_MEGAMOE_LAYOUT = dict(
+    tp_size=4, attn_tp_size=1, attn_dp_size=4, moe_tp_size=1, moe_ep_size=4
+)
 
 
 class TestBeamConfig(CustomTestCase):
@@ -176,6 +193,69 @@ class TestBeamConfig(CustomTestCase):
                     self.assertRaisesRegex(ValueError, "auto or triton"),
                 ):
                     BeamMoE(tiny_config(), 1, quant_config=quant)
+
+    def test_megamoe_builds_one_expert_set_with_explicit_routing(self):
+        from sglang.srt.runtime_context import get_flags
+
+        built = []
+
+        def make_experts(**kwargs):
+            built.append(kwargs["prefix"])
+            experts = torch.nn.Module()
+            experts.should_fuse_routed_scaling_factor_in_topk = True
+            return experts
+
+        def megamoe_context(runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE):
+            stack = contextlib.ExitStack()
+            stack.enter_context(get_context().override_server_args())
+            stack.enter_context(
+                get_flags().moe.override(
+                    runner_backend=runner_backend,
+                    a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+                )
+            )
+            stack.enter_context(get_parallel().override(**_DP4_MEGAMOE_LAYOUT))
+            return stack
+
+        nvfp4 = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        with (
+            megamoe_context(),
+            patch(
+                "sglang.srt.models.beam.get_moe_impl_class",
+                return_value=make_experts,
+            ),
+        ):
+            moe = BeamMoE(
+                tiny_config(), 1, prefix="model.layers.1.mlp", quant_config=nvfp4
+            )
+
+        self.assertEqual(built, ["model.layers.1.mlp.experts"])
+        # MegaMOE dispatches on explicit expert ids and weights.
+        self.assertEqual(moe.topk.topk_config.output_format, TopKOutputFormat.STANDARD)
+        self.assertTrue(moe.topk.topk_config.apply_routed_scaling_factor_on_output)
+
+        rejected = {
+            "bf16": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "fp8": (fp8_config(), MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            # Compressed-tensors NVFP4 has no MegaMOE weight preparation.
+            "non_modelopt_nvfp4": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "trtllm_runner": (nvfp4, MoeRunnerBackend.FLASHINFER_TRTLLM),
+        }
+        for case, (quant, runner) in rejected.items():
+            with (
+                self.subTest(case=case),
+                megamoe_context(runner),
+                patch(
+                    "sglang.srt.models.beam.get_beam_quantization",
+                    return_value=(
+                        "nvfp4"
+                        if case == "non_modelopt_nvfp4"
+                        else get_beam_quantization(quant)
+                    ),
+                ),
+                self.assertRaisesRegex(ValueError, "only for ModelOpt NVFP4"),
+            ):
+                BeamMoE(tiny_config(), 1, quant_config=quant)
 
     def test_unsupported_quantization_fails_before_allocation(self):
         # Other FP8 layouts must not pass merely because they use the same exporter.
@@ -534,6 +614,63 @@ class TestBeamNumerics(CustomTestCase):
                     topk.forward.assert_not_called()
                     topk.empty_topk_output.assert_called_once()
 
+    def test_megamoe_runs_sparse_layers_on_dp_local_tokens(self):
+        from sglang.srt.runtime_context import get_flags
+
+        with (
+            get_context().override_server_args(),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE,
+                a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+            ),
+            get_parallel().override(**_DP4_MEGAMOE_LAYOUT),
+            patch(
+                "sglang.srt.models.beam.BeamAttention",
+                return_value=torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMLP", return_value=torch.nn.Identity()),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+        ):
+            dense, sparse = (BeamDecoderLayer(tiny_config(), i) for i in (0, 1))
+            # Dense MLPs stay TP-sharded over the gathered tokens.
+            self.assertTrue(dense.gather_mlp_tokens)
+            self.assertFalse(sparse.gather_mlp_tokens)
+
+            # MegaMOE returns complete tokens, so the block owes no all-reduce.
+            moe = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(moe)
+            moe.layer_id, moe.tp_size, moe.ep_size = 1, 1, 4
+            moe.use_fp32_router = moe.refresh_correction_bias = False
+            moe.use_fast_router = False
+            moe.gate = Mock(return_value=(torch.zeros(2, 8), None))
+            moe.topk = Mock(return_value="routing")
+            moe.topk.empty_topk_output = Mock(return_value="empty routing")
+            moe.experts = Mock(side_effect=lambda hidden, routing: hidden + 6)
+            sparse.mlp = moe
+            with (
+                patch(
+                    "sglang.srt.models.beam.moe_expert_parallel_all_reduce"
+                ) as ep_all_reduce,
+                patch(
+                    "sglang.srt.models.beam.moe_tensor_model_parallel_all_reduce"
+                ) as tp_all_reduce,
+                patch("sglang.srt.models.beam.dp_gather_replicate") as gather,
+            ):
+                local = torch.ones(2, 3)
+                output = sparse._forward_mlp(local, SimpleNamespace())
+                # An idle rank still enters the MegaMOE collective.
+                idle = torch.empty(0, 3)
+                idle_output = sparse._forward_mlp(idle, SimpleNamespace())
+            self.assertEqual(
+                [call.args for call in moe.experts.call_args_list],
+                [(local, "routing"), (idle, "empty routing")],
+            )
+            gather.assert_not_called()
+            ep_all_reduce.assert_not_called()
+            tp_all_reduce.assert_not_called()
+            torch.testing.assert_close(output, torch.full((2, 3), 7.0))
+            self.assertEqual(idle_output.shape, (0, 3))
+
     def _select_beam_experts(self, config, bias, logits):
         # Exercise the TopK constructed by Beam, replacing only the hardware
         # selector with its shared eager implementation for CPU CI.
@@ -581,6 +718,21 @@ class TestBeamNumerics(CustomTestCase):
         self.assertEqual(output.topk_weights.dtype, torch.float32)
         self.assertEqual(output.topk_ids.dtype, torch.int32)
         return output.topk_weights, output.topk_ids
+
+    def test_non_bf16_router_uses_linear_fallback(self):
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                hidden = torch.randn(17, 24, dtype=dtype)
+                weight = torch.randn(8, 24)
+                expected = hidden.float() @ weight.T
+                gate = Mock(weight=weight, return_value=(expected, None))
+                moe = SimpleNamespace(
+                    use_fast_router=True, use_fp32_router=True, gate=gate
+                )
+                actual = BeamMoE._router_logits(moe, hidden)
+                torch.testing.assert_close(actual, expected)
+                gate.assert_called_once()
+                torch.testing.assert_close(gate.call_args.args[0], hidden.float())
 
     def test_router_bias_selects_experts_with_unscaled_fp32_combine_scores(self):
         config = tiny_config()
@@ -856,6 +1008,7 @@ class TestBeamLoading(CustomTestCase):
                 ),
                 get_parallel().override(
                     tp_size=tp_size,
+                    tp_rank=rank,
                     attn_tp_rank=rank,
                     attn_tp_size=tp_size,
                     moe_tp_size=tp_size,
@@ -868,9 +1021,7 @@ class TestBeamLoading(CustomTestCase):
                 ),
             ):
                 attention = BeamAttention(config, layer_id=0)
-                dense = MergedColumnParallelLinear(
-                    24, [32, 32], bias=False, tp_rank=rank, tp_size=tp_size
-                )
+                dense = MergedColumnParallelLinear(24, [32, 32], bias=False)
                 params = {
                     "model.layers.0.self_attn.gate_bias": attention.gate_bias,
                     "model.layers.0.mlp.gate_up_proj.weight": dense.weight,
@@ -1238,6 +1389,221 @@ class TestBeamPipelineStage(CustomTestCase):
                         pp_proxy_tensors=PPProxyTensors({"hidden_states": stream}),
                     )
                     torch.testing.assert_close(hidden, stream * 10)
+
+
+class TestBeamBoundaryOwnership(CustomTestCase):
+    """Who reduces each TP boundary, and how FlashInfer's workspace is set up."""
+
+    @staticmethod
+    def stub_layer(moe: bool, log: list):
+        """A decoder layer whose attention, MLP and collectives only record calls."""
+
+        def attention(positions, normed, batch, ssmax_scale, skip_all_reduce=False):
+            log.append("attention" if skip_all_reduce else "attention+own reduce")
+            return normed + 1
+
+        def mlp(hidden, defer_sum=False, skip_all_reduce=False):
+            if defer_sum:
+                log.append("experts deferred")
+                return hidden.unsqueeze(1).expand(-1, 8, -1)
+            log.append("mlp" if skip_all_reduce else "mlp+own reduce")
+            return hidden + 2
+
+        layer = BeamDecoderLayer.__new__(BeamDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = attention
+        if moe:
+            layer.mlp = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(layer.mlp)
+            layer.mlp.forward = mlp
+            layer.mlp.config = SimpleNamespace(routed_scaling_factor=2.5)
+            backend = SimpleNamespace(is_triton=lambda: True)
+            layer.mlp.experts = SimpleNamespace(
+                quant_method=SimpleNamespace(
+                    runner=SimpleNamespace(runner_backend=backend)
+                ),
+                _dwdp_bound=False,
+            )
+        else:
+            layer.mlp = mlp
+        layer.gather_mlp_tokens = False
+        weight = SimpleNamespace(weight=torch.ones(4))
+        layer.post_attention_layernorm = layer.pre_feedforward_layernorm = weight
+        layer.post_feedforward_layernorm = weight
+        layer.rms_norm_eps = 1e-6
+        layer.attn_residual_scales = layer.mlp_residual_scales = (0.5, 0.5)
+
+        def norm(branch, residual, *args):
+            log.append("norm")
+            return branch, residual
+
+        layer.sandwich_residual_norm = norm
+        return layer
+
+    def test_each_boundary_is_reduced_exactly_once(self):
+        def fused(comm, branch, residual, *args, routed_scale=1.0):
+            log.append(f"{comm} {tuple(branch.shape[1:-1])} x{routed_scale}")
+            return branch[:, 0] if branch.ndim == 3 else branch, residual
+
+        def flashinfer(branch):
+            log.append("flashinfer")
+            return branch
+
+        # (MoE layer, replacements) -> calls in order; "x2.5" marks routed scaling.
+        cases = [
+            (False, {}, ["attention+own reduce", "norm", "mlp+own reduce", "norm"]),
+            (
+                False,
+                {"attention_beam_ar_comm": "fused", "mlp_beam_ar_comm": "fused"},
+                ["attention", "fused () x1.0", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_beam_ar_comm": "fused",
+                    "mlp_beam_ar_topk_comm": "topk",
+                    "mlp_beam_ar_comm": "fused",
+                },
+                ["attention", "fused () x1.0", "experts deferred", "topk (8,) x2.5"],
+            ),
+            # The top-k variant needs per-expert outputs; a dense MLP falls back.
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk"},
+                ["attention+own reduce", "norm", "mlp+own reduce", "norm"],
+            ),
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk", "mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {"mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_flashinfer_ar": flashinfer,
+                    "mlp_flashinfer_ar": flashinfer,
+                },
+                ["attention", "flashinfer", "norm", "mlp", "flashinfer", "norm"],
+            ),
+            # A reduce-scatter or two-group MLP keeps its own reduction.
+            (
+                True,
+                {"attention_flashinfer_ar": flashinfer},
+                ["attention", "flashinfer", "norm", "mlp+own reduce", "norm"],
+            ),
+        ]
+        hidden = torch.zeros(3, 4)
+        for moe, replacements, expected in cases:
+            with self.subTest(moe=moe, replacements=sorted(replacements)):
+                log = []
+                layer = self.stub_layer(moe, log)
+                with patch(
+                    "sglang.kernels.ops.communication.beam_all_reduce."
+                    "beam_all_reduce_norm",
+                    side_effect=fused,
+                ):
+                    layer.forward_fused(
+                        None, hidden, hidden, None, None, None, **replacements
+                    )
+                self.assertEqual(log, expected)
+
+    def test_meta_construction_defers_flashinfer_setup(self):
+        pp_group = SimpleNamespace(
+            is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                pp_group=pp_group,
+            ),
+            patch(
+                "sglang.srt.models.beam.BeamRotaryEmbedding",
+                side_effect=lambda config: torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+            patch.object(BeamModel, "_flashinfer_ar_band", return_value=(96, 640)),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                side_effect=AssertionError("workspace setup during construction"),
+            ),
+            torch.device("meta"),
+        ):
+            model = BeamModel(tiny_config())
+        self.assertEqual(model._flashinfer_ar_tokens, (96, 640))
+        self.assertIsNone(model._flashinfer_ar)
+
+    def run_setup(self, *, local_ok=True, peer_ok=True, calls=()):
+        """Drive `_flashinfer_ar_for` through `calls` of (tokens, capturing)."""
+        manager = Mock(workspace=object() if local_ok else None)
+        model = BeamModel.__new__(BeamModel)
+        torch.nn.Module.__init__(model)
+        model._flashinfer_ar_tokens, model._flashinfer_ar = (96, 640), None
+        group = SimpleNamespace(
+            world_size=4, rank_in_group=0, device_group=None, cpu_group=None
+        )
+
+        def vote(ready, op, group):
+            ready.mul_(int(peer_ok))
+
+        results = []
+        with (
+            get_parallel().override(tp_group=group),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                return_value=manager,
+            ) as manager_class,
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion."
+                "is_flashinfer_allreduce_unavailable",
+                return_value=False,
+            ),
+            patch("torch.distributed.all_reduce", side_effect=vote),
+            patch("sglang.srt.models.beam.atexit.register"),
+        ):
+            for tokens, capturing in calls:
+                hidden = torch.zeros(tokens, 8, dtype=torch.bfloat16)
+                with patch(
+                    "torch.cuda.is_current_stream_capturing", return_value=capturing
+                ):
+                    results.append(model._flashinfer_ar_for(hidden))
+        return model, manager, manager_class, results
+
+    def test_flashinfer_setup_runs_once_eagerly_and_is_reused(self):
+        model, manager, manager_class, results = self.run_setup(
+            calls=[(128, True), (8, False), (128, False), (128, True), (641, True)]
+        )
+        # Never during capture; once on the first eager forward, whatever its size.
+        self.assertIsNone(results[0])
+        manager_class.assert_called_once()
+        self.assertEqual(manager.initialize.call_args.kwargs["max_token_num"], 640)
+        self.assertIsNone(results[1])
+        self.assertIs(results[2], model._flashinfer_ar)
+        self.assertIs(results[3], model._flashinfer_ar)
+        self.assertIsNone(results[4])
+        manager.cleanup.assert_not_called()
+
+    def test_flashinfer_setup_failure_falls_back_for_good(self):
+        for local_ok, peer_ok in ((False, True), (True, False)):
+            with self.subTest(local_ok=local_ok, peer_ok=peer_ok):
+                model, manager, manager_class, results = self.run_setup(
+                    local_ok=local_ok,
+                    peer_ok=peer_ok,
+                    calls=[(128, False), (128, False), (256, True)],
+                )
+                self.assertEqual(results, [None, None, None])
+                manager_class.assert_called_once()
+                manager.cleanup.assert_called_once()
+                self.assertIsNone(model._flashinfer_ar_tokens)
 
 
 if __name__ == "__main__":

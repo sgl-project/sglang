@@ -383,6 +383,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mtp_draft_device_pools = ()
+        self.mtp_draft_mamba_pools = ()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
@@ -1416,12 +1417,9 @@ class ModelRunner:
         """Load a new lora adapter from disk or huggingface."""
         return self.lora_manager.load_lora_adapter(lora_ref)
 
-    def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
-    ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
-        )
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
