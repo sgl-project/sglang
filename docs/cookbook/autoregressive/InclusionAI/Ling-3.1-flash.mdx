@@ -35,12 +35,12 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. The H200 recipe is verified; the GB300 recipe is awaiting current-revision validation.
+- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding, on H200 or GB300.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
 <Note>
-DSpark is not available for Ling-3.1-flash yet: a compatible draft checkpoint does not exist. The built-in NEXTN head is the speculative path; see the verification table.
+DSpark is not available for Ling-3.1-flash yet: a compatible draft checkpoint does not exist. The built-in NEXTN head is the speculative path.
 </Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -65,6 +65,8 @@ The model supports reasoning and structured tool calling, with a context limit o
 
 **Checkpoint:** [inclusionAI/Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash). **License:** MIT.
 
+The model has about 560B total parameters (512 routed experts with 8 active plus one shared expert per token, about 17B active), 72 layers, and FP8 block-quantized weights.
+
 ## 2. Configuration tips
 
 - Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
@@ -83,16 +85,24 @@ The model supports reasoning and structured tool calling, with a context limit o
 
 ### Performance
 
-On H200 TP8 + EP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **251.2 tokens/s**. GB300 NEXTN batch-size-1 result: `{{GB300_NEXTN_BS1}}`.
+On H200 TP8 + EP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **251.2 tokens/s**. GB300 NEXTN batch-size-1 result: `180.0 tok/s (TPOT 5.14 ms, accept 2.59)`.
 
 Acceptance length is the mean number of tokens accepted per speculative verification step, including the target bonus token:
 
-| Workload | Acceptance length |
-|---|---:|
-| Random-token benchmark (bs=1) | 2.61 |
-| GSM8K smoke (HiCache serve) | 2.29 |
-| Full GSM8K (cumulative) | 2.43 |
-| Real-text probes (30 prompts) | 2.13 |
+<table>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Workload</th>
+      <th style={{textAlign: "right", padding: "10px 12px"}}>Acceptance length</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px"}}>Random-token benchmark (bs=1)</td><td style={{padding: "9px 12px", textAlign: "right"}}>2.61</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>GSM8K smoke (HiCache serve)</td><td style={{padding: "9px 12px", textAlign: "right"}}>2.29</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>Full GSM8K (cumulative)</td><td style={{padding: "9px 12px", textAlign: "right"}}>2.43</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>Real-text probes (30 prompts)</td><td style={{padding: "9px 12px", textAlign: "right"}}>2.13</td></tr>
+  </tbody>
+</table>
 
 The image includes KDA normalization/quantization fusion, FP8 block GEMV, router-gate matrix-vector kernels, and a 512-expert top-k router.
 
@@ -109,7 +119,21 @@ python3 -m sglang.bench_serving \
   --random-input-len 2048 --random-output-len 512 \
   --random-range-ratio 1 \
   --num-prompts 16 --max-concurrency 1 \
-  --flush-cache
+  --flush-cache --seed 11
+```
+
+For the concurrency-32 row in the benchmark widget:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host localhost --port 30000 \
+  --model inclusionAI/Ling-3.1-flash \
+  --dataset-name random \
+  --random-input-len 4096 --random-output-len 512 \
+  --random-range-ratio 1 \
+  --num-prompts 96 --max-concurrency 32 \
+  --flush-cache --seed 11
 ```
 
 </Accordion>
@@ -152,18 +176,20 @@ print(response.choices[0].message.content)
 
 <Accordion title="Example Output">
 
-```json Output
-{
-  "message": {
-    "role": "assistant",
-    "content": "**36**\n\nHere's the calculation:\n- 15% = 0.15\n- 0.15 × 240 = 36\n\nOr break it down: 10% of 240 = 24, and 5% of 240 = 12, so 24 + 12 = **36**",
-    "reasoning_content": "15% of 240 = 0.15 × 240 = 36.\n\nQuick check: 10% of 240 = 24, 5% = 12, total 36. Correct.",
-    "tool_calls": null
-  },
-  "finish_reason": "stop",
-  "usage": { "prompt_tokens": 32, "completion_tokens": 147, "reasoning_tokens": 59 }
-}
+```text Output
+15% of 240 = 0.15 × 240 = 36.
+
+Quick check: 10% of 240 = 24, 5% = 12, total 36. Correct.
+**36**
+
+Here's the calculation:
+- 15% = 0.15
+- 0.15 × 240 = 36
+
+Or break it down: 10% of 240 = 24, and 5% of 240 = 12, so 24 + 12 = **36**
 ```
+
+The first block is `reasoning_content` (59 tokens); the second is `content`. `finish_reason` is `stop`.
 
 </Accordion>
 
@@ -183,18 +209,19 @@ print(response.choices[0].message.content)
 
 <Accordion title="Example Output">
 
-```json Output
-{
-  "message": {
-    "role": "assistant",
-    "content": "15% of 240 is **36**.\n\nCalculation:\n- 10% of 240 = 24\n- 5% of 240 = 12\n- 24 + 12 = **36**\n\nOr directly: 240 × 0.15 = **36**",
-    "reasoning_content": null,
-    "tool_calls": null
-  },
-  "finish_reason": "stop",
-  "usage": { "prompt_tokens": 33, "completion_tokens": 81, "reasoning_tokens": 0 }
-}
+```text Output
+None
+15% of 240 is **36**.
+
+Calculation:
+- 10% of 240 = 24
+- 5% of 240 = 12
+- 24 + 12 = **36**
+
+Or directly: 240 × 0.15 = **36**
 ```
+
+`reasoning_content` is `None` and `reasoning_tokens` is 0.
 
 </Accordion>
 
@@ -223,21 +250,38 @@ tools = [
     }
 ]
 
+import json
+
 response = client.chat.completions.create(
     model="Ling-3.1-flash",
     messages=[{"role": "user", "content": "What's the weather like in Hangzhou right now?"}],
     tools=tools,
     tool_choice="required",
 )
-call = response.choices[0].message.tool_calls[0]
-print(call.function.name, call.function.arguments)
-# Then call get_weather yourself and send the result back
-# with {"role": "tool", "tool_call_id": call.id, "content": ...}
+msg = response.choices[0].message
+call = msg.tool_calls[0]
+print(msg.model_dump_json(indent=2, exclude_none=True))
+print(response.choices[0].finish_reason)
+
+# Execute the tool yourself, then return its result on the matching tool_call_id
+result = get_weather(**json.loads(call.function.arguments))
+
+follow_up = client.chat.completions.create(
+    model="Ling-3.1-flash",
+    messages=[
+        {"role": "user", "content": "What's the weather like in Hangzhou right now?"},
+        msg,
+        {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)},
+    ],
+    tools=tools,
+)
+print(follow_up.choices[0].message.reasoning_content)
+print(follow_up.choices[0].message.content)
 ```
 
 </Accordion>
 
-<Accordion title="Example Output">
+<Accordion title="Example Output (first turn)">
 
 ```json Output
 {
@@ -261,11 +305,13 @@ print(call.function.name, call.function.arguments)
 }
 ```
 
+The follow-up assistant turn answers with both `reasoning_content` and `content` populated.
+
 </Accordion>
 
 ### 3.3 HiCache with Mooncake
 
-The H200 HiCache combination is verified on the current checkpoint revision with NEXTN: GSM8K smoke 98/100 with stop rate 100%, acceptance length 2.29, and L3 prefetch hits on all 8 TP ranks. Mooncake runs as L3 prefix storage over TCP; start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
+With HiCache enabled, prefix state is written through to Mooncake L3 and later requests prefetch it back: measured 5952 of 6000 tokens restored from storage on every TP rank. Mooncake runs as L3 prefix storage over TCP; start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
 
 <Accordion title="Start Mooncake services">
 
@@ -294,18 +340,25 @@ docker run --rm --network host --ipc=host \
 
 ```text Output
 Master service started on port 50171 ... role=leader, state=serving, service_ready=true
+Master Admin Metrics: role=leader, state=serving, service_ready=true, master={Mem Storage: 0 B / 4.00 GB ... | Clients: 1 ...}
 Client HTTP server started on port 8291
 Starting real client service on 127.0.0.1:50172
-...
-[TP0] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
-[TP1] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
-... (all 8 TP ranks)
 ```
 
 </Accordion>
 
 Select **H200 → Low-Latency** in Deployment, then enable **HiCache → Mooncake** in the Playground. Keep NEXTN inherited from the base. Docker commands use host networking so the SGLang container can reach these localhost services. Change the master and metadata endpoints in the **Env** dialog for a remote store.
 
-The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. Check that L3 prefetch completes on every TP rank when validating this combination.
+The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. To verify L3 round-trip: send a long prompt (thousands of tokens), wait for the server to go idle, flush with `curl -X POST http://localhost:30000/flush_cache -H 'Content-Type: application/json' -d '{}'`, then repeat the same prompt. The serve log shows one `HiCache prefetch success` line per TP rank with the restored token count:
+
+```text Output
+[TP0] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
+[TP1] HiCache prefetch success req=... completed=5952 matched=0 loaded=5952 occupied=0
+... (all 8 TP ranks)
+```
+
+<Note>
+`POST /flush_cache` is refused with 400 while any request is still in flight — the L3 write-through finishes after the response returns. Wait a few seconds of idle before flushing.
+</Note>
 
 For storage sizing and backend details, see [HiCache best practices](/docs/advanced_features/hicache_best_practices).

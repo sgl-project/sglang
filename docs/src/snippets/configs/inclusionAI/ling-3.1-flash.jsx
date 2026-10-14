@@ -175,7 +175,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -185,7 +185,6 @@ export const config = {
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
-      warn: "Current-revision NEXTN validation pending: {{GB300_NEXTN_SMOKE}}; batch-size-1 speed: {{GB300_NEXTN_BS1}}.",
     },
   ],
 };

@@ -13,6 +13,6 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-    notes: "{{GB300_NEXTN_SMOKE}}; {{GB300_NEXTN_BS1}}",
+    notes: "GSM8K smoke 97/100, stop rate 100%, acceptance length 2.40; 180.0 tok/s (TPOT 5.14 ms, accept 2.59)",
   },
 ];
