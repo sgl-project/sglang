@@ -127,6 +127,10 @@ def apply_prefill_cp_cuda_graph_default(server_args: Any):
             logger.info(
                 "Enabling breakable prefill CUDA graph for supported prefill CP."
             )
+    if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+        logger.warning(
+            "Breakable prefill CUDA graph is not enabled for this prefill CP configuration."
+        )
 
 
 def apply_cuda_graph_compatibility(server_args: Any):
@@ -196,9 +200,10 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
-        # CP all_gather replay size mismatch under BCG.
+        # CP all_gather replay size mismatch under BCG. Defer the warning until
+        # apply_prefill_cp_cuda_graph_default has resolved the final CP default.
         (
-            "context parallel (attn_cp_size > 1)",
+            None,
             lambda: (
                 resolved_view(server_args).attn_cp_size > 1
                 and not supports_prefill_cp_bcg(server_args)
@@ -234,11 +239,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     ]
     for name, predicate in rules:
         if predicate():
-            logger.warning(
-                "Breakable CUDA graph is incompatible with %s; "
-                "disabling prefill CUDA graph.",
-                name,
-            )
+            if name is not None:
+                logger.warning(
+                    "Breakable CUDA graph is incompatible with %s; "
+                    "disabling prefill CUDA graph.",
+                    name,
+                )
             declare_resolution(
                 server_args,
                 "_disable_breakable_cudagraph_if_incompatible",
