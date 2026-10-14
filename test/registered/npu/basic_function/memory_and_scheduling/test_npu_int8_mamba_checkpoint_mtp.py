@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from transformers import AutoTokenizer
 
-from sglang.test.ascend.test_ascend_utils import MODEL_WEIGHTS_DIR
+from sglang.test.ascend.e2e.test_npu_performance_utils import (
+    QWEN3_6_35B_A3B_MODEL_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -275,10 +277,7 @@ class TestNpuInt8MambaCheckpointMtp(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = os.environ.get(
-            "SGLANG_TEST_MODEL",
-            os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.6-35B-A3B"),
-        )
+        cls.model = QWEN3_6_35B_A3B_MODEL_PATH
         cls.base_url = f"http://127.0.0.1:{find_available_port(10000)}"
         cls.env = os.environ.copy()
         cls.env.update(NPU_ENV)
