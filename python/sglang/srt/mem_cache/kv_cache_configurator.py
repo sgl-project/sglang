@@ -1898,6 +1898,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
+            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **kwargs,
         )
         return token_to_kv_pool
