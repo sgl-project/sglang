@@ -246,32 +246,6 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
             self._method("flashinfer_sparse_mla"), TopkTransformMethod.PAGED
         )
 
-    def test_mixed_chunk_batches_route_like_extend(self):
-        # Regression: a mixed-chunk batch (ForwardMode.MIXED) runs the prefill
-        # impl, but only EXTEND was routed to RAGGED. The prefill graph runner
-        # builds metadata from the MIXED batch and replays EXTEND graphs, so
-        # with an FP8 KV cache the first mixed batch died on the metadata
-        # mismatch; handed MIXED directly, the bf16-only kernels would receive
-        # the packed pool. FP8-native impls keep PAGED; a bf16 pool never
-        # needs RAGGED.
-        from sglang.srt.layers.attention.dsa_backend import TopkTransformMethod
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        for impl in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla"):
-            with self.subTest(impl=impl):
-                self.assertEqual(
-                    self._method(impl, mode=ForwardMode.MIXED),
-                    TopkTransformMethod.RAGGED,
-                )
-        self.assertEqual(
-            self._method("flashmla_kv", mode=ForwardMode.MIXED),
-            TopkTransformMethod.PAGED,
-        )
-        self.assertEqual(
-            self._method("flashmla_sparse", store_fp8=False, mode=ForwardMode.MIXED),
-            TopkTransformMethod.PAGED,
-        )
-
 
 class TestTritonSparseMLARegistration(CustomTestCase):
     """Selectable from the CLI, and opt-in only."""

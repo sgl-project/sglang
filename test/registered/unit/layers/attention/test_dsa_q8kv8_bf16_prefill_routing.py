@@ -39,6 +39,16 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
         ("flashmla_sparse_q8", False, ForwardMode.DECODE, PAGED),
         ("flashmla_sparse_q8", False, ForwardMode.TARGET_VERIFY, PAGED),
         ("flashmla_sparse_q8", False, ForwardMode.DRAFT_EXTEND_V2, PAGED),
+        # A mixed-chunk batch (MIXED) must answer exactly like EXTEND: the eager
+        # runner runs it as EXTEND, and the prefill graph runner builds the
+        # attention metadata from the MIXED batch while replaying the
+        # EXTEND-captured graphs. Routing MIXED to PAGED left that metadata
+        # without the ragged offsets the in-graph indexer asked for.
+        ("flashmla_sparse", True, ForwardMode.MIXED, RAGGED),
+        ("flashmla_sparse", False, ForwardMode.MIXED, PAGED),
+        ("flashmla_sparse_q8", False, ForwardMode.MIXED, RAGGED),
+        ("triton_sparse_mla", True, ForwardMode.MIXED, RAGGED),
+        ("flashmla_kv", True, ForwardMode.MIXED, PAGED),
     ],
 )
 def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expected):
