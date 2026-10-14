@@ -7,7 +7,8 @@ points one way, from `Scheduler` down:
 - R2: `Scheduler` passes no lambda that captures it, no `self`, and no bound
   method of its own into a component.
 - R3: the declared dependency graph has a topological order, and each built
-  component takes exactly its declared dependencies.
+  component takes exactly its declared dependencies; no code reaches a node
+  through the workers (`tp_worker.model_runner.<node>`) instead of taking it.
 - R4: nothing below `ModeOwners` takes a component that holds `ModeOwners`
   (they are replaced on a PD role switch).
 
@@ -424,6 +425,24 @@ _CALLBACK_SITES = {
     ): 1,
 }
 
+# R3: (module under srt/, scope, attribute chain) reaching a node through the
+# workers or their model runner.
+_WORKER_ROOTS = (
+    "tp_worker",
+    "model_worker",
+    "draft_worker",
+    "target_worker",
+    "model_runner",
+)
+_THROUGH_WORKERS = {
+    # The model runner builds the coordinator before graph capture.
+    (
+        "managers/scheduler.py",
+        "Scheduler.init_hisparse_coordinator",
+        "self.tp_worker.model_runner.hisparse_coordinator",
+    ): 1,
+}
+
 # R4: (module under srt/, class, parameter).
 _HUB_PARAMS_BELOW_MODE_OWNERS = {}
 
@@ -563,6 +582,36 @@ def _constructor_params(rel: str, class_name: str) -> list:
     ]
 
 
+def _scanned_modules() -> list:
+    """The scheduler, the components and the classes below ModeOwners."""
+    components = _SRT_DIR / "managers" / "scheduler_components"
+    return sorted(
+        {_SCHEDULER, *(rel for rel, _ in _BUILT.values()), *_BELOW_MODE_OWNERS}
+        | {path.relative_to(_SRT_DIR).as_posix() for path in components.glob("*.py")}
+    )
+
+
+def _scan_through_workers() -> Counter:
+    """R3: attribute chains that start at a worker and end at a node's parameter."""
+    targets = {name for name, node in _node_of_param().items() if node != "Workers"}
+    found = Counter()
+    for rel in _scanned_modules():
+        for node, scope in _scoped_nodes(_parse(rel)):
+            if not isinstance(node, ast.Attribute) or node.attr not in targets:
+                continue
+            names, cur = [], node.value
+            while isinstance(cur, ast.Attribute):
+                names.insert(0, cur.attr)
+                cur = cur.value
+            if not isinstance(cur, ast.Name):
+                continue
+            if cur.id != "self":
+                names.insert(0, cur.id)
+            if names and names[0] in _WORKER_ROOTS:
+                found[(rel, scope, ast.unparse(node))] += 1
+    return found
+
+
 def _node_of_param() -> dict:
     return {name: node for node, names in _PARAM.items() for name in names}
 
@@ -651,6 +700,12 @@ class TestComponentGraph(CustomTestCase):
             self.assertEqual(
                 taken, set(_DECLARED[node]), f"{class_name} ({rel}) dependencies"
             )
+
+    def test_r3_no_node_reached_through_the_workers(self):
+        msg = _diff(
+            _scan_through_workers(), _THROUGH_WORKERS, "node(s) reached through workers"
+        )
+        self.assertFalse(msg, msg)
 
     def test_r4_nothing_below_mode_owners_holds_the_hub(self):
         self.assertFalse(_below("ModeOwners") & _hub())
