@@ -38,6 +38,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self._spec_scratch_capacity = 0
+        self._spec_device_buffer_size = 0
 
         paged_allocator_cls = (
             current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
@@ -76,6 +78,29 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
+
+    def configure_spec_scratch(
+        self, capacity: int, *, device_buffer_size: int = 0
+    ) -> None:
+        if any(
+            size < 0 or size % self.page_size for size in (capacity, device_buffer_size)
+        ):
+            raise ValueError(
+                "HiSparse spec scratch and device buffer sizes must be "
+                f"non-negative multiples of page_size={self.page_size}."
+            )
+        self._spec_scratch_capacity = capacity
+        self._spec_device_buffer_size = device_buffer_size if capacity else 0
+
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        paged_prefill = -(-prefill_tokens // self.page_size) * self.page_size
+        # Prefill KV is reused by the persistent buffer. Charge only its
+        # missing slots, including on chunks whose scratch was already allocated.
+        buffer_reserve = max(self._spec_device_buffer_size - paged_prefill, 0)
+        scratch_reserve = 0 if has_req_pool_slot else self._spec_scratch_capacity
+        return buffer_reserve + scratch_reserve
 
     @property
     def size_full(self) -> int:
@@ -169,7 +194,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # Page zero is the padding sink and is never owned by a request.
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -514,7 +542,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.hisparse_page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.

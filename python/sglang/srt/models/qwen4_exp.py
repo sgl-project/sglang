@@ -2114,6 +2114,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen4ExpVLModel.shared_experts_fusion_disable_reason(
