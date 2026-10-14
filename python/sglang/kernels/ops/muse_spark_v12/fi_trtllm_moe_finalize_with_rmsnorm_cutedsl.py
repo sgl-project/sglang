@@ -94,7 +94,8 @@ class FinalizePushWorkspace:
 
         Fusion has a different crossover from a standalone AR launch. Allow
         push through 384 tokens when its allocated slot fits, even if ordinary
-        CUDA-graph AR would select pull above its 288-token crossover (H=4096).
+        CUDA-graph AR would select pull above its 288-token crossover (H=4096),
+        but not where the standalone AR would pick 2shot_push.
         No standalone AR thresholds or buffer allocations are changed.
         """
         if (
@@ -105,6 +106,8 @@ class FinalizePushWorkspace:
         ):
             return False
         if self.world_size > 4 and not self.uses_one_shot_push(num_tokens):
+            return False
+        if self.communicator.uses_two_shot_push(num_tokens * self.hidden_dim * 2):
             return False
         output = (
             self.peers[self.rank]

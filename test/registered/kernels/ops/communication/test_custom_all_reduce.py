@@ -63,12 +63,14 @@ TEST_SIZES = [
     32 * 1024,
     256 * 1024,
     2 * 1024 * 1024,
+    3 * 1024 * 1024 + 24,  # chunks not a multiple of world_size
     4 * 1024 * 1024,
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
 USE_GRAPH_OPTIONS = [False, True]
@@ -156,14 +158,18 @@ def _init_nccl_group_once() -> dist.ProcessGroup:
 
 
 @cache_once
-def _init_comm_once() -> CustomAllReduceV2:
+def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
     cpu_group = _init_cpu_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_size = max(TEST_SIZES) * max(
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
     )
     comm = CustomAllReduceV2(
-        cpu_group, device, max_pull_size=max_size, max_push_size=max_size
+        cpu_group,
+        device,
+        max_pull_size=max_size,
+        max_push_size=max_size,
+        max_push_blocks=max_push_blocks,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -187,8 +193,32 @@ def test_custom_all_reduce(
     algo: AllReduceAlgo,
     use_graph: bool,
 ) -> None:
+    _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("nbytes", [32, 288 * 1024])
+@torch.inference_mode()
+def test_two_shot_push_single_block(
+    nbytes: int, dtype: torch.dtype, use_graph: bool
+) -> None:
+    # At TP8 a 128-thread block has only four warps for seven peers. Both
+    # sizes used to hang; the larger one also falls in SM100's tuned range.
+    size = nbytes // torch.tensor([], dtype=dtype).element_size()
+    _check_custom_all_reduce(
+        size, dtype, AllReduceAlgo.TWO_SHOT_PUSH, use_graph, _init_comm_once(1)
+    )
+
+
+def _check_custom_all_reduce(
+    size: int,
+    dtype: torch.dtype,
+    algo: AllReduceAlgo,
+    use_graph: bool,
+    comm: CustomAllReduceV2,
+) -> None:
     nccl_group = _init_nccl_group_once()
-    comm = _init_comm_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     comm.override_algo = algo
 
