@@ -208,6 +208,7 @@ def build_load_config(
     weight_cache_mode: str,
     weight_cache_socket: str | None,
     load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+    is_draft_worker: bool = False,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -235,8 +236,8 @@ def build_load_config(
         modelopt_config=modelopt_config,
         rl_quant_profile=get_model().rl_quant_profile,
         draft_model_idx=draft_model_idx,
-        weight_cache_mode=weight_cache_mode,
-        weight_cache_socket=weight_cache_socket,
+        weight_cache_mode="off" if is_draft_worker else weight_cache_mode,
+        weight_cache_socket=None if is_draft_worker else weight_cache_socket,
         load_group=load_group,
     )
 
@@ -252,7 +253,7 @@ def maybe_enable_ipc_weight_cache(
     so a second call (e.g. a weight reload) can't overwrite the captured
     fallback format.
     """
-    if get_model().weight_cache_mode == "off":
+    if load_config.weight_cache_mode == "off":
         return
 
     if load_config.load_format != LoadFormat.IPC_CACHE:
@@ -310,7 +311,7 @@ def load_model_with_memory_saver(
 
     # In zero-copy IPC mode, the weights are shared with the daemon via
     # CUDA IPC and must not be offloaded/reloaded by the memory saver.
-    is_ipc_zero_copy = get_model().weight_cache_mode != "off"
+    is_ipc_zero_copy = load_config.weight_cache_mode != "off"
     if is_ipc_zero_copy and enable_cpu_backup:
         logger.warning(
             "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "

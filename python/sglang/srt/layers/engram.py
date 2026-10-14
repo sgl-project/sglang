@@ -267,6 +267,52 @@ class EngramHasher(nn.Module):
     def from_config(
         cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
     ) -> EngramHasher:
+        if (
+            torch.empty(0).device.type == "meta"
+            and get_model().weight_cache_mode != "off"
+        ):
+            # IPC supplies the already-built hash buffers and pad_id. Rebuilding
+            # the HF tokenizer map here would dominate a zero-copy restart.
+            result = cls.__new__(cls)
+            nn.Module.__init__(result)
+            result.max_ngram_size = layout.max_ngram_size
+            result.pad_id = 0  # replaced from the post-load manifest
+            result.image_token_id = image_token_id
+            result.history = None  # request state always belongs to this engine
+            result.pad_row = 0
+            result.register_buffer(
+                "token_map",
+                torch.empty(config.vocab_size, dtype=torch.int64),
+                persistent=False,
+            )
+            result.register_buffer(
+                "multipliers",
+                torch.empty(
+                    len(layout.layer_ids), layout.max_ngram_size, dtype=torch.int64
+                ),
+                persistent=False,
+            )
+            result.register_buffer(
+                "primes",
+                torch.empty(
+                    len(layout.layer_ids),
+                    layout.max_ngram_size - 1,
+                    layout.n_heads,
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
+            result.register_buffer(
+                "offsets",
+                torch.empty(
+                    len(layout.layer_ids),
+                    (layout.max_ngram_size - 1) * layout.n_heads,
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
+            return result
+
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -585,10 +631,24 @@ def _hip_runtime() -> ctypes.CDLL:
 def _registered_device_ptr(host_ptr: int) -> int:
     """
     Address kernels must use for registered host memory.
-    UVA makes it the host address on CUDA; HIP may map it elsewhere.
+    Resolve the address for this process/context; do not reuse an exporter pointer.
     """
     if not _is_hip:
-        return host_ptr
+        path = find_loaded_library("libcudart")
+        if path is None:
+            raise RuntimeError("libcudart is not loaded in the current process")
+        lib = ctypes.CDLL(path)
+        lib.cudaHostGetDevicePointer.restype = ctypes.c_int
+        lib.cudaHostGetDevicePointer.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        device_ptr = ctypes.c_void_p()
+        err = lib.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+        if err != 0 or not device_ptr.value:
+            raise RuntimeError(f"cudaHostGetDevicePointer failed: {err}")
+        return device_ptr.value
     device_ptr = ctypes.c_void_p()
     err = _hip_runtime().hipHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
     if err != 0 or not device_ptr.value:
@@ -599,8 +659,8 @@ def _registered_device_ptr(host_ptr: int) -> int:
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
-    Lives for the whole process: the mapping, the memfd and the cudaHostRegister
-    pin are never released because the table is read by every forward.
+    Ordinary registered tables keep their process lifetime. Imported and VMM
+    mappings belong to the model and must outlive all tensor/kernel users.
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
@@ -613,8 +673,23 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
-            self.fd = self._open_shared_fd(nbytes, name)
+        from sglang.srt.runtime_context import get_server_args, publish_role
+        from sglang.srt.weight_cache.model_state import host_table_backend
+
+        self.backend = host_table_backend(get_server_args().model_loader_extra_config)
+        if self.backend == "cuda_vmm":
+            self._init_vmm()
+            return
+
+        if layout == "shared" or publish_role() == "weight_cache_daemon":
+            if layout == "shared":
+                self.fd = self._open_shared_fd(nbytes, name)
+            else:
+                # An anonymous MAP_PRIVATE shard cannot survive worker restart.
+                # A daemon-owned memfd keeps the same per-rank row ownership
+                # while allowing clients to map the physical pages via an FD.
+                self.fd = os.memfd_create(name, 0)
+                os.ftruncate(self.fd, nbytes)
             self.mm = mmap.mmap(
                 self.fd,
                 nbytes,
@@ -635,7 +710,8 @@ class _HostTable:
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            if self.fd is None:
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
@@ -645,6 +721,127 @@ class _HostTable:
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+
+    def _init_vmm(self):
+        from multiprocessing.reduction import DupFd
+
+        from sglang.srt.weight_cache.host_vmm import HostVmmAllocation
+
+        if self.layout == "per_rank" or self.group.rank_in_group == 0:
+            self._vmm = HostVmmAllocation.create(self.nbytes)
+        if self.layout == "shared":
+            payload = None
+            if self.group.rank_in_group == 0:
+                payload = (
+                    self._vmm.allocation_nbytes,
+                    self._vmm.numa_id,
+                    [DupFd(self._vmm.fd) for _ in range(self.group.world_size - 1)],
+                )
+            allocation_nbytes, numa_id, handles = self.group.broadcast_object(
+                payload, src=0
+            )
+            if self.group.rank_in_group != 0:
+                fd = handles[self.group.rank_in_group - 1].detach()
+                self._vmm = HostVmmAllocation.from_fd(
+                    fd, self.nbytes, allocation_nbytes, numa_id
+                )
+            self.group.barrier()
+        self.fd = self._vmm.fd
+        self.bytes = self._vmm.bytes
+        self.device_ptr = self._vmm.device_ptr
+
+    @classmethod
+    def from_vmm_fd(cls, layout, nbytes, fd, allocation_nbytes, numa_id):
+        from sglang.srt.weight_cache.host_vmm import HostVmmAllocation
+
+        if layout not in ("shared", "per_rank"):
+            os.close(fd)
+            raise ValueError("Invalid host VMM layout")
+        result = cls.__new__(cls)
+        result.layout, result.nbytes = layout, nbytes
+        result.group, result.dirty, result.backend = None, False, "cuda_vmm"
+        result._vmm = HostVmmAllocation.from_fd(
+            fd, nbytes, allocation_nbytes, numa_id, gpu_view=True
+        )
+        result.fd = result._vmm.fd
+        result.bytes = result._vmm.bytes
+        result.device_ptr = result._vmm.device_ptr
+        return result
+
+    @classmethod
+    def from_fd(cls, layout: str, nbytes: int, fd: int):
+        """Adopt a daemon-owned table FD and register this process's mapping.
+
+        No page pre-fault, checkpoint copy, or huge-page collapse is performed.
+        FD ownership transfers to this object, including on registration failure.
+        """
+        if layout not in ("shared", "per_rank") or nbytes <= 0:
+            os.close(fd)
+            raise ValueError("Invalid imported Engram table layout/size")
+        result = cls.__new__(cls)
+        result.layout, result.nbytes, result.fd = layout, nbytes, fd
+        result.backend = "memfd"
+        result.group, result.dirty = None, False
+        result._ipc_registered = False
+        try:
+            if os.fstat(fd).st_size != nbytes:
+                raise ValueError("Engram memfd size does not match its descriptor")
+            result.mm = mmap.mmap(
+                fd,
+                nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+            result.bytes = torch.frombuffer(result.mm, dtype=torch.uint8)
+            tic = time.perf_counter()
+            err = torch.cuda.cudart().cudaHostRegister(
+                result.bytes.data_ptr(), nbytes, 0
+            )
+            if int(err) != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister({nbytes} imported bytes) failed: {err}"
+                )
+            result._ipc_registered = True
+            result.device_ptr = _registered_device_ptr(result.bytes.data_ptr())
+            logger.info(
+                "Engram IPC host registration: layout=%s, bytes=%d, elapsed=%.3fs",
+                layout,
+                nbytes,
+                time.perf_counter() - tic,
+            )
+            return result
+        except Exception:
+            result.close_import()
+            raise
+
+    def close_import(self):
+        """Release a client registration after all kernel/tensor users retire."""
+        if getattr(self, "_vmm", None) is not None:
+            if hasattr(self, "bytes"):
+                del self.bytes
+            self._vmm.close()
+            self.fd = None
+            return
+        if getattr(self, "_ipc_registered", False):
+            torch.cuda.cudart().cudaHostUnregister(self.bytes.data_ptr())
+            self._ipc_registered = False
+        if hasattr(self, "bytes"):
+            del self.bytes
+        try:
+            if hasattr(self, "mm"):
+                self.mm.close()
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+
+    def __del__(self):
+        # Ordinary loader tables keep their existing process-lifetime policy.
+        if hasattr(self, "_ipc_registered") or hasattr(self, "_vmm"):
+            try:
+                self.close_import()
+            except Exception:
+                pass
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -691,8 +888,17 @@ class _HostTable:
         self.dirty = False
         if self.layout == "shared":
             self.group.barrier()
+        if getattr(self, "backend", "memfd") == "cuda_vmm":
+            logger.info(
+                "engram host table %s: layout=%s, CUDA HOST_NUMA VMM, logical_bytes=%d, numa=%d",
+                label,
+                self.layout,
+                self.nbytes,
+                self._vmm.numa_id,
+            )
+            return
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if self.layout == "per_rank" and self.fd is None and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -705,7 +911,7 @@ class _HostTable:
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+            knob = "shmem_enabled" if self.fd is not None else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -756,6 +962,17 @@ class EngramEmbedding(nn.Module):
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        if torch.empty(0).is_meta:
+            # IPC restores the host mapping after the skeleton is constructed.
+            # Allocating/registering a second huge host table here defeats it.
+            self.weight = nn.Parameter(
+                torch.empty(n, dim, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            self.scale = nn.Parameter(
+                torch.empty(n, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
+                requires_grad=False,
+            )
+            return
         self.host_table = _HostTable(
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.

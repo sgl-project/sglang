@@ -55,6 +55,9 @@ class CacheConfig(msgspec.Struct):
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
 
+    model_state_contract: str = ""
+    weight_layout_hash: str = ""
+
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
         return self == other

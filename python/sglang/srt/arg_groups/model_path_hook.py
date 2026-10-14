@@ -275,16 +275,8 @@ def handle_load_format(server_args: Any):
             "that selects IPC loading automatically."
         )
 
-    # Speculative decoding loads an extra draft model whose weights the
-    # daemon does not export, so refuse the combination up front instead of
-    # failing deep inside draft-worker load (draft-model daemon TBD).
-    if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "--weight-cache-mode is not supported together with speculative "
-            "decoding (--speculative-algorithm): the weight cache daemon does "
-            "not export the draft model's weights. Disable one of them "
-            "(--weight-cache-mode off) for this configuration."
-        )
+    # The target uses IPC; draft workers keep their own ordinary disk loader.
+    # Role isolation is enforced in build_load_config, not on shared ServerArgs.
 
 
 def validate_transfer_engine(server_args: Any):

@@ -2806,9 +2806,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         """Save the next layer for mhc. Must be called before `_init_boundaries`"""
         if not self.hc_pre_from_prev_sublayer:
             return
-        self._next_layer = None
+        # A non-owning seam reference must not register the next layer as a
+        # child: that duplicates every downstream weight in state_dict/IPC.
+        self._modules.pop("_next_layer", None)
+        object.__setattr__(self, "_next_layer", None)
         if isinstance(next_layer, DeepseekV4DecoderLayer) and next_layer.engram is None:
-            self._next_layer = next_layer
+            object.__setattr__(self, "_next_layer", next_layer)
 
     def _init_hyper_connections(self) -> None:
         """(Re)bind the two hyper-connections to the current mixing weights."""
