@@ -164,14 +164,16 @@ def _try_forward_pipeline(
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return None
 
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        is_symmetric_memory_enabled,
+    )
     from sglang.srt.distributed.utils import get_group_rank_size
-    from sglang.srt.layers.dp_attention import is_allocation_symmetric
     from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
     from sglang.srt.runtime_context import get_exec, get_forward
 
     if should_skip_mlp_all_reduce() or get_forward().sp_active:
         return None
-    if is_allocation_symmetric():
+    if is_symmetric_memory_enabled():
         return None
     if (
         forward_batch is not None

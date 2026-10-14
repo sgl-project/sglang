@@ -7,7 +7,8 @@ the all-reduce silently, so pin the invariants.
 """
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -81,6 +82,78 @@ class TestChunkPlan(CustomTestCase):
             plan = compute_chunk_plan(25000, 4, ratio)
             self.assertIsNotNone(plan)
             self._check_cover(plan, 25000)
+
+
+class _FakeCudaTensor(torch.Tensor):
+    @staticmethod
+    def __new__(cls, data):
+        return torch.Tensor._make_subclass(cls, data, False)
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+class TestPipelineSymmetricGuard(CustomTestCase):
+    # Regression: the guard imported dp_attention.is_allocation_symmetric,
+    # which is always True under plain TP and made the pipeline unreachable.
+
+    def _layer(self, apply_into):
+        return SimpleNamespace(
+            quant_method=SimpleNamespace(apply_into=apply_into),
+            output_size=8,
+            tp_group=object(),
+        )
+
+    def _run(self, symm_enabled):
+        x = _FakeCudaTensor(torch.zeros(2048, 16))
+        apply_into = MagicMock()
+        group = SimpleNamespace(world_size=1, device_group=None, unique_name="tp")
+        work = SimpleNamespace(wait=lambda: None)
+        with (
+            patch.object(
+                chunked_gemm_ar,
+                "_knobs",
+                return_value=SimpleNamespace(
+                    min_tokens=1, num_chunks=2, ratio=0.5, reserve_sms=0
+                ),
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch(
+                "sglang.srt.layers.moe.utils.should_skip_mlp_all_reduce",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_forward",
+                return_value=SimpleNamespace(sp_active=False),
+            ),
+            patch(
+                "sglang.srt.distributed.device_communicators.pynccl_allocator.is_symmetric_memory_enabled",
+                return_value=symm_enabled,
+            ),
+            patch(
+                "sglang.srt.distributed.utils.get_group_rank_size",
+                return_value=(0, 1),
+            ),
+            patch("torch.distributed.all_reduce", return_value=work) as all_reduce,
+        ):
+            result = chunked_gemm_ar._try_forward_pipeline(
+                self._layer(apply_into), x, None, None, group
+            )
+        return result, apply_into, all_reduce
+
+    def test_plain_tp_without_symmetric_memory_engages(self):
+        result, apply_into, all_reduce = self._run(symm_enabled=False)
+        self.assertIsNotNone(result)
+        self.assertEqual(tuple(result.shape), (2048, 8))
+        self.assertEqual(apply_into.call_count, 2)
+        self.assertEqual(all_reduce.call_count, 2)
+
+    def test_symmetric_memory_bails(self):
+        result, apply_into, all_reduce = self._run(symm_enabled=True)
+        self.assertIsNone(result)
+        apply_into.assert_not_called()
+        all_reduce.assert_not_called()
 
 
 class TestInlineEntryEligibility(CustomTestCase):
