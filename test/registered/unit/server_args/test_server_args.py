@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_kv4_compatibility,
+    handle_mxfp8_kv_cache_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
@@ -1324,6 +1325,21 @@ class TestLoraForwardDomains(unittest.TestCase):
                     )
                     with self.assertRaises(ValueError):
                         check_lora_server_args(args)
+
+
+class TestMXFP8KVCacheCompatibility(unittest.TestCase):
+    @override_platform(is_cuda=True, is_blackwell=True)
+    def test_mxfp8_rejects_unified_memory(self):
+        """The unified pool allocates no MXFP8 scale buffers, so the pair boots
+        and then fails on the first attention forward."""
+        handle_mxfp8_kv_cache_compatibility(
+            ServerArgs(model_path="dummy", kv_cache_dtype="mxfp8")
+        )
+        args = ServerArgs(
+            model_path="dummy", kv_cache_dtype="mxfp8", enable_unified_memory=True
+        )
+        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            handle_mxfp8_kv_cache_compatibility(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
