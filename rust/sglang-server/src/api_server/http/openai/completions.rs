@@ -24,7 +24,7 @@ use serde::Deserialize;
 use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
 use crate::message::finish_reason::Matched;
@@ -79,12 +79,8 @@ async fn completions(
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{model}` does not exist"),
-            false,
-        );
+    if let Some(message) = model_error(&model, &state.server_args.served_model_name) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
 
     if request.prompt_embeds.is_some() {
