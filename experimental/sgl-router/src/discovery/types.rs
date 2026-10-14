@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Opaque worker identifier. Wraps a string so callsites can't confuse it
 /// with other string types (e.g. `ModelId`).
@@ -66,6 +67,10 @@ pub struct WorkerSpec {
     pub bootstrap_port: Option<u16>,
     #[serde(default)]
     pub version_group: Option<String>,
+    /// Kubernetes Services selecting this worker, as namespace/name. Independent
+    /// of the pod-incarnation ID; empty for static URL discovery.
+    #[serde(default)]
+    pub services: BTreeSet<String>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -85,6 +90,11 @@ pub enum DiscoveryEvent {
     Added(WorkerSpec),
     Removed {
         id: WorkerId,
+    },
+    /// Service membership changed without replacing the worker or its live state.
+    ServicesChanged {
+        id: WorkerId,
+        services: BTreeSet<String>,
     },
     /// Used by the k8s backend when only the PD label flips (rare).
     ModeChanged {

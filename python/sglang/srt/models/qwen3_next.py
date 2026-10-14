@@ -36,6 +36,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -269,8 +270,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -282,8 +282,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.in_proj_ba = MergedColumnParallelLinear(
@@ -292,8 +291,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         # Override weight_loader for packed checkpoint format.
@@ -331,8 +329,14 @@ class Qwen3GatedDeltaNet(nn.Module):
             torch.zeros(self.num_v_heads // self.attn_tp_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
         self.norm = (
             RMSNormGated(
                 self.head_v_dim,
@@ -368,8 +372,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -423,9 +426,14 @@ class Qwen3GatedDeltaNet(nn.Module):
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
-                if output_dim is not None and module.tp_size > 1:
+                group = module.tp_group
+                if (
+                    output_dim is not None
+                    and group is not None
+                    and group.world_size > 1
+                ):
                     shard_size = param.data.shape[output_dim]
-                    start_idx = module.tp_rank * shard_size
+                    start_idx = group.rank_in_group * shard_size
                     if (
                         _is_cpu and _is_amx_available
                     ) and start_idx + shard_size > loaded_weight.shape[output_dim]:
@@ -456,8 +464,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         value_dim: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
         return MergedColumnParallelLinear(
             input_size=hidden_size,
@@ -465,8 +473,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
     def fix_query_key_value_ordering(
@@ -809,8 +816,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 and quant_config.get_name() != "modelopt_fp4"
                 else None
             ),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -820,8 +826,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 

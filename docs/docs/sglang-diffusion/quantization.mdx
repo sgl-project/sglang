@@ -987,6 +987,7 @@ startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 1x GB300 (CUDA 13, PyTorch 2.13) | 50-step t2va 1344x768, 107 frames, H.264 + AAC; 105.38 s and 80.88 GB peak |
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 2x GB300, TP2 (CUDA 13, PyTorch 2.13) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 7.55 s and 51.90 GB peak per rank |
 | Qwen-Image 2.1 | Private native-name Q4_0 exports; DiT 3.91 GiB, encoder 7.03 GiB | 1x B200; separate TP2 check | 1024px/40-step generation, editing, and transparent RGBA; each component and both together; combined offload matched resident pixels |
+| Qwen-Image 2.1 | Community ComfyUI-GGUF DiT [`abenzerps/Qwen-Image-2.1-Uncensored-GGUF`](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF) `qwen-image-2.1-UC-Q4_K_M.gguf` (4.6 GB) | 1x RTX 5090 (32 GiB) | 1024px/40-step text-to-image; 8.25 GB peak vs 17.0 GB for the BF16 DiT, 0.47 vs 0.43-0.48 s/step |
 
 The unpruned MiniMax-H3 DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
 fidelity was checked tensor-by-tensor against the BF16 reference: cosine
