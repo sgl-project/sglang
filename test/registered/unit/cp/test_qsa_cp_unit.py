@@ -1,7 +1,7 @@
-"""CPU checks for shared CP gathers and QSA's zigzag-only entrypoints."""
+"""CPU checks for QSA's zigzag-only context parallel entrypoints."""
 
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,9 +14,6 @@ from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_pr
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.cp import base as cp_base
-from sglang.srt.layers.cp import interleave
-from sglang.srt.layers.cp import padding as cp_padding
-from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -254,7 +251,10 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     out_cache_loc = torch.cat(out_cache_locs)
     initial_k, initial_v = k_cache.clone(), v_cache.clone()
 
+    events = []
+
     def store_kv(layer, locations, k, v):
+        events.append("store")
         k_cache[locations.long()] = k.to(cache_dtype)
         v_cache[locations.long()] = v.to(cache_dtype)
 
@@ -270,22 +270,22 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         pool.get_value_buffer.side_effect = AssertionError(
             "zero prefix needs no cache read"
         )
-    # A prefetched gather (prefetch_cp_kv) hands over the global K|V halves.
-    prefetched_kv = SimpleNamespace(wait=lambda: (new_k.flatten(1), new_v.flatten(1)))
     backend = SimpleNamespace(
         token_to_kv_pool=pool,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
-        _cp_kv_prefetched={0: prefetched_kv} if prefetched else {},
+        # Per-forward metadata: row i of the slot table is request i's row.
+        _resolve_metadata=lambda forward_batch: SimpleNamespace(
+            token_slot_table=req_to_token[req_indices],
+            sequence_lengths=torch.tensor(seq_lens, dtype=torch.int32),
+        ),
+        _cp_kv_pending=None,
     )
+    # No req_pool_indices: reading them on the host would sync every layer.
     batch = SimpleNamespace(
         attn_cp_metadata=meta,
-        seq_lens=torch.tensor(seq_lens),
         seq_lens_cpu=seq_lens,
         extend_seq_lens_cpu=extend_lens,
         extend_prefix_lens_cpu=list(prefix_lens),
-        req_pool_indices=torch.tensor(req_indices),
-        req_pool_indices_cpu=torch.tensor(req_indices),
         out_cache_loc=out_cache_loc,
     )
     local_q = strategy.shard_hidden_states(queries, batch)
@@ -301,7 +301,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     local_positions = logical_positions.index_select(0, local_rows)
 
     def gather_new_kv(local_kv, forward_batch):
-        assert not prefetched, "a prefetched layer must not gather again"
+        events.append("gather")
         assert forward_batch is batch
         torch.testing.assert_close(
             local_kv, torch.cat([local_k.flatten(1), local_v.flatten(1)], dim=-1)
@@ -319,6 +319,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         assert k.dtype == v.dtype == q.dtype
         # The host max_q sizes the kernel grid; a short one would skip query rows.
         assert max_q == int((cu_q[1:] - cu_q[:-1]).max())
+        events.append("attention")
         return _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale)
 
     monkeypatch.setattr(
@@ -339,10 +340,42 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     # The indexer supplies causal logical positions and marks other slots invalid.
     candidates = torch.arange(max(seq_lens), dtype=torch.int32).expand(num_local, -1)
     topk = torch.where(candidates <= local_positions[:, None], candidates, -1)
+    side, main = Mock(), Mock()
+    side.wait_stream.side_effect = lambda stream: events.append(("side_waits", stream))
+    main.wait_stream.side_effect = lambda stream: events.append(("main_waits", stream))
+
+    @contextmanager
+    def on_stream(stream):
+        events.append(("enter", stream))
+        yield
+        events.append(("exit", stream))
+
+    monkeypatch.setattr(qwen_sparse_attn_backend, "get_stream", lambda name: side)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", on_stream)
+    if prefetched:
+        QwenSparseAttnBackend.prefetch_cp_kv(backend, layer, local_k, local_v, batch)
     actual = QwenSparseAttnBackend._forward_extend_cp(
         backend, local_q, local_k, local_v, layer, batch, topk, save_kv_cache
     )
-    assert not backend._cp_kv_prefetched
+    assert backend._cp_kv_pending is None
+    store = ["store"] if save_kv_cache else []
+    if prefetched:
+        # The side stream starts after the main stream's prior work (the key
+        # gather); the main stream joins before using the gathered K/V; the
+        # side stream, which owns their memory, then waits for those reads.
+        assert events == [
+            ("side_waits", main),
+            ("enter", side),
+            "gather",
+            ("exit", side),
+            ("main_waits", side),
+            *store,
+            "attention",
+            ("side_waits", main),
+        ]
+    else:
+        assert events == ["gather", *store, "attention"]
 
     expected = []
     row = 0
@@ -367,107 +400,37 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
-@pytest.mark.parametrize(
-    "strategy_cls", [zigzag.ZigzagCPStrategy, interleave.InterleaveCPStrategy]
-)
-@pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("cp_size", [2, 4])
-@pytest.mark.parametrize(
-    "extend_lens,prefix_lens",
-    [
-        ([8193], [0]),  # uneven logical rows, padded physical rows
-        ([1000, 7193], [0, 0]),
-        ([3001, 5190], [64, 0]),
-        ([8, 5], [4, 8]),
-    ],
-)
-def test_cp_gather_index_restores_global_token_order(
-    monkeypatch, strategy_cls, padded, cp_size, extend_lens, prefix_lens
-):
-    """Both layouts restore global order across unequal or aligned rank lengths."""
-    seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
-    num_tokens = sum(extend_lens)
-    monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cpu"))
-    monkeypatch.setattr(
-        cp_padding, "get_parallel", lambda: SimpleNamespace(attn_cp_size=cp_size)
+@pytest.mark.parametrize("ensure_cos_sin_cache", [False, True])
+def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
+    class Sized(Exception):
+        pass
+
+    rotary_emb = SimpleNamespace(
+        _ensure_cos_sin_cache_length=Mock(),
+        get_cos_sin_with_position=Mock(side_effect=Sized),
     )
-    monkeypatch.setattr(
-        cp_base, "is_zigzag", lambda: strategy_cls is zigzag.ZigzagCPStrategy
-    )
-    strategy = strategy_cls(cp_size=cp_size)
-    rank_rows, indices = [], []
-    for rank in range(cp_size):
-        monkeypatch.setattr(
-            cp_base,
-            "get_parallel",
-            lambda rank=rank: SimpleNamespace(attn_cp_rank=rank),
+    with pytest.raises(Sized):
+        QSAIndexer.apply_rope(
+            SimpleNamespace(rotary_emb=rotary_emb),
+            torch.arange(4),
+            torch.zeros(4, 1, 4),
+            ensure_cos_sin_cache=ensure_cos_sin_cache,
         )
-        meta = strategy.build_metadata(num_tokens, seq_lens, extend_lens)
-        if padded:
-            cp_padding.pad_logical_token_to_physical(meta)
-        batch = SimpleNamespace(attn_cp_metadata=meta)
-        local_rows = strategy.shard_hidden_states(torch.arange(num_tokens), batch)
-        # Equal-size all-gather buffers also pad unequal, unaligned rank lengths.
-        rank_rows.append(
-            torch.nn.functional.pad(
-                local_rows,
-                (0, max(meta.per_rank_actual_token) - len(local_rows)),
-                value=-1,
-            )
-        )
-        indices.append(strategy.build_gather_index(meta, torch.device("cpu")))
-    gathered = torch.cat(rank_rows)
-    for index in indices:
-        torch.testing.assert_close(index, indices[0])
-    torch.testing.assert_close(
-        gathered.index_select(0, indices[0]), torch.arange(num_tokens)
-    )
+    # Sizing reads positions.max() on the host: the CP path must skip it.
+    assert rotary_emb._ensure_cos_sin_cache_length.called is ensure_cos_sin_cache
 
 
-@pytest.mark.parametrize("split_sizes", [None, (2, 5), (1, 4, 2)])
-def test_cp_async_gather_restores_contiguous_payloads(monkeypatch, split_sizes):
-    """One payload, unequal K/V widths, and multiple payloads share the gather."""
-    expected = torch.arange(21).reshape(3, 7)
-    rank_rows = [
-        expected[[0, 2]],
-        torch.cat([expected[[1]], torch.full((1, 7), -1)]),
-    ]
-    gather_index = torch.tensor([0, 2, 1])
-    group = SimpleNamespace(
-        world_size=2,
-        all_gather_into_tensor=Mock(
-            side_effect=lambda output, local: torch.cat(rank_rows, out=output)
-        ),
+def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
+    side, main = Mock(), Mock()
+    monkeypatch.setattr(qwen_sparse_attn_backend, "get_stream", lambda name: side)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    backend = SimpleNamespace(_cp_kv_pending=(0, None, None))
+    QwenSparseAttnBackend.init_forward_metadata(
+        backend, SimpleNamespace(forward_mode=ForwardMode.IDLE)
     )
-    consumer, stream = Mock(), Mock()
-    monkeypatch.setattr(
-        cp_utils, "get_parallel", lambda: SimpleNamespace(attn_cp_group=group)
-    )
-    monkeypatch.setattr(cp_utils, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(
-        cp_utils, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
-    )
-    monkeypatch.setattr(torch.cuda, "Event", Mock)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: consumer)
-    monkeypatch.setattr(torch.cuda, "stream", lambda selected: nullcontext())
-
-    handle = cp_utils.CPAsyncGather(stream).issue(
-        rank_rows[0], gather_index, split_sizes=split_sizes
-    )
-    consumer.wait_event.assert_not_called()
-    actual = handle.wait()
-    consumer.wait_event.assert_called_once_with(handle.done)
-    handle.done.synchronize.assert_not_called()
-    group.all_gather_into_tensor.assert_called_once()
-    assert any(value is rank_rows[0] for value in handle.keepalive)
-    assert any(value is gather_index for value in handle.keepalive)
-    expected_parts = (
-        (expected,) if split_sizes is None else expected.split(split_sizes, dim=1)
-    )
-    assert len(actual) == len(expected_parts)
-    for output, reference in zip(actual, expected_parts):
-        assert output.is_contiguous()
-        torch.testing.assert_close(output, reference)
+    # Later CP collectives on the main stream must not overlap the gather.
+    main.wait_stream.assert_called_once_with(side)
+    assert backend._cp_kv_pending is None
 
 
 if __name__ == "__main__":

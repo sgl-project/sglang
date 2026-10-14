@@ -315,31 +315,24 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        return self.gather_kv_cache(x, forward_batch, stream)
+        gathered = self._all_gather_reorganized(x, forward_batch)
+        chunks = torch.split(
+            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+        )
+        return torch.cat(
+            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
+        )
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         gathered = self._all_gather_reorganized(x, forward_batch)
-        return self._restore_token_order(gathered, forward_batch.attn_cp_metadata)
-
-    @staticmethod
-    def _restore_token_order(x: torch.Tensor, metadata) -> torch.Tensor:
-        chunks = torch.split(x, metadata.reverse_split_len, dim=0)
-        return torch.cat([chunks[i] for i in metadata.cp_reverse_index], dim=0)
-
-    def build_gather_index(self, metadata, device) -> torch.Tensor:
-        physical_rows = max(metadata.per_rank_actual_token)
-        logical_rows = metadata.per_rank_logical_token or metadata.per_rank_actual_token
-        # Construct the same unpadded rank order as _all_gather_reorganized,
-        # using row indices instead of payloads. Build once per forward.
-        rows = torch.cat(
-            [
-                torch.arange(rank * physical_rows, rank * physical_rows + length)
-                for rank, length in enumerate(logical_rows)
-            ]
+        chunks = torch.split(
+            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
-        return self._restore_token_order(rows, metadata).to(device)
+        return torch.cat(
+            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
+        )
 
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
         meta = forward_batch.attn_cp_metadata

@@ -17,12 +17,6 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-import msgspec
-import torch
-
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -41,7 +35,6 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel, uses_mla_backend
 
@@ -266,71 +259,6 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
-class CPGatherHandle(msgspec.Struct):
-    """A gather in flight. Keep alive until wait() on the issuing stream."""
-
-    outputs: Tuple[torch.Tensor, ...]
-    done: torch.cuda.Event
-    keepalive: Tuple[torch.Tensor, ...]
-
-    def wait(self) -> Tuple[torch.Tensor, ...]:
-        torch.cuda.current_stream().wait_event(self.done)
-        return self.outputs
-
-
-class CPAsyncGather:
-    """Gather padded CP rows on a side stream, restoring global token order.
-
-    Callers choose the launch point and must wait on the issuing stream before
-    consuming outputs or issuing another collective on the CP group. Inputs
-    must also belong to that stream; the handle retains them through the wait.
-    """
-
-    def __init__(self, stream: torch.cuda.Stream) -> None:
-        self._stream = stream
-        self._fork = torch.cuda.Event()
-
-    def issue(
-        self,
-        x: torch.Tensor,
-        gather_index: torch.Tensor,
-        split_sizes: Optional[Tuple[int, ...]] = None,
-    ) -> CPGatherHandle:
-        """Gather [physical_rows, width], optionally into contiguous column splits.
-
-        Every rank must supply equally padded rows. The strategy's
-        build_gather_index supplies the mapping for that physical row stride.
-        """
-        group = get_parallel().attn_cp_group
-        rows, width = x.shape
-        split_sizes = (width,) if split_sizes is None else split_sizes
-        # Validate before issuing a collective, including torch.split's sizes.
-        if (
-            not split_sizes
-            or any(size < 0 for size in split_sizes)
-            or sum(split_sizes) != width
-        ):
-            raise ValueError("CP gather split sizes must sum to the payload width")
-        # Allocate on the consumer stream and retain side-stream inputs until
-        # it waits, avoiding record_stream and allocator event polling.
-        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-            gathered = x.new_empty((group.world_size * rows, width))
-        outputs = tuple(
-            x.new_empty((gather_index.numel(), size)) for size in split_sizes
-        )
-        done = torch.cuda.Event()
-        self._fork.record()
-        self._stream.wait_event(self._fork)
-        with torch.cuda.stream(self._stream):
-            group.all_gather_into_tensor(gathered, x)
-            for part, output in zip(gathered.split(split_sizes, dim=-1), outputs):
-                torch.index_select(part, 0, gather_index, out=output)
-            done.record()
-        return CPGatherHandle(
-            outputs=outputs, done=done, keepalive=(x, gathered, gather_index)
-        )
-
-
 def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
@@ -404,8 +332,6 @@ def _to_int_list(values) -> Optional[list[int]]:
 __all__ = [
     "BaseContextParallelMetadata",
     "CPAttentionBackendKind",
-    "CPAsyncGather",
-    "CPGatherHandle",
     "ContextParallelMetadata",
     "ContextParallelStrategy",
     "ContextParallelStrategyKind",

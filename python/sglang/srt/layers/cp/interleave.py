@@ -269,13 +269,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     ) -> Any:
         return self._gather_interleaved_tensor(x, forward_batch)
 
-    def build_gather_index(self, metadata, device) -> torch.Tensor:
-        if metadata.gather_index is not None:
-            return metadata.gather_index.to(device)
-        indices = torch.arange(metadata.total_seq_lens, device=device)
-        physical_rows = max(metadata.per_rank_actual_token)
-        return (indices % self.cp_size) * physical_rows + indices // self.cp_size
-
     def _gather_interleaved_tensor(self, x: Any, forward_batch) -> Any:
         metadata = getattr(forward_batch, "attn_cp_metadata", None)
         if metadata is None:
@@ -327,7 +320,11 @@ class InterleaveCPStrategy(ContextParallelStrategy):
                 .reshape(total_tokens, *x.shape[1:])
             )
 
-        return gathered.index_select(0, self.build_gather_index(metadata, x.device))
+        flat_indices = torch.arange(total_tokens, device=x.device)
+        gather_indices = (
+            flat_indices % self.cp_size
+        ) * physical_rank_len + flat_indices // self.cp_size
+        return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]
