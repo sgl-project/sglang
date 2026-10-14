@@ -39,8 +39,11 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
     def test_flashmla_mega_launch_policy(self):
         rejected = (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
-            ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.BREAKABLE)),
-            ("SWA bounded replay", dict(enable_decoder_swa_bounded_replay=True)),
+            ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.FULL)),
+            (
+                "encoder SWA bounded replay",
+                dict(enable_encoder_swa_bounded_replay=True),
+            ),
         )
         with (
             override_platform(is_cuda=True, is_hip=False, is_npu=False),
@@ -54,6 +57,17 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
                         )
             apply_deepseek_v4_defaults(
                 mega_args(tp_size=4, attn_dp_size=4), "DeepseekV4ForCausalLM"
+            )
+            apply_deepseek_v4_defaults(
+                mega_args(
+                    tp_size=2,
+                    attn_dp_size=2,
+                    ep_size=2,
+                    moe_a2a_backend="megamoe",
+                    cuda_graph_backend_prefill=Backend.BREAKABLE,
+                    enable_decoder_swa_bounded_replay=True,
+                ),
+                "DeepseekV4ForCausalLM",
             )
         with (
             override_platform(is_cuda=True, is_hip=False, is_npu=False),

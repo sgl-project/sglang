@@ -196,7 +196,7 @@ class TestMegaAttention(CustomTestCase):
 
     def _check_paged_causal_prefill(self, heads, ratio):
         torch.manual_seed(456)
-        query_lens, seq_lens = (129, 257, 3), (65536, 32768, 3)
+        query_lens, seq_lens = (129, 257, 3), (131072, 65536, 3)
         tokens = sum(query_lens)
         main_page, extra_page = 256, 256 // ratio
         main_offsets, extra_offsets = [0], [0]
@@ -553,6 +553,44 @@ class TestMegaAttention(CustomTestCase):
         ]
         self.assertTrue(any("core_attn::fwd_kernel" in name for name in names))
         self.assertFalse(any("_dequantize_k_cache_paged" in name for name in names))
+
+        from sglang.srt.models.deepseek_v4 import deepseek_v4_mega_attention_with_output
+
+        weight = torch.randn(8, 64, 4096, device="cuda", dtype=torch.bfloat16)
+        wo_a = prepare_mega_wo_a(weight)
+        model_layer = SimpleNamespace(
+            n_local_groups=8,
+            o_lora_rank=64,
+            attn_mqa=SimpleNamespace(layer_id=0),
+            compress_ratio=ratio,
+            mega_cos_sin_cache=table,
+            mega_wo_a=wo_a,
+        )
+        batch.global_num_token_non_padded_cpu = q.shape[0]
+        padded = torch.cat((q, torch.randn_like(q[:17])))
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.get_attn_backend", return_value=backend
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_tc_piecewise_forward_context",
+                return_value=SimpleNamespace(forward_batch=batch),
+            ),
+        ):
+            bridge = padded.new_empty((padded.shape[0], 8, 64))
+            deepseek_v4_mega_attention_with_output(model_layer, padded, bridge, sink)
+            torch.testing.assert_close(
+                bridge[: q.shape[0]],
+                apply_mega_wo_a(expected[0], expected[1], wo_a),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(torch.count_nonzero(bridge[q.shape[0] :]).item(), 0)
+            batch.global_num_token_non_padded_cpu = 0
+            bridge.fill_(1)
+            deepseek_v4_mega_attention_with_output(model_layer, padded, bridge, sink)
+            self.assertEqual(torch.count_nonzero(bridge).item(), 0)
+            self.assertEqual(bridge.dtype, torch.bfloat16)
 
         # DSpark's draft uses ordinary queries and supplies no fused RoPE table,
         # even when the target's launch configuration selects MegaAttention.

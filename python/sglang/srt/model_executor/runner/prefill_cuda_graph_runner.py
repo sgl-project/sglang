@@ -301,6 +301,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
+    _backend_max_seq_len: Optional[int] = None
     dllm_attention = None
 
     def __init__(self, model_runner: ModelRunner):
@@ -357,6 +358,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
+        self._backend_max_seq_len = prefill_config.max_seq_len
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
@@ -1272,6 +1274,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    @property
+    def replay_max_context_size(self) -> Optional[int]:
+        limits = [
+            limit
+            for limit in (self.max_context_size, self._backend_max_seq_len)
+            if limit is not None
+        ]
+        return min(limits) if limits else None
+
     def can_replay_locally(
         self,
         *,
@@ -1345,11 +1356,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
-        if self.max_context_size is not None:
-            if (
-                batch_max_context_len is None
-                or batch_max_context_len > self.max_context_size
-            ):
+        context_limit = self.replay_max_context_size
+        if context_limit is not None:
+            if batch_max_context_len is None or batch_max_context_len > context_limit:
                 return False
         if num_tokens is None:
             return True
@@ -1386,7 +1395,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
             self._batch_max_context_len(forward_batch)
-            if self.max_context_size is not None
+            if self.replay_max_context_size is not None
             else None
         )
         if not self.can_replay_locally(

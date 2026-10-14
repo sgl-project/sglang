@@ -21,9 +21,9 @@ def use_mega_paged_prefill(
         or not seq_lens
     ):
         return False
-    # Gathered prefill dequantizes a rectangular request-by-context workspace.
+    # Gathered prefill dequantizes each request's live compressed history.
     # GB300 sweeps favor paged reads when this cost dominates a short extension.
-    gather_tokens = len(seq_lens) * (max(seq_lens) // compress_ratio)
+    gather_tokens = sum(length // compress_ratio for length in seq_lens)
     return gather_tokens >= max(32768, 192 * num_query_tokens)
 
 

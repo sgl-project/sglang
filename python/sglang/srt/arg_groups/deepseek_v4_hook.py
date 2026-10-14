@@ -56,16 +56,14 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         if cfg.device != "cuda" or not is_sm100_supported():
             raise ValueError("--dsv4-attn-backend flashmla_mega requires SM100/SM103")
         unsupported = (
-            # The breakable prefill graph routes attention through a BF16-output op.
             (
                 "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
-            # Tail-row replays hand attention fewer rows than the metadata positions.
             (
-                "SWA bounded replay",
-                cfg.enable_encoder_swa_bounded_replay
-                or cfg.enable_decoder_swa_bounded_replay,
+                "encoder SWA bounded replay",
+                cfg.enable_encoder_swa_bounded_replay,
             ),
         )
         for feature, enabled in unsupported:

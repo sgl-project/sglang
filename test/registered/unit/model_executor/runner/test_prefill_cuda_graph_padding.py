@@ -226,6 +226,35 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 )
             )
 
+    def test_backend_context_limit_rejects_scheduler_vote_and_replay(self):
+        """A long cached context must vote eager before an idle peer replays."""
+        from sglang.srt.managers.scheduler_components.dp_attn import (
+            _local_prefill_cuda_graph_vote,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        runner = self._make_runner()
+        runner._backend_max_seq_len = 16384
+        batch = self._make_forward_batch(8)
+        batch.seq_lens_cpu.fill_(32768)
+        batch.batch_size = lambda: 1
+        batch.extend_num_tokens = 8
+        batch.prefix_lens = [32760]
+        batch.multimodal_inputs = None
+        vote = _local_prefill_cuda_graph_vote(
+            local_batch=batch,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            model_config=None,
+        )
+        self.assertFalse(vote)
+        batch.batch_size = 1
+        self.assertFalse(runner.can_run_graph(batch))
+        batch.seq_lens_cpu.fill_(16384)
+        self.assertTrue(runner.can_run_graph(batch))
+
     def test_rejects_context_above_fixed_maximum(self):
         runner = self._make_runner()
         runner.max_context_size = 700

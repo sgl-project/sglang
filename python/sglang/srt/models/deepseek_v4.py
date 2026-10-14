@@ -768,6 +768,36 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> None:
+    from sglang.srt.layers.attention.dsv4.mega_attention import apply_mega_wo_a
+
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        output.zero_()
+        return
+    live_query = query[:real_num_tokens]
+    data, scale = get_attn_backend().forward(
+        q=live_query,
+        k=live_query,
+        v=live_query,
+        layer=layer.attn_mqa,
+        forward_batch=forward_batch,
+        compress_ratio=layer.compress_ratio,
+        attn_sink=attn_sink,
+        save_kv_cache=False,
+        cos_sin_cache=layer.mega_cos_sin_cache,
+    )
+    projected = apply_mega_wo_a(data, scale, layer.mega_wo_a)
+    output[:real_num_tokens].copy_(projected)
+    output[real_num_tokens:].zero_()
+
+
+bcg_deepseek_v4_mega_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_mega_attention_with_output
+)
+
+
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -2485,18 +2515,28 @@ class MQALayer(MqaAttentionBase):
             else:
                 if not self._use_mega_q_projection():
                     q = pack_mega_query(q, kernel_num_heads)
-                data, scale = attn_backend.forward(
-                    q=q,
-                    k=q,
-                    v=q,
-                    layer=self.attn_mqa,
-                    forward_batch=forward_batch,
-                    compress_ratio=self.compress_ratio,
-                    attn_sink=attn_sink,
-                    save_kv_cache=False,
-                    cos_sin_cache=self.mega_cos_sin_cache,
-                )
-                o = apply_mega_wo_a(data, scale, self.mega_wo_a)
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and is_in_breakable_cuda_graph()
+                ):
+                    o = q.new_empty(
+                        (q.shape[0], self.n_local_groups, self.o_lora_rank),
+                        dtype=torch.bfloat16,
+                    )
+                    bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
+                else:
+                    data, scale = attn_backend.forward(
+                        q=q,
+                        k=q,
+                        v=q,
+                        layer=self.attn_mqa,
+                        forward_batch=forward_batch,
+                        compress_ratio=self.compress_ratio,
+                        attn_sink=attn_sink,
+                        save_kv_cache=False,
+                        cos_sin_cache=self.mega_cos_sin_cache,
+                    )
+                    o = apply_mega_wo_a(data, scale, self.mega_wo_a)
             return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is

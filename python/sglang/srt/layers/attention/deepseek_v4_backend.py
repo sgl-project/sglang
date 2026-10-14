@@ -987,9 +987,6 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
-    prefill_graph_tail: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1189,11 +1186,6 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
-        # Prefill CUDA graph tail block (bounded replay inside the graph): row
-        # capacity, persistent index/location buffers, held metadata per block size.
-        self._bcg_tail_capacity: Optional[int] = None
-        self._bcg_tail_buffers: Optional[tuple] = None
-        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -3981,7 +3973,7 @@ class DeepseekV4AttnBackend(
                 q_flat,
                 kv,
                 combined_indices.unsqueeze(1),
-                core_attn_metadata.positions,
+                core_attn_metadata.positions[: q_flat.shape[0]],
                 cos_sin_cache,
                 self.softmax_scale,
                 attn_sink=attn_sink,
