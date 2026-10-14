@@ -15,7 +15,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
 
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA. On SM100/B200, dense non-causal fp16/bf16 native attention prefers cuDNN SDPA and falls back to FA4 if cuDNN has no compatible kernel.
-- **ROCm**: AITER is the default. On gfx1250, enabling the qualified Wan2.2 fast path below selects Gluon FAv3; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
+- **ROCm**: AITER is the default. gfx1250 can explicitly select Gluon FAv3 for compatible BF16 dense attention; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
 - **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
@@ -867,9 +867,8 @@ sglang generate \
   --attention-backend torch_sdpa
 ```
 
-gfx1250 selects `gluon_fav3` automatically when the qualified Wan fast path
-below is enabled. It can also be selected explicitly; use `aiter` to force the
-comparison/fallback backend:
+Select `gluon_fav3` explicitly on gfx1250; the fixed-shift opt-in below does
+not change the backend choice:
 
 ```bash
 sglang generate \
@@ -886,9 +885,16 @@ remove redundant online rescaling. Enable it only for the validated
 export SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1
 ```
 
-Other shapes continue to use stable online softmax. The runtime rejects an
-explicit `wan_self` launch unless both the exact shape and this opt-in are
-present. Without the opt-in, ROCm keeps AITER as the default backend.
+The fixed shift is model-specific rather than a generic softmax replacement.
+Its exponent is capped before `exp2` so an outlier outside the first K tile
+cannot overflow to `inf`. Other shapes continue to use stable online softmax,
+and the runtime rejects an explicit `wan_self` launch unless both the exact
+shape and this opt-in are present.
+
+The generic Gluon path specializes sequence lengths and softmax scale as JIT
+compile-time constants. A new resolution, frame count, or prompt/KV length can
+therefore trigger a separate compilation; the optimized Wan shapes are fixed
+resolution and reuse their cached binaries.
 
 ### Override one component
 
@@ -1046,7 +1052,7 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm gfx1250: enabling `SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1` makes `gluon_fav3` the automatic default; otherwise the default is AITER. Use `--attention-backend aiter` to force AITER.
+- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fav3` explicitly; `SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1` only enables the qualified Wan self schedule inside that backend.
 - Other ROCm GPUs: `aiter` is the automatic default.
 - ROCm gfx1151 / Strix Halo (wave32): do **not** use `aiter`; prefer `torch_sdpa` (the image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.

@@ -4117,18 +4117,11 @@ class ServerArgs(DisaggServerArgsMixin):
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
         if current_platform.is_rocm():
-            capability = current_platform.get_device_capability()
-            default_backend = (
-                AttentionBackendEnum.GLUON_FAV3.name.lower()
-                if capability is not None
-                and (capability.major, capability.minor) == (12, 5)
-                and os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") == "1"
-                else AttentionBackendEnum.AITER.name.lower()
-            )
+            default_backend = AttentionBackendEnum.AITER.name.lower()
             self.attention_backend = default_backend
             logger.info(
                 "Attention backend not specified. Using '%s' by default on ROCm "
-                "for this device.",
+                "to match SGLang SRT defaults.",
                 default_backend,
             )
 

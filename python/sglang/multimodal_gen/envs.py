@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
     SGLANG_USE_ROCM_AITER_TGEMM: bool = False
+    SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -519,6 +520,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
     # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
     "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
+    # gfx1250 Wan2.2: opt into the qualified fixed-shift self-attention path.
+    "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT": _lazy_bool(
+        "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT"
+    ),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

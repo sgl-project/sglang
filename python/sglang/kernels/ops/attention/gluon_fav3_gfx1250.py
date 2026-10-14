@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from typing import NamedTuple
 
 import torch
@@ -196,6 +195,8 @@ class _AttentionProgram:
         batch_id = gl.program_id(0)
         head_id = gl.program_id(1)
         query_start = gl.program_id(2) * cfg.BLOCK_M
+        batch_id_i64 = batch_id.to(gl.int64)
+        head_id_i64 = head_id.to(gl.int64)
 
         query_rows = query_start + gl.arange(
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
@@ -205,13 +206,13 @@ class _AttentionProgram:
             stride_qs * query_rows[:, None] + stride_qd * query_dims[None, :]
         )
         query_mask = query_rows[:, None] < cfg.SEQLEN_Q
-        query_base = q_ptr + stride_qb * batch_id + stride_qh * head_id
+        query_base = q_ptr + stride_qb * batch_id_i64 + stride_qh * head_id_i64
         q = gl.amd.cdna5.buffer_load(
             query_base, query_offsets, mask=query_mask, other=0.0
         )
 
         k_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-            base=k_ptr + stride_kb * batch_id + stride_kh * head_id,
+            base=k_ptr + stride_kb * batch_id_i64 + stride_kh * head_id_i64,
             shape=(cfg.SEQLEN_K, cfg.HEAD_SIZE),
             strides=(stride_ks, stride_kd),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_SIZE),
@@ -223,7 +224,7 @@ class _AttentionProgram:
             layout=k_desc.layout,
         )
         v_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-            base=v_ptr + stride_vb * batch_id + stride_vh * head_id,
+            base=v_ptr + stride_vb * batch_id_i64 + stride_vh * head_id_i64,
             shape=(cfg.SEQLEN_K, cfg.HEAD_SIZE),
             strides=(stride_vs, stride_vd),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_SIZE),
@@ -245,7 +246,7 @@ class _AttentionProgram:
             stride_os * output_rows[:, None] + stride_od * output_dims[None, :]
         )
         output_mask = output_rows[:, None] < cfg.SEQLEN_Q
-        output_base = output_ptr + stride_ob * batch_id + stride_oh * head_id
+        output_base = output_ptr + stride_ob * batch_id_i64 + stride_oh * head_id_i64
 
         return _AttentionProgram(
             cfg,
@@ -347,6 +348,9 @@ class _AttentionProgram:
     @gluon.jit
     def softmax_finish_fixed(self, scores, row_max_scaled, row_max):
         shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
+        # A later Wan key can exceed the first-tile shift. Cap the exponent
+        # below FP32 overflow while retaining an overwhelming softmax weight.
+        shifted = gl.minimum(shifted, 80.0)
         probabilities = gl.exp2(shifted)
         alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
         return probabilities, alpha
@@ -355,6 +359,7 @@ class _AttentionProgram:
     def softmax_part0_fixed(self, scores, row_max):
         row_max_scaled = row_max * self.softmax_scale_log2
         shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
+        shifted = gl.minimum(shifted, 80.0)
         probabilities = gl.exp2(shifted)
         alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
         return probabilities, alpha, row_max
@@ -862,6 +867,7 @@ def select_fav3_launch_config(
     *,
     seqlen_k: int | None = None,
     num_cus: int | None = None,
+    wan_fixed_shift: bool = False,
 ) -> FAv3LaunchConfig:
     """Select the measured gfx1250 D128 launch policy."""
     if min(batch, num_heads, seqlen_q) <= 0:
@@ -893,7 +899,7 @@ def select_fav3_launch_config(
             and num_heads == 40
             and seqlen_q == 176_400
             and seqlen_k == seqlen_q
-            and os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") == "1"
+            and wan_fixed_shift
         )
         schedule = "wan_self" if use_fixed_shift else "pingpong"
         if use_fixed_shift:
@@ -916,6 +922,7 @@ def gluon_fav3_attention(
     *,
     softmax_scale: float | None = None,
     launch_config: FAv3LaunchConfig | None = None,
+    wan_fixed_shift: bool = False,
 ) -> torch.Tensor:
     """Run non-causal BF16 MHA on gfx1250.
 
@@ -967,18 +974,15 @@ def gluon_fav3_attention(
         seqlen_q,
         seqlen_k=seqlen_k,
         num_cus=get_num_cus(query.device),
+        wan_fixed_shift=wan_fixed_shift,
     )
     wan_self_contract = (
         batch == 2 and num_heads == 40 and seqlen_q == 176_400 and seqlen_k == seqlen_q
     )
     fixed_shift = config.schedule == "wan_self"
-    if fixed_shift and (
-        not wan_self_contract
-        or os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") != "1"
-    ):
+    if fixed_shift and (not wan_self_contract or not wan_fixed_shift):
         raise ValueError(
-            "wan_self FAv3 requires B2/S176400/H40/D128 and "
-            "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1"
+            "wan_self FAv3 requires B2/S176400/H40/D128 and wan_fixed_shift=True"
         )
     if config.schedule == "wan_cross":
         expected_geometry = (128, 256, 4)
