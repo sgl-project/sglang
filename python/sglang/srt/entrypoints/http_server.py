@@ -1268,6 +1268,8 @@ async def update_weights_from_disk(
     obj: Annotated[UpdateWeightFromDiskReqInput, Body()], request: Request
 ):
     """Update the weights from disk inplace without re-launching the server."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     (
         success,
         message,
@@ -1372,6 +1374,8 @@ async def init_weights_update_group(
     obj: Annotated[InitWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Initialize the parameter update group."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
         obj, request
     )
@@ -1388,6 +1392,8 @@ async def destroy_weights_update_group(
     obj: Annotated[DestroyWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Destroy the parameter update group."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     (
         success,
         message,
@@ -1409,6 +1415,8 @@ async def update_weights_from_tensor(
     2. HTTP will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
     3. Any binary data in the named tensors should be base64 encoded.
     """
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
@@ -1426,6 +1434,8 @@ async def begin_weight_update(
     obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
 ):
     """Open a weight-update session so in-place-quantized weights become loadable."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     success, message = await _global_state.tokenizer_manager.begin_weight_update(
         obj, request
     )
@@ -1441,6 +1451,8 @@ async def end_weight_update(
     obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
 ):
     """Close the weight-update session and finalize quantized weights."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     success, message = await _global_state.tokenizer_manager.end_weight_update(
         obj, request
     )
@@ -1456,6 +1468,8 @@ async def update_weights_from_distributed(
     obj: Annotated[UpdateWeightsFromDistributedReqInput, Body()], request: Request
 ):
     """Update model parameter from distributed online."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     (
         success,
         message,
@@ -1476,6 +1490,8 @@ async def update_weights_from_ipc(
     obj: Annotated[UpdateWeightsFromIPCReqInput, Body()], request: Request
 ):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
     )
@@ -1495,6 +1511,8 @@ async def update_weight_version(
     obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
 ):
     """Update the weight version. This operation requires no active requests."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
 
