@@ -1966,6 +1966,11 @@ class Envs:
     SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
         "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
     )
+    # Quantize Kimi-K3 decode activations to per-token FP8 inside the producer
+    # kernels, for per-channel FP8 attention linears in this token window.
+    SGLANG_OPT_HIP_K3_PTPC_FP8 = EnvBool(False)
+    SGLANG_OPT_HIP_K3_PTPC_FP8_MIN_TOKENS = EnvInt(1)
+    SGLANG_OPT_HIP_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

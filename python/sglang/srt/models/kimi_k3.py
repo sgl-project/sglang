@@ -161,6 +161,13 @@ _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
+def _k3_num_tokens(hidden_states) -> int:
+    """Rows of a BF16 activation or of a ROCm (fp8, per-token scale) tuple."""
+    if isinstance(hidden_states, tuple):
+        return hidden_states[0].shape[0]
+    return hidden_states.shape[0]
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -1816,6 +1823,15 @@ class KimiK3DeltaAttention(nn.Module):
         self._kda_hip_fused_decode_ready = False
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_ptpc import init_kda_ptpc_state
+
+            init_kda_ptpc_state(self)
+
+    def _attn_input_quant_format(self, num_tokens: int) -> str:
+        from sglang.srt.models.kimi_k3_rocm_ptpc import kda_attn_input_quant_format
+
+        return kda_attn_input_quant_format(self, num_tokens)
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1843,9 +1859,10 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_npu:
             return
         if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_ptpc import merge_kda_inproj_ptpc
             from sglang.srt.models.kimi_k3_rocm_quant import _k3_merge_kda_inproj_fp8
 
-            if _k3_merge_kda_inproj_fp8(self):
+            if merge_kda_inproj_ptpc(self) or _k3_merge_kda_inproj_fp8(self):
                 return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
@@ -2035,14 +2052,21 @@ class KimiK3DeltaAttention(nn.Module):
             if (
                 _is_hip
                 and self._qkvgbfa_sizes is not None
-                and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
+                and 0 < _k3_num_tokens(hidden_states) <= self._qkvgbfa_bs_limit
             ):
                 # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
                 # tail rides the wide projection's bandwidth (~30% of the
                 # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
-                fused_states = self.fused_qkvg_proj.quant_method.apply(
-                    self._qkvgbfa_layer, hidden_states, None
-                )
+                if self._qkvgbfa_ptpc is not None:
+                    from sglang.srt.models.kimi_k3_rocm_ptpc import (
+                        run_kda_inproj_ptpc,
+                    )
+
+                    fused_states = run_kda_inproj_ptpc(self, hidden_states)
+                else:
+                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                        self._qkvgbfa_layer, hidden_states, None
+                    )
                 qkv, g_proj_states, f_a, beta, _pad = torch.split(
                     fused_states, self._qkvgbfa_sizes, dim=-1
                 )
@@ -2156,6 +2180,14 @@ class KimiK3DeltaAttention(nn.Module):
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False
+        quantized = None
+        if _is_hip and not fused_onorm:
+            from sglang.srt.models.kimi_k3_rocm_ptpc import fuse_kda_o_norm_ptpc
+
+            quantized = fuse_kda_o_norm_ptpc(self, core_attn_out, g_proj_states)
+        if quantized is not None:
+            # (fp8, per-token scale) for the PTPC o_proj; all_reduce_fusion is off.
+            return self.o_proj(quantized)[0]
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -2255,6 +2287,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             from sglang.srt.models.kimi_k3_rocm_mla import init_mla_rocm_state
 
             init_mla_rocm_state(self)
+            from sglang.srt.models.kimi_k3_rocm_ptpc import init_mla_ptpc_state
+
+            init_mla_ptpc_state(self)
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -2376,6 +2411,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             out_cache_loc=out_cache_loc,
         )
 
+    def _attn_input_quant_format(self, num_tokens: int) -> str:
+        from sglang.srt.models.kimi_k3_rocm_ptpc import mla_attn_input_quant_format
+
+        return mla_attn_input_quant_format(self, num_tokens)
+
+    def _q_b_takes_ptpc_fp8(self, num_tokens: int) -> bool:
+        # Looked up by forward_mla_rocm.
+        return _is_hip and self._k3_q_b_ptpc and self._k3_ptpc.covers(num_tokens)
+
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
@@ -2384,7 +2428,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             and get_is_capture_mode()
             # Keep the fork and join within one capture segment.
             and not is_in_breakable_cuda_graph()
-            and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
+            and (0 < _k3_num_tokens(hidden_states) <= self._gate_bs_limit)
         ):
             alt = self._gate_alt_stream
             alt.wait_stream(torch.cuda.current_stream())
@@ -2693,6 +2737,22 @@ class KimiK3DecoderLayer(nn.Module):
             )
         return ()
 
+    def _attn_input_quant_format(
+        self,
+        forward_batch: ForwardBatch,
+        capture_gathered: Optional[AuxHiddenStateAccumulator],
+    ) -> str:
+        """ROCm decode can read the attention input already quantized for the
+        in-projection; a captured input must stay a tensor."""
+        if not (
+            _is_hip
+            and capture_gathered is None
+            and forward_batch.forward_mode.is_decode()
+            and not is_dp_attention_enabled()
+        ):
+            return ""
+        return self.self_attn._attn_input_quant_format(forward_batch.batch_size)
+
     def _run_self_attn(
         self,
         hidden_states: torch.Tensor,
@@ -2739,7 +2799,10 @@ class KimiK3DecoderLayer(nn.Module):
         capture_gathered: Optional[AuxHiddenStateAccumulator] = None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_gathered=capture_gathered
+            hidden_states,
+            forward_batch,
+            capture_gathered=capture_gathered,
+            quant_format=self._attn_input_quant_format(forward_batch, capture_gathered),
         )
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
