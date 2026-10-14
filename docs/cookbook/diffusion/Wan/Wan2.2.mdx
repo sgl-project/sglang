@@ -1,15 +1,28 @@
 ---
 title: Wan2.2
+description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
 metatags:
     description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "T2V / I2V / TI2V", "MoE", "720p @ 24 fps", "cinematic motion"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan22.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Wan2.2](https://github.com/Wan-Video/Wan2.2) extends the Wan family with timestep-specialized Mixture-of-Experts models and a unified 5B TI2V checkpoint. It targets cinematic composition, lighting, and complex motion while supporting text-to-video, image-to-video, and hybrid text/image conditioning.
 
@@ -21,12 +34,6 @@ for image-to-video generation. Use `Wan-AI/Wan2.2-I2V-A14B-Diffusers` when I2V
 quality is the priority.
 </Warning>
 
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -35,9 +42,7 @@ This section provides deployment configurations optimized for different hardware
 
 The Wan2.2 series offers models in various sizes, architectures and input types, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200, AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs.
-
-<Wan22Deployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
@@ -212,7 +217,7 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference. Enable if run out of memory with FSDP.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference. Enable if run out of memory with FSDP.
 - `--vae-cpu-offload`: Use CPU offload for VAE. Enable if run out of memory.
@@ -459,3 +464,9 @@ Test Environment:
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

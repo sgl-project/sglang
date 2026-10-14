@@ -5,6 +5,9 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod affinity;
+pub mod cache_aware;
+pub mod factory;
 pub mod power_of_two;
 pub mod session_aware;
 
@@ -24,8 +27,12 @@ pub struct PickRequest<'a> {
     pub model: &'a ModelId,
     pub stage: Stage,
     pub bucket: &'a str,
+    /// The longest prompt, for bucket fit and prefix matching.
     pub input_tokens: u64,
+    /// Every prompt in a batch, for load comparisons.
+    pub total_input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
+    pub prefix: Option<&'a cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
@@ -38,7 +45,9 @@ impl<'a> PickRequest<'a> {
             stage,
             bucket: "",
             input_tokens,
+            total_input_tokens: input_tokens,
             expected_peak_tokens: None,
+            prefix: None,
             token_ids: None,
             session_key: None,
             routing_key: None,
@@ -87,7 +96,18 @@ pub trait Policy: Send + Sync + Debug {
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// Whether this policy may serve `stage`; checked when a resolver is built.
+    fn supports(&self, _stage: Stage) -> bool {
+        true
+    }
+
+    /// Whether picks read request tokens (prefix matching). Load-only policies
+    /// work from the request-size estimate when no tokenizer is loaded.
+    fn needs_request_tokens(&self) -> bool {
+        false
+    }
+
+    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
     }

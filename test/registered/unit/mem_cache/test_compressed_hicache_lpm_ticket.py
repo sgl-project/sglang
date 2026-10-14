@@ -36,9 +36,21 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 RadixKey = source_definition("mem_cache/radix_cache.py", "RadixKey", array=array)
 ENV = NS(SGLANG_RADIX_FORCE_MISS=NS(get=lambda: False))
 MATCH = dict(RadixKey=RadixKey, MatchPrefixParams=NS, envs=ENV)
-match_request = source_definition(
-    "managers/schedule_policy.py", "match_prefix_for_req", **MATCH
+radix_key = source_definition(
+    "mem_cache/common.py", "_req_radix_key", RadixKey=RadixKey
 )
+match_kv_cache = source_definition(
+    "mem_cache/common.py", "match_kv_cache", _req_radix_key=radix_key, **MATCH
+)
+MATCH["match_kv_cache"] = match_kv_cache
+
+
+def match_request(cache, req, token_ids=None, **kwargs):
+    return match_kv_cache(
+        req, cache, token_ids, cow_mamba=kwargs.get("cow_mamba", False)
+    )
+
+
 CacheAwarePolicy = source_definition(
     "managers/schedule_policy.py", "CacheAwarePolicy", Enum=Enum
 )
@@ -76,13 +88,15 @@ class Request:
         self.sampling_params = NS(ignore_eos=False, max_new_tokens=1)
         self.host_loaded_length = 0
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.prefix_len = 0
+        self.dllm_config = None
+        self.retracted_stain = False
         self.set_finish_with_abort = Mock()
 
     def is_dllm(self):
         return False
 
-    def _refresh_fill_ids(self):
+    def refresh_fill_ids(self):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
 
@@ -99,7 +113,7 @@ class Policy:
         "managers/schedule_policy.py",
         "_compute_prefix_matches",
         "SchedulePolicy",
-        match_prefix_for_req=match_request,
+        match_kv_cache=match_kv_cache,
         IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD=-1,
     )
     _sort_by_longest_prefix = staticmethod(
@@ -114,7 +128,8 @@ class Policy:
         self.tree_cache = cache
         self.policy = CacheAwarePolicy.LPM
         self.waiting_queue_radix_tree = NS(reset=Mock())
-        self._determine_active_policy = lambda waiting: self.policy
+        self._determine_active_policy = lambda waiting, *args: self.policy
+        self._touch_waiting_prefixes = lambda *args: None
 
 
 # calc_priority references its class for the unchanged static sort.
@@ -130,24 +145,37 @@ class Adder:
         torch=torch,
         CLIP_MAX_NEW_TOKENS=4096,
         InitLoadBackParams=lambda **kw: NS(mem_quota=None, **kw),
+        UnifiedRadixCache=CacheHarness,
+        nullcontext=nullcontext,
+        ComponentType=ComponentType,
+        CacheTransferPhase=NS(LOAD_BACK="load"),
     )
 
     def __init__(self, cache, count):
         self.tree_cache = cache
         self.page_size = 1
         self.prefill_max_requests = self.prefill_delayer_single_pass = None
-        self._mamba_gap_budget_for_req = lambda req: 0
-        self._lock_node = lambda node: nullcontext()
+        self._mamba_gap_budget_for_req = lambda req, **kw: 0
+        self._lock_node = lambda node, **kwargs: nullcontext()
         self._select_prefill_admission = lambda *a, **kw: NS(
-            extend_len=1, is_chunked=False
+            prefix_len=count, extend_len=1, max_new_tokens=1, is_chunked=False
         )
         self._commit_prefill_admission = Mock()
         self.budget_state = lambda: AddReqResult.CONTINUE
+        self.rem_chunk_tokens = None
+        self.rem_mamba_slots = None
+        self.per_req_token_overhead = 0
+        self._request_slot_reserve_for_req = lambda req: 0
+        self._kv_shard_reserve_scratch = lambda **kw: True
+        self.memory_budget = NS(
+            load_back_needs_full_tokens=True,
+            prepare_load_back=Mock(return_value=True),
+        )
 
 
 def result(count, anchor):
     return NS(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=0,
         last_host_node=anchor,
         best_match_node=anchor,
@@ -254,6 +282,10 @@ def restored_prefix():
             commit_load_back=Mock(return_value=[]),
             finish_load_back=Mock(),
         )
+        c.tree_core.build_hicache_transfers = Mock(
+            return_value=[NS(host_indices=handles)]
+        )
+        c.linker = c.buffer_pipeline = None
         c.load_back_threshold = 1
         c.inc_host_lock_ref = Mock(return_value=NS(to_dec_params=lambda: "host"))
         c.inc_lock_ref = Mock(return_value=NS(delta=0, to_dec_params=lambda: "device"))
@@ -268,6 +300,7 @@ def restored_prefix():
         c.swa_reprefill_tail_tokens = lambda: 0
         c.supports_mamba = lambda: False
         c.init_load_back = c.init_async_load_back
+        c.load_back_is_cache_owned = lambda: True
         c.matches = []
         c.anchor = 1
 
@@ -324,6 +357,11 @@ def test_lpm_polling_preserves_ticket_then_adder_consumes_after_ack(
         assert a.add_one_req(r, False, None) == AddReqResult.CONTINUE
         assert state.restore_ticket is None and ticket.consumed
         assert r.host_loaded_length == count
+        assert a.memory_budget.prepare_load_back.call_args.kwargs["full_tokens"] == 3
+        assert (
+            a.memory_budget.prepare_load_back.call_args_list[0].kwargs["full_tokens"]
+            == count + 3
+        )
         assert pool.snapshot()["active_readers"] == 0
         c.token_to_kv_pool_allocator.free.assert_not_called()
         c.tree_core.commit_load_back.assert_called_once()

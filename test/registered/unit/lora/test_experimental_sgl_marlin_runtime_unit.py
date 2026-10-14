@@ -273,7 +273,7 @@ def _run_marlin_flow(
     )
     _stub_module(
         monkeypatch,
-        "sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts",
+        "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts",
         merged_experts_fused_moe_lora_add=merged_experts_fused_moe_lora_add,
     )
     _stub_module(

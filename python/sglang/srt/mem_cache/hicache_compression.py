@@ -22,6 +22,8 @@ def attach_compressed_hicache(cache, params, load_cache_event):
     from sglang.srt.runtime_context import get_memory
 
     pool = params.token_to_kv_pool_allocator.get_kvcache()
+    if getattr(pool, "host_transfer_translate", None) is not None:
+        raise ValueError("Compressed L2 does not support virtual KV relocation")
     layout = KVLayoutAdapter(pool.k_buffer, pool.v_buffer, params.page_size)
     budget = int(get_memory().hicache_size * 1e9)
     if budget > host_memory_budget_bytes(budget):

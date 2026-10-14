@@ -304,3 +304,30 @@ Keep `SGLANG_KV_COMPRESSION_WORKSPACE_MB=640` for the validated Qwen3-8B
 or change ANS batching/performance. Re-run GPU preflight, targeted abort/ACK and
 VERIFY mismatch faults, then the ten-group normal matrix on the new image. CPU
 method tests do not establish GPU/RDMA safety or Router retry behavior.
+
+
+## Upstream integration and validation boundary
+
+The latest integration merges upstream `c82e8bd5fe` and preserves the fixes from
+`8674c58d0a`. Priority matching and admission now use upstream's common
+`match_kv_cache()` helper with the same admissible prefix range. Compressed
+restore tickets return the adopted prefix length, matching the current HiCache
+interface; their reserved target pages are deducted from both admission and
+load-back demand.
+
+Native transfers retain upstream's generation-bearing abort messages and ACK
+fan-out. Compressed v2 transfers retain their nonce-bearing messages and strict
+expected-rank checks. Receiver error reporting does not clear drain ACKs; the
+owning release queue clears them only after safe release. Uncertain Prefill
+cancellation, including bootstrap failure handling, retains its owners and
+blocks further admission.
+
+Compression requires early Decode allocation and device receive destinations.
+Compressed L2 rejects virtual KV relocation; shared-layout, topology-converting
+and buffer-only combinations are outside this draft's supported scope.
+
+Local CPU/control-flow, Router and style checks are recorded separately from
+prior online results. GPU/nvCOMP, real RDMA and the complete online fault matrix
+have **not** been revalidated after this upstream integration. Build a new image
+from the updated PR head and repeat GPU preflight, LPM restoration, cancellation,
+normal-path and fault tests before claiming acceptance of this revision.

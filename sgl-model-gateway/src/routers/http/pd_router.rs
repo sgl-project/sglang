@@ -722,12 +722,10 @@ impl PDRouter {
         _start_time: Instant,
         retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Count the request from dispatch so load-based policies see it before
+        // upstream headers arrive; streaming responses attach their own guards.
+        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        let _decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);

@@ -105,6 +105,20 @@ class CacheHarness(HiCacheLifecycleMixin):
 
 
 class SchedulerHarness:
+    _abort_prefill_sender = source_definition(
+        "disaggregation/prefill.py",
+        "_abort_prefill_sender",
+        "SchedulerDisaggregationPrefillMixin",
+        BufferDrainError=BufferDrainError,
+    )
+    release_aborted_prefill_waiting_req = source_definition(
+        "disaggregation/prefill.py",
+        "release_aborted_prefill_waiting_req",
+        "SchedulerDisaggregationPrefillMixin",
+        maybe_release_metadata_buffer=lambda *a: None,
+        release_kv_cache=lambda *a, **kw: None,
+    )
+    clear_pending_chunk_send = lambda self, req: None
     _is_prefill_abort_quarantined = source_definition(
         "disaggregation/prefill.py",
         "_is_prefill_abort_quarantined",
@@ -159,13 +173,15 @@ class QueuedCancelTests(unittest.TestCase):
             runtime=NS(verify=False),
         )
         self.req = NS(
+            release_mm_inputs_on_abort=Mock(),
+            session=None,
             rid="queued",
             cache_request_handle=CacheRequestHandle("queued", 0),
             finished_reason=None,
             to_finish=None,
             last_node=0,
             pending_bootstrap=False,
-            kv=NS(holds_mamba=False),
+            kv=NS(holds_kv=False, holds_mamba=False),
             output_ids=[],
             weight_version_events=[],
             set_finish_with_abort=Mock(),
@@ -358,7 +374,7 @@ class QueuedCancelTests(unittest.TestCase):
         self.complete()
         adopted, anchor = self.begin()
         self.assertEqual(anchor, 1)
-        self.assertEqual(adopted.tolist(), [9, 11, 5])
+        self.assertEqual(adopted, 3)
         self.assertEqual(self.pool.snapshot()["active_readers"], 0)
         self.cache.token_to_kv_pool_allocator.free.assert_not_called()
         self.cache.tree_core.commit_load_back.assert_called_once()
@@ -453,7 +469,7 @@ class QueuedCancelTests(unittest.TestCase):
         self.cancel()
         self.complete()
         self.assert_released()
-        self.req = NS(**vars(self.req))
+        self.req.release_mm_inputs_on_abort = Mock()
         self.req.cache_request_handle = CacheRequestHandle(self.req.rid, 1)
         self.params.req = self.req
         self.future = Future()
@@ -466,7 +482,7 @@ class QueuedCancelTests(unittest.TestCase):
         self.complete()
         adopted, anchor = self.begin()
         self.assertEqual(anchor, 1)
-        self.assertEqual(adopted.tolist(), [9, 11, 5])
+        self.assertEqual(adopted, 3)
         self.assertEqual(self.pool.snapshot()["active_readers"], 0)
         self.assertEqual(self.state.stats["restored_pages"], 3)
         self.cache.token_to_kv_pool_allocator.free.assert_called_once()

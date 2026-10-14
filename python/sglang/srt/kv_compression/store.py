@@ -138,6 +138,7 @@ class WriteLease:
 class CompressedHostKVCache:
     can_use_write_back_jit = False
     requires_complete_restore = True
+    shared_allocation_domain = None
     page_size = logical_page_size = 1
     layout = "compressed_pages_v2"
     device = "cpu"

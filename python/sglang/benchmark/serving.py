@@ -255,6 +255,31 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
+def _record_server_prompt_len(data, output):
+    """Take the prompt length from the server, the only side that knows it.
+
+    ``RequestFuncOutput.prompt_len`` is seeded from the dataset row by
+    ``RequestFuncOutput.init_new``. That is correct for a single-turn row, where
+    one row is one request. A multi-turn row is instead replayed as one request
+    per round, and every round's output inherits the row's single value -- so
+    summing ``prompt_len`` across outputs counts one number once per round
+    rather than adding up each request's own prompt.
+
+    Two consumers divide by that sum: the ``--cache-report`` hit rate, and
+    ``input_lens`` in the JSON output.
+
+    The server reports the real figure as ``usage.prompt_tokens`` on the
+    OpenAI-compatible routes and ``meta_info.prompt_tokens`` on the native one.
+    It is the same quantity for a single-turn row, so preferring it needs no
+    per-dataset branch, and leaving the seeded value in place when the server
+    reports nothing keeps behaviour unchanged for any backend that does not.
+    """
+    reported = data.get("usage") or data.get("meta_info") or {}
+    prompt_tokens = reported.get("prompt_tokens")
+    if prompt_tokens:
+        output.prompt_len = prompt_tokens
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -327,6 +352,7 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+                            _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -484,6 +510,7 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        _record_server_prompt_len(response_json, output)
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
@@ -517,6 +544,7 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
+                                _record_server_prompt_len(data, output)
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -734,6 +762,8 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            _record_server_prompt_len(data, output)
+
                             if getattr(args, "cache_report", False):
                                 _meta = data.get("meta_info") or {}
                                 output.cached_tokens = _meta.get("cached_tokens", 0)
@@ -1321,6 +1351,15 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
+            # Each round's prompt length comes from the server's usage block,
+            # which a streamed response only carries when asked for. Default the
+            # key rather than the object, so a user's stream_options still gets
+            # it, while an explicit include_usage=false is kept.
+            if not args.disable_stream:
+                body = inner_input.extra_request_body
+                options = body.get("stream_options") or {}
+                options.setdefault("include_usage", True)
+                body["stream_options"] = options
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
@@ -1931,6 +1970,13 @@ def set_global_args(args_: argparse.Namespace):
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
+
+    # The Rust client owns the whole run, from dataset to result file, so hand
+    # it the arguments before this module sets up anything of its own.
+    if getattr(args, "rust_client", False):
+        from sglang.benchmark.rust_client import run_rust_benchmark
+
+        return run_rust_benchmark(args)
 
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
@@ -2759,7 +2805,39 @@ def cli_main():
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
+    parser.add_argument(
+        "--rust-client",
+        action="store_true",
+        help="Run through the Rust client (sglang.srt.rust_extensions._bench), "
+        "which parses each response stream on its own thread instead of one "
+        "shared asyncio thread. Same metrics and result keys; fewer backends "
+        "and datasets (see rust/sglang-bench/README.md). For a command line "
+        "that skips this module's model-tooling imports entirely, run "
+        "`python -m sglang.benchmark.rust_client` instead.",
+    )
+    parser.add_argument(
+        "--rust-worker-threads",
+        type=int,
+        default=None,
+        help="Response-stream parsing threads for --rust-client. "
+        "Defaults to the available parallelism.",
+    )
     args = parser.parse_args()
+    if args.rust_worker_threads is not None and not args.rust_client:
+        parser.error("--rust-worker-threads requires --rust-client")
+    if args.rust_client:
+        # Checked here so an unsupported combination is a usage error rather
+        # than a traceback; `run_benchmark` still raises for a programmatic
+        # caller, which has no parser to report through.
+        from sglang.benchmark.rust_client import (
+            UnsupportedByRustClient,
+            check_supported,
+        )
+
+        try:
+            check_supported(args)
+        except UnsupportedByRustClient as error:
+            parser.error(str(error))
     _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
 

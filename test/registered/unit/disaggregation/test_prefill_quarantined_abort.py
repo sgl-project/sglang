@@ -89,7 +89,18 @@ class Harness:
         release_kv_cache=lambda req, tree, **kw: tree.release(req),
     )
 
+    release_aborted_prefill_waiting_req = definition(
+        "disaggregation/prefill.py",
+        "release_aborted_prefill_waiting_req",
+        "SchedulerDisaggregationPrefillMixin",
+        maybe_release_metadata_buffer=lambda req, alloc: alloc.free(
+            req.metadata_buffer_index
+        ),
+        release_kv_cache=lambda req, tree, **kw: tree.release(req),
+    )
+
     def __init__(self, req, queue):
+        self.enable_lmcache = False
         self.chunked_req = self.mm_receiver = self.dllm_config = None
         self.waiting_queue = [req] if queue == "waiting" else []
         self.disagg_prefill_bootstrap_queue = NS(
@@ -369,6 +380,27 @@ def test_quarantined_ownership_uses_object_identity_for_reused_rid():
     assert any(r is second for r in s._compression_quarantined_waiting)
     s.tree_cache.finish.assert_not_called()
     s.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+
+
+@pytest.mark.parametrize("queue", ["waiting", "bootstrap"])
+def test_bootstrap_failure_cannot_retire_undrained_sender(queue):
+    r = request()
+    s = Harness(r, queue)
+    r.disagg_kv_sender.failure_exception = Mock(
+        side_effect=BufferDrainError("undrained")
+    )
+    fn = definition(
+        "disaggregation/prefill.py",
+        "handle_bootstrap_failure",
+        "SchedulerDisaggregationPrefillMixin",
+        BufferDrainError=BufferDrainError,
+        get_parallel=lambda: NS(tp_rank=0),
+    )
+    fn(s, r)
+    assert_owned(s, r)
+    s.tree_cache.release.assert_not_called()
+    s.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+    s.output_streamer.stream_output.assert_called_once()
 
 
 if __name__ == "__main__":

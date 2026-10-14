@@ -245,6 +245,7 @@ class ZImageAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        norm_cls: type[nn.Module] = ZImageRMSNorm,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -252,7 +253,9 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
-        self.enable_zimage_qk_fusion = quant_config is None
+        self.enable_zimage_qk_fusion = (
+            quant_config is None and norm_cls is ZImageRMSNorm
+        )
 
         tp_size = get_tp_world_size()
         assert num_heads % tp_size == 0, (
@@ -303,8 +306,8 @@ class ZImageAttention(nn.Module):
             )
 
         if self.qk_norm:
-            self.norm_q = ZImageRMSNorm(self.head_dim, eps=eps)
-            self.norm_k = ZImageRMSNorm(self.head_dim, eps=eps)
+            self.norm_q = norm_cls(self.head_dim, eps=eps)
+            self.norm_k = norm_cls(self.head_dim, eps=eps)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -519,13 +522,16 @@ class ZImageTransformerBlock(nn.Module):
         modulation=True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        norm_cls: type[nn.Module] = ZImageRMSNorm,
     ):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // n_heads
         self.layer_id = layer_id
         self.modulation = modulation
-        self.enable_zimage_native_norm_fusion = quant_config is None
+        self.enable_zimage_native_norm_fusion = (
+            quant_config is None and norm_cls is ZImageRMSNorm
+        )
 
         self.attention = ZImageAttention(
             dim=dim,
@@ -535,6 +541,7 @@ class ZImageTransformerBlock(nn.Module):
             eps=1e-5,
             quant_config=quant_config,
             prefix=f"{prefix}.attention",
+            norm_cls=norm_cls,
         )
         if not modulation:
             # Context refiner runs on fully replicated caption tokens only.
@@ -574,11 +581,11 @@ class ZImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.feed_forward",
             )
 
-        self.attention_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.attention_norm1 = norm_cls(dim, eps=norm_eps)
+        self.ffn_norm1 = norm_cls(dim, eps=norm_eps)
 
-        self.attention_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.attention_norm2 = norm_cls(dim, eps=norm_eps)
+        self.ffn_norm2 = norm_cls(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -763,6 +770,7 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    norm_cls = ZImageRMSNorm
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
@@ -856,6 +864,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     modulation=True,
                     quant_config=quant_config,
                     prefix=f"noise_refiner.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -872,6 +881,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     modulation=False,
                     quant_config=quant_config,
                     prefix=f"context_refiner.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -881,7 +891,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.cap_embedder = nn.Sequential(
-            ZImageRMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
+            self.norm_cls(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
             ReplicatedLinear(arch_config.cap_feat_dim, self.dim, bias=True),
         )
 
@@ -899,6 +909,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     arch_config.qk_norm,
                     quant_config=quant_config,
                     prefix=f"layers.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.num_layers)
             ]
@@ -1369,10 +1380,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return self._pin_for_active_capture(result)
 
     @staticmethod
-    def _has_padding(valid_lens: list[int], target_len: int) -> bool:
-        return any(int(length) < target_len for length in valid_lens)
-
-    @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
         """Normalize 4D/5D image latents into per-sample tensors."""
         if torch.is_tensor(hidden_states):
@@ -1444,23 +1451,24 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
-        """Replace padded token rows after each valid sequence length."""
-        if not torch.is_tensor(valid_lens) and all(
-            int(length) >= tensor.shape[1] for length in valid_lens
-        ):
+        """Replace padded token rows after each valid sequence length.
+
+        Selects rather than mask-assigns: a boolean-mask write syncs with the host.
+        """
+        seq_len = tensor.shape[1]
+        pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        if not torch.is_tensor(valid_lens):
+            if all(int(length) >= seq_len for length in valid_lens):
+                return tensor
+            tensor = tensor.clone()
+            for row, length in enumerate(valid_lens):
+                tensor[row, int(length) :] = pad_value
             return tensor
-        positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        if torch.is_tensor(valid_lens):
-            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
-        else:
-            lengths = torch.tensor(valid_lens, device=tensor.device)
-        if lengths.ndim == 0:
-            lengths = lengths.reshape(1)
-        lengths = lengths.unsqueeze(1)
-        pad_mask = positions >= lengths
-        tensor = tensor.clone()
-        tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
-        return tensor
+        lengths = valid_lens.to(device=tensor.device, dtype=torch.long).reshape(-1, 1)
+        positions = torch.arange(seq_len, device=tensor.device).unsqueeze(0)
+        return torch.where(
+            (positions >= lengths).unsqueeze(-1), pad_value.view(1, 1, -1), tensor
+        )
 
     @staticmethod
     def _replace_padding_with_token_mask(

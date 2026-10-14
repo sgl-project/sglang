@@ -363,7 +363,7 @@ class HiCacheLifecycleMixin:
             raise ValueError("Async compressed L2 supports FULL KV only")
         count = len(kv.host_indices)
         if should_skip_full_load(count, self.load_back_threshold):
-            return self.tree_core.empty_match_result.device_indices, req.last_node
+            return 0, req.last_node
         anchor = params.best_match_node
         host_lock, device_lock = None, None
         indices, leases = None, []
@@ -375,7 +375,7 @@ class HiCacheLifecycleMixin:
             lock_result = self.inc_lock_ref(anchor)
             device_lock = lock_result.to_dec_params()
             if exceeds_load_quota(count, lock_result.delta, params.mem_quota):
-                return self.tree_core.empty_match_result.device_indices, req.last_node
+                return 0, req.last_node
             allocator = self.token_to_kv_pool_allocator
             if allocator.available_size() < count:
                 self.evict_for_alloc(
@@ -383,7 +383,7 @@ class HiCacheLifecycleMixin:
                 )
             indices = allocator.alloc(count)
             if indices is None:
-                return self.tree_core.empty_match_result.device_indices, req.last_node
+                return 0, req.last_node
             checking_objects = True
             refs = tuple(
                 ref
@@ -536,7 +536,7 @@ class HiCacheLifecycleMixin:
                 ),
             )
             self._drop_restore_ticket(ticket, free_targets=False)
-            return adopted, ticket.anchor
+            return len(adopted), ticket.anchor
         except Exception:
             ticket.req.set_finish_with_abort("L2 restore publication failed", 500)
             if published:
