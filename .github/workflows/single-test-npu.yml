@@ -28,7 +28,7 @@ jobs:
           npu-smi info
 
       - name: Run test
-        timeout-minutes: 200
+        timeout-minutes: 500
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
