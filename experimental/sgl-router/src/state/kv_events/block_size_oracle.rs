@@ -29,6 +29,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use super::CacheNamespace;
+
 /// Tri-state for the bigram flag: distinguishes "not yet reported" from an
 /// established `false`, so [`BlockSizeOracle::set_bigram`] can be first-wins
 /// (matching `try_set`) rather than last-writer-wins.
@@ -116,6 +118,13 @@ impl BlockSizeOracle {
     /// until a worker reports an EAGLE-family `speculative_algorithm`.
     pub fn is_bigram(&self) -> bool {
         self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
+    }
+
+    /// The prompt's block hashes as workers publish them; `None` until the
+    /// block size is known.
+    pub fn block_hashes(&self, token_ids: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+        let block_size = self.get()? as usize;
+        Some(namespace.block_hashes(token_ids, block_size, self.is_bigram()))
     }
 
     /// The block size and hashing mode together. `None` until both the size

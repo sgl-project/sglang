@@ -1,9 +1,9 @@
+import pickle
 import unittest
-from array import array
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
-import zmq
 
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
@@ -18,18 +18,15 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     BeamSearchOutput,
-    sock_recv,
-    unwrap_from_pickle,
-    wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
-    SocketMapping,
     TokenizerWorker,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
+    _send_output_to_tokenizer_workers,
     get_tokenizer_worker_class,
 )
 
@@ -196,12 +193,6 @@ def _make_router() -> MultiDetokenizerRouter:
     return router
 
 
-def _make_detokenizer() -> MultiHttpWorkerDetokenizerMixin:
-    manager = MultiHttpWorkerDetokenizerMixin()
-    manager.socket_mapping = Mock()
-    return manager
-
-
 class TestMultiTokenizerMixin(CustomTestCase):
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
@@ -359,196 +350,90 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
 
-    def test_detokenizer_groups_by_destination_and_preserves_owner_ipcs(self):
-        output = _make_batch_str_output()
-        manager = _make_detokenizer()
-
-        manager._send_batch_output(
-            output, ["worker-a", "worker-a"], enable_batching=True
+    def test_return_path_groups_noncontiguous_owners(self):
+        output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
+        output.rids = ["rid-0", "rid-1", "rid-2"]
+        output.output_strs = ["first", "second", "third"]
+        ipcs = ["worker-b", "worker-a", "worker-b"]
+        output.http_worker_ipcs = list(ipcs)
+        original = pickle.dumps(output)
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append(
+                (target, obj.rids, obj.output_strs, obj.http_worker_ipcs, is_tokenizer)
+            )
         )
 
-        manager.socket_mapping.send_output.assert_called_once()
-        ipc_name, grouped = manager.socket_mapping.send_output.call_args.args
-        self.assertEqual(ipc_name, "worker-a")
-        self.assertEqual(grouped.rids, ["rid-0", "rid-1"])
-        self.assertEqual(grouped.http_worker_ipcs, ["worker-a", "worker-a"])
-        self.assertTrue(
-            manager.socket_mapping.send_output.call_args.kwargs["is_tokenizer"]
+        _send_output_to_tokenizer_workers(output, ipcs, mapping)
+
+        self.assertEqual(
+            sent,
+            [
+                (
+                    "worker-b",
+                    ["rid-0", "rid-2"],
+                    ["first", "third"],
+                    ["worker-b", "worker-b"],
+                    True,
+                ),
+                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+            ],
         )
-        self.assertEqual(output.rids, ["rid-0", "rid-1"])
+        self.assertEqual(pickle.dumps(output), original)
 
-    def test_detokenizer_keeps_first_destination_order(self):
-        output = _make_batch_str_output()
-        manager = _make_detokenizer()
+    def test_return_path_falls_back_before_sending_any_group(self):
+        output = _make_batch_embedding_output()
+        output.rids.append("embedding-rid-2")
+        output.embeddings.append([0.5, 0.6])
+        output.prompt_tokens.append(30)
+        output.cached_tokens.append(5)
+        output.finished_reasons.append(None)
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append((target, obj))
+        )
 
-        manager._send_batch_output(
-            output, ["worker-b", "worker-a"], enable_batching=True
+        _send_output_to_tokenizer_workers(
+            output, ["worker-b", "worker-a", "worker-a"], mapping
         )
 
         self.assertEqual(
+            [(target, obj.rids) for target, obj in sent],
             [
-                (call.args[0], call.args[1].rids, call.args[1].http_worker_ipcs)
-                for call in manager.socket_mapping.send_output.call_args_list
-            ],
-            [
-                ("worker-b", ["rid-0"], ["worker-b"]),
-                ("worker-a", ["rid-1"], ["worker-a"]),
+                ("worker-b", ["embedding-rid-0"]),
+                ("worker-a", ["embedding-rid-1"]),
+                ("worker-a", ["embedding-rid-2"]),
             ],
         )
 
-    def test_detokenizer_groups_token_output_without_speculative_decoding(self):
-        output = _make_batch_token_id_output()
-        manager = _make_detokenizer()
-
-        manager._send_batch_output(
-            output, ["worker-a", "worker-a"], enable_batching=True
-        )
-
-        manager.socket_mapping.send_output.assert_called_once()
-        grouped = manager.socket_mapping.send_output.call_args.args[1]
-        self.assertEqual(grouped.rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(grouped.decoded_texts, ["first", "second"])
-        self.assertIsNone(grouped.spec_verify_ct)
-
-    def test_detokenizer_grouped_outputs_round_trip(self):
+    def test_event_loop_sends_one_message_per_owner(self):
         output = _make_batch_str_output()
-        for name in output.__struct_fields__:
-            value = getattr(output, name)
-            if isinstance(value, list):
-                setattr(output, name, value * 2)
-        output.rids = ["rid-0", "rid-1", "rid-2", "rid-3"]
-        output.output_ids = [array("q", [i]) for i in range(4)]
-        output.customized_info = wrap_as_pickle({"score": [0, 1, 2, 3]})
-        output.time_stats = wrap_as_pickle([0, 1, 2, 3])
-        ipc_names = ["inproc://worker-b", "inproc://worker-a"] * 2
-        output.http_worker_ipcs = ipc_names.copy()
+        output.http_worker_ipcs = ["worker-a", "worker-a"]
+        worker = MultiHttpWorkerDetokenizerMixin()
+        worker.recv_from_scheduler = object()
+        worker.soft_watchdog = MagicMock()
+        worker._request_dispatcher = lambda obj: obj
+        sent = []
+        mapping = SimpleNamespace(
+            send_output=lambda target, obj, *, is_tokenizer: sent.append(
+                (target, obj.rids)
+            )
+        )
 
-        manager = MultiHttpWorkerDetokenizerMixin()
-        manager.socket_mapping = SocketMapping()
-        context = manager.socket_mapping._zmq_context
-        self.addCleanup(context.destroy, linger=0)
-        self.addCleanup(manager.socket_mapping.clear_all_sockets)
-        context.setsockopt(zmq.LINGER, 0)
-        context.setsockopt(zmq.SNDTIMEO, 1000)
-        receivers = {}
-        for ipc_name in dict.fromkeys(ipc_names):
-            receiver = context.socket(zmq.PULL)
-            self.addCleanup(receiver.close, linger=0)
-            receiver.setsockopt(zmq.RCVTIMEO, 1000)
-            receiver.bind(ipc_name)
-            receivers[ipc_name] = receiver
-
-        manager._send_batch_output(output, ipc_names, enable_batching=True)
-
-        for ipc_name, indices in (
-            ("inproc://worker-b", [0, 2]),
-            ("inproc://worker-a", [1, 3]),
+        with (
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.SocketMapping",
+                return_value=mapping,
+            ),
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
+                side_effect=[output, EOFError("end of input")],
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
         ):
-            received = sock_recv(receivers[ipc_name])
-            self.assertEqual(received.rids, [output.rids[i] for i in indices])
-            self.assertEqual(received.http_worker_ipcs, [ipc_name] * 2)
-            self.assertEqual(
-                received.output_ids, [output.output_ids[i] for i in indices]
-            )
-            self.assertEqual(
-                received.output_strs, [output.output_strs[i] for i in indices]
-            )
-            self.assertEqual(
-                received.finished_reasons, [output.finished_reasons[i] for i in indices]
-            )
-            self.assertEqual(
-                received.weight_versions, [output.weight_versions[i] for i in indices]
-            )
-            self.assertEqual(
-                unwrap_from_pickle(received.customized_info), {"score": indices}
-            )
-            self.assertEqual(unwrap_from_pickle(received.time_stats), indices)
-            for offset, index in enumerate(indices):
-                np.testing.assert_equal(
-                    received.input_top_logprobs_val_flat[offset],
-                    output.input_top_logprobs_val_flat[index],
-                )
-                self.assertEqual(
-                    received.output_token_sampling_mask[offset].to_lists(True),
-                    output.output_token_sampling_mask[index].to_lists(True),
-                )
-            with self.assertRaises(zmq.Again):
-                sock_recv(receivers[ipc_name], flags=zmq.NOBLOCK)
-        self.assertEqual(output.http_worker_ipcs, ipc_names)
+            worker.multi_http_worker_event_loop()
 
-    def test_detokenizer_falls_back_before_any_grouped_send(self):
-        output = BatchEmbeddingOutput(
-            rids=["rid-0", "rid-1", "rid-2"],
-            finished_reasons=[None, None, None],
-            embeddings=[[0.0], [1.0], [2.0]],
-            prompt_tokens=[10, 20, 30],
-            cached_tokens=[1, 2, 3],
-            placeholder_tokens_idx=[None, None, None],
-            placeholder_tokens_val=[None, None, None],
-        )
-        manager = _make_detokenizer()
-
-        manager._send_batch_output(
-            output,
-            ["worker-a", "worker-b", "worker-b"],
-            enable_batching=True,
-        )
-
-        self.assertEqual(
-            [
-                (call.args[0], call.args[1].rids)
-                for call in manager.socket_mapping.send_output.call_args_list
-            ],
-            [
-                ("worker-a", ["rid-0"]),
-                ("worker-b", ["rid-1"]),
-                ("worker-b", ["rid-2"]),
-            ],
-        )
-
-    def test_detokenizer_batching_disabled_uses_per_request_sends(self):
-        output = _make_batch_str_output()
-        manager = _make_detokenizer()
-
-        manager._send_batch_output(
-            output, ["worker-a", "worker-a"], enable_batching=False
-        )
-
-        self.assertEqual(manager.socket_mapping.send_output.call_count, 2)
-        self.assertEqual(
-            [
-                call.args[1].rids
-                for call in manager.socket_mapping.send_output.call_args_list
-            ],
-            [["rid-0"], ["rid-1"]],
-        )
-
-    def test_detokenizer_send_error_propagates_without_resending(self):
-        output = _make_batch_str_output()
-        manager = _make_detokenizer()
-        for successful_sends in (0, 1):
-            with self.subTest(successful_sends=successful_sends):
-                manager.socket_mapping.reset_mock()
-                manager.socket_mapping.send_output.side_effect = [
-                    *([None] * successful_sends),
-                    RuntimeError("send failed"),
-                ]
-
-                with self.assertRaisesRegex(RuntimeError, "send failed"):
-                    manager._send_batch_output(
-                        output, ["worker-a", "worker-b"], enable_batching=True
-                    )
-
-                self.assertEqual(
-                    [
-                        (call.args[0], call.args[1].rids)
-                        for call in manager.socket_mapping.send_output.call_args_list
-                    ],
-                    [
-                        ("worker-a", ["rid-0"]),
-                        ("worker-b", ["rid-1"]),
-                    ][: successful_sends + 1],
-                )
+        self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
