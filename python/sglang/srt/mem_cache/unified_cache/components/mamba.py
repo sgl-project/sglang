@@ -736,10 +736,6 @@ class MambaComponent(TreeComponent):
             pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         # The layer-gated load writes the request's private state directly.
         req.kv.mamba_pool_idx = transfer.device_indices[0]
-        if req.kv.req_pool_idx is not None:
-            pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = (
-                req.kv.mamba_pool_idx
-            )
         self._adopt_loaded_state(req)
         return transfer
 

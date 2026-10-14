@@ -742,12 +742,6 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         loaded_state = loads[PoolName.MAMBA].device_indices
         self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
         self.assertFalse(req.kv.mamba_needs_clear)
-        self.assertEqual(
-            int(
-                consumer_req_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx]
-            ),
-            int(loaded_state),
-        )
 
         loaded_indices = consumer.linker.private_load_indices[req.rid]
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
