@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -95,6 +96,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+# Highest FLUX.1 true CFG weight at which the bounded Spectrum schedule passed
+# image-quality validation; above it Spectrum is disabled.
+_SPECTRUM_TRUE_CFG_MAX_SCALE = 2.0
 
 _get_qkv_projections = get_qkv_projections
 
@@ -1316,10 +1321,13 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         ctx = super()._get_spectrum_context()
         if ctx is None or not ctx.do_cfg:
             return ctx
-        # Even one final-step feature forecast can introduce border artifacts
-        # under FLUX.1 true CFG. Disable Spectrum for the request until a
-        # forecast policy passes independent image-quality validation; a None
+        # Under FLUX.1 true CFG, forecasts from early steps drift far from the
+        # real features. Up to CFG 2 a conservative schedule (real forwards for
+        # the first 40% and the last 2 steps, a real forward every other step
+        # in between) was validated; above it, Spectrum is disabled and a None
         # context skips all forecaster bookkeeping, matching the uncached path.
+        cfg_scale = self._spectrum_cfg_scale()
+        bounded = cfg_scale is not None and cfg_scale <= _SPECTRUM_TRUE_CFG_MAX_SCALE
         if ctx.current_step > 0:
             self._spectrum_true_cfg_warned = False
         elif not ctx.is_cfg_negative and not getattr(
@@ -1327,14 +1335,48 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         ):
             # begin and record both query the context at step 0; warn once.
             self._spectrum_true_cfg_warned = True
-            logger.warning(
-                "FLUX.1 true CFG disables Spectrum for this request: all %d "
-                "steps use real forwards because even a final-step forecast "
-                "can introduce border artifacts. No Spectrum speedup is "
-                "expected.",
-                ctx.num_inference_steps,
-            )
-        return None
+            if bounded:
+                logger.warning(
+                    "FLUX.1 true CFG %.2f uses a bounded Spectrum schedule: real "
+                    "forwards for the first 40%% and last 2 of %d steps.",
+                    cfg_scale,
+                    ctx.num_inference_steps,
+                )
+            else:
+                logger.warning(
+                    "FLUX.1 true CFG above %.1f disables Spectrum for this "
+                    "request: all %d steps use real forwards. No Spectrum "
+                    "speedup is expected.",
+                    _SPECTRUM_TRUE_CFG_MAX_SCALE,
+                    ctx.num_inference_steps,
+                )
+        if not bounded:
+            return None
+        # Copy request parameters: callers may reuse them for another request.
+        params = ctx.spectrum_params
+        steps = ctx.num_inference_steps
+        return replace(
+            ctx,
+            spectrum_params=replace(
+                params,
+                warmup_steps=max(params.warmup_steps, max(1, round(0.4 * steps))),
+                window_size=min(params.window_size, 2.0),
+                flex_window=0.0,
+                final_real_steps=max(params.final_real_steps, 2),
+            ),
+        )
+
+    @staticmethod
+    def _spectrum_cfg_scale() -> Optional[float]:
+        """CFG weight of the current request, or None when it is unknown."""
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        batch = get_forward_context().forward_batch
+        scale = getattr(batch, "guidance_scale", None)
+        pipeline_config = getattr(get_global_server_args(), "pipeline_config", None)
+        if scale is not None and pipeline_config is not None:
+            scale = pipeline_config.get_classifier_free_guidance_scale(batch, scale)
+        return scale
 
     def forward(
         self,

@@ -595,6 +595,9 @@ class SpectrumMixin:
         # even when CFG needs to refresh a residual on a scheduled skip.
         if ctx.force_real:
             actual_forward = True
+        # The final steps set fine detail; a policy can keep them exact.
+        if ctx.current_step >= ctx.num_inference_steps - params.final_real_steps:
+            actual_forward = True
 
         # One denoising forward completed on this branch.
         cnt += 1

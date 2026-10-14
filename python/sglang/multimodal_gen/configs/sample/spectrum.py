@@ -51,6 +51,10 @@ class SpectrumParams(CacheParams):
         taylor_order (`int`, defaults to `1`):
             Order of the local discrete Taylor fallback used in the blend when
             `w < 1.0`. Supported values: `1`, `2`, or `3`.
+        final_real_steps (`int`, defaults to `0`):
+            Number of final denoising steps that always run the full DiT,
+            regardless of the skip schedule. Set by model policies; there is no
+            CLI flag.
         separate_cfg_branches (not a field — determined by the DiT model):
             Wan, Hunyuan, SD3, and FLUX maintain independent Spectrum state per
             CFG branch. Other ``CachableDiT`` models use one counter for all
@@ -67,6 +71,7 @@ class SpectrumParams(CacheParams):
     history_size: int = 100
     tau_num_steps: int = 50
     taylor_order: int = 1
+    final_real_steps: int = 0
 
     def __post_init__(self) -> None:
         finite_numbers = {
@@ -92,7 +97,10 @@ class SpectrumParams(CacheParams):
         if self.lam < 0:
             raise ValueError("Spectrum lam must be non-negative.")
 
-        non_negative_ints = {"warmup_steps": self.warmup_steps}
+        non_negative_ints = {
+            "warmup_steps": self.warmup_steps,
+            "final_real_steps": self.final_real_steps,
+        }
         positive_ints = {
             "m": self.m,
             "history_size": self.history_size,
