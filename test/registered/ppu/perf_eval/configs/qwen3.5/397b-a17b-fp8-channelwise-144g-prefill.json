@@ -1,0 +1,68 @@
+{
+  "schema_version": "ppu-perf-test-config/v1",
+  "test_id": "qwen3.5-397b-a17b-fp8-channelwise-perf-144g",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/v3.5/Qwen3.5-397B-A17B-FP8-Channelwise",
+    "checkpoint_name": "Qwen3.5-397B-A17B-FP8-Channelwise",
+    "served_model_name": "Qwen3.5-397B-A17B-FP8-Channelwise",
+    "accepted_model_types": [
+      "qwen3_5_moe",
+      "qwen3_5_moe_text"
+    ]
+  },
+  "server": {
+    "startup_timeout_seconds": 3600,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 4,
+      "attention_backend": "fa3",
+      "page_size": 64,
+      "mem_fraction_static": 0.9,
+      "quantization": null,
+      "dist_timeout": 3600,
+      "watchdog_timeout": 3600,
+      "disable_radix_cache": true,
+      "disable_shared_experts_fusion": true
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "workload": {
+    "dataset": "random-ids",
+    "random_range_ratio": 1.0,
+    "warmup_requests": 1,
+    "seed": 0,
+    "measurements": [
+      {
+        "id": "prefill-4k",
+        "input_len": 4000,
+        "output_len": 1,
+        "num_prompts": 10,
+        "concurrency": 1,
+        "source_case": "qwen3_5-397b-a17b_fp8-channel_4000_1_0001.json",
+        "tc_name": "qwen3.5-397b-a17b_prefill_4k_1_tp"
+      },
+      {
+        "id": "prefill-64k",
+        "input_len": 64000,
+        "output_len": 1,
+        "num_prompts": 10,
+        "concurrency": 1,
+        "source_case": "qwen3_5-397b-a17b_fp8-channel_64000_1_0001.json",
+        "tc_name": "qwen3.5-397b-a17b_prefill_64k_1_tp"
+      }
+    ]
+  }
+}

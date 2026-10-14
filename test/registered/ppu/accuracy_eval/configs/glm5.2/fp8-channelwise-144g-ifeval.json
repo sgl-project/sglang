@@ -1,0 +1,67 @@
+{
+  "schema_version": "ppu-accuracy-test-config/v1",
+  "test_id": "glm-5.2-fp8-channelwise-accuracy-ifeval-144g",
+  "name": "GLM-5.2-FP8-Channelwise accuracy on IFEval (ZW-M890P, 8x144G)",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "accuracy",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/v5.2/GLM-5.2-FP8-Channelwise",
+    "checkpoint_name": "GLM-5.2-FP8-Channelwise",
+    "served_model_name": "GLM-5.2-FP8-Channelwise",
+    "accepted_model_types": ["glm_moe_dsa"]
+  },
+  "server": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": "dsa",
+      "dsa_prefill_backend": "flashmla_sparse",
+      "dsa_decode_backend": "flashmla_kv",
+      "dsa_prefill_cp_mode": "round-robin-split",
+      "enable_dsa_prefill_context_parallel": true,
+      "attn_cp_size": 8,
+      "chunked_prefill_size": 7488,
+      "cuda_graph_max_bs": 40,
+      "max_running_requests": 40,
+      "num_continuous_decode_steps": 1,
+      "mem_fraction_static": 0.9,
+      "quantization": null,
+      "reasoning_parser": "glm45",
+      "dist_timeout": 24000,
+      "watchdog_timeout": 24000,
+      "disable_custom_all_reduce": true,
+      "disable_piecewise_cuda_graph": true,
+      "disable_shared_experts_fusion": true,
+      "enforce_disable_flashinfer_allreduce_fusion": true
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600,
+      "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0"
+    }
+  },
+  "evaluation": {
+    "dataset": "ifeval",
+    "dataset_dir": "/nas_aisw/datasets/evalscope/opencompass/ifeval",
+    "eval_batch_size": 40,
+    "limit": null,
+    "primary_metric": "prompt_level_strict",
+    "baseline": 0.9279,
+    "min_ratio": 0.9244,
+    "generation": {
+      "max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "source_case": "btv1.5/llm_infer_sglang_evalscope/P0_daily/glm-5.2-fp8-channel_3002.json",
+    "tc_name": "glm-5.2_0007"
+  }
+}

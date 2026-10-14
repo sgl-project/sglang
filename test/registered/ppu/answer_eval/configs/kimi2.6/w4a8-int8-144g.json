@@ -1,0 +1,55 @@
+{
+  "schema_version": "ppu-answer-test-config/v1",
+  "test_id": "kimi-k2.6-w4a8-int8-answer-144g",
+  "name": "Kimi-K2.6 W-INT4/A-INT8 Answer (ZW-M890P)",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "answer",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/k2.6/Kimi-K2.6-MoE-Quant-W-INT4-PerChannel-A-INT8-PerToken",
+    "checkpoint_name": "Kimi-K2.6-MoE-Quant-W-INT4-PerChannel-A-INT8-PerToken",
+    "served_model_name": "Kimi-K2.6-W4A8-INT8",
+    "accepted_model_types": ["kimi_k25"]
+  },
+  "server": {
+    "startup_timeout_seconds": 4200,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": null,
+      "prefill_attention_backend": "fa3",
+      "decode_attention_backend": "flashmla",
+      "mem_fraction_static": 0.8,
+      "quantization": null,
+      "reasoning_parser": "kimi_k2",
+      "dist_timeout": 6000,
+      "watchdog_timeout": 600,
+      "disable_piecewise_cuda_graph": true
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "request": {
+    "timeout_seconds": 300,
+    "generation": {
+      "temperature": 0,
+      "top_p": 1,
+      "max_tokens": 2048,
+      "separate_reasoning": true,
+      "chat_template_kwargs": {
+        "thinking": false
+      }
+    }
+  },
+  "evaluation": {
+    "dataset": "dataset/answer_cases_zh_v1.json",
+    "quality_profile": "dataset/quality_profile.json"
+  }
+}

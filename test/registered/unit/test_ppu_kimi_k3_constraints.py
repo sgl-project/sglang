@@ -316,3 +316,9 @@ def test_ppu_w4a16_deep_gemm_moe_accepts_k3_situ():
     scheme.runner.run.assert_called_once_with(
         sentinel.dispatch_output, sentinel.quant_info
     )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

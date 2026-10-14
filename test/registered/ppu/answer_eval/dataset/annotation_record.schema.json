@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/flytiger-eco/sglang-for-sail/ppu-answer-annotation-record.schema.json",
+  "title": "PPU Answer annotation record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample_id",
+    "case_id",
+    "case_revision",
+    "answer_sha256",
+    "quality_profile",
+    "selection_reasons",
+    "source_type",
+    "provenance",
+    "annotation"
+  ],
+  "properties": {
+    "schema_version": {"const": "ppu-answer-annotation/v1"},
+    "sample_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "case_id": {"type": "string", "minLength": 1},
+    "case_revision": {"type": "integer", "minimum": 1},
+    "answer_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "quality_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "candidate_answer": {"type": "string", "minLength": 1},
+    "candidate_answer_ref": {"type": "string", "minLength": 1},
+    "selection_reasons": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "source_type": {
+      "enum": ["github_nightly_output", "synthetic_mutation", "historical_output"]
+    },
+    "provenance": {"type": "object"},
+    "annotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviews", "adjudication", "partition"],
+      "properties": {
+        "status": {"enum": ["pending", "reviewed", "adjudicated"]},
+        "reviews": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/review"},
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "adjudication": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/review"}]
+        },
+        "partition": {"enum": [null, "calibration", "holdout"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "pending"}}},
+          "then": {
+            "properties": {
+              "reviews": {"maxItems": 0},
+              "adjudication": {"type": "null"},
+              "partition": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "reviewed"}}},
+          "then": {
+            "properties": {
+              "reviews": {"minItems": 2},
+              "adjudication": {"type": "null"},
+              "partition": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "adjudicated"}}},
+          "then": {
+            "properties": {
+              "reviews": {"minItems": 2},
+              "adjudication": {"$ref": "#/$defs/review"},
+              "partition": {"enum": ["calibration", "holdout"]}
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {"required": ["candidate_answer"]},
+    {"required": ["candidate_answer_ref"]}
+  ],
+  "$defs": {
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewer", "reviewed_at", "verdict", "scores", "critical_errors"],
+      "properties": {
+        "reviewer": {"type": "string", "minLength": 1},
+        "reviewed_at": {"type": "string", "format": "date-time"},
+        "verdict": {"enum": ["pass", "fail", "uncertain"]},
+        "scores": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["factual_correctness", "relevance", "completeness", "coherence", "no_repetition"],
+          "properties": {
+            "factual_correctness": {"type": "integer", "minimum": 0, "maximum": 3},
+            "relevance": {"type": "integer", "minimum": 0, "maximum": 3},
+            "completeness": {"type": "integer", "minimum": 0, "maximum": 3},
+            "coherence": {"type": "integer", "minimum": 0, "maximum": 3},
+            "no_repetition": {"type": "integer", "minimum": 0, "maximum": 3}
+          }
+        },
+        "critical_errors": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "garbled_text",
+              "degenerate_repetition",
+              "factual_error",
+              "instruction_not_followed"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "evidence": {"type": "string"}
+      }
+    }
+  }
+}

@@ -443,3 +443,7 @@ def test_w4a4_deepep_ll_uses_masked_k3_situ_mxfp4_post_quant():
     assert activation.call_args.args[1].shape == (2, 3, 32)
     assert activation.call_args.args[2].shape == (2, 1, 3)
     assert grouped_gemm.call_args_list[1].args[0][1].shape == (2, 3, 1)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

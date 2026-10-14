@@ -1,0 +1,318 @@
+name: PR Test (PPU)
+
+on:
+  # No pull_request trigger: the PR path is orchestrated by ci.yaml, and a
+  # direct pull_request trigger here would double-run alongside that chain.
+  # The run-ci label gate below still applies to the inherited pull_request
+  # event on the workflow_call path. Manual verification keeps using
+  # workflow_dispatch, which bypasses the PR-event gate.
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests"
+        required: false
+        type: boolean
+        default: false
+      require_run_ci_label:
+        description: >-
+          Whether the run-ci label gate applies when the caller's event
+          is pull_request. ci.yaml keeps the default enabled.
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    # PPU runner consumption is gated behind the `run-ci` label on the
+    # pull_request event. A called workflow inherits the caller's event,
+    # so the default-enabled gate also applies on the ci.yaml -> workflow_call
+    # path. Manual runs (workflow_dispatch) bypass the gate via the event check.
+    if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
+        || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            ppu_code:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "python/pyproject_other.toml"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "test/registered/**"
+              - "scripts/ci/ppu/**"
+
+  # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
+  # test_ppu_basic.py exercises offline engine initialization and decoding.
+  # This stage does not currently include an HTTP server smoke test.
+  #
+  # K8s form: the orchestration shell is CPU-only and holds no device; the
+  # flytiger-eco/ppu-distributed-action submits a worker pod onto a board that
+  # carries the requested label (OAM-810E), stages this checkout under
+  # /workspace/source, and runs the command there. The kernel is built from
+  # source and cached on /mnt/wl_nas by scripts/ci/ppu/ppu_build_kernel.sh
+  # (invoked from ppu_install_dependency.sh) -- no prebuilt wheel artifact.
+  stage-a-test-1-gpu-ppu:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 120
+    steps:
+      # Two checkout attempts: the fetch to github.com is the least reliable
+      # step in a K8s run and a lost one takes the entry down with it; a
+      # second attempt after a 90s wait roughly doubles what an entry survives.
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+
+      - name: Run PPU smoke test (stage-a) via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
+          command: |
+            ppu-smi
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            cd /workspace/source &&
+            bash scripts/ci/ppu/ppu_install_dependency.sh &&
+            git config --global --add safe.directory /workspace/source &&
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
+            cd test &&
+            python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
+          # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
+          # budget). A smoke gate must fail fast and retries would mask flakiness
+          # (ci-mechanism-gap-review §10.3 fact 1).
+          # PIP_INDEX_URL/PIP_TRUSTED_HOST: the sdk2.2.0 base image ships a pip
+          # index pointing at the Artifactory PyPI repo, which outranks
+          # ~/.pip/pip.conf and returns 401 for the CI credentials (run
+          # 37901303379). Env vars take precedence over every pip config file.
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_TEST_MAX_RETRY=0,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: 110
+
+  # ==================== Stage B: 1-GPU body ==================== #
+  # Serial after stage-a: stage-a is listed in needs directly so a stage-a
+  # failure fast-fails this stage via !failure(). On K8s the serial chain is
+  # expressed through `needs` alone -- no wait-for-jobs job is required, since
+  # each stage is its own GitHub job (not a matrix leg) and the dependency
+  # graph already serializes them and carries the verdict forward.
+  stage-b-test-1-gpu-ppu:
+    needs: [check-changes, stage-a-test-1-gpu-ppu]
+    # `always()` overrides skip-on-skipped-dependency so this job still
+    # evaluates when stage-a was skipped; !failure() fast-fails when stage-a
+    # went red. That fast-fail is the point of the serial chain.
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+
+      - name: Run PPU 1-GPU tests (stage-b) via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
+          command: |
+            ppu-smi
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            cd /workspace/source &&
+            bash scripts/ci/ppu/ppu_install_dependency.sh &&
+            git config --global --add safe.directory /workspace/source &&
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
+            cd test &&
+            python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: 110
+
+  # ==================== Stage C: 2-GPU ==================== #
+  # No tests are currently registered to stage-c; the suite runner reports
+  # the empty stage explicitly. This job does not yet provide 2-GPU coverage.
+  stage-c-test-2-gpu-ppu:
+    # Same serial deviation as stage-b: stage-b is in needs directly so
+    # !failure() fast-fails on every trigger.
+    needs: [check-changes, stage-b-test-1-gpu-ppu]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+
+      - name: Run PPU 2-GPU tests (stage-c) via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: "board-type=OAM-810E"
+          command: |
+            ppu-smi
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            export CUDA_VISIBLE_DEVICES=0,1 &&
+            cd /workspace/source &&
+            bash scripts/ci/ppu/ppu_install_dependency.sh &&
+            git config --global --add safe.directory /workspace/source &&
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
+            cd test &&
+            python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 110
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    needs:
+      [
+        check-changes,
+        stage-a-test-1-gpu-ppu,
+        stage-b-test-1-gpu-ppu,
+        stage-c-test-2-gpu-ppu,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "Job $job did not succeed (result: $result)."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"

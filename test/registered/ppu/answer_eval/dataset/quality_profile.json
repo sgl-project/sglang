@@ -1,0 +1,40 @@
+{
+  "schema_version": "ppu-answer-quality-profile/v1",
+  "profile_id": "answer-zh-v1",
+  "normalization": {
+    "unicode_form": "NFKC",
+    "collapse_whitespace": true
+  },
+  "unicode": {
+    "replacement_character": "\ufffd",
+    "abnormal_categories": ["Co", "Cn"],
+    "abnormal_min_count": 3,
+    "abnormal_ratio": 0.02
+  },
+  "repetition": {
+    "same_codepoint_run": 8,
+    "periodic_unit_min": 2,
+    "periodic_unit_max": 32,
+    "periodic_min_repeats": 4,
+    "periodic_min_span": 24,
+    "sentence_min_chars": 8,
+    "sentence_min_repeats": 3,
+    "ngram_size": 4,
+    "ngram_min_text_chars": 80,
+    "ngram_min_occurrences": 3,
+    "ngram_hard_fail_coverage": 0.65,
+    "ngram_suspect_coverage": 0.40,
+    "cross_case_exact_min_chars": 20,
+    "cross_case_near_min_chars": 50,
+    "cross_case_hard_fail_jaccard": 0.95,
+    "cross_case_suspect_jaccard": 0.85
+  },
+  "mojibake": {
+    "markers": ["\u00c3", "\u00c2", "\u00e2\u20ac", "\u00f0\u0178"],
+    "min_occurrences": 2
+  },
+  "selection": {
+    "normal_sample_percent": 10,
+    "seed": "ppu-answer-selection-v1"
+  }
+}

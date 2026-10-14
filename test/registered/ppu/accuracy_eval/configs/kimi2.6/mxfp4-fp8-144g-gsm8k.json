@@ -1,0 +1,58 @@
+{
+  "schema_version": "ppu-accuracy-test-config/v1",
+  "test_id": "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-144g",
+  "name": "Kimi-K2.6-MXFP4-FP8 accuracy on GSM8K (ZW-M890P, 8x144G)",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "accuracy",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/k2.6/Kimi-K2.6-MXFP4-FP8",
+    "checkpoint_name": "Kimi-K2.6-MXFP4-FP8",
+    "served_model_name": "Kimi-K2.6-MXFP4-FP8",
+    "accepted_model_types": ["kimi_k25"]
+  },
+  "server": {
+    "startup_timeout_seconds": 4200,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": null,
+      "prefill_attention_backend": "fa3",
+      "decode_attention_backend": "flashmla",
+      "cuda_graph_max_bs": 32,
+      "max_running_requests": 32,
+      "mem_fraction_static": 0.8,
+      "quantization": null,
+      "reasoning_parser": "kimi_k2",
+      "dist_timeout": 6000,
+      "watchdog_timeout": 600,
+      "disable_piecewise_cuda_graph": true
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "evaluation": {
+    "dataset": "gsm8k",
+    "dataset_dir": "/nas_aisw/datasets/evalscope/AI-ModelScope/gsm8k",
+    "eval_batch_size": 32,
+    "limit": null,
+    "primary_metric": "accuracy",
+    "baseline": 0.9765,
+    "min_ratio": 0.9707,
+    "generation": {
+      "max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "source_case": "btv1.5/llm_infer_sglang_evalscope/P0_daily/kimi-k2.6-mxfp4-fp8_3002.json",
+    "tc_name": "kimi-k2.6_0003"
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "schema_version": "ppu-pd-perf-test-config/v1",
+  "test_id": "qwen3.5-397b-a17b-fp8-channelwise-pd-perf-144g-1p1d-4k-1500",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/v3.5/Qwen3.5-397B-A17B-FP8-Channelwise",
+    "checkpoint_name": "Qwen3.5-397B-A17B-FP8-Channelwise",
+    "served_model_name": "Qwen3.5-397B-A17B-FP8-Channelwise",
+    "accepted_model_types": ["qwen3_5_moe"]
+  },
+  "disaggregation": {
+    "prefill_nodes": 1,
+    "decode_nodes": 1,
+    "transfer_backend": "mooncake",
+    "ib_devices": ["mlx5_bond_0", "mlx5_bond_1", "mlx5_bond_2", "mlx5_bond_3"],
+    "bootstrap_port": 8998,
+    "prefill_port": 21000,
+    "decode_port": 21001,
+    "router_port": 12345,
+    "peer_wait_timeout_seconds": 5400
+  },
+  "prefill": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": "fa3",
+      "page_size": 64,
+      "mem_fraction_static": 0.9,
+      "quantization": null,
+      "dist_timeout": 3600,
+      "watchdog_timeout": 3600,
+      "disable_shared_experts_fusion": true,
+      "disable_radix_cache": true,
+      "enable_cache_report": true,
+      "enable_metrics": true,
+      "speculative_algorithm": "NEXTN",
+      "speculative_num_steps": 2,
+      "speculative_eagle_topk": 1,
+      "speculative_num_draft_tokens": 3,
+      "speculative_draft_attention_backend": "triton",
+      "mamba_scheduler_strategy": "no_buffer"
+    },
+    "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
+      "MC_NUM_QP_PER_EP": 4,
+      "MC_TE_METRIC": 1,
+      "MC_LOG_LEVEL": "TRACE",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": 128,
+      "SAIL_SGL_DEEPEP_ICN": 1,
+      "SAIL_SGL_DEEPEP_RECV_HOOK": 0
+    }
+  },
+  "decode": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "dp_size": 8,
+      "moe_dense_tp_size": 1,
+      "attention_backend": "fa3",
+      "page_size": 64,
+      "cuda_graph_max_bs": 128,
+      "max_running_requests": 128,
+      "moe_a2a_backend": "deepep",
+      "deepep_mode": "low_latency",
+      "mem_fraction_static": 0.7,
+      "quantization": null,
+      "dist_timeout": 3600,
+      "watchdog_timeout": 3600,
+      "disable_shared_experts_fusion": true,
+      "disable_radix_cache": true,
+      "enable_dp_attention": true,
+      "enable_dp_lm_head": true,
+      "enable_cache_report": true,
+      "enable_metrics": true,
+      "speculative_algorithm": "NEXTN",
+      "speculative_num_steps": 2,
+      "speculative_eagle_topk": 1,
+      "speculative_num_draft_tokens": 3,
+      "speculative_draft_attention_backend": "triton",
+      "mamba_scheduler_strategy": "no_buffer"
+    },
+    "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
+      "MC_NUM_QP_PER_EP": 4,
+      "MC_TE_METRIC": 1,
+      "MC_LOG_LEVEL": "TRACE",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": 128,
+      "SAIL_SGL_DEEPEP_ICN": 1,
+      "SAIL_SGL_DEEPEP_RECV_HOOK": 0
+    }
+  },
+  "workload": {
+    "dataset": "random-ids",
+    "random_range_ratio": 1.0,
+    "warmup_requests": 1,
+    "warmup_passes": 1,
+    "seed": 0,
+    "measurements": [
+      {
+        "id": "pd-1p1d-4k-1500",
+        "input_len": 4096,
+        "output_len": 1500,
+        "num_prompts": 80,
+        "concurrency": 8,
+        "source_case": "qwen3_5-397b-a17b_fp8-channel_1p1d_4096_1500_0001.json",
+        "tc_name": "qwen3.5-397b-a17b_pd_notune_4096_1500_mtp"
+      }
+    ]
+  }
+}

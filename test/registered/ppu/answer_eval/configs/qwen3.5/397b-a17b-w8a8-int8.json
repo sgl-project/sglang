@@ -1,0 +1,59 @@
+{
+  "schema_version": "ppu-answer-test-config/v1",
+  "test_id": "qwen3.5-397b-a17b-w8a8-int8-answer-96g",
+  "name": "Qwen3.5-397B-A17B-W8A8-INT8 Answer",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "answer",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw810e",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 96
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-397B-A17B-W8A8-INT8",
+    "checkpoint_name": "Qwen3.5-397B-A17B-W8A8-INT8",
+    "served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8",
+    "accepted_model_types": ["qwen3_5_moe", "qwen3_5_moe_text"]
+  },
+  "server": {
+    "startup_timeout_seconds": 3600,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": "fa3",
+      "mem_fraction_static": 0.8,
+      "quantization": "w8a8_int8",
+      "reasoning_parser": "qwen3",
+      "dist_timeout": 6000,
+      "watchdog_timeout": 600
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "request": {
+    "timeout_seconds": 300,
+    "generation": {
+      "temperature": 0,
+      "top_p": 1,
+      "max_tokens": 2048,
+      "separate_reasoning": true,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    }
+  },
+  "evaluation": {
+    "dataset": "dataset/answer_cases_zh_v1.json",
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 9,
+      "known_failures": [
+        "deepseek-letter-count"
+      ],
+      "note": "Seeded from the ZW810E measured baseline (ptg-ppu-02, 16 x PPU-ZW810E 96GiB, 2026-09-01, eight devices, 9/10 at temperature 0; see README 'Measured baseline (ZW810E)'). deepseek-letter-count is a model-capability miss (fact_rule_failed, finish_reason=stop), not an infrastructure failure. This ZW810E line is retired from the active nightly and is NOT validated by the M890P probe; the -144g sibling carries the M890P coverage."
+    }
+  }
+}

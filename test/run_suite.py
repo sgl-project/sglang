@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -123,6 +124,14 @@ PER_COMMIT_SUITES = {
     HWBackend.MLX: [
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
+    ],
+    HWBackend.PPU: [
+        # pr-test-ppu.yml serializes these stages through job dependencies.
+        # Stage A is the smoke gate; B holds 1-GPU tests. Stage C is declared
+        # for 2-GPU tests but currently has no registered coverage.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
     ],
 }
 
@@ -229,6 +238,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.PPU,
 }
 
 

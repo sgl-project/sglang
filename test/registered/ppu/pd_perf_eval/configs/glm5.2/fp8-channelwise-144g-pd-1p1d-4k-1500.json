@@ -1,0 +1,150 @@
+{
+  "schema_version": "ppu-pd-perf-test-config/v1",
+  "test_id": "glm-5.2-fp8-channelwise-pd-perf-144g-1p1d-4k-1500",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/v5.2/GLM-5.2-FP8-Channelwise",
+    "checkpoint_name": "GLM-5.2-FP8-Channelwise",
+    "served_model_name": "GLM-5.2-FP8-Channelwise",
+    "accepted_model_types": [
+      "glm_moe_dsa"
+    ]
+  },
+  "disaggregation": {
+    "prefill_nodes": 1,
+    "decode_nodes": 1,
+    "transfer_backend": "mooncake",
+    "ib_devices": [
+      "mlx5_bond_0",
+      "mlx5_bond_1",
+      "mlx5_bond_2",
+      "mlx5_bond_3"
+    ],
+    "bootstrap_port": 8998,
+    "prefill_port": 21000,
+    "decode_port": 21001,
+    "router_port": 12345,
+    "peer_wait_timeout_seconds": 5400
+  },
+  "prefill": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "ep_size": 8,
+      "page_size": 64,
+      "moe_a2a_backend": "deepep",
+      "deepep_mode": "auto",
+      "attention_backend": "dsa",
+      "dsa_prefill_backend": "flashmla_sparse",
+      "dsa_decode_backend": "flashmla_kv",
+      "dsa_prefill_cp_mode": "round-robin-split",
+      "attn_cp_size": 8,
+      "chunked_prefill_size": 32768,
+      "mem_fraction_static": 0.85,
+      "quantization": null,
+      "reasoning_parser": "glm45",
+      "tool_call_parser": "glm47",
+      "dist_timeout": 60000,
+      "watchdog_timeout": 60000,
+      "disable_radix_cache": true,
+      "disable_cuda_graph": true,
+      "disable_piecewise_cuda_graph": true,
+      "disable_overlap_schedule": true,
+      "disable_custom_all_reduce": true,
+      "disable_shared_experts_fusion": true,
+      "enable_dsa_prefill_context_parallel": true,
+      "enable_cache_report": true,
+      "enable_request_time_stats_logging": true,
+      "enable_metrics": true
+    },
+    "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
+      "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": 1,
+      "SGLANG_SAIL_DEEPEP_RECV_HOOK": 0,
+      "DG_USE_MOE_DYNAMIC_TILE": 1,
+      "NCCL_DEBUG": "INFO",
+      "NCCL_DEBUG_SUBSYS": "INIT",
+      "MC_LOG_LEVEL": "TRACE",
+      "MC_NUM_QP_PER_EP": 4,
+      "MC_TE_METRIC": 1,
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "decode": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "dp_size": 8,
+      "page_size": 64,
+      "moe_a2a_backend": "deepep",
+      "deepep_mode": "auto",
+      "attention_backend": null,
+      "prefill_attention_backend": "fa3",
+      "decode_attention_backend": "flashmla",
+      "cuda_graph_max_bs": 32,
+      "chunked_prefill_size": 2048,
+      "max_running_requests": 1280,
+      "stream_interval": 64,
+      "mem_fraction_static": 0.8,
+      "quantization": null,
+      "reasoning_parser": "glm45",
+      "tool_call_parser": "glm47",
+      "dist_timeout": 60000,
+      "watchdog_timeout": 60000,
+      "disable_radix_cache": true,
+      "disable_piecewise_cuda_graph": true,
+      "disable_custom_all_reduce": true,
+      "disable_shared_experts_fusion": true,
+      "enable_dp_attention": true,
+      "enable_dp_lm_head": true,
+      "enable_cache_report": true,
+      "enable_metrics": true
+    },
+    "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
+      "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": 1,
+      "SGLANG_SAIL_DEEPEP_RECV_HOOK": 0,
+      "DG_USE_MOE_DYNAMIC_TILE": 1,
+      "NCCL_DEBUG": "INFO",
+      "NCCL_DEBUG_SUBSYS": "INIT",
+      "MC_LOG_LEVEL": "TRACE",
+      "MC_NUM_QP_PER_EP": 4,
+      "MC_TE_METRIC": 1,
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "workload": {
+    "dataset": "random-ids",
+    "random_range_ratio": 1.0,
+    "warmup_requests": 1,
+    "warmup_passes": 1,
+    "seed": 0,
+    "measurements": [
+      {
+        "id": "pd-1p1d-4k-1500",
+        "input_len": 4096,
+        "output_len": 1500,
+        "num_prompts": 80,
+        "concurrency": 8,
+        "source_case": "glm-5_2_fp8-channel_1p1d_4096_1500_0001.json",
+        "tc_name": "glm-5.2_pd_notune_4096_1500_mtp"
+      }
+    ]
+  }
+}

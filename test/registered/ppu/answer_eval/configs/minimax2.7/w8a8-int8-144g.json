@@ -1,0 +1,55 @@
+{
+  "schema_version": "ppu-answer-test-config/v1",
+  "test_id": "minimax-m2.7-w8a8-int8-answer-144g",
+  "name": "MiniMax-M2.7-W8A8-INT8 Answer (ZW-M890P)",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "answer",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T-HEAD/m2.7/MiniMax-M2.7-W8A8-INT8",
+    "checkpoint_name": "MiniMax-M2.7-W8A8-INT8",
+    "served_model_name": "MiniMax-M2.7-W8A8-INT8",
+    "accepted_model_types": ["minimax_m2"]
+  },
+  "server": {
+    "startup_timeout_seconds": 3600,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": "fa3",
+      "mem_fraction_static": 0.8,
+      "quantization": "w8a8_int8",
+      "reasoning_parser": "minimax",
+      "dist_timeout": 6000,
+      "watchdog_timeout": 600
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "request": {
+    "timeout_seconds": 900,
+    "generation": {
+      "temperature": 0,
+      "top_p": 1,
+      "max_tokens": 16384,
+      "separate_reasoning": true,
+      "chat_template_kwargs": {}
+    }
+  },
+  "evaluation": {
+    "dataset": "dataset/answer_cases_zh_v1.json",
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 10,
+      "known_failures": [],
+      "note": "Seeded from v0.5.13 Answer PR-stack run 34100574370 (ZW-M890P single board, 10/10 at temperature 0). No known model-capability misses; any miss on the M890P probe reddens as a regression."
+    }
+  }
+}

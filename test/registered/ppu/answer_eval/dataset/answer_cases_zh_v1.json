@@ -1,0 +1,167 @@
+{
+  "schema_version": "ppu-answer-cases/v1",
+  "dataset_id": "ppu-answer-zh-v1",
+  "revision": 2,
+  "license": "Apache-2.0",
+  "publication_approval": {
+    "status": "approved",
+    "date": "2026-09-01",
+    "scope": ["prompts", "reference_facts", "deterministic_rules"]
+  },
+  "request_suffix": "请直接回复最终的答案，答案中不要包含思考过程。",
+  "cases": [
+    {
+      "id": "deepseek-letter-count",
+      "kind": "objective",
+      "prompt": "deepseek这个单词中有几个e？",
+      "reference_facts": {"letter": "e", "count": 4},
+      "rules": [
+        {"type": "number", "target": 4, "tolerance": 0, "description": "答案包含数字 4"}
+      ]
+    },
+    {
+      "id": "spring-dawn-poem",
+      "kind": "objective",
+      "prompt": "春眠不觉晓，处处闻啼鸟 补充整首诗以及作者!",
+      "reference_facts": {
+        "author": "孟浩然",
+        "lines": ["春眠不觉晓", "处处闻啼鸟", "夜来风雨声", "花落知多少"]
+      },
+      "rules": [
+        {"type": "contains_all", "items": [["孟浩然"]], "description": "作者为孟浩然"},
+        {
+          "type": "ordered_items",
+          "items": [["春眠不觉晓"], ["处处闻啼鸟"], ["夜来风雨声"], ["花落知多少"]],
+          "exact_sequence": true,
+          "description": "四句《春晓》完整且顺序正确"
+        }
+      ]
+    },
+    {
+      "id": "mount-everest-height",
+      "kind": "objective",
+      "prompt": "世界上最高的山是什么山，以及它的高度",
+      "reference_facts": {"mountain": "珠穆朗玛峰", "height_m": 8848.86},
+      "rules": [
+        {"type": "contains_all", "items": [["珠穆朗玛峰", "珠峰", "Mount Everest", "Everest"]], "description": "最高峰为珠穆朗玛峰"},
+        {"type": "number", "target": 8848.86, "tolerance": 1.0, "description": "高度为 8848.86 米，允许 1 米测量口径差异"}
+      ]
+    },
+    {
+      "id": "henan-bordering-provinces",
+      "kind": "objective",
+      "prompt": "河南省与哪几个省份接壤",
+      "reference_facts": {"provinces": ["河北", "山西", "陕西", "湖北", "安徽", "山东"]},
+      "rules": [
+        {
+          "type": "exact_entity_set",
+          "items": {
+            "北京": ["北京", "北京市"],
+            "天津": ["天津", "天津市"],
+            "河北": ["河北", "河北省"],
+            "山西": ["山西", "山西省"],
+            "内蒙古": ["内蒙古", "内蒙古自治区"],
+            "辽宁": ["辽宁", "辽宁省"],
+            "吉林": ["吉林", "吉林省"],
+            "黑龙江": ["黑龙江", "黑龙江省"],
+            "上海": ["上海", "上海市"],
+            "江苏": ["江苏", "江苏省"],
+            "浙江": ["浙江", "浙江省"],
+            "陕西": ["陕西", "陕西省"],
+            "湖北": ["湖北", "湖北省"],
+            "安徽": ["安徽", "安徽省"],
+            "山东": ["山东", "山东省"],
+            "福建": ["福建", "福建省"],
+            "江西": ["江西", "江西省"],
+            "湖南": ["湖南", "湖南省"],
+            "广东": ["广东", "广东省"],
+            "广西": ["广西", "广西壮族自治区"],
+            "海南": ["海南", "海南省"],
+            "重庆": ["重庆", "重庆市"],
+            "四川": ["四川", "四川省"],
+            "贵州": ["贵州", "贵州省"],
+            "云南": ["云南", "云南省"],
+            "西藏": ["西藏", "西藏自治区"],
+            "甘肃": ["甘肃", "甘肃省"],
+            "青海": ["青海", "青海省"],
+            "宁夏": ["宁夏", "宁夏回族自治区"],
+            "新疆": ["新疆", "新疆维吾尔自治区"],
+            "台湾": ["台湾", "台湾省"],
+            "香港": ["香港", "香港特别行政区"],
+            "澳门": ["澳门", "澳门特别行政区"]
+          },
+          "forbidden_items": {
+            "河南自身": ["河南自身", "河南省自身", "本省自身"]
+          },
+          "expected": ["河北", "山西", "陕西", "湖北", "安徽", "山东"],
+          "description": "河南与河北、山西、陕西、湖北、安徽、山东六省接壤；答案含湖南等非接壤省或漏列任一省即为错答"
+        }
+      ]
+    },
+    {
+      "id": "baijiaxing-first-ten",
+      "kind": "objective",
+      "prompt": "请告诉我百家姓的前十个姓",
+      "reference_facts": {"ordered_surnames": ["赵", "钱", "孙", "李", "周", "吴", "郑", "王", "冯", "陈"]},
+      "rules": [
+        {
+          "type": "ordered_items",
+          "items": [["赵"], ["钱"], ["孙"], ["李"], ["周"], ["吴"], ["郑"], ["王"], ["冯"], ["陈"]],
+          "exact_sequence": true,
+          "strict_list_edges": true,
+          "description": "《百家姓》前十姓完整且顺序正确"
+        }
+      ]
+    },
+    {
+      "id": "art-primary-colors",
+      "kind": "objective",
+      "prompt": "请问美术中的三原色指的是哪三色？",
+      "reference_facts": {"colors": ["红", "黄", "蓝"]},
+      "rules": [
+        {"type": "contains_all", "items": [["红", "红色"], ["黄", "黄色"], ["蓝", "蓝色"]], "description": "美术颜料三原色为红、黄、蓝"}
+      ]
+    },
+    {
+      "id": "chinese-zodiac",
+      "kind": "objective",
+      "prompt": "请问十二生肖指的是什么？",
+      "reference_facts": {"animals": ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"]},
+      "rules": [
+        {"type": "contains_all", "items": [["鼠"], ["牛"], ["虎"], ["兔"], ["龙"], ["蛇"], ["马"], ["羊"], ["猴"], ["鸡"], ["狗"], ["猪"]], "description": "十二生肖完整"}
+      ]
+    },
+    {
+      "id": "red-ball-probability",
+      "kind": "objective",
+      "prompt": "箱子里共有3个红球，4个蓝球，从箱子里依次随机取出2个球，全是红球的概率为百分之多少？",
+      "reference_facts": {"probability": "1/7", "percent": 14.2857142857},
+      "rules": [
+        {"type": "probability", "target": 0.142857142857, "tolerance": 0.0006, "bare_number_units": ["percent", "probability"], "description": "无放回抽取两个红球的概率为 1/7，约 14.29%"}
+      ]
+    },
+    {
+      "id": "xian-three-day-trip",
+      "kind": "open_ended",
+      "prompt": "我想去西安旅游，大概三天左右，请帮我做一份50字左右的攻略，需要包括景点钟楼和大雁塔以及其他，不需要考虑食宿。",
+      "reference_facts": {"required_places": ["钟楼", "大雁塔"], "required_days": 3},
+      "rules": [
+        {"type": "contains_all", "items": [["钟楼", "钟鼓楼"], ["大雁塔"]], "description": "包含钟楼和大雁塔"},
+        {"type": "contains_any", "items": ["三天", "三日", "3天", "3日", "day3", "day 3"], "description": "形成三日行程"},
+        {"type": "length", "min_chars": 35, "max_chars": 100, "description": "约 50 字，MVP 容许 35 至 100 个非空白字符"}
+      ],
+      "judge_rubric": {"factual_correctness": 3, "relevance": 2, "completeness": 2, "coherence": 2, "no_repetition": 1}
+    },
+    {
+      "id": "tengwangge-reflection",
+      "kind": "open_ended",
+      "prompt": "请帮我写一份《滕王阁序》的观后感，300字左右。",
+      "reference_facts": {"work": "滕王阁序", "author": "王勃", "target_chars": 300},
+      "rules": [
+        {"type": "contains_all", "items": [["滕王阁序"], ["王勃"]], "description": "明确作品和作者"},
+        {"type": "length", "min_chars": 200, "max_chars": 450, "description": "约 300 字，MVP 容许 200 至 450 个非空白字符"}
+      ],
+      "judge_rubric": {"factual_correctness": 3, "relevance": 2, "completeness": 2, "coherence": 2, "no_repetition": 1}
+    }
+  ]
+}
