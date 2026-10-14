@@ -1869,10 +1869,6 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        # Inside the prefill CUDA graph the tail block is padded to a fixed capacity;
-        # the eager breaks (attention, low-ratio sources) clip their inputs to the
-        # batch's non-padded count, so point it at the real tail rows while the
-        # late layers run.
         saved = saved + (
             forward_batch.global_num_token_non_padded_cpu,
             forward_batch.global_num_token_non_padded,
