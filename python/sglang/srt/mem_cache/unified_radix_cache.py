@@ -1221,11 +1221,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        # Protect the whole inserted path. With disaggregated decode caching,
-        # SWA slots may exist only for the prompt's tail; EAGLE page alignment
-        # can leave less than a live window inside the inserted range. A fresh
-        # match may then stop short, letting the request free tree-owned slots.
-        # Read canonical indices from the final insert path instead.
+        # With PD decode radix caching, SWA matching can stop short of the inserted path.
+        # Repoint from that path to protect all tree-owned KV.
         new_last_node = result.last_device_node
         new_indices = self.tree_core.collect_full_device_indices(
             new_last_node, self.root_node_handle()

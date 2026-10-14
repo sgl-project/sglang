@@ -94,13 +94,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
-                )
-
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "

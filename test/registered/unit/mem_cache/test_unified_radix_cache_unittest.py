@@ -1934,7 +1934,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         # The window already slid past [0, 6): those SWA slots are freed.
         allocator.free_swa(kv_indices[:evicted_len])
-        req.kv.swa_evicted_seqlen = evicted_len
+        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
         cache.cache_unfinished_req(req)
 
@@ -1945,7 +1945,7 @@ class UnifiedRadixCacheSuite:
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(len(m.device_indices), 0)
 
-        cache.cache_finished_req(req, owned_kv_len=len(tokens))
+        finish_req(cache, req, len(tokens))
         req.kv.mark_kv_released()
         cache.sanity_check()
         # Everything the request held is now tree-owned exactly once.
