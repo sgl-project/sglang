@@ -1971,6 +1971,9 @@ class Envs:
     SGLANG_OPT_HIP_K3_PTPC_FP8 = EnvBool(False)
     SGLANG_OPT_HIP_K3_PTPC_FP8_MIN_TOKENS = EnvInt(1)
     SGLANG_OPT_HIP_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
+    # Also run the PTPC latent MoE up-projection for prefill chunks of at least
+    # this many tokens; 0 keeps it to the decode window.
+    SGLANG_OPT_HIP_K3_PTPC_FP8_PREFILL_MIN_TOKENS = EnvInt(0)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

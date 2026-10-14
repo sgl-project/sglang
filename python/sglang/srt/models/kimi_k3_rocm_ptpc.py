@@ -192,6 +192,21 @@ def init_mla_ptpc_state(self_attn: nn.Module) -> None:
         and self_attn.q_lora_rank is not None
         and takes_ptpc_tuple(self_attn.q_b_proj)
     )
+    self_attn._k3_gate_ptpc = (
+        window is not None
+        and self_attn.use_output_gate
+        and takes_ptpc_tuple(self_attn.o_proj)
+    )
+
+
+def fuse_mla_gate_ptpc(x: torch.Tensor, gate: torch.Tensor):
+    """x * sigmoid(gate) as (fp8, per-token scale), or the BF16 product when the
+    fused kernel does not cover the shape."""
+    from sglang.kernels.ops.attention import mla_output_gate_fp8_quant_hip
+
+    if mla_output_gate_fp8_quant_hip.covered(x, gate):
+        return mla_output_gate_fp8_quant_hip.kimi_k3_mla_output_gate_fp8_quant(x, gate)
+    return x * torch.sigmoid(gate)
 
 
 # ===== Attention input =====

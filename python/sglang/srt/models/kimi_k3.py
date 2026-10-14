@@ -2354,7 +2354,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     gate = self._compute_output_gate(gate_input)
                     from sglang.kernels.ops.attention import mla_output_gate
 
-                    if mla_output_gate.covered(x, gate):
+                    if _is_hip and self._k3_gate_ptpc:
+                        from sglang.srt.models.kimi_k3_rocm_ptpc import (
+                            fuse_mla_gate_ptpc,
+                        )
+
+                        # (fp8, per-token scale) straight into the PTPC o_proj.
+                        x = fuse_mla_gate_ptpc(x, gate)
+                    elif mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
                         # matches the unfused pair bit-for-bit.
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)

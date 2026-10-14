@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.gemm import ptpc_fp8_aiter_hip
 from sglang.kernels.ops.moe import latent_tail_aiter_hip, moe_preroute_aiter_hip
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -44,6 +45,13 @@ def init_moe_rocm_state(self) -> None:
     self._k3_latent_tail_max_tokens = (
         envs.SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS.get()
     )
+    from sglang.srt.models.kimi_k3_rocm_ptpc import ptpc_window
+
+    self._k3_ptpc = ptpc_window()
+    self._k3_ptpc_prefill_min_tokens = (
+        envs.SGLANG_OPT_HIP_K3_PTPC_FP8_PREFILL_MIN_TOKENS.get()
+    )
+    self._latent_up_ptpc = None
     self._partial_fused_front = False
     self._preroute_routed_weight: Optional[torch.Tensor] = None
     self._preroute_routed_scale: Optional[torch.Tensor] = None
@@ -103,6 +111,7 @@ def prepare_moe_rocm(self) -> None:
     )
     _prepare_preroute_fp8(self)
     _prepare_latent_tail_fp8(self)
+    _prepare_latent_up_ptpc(self)
     _keep_correction_bias_in_logit_dtype(self)
 
 
@@ -214,6 +223,35 @@ def _prepare_latent_tail_fp8(self) -> None:
         up_scale=self._latent_tail_scale,
         epsilon=epsilon,
         max_tokens=self._k3_latent_tail_max_tokens,
+    )
+
+
+def _prepare_latent_up_ptpc(self) -> None:
+    from sglang.srt.models.kimi_k3_rocm_ptpc import PtpcFp8Weight
+
+    if self._k3_ptpc is None or self.routed_expert_up_proj is None:
+        return
+    weight = self.routed_expert_up_proj.weight
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        return
+    packed, scale, out_features = ptpc_fp8_aiter_hip.pack(weight.contiguous())
+    self._latent_up_ptpc = PtpcFp8Weight(
+        weight=packed, scale=scale, out_features=out_features
+    )
+    ptpc_fp8_aiter_hip.warmup(
+        weight=packed,
+        scale=scale,
+        out_features=out_features,
+        in_features=weight.shape[1],
+        max_tokens=self._k3_ptpc.max_tokens,
+    )
+
+
+def _use_latent_up_ptpc(self, num_tokens: int) -> bool:
+    # The FP8 GEMM also wins again at prefill-chunk sizes.
+    return self._latent_up_ptpc is not None and (
+        self._k3_ptpc.covers(num_tokens)
+        or 0 < self._k3_ptpc_prefill_min_tokens <= num_tokens
     )
 
 
@@ -399,5 +437,12 @@ def forward_fused_rocm(
         out = _try_latent_tail(self, latent, shared_output, prefix_sum)
         if out is not None:
             return out
-    out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+    latent = self._latent_norm(latent)
+    if _use_latent_up_ptpc(self, num_tokens) and ptpc_fp8_aiter_hip.covered(latent):
+        packed = self._latent_up_ptpc
+        out = ptpc_fp8_aiter_hip.run(
+            latent, packed.weight, packed.scale, packed.out_features
+        )
+    else:
+        out, _ = self.routed_expert_up_proj(latent)
     return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
