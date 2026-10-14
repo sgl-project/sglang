@@ -242,7 +242,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
-        self._init_compilers(tokenizer_info)
+        self._tokenizer_info = tokenizer_info
+        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -252,25 +254,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def is_support_token_filter(self):
         return True
 
-    def _init_compilers(self, tokenizer_info: TokenizerInfo) -> None:
-        self._tokenizer_info = tokenizer_info
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+    @staticmethod
+    def _new_framing_compiler(tokenizer_info: TokenizerInfo) -> GrammarCompiler:
         # The cache mixes up token-level structural tags of different shapes, so
         # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
-        self._framing_compiler = GrammarCompiler(
-            tokenizer_info=tokenizer_info, cache_enabled=False
-        )
+        return GrammarCompiler(tokenizer_info=tokenizer_info, cache_enabled=False)
 
     def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
         info = self._tokenizer_info
         reserved = set(token_ids)
-        # A leading 0xFF is invalid UTF-8, so no text grammar can match these;
-        # token-level structural-tag elements still match them by id.
+        # A leading 0xFF is invalid UTF-8, so framed text cannot match these while
+        # token elements still match by id; string tool tags spell them, so only framing.
         vocab = [
             b"\xff" + piece if token_id in reserved else piece
             for token_id, piece in enumerate(info.decoded_vocab)
         ]
-        self._init_compilers(
+        self._framing_compiler = self._new_framing_compiler(
             TokenizerInfo(
                 vocab,
                 VocabType.RAW,

@@ -17,7 +17,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.inkling_detector import (
     InklingDetector as InklingToolDetector,
 )
@@ -600,6 +601,34 @@ class TestReasonerGrammarBackend(CustomTestCase):
                     _allowed_token_ids(mask, [ord("y"), ids[END_MESSAGE]]),
                     [ord("y")] if inkling else [ord("y"), ids[END_MESSAGE]],
                 )
+
+    def test_inkling_required_tool_tag_matches_native_markers(self):
+        """Required and named tool tags spell Inkling's markers as strings; the native
+        marker tokens must still match them while payload framing is enabled."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), tokenizer
+        )
+        tools = [Tool(type="function", function={"name": "f", "parameters": {}})]
+        request = ChatCompletionRequest(
+            model="inkling", messages=[], tools=tools, tool_choice="required"
+        )
+        params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=FunctionCallParser(
+                tools, "inkling"
+            ).get_structure_constraint("required"),
+        )
+        grammar = backend.dispatch_structural_tag(params["structural_tag"])
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        self._accept_allowed_tokens(
+            grammar,
+            [ids[MESSAGE_MODEL], *tokenizer.encode("f"), ids[CONTENT_INVOKE_TOOL_JSON]]
+            + tokenizer.encode('{"name":"f","args":{}}')
+            + [ids[END_MESSAGE]],
+            backend.vocab_size,
+        )
 
     def test_inkling_strict_budget_caps_thinking_and_cannot_reopen_it(self):
         """Strict thinking caps the thinking message; after its end a header may only
