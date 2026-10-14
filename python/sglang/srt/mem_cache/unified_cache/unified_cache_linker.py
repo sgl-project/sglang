@@ -162,7 +162,7 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools.
 
     Out-of-tree linkers are constructed per worker as
-    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    ``Linker(server_args, params, cache=..., extra_config=..., forward_stream=...)``.
     Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
     and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
     ``wait_until(layer)``. Report completion only after device copies finish.
@@ -248,10 +248,14 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def offload(
-        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+        self,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        session_id: Optional[str] = None,
     ) -> bool:
         """Queue every transfer for atomic persistence.
 
+        ``node_id`` identifies the radix node that owns the transfers.
         ``session_id`` names the session whose insert produced the transfers,
         when known; backends may attribute the stored objects to it.
         """
@@ -757,7 +761,9 @@ class UnifiedCacheLinkerWrapper:
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
             queued = self.cache_linker.offload(
-                transfers, session_id=getattr(cache, "insert_session_id", None)
+                node_id,
+                transfers,
+                session_id=getattr(cache, "insert_session_id", None),
             )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)

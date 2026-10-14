@@ -234,7 +234,7 @@ def create_unified_radix_cache(
             params,
             backend=get_memory().unified_cache_external_linker_backend,
             config=get_startup_linker_config(),
-            components=set(cache.components),
+            cache=cache,
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         cache.init_cache_linker(linker)
