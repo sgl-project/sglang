@@ -323,7 +323,7 @@ async fn run_session(
 
     loop {
         let message = tokio::select! {
-            result = subscriber.recv() => result?,
+            result = recv_batch(&mut subscriber) => result?,
             _ = tokio::signal::ctrl_c() => {
                 info!("received ctrl-c; shutting down bridge");
                 return Ok(());
@@ -352,6 +352,13 @@ async fn run_session(
         forward_raw_batch(config, &mut client, seq, &payload).await?;
     }
 }
+
+/// zeromq's fair queue re-polls a woken stream within the same poll, so a read that
+/// yields to tokio's spent coop budget spins forever on batches over ~1 MiB.
+async fn recv_batch(subscriber: &mut SubSocket) -> zeromq::ZmqResult<zeromq::ZmqMessage> {
+    tokio::task::unconstrained(subscriber.recv()).await
+}
+
 fn parse_zmq_frames(frames: &[bytes::Bytes]) -> Result<(u64, &[u8]), BridgeError> {
     match frames.len() {
         2 => Ok((decode_seq(&frames[0])?, frames[1].as_ref())),
@@ -1589,5 +1596,54 @@ mod tests {
         assert_eq!(component_bit("full"), Some(crate::service::COMPONENT_FULL));
         assert_eq!(component_bit("swa"), Some(COMPONENT_SWA));
         assert_eq!(component_bit("bogus"), None);
+    }
+
+    #[test]
+    fn large_batches_reach_a_block_on_receive_loop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use zeromq::{PubSocket, SocketSend, ZmqMessage};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (endpoint_tx, endpoint_rx) = mpsc::channel();
+        let publisher_stop = Arc::clone(&stop);
+        let publisher = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let mut socket = PubSocket::new();
+                let endpoint = socket.bind("tcp://127.0.0.1:0").await.unwrap();
+                endpoint_tx.send(endpoint.to_string()).unwrap();
+                let body = vec![7u8; 2 << 20];
+                while !publisher_stop.load(Ordering::Relaxed) {
+                    let mut message = ZmqMessage::from("kv");
+                    message.push_back(0u64.to_be_bytes().to_vec().into());
+                    message.push_back(body.clone().into());
+                    socket.send(message).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        });
+        let endpoint = endpoint_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let mut subscriber = SubSocket::new();
+                subscriber.subscribe("kv").await.unwrap();
+                subscriber.connect(&endpoint).await.unwrap();
+                // Let batches queue up, as behind a slow apply.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let message = recv_batch(&mut subscriber).await.unwrap();
+                done_tx.send(message.into_vec()[2].len()).unwrap();
+            });
+        });
+        let received = done_rx.recv_timeout(Duration::from_secs(60));
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            received,
+            Ok(2 << 20),
+            "a 2 MiB batch must reach the receive loop"
+        );
+        publisher.join().unwrap();
     }
 }
