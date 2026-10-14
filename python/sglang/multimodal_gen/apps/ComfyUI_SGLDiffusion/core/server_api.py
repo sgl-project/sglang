@@ -3,6 +3,7 @@ SGLang Diffusion Server API client.
 Provides a low-level interface for interacting with SGLang Diffusion HTTP server.
 """
 
+import contextlib
 import os
 import time
 from typing import Any, Callable, Dict, Optional
@@ -229,6 +230,7 @@ class SGLDiffusionServerAPI:
         enable_teacache: bool = False,
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
+        video_path: Optional[str] = None,
         output_path: Optional[str] = None,
         extra_fields: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
@@ -256,6 +258,8 @@ class SGLDiffusionServerAPI:
             enable_teacache: Enable TEA cache acceleration
             generator_device: Device for random generator ("cuda" or "cpu")
             input_reference: Path to input reference image for image-to-video
+            video_path: Source clip for video-to-video. A local file is
+                uploaded; a URL or server-side path is sent as is
             extra_fields: Model-specific request fields merged into the payload
                 last, so a caller can reach a model's own request surface
                 (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
@@ -307,28 +311,37 @@ class SGLDiffusionServerAPI:
         if extra_fields:
             fields.update(extra_fields)
 
-        local_reference = (
-            input_reference
-            and not input_reference.startswith(("http://", "https://"))
-            and os.path.exists(input_reference)
-        )
+        # Upload local files instead of sending their paths: a server on
+        # another machine cannot read this machine's filesystem (the images
+        # endpoint already does this for image_path). The server takes an
+        # uploaded source clip as `video_reference`.
+        string_fields: Dict[str, Any] = {}
+        uploads: Dict[str, str] = {}
+        for form_key, json_key, path in (
+            ("input_reference", "input_reference", input_reference),
+            ("video_reference", "video_path", video_path),
+        ):
+            if not path:
+                continue
+            if self._is_local_file(path):
+                uploads[form_key] = path
+            else:
+                string_fields[json_key] = path
 
         try:
-            if local_reference:
-                # Upload the file instead of sending a path: a server on
-                # another machine cannot read this machine's filesystem
-                # (the images endpoint already does this for image_path).
-                with open(input_reference, "rb") as fh:
+            if uploads:
+                data = {
+                    key: (value if isinstance(value, (str, bytes)) else str(value))
+                    for key, value in {**fields, **string_fields}.items()
+                }
+                with contextlib.ExitStack() as stack:
                     files = {
-                        "input_reference": (
-                            os.path.basename(input_reference),
-                            fh,
-                            self._get_content_type(input_reference),
+                        form_key: (
+                            os.path.basename(path),
+                            stack.enter_context(open(path, "rb")),
+                            self._get_content_type(path),
                         )
-                    }
-                    data = {
-                        key: (value if isinstance(value, (str, bytes)) else str(value))
-                        for key, value in fields.items()
+                        for form_key, path in uploads.items()
                     }
                     response = requests.post(
                         f"{self.base_url}/videos",
@@ -338,12 +351,9 @@ class SGLDiffusionServerAPI:
                         timeout=30,
                     )
             else:
-                payload = dict(fields)
-                if input_reference:
-                    payload["input_reference"] = input_reference
                 response = requests.post(
                     f"{self.base_url}/videos",
-                    json=payload,
+                    json={**fields, **string_fields},
                     headers=self.headers,
                     timeout=30,
                 )
@@ -495,6 +505,12 @@ class SGLDiffusionServerAPI:
 
         return params
 
+    @staticmethod
+    def _is_local_file(path: str) -> bool:
+        return not path.startswith(("http://", "https://", "data:")) and os.path.isfile(
+            path
+        )
+
     def _get_content_type(self, file_path: str) -> str:
         """Get content type based on file extension."""
         ext = os.path.splitext(file_path)[1].lower()
@@ -503,6 +519,10 @@ class SGLDiffusionServerAPI:
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
+            ".mkv": "video/x-matroska",
         }
         return content_types.get(ext, "image/png")
 

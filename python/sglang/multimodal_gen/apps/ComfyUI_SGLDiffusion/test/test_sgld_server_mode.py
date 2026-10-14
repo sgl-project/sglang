@@ -354,6 +354,59 @@ def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
     assert seen["json"] is None
 
 
+def _capture_video_request(client, **kwargs):
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        seen["files"] = files and {
+            key: (name, fh.read(), content_type)
+            for key, (name, fh, content_type) in files.items()
+        }
+        seen["data"] = data
+        seen["json"] = json
+        return _Response({"id": "job-1"})
+
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+
+    def fake_get(url, headers=None, timeout=None, **kw):
+        return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
+
+    with (
+        mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+        mock.patch(f"{PKG}.core.server_api.requests.get", side_effect=fake_get),
+    ):
+        client.generate_video(prompt="a cat", **kwargs)
+    return seen
+
+
+def test_generate_video_uploads_local_source_video_as_video_reference():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    with tempfile.TemporaryDirectory() as tmp:
+        clip = os.path.join(tmp, "clip.mp4")
+        image = os.path.join(tmp, "ref.png")
+        for path, body in ((clip, b"fake-mp4"), (image, b"fake-png")):
+            with open(path, "wb") as fh:
+                fh.write(body)
+
+        seen = _capture_video_request(client, video_path=clip, input_reference=image)
+
+    # Both local files go up as multipart; neither path string is sent.
+    assert seen["json"] is None
+    assert seen["files"]["video_reference"] == ("clip.mp4", b"fake-mp4", "video/mp4")
+    assert seen["files"]["input_reference"][1] == b"fake-png"
+    assert "video_path" not in seen["data"]
+    assert "input_reference" not in seen["data"]
+
+
+def test_generate_video_sends_remote_source_video_as_video_path():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    for source in ("https://example.com/clip.mp4", "/srv/sglang/inputs/clip.mp4"):
+        seen = _capture_video_request(client, video_path=source)
+        # A URL or a path that only exists on the server stays a string.
+        assert seen["files"] is None
+        assert seen["json"]["video_path"] == source
+
+
 def test_generate_video_downloads_result_when_server_path_is_not_local():
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
 
