@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark import quark as quark_config_mod
@@ -477,7 +478,7 @@ class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
 
     def test_apply_forwards_clamp_separated_layout_and_padding(self):
         scheme = object.__new__(QuarkW4A4MXFp4MoE)
-        scheme.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)
+        scheme.moe_runner_config = MoeRunnerConfig(swiglu_limit=10.0)
         scheme.runner = _Runner()
 
         layer = SimpleNamespace(
@@ -1047,6 +1048,82 @@ class TestSharedExpertOnlineMxfp4Quantize(CustomTestCase):
                 self._scheme().quantize_shared_expert(
                     torch.zeros(4, 64, dtype=torch.bfloat16), torch.device("cpu")
                 )
+
+
+class TestSharedExpertOnlineMxfp4CreateWeightsGuards(CustomTestCase):
+    """The startup geometry checks create_weights applies to the fused slot."""
+
+    BLOCK = quark_moe.OCP_MX_BLOCK_SIZE
+
+    @staticmethod
+    def _scheme() -> QuarkW4A4MXFp4MoE:
+        scheme = object.__new__(QuarkW4A4MXFp4MoE)
+        scheme.dequantization_config = None
+        scheme.quantize_shared_expert_online = True
+        return scheme
+
+    @staticmethod
+    def _layer(has_fused_shared: bool = True) -> SimpleNamespace:
+        return SimpleNamespace(
+            _has_fused_shared=has_fused_shared,
+            use_presharded_weights=True,
+            moe_tp_size=1,
+        )
+
+    def _create_weights(self, scheme, layer, hidden_size, intermediate_size):
+        scheme.create_weights(
+            layer=layer,
+            num_experts=4,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            params_dtype=torch.bfloat16,
+        )
+
+    def test_a_hidden_size_off_the_block_boundary_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "hidden"):
+            self._create_weights(
+                self._scheme(),
+                self._layer(),
+                hidden_size=self.BLOCK + 1,
+                intermediate_size=self.BLOCK,
+            )
+
+    def test_an_intermediate_size_off_the_block_boundary_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "intermediate size per partition"):
+            self._create_weights(
+                self._scheme(),
+                self._layer(),
+                hidden_size=self.BLOCK,
+                intermediate_size=self.BLOCK + 1,
+            )
+
+    def test_an_aligned_geometry_clears_both_guards(self):
+        with self.assertRaises(Exception) as past_the_guards:
+            self._create_weights(
+                self._scheme(),
+                self._layer(),
+                hidden_size=self.BLOCK * 2,
+                intermediate_size=self.BLOCK * 2,
+            )
+        self.assertNotIn("MX block size", str(past_the_guards.exception))
+
+    def test_the_guards_are_scoped_to_an_online_fused_layer(self):
+        cases = {
+            "no_fused_slot": (self._scheme(), self._layer(has_fused_shared=False)),
+            "conversion_off": (self._scheme(), self._layer()),
+        }
+        cases["conversion_off"][0].quantize_shared_expert_online = False
+
+        for case, (scheme, layer) in cases.items():
+            with self.subTest(case=case):
+                with self.assertRaises(Exception) as past_the_guards:
+                    self._create_weights(
+                        scheme,
+                        layer,
+                        hidden_size=self.BLOCK + 1,
+                        intermediate_size=self.BLOCK + 1,
+                    )
+                self.assertNotIn("MX block size", str(past_the_guards.exception))
 
 
 if __name__ == "__main__":
