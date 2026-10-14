@@ -175,6 +175,17 @@ class TestChatSamplingValidation(CustomTestCase):
                 response = self._post(logit_bias=value)
                 self.assertEqual(response.status_code, 200)
 
+    def test_negative_output_limits_return_400(self):
+        """A preferred completion limit previously hid a negative legacy limit."""
+        for params, field in (
+            ({"max_tokens": -1}, "max_tokens"),
+            ({"max_completion_tokens": -1}, "max_completion_tokens"),
+            ({"max_tokens": -1, "max_completion_tokens": 1}, "max_tokens"),
+        ):
+            with self.subTest(params=params):
+                response = self._post(**params)
+                self._assert_validation_error(response, field)
+
 
 if __name__ == "__main__":
     unittest.main()

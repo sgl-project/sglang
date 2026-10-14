@@ -583,6 +583,26 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
+    def test_output_limit_precedence_preserves_zero_during_validation(self):
+        """A zero completion limit must not fall back during context validation."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_model",
+            return_value=Mock(context_length=4),
+        ):
+            zero_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=0,
+                max_tokens=5,
+            )
+            self.assertIsNone(self.chat._validate_request(zero_limit))
+
+            excessive_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=5,
+                max_tokens=0,
+            )
+            self.assertIn("too large", self.chat._validate_request(excessive_limit))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (

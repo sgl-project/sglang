@@ -882,11 +882,13 @@ class ChatCompletionRequest(PDRoutingFields):
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
     max_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
     )
     max_completion_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
@@ -1126,6 +1128,15 @@ class ChatCompletionRequest(PDRoutingFields):
 
         return values
 
+    @property
+    def effective_max_tokens(self) -> Optional[int]:
+        """Prefer max_completion_tokens when set, including an explicit zero."""
+        return (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -1155,7 +1166,7 @@ class ChatCompletionRequest(PDRoutingFields):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
+            "max_new_tokens": self.effective_max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,

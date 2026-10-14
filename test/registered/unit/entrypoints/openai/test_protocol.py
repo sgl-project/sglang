@@ -32,7 +32,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     UsageInfo,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -60,7 +62,7 @@ class TestCompletionRequest(unittest.TestCase):
             CompletionRequest(model="test-model")  # missing prompt
 
 
-class TestChatCompletionRequest(unittest.TestCase):
+class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
@@ -492,6 +494,25 @@ class TestChatCompletionRequest(unittest.TestCase):
             renderer_handles_response_format=True,
         )
         self.assertNotIn("json_schema", sampling_params)
+
+    def test_zero_output_limits_preserve_precedence(self):
+        """An explicit zero completion limit must survive request conversion."""
+        for params, expected in (
+            ({}, None),
+            ({"max_tokens": None, "max_completion_tokens": None}, None),
+            ({"max_tokens": 0}, 0),
+            ({"max_completion_tokens": 0}, 0),
+            ({"max_tokens": 5, "max_completion_tokens": 0}, 0),
+            ({"max_tokens": 0, "max_completion_tokens": 5}, 5),
+            ({"max_tokens": 5, "max_completion_tokens": None}, 5),
+        ):
+            with self.subTest(params=params):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}], **params
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                sampling_params.verify(vocab_size=32)
+                self.assertEqual(sampling_params.max_new_tokens, expected)
 
 
 class TestAudioContentParts(unittest.TestCase):
