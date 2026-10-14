@@ -1367,6 +1367,8 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
