@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
+    from sglang.srt.managers.scheduler_components.step_counters import StepCounters
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -44,9 +45,7 @@ class SchedulerLoadInquirer:
     metrics_sink: MetricsSink
     get_request_lists: Callable
     get_disagg_decode_prealloc_queue: Callable
-    get_total_prefill_uncached_tokens: Callable
-    get_total_prefill_busy_us: Callable
-    get_decode_moment_totals: Callable
+    step_counters: StepCounters
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
@@ -187,7 +186,7 @@ class SchedulerLoadInquirer:
             prealloc_ready=decode_prealloc_ready,
         )
 
-        totals = self.get_decode_moment_totals()
+        totals = self.step_counters.decode_moment_totals
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
@@ -213,7 +212,7 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
-            total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
-            total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_prefill_uncached_tokens=self.step_counters.total_prefill_uncached_tokens,
+            total_prefill_busy_us=self.step_counters.total_prefill_busy_us,
             decode_moments=decode_moments,
         )

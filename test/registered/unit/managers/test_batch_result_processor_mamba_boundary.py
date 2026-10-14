@@ -158,7 +158,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.run_batch = MagicMock(return_value=result)
         scheduler._apply_war_barrier = MagicMock()
-        scheduler._record_step_counters = MagicMock()
+        scheduler.step_counters = MagicMock()
         scheduler.is_generation = False
 
         pool = SimpleNamespace(

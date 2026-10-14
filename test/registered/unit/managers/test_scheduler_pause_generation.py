@@ -468,7 +468,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             event_log.append("drain")
 
         scheduler.process_batch_result = MagicMock(side_effect=process_result)
-        scheduler._record_step_counters = MagicMock()
+        scheduler.step_counters = MagicMock()
         scheduler._add_request_to_queue = MagicMock(
             side_effect=lambda req: event_log.append(
                 "requeue-released" if req.is_retracted else "requeue-unreleased"
@@ -527,7 +527,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 result = SimpleNamespace(delay_sample_func=None)
                 self._push_pending(scheduler, batch, result)
                 scheduler.process_batch_result = MagicMock()
-                scheduler._record_step_counters = MagicMock()
+                scheduler.step_counters = MagicMock()
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 

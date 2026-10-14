@@ -285,7 +285,7 @@ class _Scheduler:
         self.load_publisher = Mock(spec=["publish_load_stat"])
         self.load_inquirer = SimpleNamespace(get_loads=Mock())
         self.enable_fpm = False
-        self._record_step_counters = Mock()
+        self.step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
         self.output_streamer = Mock(spec=["maybe_reply_health_check"])
         self.send_kv_chunk = Mock()
@@ -950,7 +950,7 @@ class TestPrefillResultPolling(CustomTestCase):
         self.assertEqual(scheduler.result_processes, {1: 1, 2: 1, 3: 1})
         self.assertEqual(scheduler.load_publisher.publish_load_stat.call_count, 3)
         self.assertEqual(scheduler.tree_cache.flush_pending_backups.call_count, 3)
-        self.assertEqual(scheduler._record_step_counters.call_count, 3)
+        self.assertEqual(scheduler.step_counters.record.call_count, 3)
         for iteration in range(1, 8):
             self.assertIn((iteration, "receive", None), scheduler.actions)
             self.assertNotIn((iteration, "idle", None), scheduler.actions)

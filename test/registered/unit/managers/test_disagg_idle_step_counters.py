@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
     PendingSteps,
 )
+from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -227,8 +228,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         self.record_result(scheduler, batch, 0.5)
         # One charge for the whole burst: first chunk's launch to the result.
-        self.assertEqual(scheduler.total_prefill_busy_us, total_us([0.5 - 0.0]))
-        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+        self.assertEqual(
+            scheduler.step_counters.total_prefill_busy_us, total_us([0.5 - 0.0])
+        )
+        self.assertEqual(scheduler.step_counters.total_prefill_uncached_tokens, 1024)
 
     def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
         # An overlapped launch can precede the previous prefill's result; the
@@ -244,10 +247,14 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         # 0.6 -> 1.0 already belongs to the first prefill, so the second one is
         # charged from that result rather than from its own launch.
-        self.assertEqual(scheduler.total_prefill_busy_us, total_us([1.0, 0.5]))
-        self.assertEqual(scheduler.total_prefill_uncached_tokens, 2 * 1024)
+        self.assertEqual(
+            scheduler.step_counters.total_prefill_busy_us, total_us([1.0, 0.5])
+        )
+        self.assertEqual(
+            scheduler.step_counters.total_prefill_uncached_tokens, 2 * 1024
+        )
         # The decode broke contiguity, so it contributes no timing sample.
-        self.assertEqual(scheduler.decode_moment_totals[0], 0)
+        self.assertEqual(scheduler.step_counters.decode_moment_totals[0], 0)
 
     def make_batch(self, mode, forward_iter, *, extend_num_tokens=1024):
         return ScheduleBatch(
@@ -306,16 +313,18 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result, slot):
             clock[0] = RESULT_TIMESTAMPS[batch.forward_iter - 1]
 
+        step_counters = scheduler.step_counters
+
         def record_step_counters(record):
             observed_idle_flags.append(record.after_idle_gap)
             observed_iters.append(record.step.forward_iter)
-            Scheduler._record_step_counters(scheduler, record)
+            step_counters.record(record)
 
         scheduler.get_next_disagg_prefill_batch_to_run = schedule
         scheduler.get_next_disagg_decode_batch_to_run = schedule
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
-        scheduler._record_step_counters = record_step_counters
+        scheduler.step_counters = SimpleNamespace(record=record_step_counters)
         scheduler.init_mode_stages()
         with (
             get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
@@ -343,11 +352,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 RESULT_TIMESTAMPS[3] - RESULT_TIMESTAMPS[2],
             ]
             self.assertEqual(
-                scheduler.total_prefill_busy_us, total_us(expected_intervals)
+                step_counters.total_prefill_busy_us, total_us(expected_intervals)
             )
             # Every prefill contributes its tokens; only the span is gap-aware.
             self.assertEqual(
-                scheduler.total_prefill_uncached_tokens,
+                step_counters.total_prefill_uncached_tokens,
                 len(LAUNCH_TIMESTAMPS) * 1024,
             )
         else:
@@ -358,9 +367,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             ]
             if not after_idle:
                 expected_intervals.append(LAUNCH_TIMESTAMPS[2] - LAUNCH_TIMESTAMPS[1])
-            self.assertEqual(scheduler.decode_moment_totals[0], len(expected_intervals))
             self.assertEqual(
-                scheduler.decode_moment_totals[2], total_us(expected_intervals)
+                step_counters.decode_moment_totals[0], len(expected_intervals)
+            )
+            self.assertEqual(
+                step_counters.decode_moment_totals[2], total_us(expected_intervals)
             )
 
     def launch_batch(self, scheduler, batch, launch_ts, *, pp_proxy_tensors=None):
@@ -376,7 +387,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         with patch(
             "sglang.srt.managers.scheduler.time.monotonic", return_value=result_ts
         ):
-            scheduler._record_step_counters(record)
+            scheduler.step_counters.record(record)
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
@@ -390,8 +401,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.flags._engine_paused = False
         scheduler._deferred_input_requests = []
         scheduler._sched_idled = False
-        scheduler._prev_step = None
-        scheduler._prev_prefill_end_ts = None
+        scheduler.step_counters = StepCounters()
         scheduler.counters.forward_ct = 0
         scheduler.counters.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -408,9 +418,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
-        scheduler.total_prefill_busy_us = 0
-        scheduler.total_prefill_uncached_tokens = 0
-        scheduler.decode_moment_totals = [0.0] * 6
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
         scheduler.recv_skipper = None

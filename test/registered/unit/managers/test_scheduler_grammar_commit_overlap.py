@@ -108,7 +108,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
         s.batch_result_processor = processor
         s.get_next_batch_to_run = MagicMock(side_effect=steps)
         s._apply_war_barrier = MagicMock()
-        s._record_step_counters = MagicMock()
+        s.step_counters = MagicMock()
 
         def run_batch(step):
             events.append(("launch", step.forward_iter))

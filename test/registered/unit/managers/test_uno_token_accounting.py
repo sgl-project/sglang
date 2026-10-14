@@ -5,12 +5,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
+from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,9 +56,8 @@ class TestUnoTokenAccounting(CustomTestCase):
         self.assertEqual(reporter.spec_num_forward_ct, 2)
 
     def test_decode_moment_receives_full_generated_token_count(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler._prev_step = (1, 10.0, False)
-        scheduler.decode_moment_totals = [0.0] * 6
+        step_counters = StepCounters()
+        step_counters._prev_step = (1, 10.0, False)
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(
                 is_extend_without_speculative=lambda: False,
@@ -69,7 +68,7 @@ class TestUnoTokenAccounting(CustomTestCase):
             forward_iter=2,
         )
 
-        scheduler._record_step_counters(
+        step_counters.record(
             PendingStep(
                 step=batch,
                 result=self.result,
@@ -79,7 +78,7 @@ class TestUnoTokenAccounting(CustomTestCase):
             )
         )
 
-        self.assertEqual(scheduler.decode_moment_totals[5], 7)
+        self.assertEqual(step_counters.decode_moment_totals[5], 7)
 
 
 if __name__ == "__main__":

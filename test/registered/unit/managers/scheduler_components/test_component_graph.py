@@ -311,6 +311,7 @@ _PARAM = {
     "ModeOwners": ("mode_owners",),
     "RequestEnqueuer": ("request_enqueuer",),
     "StepBuilder": ("step_builder",),
+    "StepCounters": ("step_counters",),
 }
 
 # Components in their final form: node -> (module under srt/, class).
@@ -352,6 +353,7 @@ _BUILT = {
         "RequestRetirer",
     ),
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
+    "StepCounters": ("managers/scheduler_components/step_counters.py", "StepCounters"),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
     "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
     "ModeOwners": ("managers/scheduler_components/mode_owners.py", "ModeOwners"),
@@ -457,24 +459,6 @@ _CALLBACK_SITES = {
         "init_load_inquirer",
         "SchedulerLoadInquirer",
         "get_disagg_decode_prealloc_queue",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_load_inquirer",
-        "SchedulerLoadInquirer",
-        "get_total_prefill_uncached_tokens",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_load_inquirer",
-        "SchedulerLoadInquirer",
-        "get_total_prefill_busy_us",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_load_inquirer",
-        "SchedulerLoadInquirer",
-        "get_decode_moment_totals",
         _LAMBDA,
     ): 1,
     ("init_load_inquirer", "SchedulerLoadInquirer", "get_request_lists", _BOUND): 1,

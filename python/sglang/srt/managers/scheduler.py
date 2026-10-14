@@ -317,6 +317,7 @@ from sglang.srt.managers.scheduler_components.request_retirer import (
     make_abort_req,
 )
 from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
+from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -426,8 +427,6 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
-STEP_MAX_US = 2_000_000
-
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
@@ -442,25 +441,6 @@ class _MultimodalInputBroadcast:
 
 class _MultimodalInputProcessingError(RuntimeError):
     pass
-
-
-def _accumulate_decode_moment(
-    totals: list[float],
-    batch_size: int,
-    step_us: int,
-    generated: int,
-) -> None:
-    if batch_size <= 0 or step_us <= 0:
-        return
-    b = float(batch_size)
-    t = float(step_us)
-    g = float(generated)
-    totals[0] += 1.0
-    totals[1] += b
-    totals[2] += t
-    totals[3] += b * b
-    totals[4] += b * t
-    totals[5] += g
 
 
 _is_npu = is_npu()
@@ -703,6 +683,7 @@ class Scheduler:
 
         self.init_load_publisher()
 
+        self.init_step_counters()
         self.init_load_inquirer()
 
         self.init_output_streamer()
@@ -2309,7 +2290,7 @@ class Scheduler:
     def commit_step(self, record: PendingStep) -> None:
         """The host commit of one launched step, popped from pending."""
         self.process_batch_result(record.step, record.result, record.slot)
-        self._record_step_counters(record)
+        self.step_counters.record(record)
 
     def leave_finished_reqs(self, slot: ScheduleSlot) -> None:
         """Drop the requests a commit finished from decoding (PD decode holds
@@ -2760,12 +2741,10 @@ class Scheduler:
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
 
+    def init_step_counters(self) -> None:
+        self.step_counters = StepCounters()
+
     def init_load_inquirer(self) -> None:
-        self.total_prefill_uncached_tokens = 0
-        self.total_prefill_busy_us = 0
-        self.decode_moment_totals: list[float] = [0.0] * 6
-        self._prev_step: Optional[Tuple[int, float, bool]] = None
-        self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             # The worker reports logical DCP capacity; add KV shard widening.
@@ -2779,11 +2758,7 @@ class Scheduler:
             metrics_sink=self.metrics_sink,
             get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode.prealloc_queue,
-            get_total_prefill_uncached_tokens=lambda: (
-                self.total_prefill_uncached_tokens
-            ),
-            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
-            get_decode_moment_totals=lambda: self.decode_moment_totals,
+            step_counters=self.step_counters,
         )
 
     def init_output_streamer(self) -> None:
@@ -4929,55 +4904,6 @@ class Scheduler:
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_process_result(batch)
-
-    def _record_step_counters(self, record: PendingStep) -> None:
-        batch = record.step
-        mode = batch.forward_mode
-        is_prefill = mode.is_extend_without_speculative()
-        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
-            return
-        if all(is_health_check_generate_req(req) for req in batch.reqs):
-            return
-        start_iter, start_ts = batch.forward_iter, record.launch_ts
-        prev = self._prev_step
-        self._prev_step = (batch.forward_iter, record.launch_ts, is_prefill)
-        # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
-        contiguous = False
-        if prev is not None:
-            prev_iter, prev_launch_ts, prev_is_prefill = prev
-            contiguous = (
-                not record.after_idle_gap
-                and prev_iter + 1 == start_iter
-                and prev_is_prefill == is_prefill
-            )
-        if is_prefill:
-            # Completion boundaries include the burst tail and scheduling overhead
-            # without double-counting overlapping launch-to-result spans.
-            end_ts = time.monotonic()
-            prev_end_ts = self._prev_prefill_end_ts
-            self._prev_prefill_end_ts = end_ts
-            if prev_end_ts is not None:
-                # A new burst or mode can still overlap an earlier prefill.
-                start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
-            step_us = int((end_ts - start_ts) * 1e6)
-        else:
-            # Decode regression uses launch cadence and skips boundaries.
-            if not contiguous:
-                return
-            step_us = int((record.launch_ts - prev_launch_ts) * 1e6)
-        if not 0 < step_us < STEP_MAX_US:
-            return
-        if is_prefill:
-            self.total_prefill_busy_us += step_us
-            self.total_prefill_uncached_tokens += batch.extend_num_tokens
-        else:
-            batch_size = len(batch.reqs)
-            _accumulate_decode_moment(
-                self.decode_moment_totals,
-                batch_size,
-                step_us,
-                record.result.get_num_generated_tokens(batch_size),
-            )
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput

@@ -252,7 +252,7 @@ class _Shell:
         s._apply_war_barrier = lambda: self.log("war_barrier")
         s.launch_batch_sample_if_needed = self.sample
         s.process_batch_result = self.process_batch_result
-        s._record_step_counters = lambda record: None
+        s.step_counters = SimpleNamespace(record=lambda record: None)
         s.on_idle = lambda: self.log("idle")
 
     def log(self, *event):
