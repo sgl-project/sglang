@@ -1922,6 +1922,8 @@ class BaseMultimodalProcessor(ABC):
                         modality=modality,
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                        offsets=dict_item.pop("offsets", None),
+                        hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
                 )
