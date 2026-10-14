@@ -1544,7 +1544,6 @@ class Scheduler:
             tp_cpu_group=self.tp_cpu_group,
             sliding_window_size=self.sliding_window_size,
             enable_overlap=(not get_schedule().disable_overlap_schedule),
-            metrics_collector=self.metrics_collector,
             batch_result_processor=self.batch_result_processor,
             counters=self.counters,
             request_retirer=self.request_retirer,

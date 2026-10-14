@@ -118,9 +118,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.observability.metrics_collector import (
-        SchedulerMetricsCollector,
-    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -618,7 +615,6 @@ class DisaggPrefill:
         tp_cpu_group: Any,
         sliding_window_size: Optional[int],
         enable_overlap: bool,
-        metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
         request_retirer: RequestRetirer,
@@ -633,6 +629,7 @@ class DisaggPrefill:
         scheduler_stage_metrics = services.scheduler_stage_metrics
         output_streamer = services.output_streamer
         metrics_sink = services.metrics_sink
+        metrics_collector = metrics_sink.metrics_collector
         self.num_kv_heads = model_config.num_key_value_heads
         self.spec_algorithm = spec_algorithm
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
