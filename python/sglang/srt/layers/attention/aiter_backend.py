@@ -72,6 +72,15 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.flydsl.muse_paged_decode import (
+        muse_paged_gqa_decode_flydsl,
+        prepare_muse_paged_gqa_decode_scratch,
+    )
+except ImportError:
+    muse_paged_gqa_decode_flydsl = None
+    prepare_muse_paged_gqa_decode_scratch = None
+
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
@@ -210,6 +219,7 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    prefill_seqlen_k: Optional[torch.Tensor] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
     asm_ctx_ready: bool = False
@@ -540,6 +550,26 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
+
+        # Opt-in Muse SWA decode: replace unified_attention_2d with a split-K
+        # FlyDSL kernel. Keep this shape-gated so Qwen/Kimi/DSV4 dispatch is
+        # unchanged; full-attention Muse layers retain unified_attention_3d.
+        self.use_muse_flydsl_decode = (
+            envs.SGLANG_MUSE_FLYDSL_DECODE.get()
+            and muse_paged_gqa_decode_flydsl is not None
+            and is_gfx95_supported()
+            and self.page_size == 16
+            and self.head_dim == 64
+            and self.num_head == self.num_kv_head * 8
+            and self.input_dtype == torch.bfloat16
+        )
+        if self.use_muse_flydsl_decode:
+            prepare_muse_paged_gqa_decode_scratch(
+                self.device,
+                batches=range(1, 9),
+                num_kv_heads=self.num_kv_head,
+                num_splits=128,
             )
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
@@ -1016,23 +1046,19 @@ class AiterAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
-    def _build_unified_page_table_from_spec(
+    def _build_unified_page_table_from_ragged(
         self,
-        spec_info,
+        kv_flat: torch.Tensor,
+        kv_indptr: torch.Tensor,
         bs: int,
         dest_buf: Optional[torch.Tensor] = None,
         swa_dest_buf: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Convert ragged (token-level) kv_indices from spec_info into a 2D
-        block-level page_table of shape (bs, max_num_blocks_per_seq).
-        unified_attention expects max_seqlen_k = page_table.shape[1] *
-        page_size to be a captured constant, so rows are sized to the
-        backend-level max_num_blocks_per_seq regardless of seqused_k.
-        """
-        kv_indptr = spec_info.kv_indptr
-        kv_flat = spec_info.kv_indices
+        max_blocks: Optional[int] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Convert ragged token-level KV indices to a dense block page table."""
         page_size = self.page_size
-        max_blocks = (self.max_context_len + page_size - 1) // page_size
+        if max_blocks is None:
+            max_blocks = (self.max_context_len + page_size - 1) // page_size
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -1072,6 +1098,22 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         return page_table, swa_page_table
+
+    def _build_unified_page_table_from_spec(
+        self,
+        spec_info,
+        bs: int,
+        dest_buf: Optional[torch.Tensor] = None,
+        swa_dest_buf: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Build the graph-stable block page table used by unified_attention."""
+        return self._build_unified_page_table_from_ragged(
+            spec_info.kv_indices,
+            spec_info.kv_indptr,
+            bs,
+            dest_buf=dest_buf,
+            swa_dest_buf=swa_dest_buf,
+        )
 
     def _build_verify_unified_metadata(
         self,
@@ -2562,7 +2604,22 @@ class AiterAttnBackend(AttentionBackend):
                     plan=forward_batch.kv_loc_plan,
                 )
 
-                if self.use_sliding_window_kv_pool:
+                kv_indices = self.indices_updater_prefill.kv_indices
+                if self.page_size > 1:
+                    # CK's 3D fallback treats every token as a one-token page.
+                    # Preserve the configured paging for its 4D KV path so
+                    # BUFFER_LOAD and unified_attention use the same blocks.
+                    max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                    max_blocks = (max_kv_len + self.page_size - 1) // self.page_size
+                    kv_indices, swa_page_table = (
+                        self._build_unified_page_table_from_ragged(
+                            kv_indices,
+                            self.indices_updater_prefill.kv_indptr,
+                            bs,
+                            max_blocks=max_blocks,
+                        )
+                    )
+                elif self.use_sliding_window_kv_pool:
                     # AITER attention kernels (e.g. mha_batch_prefill_func)
                     # require int32 page indices; full_to_swa_index_mapping is
                     # stored as int64.
@@ -2591,13 +2648,18 @@ class AiterAttnBackend(AttentionBackend):
 
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indices,
                     None,
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                     swa_out_cache_loc=swa_out_cache_loc,
+                    prefill_seqlen_k=(
+                        forward_batch.seq_lens[:bs].to(torch.int32)
+                        if self.page_size > 1
+                        else None
+                    ),
                     paged_kv_view=paged_kv_view,
                 )
 
@@ -4590,6 +4652,21 @@ class AiterAttnBackend(AttentionBackend):
                 page_table = self.forward_metadata.swa_page_table
 
             extra_kwargs = {}
+            if self.page_size > 1:
+                if k_cache.shape[0] % self.page_size != 0:
+                    raise ValueError(
+                        f"KV cache size {k_cache.shape[0]} is not divisible by "
+                        f"page_size={self.page_size}"
+                    )
+                k_cache = k_cache.view(
+                    -1, self.page_size, k_cache.shape[1], k_cache.shape[2]
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, v_cache.shape[1], v_cache.shape[2]
+                )
+                extra_kwargs["block_table"] = page_table
+                extra_kwargs["seqlen_k"] = self.forward_metadata.prefill_seqlen_k
+
             attn_out = getattr(forward_batch, "_attn_output", None)
             if attn_out is not None and q.dtype != fp8_dtype:
                 extra_kwargs["out"] = attn_out.view(
@@ -4823,29 +4900,61 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     q, _ = scaled_fp8_quant(q, q_descale)
 
-                unified_attention(
-                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k=k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                    ),
-                    v=v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                    ),
-                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    cu_seqlens_q=self.forward_metadata.qo_indptr,
-                    seqused_k=forward_batch.seq_lens,
-                    max_seqlen_q=self.forward_metadata.max_q_len,
-                    max_seqlen_k=max_kv_len,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                    window_size=window_size,
-                    block_table=page_table,
-                    softcap=0,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    sinks=sinks,
+                use_muse_flydsl = (
+                    self.use_muse_flydsl_decode
+                    and bs <= 8
+                    and window_size[0] > 0
+                    and window_size[0] + 1 == 2047
+                    and self.kv_cache_dtype != fp8_dtype
+                    and sinks is None
                 )
+                if use_muse_flydsl:
+                    muse_paged_gqa_decode_flydsl(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k_cache=k_cache.view(
+                            -1,
+                            self.page_size,
+                            layer.tp_k_head_num,
+                            layer.qk_head_dim,
+                        ),
+                        v_cache=v_cache.view(
+                            -1,
+                            self.page_size,
+                            layer.tp_v_head_num,
+                            layer.v_head_dim,
+                        ),
+                        seq_lens=forward_batch.seq_lens,
+                        block_table=page_table,
+                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        softmax_scale=self.scale,
+                        window_size=2047,
+                        num_splits=128,
+                        segment_size=16,
+                    )
+                else:
+                    unified_attention(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k=k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v=v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        cu_seqlens_q=self.forward_metadata.qo_indptr,
+                        seqused_k=forward_batch.seq_lens,
+                        max_seqlen_q=self.forward_metadata.max_q_len,
+                        max_seqlen_k=max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        window_size=window_size,
+                        block_table=page_table,
+                        softcap=0,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        sinks=sinks,
+                    )
             else:
                 self._reject_paged_decode_sliding_window(layer)
                 # Drop FP8 KV upcast: keep paged cache in native FP8 and use ``fp8_e4m3`` for

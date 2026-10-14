@@ -145,7 +145,7 @@ class CustomAllReduceV2:
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_push_bytes(self.world_size), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -185,7 +185,9 @@ class CustomAllReduceV2:
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
@@ -212,7 +214,35 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        self._capture_started = False
         self.disabled = False
+
+    def reserve_push_capacity(self, nbytes: int) -> None:
+        """Grow shared storage without changing AR dispatch or counter capacity.
+
+        All ranks must call in the same order during model construction, before
+        consumers retain workspace views or capture any kernels. This replaces
+        the symmetric allocation and communicator handle; it is not a runtime
+        resize API. Explicit force-size settings remain authoritative.
+        """
+        if self.disabled or nbytes <= self.max_push_size:
+            return
+        if _FORCE_PUSH_SIZE_KB is not None:
+            return
+        if (
+            self._capture_started
+            or self._graph_mode_allowed
+            or self._graph_counter
+            or self._graph_inputs
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError("Reserve push capacity before CUDA graph capture")
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.max_push_size = _ceil_align(nbytes, _ALIGN_BYTES)
+        self.max_size = max(self.max_pull_size, self.max_push_size)
+        # Deliberately preserve self.config: capacity is not an AR crossover.
+        self._init_workspace()
 
     def _init_workspace(self) -> None:
         """Slice one symmetric-memory allocation into every shared buffer.
@@ -262,10 +292,12 @@ class CustomAllReduceV2:
         self._push_counter = torch.zeros(
             (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
         )
+        self._push_workspaces = slice_all([push_num_slots, self.max_push_size], 0)
+        self._push_multicast_ptr = mc_at(0)
         push_plane = PushPlane(
             self.rank,
             self.world_size,
-            workspaces=slice_all([push_num_slots, self.max_push_size], 0),
+            workspaces=self._push_workspaces,
             counter=self._push_counter.view(-1, 1).view(torch.uint8),
             mc_workspace=mc_at(0),
         )
@@ -338,6 +370,8 @@ class CustomAllReduceV2:
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+        if nbytes <= heuristic.two_shot_push_threshold:
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
         if can_use_multicast and heuristic.mc.contains(nbytes):
@@ -363,6 +397,23 @@ class CustomAllReduceV2:
     # ------------------------------------------------------------------
     # All-reduce
     # ------------------------------------------------------------------
+
+    def uses_one_shot_push(self, nbytes: int) -> bool:
+        """Use the normal algorithm policy, including explicit overrides."""
+        if self.disabled or nbytes <= 0 or nbytes % 16 or nbytes > self.max_push_size:
+            return False
+        if self.override_algo is not None:
+            return self.override_algo == AllReduceAlgo.ONE_SHOT_PUSH
+        config = self._pick_config(nbytes, self._can_use_graph())
+        return config is not None and config.algo == AllReduceAlgo.ONE_SHOT_PUSH
+
+    def uses_two_shot_push(self, nbytes: int) -> bool:
+        if self.disabled or nbytes <= 0 or nbytes % 16:
+            return False
+        if self.override_algo is not None:
+            return self.override_algo == AllReduceAlgo.TWO_SHOT_PUSH
+        config = self._pick_config(nbytes, self._can_use_graph())
+        return config is not None and config.algo == AllReduceAlgo.TWO_SHOT_PUSH
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
@@ -399,6 +450,7 @@ class CustomAllReduceV2:
         if self.disabled:
             yield
             return
+        self._capture_started = True
         try:
             self._graph_mode_allowed = self._is_graph_mode_supported
             yield
