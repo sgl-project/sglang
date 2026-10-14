@@ -19,8 +19,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=1200, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=1200, suite="nightly-2-npu-a3", nightly=True)
 register_npu_ci(est_time=1200, suite="full-2-npu-a3", nightly=True)
 
 # The checkpoint pool has an explicit size (3x active slots), not the 2x default.
