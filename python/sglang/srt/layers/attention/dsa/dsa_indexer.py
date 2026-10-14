@@ -99,17 +99,6 @@ def _decline_fused(reason: str) -> None:
         logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
 
 
-def _gfx950_fused_weights_ok(wk_w, wp_w, wq_b_w) -> bool:
-    return (
-        wk_w is not None
-        and wp_w is not None
-        and wq_b_w is not None
-        and wp_w.dtype == torch.bfloat16
-        and wk_w.dtype == wq_b_w.dtype
-        and wk_w.dtype in (torch.bfloat16, fp8_dtype)
-    )
-
-
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -444,7 +433,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         wk_w = getattr(getattr(self, "wk", None), "weight", None)
         wp_w = getattr(getattr(self, "weights_proj", None), "weight", None)
         wq_b_w = getattr(getattr(self, "wq_b", None), "weight", None)
-        gfx950_weights_ok = _gfx950_fused_weights_ok(wk_w, wp_w, wq_b_w)
+        gfx950_weights_ok = (
+            wk_w is not None
+            and wp_w is not None
+            and wq_b_w is not None
+            and wp_w.dtype == torch.bfloat16
+            and wk_w.dtype == wq_b_w.dtype
+            and wk_w.dtype in (torch.bfloat16, fp8_dtype)
+        )
         if gfx950_shape_ok and not gfx950_weights_ok:
             logger.info(
                 "gfx950 fused DSA indexer disabled: needs bf16 weights_proj and "
