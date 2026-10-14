@@ -101,7 +101,7 @@ def _receiver() -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        output_streamer=SimpleNamespace(stream_output=lambda *args, **kwargs: None),
     )
 
 

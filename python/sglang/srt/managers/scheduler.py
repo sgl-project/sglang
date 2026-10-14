@@ -603,6 +603,7 @@ class Scheduler:
 
         self.maybe_init_scripted_scheduler_hook()
 
+        self.init_output_streamer()
         self.init_request_receiver()
 
         self.init_step_builder()
@@ -618,7 +619,6 @@ class Scheduler:
 
         self.init_load_publisher()
 
-        self.init_output_streamer()
         self.init_services()
 
         self.init_batch_result_processor()
@@ -2520,7 +2520,7 @@ class Scheduler:
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get(),
-            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
+            output_streamer=self.output_streamer,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )

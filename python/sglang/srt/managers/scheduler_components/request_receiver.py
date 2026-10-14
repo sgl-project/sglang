@@ -6,7 +6,6 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     List,
     Optional,
     Union,
@@ -46,6 +45,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -66,7 +68,7 @@ class SchedulerRequestReceiver:
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
-    stream_output: Callable[..., None]
+    output_streamer: SchedulerOutputStreamer
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
@@ -240,7 +242,7 @@ class SchedulerRequestReceiver:
                 else:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                self.output_streamer.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

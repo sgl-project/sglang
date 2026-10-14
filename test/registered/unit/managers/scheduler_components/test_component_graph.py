@@ -416,7 +416,6 @@ _CALLBACK_SITES = {
         _SELF,
     ): 1,
     # To be removed.
-    ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (
         "init_dp_attn_adapter",
         "SchedulerDPAttnAdapter",
