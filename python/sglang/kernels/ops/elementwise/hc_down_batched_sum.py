@@ -191,7 +191,9 @@ def allocate_batched_down_buffers(rows, weights):
     return partial, down, alpha
 
 
-def batched_down_from_sum(residual, sum_sq, weights, buffers, rms_eps=1e-6):
+def batched_down_from_sum(
+    residual, sum_sq, weights, buffers, rms_eps=1e-6, *, deterministic=False
+):
     """Compute Down/Inject with one batched GEMM and one merge/nonlinear kernel.
 
     Sums are producer-initialized square sums, possibly from pre-cast FP32 updates.
@@ -233,7 +235,16 @@ def batched_down_from_sum(residual, sum_sq, weights, buffers, rms_eps=1e-6):
         return down, alpha
     # This view does not replicate the full weight or copy the residual.
     operand = residual.view(t, w.hc_count, w.hidden_size).transpose(0, 1)
-    torch.bmm(operand, w.matrix, out_dtype=torch.float32, out=partial)
+    if deterministic:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            bmm_batch_invariant,
+        )
+
+        # The framework's deterministic BMM takes its output dtype from `out`,
+        # not the out_dtype keyword accepted by the ordinary CUDA BMM.
+        bmm_batch_invariant(operand, w.matrix, out=partial)
+    else:
+        torch.bmm(operand, w.matrix, out_dtype=torch.float32, out=partial)
     n = t * (w.lowrank + w.hc_count)
     # Two outputs per lane; branch inverses stay in warp registers (no SMEM).
     _hc_down_batched_sum_post_kernel[(triton.cdiv(n, 256),)](

@@ -1,5 +1,5 @@
 // Shared HC Apply: accumulate FP32 update squares BEFORE the storage cast.
-// The caller owns and clears sum_sq. This kernel does NOT produce inv_rms.
+// Atomic mode requires cleared sum_sq; partial mode overwrites every warp slot.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -11,6 +11,10 @@
 #include <tvm/ffi/container/tensor.h>
 
 namespace sglang {
+inline constexpr uint32_t kHcApplyThreads = 160;
+inline constexpr uint32_t kHcApplyWarps = kHcApplyThreads / 32;
+inline constexpr int64_t kHcApplyPartials = 2 * kHcApplyWarps;
+
 struct HcRawFp32StatParams {
   const void* block_output;
   const void* residual;
@@ -19,13 +23,13 @@ struct HcRawFp32StatParams {
   float* sum_sq;
 };
 
-template <int64_t C, int64_t H, typename Float>
+template <int64_t C, int64_t H, typename Float, bool WritePartials = false>
 __global__
 __launch_bounds__(160) void hc_raw_transition_fp32_stat_kernel(const HcRawFp32StatParams __grid_constant__ p) {
   using namespace device;
   using Float2 = packed_t<Float>;
   using Storage = AlignedVector<Float2, 4>;
-  constexpr uint32_t kThreads = 160;
+  constexpr uint32_t kThreads = kHcApplyThreads;
   constexpr uint32_t kVecsPerHalf = H / 16;
   constexpr uint32_t kIterations = (kVecsPerHalf + kThreads - 1) / kThreads;
   static_assert(C == 4 && H > 0 && H % 512 == 0 && H <= 16384);
@@ -63,13 +67,28 @@ __launch_bounds__(160) void hc_raw_transition_fp32_stat_kernel(const HcRawFp32St
     }
   }
   sum = warp::reduce_sum(sum);
-  // The caller must clear every slot before this launch, including Graph replays.
-  // Full-device atomic scope: the two ordinary CTAs need not share a cluster.
-  // No old-value consumer, shared-memory reduction, or CTA barrier.
-  if (lane == 0) atomicAdd(p.sum_sq + static_cast<int64_t>(token) * C + branch, sum);
+  if (lane == 0) {
+    const int64_t group = static_cast<int64_t>(token) * C + branch;
+    if constexpr (WritePartials) {
+      const uint32_t slot = half * kHcApplyWarps + threadIdx.x / kWarpThreads;
+      p.sum_sq[group * kHcApplyPartials + slot] = sum;
+    } else {
+      // Full-device scope: the two ordinary CTAs need not share a cluster.
+      atomicAdd(p.sum_sq + group, sum);
+    }
+  }
 }
 
-template <int64_t C, int64_t H, typename DType>
+static __global__ __launch_bounds__(128) void hc_sum_partials_reduce_kernel(const float* partials, float* sums) {
+  using namespace device;
+  const uint32_t lane = threadIdx.x % kWarpThreads;
+  const int64_t group = static_cast<int64_t>(blockIdx.x) * 4 + threadIdx.x / kWarpThreads;
+  float sum = lane < kHcApplyPartials ? partials[group * kHcApplyPartials + lane] : 0.0f;
+  sum = warp::reduce_sum(sum);
+  if (lane == 0) sums[group] = sum;
+}
+
+template <int64_t C, int64_t H, typename DType, bool WritePartials = false>
 struct HcRawFp32StatKernel {
   static void
   run(tvm::ffi::TensorView y,
@@ -84,7 +103,11 @@ struct HcRawFp32StatKernel {
     TensorMatcher({M, H}).with_dtype<DType>().with_device(device).verify(y);
     TensorMatcher({M, C * H}).with_dtype<DType>().with_device(device).verify(r).verify(out);
     TensorMatcher({M, C}).with_dtype<float>().with_device(device).verify(alpha);
-    TensorMatcher({M, C}).with_dtype<float>().with_device(device).verify(sums);
+    if constexpr (WritePartials) {
+      TensorMatcher({M, C, kHcApplyPartials}).with_dtype<float>().with_device(device).verify(sums);
+    } else {
+      TensorMatcher({M, C}).with_dtype<float>().with_device(device).verify(sums);
+    }
     const auto p = HcRawFp32StatParams{
         y.data_ptr(),
         r.data_ptr(),
@@ -92,7 +115,22 @@ struct HcRawFp32StatKernel {
         out.data_ptr(),
         static_cast<float*>(sums.data_ptr())};
     LaunchKernel(dim3(static_cast<uint32_t>(M.unwrap()), 2 * C, 1), 160, device.unwrap())(
-        hc_raw_transition_fp32_stat_kernel<C, H, DType>, p);
+        hc_raw_transition_fp32_stat_kernel<C, H, DType, WritePartials>, p);
+  }
+};
+
+struct HcSumPartialsKernel {
+  static void run(tvm::ffi::TensorView partials, tvm::ffi::TensorView sums) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M, 4, kHcApplyPartials}).with_dtype<float>().with_device(device).verify(partials);
+    TensorMatcher({M, 4}).with_dtype<float>().with_device(device).verify(sums);
+    LaunchKernel(dim3(static_cast<uint32_t>(M.unwrap())), 128, device.unwrap())(
+        hc_sum_partials_reduce_kernel,
+        static_cast<const float*>(partials.data_ptr()),
+        static_cast<float*>(sums.data_ptr()));
   }
 };
 }  // namespace sglang

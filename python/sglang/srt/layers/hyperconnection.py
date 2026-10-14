@@ -49,6 +49,11 @@ class _HCSumContext:
             mixed=split(self.buffers.mixed),
             alpha=split(self.buffers.alpha),
             output=output,
+            partial_sums=(
+                split(self.buffers.partial_sums)
+                if self.buffers.partial_sums is not None
+                else None
+            ),
         )
         context = _HCSumContext(self.operator, state, buffers)
         context.sliced = True
@@ -66,6 +71,7 @@ class _HCSumContext:
             self.buffers.alpha,
             out=self.buffers.output.residual,
             sum_sq=self.buffers.output.sum_sq,
+            partial_sums=self.buffers.partial_sums,
         )
         return self.buffers.output
 
@@ -244,11 +250,9 @@ class GatedResidual(HyperConnectionBase):
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability()[0] == 10
         )
-        if self._packed_sum_weights and _deterministic_inference():
-            raise ValueError(
-                "Optimized HC does not support --enable-deterministic-inference; "
-                "disable the flag to use packed HC weights"
-            )
+        # Resolve once at construction, before preparing weights or Graph capture.
+        # This fixes atomic ordering; small/large-T numerical paths stay distinct.
+        self._deterministic_hc = _deterministic_inference()
         self._hc_loaded_weights = set()
         self.register_buffer("_hc_packed_down", None, persistent=False)
         self.register_buffer("_hc_packed_norm", None, persistent=False)
@@ -540,17 +544,39 @@ class GatedResidual(HyperConnectionBase):
         ):
             raise ValueError("Packed HC requires loaded Down/Inject and RMS buffers")
         weights = BatchedDownWeights(packed.transpose(1, 2), h, lowrank, c)
-        operators = (
-            SmallTSumHCShell(
-                self, down_weights=weights, norm_weight_permuted=packed_norm
-            ),
-            LargeTSumHCShell(
-                self, down_weights=weights, norm_weight_permuted=packed_norm
-            ),
+        large = LargeTSumHCShell(
+            self,
+            down_weights=weights,
+            norm_weight_permuted=packed_norm,
+            deterministic=self._deterministic_hc,
         )
+        if self._sum_operators is None:
+            small = SmallTSumHCShell(
+                self,
+                down_weights=weights,
+                norm_weight_permuted=packed_norm,
+                deterministic=self._deterministic_hc,
+            )
+        else:
+            from sglang.kernels.ops.elementwise.hc_mix import permute_pad_up_weight
+
+            small = self._sum_operators[0]
+            up = permute_pad_up_weight(self.input_mix_weight_up.weight, c)
+            previous = small.weights
+            if (
+                previous.up.shape != up.shape
+                or previous.up.dtype != up.dtype
+                or previous.up.device != up.device
+            ):
+                raise ValueError("Prepared HC Up storage changed; recreate and reload")
+            # Captured graphs retain Up and scratch addresses across in-place reloads.
+            previous.up.copy_(up)
+            small.weights = msgspec.structs.replace(
+                previous, down_inject=weights.matrix, norm_permuted=packed_norm
+            )
         self._hc_packed_down = packed
         self._hc_packed_norm = packed_norm
-        self._sum_operators = operators
+        self._sum_operators = (small, large)
         # IPC mapping replaces Parameter objects, so restore all loader hooks.
         for parameter in (
             self.input_mix_weight_down.weight,
@@ -584,7 +610,8 @@ class GatedResidual(HyperConnectionBase):
 
         Incomplete Down/Inject pairs stay dirty; validate at load completion.
         Unchanged Up/RMS need not be resent; ``force`` handles bypassed loader hooks.
-        Reloading requires graph recapture. Reuse scratch on one serialized stream.
+        In-place reload preserves captured buffers; serialize it with inference.
+        Replacing parameter storage still requires graph recapture.
         """
         if self._packed_sum_weights:
             if force:

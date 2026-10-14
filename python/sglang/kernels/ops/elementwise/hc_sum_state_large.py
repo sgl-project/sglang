@@ -8,7 +8,11 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from sglang.kernels.ops.elementwise.hc_apply_sum import _overlap, hc_apply_sum
+from sglang.kernels.ops.elementwise.hc_apply_sum import (
+    PARTIALS_PER_BRANCH,
+    _overlap,
+    hc_apply_sum,
+)
 from sglang.kernels.ops.elementwise.hc_down_batched_sum import (
     _max_hc_rows,
     _validate_batched_rows,
@@ -26,6 +30,7 @@ class HCLargeSumBuffers(NamedTuple):
     partial: torch.Tensor
     down: torch.Tensor
     logits: torch.Tensor
+    partial_sums: torch.Tensor | None = None
 
 
 @gluon.jit
@@ -133,8 +138,16 @@ class LargeTSumHCShell:
     """
 
     @torch.no_grad()
-    def __init__(self, source, *, down_weights=None, norm_weight_permuted=None):
+    def __init__(
+        self,
+        source,
+        *,
+        down_weights=None,
+        norm_weight_permuted=None,
+        deterministic=False,
+    ):
         self.eps = source.config.rms_norm_eps
+        self.deterministic = deterministic
         if (
             not source.config.hc_per_branch_norm
             or not math.isfinite(self.eps)
@@ -226,6 +239,9 @@ class LargeTSumHCShell:
             partial,
             down,
             new((rows, 4 * w.hidden_size)),
+            new((rows, 4, PARTIALS_PER_BRANCH), torch.float32)
+            if self.deterministic
+            else None,
         )
 
     def _validate(self, state, buffers):
@@ -248,6 +264,12 @@ class LargeTSumHCShell:
             (buffers.down, (t, w.lowrank), w.matrix.dtype),
             (buffers.logits, (t, 4 * w.hidden_size), w.matrix.dtype),
         )
+        if self.deterministic != (buffers.partial_sums is not None):
+            raise ValueError("Apply workspace must match the HC deterministic mode")
+        if buffers.partial_sums is not None:
+            specs += (
+                (buffers.partial_sums, (t, 4, PARTIALS_PER_BRANCH), torch.float32),
+            )
         for tensor, shape, dtype in specs:
             if (
                 tensor.shape != shape
@@ -279,6 +301,7 @@ class LargeTSumHCShell:
             w,
             (buffers.partial, buffers.down, buffers.alpha),
             self.eps,
+            deterministic=self.deterministic,
         )
         torch.mm(buffers.down, self.up_weight.T, out=buffers.logits)
         _hc_mix_from_sum_kernel[(triton.cdiv(t * w.hidden_size, 256),)](
@@ -309,5 +332,6 @@ class LargeTSumHCShell:
             buffers.alpha,
             out=buffers.output.residual,
             sum_sq=buffers.output.sum_sq,
+            partial_sums=buffers.partial_sums,
         )
         return buffers.output
