@@ -45,9 +45,16 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // Always set max_new_tokens so the Python side can distinguish
+            // between "caller explicitly set a value" and "caller omitted it".
+            // When omitted, null tells SamplingParams to treat it as unbounded
+            // (None) instead of falling back to its default of 128.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map(|v| serde_json::json!(v))
+                    .unwrap_or(serde_json::Value::Null),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
@@ -705,5 +712,45 @@ mod tests {
         for request in [conflicting, empty_choice, empty_legacy_regex] {
             assert!(build_generate_dict("request", &request).is_err());
         }
+    }
+
+    #[test]
+    fn sampling_params_max_new_tokens_omitted_becomes_null() {
+        // When max_new_tokens is not set in the proto, the sampling_params map
+        // must include it as explicit null so the Python SamplingParams treats
+        // it as unbounded (None) instead of its default of 128.
+        let request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.0),
+                ignore_eos: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("request", &request).unwrap();
+        let sp = mapped["sampling_params"]
+            .as_object()
+            .expect("sampling_params must be an object");
+        assert!(
+            sp.contains_key("max_new_tokens"),
+            "max_new_tokens key must always be present in sampling_params"
+        );
+        assert_eq!(sp["max_new_tokens"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn sampling_params_max_new_tokens_passthrough_when_set() {
+        let request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                max_new_tokens: Some(2048),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("request", &request).unwrap();
+        assert_eq!(
+            mapped["sampling_params"]["max_new_tokens"],
+            serde_json::json!(2048)
+        );
     }
 }
