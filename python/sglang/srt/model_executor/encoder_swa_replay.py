@@ -56,7 +56,8 @@ def run_encoder_swa_replay(worker, batch):
         replay.spec_info = None
         replay.sampling_info = None
         replay.has_grammar = False
-        replay.multimodal_inputs = [None]
+        # Preserve image embeddings and Engram masking for hash-padded IDs.
+        replay.multimodal_inputs = [req.multimodal_inputs]
         replay.engram_history = None
         hasher = runner.model.model.engram_hasher
         if hasher is not None:

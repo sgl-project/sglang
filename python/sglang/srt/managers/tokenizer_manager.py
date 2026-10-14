@@ -1314,7 +1314,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if any(
                 value is not None
                 for value in (
-                    obj.image_data,
                     obj.video_data,
                     obj.audio_data,
                     obj.input_embeds,
@@ -1322,7 +1321,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             ):
                 raise ValueError(
-                    "encoder SWA replay currently supports token-only text requests"
+                    "encoder SWA replay currently supports text and image requests only"
                 )
             if (
                 isinstance(obj, GenerateReqInput)
