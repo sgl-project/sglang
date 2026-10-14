@@ -54,6 +54,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -139,6 +140,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_cuda_graph_max_batch_size,
     is_cuda,
+    is_hip,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -485,6 +487,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
+        )
+        # ROCm + aiter runs the prefix work of an MHA-companion extend inside
+        # the attention eager break, so prefix extends can replay under BCG.
+        self._rocm_bcg_prefix_extend = bool(
+            envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get()
+            and is_hip()
+            and self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and model_runner.prefill_attention_backend_str == "aiter"
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -1378,8 +1389,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # Off CUDA, BCG takes the MHA companion, whose prefix path is
-        # uncapturable. DSA is exempt: it stays on sparse MLA under BCG.
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable
+        # unless _rocm_bcg_prefix_extend. DSA is exempt: it stays on sparse MLA under
+        # BCG. Over the KV chunk capacity eager aiter switches to chunked KV, so
+        # those batches stay eager.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
@@ -1388,7 +1401,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and any(prefix_lens)
             and not self._attn_backend_is_dsa
         ):
-            return False
+            if not self._rocm_bcg_prefix_extend or (
+                num_tokens is not None
+                and int(sum(prefix_lens)) + int(num_tokens)
+                > envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+            ):
+                return False
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):

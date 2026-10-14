@@ -9,6 +9,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -754,6 +755,62 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_rocm_bcg_prefix_extend_gate(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 4
+        runner.enable_lora = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.max_num_tokens = 32
+        runner.capture_num_tokens = [4]
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner.backend = SimpleNamespace()
+        runner.model_runner = SimpleNamespace(attn_backend=None)
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = True
+        runner._is_full_backend = False
+        runner._capture_chunked_prefix = False
+
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            input_embeds=None,
+            replace_embeds=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens_cpu=None,
+            dp_prefill_cuda_graph_max_prefix_len=0,
+            contains_mm_inputs=lambda: False,
+            return_logprob=False,
+            extend_prefix_lens_cpu=[8],
+        )
+
+        cases = (
+            # (opted in, KV chunk capacity, prefix lens, replays)
+            (False, 32768, [0], True),
+            (False, 32768, [8], False),
+            (True, 32768, [8], True),
+            (True, 12, [8], True),
+            (True, 11, [8], False),
+        )
+        with patch.object(runner_module, "is_cuda", return_value=False):
+            for opted_in, capacity, prefix_lens, expected in cases:
+                with (
+                    self.subTest(
+                        opted_in=opted_in, capacity=capacity, prefix_lens=prefix_lens
+                    ),
+                    envs.SGLANG_MAX_KV_CHUNK_CAPACITY.override(capacity),
+                ):
+                    runner._rocm_bcg_prefix_extend = opted_in
+                    forward_batch.extend_prefix_lens_cpu = prefix_lens
+                    self.assertEqual(runner.can_run_graph(forward_batch), expected)
+
+        # CUDA BCG does not route prefix extends through the MHA companion.
+        runner._rocm_bcg_prefix_extend = False
+        forward_batch.extend_prefix_lens_cpu = [8]
+        with patch.object(runner_module, "is_cuda", return_value=True):
+            self.assertTrue(runner.can_run_graph(forward_batch))
 
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):

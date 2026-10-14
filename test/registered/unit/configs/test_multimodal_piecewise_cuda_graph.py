@@ -40,6 +40,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner._qwen_bcg_mtp_draft = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
+        runner._rocm_bcg_prefix_extend = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
