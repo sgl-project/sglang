@@ -202,9 +202,9 @@ export const config = {
   ],
 
   modelNames: {
-    nvfp4: "meta-models/Muse-Spark-open-816B-A42B-NVFP4",
+    nvfp4: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
     mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
-    bf16: "meta-models/Muse-Spark-open-816B-A42B",
+    bf16: "meta-models/Muse-Spark-Open-816B-A42B",
     int4: "intel-ai/Muse-Spark-open-816B-A42B-INT4",
   },
   dockerImages: {
@@ -220,7 +220,7 @@ export const config = {
     PORT: { target: "command", label: "Bind port", default: "30000" },
     NODE0_IP: { target: "command", label: "Head node IP", default: "<node0-ip>" },
     NODE_RANK: { target: "command", label: "This node rank", default: "<node-rank>" },
-    DRAFT_MODEL_ID: { target: "command", label: "Dflash V2 draft model", default: "RadixArk/Muse-Spark-Dflash2" },
+    DRAFT_MODEL_ID: { target: "command", label: "Dflash V2 draft model", default: "RadixArk/Muse-Spark-Open-DFlash2" },
     HF_TOKEN: { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
@@ -230,7 +230,7 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
   github: {
-    cookbookModel: "meta-models/Muse-Spark-open-816B-A42B-NVFP4",
+    cookbookModel: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
   },
 
   // No verification badge is claimed before these recipes are measured.
