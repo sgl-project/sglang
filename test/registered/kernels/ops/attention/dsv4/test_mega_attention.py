@@ -380,6 +380,76 @@ class TestMegaAttention(CustomTestCase):
         graph.replay()
         torch.testing.assert_close(captured, run(), rtol=0, atol=0)
 
+    def test_prefill_indexer_publishes_physical_slots(self):
+        """Paged prefill must receive the indexer's physical selection, not stale slots."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            DeepGEMMPrefillData,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        raw = torch.full((2, 3), -1, device="cuda", dtype=torch.int32)
+        physical = torch.full_like(raw, -1)
+        core = SimpleNamespace(
+            page_table=torch.tensor([[2, 0, 1]], device="cuda", dtype=torch.int32),
+            sparse_raw_indices=lambda _: raw,
+            sparse_page_indices=lambda _: physical,
+        )
+        backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+        backend.trtllm_attn, backend.mega_attn = False, True
+        backend.tail_forward_metadata = None
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=core, late_layer_tail=None
+        )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens_cpu=torch.tensor([131072]),
+            extend_seq_lens_cpu=[2],
+            extend_seq_lens=torch.tensor([2], device="cuda", dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
+        )
+        x = torch.zeros((2, 1), device="cuda", dtype=torch.bfloat16)
+        starts = torch.zeros(2, device="cuda", dtype=torch.int32)
+        selected = torch.tensor(
+            [[0, 2, -1], [3, -1, 1]], device="cuda", dtype=torch.int32
+        )
+        slots = torch.tensor([17, 9, 28, 3], device="cuda", dtype=torch.int32)
+        scoring = DeepGEMMPrefillData(
+            k_slots=slots,
+            request_starts=starts,
+            lens_per_request=[4],
+            rows_per_request=[2],
+            compress_lens=torch.full_like(starts, 4),
+            q_fp4=x,
+            q_sf=x,
+            weights=x,
+        )
+        for ratio in (1, 2):
+            physical.fill_(-1)
+            layer = SimpleNamespace(
+                indexer=None,
+                layer_id=0,
+                compress_ratio=ratio,
+                freqs_cis=x,
+                n_local_heads=64,
+            )
+            with envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True):
+                inputs = backend._make_low_ratio_prefill_indexer_inputs(
+                    layer, x, x, starts, starts, batch, None
+                )
+            scoring.write_selection(selected, inputs)
+            torch.testing.assert_close(
+                physical,
+                torch.tensor(
+                    [[17, 28, -1], [3, -1, 9]], device="cuda", dtype=torch.int32
+                ),
+            )
+            torch.testing.assert_close(raw, selected)
+
     def _check_paged_prefill_dispatch(
         self,
         q,

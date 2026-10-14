@@ -3537,17 +3537,37 @@ class DeepseekV4AttnBackend(
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)
-                if self._low_ratio_prefill_reads_page_indices(forward_batch)
+                if self._low_ratio_prefill_reads_page_indices(
+                    forward_batch,
+                    num_qo_tokens=x.shape[0],
+                    compress_ratio=layer.compress_ratio,
+                    num_heads=layer.n_local_heads,
+                )
                 else None
             ),
         )
 
-    def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
-        # The negation of the sparse-prefill gate in forward(), which reads only
-        # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
-        # to True. Paged attention under active CP needs the page indices.
+    def _low_ratio_prefill_reads_page_indices(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        compress_ratio: int,
+        num_heads: int,
+    ):
+        # Paged Mega prefill needs physical slots; gathered prefill reads raw indices.
         return (
             self.trtllm_attn
+            or (
+                self.mega_attn
+                and forward_batch.seq_lens_cpu is not None
+                and use_mega_paged_prefill(
+                    num_qo_tokens,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    compress_ratio,
+                    num_heads,
+                )
+            )
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
