@@ -124,7 +124,8 @@ class DllmAlgorithm:
             forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
-            if all(done):
+            done = torch.as_tensor(done, dtype=torch.bool)
+            if done.all():
                 break
             self.prepare_inputs(model_runner, forward_batch, states)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -156,9 +157,7 @@ class DllmAlgorithm:
         self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
-        done = torch.as_tensor(
-            done, dtype=torch.bool, device=forward_batch.input_ids.device
-        )
+        done = torch.as_tensor(done, dtype=torch.bool)
         # Clone so a later in-place step cannot race the async D2H of this result.
         block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
 

@@ -136,6 +136,36 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         )
         self.assertEqual(result.block_done.tolist(), [False, True])
 
+    def test_sync_accepts_list_and_tensor_done(self):
+        for tensor_done in (False, True):
+            with self.subTest(tensor_done=tensor_done):
+                algo = _low_confidence()
+                batch = SimpleNamespace(batch_size=2, input_ids=torch.zeros(8))
+                runner = _Runner(torch.zeros(8, 6))
+                done = [[True, False], [True, True]]
+                if tensor_done:
+                    done = [torch.tensor(values) for values in done]
+                with (
+                    patch.object(algo, "step", side_effect=done) as step,
+                    patch.object(runner, "forward", wraps=runner.forward) as forward,
+                ):
+                    result = algo._run_sync(runner, batch)
+                self.assertEqual(step.call_count, 2)
+                self.assertEqual(forward.call_count, 2)
+                self.assertIsNone(result.block_done)
+
+    def test_fdfo_keeps_host_done_on_cpu(self):
+        for done in ([False, True], torch.tensor([False, True])):
+            with self.subTest(done_type=type(done)):
+                algo = _low_confidence()
+                batch = SimpleNamespace(
+                    batch_size=2, input_ids=torch.empty(8, device="meta")
+                )
+                with patch.object(algo, "step", return_value=done):
+                    result = algo._run_fdfo(_Runner(None), batch, None)
+                self.assertEqual(result.block_done.device.type, "cpu")
+                self.assertEqual(result.block_done.tolist(), [False, True])
+
     def test_result_snapshot_survives_next_step(self):
         algo = _low_confidence()
         inputs = torch.tensor([[2, 0, 0, 0]])
