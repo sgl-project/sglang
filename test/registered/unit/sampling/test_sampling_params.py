@@ -331,6 +331,33 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    def test_logit_bias_value_bounds(self):
+        """Malformed and oversized native bias values must fail admission.
+
+        These inputs previously raised TypeError or OverflowError instead of
+        ValueError, escaping the request-validation error path.
+        """
+        for value in (
+            -101.0,
+            101.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "abc",
+            None,
+            True,
+            1 << 2000,
+            -(1 << 2000),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+
+        # An int bias is a valid JSON number; the type guard must not narrow to float.
+        self._make(logit_bias={"0": -100.0, "1": 5, "31999": 100.0}).verify(
+            self.VOCAB_SIZE
+        )
+
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""

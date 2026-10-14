@@ -71,7 +71,11 @@ try:
 except:
     StructuralTag = Any
 
-from sglang.srt.sampling.sampling_params import MAX_N
+from sglang.srt.sampling.sampling_params import (
+    LOGIT_BIAS_MAX,
+    LOGIT_BIAS_MIN,
+    MAX_N,
+)
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -865,7 +869,15 @@ class ChatCompletionRequest(PDRoutingFields):
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
     )
     frequency_penalty: float = 0.0
-    logit_bias: Optional[Dict[str, float]] = None
+    logit_bias: Optional[
+        Dict[
+            str,
+            Annotated[
+                float,
+                Field(ge=LOGIT_BIAS_MIN, le=LOGIT_BIAS_MAX, allow_inf_nan=False),
+            ],
+        ]
+    ] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
     max_tokens: Optional[int] = Field(

@@ -145,6 +145,36 @@ class TestChatSamplingValidation(CustomTestCase):
                     response.json()["temperature"], params.get("temperature")
                 )
 
+    def test_logit_bias_bounds_return_400(self):
+        """Bias values outside the documented range previously reached serving."""
+        for value in (-101.0, 101.0):
+            with self.subTest(value=value):
+                response = self._post(logit_bias={"1": value})
+                self._assert_validation_error(response, "logit_bias", "1")
+
+    def test_logit_bias_nonfinite_returns_400(self):
+        """Valid JSON numbers that overflow float64 must not enter sampling."""
+        for value in ("1e309", "-1e309"):
+            with self.subTest(value=value):
+                self.validation_errors.clear()
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    content=(
+                        '{"model":"test-model",'
+                        '"messages":[{"role":"user","content":"Hello"}],'
+                        f'"logit_bias":{{"1":{value}}}'
+                        "}"
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+                self._assert_validation_error(response, "logit_bias", "1")
+
+    def test_logit_bias_boundaries_and_defaults_are_accepted(self):
+        for value in (None, {}, {"1": -100.0}, {"1": 100.0}, {"1": 0.5}):
+            with self.subTest(value=value):
+                response = self._post(logit_bias=value)
+                self.assertEqual(response.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

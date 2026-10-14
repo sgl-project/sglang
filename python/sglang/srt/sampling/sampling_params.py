@@ -37,6 +37,8 @@ CustomParamValue = Union[
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 MAX_N = 128
+LOGIT_BIAS_MIN = -100.0
+LOGIT_BIAS_MAX = 100.0
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
 MAX_STOP_REGEX_COUNT = 32
@@ -266,11 +268,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
-            for token_id in self.logit_bias:
+            for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
+                    )
+                if (
+                    type(bias) not in (int, float)
+                    or not LOGIT_BIAS_MIN <= bias <= LOGIT_BIAS_MAX
+                ):
+                    raise ValueError(
+                        "logit_bias values must be finite numbers in "
+                        f"[{LOGIT_BIAS_MIN:g}, {LOGIT_BIAS_MAX:g}], "
+                        f"got {bias} for token {token_id}."
                     )
         if self.sampling_seed is not None:
             if not isinstance(self.sampling_seed, int):
