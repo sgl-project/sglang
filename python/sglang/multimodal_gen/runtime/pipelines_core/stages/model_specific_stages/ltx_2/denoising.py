@@ -38,6 +38,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    rollout_transition,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
@@ -179,12 +182,6 @@ class LTX2DenoisingStage(DenoisingStage):
         self.sampler_name = sampler_name
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
-
-    def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
-        return self.prepare_extra_func_kwargs(
-            scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
-        )
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -1825,19 +1822,13 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
-                        model_video,
-                        step.t_device,
-                        ctx.latents,
-                        return_dict=False,
-                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                ctx.latents = ctx.scheduler.step(
+                    model_video,
+                    step.t_device,
+                    ctx.latents,
+                    transition=rollout_transition(batch),
+                    return_dict=False,
+                )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]

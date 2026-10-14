@@ -4,6 +4,9 @@ import unittest
 
 import torch
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
@@ -19,6 +22,7 @@ def _make_rollout(batch, pipeline_config=None) -> FlowRolloutController:
         log_prob_no_const=batch.rollout_log_prob_no_const,
         debug_mode=batch.rollout_debug_mode,
         sde_step_indices=batch.rollout_sde_step_indices,
+        generator=torch.Generator().manual_seed(0),
         shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
             batch=batch, latents=latents
         )[0],
@@ -123,6 +127,36 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         self.assertEqual(rollout_prev.dtype, non_rollout_prev.dtype)
         self.assertEqual(pre_cast_max_abs_diff, 0.0)
         self.assertEqual(post_cast_max_abs_diff, 0.0)
+
+    def test_ode_transition_matches_serving_step(self):
+        """Passing the rollout transition to a real FlowMatchEulerDiscreteScheduler
+        must reproduce rollout=False bit for bit in ODE mode: step() keeps its
+        index, sigma lookup and dtype casts around either transition."""
+        serving, rollout_scheduler = (
+            FlowMatchEulerDiscreteScheduler(shift=3.0),
+            FlowMatchEulerDiscreteScheduler(shift=3.0),
+        )
+        for scheduler in (serving, rollout_scheduler):
+            scheduler.set_timesteps(5)
+            scheduler.set_begin_index(0)
+        rollout = _make_rollout(self._build_batch(debug_mode=False))
+
+        g = torch.Generator().manual_seed(0)
+        sample = torch.randn(2, 4, 8, 8)
+        expected, actual = sample.clone(), sample.clone()
+        for t in serving.timesteps:
+            model_output = torch.randn(sample.shape, generator=g).to(torch.bfloat16)
+            expected = serving.step(model_output, t, expected, return_dict=False)[0]
+            actual = rollout_scheduler.step(
+                model_output,
+                t,
+                actual,
+                transition=rollout.transition,
+                return_dict=False,
+            )[0]
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(rollout_scheduler.step_index, serving.step_index)
+        self.assertEqual(len(rollout.local_log_prob_sum), len(serving.timesteps))
 
     def test_ode_debug_tensors_have_shape_safe_noise_std(self):
         batch = self._build_batch(debug_mode=True)

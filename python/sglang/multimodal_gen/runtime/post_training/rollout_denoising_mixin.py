@@ -57,6 +57,7 @@ class RolloutDenoisingMixin:
                 log_prob_no_const=batch.rollout_log_prob_no_const,
                 debug_mode=batch.rollout_debug_mode,
                 sde_step_indices=batch.rollout_sde_step_indices,
+                generator=batch.generator,
                 shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
                     batch=batch, latents=latents
                 )[0],
