@@ -58,14 +58,10 @@ class ReqDllmMixin:
             )
             return
 
-        min_required_length = prefix_length + self.dllm_config.block_size
-        if len(self.full_untruncated_fill_ids) < min_required_length:
-            return
-
-        input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
+        block_end = prefix_length + self.dllm_config.block_size
         self.dllm_phase = (
             DllmReqPhase.STAGING_PREFILL
-            if self.dllm_config.mask_id not in input_block
+            if block_end <= len(self.origin_input_ids)
             else DllmReqPhase.STAGING_DECODE
         )
 

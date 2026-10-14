@@ -53,6 +53,9 @@ class SchedulerDllmMixin:
         # Clear the previous batch and fetch waiting requests
         self.dllm_manager.staging_queue = []
         self._fetch_waiting_reqs()
+        for req in self.dllm_manager.waiting_queue:
+            if req.dllm_initialized:
+                req.determine_dllm_phase()
 
         # Process batches
         forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
