@@ -9,12 +9,19 @@ import glob
 import json
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from itertools import chain
 from typing import Any, Dict, Type
 
 import torch
+from huggingface_hub import (
+    hf_hub_download,
+    parse_local_safetensors_file_metadata,
+    parse_safetensors_file_metadata,
+    snapshot_download,
+)
+from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
 from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 from torch.nn.utils import parametrize
@@ -26,6 +33,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -368,8 +376,6 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
     for each missing shard. Returns True if all shards were recovered.
     """
     try:
-        from huggingface_hub import hf_hub_download
-
         match = re.search(
             r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\]([^/\\]+)", model_path
         )
@@ -409,6 +415,96 @@ def checkpoint_bytes(model_path: str) -> int:
         except OSError:
             continue
     return total
+
+
+_DIT_SUBFOLDER = "transformer"
+_DIT_SINGLE_FILE = "diffusion_pytorch_model.safetensors"
+_FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
+
+
+def _index_shard_names(index_path: str) -> list[str]:
+    with open(index_path) as f:
+        return sorted(set(json.load(f)["weight_map"].values()))
+
+
+def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
+    # the same files _list_safetensors_files loads, without its shard repair
+    index_path = _select_safetensors_index_file(folder, _DEFAULT_SAFETENSORS_INDEX)
+    if index_path is None:
+        shards = filter_duplicate_precision_variant_safetensors(
+            sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+        )
+    else:
+        shards = [os.path.join(folder, name) for name in _index_shard_names(index_path)]
+    if not shards or not all(os.path.isfile(shard) for shard in shards):
+        return None
+    counts: Counter[str] = Counter()
+    for shard in shards:
+        counts.update(parse_local_safetensors_file_metadata(shard).parameter_count)
+    return counts
+
+
+def _hub_dit_parameter_counts(
+    repo_id: str, folder: str, revision: str | None
+) -> Counter[str]:
+    try:
+        index_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{folder}/{_DEFAULT_SAFETENSORS_INDEX}",
+            revision=revision,
+        )
+        shards = _index_shard_names(index_path)
+    except RemoteEntryNotFoundError:
+        shards = [_DIT_SINGLE_FILE]
+    counts: Counter[str] = Counter()
+    for shard in shards:
+        metadata = parse_safetensors_file_metadata(
+            repo_id=repo_id, filename=f"{folder}/{shard}", revision=revision
+        )
+        counts.update(metadata.parameter_count)
+    return counts
+
+
+def _dit_parameter_counts(
+    model_path: str, folder: str, revision: str | None
+) -> Counter[str] | None:
+    if os.path.isdir(model_path):
+        return _local_dit_parameter_counts(os.path.join(model_path, folder))
+    if os.path.exists(model_path) or envs.SGLANG_USE_MODELSCOPE.get():
+        # a single-file checkpoint has no transformer folder to size,
+        # and ModelScope has no header-only read
+        return None
+    try:
+        snapshot = snapshot_download(
+            repo_id=model_path,
+            revision=revision,
+            allow_patterns=[f"{folder}/*"],
+            local_files_only=True,
+        )
+        counts = _local_dit_parameter_counts(os.path.join(snapshot, folder))
+    except LocalEntryNotFoundError:
+        counts = None
+    if counts is None:
+        counts = _hub_dit_parameter_counts(model_path, folder, revision)
+    return counts
+
+
+def dit_parameter_count(
+    model_path: str, *, subfolder: str | None, revision: str | None
+) -> int | None:
+    """Parameter count of a Diffusers transformer, from its safetensors headers.
+
+    None when it cannot be sized without its weights, or is stored quantized.
+    """
+    folder = f"{subfolder}/{_DIT_SUBFOLDER}" if subfolder else _DIT_SUBFOLDER
+    try:
+        counts = _dit_parameter_counts(os.path.expanduser(model_path), folder, revision)
+    except Exception as exc:
+        logger.debug("Could not size the transformer of %s: %s", model_path, exc)
+        return None
+    if not counts or not counts.keys() <= _FLOAT_DTYPES:
+        return None
+    return sum(counts.values())
 
 
 def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:

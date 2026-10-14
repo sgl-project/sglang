@@ -40,7 +40,7 @@ def _fused_dsa_decode_metadata_kernel(
     num_splits,
     dsa_index_topk: tl.constexpr,
     index_kpool: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
     BLOCK_BS: tl.constexpr,
@@ -111,13 +111,13 @@ def _fused_dsa_decode_metadata_kernel(
             )
 
         if HAS_REAL_PAGE_TABLE:
-            real_mask = mask & ((offs_n % real_page_size) == 0)
-            real_cols = offs_n // real_page_size
+            real_mask = mask & ((offs_n % physical_page_size) == 0)
+            real_cols = offs_n // physical_page_size
             tl.store(
                 real_page_table
                 + row_i64 * real_page_table_stride_0
                 + real_cols * real_page_table_stride_1,
-                vals // real_page_size,
+                vals // physical_page_size,
                 mask=real_mask,
             )
 
@@ -135,16 +135,16 @@ def fused_dsa_decode_metadata(
     bs: int,
     max_len: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     index_kpool: int = 1,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
     ``page_table_1`` (the wide page_size=1 table) is optional: pass ``None`` to
     skip materializing it and write only the compact ``real_page_table``
-    (page_size=``real_page_size``). This is used by the fused decode CUDA graph,
+    (page_size=``physical_page_size``). This is used by the fused decode CUDA graph,
     where the wide table is never read (attention uses topk_indices, the indexer
-    uses real_page_table); ``real_page_size`` must be >1 in that case. When a
+    uses real_page_table); ``physical_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
 
     Contract: each page-table row is written only over its live prefix
@@ -170,7 +170,7 @@ def fused_dsa_decode_metadata(
         return
     assert index_kpool > 0
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -217,7 +217,7 @@ def fused_dsa_decode_metadata(
         num_splits,
         dsa_index_topk,
         index_kpool,
-        real_page_size,
+        physical_page_size,
         has_real_page_table,
         has_page_table_1,
         BLOCK_BS=block_bs,

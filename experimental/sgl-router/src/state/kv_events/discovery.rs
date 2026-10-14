@@ -26,6 +26,8 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::workers::introspect::{resolve_event_config, KvEventsBlock};
+
 /// Per-worker KV-event publisher configuration, resolved to something the
 /// gateway can directly use to open ZMQ SUB sockets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,9 @@ pub struct EventConfig {
     /// Topic prefix for the dedicated load socket. The publisher advertises
     /// it with `load_port_base`; both fields are required before subscribing.
     pub load_topic: Option<String>,
+    /// Base port of the publisher's replay ROUTER (rank r = base + r), used to
+    /// re-fetch batches lost in a sequence gap. `None` when not advertised.
+    pub replay_port_base: Option<u16>,
     /// Worker-reported `page_size`. Callers MUST compare against their
     /// own configured `block_size`; a mismatch produces silent
     /// miscompute since [`super::hash::compute_block_hashes`] is keyed
@@ -95,18 +100,18 @@ pub async fn fetch_event_config(
 ) -> Result<Option<EventConfig>> {
     let parsed =
         Url::parse(worker_url).map_err(|e| anyhow!("invalid worker_url {worker_url}: {e}"))?;
-    let worker_host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("worker_url {worker_url} has no host"))?
-        .to_owned();
+    if parsed.host_str().is_none() {
+        return Err(anyhow!("worker_url {worker_url} has no host"));
+    }
 
     let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
 
     let body = fetch_with_retry(&server_info_url, worker_url, client).await?;
 
     // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
-    // token bigrams; the router must mirror that on the selection side.
-    let is_bigram = classify_bigram(body.speculative_algorithm.as_deref(), worker_url);
+    // token bigrams, except on hybrid (Mamba/linear-attention) models.
+    let is_bigram = classify_bigram(body.speculative_algorithm.as_deref(), worker_url)
+        && !body.uses_mamba_radix_cache;
 
     let block = match body.kv_events {
         Some(b) => b,
@@ -119,28 +124,7 @@ pub async fn fetch_event_config(
         }
     };
 
-    // Wildcard bind hosts mean "any interface" on the worker side — the
-    // gateway has to connect to a routable address, which it learns from
-    // the worker URL.
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
-    ) {
-        worker_host
-    } else {
-        block.endpoint_host
-    };
-
-    Ok(Some(EventConfig {
-        host,
-        port_base: block.endpoint_port_base,
-        topic: block.topic,
-        load_port_base: block.load_endpoint_port_base,
-        load_topic: block.load_topic,
-        block_size: block.block_size,
-        dp_size: block.dp_size,
-        is_bigram,
-    }))
+    Ok(Some(resolve_event_config(block, worker_url, is_bigram)))
 }
 
 /// Issue the `/server_info` request with bounded retry on transient errors
@@ -213,6 +197,10 @@ struct ServerInfoResponse {
     /// token bigrams — see [`EventConfig::is_bigram`].
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Hybrid (Mamba/linear-attention) models keep unigram KV keys even
+    /// under EAGLE.
+    #[serde(default)]
+    uses_mamba_radix_cache: bool,
 }
 
 /// Whether a worker's `/server_info` `speculative_algorithm` means it hashes KV
@@ -245,31 +233,6 @@ pub(crate) fn classify_bigram(speculative_algorithm: Option<&str>, worker_url: &
             false
         }
     }
-}
-
-#[derive(Deserialize)]
-struct KvEventsBlock {
-    // `publisher` is captured for forward-compatibility but unused: the
-    // only publisher implementation supported on the gateway side is
-    // ZMQ. Keeping the field optional means a future SGLang that adds a
-    // non-ZMQ publisher string won't fail this deserialize; the
-    // resulting subscriber will still try to open a ZMQ connection on
-    // `endpoint_host:endpoint_port_base` and fail visibly there.
-    #[allow(dead_code)]
-    #[serde(default)]
-    publisher: Option<String>,
-    endpoint_host: String,
-    endpoint_port_base: u16,
-    #[serde(default)]
-    topic: String,
-    /// Base port of the dedicated load-snapshot socket range. Absent on
-    /// workers that predate load publishing (`None` ⇒ no load subscriber).
-    #[serde(default)]
-    load_endpoint_port_base: Option<u16>,
-    #[serde(default)]
-    load_topic: Option<String>,
-    block_size: u32,
-    dp_size: u32,
 }
 
 #[cfg(test)]
@@ -338,6 +301,7 @@ mod tests {
                 topic: "kv".to_string(),
                 load_port_base: Some(5559),
                 load_topic: Some("load".to_string()),
+                replay_port_base: None,
                 block_size: 64,
                 dp_size: 2,
                 is_bigram: false,

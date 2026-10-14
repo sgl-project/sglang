@@ -12,15 +12,14 @@ import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
-    get_lora,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -238,9 +237,7 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import (
-            OpenAIServingClassify,
-        )
+        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -430,17 +427,16 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
-        # `resolved_dict` answers with what resolution decided; the launch
-        # command answers with what was asked for, and the two are not
-        # derivable from each other. The HTTP and in-process readbacks both
-        # carry it, so this one does too.
-        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
-        result.update(self.scheduler_info)
-        result["kv_events"] = describe_kv_events_publisher(
-            self.tokenizer_manager.server_args
+        return json.dumps(
+            msgspec_to_builtins(
+                redact_watermark_secrets(
+                    build_server_info(
+                        self.tokenizer_manager.server_args, self.scheduler_info
+                    )
+                )
+            ),
+            default=str,
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus
@@ -803,7 +799,8 @@ class RuntimeHandle:
                 elif hasattr(result, "body"):
                     resp_bytes = result.body
                 elif isinstance(result, (dict, list)):
-                    resp_bytes = json.dumps(result).encode("utf-8")
+                    # As FastAPI encodes it over HTTP; rerank returns a list of models.
+                    resp_bytes = json.dumps(jsonable_encoder(result)).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
                 status_code = int(
