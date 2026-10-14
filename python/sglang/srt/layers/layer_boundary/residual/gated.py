@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
@@ -111,12 +112,31 @@ class GatedResidualState:
             ffn_update=_FfnUpdate(self),
         )
 
+    @classmethod
+    def facts(cls, *, attn_reads_every_row: bool = False) -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of) for a layer whose
+        attention read needs every row when ``attn_reads_every_row``. It does
+        not depend on the layer's modules, so the stages of a layer that is
+        not built declare it too."""
+        state = cls(
+            expand=None,
+            attn_mix=None,
+            ffn_mix=None,
+            attn_combine=None,
+            ffn_combine=None,
+            attn_reads_every_row=attn_reads_every_row,
+        )
+        return residual_facts(state.residual_ops())
+
 
 class _AttnReadout:
     """The normalized, gated mix of the streams, from streams that already hold
-    the previous layer's output: such a layer takes its input written back."""
+    the previous layer's output: such a layer takes its input written back. A
+    ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
 
     def __init__(self, state: GatedResidualState):
@@ -150,6 +170,8 @@ class _AttnUpdate:
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -168,7 +190,10 @@ class _FfnReadout:
     """The attention output's injection and the FFN input's mix."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -198,6 +223,8 @@ class _FfnUpdate:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state

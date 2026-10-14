@@ -1971,6 +1971,13 @@ def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
 
+    # The Rust client owns the whole run, from dataset to result file, so hand
+    # it the arguments before this module sets up anything of its own.
+    if getattr(args, "rust_client", False):
+        from sglang.benchmark.rust_client import run_rust_benchmark
+
+        return run_rust_benchmark(args)
+
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
@@ -2798,7 +2805,39 @@ def cli_main():
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
+    parser.add_argument(
+        "--rust-client",
+        action="store_true",
+        help="Run through the Rust client (sglang.srt.rust_extensions._bench), "
+        "which parses each response stream on its own thread instead of one "
+        "shared asyncio thread. Same metrics and result keys; fewer backends "
+        "and datasets (see rust/sglang-bench/README.md). For a command line "
+        "that skips this module's model-tooling imports entirely, run "
+        "`python -m sglang.benchmark.rust_client` instead.",
+    )
+    parser.add_argument(
+        "--rust-worker-threads",
+        type=int,
+        default=None,
+        help="Response-stream parsing threads for --rust-client. "
+        "Defaults to the available parallelism.",
+    )
     args = parser.parse_args()
+    if args.rust_worker_threads is not None and not args.rust_client:
+        parser.error("--rust-worker-threads requires --rust-client")
+    if args.rust_client:
+        # Checked here so an unsupported combination is a usage error rather
+        # than a traceback; `run_benchmark` still raises for a programmatic
+        # caller, which has no parser to report through.
+        from sglang.benchmark.rust_client import (
+            UnsupportedByRustClient,
+            check_supported,
+        )
+
+        try:
+            check_supported(args)
+        except UnsupportedByRustClient as error:
+            parser.error(str(error))
     _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
 
