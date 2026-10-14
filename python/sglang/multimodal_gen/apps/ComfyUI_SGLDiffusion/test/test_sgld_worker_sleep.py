@@ -223,6 +223,8 @@ class _FakeWorkerOwner:
 
     def __init__(self, asleep=False):
         self.worker_asleep = asleep
+        self.shares_comfy_gpu = True
+        self.resident_bytes = 0
         self.calls = []
 
     def sleep_worker(self, token=None):
@@ -288,6 +290,9 @@ def _live_generator(monkeypatch, responses=None):
     )
     io_struct.ResumeMemoryOccupationReqInput = type(
         "ResumeMemoryOccupationReqInput", (), {}
+    )
+    io_struct.ReleaseAllocatorCacheReqInput = type(
+        "ReleaseAllocatorCacheReqInput", (), {}
     )
     monkeypatch.setitem(sys.modules, io_struct.__name__, io_struct)
     return gen, sent
@@ -358,3 +363,63 @@ def test_clone_of_live_patcher_still_sleeps_the_real_generator(monkeypatch):
 def test_partially_unload_has_no_side_effects():
     patcher = _make_patcher(_FakeWorkerOwner())
     assert patcher.partially_unload(torch.device("cpu"), 123) == 0
+
+
+def test_off_gpu_worker_reports_zero_and_detach_is_a_noop(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.shares_comfy_gpu = False
+    patcher = SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=9,
+        worker=gen,
+        worker_token=gen.generator,
+    )
+    assert patcher.loaded_size() == 0
+    patcher.detach()
+    assert sent == []
+    assert not gen.worker_asleep
+
+
+def test_loaded_size_prefers_measured_resident_bytes():
+    owner = _FakeWorkerOwner()
+    patcher = _make_patcher(owner, size=100)
+    owner.resident_bytes = 40
+    assert patcher.loaded_size() == 40
+
+
+def test_worker_gpu_topology(monkeypatch):
+    mm = sys.modules["comfy.model_management"]
+    monkeypatch.setattr(
+        mm, "get_torch_device", lambda: torch.device("cuda", 1), raising=False
+    )
+    share = GENERATOR.SGLDiffusionGenerator._worker_shares_comfy_gpu
+    assert share({"base_gpu_id": 1})
+    assert share({"base_gpu_id": 0, "num_gpus": 2})
+    assert not share({"base_gpu_id": 2})
+    assert not share({})  # worker on GPU 0, ComfyUI on GPU 1
+    monkeypatch.setattr(
+        mm, "get_torch_device", lambda: torch.device("cpu"), raising=False
+    )
+    assert not share({})
+
+
+def test_release_worker_cache_records_resident_bytes(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.generator._send_to_scheduler_and_wait_for_response = lambda reqs: (
+        sent.append(type(reqs[0]).__name__)
+        or types.SimpleNamespace(
+            error=None, output={"success": True, "resident_bytes": 123}
+        )
+    )
+    gen.release_worker_cache()
+    assert sent == ["ReleaseAllocatorCacheReqInput"]
+    assert gen.resident_bytes == 123
+    gen.shares_comfy_gpu = False
+    gen.release_worker_cache()
+    assert len(sent) == 1
+    gen.shares_comfy_gpu = True
+    gen.worker_asleep = True
+    gen.release_worker_cache()
+    assert len(sent) == 1

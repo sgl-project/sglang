@@ -93,9 +93,15 @@ class SGLDModelPatcher(ModelPatcher):
         it is always 0 and ComfyUI never considers this patcher worth
         unloading. The weights are resident in the worker unless it sleeps.
         """
-        if self.worker is None or getattr(self.worker, "worker_asleep", False):
+        if (
+            self.worker is None
+            or getattr(self.worker, "worker_asleep", False)
+            or not getattr(self.worker, "shares_comfy_gpu", True)
+        ):
             return 0
-        return self.model_size()
+        # What the worker keeps on the GPU (after offload, TP, quantization),
+        # once measured; the checkpoint size is only the first estimate.
+        return getattr(self.worker, "resident_bytes", 0) or self.model_size()
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         """Nothing is partially offloadable; ``detach`` does the real unload."""
@@ -108,7 +114,7 @@ class SGLDModelPatcher(ModelPatcher):
         for the VAE or a text encoder) ends here. The worker is woken again
         by ``SGLDiffusionGenerator.ensure_executor`` on the next forward.
         """
-        if self.worker is not None:
+        if self.worker is not None:  # no-op unless the worker shares ComfyUI's GPU
             self.worker.sleep_worker(self.worker_token)
         return super().detach(unpatch_all)
 

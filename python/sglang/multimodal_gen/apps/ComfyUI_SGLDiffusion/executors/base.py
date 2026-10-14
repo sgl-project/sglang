@@ -233,6 +233,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
             return executor(*args, **kwargs)
         finally:
             self.end_sampler_run()
+            release = getattr(self, "_release_cache", None)
+            if release is not None:
+                release()
 
     def comfyui_session_id(self) -> str:
         return f"{self.session_id}:{self._run_id}"

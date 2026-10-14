@@ -221,6 +221,8 @@ class SGLDiffusionGenerator:
         self.last_options = None
         self._patcher = None
         self.worker_asleep = False
+        self.shares_comfy_gpu = True
+        self.resident_bytes = 0
 
         # Native pipelines, run under comfyui_mode as a DiT-only forward service.
         self.pipeline_class_dict = {}
@@ -392,6 +394,48 @@ class SGLDiffusionGenerator:
             raise RuntimeError(payload.get("message", "memory occupation failed"))
         return payload
 
+    @staticmethod
+    def _worker_shares_comfy_gpu(sgld_options: dict) -> bool:
+        """True when the worker's GPUs include the one ComfyUI runs on.
+
+        Only then does the worker's memory compete with ComfyUI's own models;
+        on a different GPU, freeing it would help nothing and cost a reload.
+        """
+        import torch
+        from comfy import model_management
+
+        device = model_management.get_torch_device()
+        if getattr(device, "type", None) != "cuda":
+            return False
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        base = int(sgld_options.get("base_gpu_id") or 0)
+        count = int(sgld_options.get("num_gpus") or 1)
+        return base <= index < base + count
+
+    def release_worker_cache(self) -> None:
+        """Hand the worker's cached allocator blocks back to the device.
+
+        No weights move, so this is cheap enough to run after every sampler
+        run; it lets VAE decode use the memory the DiT's activations held.
+        """
+        if (
+            not self.shares_comfy_gpu
+            or self.worker_asleep
+            or self.generator is None
+            or not self._is_live()
+        ):
+            return
+        try:
+            payload = self._memory_occupation_request("ReleaseAllocatorCacheReqInput")
+        except Exception:
+            logger.warning(
+                "Could not release SGLD worker allocator cache", exc_info=True
+            )
+            return
+        self.resident_bytes = int(payload.get("resident_bytes") or 0)
+
     def sleep_worker(self, token=None) -> None:
         """Move the worker's weights off the GPU (best effort).
 
@@ -401,6 +445,8 @@ class SGLDiffusionGenerator:
         stays resident, which is the old behaviour.
         """
         if token is not None and token is not self.generator:
+            return
+        if not self.shares_comfy_gpu:
             return
         if self.worker_asleep or self.generator is None or not self._is_live():
             return
@@ -451,6 +497,7 @@ class SGLDiffusionGenerator:
         self.executor = None
         self._patcher = None
         self.worker_asleep = False
+        self.resident_bytes = 0
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
@@ -614,6 +661,9 @@ class SGLDiffusionGenerator:
             worker_model_path, pipeline_class_name, sgld_options
         )
 
+        self.shares_comfy_gpu = self._worker_shares_comfy_gpu(sgld_options)
+        self.resident_bytes = 0
+
         executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
@@ -621,6 +671,7 @@ class SGLDiffusionGenerator:
         self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
+        self.executor._release_cache = self.release_worker_cache
         comfyui_model.diffusion_model = self.executor
 
         from comfy import model_management
