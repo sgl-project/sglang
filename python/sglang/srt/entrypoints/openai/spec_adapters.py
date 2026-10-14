@@ -83,39 +83,35 @@ class SpecAdapter(Protocol):
     ) -> list[int]: ...
 
 
-def _build_inkling(
-    *,
-    tokenizer: Any,
-    reasoning_parser: Optional[str],
-    tool_call_parser: Optional[str],
-    chat_hooks: ChatOutputHooks,
-) -> SpecAdapter:
+class SpecAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
+    """Everything a builder may read; a new builder input is a field here, so the
+    builder signature and the one construction site in serving_chat stay stable."""
+
+    tokenizer: Any
+    reasoning_parser: Optional[str]
+    tool_call_parser: Optional[str]
+    chat_hooks: ChatOutputHooks
+
+
+def _build_inkling(ctx: SpecAdapterContext) -> SpecAdapter:
     from sglang.srt.entrypoints.openai.serving_inkling import InklingSpecAdapter
 
     return InklingSpecAdapter(
-        reasoning_parser=reasoning_parser,
-        tool_call_parser=tool_call_parser,
-        chat_hooks=chat_hooks,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
     )
 
 
-_BUILDERS: dict[str, Callable[..., SpecAdapter]] = {"inkling": _build_inkling}
+_BUILDERS: dict[str, Callable[[SpecAdapterContext], SpecAdapter]] = {
+    "inkling": _build_inkling
+}
 
 
 def build_spec_adapter(
-    spec: Optional[str],
-    *,
-    tokenizer: Any,
-    reasoning_parser: Optional[str],
-    tool_call_parser: Optional[str],
-    chat_hooks: ChatOutputHooks,
+    spec: Optional[str], ctx: SpecAdapterContext
 ) -> Optional[SpecAdapter]:
     builder = _BUILDERS.get(spec) if spec is not None else None
     if builder is None:
         return None
-    return builder(
-        tokenizer=tokenizer,
-        reasoning_parser=reasoning_parser,
-        tool_call_parser=tool_call_parser,
-        chat_hooks=chat_hooks,
-    )
+    return builder(ctx)

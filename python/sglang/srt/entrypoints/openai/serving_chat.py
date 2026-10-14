@@ -486,13 +486,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """None keeps ``chat_encoding_spec`` on the branches in ``_encode_messages``."""
         return spec_adapters.build_spec_adapter(
             self.chat_encoding_spec,
-            tokenizer=self.tokenizer_manager.tokenizer,
-            reasoning_parser=self.reasoning_parser,
-            tool_call_parser=self.tool_call_parser,
-            chat_hooks=spec_adapters.ChatOutputHooks(
-                tool_call_parsing_active=self._tool_call_parsing_active,
-                history_tool_calls_count=self._get_history_tool_calls_cnt,
-                tool_call_id=self._process_tool_call_id,
+            spec_adapters.SpecAdapterContext(
+                tokenizer=self.tokenizer_manager.tokenizer,
+                reasoning_parser=self.reasoning_parser,
+                tool_call_parser=self.tool_call_parser,
+                chat_hooks=spec_adapters.ChatOutputHooks(
+                    tool_call_parsing_active=self._tool_call_parsing_active,
+                    history_tool_calls_count=self._get_history_tool_calls_cnt,
+                    tool_call_id=self._process_tool_call_id,
+                ),
             ),
         )
 

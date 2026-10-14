@@ -1270,7 +1270,7 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
 
         load_tml_renderers.cache_clear()
         self.addCleanup(load_tml_renderers.cache_clear)
-        kwargs = dict(
+        ctx = spec_adapters.SpecAdapterContext(
             tokenizer=None,
             reasoning_parser="inkling",
             tool_call_parser="inkling",
@@ -1279,9 +1279,9 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         with patch.dict(sys.modules, {"tml_renderers": None}):
             for spec in (None, "kimi_k3", "dsv4", "dsv41", "dsv32"):
                 with self.subTest(spec=spec):
-                    self.assertIsNone(spec_adapters.build_spec_adapter(spec, **kwargs))
+                    self.assertIsNone(spec_adapters.build_spec_adapter(spec, ctx))
             with self.assertRaises(ImportError):
-                spec_adapters.build_spec_adapter("inkling", **kwargs)
+                spec_adapters.build_spec_adapter("inkling", ctx)
 
     def test_responses_handler_builds_one_adapter_bound_to_itself(self):
         """The Responses handler reuses the adapter from its base init; its
@@ -1302,7 +1302,7 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
             serving = make_serving()
 
         build.assert_called_once()
-        hooks = build.call_args.kwargs["chat_hooks"]
+        hooks = build.call_args.args[1].chat_hooks
         self.assertIs(hooks.tool_call_id.__self__, serving)
         self.assertIsNotNone(serving._spec_adapter)
 
