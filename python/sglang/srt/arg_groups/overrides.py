@@ -542,6 +542,14 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if hip and dcp_size > 1 and decode_backend not in (None, "triton"):
+        raise ValueError(
+            f"The {decode_backend} DSA decode backend does not support "
+            "--dcp-size > 1: the DCP decode path only has the Triton split-K "
+            "kernel, the one that returns the per-row LSE the cross-rank merge "
+            "consumes. Pass --dsa-decode-backend triton."
+        )
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":

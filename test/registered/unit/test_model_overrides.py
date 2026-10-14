@@ -2441,6 +2441,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "triton",
                 },
             )
+            # DCP decode only has the Triton split-K kernel, so the default is
+            # fine but any other explicit decode backend has to be rejected
+            # rather than silently replaced.
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(dcp_size=4)),
+                {
+                    "dsa_prefill_backend": "triton",
+                    "dsa_decode_backend": "triton",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "--dcp-size > 1"):
+                _dsa_split_backend_resolution(
+                    _view(dcp_size=4, dsa_decode_backend="aiter")
+                )
 
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (
