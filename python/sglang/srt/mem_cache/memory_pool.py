@@ -38,7 +38,6 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -381,7 +380,7 @@ class ReqToTokenPool:
     pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
-    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    _on_alloc_rows: tuple[Callable[[List[int]], None], ...] = ()
 
     def __init__(
         self,
@@ -445,8 +444,8 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
-        if self._on_alloc_rows is not None:
-            self._on_alloc_rows(select_index)
+        for hook in self._on_alloc_rows:
+            hook(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -474,9 +473,11 @@ class ReqToTokenPool:
         assert self._aux_cache is None
         self._aux_cache = aux_cache
 
+    def get_mtp_boundary_warmup_tokens(self) -> int:
+        return 0
+
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
-        assert self._on_alloc_rows is None
-        self._on_alloc_rows = hook
+        self._on_alloc_rows += (hook,)
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:
@@ -1436,6 +1437,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
         )
+
+    def get_mtp_boundary_warmup_tokens(self) -> int:
+        return self.mamba_pool.mamba_cache.conv[0].shape[2]
 
     def _init_mamba_pool(
         self,

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
 
 import torch
-
 from sglang.srt.layers.moe.utils import (
     MoeA2ABackend,
     MoeRunnerBackend,
@@ -64,6 +63,9 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    fp8_use_rn_division: bool = False
+    silu_clamp_mode: Optional[str] = None
+    fc1_output_dtype: Optional[str] = None
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False

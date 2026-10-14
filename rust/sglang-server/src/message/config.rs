@@ -141,10 +141,10 @@ pub struct ServerArgs {
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
     /// Per-modality media-count limits from `--limit-mm-data-per-request`.
     pub limit_mm_data_per_request: BTreeMap<String, usize>,
-    /// Over-long inputs are truncated to fit the context instead of 400ing, and
-    /// `max_new_tokens` is clamped rather than rejected (Python
-    /// `TokenizerManager._validate_one_request`).
+    /// Legacy embedding-input truncation flag; generation inputs are never truncated.
     pub allow_auto_truncate: bool,
+    /// Minimum context space a generation prompt must leave for output.
+    pub min_output_token_reserve: u64,
     /// `return_hidden_states` is refused unless the server was launched with it:
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
@@ -188,6 +188,7 @@ impl ServerArgs {
         preferred_sampling_params,
         limit_mm_data_per_request,
         allow_auto_truncate,
+        min_output_token_reserve,
         enable_return_hidden_states,
         num_reserved_tokens,
         version,
@@ -221,6 +222,7 @@ impl ServerArgs {
         preferred_sampling_params: Option<PreferredSamplingParams>,
         limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
+        min_output_token_reserve: u64,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
         version: String,
@@ -252,6 +254,7 @@ impl ServerArgs {
             preferred_sampling_params,
             limit_mm_data_per_request,
             allow_auto_truncate,
+            min_output_token_reserve,
             enable_return_hidden_states,
             num_reserved_tokens,
             version,
@@ -291,6 +294,7 @@ impl Default for ServerArgs {
             preferred_sampling_params: None,
             limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
+            min_output_token_reserve: 1,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
             version: String::new(),
@@ -483,9 +487,14 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
-    ) -> Self {
+    ) -> pyo3::PyResult<Self> {
         use sglang_mm::registry::PipelineSpec;
         let pipeline = match family {
+            MmFamily::Step3Vl => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "MmFamily.Step3Vl is built with MmSpec.step3_vl(...)",
+                ));
+            }
             MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
                 image_token_id,
                 patch_size,
@@ -498,9 +507,62 @@ impl MmSpec {
                 resample: resample.into(),
             }),
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (*,
+        feature_shm,
+        image_token_id,
+        image_start_id,
+        image_end_id,
+        patch_start_id,
+        patch_end_id,
+        patch_newline_id,
+        image_size,
+        patch_size,
+        image_feature_tokens,
+        patch_feature_tokens,
+        image_mean,
+        image_std,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn step3_vl(
+        feature_shm: bool,
+        image_token_id: i64,
+        image_start_id: i64,
+        image_end_id: i64,
+        patch_start_id: i64,
+        patch_end_id: i64,
+        patch_newline_id: i64,
+        image_size: usize,
+        patch_size: usize,
+        image_feature_tokens: usize,
+        patch_feature_tokens: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+    ) -> Self {
+        Self {
+            feature_shm,
+            pipeline: sglang_mm::registry::PipelineSpec::Step3Vl(
+                sglang_mm::step3_vl::Step3VlSpec {
+                    image_token_id,
+                    image_start_id,
+                    image_end_id,
+                    patch_start_id,
+                    patch_end_id,
+                    patch_newline_id,
+                    image_size,
+                    patch_size,
+                    image_feature_tokens,
+                    patch_feature_tokens,
+                    image_mean,
+                    image_std,
+                },
+            ),
         }
     }
 }
@@ -517,6 +579,7 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    Step3Vl,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see

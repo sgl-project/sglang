@@ -11,8 +11,12 @@ class UsageProcessor:
 
     @staticmethod
     def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+        """Report the cached-token count whenever cache reporting is enabled.
+
+        Call sites are already gated on ``enable_cache_report``; a cache miss
+        must still report ``cached_tokens: 0`` rather than omitting the field.
+        """
+        return PromptTokensDetails(cached_tokens=count)
 
     @staticmethod
     def calculate_response_usage(

@@ -149,7 +149,7 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
 /// A context ceiling high enough that only a test which sets one on purpose
 /// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
 /// large number rather than `None`; kept well below `u64::MAX` so the
-/// `as i64` in the auto-truncate clamp cannot go negative if a future test
+/// `as i64` in the output clamp cannot go negative if a future test
 /// does reach this path.
 const NO_CONTEXT_CEILING: u64 = 1 << 40;
 
@@ -162,6 +162,7 @@ fn test_limits() -> Limits {
         skip_tokenizer_init: false,
         vocab_size: 1000,
         context_len: NO_CONTEXT_CEILING,
+        min_output_token_reserve: 1,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         enable_return_hidden_states: false,
@@ -183,11 +184,9 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
     }
 }
 
-/// `input + max_new_tokens` past the context window is an actionable 400, not a
-/// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
-/// The message names both halves so the client can fix the right one.
+/// Output budget is capped without rejecting or truncating the prompt.
 #[test]
-fn total_tokens_over_context_is_rejected() {
+fn total_tokens_over_context_is_clamped() {
     let limits = Limits {
         context_len: 10,
         ..test_limits()
@@ -200,22 +199,17 @@ fn total_tokens_over_context_is_rejected() {
         },
         ..Default::default()
     };
-    let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    let msg = err.to_string();
-    assert!(matches!(err, Error::Validation(_)));
-    assert!(msg.contains("total of 103 tokens"), "{msg}");
-    assert!(msg.contains("3 tokens from the input"), "{msg}");
-    assert!(msg.contains("100 tokens for the completion"), "{msg}");
+    check_total_tokens(&mut g, &limits).unwrap();
+    assert_eq!(g.sampling_params.max_new_tokens, Some(7));
     // Exactly filling the window is allowed (Python compares with `>`).
     g.sampling_params.max_new_tokens = Some(7);
     assert!(check_total_tokens(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
-/// The reserved slots (eagle draft tokens) count as input, so a request can be
-/// rejected for them even when the prompt alone would fit.
+/// Speculative scratch slots are separate from the public context.
 #[test]
-fn reserved_tokens_count_toward_the_limit() {
+fn draft_scratch_does_not_reduce_public_context() {
     let limits = Limits {
         context_len: 10,
         num_reserved_tokens: 5,
@@ -229,14 +223,35 @@ fn reserved_tokens_count_toward_the_limit() {
         },
         ..Default::default()
     };
-    let msg = check_total_tokens(&mut g, &limits).unwrap_err().to_string();
-    assert!(msg.contains("8 tokens from the input"), "{msg}");
+    check_total_tokens(&mut g, &limits).unwrap();
+    assert_eq!(g.sampling_params.max_new_tokens, Some(3));
 }
 
-/// `--allow-auto-truncate` opts into clamping instead of rejecting; with no
-/// context length, or no `max_new_tokens` cap, there is nothing to check.
 #[test]
-fn auto_truncate_clamps_and_unknowns_skip() {
+fn configurable_output_reserve_checks_input_boundary() {
+    let limits = Limits {
+        context_len: 128,
+        min_output_token_reserve: 16,
+        ..test_limits()
+    };
+    for (length, accepted) in [(112, true), (113, false)] {
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1; length]),
+            ..Default::default()
+        };
+        g.sampling_params.max_new_tokens = Some(1000);
+        assert_eq!(check_total_tokens(&mut g, &limits).is_ok(), accepted);
+        assert_eq!(g.input_ids.as_ref().unwrap().len(), length);
+        if accepted {
+            assert_eq!(g.sampling_params.max_new_tokens, Some(16));
+        }
+    }
+}
+
+/// Output clamping also applies with the legacy flag. An unspecified output
+/// cap is left for the scheduler; prompt admission is always checked.
+#[test]
+fn output_clamps_with_legacy_flag_and_unspecified_cap() {
     let sp = |max_new_tokens| SamplingParams {
         max_new_tokens,
         ..Default::default()
@@ -254,7 +269,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     assert!(check_total_tokens(&mut g, &truncating).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped to fit");
 
-    // Unknown context length → no ceiling to enforce.
+    // A sufficiently large context leaves the requested cap unchanged.
     g.sampling_params = sp(Some(100));
     assert!(check_total_tokens(&mut g, &test_limits()).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(100), "untouched");
@@ -272,8 +287,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
 /// alone must still fit. Gating the whole function on `max_new_tokens` let an
 /// over-long prompt through to the scheduler with no error at all.
-/// Python compares with `>=`: a prompt that exactly fills the window leaves no
-/// room to generate.
+/// A prompt that exactly fills the window leaves no room to generate.
 #[test]
 fn input_length_is_checked_unconditionally() {
     let limits = Limits {
@@ -290,9 +304,9 @@ fn input_length_is_checked_unconditionally() {
     };
     for max_new_tokens in [None, Some(1)] {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
-            .expect_err("input == context_len must be rejected (Python uses >=)");
+            .expect_err("input == context_len must be rejected");
         assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("longer than the model's context"));
+        assert!(err.to_string().contains("maximum allowed prompt length"));
     }
     // One token shorter fits, with or without a cap.
     let mut g = GenerateRequest {
@@ -302,17 +316,17 @@ fn input_length_is_checked_unconditionally() {
     g.sampling_params.max_new_tokens = None;
     assert!(check_total_tokens(&mut g, &limits).is_ok());
 
-    // Under auto-truncate the input is cut to fit instead of rejected.
+    // Generation inputs are never truncated, even with the legacy flag.
     let truncating = Limits {
         allow_auto_truncate: true,
         ..limits.clone()
     };
     let mut g = req(None);
-    assert!(check_total_tokens(&mut g, &truncating).is_ok());
+    assert!(check_total_tokens(&mut g, &truncating).is_err());
     assert_eq!(
         g.input_ids.as_deref(),
         Some(&[1, 2, 3][..]),
-        "fits at the cap"
+        "prompt is unchanged"
     );
 }
 
@@ -321,7 +335,7 @@ fn input_length_is_checked_unconditionally() {
 /// downstream re-checks — `is_normalized: true` makes the scheduler's own
 /// verify early-return — so the clamp has to re-assert it here.
 #[test]
-fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
+fn output_clamp_cannot_invert_min_and_max_new_tokens() {
     let limits = Limits {
         context_len: 10,
         allow_auto_truncate: true,
@@ -383,7 +397,7 @@ fn hidden_states_gated_on_server_support() {
 #[test]
 fn over_context_request_deregisters_and_never_reaches_the_channel() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
-        context_len: 4,
+        context_len: 3,
         ..test_limits()
     });
     intake.drive(generate_req(

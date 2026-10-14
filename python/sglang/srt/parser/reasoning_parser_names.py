@@ -29,6 +29,7 @@ REASONING_PARSER_NAMES = [
     "nanbeige",
     "step3",
     "step3p5",
+    "step5",
     "mistral",
     "nemotron_3",
     "granite_thinking_parser",

@@ -28,7 +28,7 @@ class TestRequestLengthValidation(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=("--max-total-tokens", "1000", "--context-length", "1000"),
+            other_args=("--max-total-tokens", "4096", "--context-length", "1000"),
         )
 
     @classmethod
@@ -49,12 +49,14 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn("maximum allowed prompt length", str(cm.exception))
 
     def test_input_length_longer_than_maximum_allowed_length(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
 
-        long_text = "hello " * 999  # the maximum allowed length is 994 tokens
+        long_text = (
+            "hello " * 999
+        )  # Chat template pushes the prompt over the admission limit
 
         with self.assertRaises(openai.BadRequestError) as cm:
             client.chat.completions.create(
@@ -65,7 +67,7 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn("maximum allowed prompt length", str(cm.exception))
 
     def test_input_length_longer_than_context_length_streaming(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
@@ -82,27 +84,47 @@ class TestRequestLengthValidation(CustomTestCase):
                 stream=True,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn("maximum allowed prompt length", str(cm.exception))
 
     def test_max_tokens_validation(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
 
         long_text = "hello "
 
-        with self.assertRaises(openai.BadRequestError) as cm:
-            client.chat.completions.create(
-                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                messages=[
-                    {"role": "user", "content": long_text},
-                ],
-                temperature=0,
-                max_tokens=1200,
-            )
-
-        self.assertIn(
-            "max_completion_tokens is too large",
-            str(cm.exception),
+        response = client.chat.completions.create(
+            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            messages=[{"role": "user", "content": long_text}],
+            temperature=0,
+            max_tokens=1200,
         )
+        self.assertLessEqual(
+            response.usage.prompt_tokens + response.usage.completion_tokens, 1000
+        )
+
+    def test_exact_context_boundary(self):
+        # Use token IDs to avoid chat-template/tokenizer length ambiguity.
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for prompt_tokens in (998, 999, 1000):
+            with self.subTest(prompt_tokens=prompt_tokens):
+                response = requests.post(
+                    f"{self.base_url}/generate",
+                    headers=headers,
+                    json={
+                        "input_ids": [1] * prompt_tokens,
+                        "sampling_params": {
+                            "max_new_tokens": 100,
+                            "ignore_eos": True,
+                        },
+                    },
+                    timeout=60,
+                )
+                if prompt_tokens == 1000:
+                    self.assertEqual(response.status_code, 400, response.text)
+                else:
+                    self.assertEqual(response.status_code, 200, response.text)
+                    usage = response.json()["meta_info"]
+                    self.assertEqual(usage["prompt_tokens"], prompt_tokens)
+                    self.assertEqual(usage["completion_tokens"], 1000 - prompt_tokens)
 
     def test_token_ids_logprob_out_of_vocabulary(self):
         headers = {"Authorization": f"Bearer {self.api_key}"}

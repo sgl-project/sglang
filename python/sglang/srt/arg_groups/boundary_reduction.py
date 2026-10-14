@@ -12,6 +12,9 @@ _RSV_ARCHITECTURES = {
     "Step3VLForConditionalGeneration",
 }
 _AR_ARCHITECTURES = {
+    "Step5ForCausalLM",
+    "Step5MTP",
+    "Step5ForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK3LinearForCausalLM",
     "Qwen3ForCausalLM",

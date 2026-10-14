@@ -1262,10 +1262,16 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("error", types)
         self.assertEqual(types[-1], "message_stop")
 
-    def test_stream_pre_first_chunk_value_error_emits_envelope(self):
-        """ValueError before any chunk must yield a clean Anthropic error sequence."""
+    def test_stream_pre_first_chunk_value_error_returns_http_400(self):
+        """Admission errors must not be hidden in an HTTP 200 SSE response."""
 
         class _RaisingOpenAI(_FakeOpenAIServingChat):
+            def _validate_request(self, request):
+                return None
+
+            def _convert_to_internal_request(self, request, raw_request):
+                return SimpleNamespace(), request
+
             def _generate_chat_stream(
                 self, adapted_request, processed_request, raw_request
             ):
@@ -1276,16 +1282,16 @@ class TestAnthropicServing(unittest.TestCase):
                 return _gen()
 
         serving = AnthropicServing(_RaisingOpenAI())
-        events = asyncio.run(
-            _collect_anthropic_events(serving, self._anthropic_request())
+        request = self._anthropic_request()
+        response = asyncio.run(
+            serving._handle_streaming(
+                serving._convert_to_chat_completion_request(request), request, None
+            )
         )
-        types = [e["type"] for e in events]
-        self.assertEqual(types[0], "message_start")
-        self.assertIn("error", types)
-        err = next(e for e in events if e["type"] == "error")
+        self.assertEqual(response.status_code, 400)
+        err = json.loads(response.body)
         self.assertEqual(err["error"]["type"], "invalid_request_error")
         self.assertIn("tokenization failed", err["error"]["message"])
-        self.assertEqual(types[-1], "message_stop")
 
     def test_server_tool_only_with_tool_choice_any_raises_400(self):
         """A request with only server-side tools cannot honor tool_choice=any."""

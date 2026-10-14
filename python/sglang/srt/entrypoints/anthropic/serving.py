@@ -811,13 +811,26 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
+        generator = self._generate_anthropic_stream(
+            adapted_request, processed_request, anthropic_request, raw_request
+        )
+        # Validate before committing HTTP 200, just like chat completions.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
         return StreamingResponse(
-            self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
-            ),
+            prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
                 adapted_request
@@ -986,11 +999,8 @@ class AnthropicServing:
             )
             return error_type, str(upstream_message)
 
-        # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization
-        # failure that raises ValueError before any chunk is yielded) would
-        # otherwise abort the StreamingResponse with no envelope at all and
-        # the client would see a half-open SSE / TCP close. Catch them here
-        # and emit a clean Anthropic error sequence instead.
+        # Before message_start, validation errors can still become HTTP 400.
+        # Once the response has started, errors must use the SSE envelope.
         try:
             stream_iter = openai_stream.__aiter__()
         except Exception as e:
@@ -1007,11 +1017,9 @@ class AnthropicServing:
             except asyncio.CancelledError:
                 raise
             except ValueError as e:
-                # _generate_chat_stream re-raises ValueError when its own
-                # ``stream_started`` flag is still False — surface as a
-                # proper Anthropic error event rather than aborting the
-                # StreamingResponse generator.
-                logger.warning("OpenAI stream raised before first chunk: %s", e)
+                if not message_started:
+                    raise
+                logger.warning("OpenAI stream raised after message_start: %s", e)
                 for frame in _flush_on_error(
                     "invalid_request_error", str(e) or "Request failed"
                 ):

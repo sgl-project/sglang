@@ -466,7 +466,7 @@ def fused_moe_kernel(
                 stride_cn,
                 pid_n,
                 N,
-                offs_token,
+                offs_token_id if c_sorted else offs_token,
                 token_mask,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
@@ -821,7 +821,12 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    fp8_use_rn_division: bool = False,
 ) -> None:
+    if fp8_use_rn_division and (
+        not _is_cuda or not use_fp8_w8a8 or block_shape is None
+    ):
+        raise ValueError("RN division requires CUDA block-wise FP8 MoE")
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -862,6 +867,14 @@ def invoke_fused_moe_kernel(
                 # the matching scales (row- or column-major, strides are
                 # passed to the kernel below).
                 assert A_scale is not None
+            elif fp8_use_rn_division:
+                from sglang.kernels.ops.quantization.per_token_group_quant import (
+                    per_token_group_quant,
+                )
+
+                A, A_scale = per_token_group_quant(
+                    A, group_size=block_k, use_rn_division=True
+                )
             elif _is_cuda:
                 A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:

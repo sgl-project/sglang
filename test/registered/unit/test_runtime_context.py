@@ -37,6 +37,11 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolved_view,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -52,6 +57,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_spec,
+    max_decode_batch_tokens,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
@@ -726,6 +733,46 @@ class TestParallelDCP(_IsolatedOverrides):
             self.assertTrue(parallel.dcp_enabled)
             self.assertEqual(parallel.attn_dcp_size, 8)
             is_cuda.assert_not_called()
+
+
+class TestMaxDecodeBatchTokens(_IsolatedOverrides):
+    def _published(self, **fields):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", **fields), role="test")
+
+    def test_running_requests_times_draft_tokens(self):
+        self._published(
+            max_running_requests=128,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(max_decode_batch_tokens(), 512)
+
+    def test_without_speculation_equals_running_requests(self):
+        self._published(max_running_requests=96)
+        self.assertEqual(max_decode_batch_tokens(), 96)
+
+    def test_adaptive_speculation_uses_the_widest_draft(self):
+        self._published(max_running_requests=64)
+        with get_spec().override(
+            speculative_num_draft_tokens=4, max_speculative_num_draft_tokens=8
+        ):
+            self.assertEqual(max_decode_batch_tokens(), 512)
+
+    def test_falls_back_to_the_decode_graph_batch(self):
+        self._published(
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=160)
+            ),
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(max_decode_batch_tokens(), 640)
 
 
 class _IsolatedServerArgs(CustomTestCase):

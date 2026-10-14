@@ -547,10 +547,10 @@ class TpModelWorker(BaseTpWorker):
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
         max_req_len = min(
-            self.model_config.context_len - 1,
+            self.model_config.context_len,
             kv_capacity - 1,
         )
-        max_req_input_len = max_req_len - 5
+        max_req_input_len = max_req_len - get_serving().min_output_token_reserve
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (

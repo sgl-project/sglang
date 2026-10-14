@@ -40,6 +40,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -296,6 +297,8 @@ def _initialize_model(
         "config": model_config.hf_config,
         "quant_config": quant_config,
     }
+    if get_step5_text_config(model_config.hf_config) is not None:
+        kwargs["valid_vocab_size"] = model_config.vocab_size
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():

@@ -1,8 +1,10 @@
 """Fused gated-activation kernels (``act(x[:h]) * x[h:]``).
 
 Each operator is a :class:`~sglang.kernels.fused_op.BaseFusedOp` with a
-pure-``torch`` reference (``forward_native``) plus AOT (``sgl_kernel``) and
-JIT CUDA backends behind one ``(input, out)`` signature. The JIT backend
+pure-``torch`` reference (``forward_native``) and optimized backends behind
+one ``(input, out)`` signature. The ordinary gated activations have AOT
+(``sgl_kernel``) and JIT CUDA backends; post-SiLU clamping has a Triton backend.
+The JIT backend
 additionally accepts ``expert_ids`` / ``expert_step`` — call
 ``forward_jit`` directly when those are needed.
 """
@@ -12,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
+from sglang.kernels.ops.activation.silu_clamp_and_mul import SiluClampAndMulOp
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
@@ -266,6 +269,9 @@ class QuickGELUOp(BaseFusedOp):
 
 
 _SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")
+_SILU_CLAMP_AND_MUL = register_fused_op(
+    SiluClampAndMulOp(), __name__, "_SILU_CLAMP_AND_MUL"
+)
 _GELU_AND_MUL = register_fused_op(GeluAndMulOp(), __name__, "_GELU_AND_MUL")
 _GELU_TANH_AND_MUL = register_fused_op(
     GeluTanhAndMulOp(), __name__, "_GELU_TANH_AND_MUL"
@@ -286,6 +292,13 @@ def gelu_and_mul(
 ) -> torch.Tensor:
     """``out = gelu(input[..., :d]) * input[..., d:]``."""
     return _GELU_AND_MUL(input, out)
+
+
+def silu_clamp_and_mul(
+    input: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Post-SiLU clamp with limit 7; use ``SiluClampAndMulOp`` for another limit."""
+    return _SILU_CLAMP_AND_MUL(input, out)
 
 
 def gelu_tanh_and_mul(
@@ -319,11 +332,13 @@ def situ_and_mul(
 __all__ = [
     "situ_and_mul",
     "SiluAndMulOp",
+    "SiluClampAndMulOp",
     "GeluAndMulOp",
     "GeluTanhAndMulOp",
     "ReLU2Op",
     "QuickGELUOp",
     "silu_and_mul",
+    "silu_clamp_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
     "relu2",

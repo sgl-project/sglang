@@ -97,6 +97,7 @@ def _build_server_args(
         ),
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
+        min_output_token_reserve=get_serving().min_output_token_reserve,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.

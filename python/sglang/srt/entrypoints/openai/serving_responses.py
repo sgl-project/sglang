@@ -957,10 +957,16 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _error_from_finish_reason(cls, finish_reason: Any) -> Optional[dict]:
         if cls._status_from_finish_reason(finish_reason) != "failed":
             return None
-        message = (
-            finish_reason.get("message") if isinstance(finish_reason, dict) else None
+        message = status_code = None
+        if isinstance(finish_reason, dict):
+            message = finish_reason.get("message")
+            status_code = finish_reason.get("status_code")
+        code = (
+            "invalid_request_error"
+            if status_code == HTTPStatus.BAD_REQUEST
+            else "server_error"
         )
-        return {"code": "server_error", "message": message or "Generation aborted"}
+        return {"code": code, "message": message or "Generation aborted"}
 
     @staticmethod
     def _terminal_stream_event(response: dict):
