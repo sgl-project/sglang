@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
-from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     rollout_transition,
 )
 from sglang.multimodal_gen.runtime.server_args import (
