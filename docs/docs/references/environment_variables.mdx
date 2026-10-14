@@ -1916,6 +1916,9 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm with Quark per-channel FP8 attention: requantize <code>kv_b</code> to per-tensor FP8 so the MLA absorb BMMs run the AITER a8w8 kernel. Adds about 2.3% weight error compared with dequantizing to BF16.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950: write the MLA decode Q (identity RoPE plus concat) and the latent KV cache in one AITER launch. Falls back to the split chain when AITER, the chip or the shapes do not match.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>
 </table>

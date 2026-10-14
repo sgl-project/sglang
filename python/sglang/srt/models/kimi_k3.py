@@ -2232,6 +2232,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 )
                 self.register_parameter(f"{role}_b_qweight_type", qweight_type)
             self._kimi_split_gguf_kv_b = True
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_mla import init_mla_rocm_state
+
+            init_mla_rocm_state(self)
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -2329,6 +2333,29 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return AttnForwardMethod.MLA
         return method
+
+    def _try_fused_mla_q_cache(
+        self,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not _is_hip:
+            return None
+        from sglang.srt.models.kimi_k3_rocm_mla import try_fused_mla_q_cache
+
+        return try_fused_mla_q_cache(
+            self,
+            q_nope_out=q_nope_out,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+        )
 
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
