@@ -361,6 +361,12 @@ class StepPlanner:
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.core_lists.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # Read once per admission: only a PD role switch changes it, on an idle
+        # instance.
+        is_pd_prefill = (
+            DisaggregationMode(get_disagg().disaggregation_mode)
+            == DisaggregationMode.PREFILL
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.core_lists.waiting_queue:
             if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
@@ -388,10 +394,7 @@ class StepPlanner:
                 running_bs, candidate_beam_width
             ):
                 slot.batch_is_full = True
-            if (
-                DisaggregationMode(get_disagg().disaggregation_mode)
-                == DisaggregationMode.PREFILL
-            ):
+            if is_pd_prefill:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
