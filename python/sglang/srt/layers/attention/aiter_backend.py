@@ -695,6 +695,19 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+            self.use_k3_mla_verify = (
+                is_gfx95_supported()
+                and self.dcp_world_size <= 1
+                and self.kv_cache_dtype == fp8_dtype
+                and self.num_draft_tokens == 8
+                and getattr(self, "num_head", None) == 12
+                and prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+            )
+
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
         reps = -(-padded // num_head)  # ceil(padded / num_head)
@@ -1300,6 +1313,30 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
             )
         return self._arange_buf[:length]
+
+    def _forward_k3_mla_verify(
+        self, q: torch.Tensor, layer: RadixAttention, k_descale
+    ) -> torch.Tensor:
+        args = (
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            layer.scaling,
+            k_descale if k_descale is not None else self.k_scale,
+        )
+        kwargs = dict(
+            num_heads=layer.tp_q_head_num,
+            qlen=self.num_draft_tokens,
+            v_head_dim=layer.v_head_dim,
+        )
+        from sglang.kernels.ops.attention.k3_mla_verify_auto import k3_mla_verify_auto
+
+        return k3_mla_verify_auto(
+            *args,
+            kv_scale_float=self._resolve_fp8_kv_scale_float(layer, k_descale),
+            **kwargs,
+        )
 
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
@@ -3977,6 +4014,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.use_k3_mla_verify:
+                    return self._forward_k3_mla_verify(q, layer, k_descale)
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),

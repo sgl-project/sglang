@@ -268,6 +268,24 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    (
+        "k3_mla_verify_auto",
+        "k3_mla_verify_auto",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_mla_verify_hk",
+        "hk_stage1",
+        KernelBackend.JIT,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_mla_verify_hk",
+        "hk_reduce",
+        KernelBackend.JIT,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(
