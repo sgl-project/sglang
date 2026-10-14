@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -338,20 +338,29 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     if cfg.enable_decoder_swa_bounded_replay:
         # Late layers see a per-request tail slice, not the captured prefill shape.
+        # The breakable backend is admitted: the tail switch runs as eager breaks and
+        # the tail is a fixed-capacity row block inside the captured segments.
         incompatible = (
             (
                 "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
-            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
-            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            # Late-layer communication uses one row count per attention-DP rank.
+            # Attention TP/CP shards need a separate tail padding layout.
             (
-                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                "DP attention other than attention TP 1 with supported MoE backends",
                 attn_dp_enabled_of(cfg)
                 and not (
-                    is_hip()
-                    and cfg.moe_a2a_backend == "none"
-                    and cfg.attn_dp_size == cfg.tp_size
+                    cfg.attn_dp_size == cfg.tp_size
+                    and cfg.attn_cp_size == 1
+                    and (
+                        (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                        or (
+                            get_platform().is_cuda
+                            and cfg.moe_a2a_backend in ("none", "megamoe")
+                        )
+                    )
                 ),
             ),
         )

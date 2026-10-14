@@ -37,6 +37,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     stale = object()
     fresh = object()
     loads = []
+    sampler_runs = []
     executor = SimpleNamespace(
         generator=stale,
         _sgld_reload={
@@ -45,6 +46,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
             "sgld_options": {},
         },
         _lora_input=None,
+        begin_sampler_run=lambda: sampler_runs.append(True),
     )
 
     def fake_load(**kwargs):
@@ -56,6 +58,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     runtime.ensure_executor(executor)
     assert loads == [executor._sgld_reload]
     assert executor.generator is fresh
+    assert sampler_runs == [True]
 
 
 def test_ensure_is_noop_when_executor_still_owns_live_worker() -> None:
@@ -366,3 +369,24 @@ def test_renamed_h3_paths_resolve_through_the_plugin_model_id(
     assert seen["warmup_mode"] == "off"
     info = _get_config_info(path, model_id=seen["model_id"])
     assert info.pipeline_config_cls.__name__ == config_cls
+
+
+def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
+    """The plugin reads the OpenAI /v1/models route, not the deprecated root
+    /models, so it must unwrap the card from the list envelope."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import server_api
+
+    card = {"id": "wan", "object": "model", "task_type": "T2V"}
+    urls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        urls.append(url)
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"object": "list", "data": [card]},
+        )
+
+    monkeypatch.setattr(server_api.requests, "get", fake_get)
+    client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
+    assert client.get_model_info() == card
+    assert urls == ["http://host:30010/v1/models"]
