@@ -3248,6 +3248,48 @@ class ServingChatTestCase(CustomTestCase):
         return parsed
 
     def test_streaming_created_is_stable_across_chunks(self):
+        for spec in (None, "inkling"):
+            with self.subTest(spec=spec):
+                if spec == "inkling":
+                    self._stream_inkling_output_in_two_chunks()
+                self._assert_streaming_created_is_stable()
+
+    def _stream_inkling_output_in_two_chunks(self):
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        output_ids = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+            *tokenizer.encode_ordinary("Hello there"),
+            tokenizer.encode_special("end_message"),
+        ]
+
+        async def generate():
+            for count, finish in (
+                (len(output_ids) - 1, None),
+                (len(output_ids), {"type": "stop", "matched": None}),
+            ):
+                yield {
+                    "text": "",
+                    "output_ids": output_ids[:count],
+                    "index": 0,
+                    "meta_info": {
+                        "id": "chatcmpl-inkling",
+                        "prompt_tokens": 2,
+                        "completion_tokens": count,
+                        "cached_tokens": 0,
+                        "finish_reason": finish,
+                    },
+                }
+
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat.reasoning_parser = "inkling"
+        self.chat.tool_call_parser = "inkling"
+        self.chat._spec_adapter = self.chat._build_spec_adapter()
+        self.tm.generate_request.return_value = generate()
+
+    def _assert_streaming_created_is_stable(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -5256,6 +5298,7 @@ class InklingTokenOutputTest(CustomTestCase):
                     },
                     index=0,
                     request=request,
+                    created=0,
                     parser_dict=parser_dict,
                     has_tool_calls={},
                     choice_logprobs=None,
@@ -5342,6 +5385,7 @@ class InklingTokenOutputTest(CustomTestCase):
                     },
                     index=0,
                     request=request,
+                    created=0,
                     parser_dict=parser_dict,
                     has_tool_calls={} if has_tool_calls is None else has_tool_calls,
                     choice_logprobs=None,

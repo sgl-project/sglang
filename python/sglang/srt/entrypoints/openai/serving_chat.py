@@ -830,6 +830,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 content=content,
                 index=index,
                 request=request,
+                created=created,
                 parser_dict=parser_dict,
                 has_tool_calls=has_tool_calls,
                 choice_logprobs=choice_logprobs,

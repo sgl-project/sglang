@@ -53,6 +53,7 @@ class SpecOutputAdapter(Protocol):
         content: dict[str, Any],
         index: int,
         request: ChatCompletionRequest,
+        created: int,
         parser_dict: dict[int, Any],
         has_tool_calls: dict[int, bool],
         choice_logprobs: Optional[dict],

@@ -4,7 +4,6 @@ Chat Completions and Responses APIs."""
 from __future__ import annotations
 
 import math
-import time
 from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -130,6 +129,7 @@ class InklingSpecAdapter:
         content: dict[str, Any],
         index: int,
         request: ChatCompletionRequest,
+        created: int,
         parser_dict: dict,
         has_tool_calls: dict[int, bool],
         choice_logprobs: dict | None,
@@ -157,7 +157,7 @@ class InklingSpecAdapter:
 
         chunk_fields = dict(
             chunk_id=content["meta_info"]["id"],
-            created=int(time.time()),
+            created=created,
             model=request.model,
             index=index,
             usage=usage,
