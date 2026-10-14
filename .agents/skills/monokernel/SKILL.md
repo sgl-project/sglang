@@ -18,8 +18,14 @@ dtype), in its own PR.
 
 ```
 python/sglang/kernels/ops/mono/
-  hooks.py                 the calls SGLang makes: handle_monokernel (config),
+  __init__.py              re-exports the calls SGLang makes: handle_monokernel,
                            load_tensor, attach, route, kernel
+  guards.py                before any process starts: handle_monokernel refuses
+                           an unsupported setup with every reason and sets the
+                           decode capture sizes; every wait's deadline
+  runtime.py               in each process: load_tensor, attach (refuse with the
+                           loaded weights, build, compare the ranks' plans),
+                           route, kernel
   spec.py                  what a model declares (MonoSpec, Span, Feature,
                            Numerics) and the registry, by HF architecture
   common_hip/              the shared device runtime: resident grid, mailboxes,
@@ -36,7 +42,8 @@ while you fix, tune or extend the plugin:
 - `arg_groups/fields/exec_.py`: the `enable_monokernel` flag.
 - `arg_groups/pipeline.py` and `resolution_hooks.py`: the `handle_monokernel` call
   and its whitelist entry.
-- Each covered model: `mono.load_tensor()` in `load_weights()`, `mono.attach()` in
+- Each covered model, through `from sglang.kernels.ops import mono`:
+  `mono.load_tensor()` in `load_weights()`, `mono.attach()` in
   `precompile_kernels_after_loading()`, one `mono.route()` a forward, and
   `mono.kernel(plan, layer_id, point)` where a span starts. For DeepSeek-V4.1:
   `models/deepseek_v4.py`, `models/deepseek_common/amd/deepseek_v4_hip.py` and

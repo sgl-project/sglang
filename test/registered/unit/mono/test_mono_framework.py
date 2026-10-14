@@ -9,16 +9,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.mono import hooks as mono
+from sglang.kernels.ops import mono
+from sglang.kernels.ops.mono import guards, runtime
 from sglang.kernels.ops.mono import spec as registry
-from sglang.kernels.ops.mono.hooks import (
+from sglang.kernels.ops.mono.guards import (
     MAX_DEADLINE_S,
     covered_capture_sizes,
     deadline_s,
     features_in_use,
     monokernel_disable_reasons,
-    shape_key,
 )
+from sglang.kernels.ops.mono.runtime import shape_key
 from sglang.kernels.ops.mono.spec import (
     BuildContext,
     DeviceLimits,
@@ -140,7 +141,7 @@ def attached(widths=None):
     """A model as attach() leaves it: ``mono`` holds the runtime."""
     widths = widths or SPEC.widths("gfx950")
     built = SPEC.build(None, None, BuildContext("gfx950", widths, 30.0, {}))
-    rt = mono.MonoRuntime(built, range(LAYERS), widths)
+    rt = runtime.MonoRuntime(built, range(LAYERS), widths)
     return SimpleNamespace(mono=rt), built
 
 
@@ -221,7 +222,7 @@ def test_exact_modes_take_only_bitwise_specs(monkeypatch):
         )
         assert reasons == []  # SPEC is BITWISE
     tol = replace(SPEC, numerics=Numerics(NumericsKind.TOLERANCE, {"k1.q.rel": 5e-3}))
-    monkeypatch.setattr(mono, "find_spec", lambda arch, isa: (tol, None))
+    monkeypatch.setattr(guards, "find_spec", lambda arch, isa: (tol, None))
     _, reasons = monokernel_disable_reasons(cfg(**modes), model_config(), "gfx950")
     text = " | ".join(reasons)
     assert "--enable-deterministic-inference" in text, text
@@ -295,17 +296,17 @@ def test_tolerance_numerics_need_per_output_bounds():
 
 
 def test_load_hook_keeps_copies_by_kind(monkeypatch):
-    monkeypatch.setattr(mono, "enabled", lambda: True)
-    monkeypatch.setattr(mono, "device_isa", lambda: "gfx950")
+    monkeypatch.setattr(runtime, "enabled", lambda: True)
+    monkeypatch.setattr(runtime, "device_isa", lambda: "gfx950")
     model = torch.nn.Module()
     model.config = SimpleNamespace(architectures=[ARCH])
     mono.load_tensor(model, "layers.0.shared.weight", torch.ones(16, dtype=torch.uint8))
     mono.load_tensor(model, "layers.0.other.weight", torch.ones(16))
     copies = model.__dict__["_mono_copies"]
     assert list(copies) == [("shared expert", "layers.0.shared.weight")]
-    assert mono._sizes(copies) == "shared expert 1 x 0.0 MiB"
+    assert runtime._sizes(copies) == "shared expert 1 x 0.0 MiB"
     # off: the hook does nothing
-    monkeypatch.setattr(mono, "enabled", lambda: False)
+    monkeypatch.setattr(runtime, "enabled", lambda: False)
     other = torch.nn.Module()
     other.config = model.config
     mono.load_tensor(other, "layers.0.shared.weight", torch.ones(16))

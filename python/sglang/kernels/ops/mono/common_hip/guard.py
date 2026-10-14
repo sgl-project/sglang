@@ -12,7 +12,7 @@ that step's data, so its tokens are correct; nothing is checked on the host.
 
 The deadline comes from ``--watchdog-timeout`` (half of it, at most 60 s), and
 one under 5 s is refused, so that a normal delay on one rank is not a failure
-(``kernels/ops/mono/hooks.py``). A satisfied wait costs nothing
+(``kernels/ops/mono/guards.py``). A satisfied wait costs nothing
 more, and so does a pending one that the data reaches within ``CHECK_POLLS``
 polls; a longer one checks the failure flags every ``CHECK_POLLS`` polls and its
 deadline on the 100 MHz ``s_memrealtime`` clock from the first of those checks.
@@ -63,7 +63,7 @@ FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
 
 CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
 
-# The SGLang names this module reads (see hooks.SGLANG_READS)
+# The SGLang names this module reads (as in ``kernels/ops/mono/guards.py``)
 SGLANG_READS = {"srt/environ.py": ("envs", "SGLANG_TEST_MONO_FAULT_INJECT")}
 
 

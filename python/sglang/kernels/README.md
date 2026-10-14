@@ -60,10 +60,11 @@ projection may stay in `attention`. A model name inside a logical group is fine.
 `mono` is its own group because it has a distinct responsibility: monokernels,
 persistent kernels that run most of a decoder layer in one or two launches
 (RFC #43949). It is the one exception to the next rule: the group also holds
-the monokernel runtime (`hooks.py`, the calls SGLang makes; `spec.py`; each
-model's spec and glue in `<model>_<vendor>/spec.py`, next to its kernels).
-Monokernel work then changes `srt` only where it must: the hook calls at fixed
-points in a model's code, and any cache feature a kernel needs, in its own PR.
+the monokernel runtime (`guards.py` and `runtime.py`, the calls SGLang makes;
+`spec.py`; each model's spec and glue in `<model>_<vendor>/spec.py`, next to
+its kernels). Monokernel work then changes `srt` only where it must: the hook
+calls at fixed points in a model's code, and any cache feature a kernel needs,
+in its own PR.
 
 Runtime integration that owns process groups, symmetric buffers, or model
 dispatch stays in `srt`; the K3 communication adapters live in
