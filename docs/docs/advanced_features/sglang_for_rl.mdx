@@ -480,6 +480,18 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`nccl`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`receiver`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>External receiver factory import path; must be listed in `--weight-update-receivers`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None` (torch process group path)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`receiver_init_payload`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opaque payload handed to the receiver factory; never interpreted by SGLang.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: dict</td>
+    </tr>
   </tbody>
 </table>
 
@@ -553,6 +565,12 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None` or `flattened_bucket`</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`receiver_payload`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opaque per-round payload for the group's external receiver; on a receiver group `names`/`dtypes`/`shapes` must be empty.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: dict</td>
+    </tr>
   </tbody>
 </table>
 
@@ -594,6 +612,20 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 - `engine.update_weights_from_distributed(names, dtypes, shapes, ...)`
 - `engine.end_weight_update()`
 - `engine.destroy_weights_update_group(group_name)`
+
+### External Weight-Update Receivers
+
+An external service can receive weights into the live model on every TP worker without patching SGLang: a factory from your own package replaces the torch process group. Launch the server with `--weight-update-receivers` listing the allowed factory paths — dotted `module.function` names such as `my_package.create_receiver` (dots only; the `module:function` form is not resolved). A request's `receiver` is matched against the allowlist by exact string match, before any import happens, so a request can never make the engine import a path the operator did not launch with; with no flag, all receivers are rejected. The allowlist is the trust boundary — payload contents stay opaque to SGLang past it.
+
+Each allowlisted path names a factory taking one `WeightUpdateReceiverContext` and returning an object with `receive(payload)` and `destroy()`; a returned object missing either is torn down with its own `destroy()` when available and then rejected. The context carries `model` (the live model on this worker), `device`, `tp_rank`/`tp_size`, `group_name`, the request's `master_address`/`master_port`/`world_size`/`rank_offset` (identity metadata only; the receiver decides what to open), and `init_payload` — the request's `receiver_init_payload`, never interpreted by SGLang. The receiver owns its transport: no torch process group is created for the group.
+
+The lifecycle is `init_weights_update_group(receiver=<path>, receiver_init_payload=...)`, then `begin_weight_update()`, then one `update_weights_from_distributed` round per weight drop with empty `names`/`dtypes`/`shapes` and the per-round data in `receiver_payload`, then `end_weight_update()`, then `destroy_weights_update_group`. Requests that name no receiver take the exact pre-receiver torch process group path.
+
+SGLang calls `receiver.receive(receiver_payload)` and the receiver writes the weights into the live model itself, so a round is an in-place weight mutation and is rejected like the load paths: while the CUDA IPC weight cache or a derived weight cache is active, while a speculative draft model exists (a receiver writes the target model only — restart without speculative decoding), with non-empty `names`, with `load_format` set (the call does no broadcast and loads nothing, so a format would be silently ignored), or with no weight-update session open. The scheduler records each group's receiver at init and keys these rejections on the group, so a receiver-group round carrying no `receiver_payload` is rejected too — as are `receiver_init_payload` without `receiver` and `receiver_payload` on a group without a receiver.
+
+Rounds run inside the normal weight-update session: `begin_weight_update()` still restores in-place-packed weights, and under `sync_base=True`, `end_weight_update()` runs `postprocess_weights` and — because a receiver round never marks the session as loaded — `post_load_weights`, unless an earlier loader round in the same session already ran it. A `sync_base=False` session skips both the begin-side restore and the end-side postprocessing.
+
+On failure: a failing factory leaves no server state, so the group name is free for a later `init_weights_update_group`; a `receive()` that raises mid-round reports failure and records no weight version, but the model may be partially written — recover with `destroy_weights_update_group`, re-init, and a full re-send; and `destroy_weights_update_group` calls `receiver.destroy()` once and forgets the receiver even if `destroy()` raises, so a failed teardown is never retried and the group name can be reused. Group names are one-owner for receivers: a receiver init rejects any live group name, and a torch process group init rejects a live receiver name, while a torch init reusing a live torch name is not guarded against.
 
 ### Per-Token Weight Version Attribution
 

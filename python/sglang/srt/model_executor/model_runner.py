@@ -558,6 +558,7 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             model_config=self.model_config,
             custom_weight_loaders=get_model().custom_weight_loader,
+            weight_update_receivers=get_model().weight_update_receivers,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
             recapture_cuda_graph=self.init_decode_cuda_graph,

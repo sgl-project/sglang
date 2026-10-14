@@ -144,12 +144,14 @@ class BaseTpWorker(ABC):
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank_offset,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
+            master_address=recv_req.master_address,
+            master_port=recv_req.master_port,
+            rank_offset=recv_req.rank_offset,
+            world_size=recv_req.world_size,
+            group_name=recv_req.group_name,
+            backend=recv_req.backend,
+            receiver=recv_req.receiver,
+            receiver_init_payload=recv_req.receiver_init_payload,
         )
         return success, message
 

@@ -446,6 +446,7 @@ POSITIONAL_FIELD_ORDER = (
     "sm_group_num",
     "startup_weight_load_mode",
     "custom_weight_loader",
+    "weight_update_receivers",
     "weight_loader_disable_mmap",
     "weight_loader_prefetch_checkpoints",
     "weight_loader_prefetch_num_threads",

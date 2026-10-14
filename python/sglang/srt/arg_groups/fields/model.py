@@ -277,6 +277,13 @@ class Model(msgspec.Struct):
             nargs="*",
         ),
     ] = None
+    weight_update_receivers: A[
+        Optional[List[str]],
+        Arg(
+            help="Allowlist of dotted import paths of weight-update receiver factories selectable as receiver in init_weights_update_group, such as my_package.create_receiver (dots only; the module:function form is not resolved). See sglang.srt.weight_sync.external_receiver for the contract.",
+            nargs="*",
+        ),
+    ] = None
     custom_pull_weights_pre_read_hook: A[
         Optional[str],
         "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",

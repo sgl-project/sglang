@@ -133,6 +133,10 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
+    # Groups a successful receiver init registered; mirrors the worker's
+    # _external_receivers so guards key on group identity, not on whether a
+    # payload was sent. Rank-replicated like _session.
+    _receiver_group_names: Set[str] = field(default_factory=set)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -231,6 +235,8 @@ class SchedulerWeightUpdaterManager:
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
+        if success and recv_req.receiver is not None:
+            self._receiver_group_names.add(recv_req.group_name)
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
@@ -239,6 +245,9 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        # The worker forgets a receiver even when its destroy() raises; mirror
+        # that here so the draft-model guard cannot outlive the receiver.
+        self._receiver_group_names.discard(recv_req.group_name)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
@@ -261,6 +270,20 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        if recv_req.group_name in self._receiver_group_names and (
+            self.draft_worker is not None
+        ):
+            # A receiver writes the target model only; reporting success while
+            # the draft stays stale would serve a silently divergent engine.
+            # Keyed on the group recorded at init: a receiver round may carry
+            # a None payload, so the guard must not depend on receiver_payload.
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message="external weight-update receiver rounds update the "
+                "target model only and are rejected while a speculative draft "
+                "model exists; restart without speculative decoding to use a "
+                "weight-update receiver",
+            )
         with self._observe_weight_load("distributed"):
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
@@ -271,6 +294,7 @@ class SchedulerWeightUpdaterManager:
                     shapes=recv_req.shapes,
                     group_name=recv_req.group_name,
                     load_format=recv_req.load_format,
+                    receiver_payload=recv_req.receiver_payload,
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
                 if base_tensors:
