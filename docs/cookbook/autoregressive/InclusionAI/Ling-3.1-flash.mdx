@@ -65,31 +65,6 @@ The model supports reasoning and structured tool calling, with a context limit o
 
 **Checkpoint:** [inclusionAI/Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash). **License:** MIT.
 
-### Verification status
-
-Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separately from accuracy.
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "28%", background: "rgba(255,255,255,0.02)"}} />
-    <col style={{width: "22%", background: "rgba(255,255,255,0.05)"}} />
-    <col style={{width: "50%", background: "rgba(255,255,255,0.02)"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px"}}>Configuration</th>
-      <th style={{textAlign: "left", padding: "10px 12px"}}>Status</th>
-      <th style={{textAlign: "left", padding: "10px 12px"}}>Evidence</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>Revision <code>b426279f1833b8e097c7c3781d1efa08aba19309</code>, with BF16 <code>model.layers.72.eh_proj</code> excluded from quantization. Matched full GSM8K: NEXTN 96.89% vs standard 96.97%; stop rate 99.85% vs 99.77%. Acceptance length 2.61 on random tokens and 2.13 on real text.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4 + NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{GB300_NEXTN_SMOKE}}"}</code>; batch-size-1 speed: <code>{"{{GB300_NEXTN_BS1}}"}</code>.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K smoke 98/100, stop rate 100%, acceptance length 2.29; Mooncake/TCP prefetch verified on all 8 TP ranks. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
-  </tbody>
-</table>
-
 ## 2. Configuration tips
 
 - Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
