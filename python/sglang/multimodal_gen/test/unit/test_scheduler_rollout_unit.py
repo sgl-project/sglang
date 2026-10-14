@@ -8,6 +8,7 @@ scheduler.step().
         |-- record x_t into the trajectory  (filtered by return_step_indices)
         +-- flow_sde_sampling(...)
               |-- ode      : x_next = x_t + dt * v        (no noise, log_prob 0)
+              |              or the model's own ode_transition
               |-- sde / cps: x_next = mean + std * noise  (fp32, log_prob summed)
               +-- step outside sde_step_indices -> ode form
         v
@@ -16,6 +17,7 @@ scheduler.step().
 TestSchedulerRolloutOdeUnit
     ODE rollout == serving step, bit for bit (bare update and through step());
     ODE draws no noise; the trajectory records x_t, not x_next;
+    a model's own ode_transition replaces the Euler update on ODE steps only;
     debug tensors keep [B, T, ...] shapes.
 TestSchedulerFlowGRPOStepAlignmentUnit
     SDE / CPS match the verbatim FlowGRPO reference; bf16 model_output still
@@ -39,7 +41,9 @@ from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 
 
-def _make_rollout(batch, pipeline_config=None) -> FlowRolloutController:
+def _make_rollout(
+    batch, pipeline_config=None, ode_transition=None
+) -> FlowRolloutController:
     """The controller the denoising stage creates for ``batch`` (single GPU)."""
     return FlowRolloutController(
         sde_type=batch.rollout_sde_type,
@@ -56,6 +60,7 @@ def _make_rollout(batch, pipeline_config=None) -> FlowRolloutController:
         gather_for_sp=lambda stacked_latents: stacked_latents,
         sigmas=_SIGMAS,
         latents_shape=tuple(batch.latents.shape),
+        ode_transition=ode_transition,
     )
 
 
@@ -207,6 +212,48 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         )[0]
         self.assertTrue(torch.equal(rollout.step_latents[0], sample))
         self.assertFalse(torch.equal(rollout.step_latents[0], prev_sample))
+
+    def test_ode_transition_replaces_euler_on_ode_steps_only(self):
+        """A model's own ode_transition runs on the steps outside the SDE window
+        and nowhere else; SDE steps keep the shared stochastic update."""
+        batch = self._build_batch(debug_mode=False)
+        batch.rollout_sde_type = "sde"
+        batch.rollout_sde_step_indices = [1]
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+        ode_calls = []
+
+        def ode_transition(*, model_output, sample, step_index):
+            ode_calls.append(step_index)
+            return sample * 2
+
+        rollout = _make_rollout(batch, pipeline_config, ode_transition=ode_transition)
+        sample = torch.randn(2, 4, 8, 8)
+        model_output = torch.randn_like(sample)
+
+        # step 0 is outside the window: the model's update, zero log-prob
+        prev_0 = rollout.flow_sde_sampling(
+            model_output=model_output,
+            sample=sample,
+            current_sigma=torch.tensor(0.6),
+            next_sigma=torch.tensor(0.4),
+            generator=None,
+            step_index=0,
+        )
+        self.assertTrue(torch.equal(prev_0, sample * 2))
+        # step 1 is inside the window: stochastic update, ode_transition not called
+        rollout.flow_sde_sampling(
+            model_output=model_output,
+            sample=sample,
+            current_sigma=torch.tensor(0.6),
+            next_sigma=torch.tensor(0.4),
+            generator=[torch.Generator().manual_seed(i) for i in range(2)],
+            step_index=1,
+        )
+        self.assertEqual(ode_calls, [0])
+        log_prob_sum, _ = rollout.consume_local_rollout_log_probs()
+        self.assertTrue(torch.equal(log_prob_sum[:, 0], torch.zeros(2)))
 
     def test_ode_debug_tensors_have_shape_safe_noise_std(self):
         batch = self._build_batch(debug_mode=True)
