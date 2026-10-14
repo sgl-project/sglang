@@ -1230,9 +1230,25 @@ def calculate_metrics(
             ):
                 concurrent_requests_per_second[second] += 1
 
+        # True peak concurrent requests via sweep line on half-open [start, end)
+        # intervals, so sequential requests that never overlap are not miscounted.
+        events: list[tuple[float, int]] = []
+        for output in successful_outputs:
+            start = output.start_time - min_start_time
+            end = (output.start_time + output.latency) - min_start_time
+            events.append((start, 1))
+            events.append((end, -1))
+        events.sort()
+
+        current_concurrent = 0
+        true_max_concurrent = 0
+        for _, delta in events:
+            current_concurrent += delta
+            true_max_concurrent = max(true_max_concurrent, current_concurrent)
+
         if len(tokens_per_second) > 0:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+            max_concurrent_requests = int(true_max_concurrent)
 
         if plot_throughput:
             if TERM_PLOTLIB_AVAILABLE:
