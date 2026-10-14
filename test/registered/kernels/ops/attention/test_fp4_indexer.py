@@ -750,6 +750,111 @@ def test_hopper_indexer_backends_replay(ratio):
                 assert (out.raw_indices[batch] == -1).all().item()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper DeepSelect full-topk dispatch",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_hopper_deep_select_full_topk_replay(ratio):
+    from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import DecodeInputs
+
+    batch, width, topk = 12, 193, 512
+    # DeepSelect rejects score rows whose byte stride is not a multiple of 128
+    # (entry.cuh); production keeps lmax page-granular through the
+    # max_compressed_seq_len property, so the mock's capacity must be too.
+    num_pages = 512
+    capacity = num_pages * PAGE_SIZE
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
+    request_pages = (slots[::6, ::PAGE_SIZE] // PAGE_SIZE).to(torch.int32)
+    logical = torch.arange(width, device=q.device)
+    page_columns, page_offsets = logical // PAGE_SIZE, logical % PAGE_SIZE
+    req_table = torch.full(
+        (2, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    page_table = torch.full((batch, num_pages), -1, device=q.device, dtype=torch.int32)
+    positions = lens * ratio - 1
+
+    def update_tables(step):
+        pages = request_pages.roll(step, dims=1)
+        request_slots = (pages[:, page_columns] * PAGE_SIZE + page_offsets).contiguous()
+        req_table[:, : width * ratio : ratio].copy_(
+            (request_slots * ratio).to(torch.int32)
+        )
+        page_table.fill_(-1)
+        page_table[:, : pages.shape[1]].copy_(pages[req.long()])
+        return request_slots[req.long()]
+
+    current_slots = update_tables(0)
+    pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    indexer = SimpleNamespace(
+        queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
+    )
+    metadata = SimpleNamespace(
+        max_compressed_seq_len=capacity,
+        page_table=page_table,
+        compressed_page_size=PAGE_SIZE,
+    )
+    output = torch.full((batch, topk), -1, device=q.device, dtype=torch.int32)
+    inputs = DecodeInputs(
+        indexer=indexer,
+        layer_id=0,
+        compress_ratio=ratio,
+        freqs_cis=torch.zeros(width * ratio + 1, device=q.device),
+        x=weights,
+        q_lora=q,
+        positions=positions,
+        req_rows=req,
+        paged_metadata=metadata,
+        is_verify=True,
+        out_page_indices=output,
+    )
+    full = FullTopKIndexer(
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        use_deep_gemm_prefill=False,
+        use_deep_gemm_decode=False,
+    )
+    assert full.use_deep_select_decode
+
+    def run():
+        full.topk_decode(inputs)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for step, visible in enumerate([193, 0, 1, 63, 64, 65, 193]):
+        lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
+        positions.copy_(lens * ratio - 1)
+        req.copy_(req.roll(1))
+        current_slots = update_tables(step)
+        q.neg_()
+        output.fill_(12345)
+        graph.replay()
+
+        scores = _reference_logits(q, weights, current_slots, lens, table)
+        for row, length in enumerate(lens.tolist()):
+            count = min(topk, length)
+            pages = output[row]
+            assert (pages[:count] >= 0).all().item()
+            assert (pages[count:] == -1).all().item()
+            selected = (
+                current_slots[row, :, None] == pages[:count].long()[None, :]
+            ).nonzero()[:, 0]
+            assert selected.numel() == selected.unique().numel() == count
+            if count:
+                torch.testing.assert_close(
+                    scores[row, selected].sort().values,
+                    scores[row, :length].topk(count).values.sort().values,
+                    rtol=0,
+                    atol=0,
+                )
+
+
 @pytest.mark.parametrize("rows", [0, 1, 32, 129])
 @pytest.mark.parametrize("topk", [0, 1, 65, 512])
 @pytest.mark.parametrize("write_raw", [False, True])
