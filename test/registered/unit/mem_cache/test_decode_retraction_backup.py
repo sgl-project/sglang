@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregatio
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -49,6 +50,20 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+
+def _decode_req(rid: str, input_ids) -> Req:
+    """A request as the PD decode queue holds it: enqueue attaches its
+    transfer state."""
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q", input_ids),
+        sampling_params=SamplingParams(max_new_tokens=1),
+        bootstrap_host="localhost",
+    )
+    req.disagg = DisaggReqState()
+    return req
 
 
 class TestDecodeRetractionBackup(CustomTestCase):
@@ -408,13 +423,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         full_host = group.get_pool(PoolName.KV)
         swa_host = group.get_pool(PoolName.SWA)
         capacities = (full_host.available_size(), swa_host.available_size())
-        req = Req(
-            rid="swa-host-receive",
-            origin_input_text="",
-            bootstrap_host="localhost",
-            origin_input_ids=array("q", [1] * 23),
-            sampling_params=SamplingParams(max_new_tokens=1),
-        )
+        req = _decode_req("swa-host-receive", [1] * 23)
         receiver = Mock()
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
         blocker = swa_host.alloc(
@@ -507,13 +516,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     increment_decode_host_receive_reqs=lambda: host_admissions.append(1)
                 )
                 pressure = env.allocator.alloc(used_tokens)
-                req = Req(
-                    rid="threshold",
-                    origin_input_text="",
-                    bootstrap_host="localhost",
-                    origin_input_ids=array("q", [1]),
-                    sampling_params=SamplingParams(max_new_tokens=1),
-                )
+                req = _decode_req("threshold", [1])
                 receiver = Mock(supports_host_destination=True)
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
@@ -557,13 +560,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 cache = env.cache
                 queue, kv_args = self._receive_queue(env)
 
-                req = Req(
-                    rid="host-receive",
-                    origin_input_text="",
-                    bootstrap_host="localhost",
-                    origin_input_ids=array("q", [1] * num_tokens),
-                    sampling_params=SamplingParams(max_new_tokens=1),
-                )
+                req = _decode_req("host-receive", [1] * num_tokens)
                 receiver = Mock(supports_host_destination=False)
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
@@ -629,13 +626,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 # Incoming KV and retraction must coexist even with the host pool full.
                 group = cache.host_pool_group
                 blockers = group.alloc(group.available_size() - num_slots)
-                pending_req = Req(
-                    rid="pending",
-                    origin_input_text="",
-                    bootstrap_host="localhost",
-                    origin_input_ids=array("q", [1] * num_tokens),
-                    sampling_params=SamplingParams(max_new_tokens=1),
-                )
+                pending_req = _decode_req("pending", [1] * num_tokens)
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
                 queue.queue = [pending]
                 self.assertEqual(queue.pop_preallocated([]), ([], []))
@@ -700,16 +691,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         cache = env.cache
         queue, _ = self._receive_queue(env)
 
-        def make_req(rid, num_tokens):
-            return Req(
-                rid=rid,
-                origin_input_text="",
-                origin_input_ids=array("q", range(num_tokens)),
-                sampling_params=SamplingParams(max_new_tokens=1),
-                bootstrap_host="localhost",
-            )
-
-        cached = make_req("cached", 4)
+        cached = _decode_req("cached", range(4))
         cached.output_ids.append(99)
         cached.last_node = cache.root_node_handle()
         cached_indices = queue._pre_alloc(cached)
@@ -718,7 +700,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         cache.checkpoint(cached, up_to=cached.extend_end)
         pressure = env.allocator.alloc(self.pool_size // 2 - 4)
 
-        req = make_req("receiving", 8)
+        req = _decode_req("receiving", range(8))
         receiver = Mock(supports_host_destination=True)
         receiver.poll.return_value = KVPoll.WaitingForInput
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
