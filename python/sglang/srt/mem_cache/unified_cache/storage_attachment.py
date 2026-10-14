@@ -275,6 +275,8 @@ class StorageAttachment:
                 )
 
         cache.enable_storage = enable_storage
+        # Attach built fresh storage threads and sync groups.
+        cache.storage_unavailable = False
         cache.prefetch_threshold = prefetch_threshold
         cache.prefetch_timeout_base = prefetch_timeout_base
         cache.prefetch_timeout_per_page = (
@@ -287,6 +289,7 @@ class StorageAttachment:
             cache.storage_metrics_collector = self._resolve_metrics_collector(
                 storage_backend, extra_metric_labels
             )
+            cache.storage_metrics_collector.log_storage_healthy(enable_storage)
         else:
             cache.storage_metrics_collector = None
 

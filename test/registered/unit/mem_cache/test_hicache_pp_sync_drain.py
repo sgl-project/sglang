@@ -61,10 +61,12 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.linker = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
+        cache._pp_sync = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
+            storage_workers_healthy=lambda: True,
             ack_write_queue=[
                 SimpleNamespace(
                     finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
@@ -131,6 +133,9 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
 
         cache._all_reduce.assert_not_called()
         cache._all_reduce_attn_groups.assert_called_once()
+        # Only the storage health verdict is relayed from PP0, not the counts.
+        cache._pp_sync.assert_called_once()
+        self.assertEqual(cache._pp_sync.call_args.args[0].tolist(), [1])
         cache.writing_check.assert_called_once_with(finish_count=1)
         cache.loading_check.assert_called_once_with(finish_count=2)
         cache._drain_storage_control_queues_impl.assert_called_once_with(
