@@ -8,13 +8,12 @@ from typing import List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
 from sglang.multimodal_gen.runtime.models.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
     RowvLLMParameter,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 _is_npu = current_platform.is_npu()

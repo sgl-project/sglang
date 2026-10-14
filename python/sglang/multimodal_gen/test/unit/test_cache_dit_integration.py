@@ -742,6 +742,7 @@ def test_legacy_cache_computes_both_cfg_branches_across_precision_transition(
     """A stable Fn residual must not reuse the middle blocks' old-precision output."""
     import torch
     from cache_dit.caching.block_adapters.block_adapters import FakeDiffusionPipeline
+
     from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
         disable_cache_on_transformer,
     )
