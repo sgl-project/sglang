@@ -566,6 +566,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             stats_requested_tokens=8,
             is_terminated=lambda: False,
             all_hash_values=None,
+            deadline_expired=False,
         )
         cache.ongoing_prefetch[handle] = _OngoingPrefetch(
             0, RadixKey(array("q", range(8))), None, operation, None, {}

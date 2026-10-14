@@ -2314,7 +2314,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="storage_transfer",
+                reason="deadline" if operation.deadline_expired else "storage_transfer",
             )
         if (
             completed_tokens > 0
@@ -2442,7 +2442,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if pool_transfers and not all_succeeded:
             # Drop each pool's beliefs beyond what it served (KV and its
             # sidecars beyond the completed span); the next insert re-writes
-            # only the missing pools.
+            # only the missing pools. A deadline is not evidence of absent data.
             invalidation_hashes = (
                 operation.sidecar_hash_values
                 if operation.sidecar_hash_values is not None
@@ -2451,7 +2451,7 @@ class UnifiedRadixCache(BasePrefixCache):
             trimmed_pages = len(invalidation_hashes) - len(hash_value)
             keep_pages = trimmed_pages + completed_tokens // self.page_size
             beliefs = self.storage_existence_cache
-            if keep_pages < len(invalidation_hashes):
+            if not operation.deadline_expired and keep_pages < len(invalidation_hashes):
                 self._belief_policy(
                     PoolName.KV, PoolHitPolicy.ALL_PAGES
                 ).heal_from_transfer(
@@ -2467,15 +2467,18 @@ class UnifiedRadixCache(BasePrefixCache):
                             keep_pages,
                         )
             for transfer, count in zip(pool_transfers, pool_hit_pages):
-                if transfer.keys is not None and count < len(transfer.keys):
+                if (
+                    not operation.deadline_expired
+                    and transfer.keys is not None
+                    and count < len(transfer.keys)
+                ):
                     self._belief_policy(
                         transfer.name, transfer.hit_policy
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            self._finish_storage_prefetch(
-                request, fulfilled_tokens=0, reason="storage_transfer"
-            )
+            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self._retire_ongoing_prefetch(
@@ -2486,12 +2489,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_tokens_by_reqid[request] = 0
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d aux_pool_hit_pages=%s",
+                "HiCache hybrid prefetch discarded req=%s reason=%s completed=%d "
+                "requested=%d kv_beliefs_kept_pages=%s aux_pool_hit_pages=%s",
                 request.rid,
+                reason,
                 completed_tokens,
                 expected_tokens,
-                keep_pages,
+                None if operation.deadline_expired else keep_pages,
                 {
                     getattr(transfer.name, "value", transfer.name): count
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
@@ -2699,7 +2703,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only":
+        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+            # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
         if chain is None:
