@@ -414,6 +414,7 @@ class KimiK3MoEHipMixin:
         min_tokens = self._a8w4_moe_min_tokens
         if (
             not self._row_front_on
+            or self._front_fp8 is not None
             # the A8W4 kernels and the latent reduce write bf16
             or normed.dtype != torch.bfloat16
             or min_tokens is None
