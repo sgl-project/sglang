@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     MeshGenerationsRequest,
     MeshListResponse,
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -54,6 +56,7 @@ def _build_sampling_params_from_request(
     server_args = get_global_server_args()
     sampling_kwargs: Dict[str, Any] = {
         "request_id": request_id,
+        "task_type": ModelTaskType.I2M,
         "prompt": req.prompt,
         "num_frames": 1,
         "image_path": [image_path] if image_path else None,
@@ -162,9 +165,12 @@ async def create_mesh(
         os.makedirs(uploads_dir, exist_ok=True)
         img = image_list[0]
         filename = img.filename if hasattr(img, "filename") else "input_image"
+        safe_name = sanitize_upload_filename(filename, "input_image")
         try:
             input_path = await save_image_to_path(
-                img, os.path.join(uploads_dir, f"{request_id}_{filename}")
+                img,
+                os.path.join(uploads_dir, f"{request_id}_{safe_name}"),
+                uploads_root=uploads_dir,
             )
         except Exception as e:
             raise HTTPException(
@@ -198,6 +204,7 @@ async def create_mesh(
                 input_path = await save_image_to_path(
                     img_src,
                     os.path.join(uploads_dir, f"{request_id}_input_image"),
+                    uploads_root=uploads_dir,
                 )
 
             req = MeshGenerationsRequest(**payload)

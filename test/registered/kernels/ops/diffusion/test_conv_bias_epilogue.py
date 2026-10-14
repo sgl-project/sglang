@@ -7,6 +7,8 @@ input's dense channels_last(_3d) strides, and refuse anything else through
 its predicate (never by raising from ``can_use_``).
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -96,3 +98,7 @@ def test_conv_bias_epilogue_rejects_unsupported_inputs():
         assert not can_use_conv_bias_epilogue(xg, bias)
         with pytest.raises(ValueError):
             conv_bias_epilogue(xg, bias)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -6,26 +6,33 @@ reduction holds only if ranks also enter tuning with the same cache, so these
 cover that gate and the digest it decides on.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=52, suite="base-a-test-cpu")
+register_cpu_ci(est_time=57, suite="base-a-test-cpu")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import traceback
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -57,6 +64,146 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
+
+
+class TestMegaMoEAutotuneStartup(CustomTestCase):
+    def test_context_bridges_profile_limits(self):
+        from sglang.srt.layers.moe import flashinfer_megamoe_autotune as mega_autotune
+
+        runner = SimpleNamespace(
+            device="cuda",
+            forward_stream=Mock(),
+            max_decode_logits_rows=Mock(),
+            decode_num_tokens_per_req=Mock(),
+            max_running_requests=256,
+            is_draft_worker=False,
+        )
+        general = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
+        modules = {
+            "flashinfer.autotuner": SimpleNamespace(
+                AutoTuner=SimpleNamespace(
+                    get=lambda: SimpleNamespace(
+                        get_namespaced_records=lambda _: {},
+                        load_configs=lambda _: None,
+                        save_configs=lambda _: None,
+                        publish_namespaced_records=lambda *_: None,
+                    )
+                ),
+                _collect_metadata=lambda: ENV,
+                autotune=general,
+                get_autotune_process_group=lambda: None,
+                set_autotune_process_group=lambda _: None,
+            ),
+            "sglang.srt.layers.logits_processor": SimpleNamespace(
+                autotune_dummy_run_mode=lambda **_: nullcontext()
+            ),
+        }
+        # The resolved chunk size is already per DP rank. Disabled chunking
+        # uses the scheduler's prefill ceiling; skip-op suppresses the bridge.
+        # (chunk, skip, draft, graph rows, maximum MTP width, decode, prefill)
+        cases = [
+            (4096, False, False, 128 * 6, 6, 256 * 6, 4096),
+            (-1, False, False, 8192, 6, 8192, 16384),
+            (4096, False, False, 4096, 32, 8192, 4096),
+            (4096, True, False, 128 * 6, 6, None, None),
+            (4096, False, True, 128 * 6, 6, None, None),
+        ]
+        previous = mega_autotune._active_context
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "rank.json"
+            for chunk_size, skip, draft, graph_rows, width, decode, prefill in cases:
+                runner.is_draft_worker = draft
+                runner.max_decode_logits_rows.return_value = graph_rows
+                runner.decode_num_tokens_per_req.return_value = width
+                skip_ops = {"flashinfer_megamoe"} if skip else set()
+                with (
+                    self.subTest(chunk_size=chunk_size, skip=skip, draft=draft),
+                    get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+                    patch.dict(sys.modules, modules),
+                    patch.dict(
+                        os.environ,
+                        SGLANG_FLASHINFER_AUTOTUNE_CACHE="1",
+                    ),
+                    patch.multiple(
+                        autotune,
+                        flashinfer_autotune_cache_path=lambda _: cache_path,
+                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_exec=lambda: SimpleNamespace(
+                            moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
+                        ),
+                        get_eager_max_batch_size=lambda bs: bs,
+                        max_speculative_num_draft_tokens=lambda: width,
+                        max_prefill_buffer_tokens=lambda: max(chunk_size, 0),
+                        get_schedule=lambda: SimpleNamespace(max_prefill_tokens=16384),
+                    ),
+                    patch.object(
+                        autotune.torch.cuda,
+                        "current_stream",
+                        return_value=Mock(),
+                    ),
+                    patch.object(
+                        autotune.torch,
+                        "get_device_module",
+                        return_value=SimpleNamespace(stream=lambda _: nullcontext()),
+                    ),
+                ):
+                    general.reset_mock()
+                    with autotune.flashinfer_autotune_context(
+                        runner, run_lm_head=False
+                    ):
+                        general.assert_called_once_with(
+                            True,
+                            cache=None,
+                            skip_ops=skip_ops,
+                        )
+                        context = mega_autotune._active_context
+                        if prefill is None:
+                            self.assertIs(context, previous)
+                        else:
+                            self.assertIsNot(context, previous)
+                            runner.max_decode_logits_rows.assert_called_with()
+                            runner.decode_num_tokens_per_req.assert_called_with(
+                                num_draft_tokens=width
+                            )
+                            self.assertEqual(context.decode_num_tokens, decode)
+                            self.assertEqual(context.prefill_num_tokens, prefill)
+                    self.assertIs(mega_autotune._active_context, previous)
+
+            # Cache-disabled startups in the same second must still write to
+            # different files, even if they use the same device and rank.
+            with (
+                get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+                patch.dict(sys.modules, modules),
+                patch.dict(os.environ, SGLANG_FLASHINFER_AUTOTUNE_CACHE="0"),
+                patch.multiple(
+                    autotune,
+                    flashinfer_autotune_cache_path=lambda _: cache_path,
+                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_exec=lambda: SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="triton")
+                    ),
+                ),
+                patch.object(autotune.datetime, "datetime") as clock,
+                patch.object(
+                    autotune.torch.cuda, "current_stream", return_value=Mock()
+                ),
+                patch.object(
+                    autotune.torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(stream=lambda _: nullcontext()),
+                ),
+            ):
+                clock.now.return_value.strftime.return_value = "20260922_010000"
+                paths = []
+                for _ in range(2):
+                    with autotune.flashinfer_autotune_context(
+                        runner, run_lm_head=False
+                    ):
+                        paths.append(Path(general.call_args.kwargs["cache"]))
+                self.assertNotEqual(*paths)
+                for path in paths:
+                    self.assertEqual(path.parent, cache_path.parent / "runs")
+                    self.assertTrue(path.name.startswith("rank.20260922_010000."))
 
 
 class TestAutotuneCacheDigest(CustomTestCase):
@@ -158,6 +305,118 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             ),
             [False, False],
         )
+
+
+class TestModelPrefillAutotune(CustomTestCase):
+    """Model kernel warmup must cover prefill without a speculative dummy batch."""
+
+    def setUp(self):
+        self.hook = Mock(return_value=1)
+        self.mr = SimpleNamespace(
+            model=SimpleNamespace(autotune_prefill_kernels=self.hook),
+            is_generation=True,
+            is_draft_worker=False,
+            dtype=torch.bfloat16,
+        )
+        self.runner = SimpleNamespace(model_runner=self.mr)
+        # No dummy-buffer or attention APIs: this path must not build a
+        # TARGET_VERIFY batch or mutate request/KV state.
+        for target, kwargs in (
+            ("max_prefill_buffer_tokens", {"return_value": 65536}),
+            (
+                "flashinfer_autotune_context",
+                {"side_effect": lambda *a, **k: nullcontext()},
+            ),
+        ):
+            p = patch.object(autotune, target, **kwargs)
+            setattr(self, target, p.start())
+            self.addCleanup(p.stop)
+        p = patch.object(
+            autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND, "get", return_value=False
+        )
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_declining_model_never_enters_the_autotune_context(self):
+        self.mr.model.wants_prefill_autotune = lambda: False
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=384)
+        self.hook.assert_not_called()
+        self.flashinfer_autotune_context.assert_not_called()
+
+    def test_extend_pass_is_opt_in(self):
+        # A draft worker keeps its own warmup; a model without the hook opts out.
+        for draft, has_hook in ((True, True), (False, False)):
+            with self.subTest(draft=draft, has_hook=has_hook):
+                self.mr.is_draft_worker = draft
+                if not has_hook:
+                    del self.mr.model.autotune_prefill_kernels
+                autotune.maybe_flashinfer_autotune_extend(
+                    self.runner, decode_num_tokens=384
+                )
+                self.hook.assert_not_called()
+                self.flashinfer_autotune_context.assert_not_called()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
+class TestAutotuneCachePhases(CustomTestCase):
+    """Loaded target tactics survive draft warmup, unless cache reuse is off."""
+
+    def test_target_and_draft_cache_reuse(self):
+        from flashinfer.autotuner import AutoTuner, _collect_metadata
+
+        tuner = AutoTuner.get()
+        tuner.clear_cache()
+        self.addCleanup(tuner.clear_cache)
+        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
+        with tempfile.TemporaryDirectory() as directory:
+            target, draft = (
+                Path(directory) / name for name in ("target.json", "draft.json")
+            )
+            for path, key, tactic in (
+                (target, "target_prefill", 7),
+                (draft, "draft_decode", 3),
+            ):
+                path.write_text(
+                    json.dumps(
+                        {"_metadata": _collect_metadata(), key: ["TestRunner", tactic]}
+                    )
+                )
+            with (
+                patch.object(
+                    autotune,
+                    "flashinfer_autotune_cache_path",
+                    side_effect=[target, draft, draft],
+                ),
+                patch.object(
+                    autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
+                ),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
+                    ),
+                ),
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
+                get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+            ):
+                with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
+                    self.assertEqual(
+                        tuner._file_configs["target_prefill"], ("TestRunner", 7)
+                    )
+                # No profiling: this models a restart that loads tactics from disk.
+                self.assertFalse(tuner.profiling_cache)
+                with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
+                    pass
+                saved = json.loads(draft.read_text())
+                self.assertEqual(saved["target_prefill"], ["TestRunner", 7])
+                self.assertEqual(saved["draft_decode"], ["TestRunner", 3])
+                with (
+                    autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(False),
+                    autotune.flashinfer_autotune_context(runner, run_lm_head=False),
+                ):
+                    self.assertNotIn("target_prefill", tuner._file_configs)
+                    self.assertNotIn("draft_decode", tuner._file_configs)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 
 import gc
 import platform as _platform
-from functools import cached_property
 from typing import Optional
 
 import psutil
@@ -14,7 +13,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class CpuDeviceMixin(DeviceMixin):
@@ -23,16 +22,6 @@ class CpuDeviceMixin(DeviceMixin):
     _enum: PlatformEnum = PlatformEnum.CPU
     device_name: str = "cpu"
     device_type: str = "cpu"
-
-    @cached_property
-    def cpu_arch(self) -> CpuArchEnum:
-        """Host CPU architecture (X86 / ARM / UNSPECIFIED), resolved once.
-
-        First-class identity attribute parallel to ``_enum`` — callers branch
-        on CPU arch through this instead of recomputing ``platform.machine()``.
-        ``get_cpu_architecture()`` is process-stable, so caching is safe.
-        """
-        return self.get_cpu_architecture()
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(psutil.virtual_memory().total)
@@ -55,8 +44,8 @@ class CpuDeviceMixin(DeviceMixin):
         vm = psutil.virtual_memory()
         return float(vm.total - vm.available)
 
-    def get_device(self, local_rank: int) -> "torch.device":
-        # local_rank is ignored: all CPU ranks share the one CPU device, so
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        # device_id is ignored: all CPU ranks share the one CPU device, so
         # there is nothing rank-specific to return. PyTorch enforces this —
         # Device::validate() asserts a CPU index must be -1 or 0 (c10/core/
         # Device.h). Per-rank isolation is done via OpenMP/numactl binding
@@ -123,11 +112,11 @@ class CpuDeviceMixin(DeviceMixin):
 class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
     """Default in-tree CPU SRT platform.
 
-    supports_fp8 / support_cuda_graph / support_piecewise_cuda_graph keep the
-    conservative SRTPlatform defaults (all False), so they are not repeated
-    here. is_pin_memory_available is repeated for explicitness: CPU has no GPU
+    is_pin_memory_available is repeated for explicitness: CPU has no GPU
     to pin host memory to.
     """
+
+    capabilities = PlatformCapabilities(graph_capture=True)
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False

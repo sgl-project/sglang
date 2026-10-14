@@ -962,7 +962,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -1072,7 +1072,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")

@@ -9,7 +9,6 @@ import unittest
 
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
-    _has_nixl,
 )
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -21,6 +20,14 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE, i
 register_cuda_ci(est_time=365, stage="extra-b", runner_config="8-gpu-h200")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
+
+
+def _has_nixl():
+    try:
+        import nixl._api  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 @unittest.skipUnless(
@@ -37,9 +44,6 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
     # so keep the original 0.45 absolute floor and rely on the two-pass
     # non-regression check below to catch decode-cache corruption.
     gsm8k_min_score = 0.45
-    # SWA + decode-side radix cache is gated to the unified radix tree.
-    extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-    extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_prefill_args = SWA_SERVER_ARGS
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
