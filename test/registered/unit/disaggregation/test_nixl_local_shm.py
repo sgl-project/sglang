@@ -3,12 +3,14 @@
 import os
 import socket
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.nixl.local_shm import (
     LocalShmExport,
+    LocalShmMapping,
     LocalShmTransfer,
     copy_plan,
 )
@@ -117,6 +119,7 @@ class TestLocalShm(CustomTestCase):
         from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 
         manager = NixlKVManager.__new__(NixlKVManager)
+        manager.local_shm_enabled = False
         manager.local_shm_errors = {}
         manager.local_shm_mappings = {}
         manager.src_mem_kind = "VRAM"
@@ -128,10 +131,10 @@ class TestLocalShm(CustomTestCase):
         manager._send_kvcache_generic.assert_called_once()
 
     def test_failed_mapping_cannot_fall_back_to_nixl_write(self):
-        from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 
-        manager = NixlKVManager.__new__(NixlKVManager)
+        manager, info = self.mapping_manager()
         manager.local_shm_errors = {"peer": "mapping failed"}
+        manager.decode_kv_args_table = {"peer": info}
         manager._send_kvcache_generic = Mock()
         with self.assertRaisesRegex(RuntimeError, "mapping failed"):
             manager.send_kvcache("peer", [0], [20], [0], 0, "done")
@@ -144,6 +147,9 @@ class TestLocalShm(CustomTestCase):
         settled = Mock()
         pending = Mock()
         pending.close.side_effect = RuntimeError("DMA unresolved")
+        manager._local_shm_shutdown = threading.Event()
+        manager._local_shm_reaper = None
+        manager._local_shm_lock = threading.RLock()
         manager.local_shm_mappings = {"settled": settled, "pending": pending}
         with self.assertLogs("sglang.srt.disaggregation.nixl.conn", level="ERROR"):
             manager.release_host_resources()
@@ -191,6 +197,119 @@ class TestLocalShm(CustomTestCase):
         self.assertIsNone(pool.kv_buffer)
         self.assertFalse(pool._host_resource_cleanup)
 
+    def mapping_manager(self):
+        from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.local_shm_enabled = True
+        manager.local_shm_mappings = {}
+        manager.local_shm_errors = {}
+        manager._local_shm_retry_at = {}
+        manager._local_shm_lock = threading.RLock()
+        manager.is_mla_backend = True
+        manager.attn_tp_size = 4
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[10], kv_item_lens=[16], kv_layer_ids=[0], gpu_id=0
+        )
+        info = SimpleNamespace(
+            agent_name="peer",
+            local_shm={"items": [16]},
+            decode_tp_size=4,
+            dst_dcp_size=1,
+            staging_base_ptr=0,
+            dst_kv_mem_kinds=["DRAM"],
+            dst_kv_item_lens=[16],
+            dst_kv_layer_ids=[0],
+        )
+        return manager, info
+
+    def test_transient_mapping_failure_recovers_after_backoff(self):
+        manager, info = self.mapping_manager()
+        module = "sglang.srt.disaggregation.nixl.conn"
+        mapping = object()
+        with (
+            patch(module + ".same_host", return_value=True),
+            patch(
+                module + ".LocalShmMapping",
+                side_effect=[TimeoutError("FD timeout"), mapping],
+            ) as create,
+            patch(module + ".time.monotonic", return_value=10) as clock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "FD timeout"):
+                manager._ensure_local_shm_mapping(info)
+            with self.assertRaises(RuntimeError):
+                manager._ensure_local_shm_mapping(info)
+            self.assertEqual(create.call_count, 1)
+            clock.return_value = 12
+            self.assertIs(manager._ensure_local_shm_mapping(info), mapping)
+            self.assertEqual(create.call_count, 2)
+            self.assertFalse(manager.local_shm_errors)
+            self.assertFalse(manager._local_shm_retry_at)
+            self.assertIs(manager._ensure_local_shm_mapping(info), mapping)
+            self.assertEqual(create.call_count, 2)
+
+    def test_layout_failure_is_not_retried(self):
+        manager, info = self.mapping_manager()
+        info.decode_tp_size = 8
+        module = "sglang.srt.disaggregation.nixl.conn"
+        with (
+            patch(module + ".same_host", return_value=True),
+            patch(module + ".LocalShmMapping") as create,
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "matching flat MLA"):
+                    manager._ensure_local_shm_mapping(info)
+            create.assert_not_called()
+            self.assertFalse(manager._local_shm_retry_at)
+
+    def test_dead_exporter_released_only_after_pending_copy_settles(self):
+        manager, info = self.mapping_manager()
+        mapping = Mock(pending={"copy"})
+        mapping.exporter_closed.return_value = True
+        manager.local_shm_mappings["peer"] = mapping
+        manager._reap_local_shm_mappings()
+        mapping.close.assert_not_called()
+        mapping.pending.clear()
+        manager._reap_local_shm_mappings()
+        mapping.close.assert_called_once()
+        self.assertFalse(manager.local_shm_mappings)
+        # Late queued requests must not silently use NIXL or reopen the dead pool.
+        with self.assertRaisesRegex(RuntimeError, "exporter has closed"):
+            manager._ensure_local_shm_mapping(info)
+
+    def test_live_exporter_and_failed_unregister_are_retained(self):
+        manager, _ = self.mapping_manager()
+        live = Mock(pending=set())
+        live.exporter_closed.return_value = False
+        dead = Mock(pending=set())
+        dead.exporter_closed.return_value = True
+        dead.close.side_effect = RuntimeError("still pinned")
+        manager.local_shm_mappings = {"live": live, "dead": dead}
+        with self.assertLogs("sglang.srt.disaggregation.nixl.conn", level="ERROR"):
+            manager._reap_local_shm_mappings()
+        live.close.assert_not_called()
+        self.assertEqual(set(manager.local_shm_mappings), {"live", "dead"})
+
+    def test_reaper_cannot_race_submission(self):
+        manager, _ = self.mapping_manager()
+        mapping = Mock(pending=set())
+        mapping.exporter_closed.return_value = True
+        manager.local_shm_mappings["peer"] = mapping
+        started = threading.Event()
+
+        def reap():
+            started.set()
+            manager._reap_local_shm_mappings()
+
+        with manager._local_shm_lock:
+            worker = threading.Thread(target=reap)
+            worker.start()
+            self.assertTrue(started.wait(2))
+            mapping.pending.add("submitted")
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        mapping.close.assert_not_called()
+
     def test_empty_chunk(self):
         self.assertEqual(copy_plan([64], [128], [16], [], []), [])
 
@@ -234,6 +353,22 @@ class TestLocalShmFDExchange(CustomTestCase):
             self.assertEqual(os.pread(fds[0], 4, 0), b"test")
         finally:
             os.close(fds[0])
+
+    def test_exporter_liveness_tracks_endpoint_shutdown(self):
+        mapping = LocalShmMapping.__new__(LocalShmMapping)
+        mapping.endpoint = self.export.descriptor["endpoint"]
+        self.assertFalse(mapping.exporter_closed())
+        self.export.close()
+        self.assertTrue(mapping.exporter_closed())
+
+    def test_probe_timeout_does_not_establish_peer_death(self):
+        mapping = LocalShmMapping.__new__(LocalShmMapping)
+        mapping.endpoint = self.export.descriptor["endpoint"]
+        with patch("socket.socket") as sock:
+            sock.return_value.__enter__.return_value.connect.side_effect = (
+                TimeoutError()
+            )
+            self.assertFalse(mapping.exporter_closed())
 
     def test_pool_restart_has_new_identity(self):
         old = self.export.descriptor

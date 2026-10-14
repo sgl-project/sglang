@@ -531,6 +531,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.local_shm_descriptor = None
         self.local_shm_mappings = {}
         self.local_shm_errors = {}
+        self._local_shm_retry_at = {}
+        self._local_shm_lock = threading.RLock()
+        self._local_shm_shutdown = threading.Event()
+        self._local_shm_reaper = None
         if self.local_shm_enabled:
             if not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get():
                 raise ValueError("Local SHM requires deferred decode KV release")
@@ -597,6 +601,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
+            if self.local_shm_enabled:
+                self._local_shm_reaper = threading.Thread(
+                    target=self._reap_local_shm_loop, daemon=True
+                )
+                self._local_shm_reaper.start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -755,15 +764,40 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
-    def release_host_resources(self):
-        for peer_name, mapping in list(self.local_shm_mappings.items()):
-            try:
-                mapping.close()
-            except Exception:
-                # Never unmap a buffer whose writes or pinning are unresolved.
-                logger.exception("Retaining local SHM mapping for peer %s", peer_name)
-            else:
-                del self.local_shm_mappings[peer_name]
+    def _reap_local_shm_loop(self) -> None:
+        while not self._local_shm_shutdown.wait(5):
+            self._reap_local_shm_mappings()
+
+    def _reap_local_shm_mappings(self) -> None:
+        # Serialize retirement with submission and mapping initialization.
+        with self._local_shm_lock:
+            for peer, mapping in list(self.local_shm_mappings.items()):
+                if mapping.pending or not mapping.exporter_closed():
+                    continue
+                try:
+                    mapping.close()
+                except Exception:
+                    logger.exception("Retaining local SHM mapping for peer %s", peer)
+                    continue
+                del self.local_shm_mappings[peer]
+                self.local_shm_errors[peer] = "Local SHM exporter has closed"
+                logger.info("Released local SHM mapping for closed peer %s", peer)
+
+    def release_host_resources(self) -> None:
+        self._local_shm_shutdown.set()
+        if self._local_shm_reaper is not None:
+            self._local_shm_reaper.join()
+        with self._local_shm_lock:
+            for peer_name, mapping in list(self.local_shm_mappings.items()):
+                try:
+                    mapping.close()
+                except Exception:
+                    # Never unmap unresolved writes or still-pinned memory.
+                    logger.exception(
+                        "Retaining local SHM mapping for peer %s", peer_name
+                    )
+                else:
+                    del self.local_shm_mappings[peer_name]
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
@@ -1362,9 +1396,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
-                    error = self.local_shm_errors.get(req.agent_name)
-                    if error is not None:
-                        raise RuntimeError(error)
+                    self._ensure_local_shm_mapping(dst_info)
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -1707,6 +1739,54 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if not self.state_descs:
                 raise Exception("NIXL memory registration failed for state tensors")
 
+    def _ensure_local_shm_mapping(
+        self, decode_kv_args: KVArgsRegisterInfo
+    ) -> Optional[LocalShmMapping]:
+        if not self.local_shm_enabled or decode_kv_args.local_shm is None:
+            return None
+        agent_name = decode_kv_args.agent_name
+        with self._local_shm_lock:
+            mapping = self.local_shm_mappings.get(agent_name)
+            if mapping is not None:
+                return mapping
+            error = self.local_shm_errors.get(agent_name)
+            if error is not None:
+                retry_at = self._local_shm_retry_at.get(agent_name)
+                if retry_at is None or time.monotonic() < retry_at:
+                    raise RuntimeError(error)
+            try:
+                if not same_host(decode_kv_args.local_shm):
+                    return None
+                if (
+                    not (self.is_mla_backend or self.is_hybrid_mla_backend)
+                    or self.attn_tp_size != decode_kv_args.decode_tp_size
+                    or decode_kv_args.dst_dcp_size != 1
+                    or decode_kv_args.staging_base_ptr
+                    or decode_kv_args.dst_kv_mem_kinds
+                    != ["DRAM"] * len(self.kv_args.kv_data_ptrs)
+                    or decode_kv_args.dst_kv_item_lens != self.kv_args.kv_item_lens
+                    or decode_kv_args.local_shm["items"] != self.kv_args.kv_item_lens
+                    or decode_kv_args.dst_kv_layer_ids != self.kv_args.kv_layer_ids
+                ):
+                    raise ValueError(
+                        "Local SHM requires matching flat MLA KV layouts and TP sizes"
+                    )
+                mapping = LocalShmMapping(decode_kv_args.local_shm, self.kv_args.gpu_id)
+            except Exception as exc:
+                error = f"Local SHM peer initialization failed: {exc}"
+                self.local_shm_errors[agent_name] = error
+                if isinstance(exc, OSError):
+                    self._local_shm_retry_at[agent_name] = time.monotonic() + 2
+                else:
+                    self._local_shm_retry_at.pop(agent_name, None)
+                logger.error("%s", error)
+                raise RuntimeError(error) from exc
+            self.local_shm_mappings[agent_name] = mapping
+            self.local_shm_errors.pop(agent_name, None)
+            self._local_shm_retry_at.pop(agent_name, None)
+            logger.info("Local SHM D2H enabled for peer %s", agent_name)
+            return mapping
+
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
@@ -1717,33 +1797,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if decode_kv_args.requires_dcp_relayout:
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
-        if self.local_shm_enabled and decode_kv_args.local_shm is not None:
-            try:
-                if same_host(decode_kv_args.local_shm):
-                    if (
-                        not (self.is_mla_backend or self.is_hybrid_mla_backend)
-                        or self.attn_tp_size != decode_kv_args.decode_tp_size
-                        or decode_kv_args.dst_dcp_size != 1
-                        or decode_kv_args.staging_base_ptr
-                        or decode_kv_args.dst_kv_mem_kinds
-                        != ["DRAM"] * len(self.kv_args.kv_data_ptrs)
-                        or decode_kv_args.dst_kv_item_lens != self.kv_args.kv_item_lens
-                        or decode_kv_args.local_shm["items"]
-                        != self.kv_args.kv_item_lens
-                        or decode_kv_args.dst_kv_layer_ids != self.kv_args.kv_layer_ids
-                    ):
-                        raise ValueError(
-                            "Local SHM requires matching flat MLA KV layouts and TP sizes"
-                        )
-                    self.local_shm_mappings[agent_name] = LocalShmMapping(
-                        decode_kv_args.local_shm, self.kv_args.gpu_id
-                    )
-                    logger.info("Local SHM D2H enabled for peer %s", agent_name)
-            except Exception as exc:
-                self.local_shm_errors[agent_name] = (
-                    f"Local SHM peer initialization failed: {exc}"
-                )
-                logger.error("%s", self.local_shm_errors[agent_name])
+        try:
+            self._ensure_local_shm_mapping(decode_kv_args)
+        except RuntimeError:
+            # Preserve registration so a later request can retry a transient
+            # connection failure. The transfer path still fails closed.
+            pass
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2016,18 +2075,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         notif: str,
         dst_mem_kind: str = "VRAM",
     ):
-        error = self.local_shm_errors.get(peer_name)
-        if error is not None:
-            raise RuntimeError(error)
-        mapping = self.local_shm_mappings.get(peer_name)
-        if mapping is not None:
-            return mapping.submit(
-                self.kv_args.kv_data_ptrs,
-                self.kv_args.kv_data_lens,
-                prefill_kv_indices,
-                dst_kv_indices,
-                lambda: self.agent.send_notif(peer_name, notif.encode("ascii")),
-            )
+        if self.local_shm_enabled:
+            with self._local_shm_lock:
+                mapping = self._ensure_local_shm_mapping(
+                    self.decode_kv_args_table[peer_name]
+                )
+                if mapping is not None:
+                    return mapping.submit(
+                        self.kv_args.kv_data_ptrs,
+                        self.kv_args.kv_data_lens,
+                        prefill_kv_indices,
+                        dst_kv_indices,
+                        lambda: self.agent.send_notif(peer_name, notif.encode("ascii")),
+                    )
         assert self.src_mem_kind is not None
         return self._send_kvcache_generic(
             peer_name=peer_name,
