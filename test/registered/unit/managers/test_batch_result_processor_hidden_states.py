@@ -45,6 +45,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
@@ -243,6 +244,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
+                    kv_weight_version_record=None,
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
@@ -298,6 +300,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             routed_experts_output=None,
             indexer_topk_output=None,
             logits_output=None,
+            kv_weight_version_record=None,
             next_token_ids=torch.zeros(1, dtype=torch.int64),
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
@@ -351,6 +354,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
             auxiliary_host_output=None,
             routed_experts_output=None,
             indexer_topk_output=None,
+            kv_weight_version_record=None,
             logits_output=SimpleNamespace(
                 hidden_states=None, customized_info=None, sampling_mask_output=None
             ),

@@ -553,5 +553,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "enable_prefill_weight_versions",
 )
 # fmt: on

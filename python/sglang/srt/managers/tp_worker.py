@@ -658,6 +658,7 @@ class TpModelWorker(BaseTpWorker):
                     if folded is None
                     else self.model_runner.kv_index_translator.own_plan(batch)
                 ),
+                kv_weight_version_record=out.kv_weight_version_record,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
