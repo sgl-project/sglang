@@ -250,7 +250,9 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
+def _low_ratio_source_projections(
+    layer, x, q_lora, positions, bufs, run_compressor, run_indexer
+):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
     )
@@ -275,12 +277,12 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
             buf.zero_()
         return
 
-    if layer.compressor is not None:
+    if run_compressor and layer.compressor is not None:
         kv, score = layer.compressor.project(x[:real])
         put("kv", kv)
         if score is not None:
             put("score", score)
-    if layer.indexer is not None:
+    if run_indexer and layer.indexer is not None:
         indexer = layer.indexer
         put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
         put("w", indexer.head_weights(x[:real]))
@@ -2994,7 +2996,9 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, run_compressor, run_indexer
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
