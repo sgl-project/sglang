@@ -120,7 +120,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.lists.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
-        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.metrics_sink = MagicMock()
+        scheduler.metrics_sink.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
 
@@ -292,16 +293,16 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         for is_idle in (True, False):
             with self.subTest(is_idle=is_idle):
                 scheduler.is_fully_idle.return_value = is_idle
-                scheduler.metrics_reporter.reset_mock()
+                scheduler.metrics_sink.reset_mock()
 
                 scheduler._record_scheduler_state_for_paused_engine()
 
                 if is_idle:
-                    scheduler.metrics_reporter.record_scheduler_idle.assert_called_once_with()
-                    scheduler.metrics_reporter.record_scheduler_active.assert_not_called()
+                    scheduler.metrics_sink.record_scheduler_idle.assert_called_once_with()
+                    scheduler.metrics_sink.record_scheduler_active.assert_not_called()
                 else:
-                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once()
-                    scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
+                    scheduler.metrics_sink.record_scheduler_active.assert_called_once()
+                    scheduler.metrics_sink.record_scheduler_idle.assert_not_called()
 
     def test_inplace_does_not_commit_pending_steps(self):
         """in_place should leave the pending steps to the event loop."""

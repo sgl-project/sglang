@@ -48,7 +48,7 @@ def _scheduler(device_module, schedule_stream, forward_stream):
     scheduler.device_module = device_module
     scheduler.schedule_stream = schedule_stream
     scheduler.forward_stream = forward_stream
-    scheduler.metrics_reporter = SimpleNamespace(
+    scheduler.metrics_sink = SimpleNamespace(
         start_scheduler_time_accounting=lambda: None
     )
     return scheduler

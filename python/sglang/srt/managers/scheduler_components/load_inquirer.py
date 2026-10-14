@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
@@ -41,7 +41,7 @@ class SchedulerLoadInquirer:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
-    metrics_reporter: SchedulerMetricsReporter
+    metrics_sink: MetricsSink
     get_request_lists: Callable
     get_disagg_decode_prealloc_queue: Callable
     get_total_prefill_uncached_tokens: Callable
@@ -59,7 +59,7 @@ class SchedulerLoadInquirer:
         waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
             lists["waiting"].reqs
         )
-        cache_miss_rate = 1.0 - self.metrics_reporter.recent_cache_hit_rate
+        cache_miss_rate = 1.0 - self.metrics_sink.recent_cache_hit_rate
         num_tokens = 0
         for req in lists["waiting"].reqs:
             if waiting_queue_prefix_matched:
@@ -73,7 +73,7 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
-        stats = self.metrics_reporter.stats
+        stats = self.metrics_sink.stats
         lists = self.get_request_lists()
         num_running_reqs = len(lists["decoding"].reqs)
 
@@ -126,15 +126,15 @@ class SchedulerLoadInquirer:
             logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
-        metrics_reporter = self.metrics_reporter
+        metrics_sink = self.metrics_sink
         if (
             not self.spec_algorithm.is_none()
-            and metrics_reporter.spec_total_num_forward_ct > 0
+            and metrics_sink.spec_total_num_forward_ct > 0
         ):
             speculative = SpeculativeMetrics(
                 accept_length=(
-                    metrics_reporter.spec_total_num_accept_tokens
-                    / metrics_reporter.spec_total_num_forward_ct
+                    metrics_sink.spec_total_num_accept_tokens
+                    / metrics_sink.spec_total_num_forward_ct
                 ),
                 accept_rate=stats.spec_accept_rate,
             )

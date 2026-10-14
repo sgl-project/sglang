@@ -104,7 +104,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -618,7 +618,7 @@ class DisaggPrefill:
         forward_stream: Any,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         output_streamer: SchedulerOutputStreamer,
-        metrics_reporter: SchedulerMetricsReporter,
+        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
@@ -640,7 +640,7 @@ class DisaggPrefill:
         self.forward_stream = forward_stream
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.output_streamer = output_streamer
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.batch_result_processor = batch_result_processor
         self.counters = counters
@@ -1101,13 +1101,6 @@ class DisaggPrefill:
                 any(req.return_logprob for req in aborted_reqs),
             )
 
-        can_run_cuda_graph = result.can_run_cuda_graph
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
         self.maybe_send_health_check_signal()
         return waiting
 
@@ -1237,9 +1230,9 @@ class DisaggPrefill:
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
-                    self.metrics_reporter.kv_transfer_latency_ms = metrics["latency_ms"]
+                    self.metrics_sink.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
-                    self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                    self.metrics_sink.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
         self.output_streamer.stream_output(
@@ -1286,7 +1279,7 @@ class DisaggPrefill:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
@@ -1354,7 +1347,7 @@ class DisaggPrefill:
         req.disagg.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         self.kv_senders.pop(req.rid, None)
@@ -1740,7 +1733,7 @@ class DisaggPrefill:
                 f"Req {req.rid} optimistic prefill yielded "
                 f"({req.disagg.prefill_attempt_count}/{max_attempts} attempts used)"
             )
-            if self.metrics_reporter.enable_metrics:
+            if self.metrics_sink.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.counters.processed_tokens_counter

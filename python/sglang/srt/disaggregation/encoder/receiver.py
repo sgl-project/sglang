@@ -2540,7 +2540,7 @@ class MMReceiverBase(ABC):
             priority=recv_req.priority,
             metrics_collector=(
                 self.scheduler.metrics_collector
-                if self.scheduler.metrics_reporter.enable_metrics
+                if self.scheduler.metrics_sink.enable_metrics
                 else None
             ),
             extra_key=recv_req.extra_key,

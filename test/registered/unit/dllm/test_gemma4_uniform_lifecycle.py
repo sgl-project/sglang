@@ -109,7 +109,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         get_num_allocatable_reqs=None,
         build_extend_step=None,
         build_sampling_info=None,
-        metrics_reporter=SimpleNamespace(
+        metrics_sink=SimpleNamespace(
             num_generated_tokens=0,
             report_prefill_stats=Mock(),
         ),
@@ -160,7 +160,6 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
         manager.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
         manager.output_streamer.stream_output.assert_not_called()
-        manager.metrics_reporter.report_prefill_stats.assert_called_once()
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(
@@ -378,7 +377,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
         scheduler.dllm = _manager(fdfo=False)
         scheduler._maybe_namespace_elastic_radix_cache = Mock()

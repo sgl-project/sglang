@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.request_lists import RequestList
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -48,7 +48,7 @@ class SchedulerInternalStateController:
     max_total_num_tokens: int
     swa_tokens_per_layer: Optional[int]
     startup_available_gpu_memory_gb: float
-    metrics_reporter: SchedulerMetricsReporter
+    metrics_sink: MetricsSink
     rust_server: Any
     get_request_lists: Callable[[], Dict[str, RequestList]]
     # Set once the scheduler finishes starting, after this is built.
@@ -85,7 +85,7 @@ class SchedulerInternalStateController:
         )
         state["startup_time"] = self.get_startup_time()
         state["effective_max_running_requests_per_dp"] = self.max_running_requests
-        state["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
+        state["last_gen_throughput"] = self.metrics_sink.last_gen_throughput
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
         draft_worker = self.draft_worker
@@ -137,7 +137,7 @@ class SchedulerInternalStateController:
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:
-            state["step_time_dict"] = self.metrics_reporter.step_time_dict
+            state["step_time_dict"] = self.metrics_sink.step_time_dict
 
     def _add_rust_server(self, state: Dict[str, Any]) -> None:
         if self.rust_server is not None:
@@ -214,9 +214,9 @@ class SchedulerInternalStateController:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             logger.info(f"avg_spec_accept_length={accept_length}")
-        metrics_reporter = self.metrics_reporter
-        metrics_reporter.spec_total_num_accept_tokens = (
-            metrics_reporter.spec_total_num_forward_ct
+        metrics_sink = self.metrics_sink
+        metrics_sink.spec_total_num_accept_tokens = (
+            metrics_sink.spec_total_num_forward_ct
         ) = 0
         return {key: value}
 
@@ -247,15 +247,12 @@ class SchedulerInternalStateController:
     # ------------------------------------------------------------------ shared
 
     def _average_accept_length(self) -> Optional[float]:
-        metrics_reporter = self.metrics_reporter
-        if (
-            self.spec_algorithm.is_none()
-            or metrics_reporter.spec_total_num_forward_ct <= 0
-        ):
+        metrics_sink = self.metrics_sink
+        if self.spec_algorithm.is_none() or metrics_sink.spec_total_num_forward_ct <= 0:
             return None
         return (
-            metrics_reporter.spec_total_num_accept_tokens
-            / metrics_reporter.spec_total_num_forward_ct
+            metrics_sink.spec_total_num_accept_tokens
+            / metrics_sink.spec_total_num_forward_ct
         )
 
     def _has_active_sampling_mask_request(self) -> bool:

@@ -39,7 +39,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     if mode == DisaggregationMode.DECODE
                     else None
                 )
-                scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+                scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
                 scheduler.tokenizer = None
                 scheduler.dllm = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()

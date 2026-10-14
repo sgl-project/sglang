@@ -455,7 +455,7 @@ class TestAllocationIntegration(CustomTestCase):
         queue.enable_priority_scheduling = False
         queue.enable_hisparse = False
         queue.enable_lora = False
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
             available_size=Mock(return_value=1)
         )
@@ -503,7 +503,7 @@ class TestAllocationIntegration(CustomTestCase):
             release_aborted_request=Mock(),
             clear_pending_chunk_send=Mock(),
             req_to_metadata_buffer_idx_allocator=Mock(),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
             counters=LaunchCounters(),
         )
         with (

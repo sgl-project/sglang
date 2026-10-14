@@ -676,7 +676,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.release_finished_req = tree_release(q)
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
-    q.metrics_reporter = SimpleNamespace(enable_metrics=enable_metrics)
+    q.metrics_sink = SimpleNamespace(enable_metrics=enable_metrics)
     q.metrics_collector = SimpleNamespace(
         observe_decode_deferred_kv_release=MagicMock()
     )
@@ -915,7 +915,7 @@ def _make_pop_queue(mgr):
     q.enable_decode_hicache = False
     q.enable_hisparse = False
     q.output_streamer = SimpleNamespace(stream_output=lambda reqs, logprob: None)
-    q.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    q.metrics_sink = SimpleNamespace(enable_metrics=False)
     q._poll_with_metadata_gate = lambda: [KVPoll.Failed] * len(q.queue)
     q._clean_hicache_prefetch_resources = lambda decode_req: None
     return q

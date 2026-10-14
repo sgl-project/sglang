@@ -31,9 +31,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     )
     override.install()
     case.addCleanup(override.restore)
-    metrics_reporter = Mock()
-    metrics_reporter.num_generated_tokens = 0
-    metrics_reporter.forward_ct_decode = 0
+    metrics_sink = Mock()
+    metrics_sink.num_generated_tokens = 0
+    metrics_sink.forward_ct_decode = 0
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=False,
@@ -44,7 +44,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=metrics_reporter,
+        metrics_sink=metrics_sink,
         draft_worker=None,
         model_worker=Mock(),
         logprob_result_processor=None,
@@ -333,7 +333,7 @@ class TestDecodeWithoutLogits(CustomTestCase):
             processor.process_batch_result_decode(batch, result)
 
         self.assertEqual(req.output_ids, [8])
-        self.assertEqual(processor.metrics_reporter.num_generated_tokens, 1)
+        self.assertEqual(processor.metrics_sink.num_generated_tokens, 1)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
 

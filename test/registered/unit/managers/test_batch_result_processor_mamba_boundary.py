@@ -87,9 +87,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
 
 
 def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
-    metrics_reporter = MagicMock()
-    metrics_reporter.num_generated_tokens = 0
-    metrics_reporter.forward_ct_decode = 0
+    metrics_sink = MagicMock()
+    metrics_sink.num_generated_tokens = 0
+    metrics_sink.forward_ct_decode = 0
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=True,
@@ -101,7 +101,7 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=metrics_reporter,
+        metrics_sink=metrics_sink,
         draft_worker=None,
         model_worker=MagicMock(),
         logprob_result_processor=None,

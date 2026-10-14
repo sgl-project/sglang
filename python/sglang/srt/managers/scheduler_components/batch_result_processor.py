@@ -63,7 +63,7 @@ if TYPE_CHECKING:
         SchedulerLogprobResultProcessor,
     )
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -204,7 +204,7 @@ class SchedulerBatchResultProcessor:
     req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
-    metrics_reporter: SchedulerMetricsReporter
+    metrics_sink: MetricsSink
     draft_worker: BaseTpWorker
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
@@ -584,17 +584,6 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
-        can_run_cuda_graph = result.can_run_cuda_graph
-        # None on decode->extend converted batches; they are decode work and
-        # have no prefill stats to report.
-        if batch.prefill_stats is not None:
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
-
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -957,9 +946,9 @@ class SchedulerBatchResultProcessor:
 
         batch_size = batch.batch_size()
         num_generated_tokens = result.get_num_generated_tokens(batch_size)
-        self.metrics_reporter.num_generated_tokens += num_generated_tokens
+        self.metrics_sink.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
-            self.metrics_reporter.update_spec_metrics(
+            self.metrics_sink.update_spec_metrics(
                 batch_size,
                 num_generated_tokens - batch_size * result.num_non_draft_tokens_per_req,
                 num_accept_tokens=num_generated_tokens,
@@ -1073,14 +1062,10 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
-        self.metrics_reporter.forward_ct_decode = (
-            self.metrics_reporter.forward_ct_decode + 1
+        self.metrics_sink.forward_ct_decode = (
+            self.metrics_sink.forward_ct_decode + 1
         ) % (1 << 30)
-        self.metrics_reporter.report_decode_stats(
-            can_run_cuda_graph,
-            batch=batch,
-            num_generated_tokens=num_generated_tokens,
-        )
+        return num_generated_tokens
 
     def _normalize_decode_outputs(
         self,

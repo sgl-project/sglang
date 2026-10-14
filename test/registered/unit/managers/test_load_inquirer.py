@@ -57,7 +57,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             policy=SimpleNamespace(
                 waiting_queue_prefix_matched=lambda reqs: waiting_queue_prefix_matched
             ),
-            metrics_reporter=SimpleNamespace(recent_cache_hit_rate=0.75),
+            metrics_sink=SimpleNamespace(recent_cache_hit_rate=0.75),
         )
 
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):

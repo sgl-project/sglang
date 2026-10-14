@@ -358,7 +358,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             clear_pending_chunk_send=MagicMock(),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
         )
         owner.kv_senders[req.rid] = MagicMock()
 

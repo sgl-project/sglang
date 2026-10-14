@@ -50,7 +50,7 @@ def _manager(**deps):
         get_num_allocatable_reqs=lambda running_bs: 64,
         build_extend_step=_Step,
         build_sampling_info=Mock(),
-        metrics_reporter=SimpleNamespace(
+        metrics_sink=SimpleNamespace(
             num_generated_tokens=0, report_prefill_stats=Mock()
         ),
         output_streamer=SimpleNamespace(stream_output=Mock()),

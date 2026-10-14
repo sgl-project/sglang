@@ -264,7 +264,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         scheduler = SimpleNamespace(
             model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),
             disaggregation_mode=DisaggregationMode.NULL,
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
             metrics_collector=None,
             tokenizer=object(),
         )

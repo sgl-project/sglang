@@ -272,6 +272,7 @@ from sglang.srt.managers.scheduler_components.memory_usage import (
 )
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
+    MetricsSink,
     PrefillStats,
     SchedulerMetricsReporter,
 )
@@ -643,9 +644,10 @@ class Scheduler:
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
 
+        self.init_metrics_sink()
         self.init_metrics_reporter()
-        self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
-        self.enable_fpm = self.metrics_reporter.enable_fpm
+        self.scheduler_stage_metrics = self.metrics_sink.scheduler_stage_metrics
+        self.enable_fpm = self.metrics_sink.enable_fpm
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -1377,12 +1379,17 @@ class Scheduler:
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
+    def init_metrics_sink(self) -> None:
+        self.metrics_sink = MetricsSink(
+            metrics_collector_context=self.metrics_collector_context,
+            metrics_collector=self.metrics_collector,
+            device=self.device,
+        )
+
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
         self.metrics_reporter = SchedulerMetricsReporter(
-            scheduler=self,
-            metrics_collector_context=self.metrics_collector_context,
-            metrics_collector=self.metrics_collector,
+            scheduler=self, metrics_sink=self.metrics_sink
         )
 
     def init_schedule_policy(self):
@@ -1409,7 +1416,7 @@ class Scheduler:
                 self.prefill_delayer = PrefillDelayer(
                     metrics_collector=(
                         self.metrics_collector
-                        if self.metrics_reporter.enable_metrics
+                        if self.metrics_sink.enable_metrics
                         else None
                     ),
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
@@ -1531,7 +1538,7 @@ class Scheduler:
             sliding_window_size=self.sliding_window_size,
             enable_overlap=self.enable_overlap,
             forward_stream=self.forward_stream,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             metrics_collector=self.metrics_collector,
             batch_result_processor=self.batch_result_processor,
             counters=self.counters,
@@ -1577,7 +1584,7 @@ class Scheduler:
             can_schedule_lora_req=self.can_schedule_lora_req,
             enable_priority_scheduling=self.enable_priority_scheduling,
             schedule_low_priority_values_first=self.schedule_low_priority_values_first,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             metrics_collector=self.metrics_collector,
             output_streamer=self.output_streamer,
             pool_stats_observer=self.pool_stats_observer,
@@ -1946,7 +1953,7 @@ class Scheduler:
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
-            self.metrics_reporter.start_scheduler_time_accounting()
+            self.metrics_sink.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -2358,7 +2365,7 @@ class Scheduler:
 
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
-            self.metrics_reporter.record_scheduler_active(recv_start_ns)
+            self.metrics_sink.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
         return recv_reqs
 
@@ -2671,7 +2678,7 @@ class Scheduler:
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
-            get_stats=lambda: self.metrics_reporter.stats,
+            metrics_sink=self.metrics_sink,
         )
 
     def init_load_publisher(self) -> None:
@@ -2701,7 +2708,7 @@ class Scheduler:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             spec_algorithm=self.spec_algorithm,
             policy=self.policy,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode.prealloc_queue,
             get_total_prefill_uncached_tokens=lambda: (
@@ -2747,7 +2754,7 @@ class Scheduler:
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
@@ -2783,7 +2790,7 @@ class Scheduler:
             get_num_allocatable_reqs=self.get_num_allocatable_reqs,
             build_extend_step=self.build_extend_step,
             build_sampling_info=self._build_sampling_info,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             output_streamer=self.output_streamer,
             release_aborted_request=self._release_aborted_request,
             send_abort_output=self._send_abort_output,
@@ -2799,7 +2806,7 @@ class Scheduler:
             max_total_num_tokens=self.max_total_num_tokens,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
-            metrics_reporter=self.metrics_reporter,
+            metrics_sink=self.metrics_sink,
             rust_server=self.rust_server,
             get_request_lists=self.request_lists,
             get_startup_time=lambda: self.startup_time,
@@ -3117,9 +3124,7 @@ class Scheduler:
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
-                    self.metrics_collector
-                    if self.metrics_reporter.enable_metrics
-                    else None
+                    self.metrics_collector if self.metrics_sink.enable_metrics else None
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
@@ -3181,7 +3186,7 @@ class Scheduler:
                     session_id
                 )
             # TODO: set trace context
-            if self.metrics_reporter.enable_metrics:
+            if self.metrics_sink.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
@@ -4672,9 +4677,9 @@ class Scheduler:
             else None
         )
 
-        self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
-        if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
-            self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+        self.metrics_sink.num_retracted_reqs = len(retracted_reqs)
+        if self.metrics_sink.enable_metrics and len(retracted_reqs) > 0:
+            self.metrics_sink.metrics_collector.increment_retracted_reqs(
                 num_retracted_reqs=len(retracted_reqs),
                 num_retracted_input_tokens=sum(
                     len(r.origin_input_ids) for r in retracted_reqs
@@ -4720,7 +4725,7 @@ class Scheduler:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        self.metrics_sink.record_scheduler_active(time.monotonic_ns())
         self.counters.forward_ct += 1
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
@@ -5004,7 +5009,14 @@ class Scheduler:
 
         commit_step_counters(batch)
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            num_generated_tokens = (
+                self.batch_result_processor.process_batch_result_decode(batch, result)
+            )
+            self.metrics_reporter.report_decode_stats(
+                result.can_run_cuda_graph,
+                batch=batch,
+                num_generated_tokens=num_generated_tokens,
+            )
             if self.hisparse_coordinator is not None:
                 self.hisparse_coordinator.free_remapped_decode_slots()
         elif batch.forward_mode.is_extend():
@@ -5016,6 +5028,15 @@ class Scheduler:
                 )
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+            # None on decode->extend converted batches; they are decode work and
+            # have no prefill stats to report.
+            if batch.prefill_stats is not None:
+                self.metrics_reporter.report_prefill_stats(
+                    batch=batch,
+                    prefill_stats=batch.prefill_stats,
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    dp_cooperation_info=batch.dp_cooperation_info,
+                )
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self.leave_finished_reqs(slot)
@@ -5023,7 +5044,7 @@ class Scheduler:
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
-        self.metrics_reporter.log_batch_result_stats(batch, result)
+        self.metrics_sink.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
@@ -5031,7 +5052,7 @@ class Scheduler:
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
-        self.metrics_reporter.update_device_timer()
+        self.metrics_sink.update_device_timer()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_process_result(batch)
@@ -5152,7 +5173,7 @@ class Scheduler:
         # post-flush below.
         fully_idle = self.is_fully_idle()
         if not fully_idle:
-            self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+            self.metrics_sink.record_scheduler_active(time.monotonic_ns())
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -5169,7 +5190,7 @@ class Scheduler:
                 # Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
-        self.metrics_reporter.record_scheduler_idle()
+        self.metrics_sink.record_scheduler_idle()
 
         if self.enable_unified_memory:
             try:
@@ -5223,13 +5244,13 @@ class Scheduler:
 
         # sleep until next event
         self.maybe_sleep_on_idle()
-        self.metrics_reporter.record_scheduler_idle()
+        self.metrics_sink.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
         if self.is_fully_idle():
-            self.metrics_reporter.record_scheduler_idle()
+            self.metrics_sink.record_scheduler_idle()
         else:
-            self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+            self.metrics_sink.record_scheduler_active(time.monotonic_ns())
 
     def is_fully_idle(
         self, for_health_check=False, ignore_waiting=False, ignore_releasing=False
@@ -5380,7 +5401,7 @@ class Scheduler:
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
-            self.metrics_reporter.reset_metrics()
+            self.metrics_sink.reset_metrics()
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
@@ -5389,7 +5410,7 @@ class Scheduler:
                 current_platform.empty_cache()
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
-            if self.metrics_reporter.is_stats_logging_rank:
+            if self.metrics_sink.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -5665,9 +5686,9 @@ class Scheduler:
         # (e.g. across a weight update). Zero the gauge, force a one-shot
         # idle log by resetting the rate-limit timestamp, and flush pending
         # KV events.
-        self.metrics_reporter.last_gen_throughput = 0.0
-        if self.metrics_reporter.current_scheduler_metrics_enabled:
-            self.metrics_reporter.metrics_collector.last_log_time = 0.0
+        self.metrics_sink.last_gen_throughput = 0.0
+        if self.metrics_sink.current_scheduler_metrics_enabled:
+            self.metrics_sink.metrics_collector.last_log_time = 0.0
             self.metrics_reporter._maybe_log_idle_metrics()
         self.kv_events_publisher.publish_kv_events()
 
@@ -6101,7 +6122,7 @@ def run_scheduler_process(
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
-            scheduler.metrics_reporter._shutdown_fpm()
+            scheduler.metrics_sink._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.flags.gracefully_exit:

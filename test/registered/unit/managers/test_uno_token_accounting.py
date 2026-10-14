@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    SchedulerMetricsReporter,
+    MetricsSink,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
@@ -38,7 +38,7 @@ class TestUnoTokenAccounting(CustomTestCase):
         )
 
     def test_spec_metrics_keep_generated_and_draft_counts_separate(self):
-        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter = MetricsSink.__new__(MetricsSink)
         reporter.spec_num_accept_tokens = 0
         reporter.spec_num_correct_drafts = 0
         reporter.spec_num_forward_ct = 0

@@ -71,7 +71,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             checkpoint=Mock(),
             send_kv_chunk=Mock(),
             output_streamer=Mock(),
-            metrics_reporter=SimpleNamespace(
+            metrics_sink=SimpleNamespace(
                 report_prefill_stats=Mock(), enable_metrics=False
             ),
             maybe_send_health_check_signal=Mock(),

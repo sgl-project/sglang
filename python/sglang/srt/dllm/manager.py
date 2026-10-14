@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
         NewTokenRatioTracker,
@@ -65,7 +65,7 @@ class DllmManager:
         get_num_allocatable_reqs: Callable[[int], int],
         build_extend_step: Callable[..., ScheduleBatch],
         build_sampling_info: Callable,
-        metrics_reporter: SchedulerMetricsReporter,
+        metrics_sink: MetricsSink,
         output_streamer: SchedulerOutputStreamer,
         release_aborted_request: Callable[[Req], None],
         send_abort_output: Callable[[Req], None],
@@ -89,7 +89,7 @@ class DllmManager:
         self.get_num_allocatable_reqs = get_num_allocatable_reqs
         self.build_extend_step = build_extend_step
         self.build_sampling_info = build_sampling_info
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.output_streamer = output_streamer
         self.release_aborted_request = release_aborted_request
         self.send_abort_output = send_abort_output
@@ -253,12 +253,6 @@ class DllmManager:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=result.can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
             return
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
@@ -284,7 +278,7 @@ class DllmManager:
                     req.full_untruncated_fill_ids[
                         req.extend_end - new_tokens : req.extend_end
                     ] = array("q", next_token_ids)
-                    self.metrics_reporter.num_generated_tokens += new_tokens
+                    self.metrics_sink.num_generated_tokens += new_tokens
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
@@ -323,20 +317,13 @@ class DllmManager:
                 if len_fill - len(next_token_ids) < len_input:
                     next_token_ids = next_token_ids[len_input - len_fill :]
 
-                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
+                self.metrics_sink.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
                 self._finish_dllm_request_if_needed(req)
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
-
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=result.can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
 
     def _finish_dllm_request_if_needed(self, req: Req) -> None:
         if (

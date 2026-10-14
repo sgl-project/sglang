@@ -159,7 +159,7 @@ for _name, _source in (
     ("spec_algorithm", "spec_algorithm"),
     ("scheduler_stage_metrics", "scheduler_stage_metrics"),
     ("output_streamer", "output_streamer"),
-    ("metrics_reporter", "metrics_reporter"),
+    ("metrics_sink", "metrics_sink"),
     ("metrics_collector", "metrics_collector"),
     ("batch_result_processor", "batch_result_processor"),
     ("send_kv_chunk", "send_kv_chunk"),
@@ -265,15 +265,15 @@ class _Scheduler:
         self._relay_beam_tokens = Mock()
         self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = result_processor_shell()
-        self.metrics_reporter = Mock(
+        self.metrics_reporter = Mock(spec=["report_prefill_stats"])
+        self.metrics_sink = Mock(
             spec=[
-                "report_prefill_stats",
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
             ]
         )
-        self.metrics_reporter.current_scheduler_metrics_enabled = False
+        self.metrics_sink.current_scheduler_metrics_enabled = False
         self.kv_events_publisher = Mock(spec=["publish_kv_events"])
         self.publish_load_snapshot = Mock()
         self.load_publisher = Mock(spec=["publish_load_stat"])
@@ -530,7 +530,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         _deferred_input_requests=[],
                         _poll_timeout_aborts=Mock(return_value=[]),
                         request_receiver=SimpleNamespace(recv_requests=receiver),
-                        metrics_reporter=Mock(),
+                        metrics_sink=Mock(),
                         process_input_requests=Mock(),
                     )
                     with published_topology():
@@ -1464,7 +1464,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     }
                 )
                 scheduler.counters.processed_tokens_counter = 0
-                scheduler.metrics_reporter.enable_metrics = False
+                scheduler.metrics_sink.enable_metrics = False
                 release_steps = []
 
                 def release(req, tree_cache, checkpoint):

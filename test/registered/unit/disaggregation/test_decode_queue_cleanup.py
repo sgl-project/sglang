@@ -209,7 +209,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_priority_scheduling = False
         queue.enable_hisparse = False
         queue.enable_lora = False
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         queue.output_streamer = MagicMock()
 
         with patch(
@@ -451,7 +451,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_decode_hicache = False
         queue.enable_hisparse = False
         queue.output_streamer = MagicMock()
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
 
         mock_poll.return_value = [KVPoll.Failed]
 
@@ -566,7 +566,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_decode_hicache = False
         queue.enable_hisparse = False
         queue.output_streamer = MagicMock()
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         mock_poll.return_value = [KVPoll.Failed]
 
         self.assertEqual(queue.pop_transferred([]), [])
@@ -837,7 +837,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.enable_decode_hicache = True
             queue.enable_hisparse = False
             queue.output_streamer = MagicMock()
-            queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+            queue.metrics_sink = SimpleNamespace(enable_metrics=False)
 
             def reduce_with_peer(
                 pollers, group, decode_reqs=None, metadata_buffers=None

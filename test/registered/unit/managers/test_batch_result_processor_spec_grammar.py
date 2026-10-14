@@ -77,7 +77,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=SimpleNamespace(),
+        metrics_sink=SimpleNamespace(),
         draft_worker=None,
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,

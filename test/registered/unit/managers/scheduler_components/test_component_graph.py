@@ -346,6 +346,7 @@ _BUILT = {
         "managers/scheduler_components/load_publisher.py",
         "SchedulerLoadPublisher",
     ),
+    "MetricsSink": ("managers/scheduler_components/metrics_reporter.py", "MetricsSink"),
 }
 
 # The modules whose classes sit below ModeOwners.
@@ -488,7 +489,6 @@ _CALLBACK_SITES = {
         _LAMBDA,
     ): 1,
     ("init_dp_attn_adapter", "SchedulerDPAttnAdapter", "new_step", _BOUND): 1,
-    ("init_kv_events_publisher", "SchedulerKvEventsPublisher", "get_stats", _LAMBDA): 1,
     (
         "init_load_inquirer",
         "SchedulerLoadInquirer",
@@ -554,16 +554,6 @@ _CALLBACK_SITES = {
 
 # R4: (module under srt/, class, parameter).
 _HUB_PARAMS_BELOW_MODE_OWNERS = {
-    ("disaggregation/decode.py", "DecodePreallocQueue", "metrics_reporter"): 1,
-    ("disaggregation/decode.py", "DecodeTransferQueue", "metrics_reporter"): 1,
-    ("disaggregation/decode.py", "DisaggDecode", "metrics_reporter"): 1,
-    ("disaggregation/prefill.py", "DisaggPrefill", "metrics_reporter"): 1,
-    ("dllm/manager.py", "DllmManager", "metrics_reporter"): 1,
-    (
-        "managers/scheduler_components/batch_result_processor.py",
-        "SchedulerBatchResultProcessor",
-        "metrics_reporter",
-    ): 1,
     (
         "managers/scheduler_components/batch_result_processor.py",
         "SchedulerBatchResultProcessor",

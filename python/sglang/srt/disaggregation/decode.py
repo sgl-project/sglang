@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -443,7 +443,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         can_schedule_lora_req: Callable[[Req, Set[Optional[str]]], bool],
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
-        metrics_reporter: SchedulerMetricsReporter,
+        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
@@ -479,7 +479,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.can_schedule_lora_req = can_schedule_lora_req
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
         self.pool_stats_observer = pool_stats_observer
@@ -1228,7 +1228,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                if self.metrics_reporter.enable_metrics:
+                if self.metrics_sink.enable_metrics:
                     self.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
@@ -1961,7 +1961,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             destination=KVTransferDestination.HOST,
         )
         decode_req.host_staged = True
-        if self.metrics_reporter.current_scheduler_metrics_enabled:
+        if self.metrics_sink.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_decode_host_receive_reqs()
         return True
 
@@ -2546,7 +2546,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         enable_decode_hicache: bool,
         enable_hisparse: bool,
         hisparse_coordinator: Optional[HiSparseCoordinator],
-        metrics_reporter: SchedulerMetricsReporter,
+        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
         update_reasoning_tokens: Callable[[Req, int], None],
@@ -2567,7 +2567,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.enable_decode_hicache = enable_decode_hicache
         self.enable_hisparse = enable_hisparse
         self.hisparse_coordinator = hisparse_coordinator
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
         self.update_reasoning_tokens = update_reasoning_tokens
@@ -2810,7 +2810,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.release_finished_req(req, checkpoint=False)
 
     def _record_transfer_failure(self, failure_reason: str) -> None:
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _abort_failed_transfer(self, decode_req: DecodeRequest) -> None:
@@ -3027,7 +3027,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _observe_deferred_kv_release(
         self, duration_seconds: float, outcome: str
     ) -> None:
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.observe_decode_deferred_kv_release(
                 duration_seconds=duration_seconds,
                 outcome=outcome,
@@ -3150,7 +3150,7 @@ class DisaggDecode:
         can_schedule_lora_req: Callable[[Req, Set[Optional[str]]], bool],
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
-        metrics_reporter: SchedulerMetricsReporter,
+        metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
@@ -3186,7 +3186,7 @@ class DisaggDecode:
         self.hisparse_coordinator = hisparse_coordinator
         self.enable_decode_hicache = enable_decode_hicache
         self.enable_priority_scheduling = enable_priority_scheduling
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
         self.core_lists = core_lists
@@ -3241,7 +3241,7 @@ class DisaggDecode:
             enable_decode_hicache=enable_decode_hicache,
             enable_hisparse=enable_hisparse,
             hisparse_coordinator=hisparse_coordinator,
-            metrics_reporter=metrics_reporter,
+            metrics_sink=metrics_sink,
             metrics_collector=metrics_collector,
             output_streamer=output_streamer,
             update_reasoning_tokens=update_reasoning_tokens,
@@ -3277,7 +3277,7 @@ class DisaggDecode:
             can_schedule_lora_req=can_schedule_lora_req,
             enable_priority_scheduling=enable_priority_scheduling,
             schedule_low_priority_values_first=schedule_low_priority_values_first,
-            metrics_reporter=metrics_reporter,
+            metrics_sink=metrics_sink,
             metrics_collector=metrics_collector,
             output_streamer=output_streamer,
             pool_stats_observer=pool_stats_observer,
@@ -3874,5 +3874,5 @@ class DisaggDecode:
         # A ready request holds its HiSparse rows (preallocation, then the
         # move to ready), so it releases like any leaving request.
         self.release_finished_req(req, checkpoint=False)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()

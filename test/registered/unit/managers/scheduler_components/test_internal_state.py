@@ -44,7 +44,7 @@ def _controller(scheduler: Scheduler) -> SchedulerInternalStateController:
         max_total_num_tokens=0,
         swa_tokens_per_layer=0,
         startup_available_gpu_memory_gb=0.0,
-        metrics_reporter=None,
+        metrics_sink=None,
         rust_server=None,
         get_request_lists=scheduler.request_lists,
         get_startup_time=lambda: None,
