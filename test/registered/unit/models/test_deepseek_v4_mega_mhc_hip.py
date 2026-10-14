@@ -43,10 +43,12 @@ def _sublayer(cfg):
 
 
 class TestMegaMhcGate(unittest.TestCase):
-    def test_off_by_default_on_sm100(self):
-        with override_platform(is_sm100=True):
-            with mock.patch.object(mhc, "_is_hip", False):
-                self.assertFalse(mhc._can_use_mega_mhc(_cfg()))
+    def test_off_by_default_on_gfx950(self):
+        with (
+            mock.patch.object(mhc, "_is_hip", True),
+            mock.patch.object(mhc, "_is_gfx95_supported", True),
+        ):
+            self.assertFalse(mhc._can_use_mega_mhc(_cfg()))
 
     @override_platform(is_sm100=True)
     def test_cuda_sm100_unchanged(self):
@@ -78,9 +80,6 @@ class TestMegaMhcGate(unittest.TestCase):
 
 
 class TestHipFlydslDispatch(unittest.TestCase):
-    def setUp(self):
-        mhc._hip_mega_mhc_warned = False
-
     def _boundary(self, cfg):
         hc = _sublayer(cfg)
         return mhc.HcNextBoundary(
@@ -140,43 +139,6 @@ class TestHipFlydslDispatch(unittest.TestCase):
         self.assertEqual(state.stats[0].shape, (2, 4))
         self.assertEqual(state.stats[1].shape, (2, 4))
         self.assertTrue(torch.equal(state.pre, pre))
-
-    def test_launch_failure_falls_back_to_unfused_post(self):
-        cfg = _cfg()
-        flydsl = types.ModuleType("aiter.ops.flydsl")
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("no kernel")
-
-        flydsl.flydsl_mega_mhc = boom
-        ops = types.ModuleType("aiter.ops")
-        ops.flydsl = flydsl
-        aiter = types.ModuleType("aiter")
-        aiter.ops = ops
-        sentinel = torch.zeros(1)
-        with (
-            override_platform(is_blackwell=False),
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
-            mock.patch.object(mhc, "_is_hip", True),
-            mock.patch.object(mhc, "_is_gfx95_supported", True),
-            mock.patch.object(mhc, "post", return_value=sentinel),
-            mock.patch.dict(
-                sys.modules,
-                {
-                    "aiter": aiter,
-                    "aiter.ops": ops,
-                    "aiter.ops.flydsl": flydsl,
-                },
-            ),
-        ):
-            state = mhc._post_fusion(
-                _sublayer(cfg),
-                torch.zeros(2, 4),
-                torch.zeros(2, 4, 4),
-                (torch.zeros(2, 4), torch.zeros(2, 4), torch.zeros(2, 4, 4)),
-                self._boundary(cfg),
-            )
-        self.assertTrue(torch.equal(state.streams, sentinel))
 
 
 class TestFusedBoundaryYieldsToMega(unittest.TestCase):
