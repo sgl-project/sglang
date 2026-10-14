@@ -8,16 +8,28 @@ Covers three things:
      load into and silently fall back to 1.0.
   3. QWEN3_5_KV_SCALE_MAPPER remaps the checkpoint's baked KV-scale names onto the
      RadixAttention parameter names.
+  4. The dense-MLP SiLU+FP4 fusion stays off where down_proj cannot take its
+     (fp4, scale) tuple: NVFP4 AWQ, sequence parallelism, a LoRA-wrapped down_proj.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    maybe_enable_silu_fp4_quant_fusion,
+)
+from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -151,6 +163,37 @@ class TestQwen3_5KvScaleMapper(CustomTestCase):
         weight_loader(scale_param, loaded_weight)
 
         self.assertAlmostEqual(scale_param.item(), 0.0347, places=6)
+
+
+class TestSiluFp4QuantFusionGates(CustomTestCase):
+    @staticmethod
+    def _enabled_mlp(down_proj) -> SimpleNamespace:
+        return SimpleNamespace(_enable_silu_fp4_quant_fusion=True, down_proj=down_proj)
+
+    def test_runs_for_a_plain_down_proj(self):
+        mlp = self._enabled_mlp(SimpleNamespace())
+        self.assertTrue(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
+
+    def test_skips_a_lora_wrapped_down_proj(self):
+        mlp = self._enabled_mlp(SimpleNamespace(base_layer=SimpleNamespace()))
+        self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
+
+    def test_skips_under_sequence_parallelism(self):
+        mlp = self._enabled_mlp(SimpleNamespace())
+        with get_forward().scoped(sp_active=True):
+            self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
+
+    def test_stays_off_for_nvfp4_awq(self):
+        # The fused producer would skip AWQ's per-input-channel pre_quant_scale.
+        method = MagicMock(spec=ModelOptFp4LinearMethod, quant_mode="w4a4")
+        method.quant_config = SimpleNamespace(is_awq=True)
+        mlp = SimpleNamespace(
+            _enable_silu_fp4_quant_fusion=False,
+            gate_up_proj=SimpleNamespace(quant_method=method),
+            down_proj=SimpleNamespace(quant_method=method),
+        )
+        maybe_enable_silu_fp4_quant_fusion(mlp)
+        self.assertFalse(mlp._enable_silu_fp4_quant_fusion)
 
 
 if __name__ == "__main__":
