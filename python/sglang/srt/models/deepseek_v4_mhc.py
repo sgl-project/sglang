@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -581,12 +582,76 @@ def _compute_triplet(
     return coefficients
 
 
+_hip_mega_mhc_warned = False
+
+
 def _can_use_mega_mhc(cfg: HcConfig) -> bool:
-    return (
-        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        and get_platform().is_sm100
-        and not cfg.cp_prefill
-    )
+    """Opt-in single-pass Mega-mHC prefill.
+
+    SM100 keeps DeepGEMM. gfx950 DeepSeek-V4.1 (hc_mult 4, hidden 5120) uses
+    aiter ``flydsl_mega_mhc`` and must not also take the fused HIP boundary.
+    Context-parallel prefill is unsupported on both.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get() or cfg.cp_prefill:
+        return False
+    if _is_hip:
+        return _is_gfx95_supported and cfg.mult == 4 and cfg.hidden == 5120
+    return get_platform().is_sm100
+
+
+def _hip_flydsl_mega_mhc(
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb: torch.Tensor,
+    nxt: HcSubLayer,
+) -> Optional[HcState]:
+    """ROCm Mega-mHC (aiter #6179). bf16 norm; the next GEMM still quantizes.
+
+    None means aiter is missing or the launch failed, and the caller should
+    take the unfused post. The warning is once per process.
+    """
+    global _hip_mega_mhc_warned
+    try:
+        from aiter.ops.flydsl import flydsl_mega_mhc
+
+        post_in = post_mix.unsqueeze(-1) if post_mix.ndim == 2 else post_mix
+        residual_out = torch.empty_like(residual)
+        updated, next_post, next_comb, normalized, next_pre = flydsl_mega_mhc(
+            residual,
+            nxt.fn,
+            nxt.scale,
+            nxt.base,
+            nxt.cfg.rms_eps,
+            nxt.cfg.eps,
+            nxt.cfg.eps,
+            2.0,
+            nxt.cfg.sinkhorn_iters,
+            pre,
+            sublayer_out=y,
+            post_layer_mix=post_in,
+            comb_res_mix=comb,
+            norm_weight=nxt.norm.weight,
+            norm_eps=nxt.norm.variance_epsilon,
+            residual_out=residual_out,
+            out_dtype="bf16",
+        )
+        if next_post.ndim == 3:
+            next_post = next_post.squeeze(-1)
+        if next_pre.ndim == 3:
+            next_pre = next_pre.squeeze(-1)
+        return HcState(
+            updated, pre, HcNormed(normalized), (next_pre, next_post, next_comb)
+        )
+    except Exception as err:
+        if not _hip_mega_mhc_warned:
+            _hip_mega_mhc_warned = True
+            logging.getLogger(__name__).warning(
+                "flydsl_mega_mhc unavailable, falling back to the unfused post: %s",
+                err,
+            )
+        return None
 
 
 def _post_fusion(
@@ -608,23 +673,28 @@ def _post_fusion(
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
     ):
-        next_hc = next.hc
-        updated, normalized, stats = mhc_mega_boundary(
-            y,
-            residual,
-            pre,
-            post_mix,
-            comb,
-            next_hc.fn,
-            next_hc.scale,
-            next_hc.base,
-            next_hc.norm.weight,
-            next_hc.cfg.rms_eps,
-            next_hc.cfg.eps,
-            next_hc.norm.variance_epsilon,
-            next_hc.cfg.sinkhorn_iters,
-        )
-        return HcState(updated, pre, HcNormed(normalized), stats)
+        if _is_hip:
+            hip_state = _hip_flydsl_mega_mhc(y, residual, pre, post_mix, comb, next.hc)
+            if hip_state is not None:
+                return hip_state
+        else:
+            next_hc = next.hc
+            updated, normalized, stats = mhc_mega_boundary(
+                y,
+                residual,
+                pre,
+                post_mix,
+                comb,
+                next_hc.fn,
+                next_hc.scale,
+                next_hc.base,
+                next_hc.norm.weight,
+                next_hc.cfg.rms_eps,
+                next_hc.cfg.eps,
+                next_hc.norm.variance_epsilon,
+                next_hc.cfg.sinkhorn_iters,
+            )
+            return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None
         and next.norm_fusable
