@@ -279,7 +279,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
             self.session_lock = threading.Lock()
+            # Room-lifecycle bookkeeping: the decode leg can register a room
+            # BEFORE the prefill scheduler creates the room's sender -- the
+            # router dispatches both legs concurrently, so a registration
+            # can land while the prefill request is still behind tokenization
+            # or a multi-second running batch. Those early registrations
+            # leave request_status/transfer_infos entries behind that no
+            # request ever owns when the /generate leg never arrives, and a
+            # registration for a room that already concluded can re-create
+            # its transfer targets (dead-end transfers). Track both.
+            self._room_lifecycle_lock = threading.Lock()
+            self._concluded_rooms: Dict[int, float] = {}
+            self._early_rooms: Dict[int, float] = {}
+            self.tombstone_ttl_s = 360.0
+            self.early_room_ttl_s = float(self.bootstrap_timeout) + 60.0
             self.start_prefill_thread()
+            self._start_housekeeping_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -414,6 +429,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         probe_shutdown = getattr(self, "_failed_session_probe_shutdown", None)
         if probe_shutdown is not None:
             probe_shutdown.set()
+
+        # Stop the room housekeeping sweep (PREFILL role) if running.
+        housekeeping_shutdown = getattr(self, "_housekeeping_shutdown", None)
+        if housekeeping_shutdown is not None:
+            housekeeping_shutdown.set()
 
         # Stop the heartbeat checker thread (DECODE role) if running.
         heartbeat_shutdown = getattr(self, "_heartbeat_shutdown", None)
@@ -2942,6 +2962,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    # Snapshot the room: sender teardown tombstones under
+                    # _room_lifecycle_lock BEFORE popping the tables, and a
+                    # failing sender leaves the terminal Failed state behind
+                    # first or its recorded root cause outlives the pops,
+                    # so this read can never miss a conclusion that
+                    # already happened.
+                    room_status = self.request_status.get(room)
+                    with self.failure_lock:
+                        recorded_failure = self.failure_records.get(room)
+                    room_concluded = (room in self._concluded_rooms) or (
+                        room_status is None and recorded_failure is not None
+                    )
+                    if room_status == KVPoll.Failed or room_concluded:
+                        # The room already concluded (timed out, aborted, or
+                        # its tables were cleared). Accepting this late
+                        # registration would resurrect the room's transfer
+                        # targets for a request that no longer exists --
+                        # dead-end transfers (a later request reusing the
+                        # same bootstrap_room would also inherit them).
+                        logger.warning(
+                            "Dropping late registration for room %s "
+                            "(room already concluded)",
+                            room,
+                        )
+                        continue
+                    if room_status is None:
+                        # No prefill sender exists yet: the decode leg
+                        # registered while the request is still behind burst
+                        # tokenization or a running batch. Accept it (decode
+                        # never re-sends) and let the housekeeping sweep
+                        # reclaim the room if no request ever claims it.
+                        with self._room_lifecycle_lock:
+                            self._early_rooms[room] = time.monotonic()
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -2964,6 +3017,97 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         t = threading.Thread(target=bootstrap_thread, daemon=True)
         t.start()
         self._worker_threads.append(t)
+
+    def on_sender_created(self, bootstrap_room: int) -> None:
+        """A prefill sender now owns the room, so stop tracking it as an
+        unconsumed early registration. Called BEFORE the sender inserts the
+        room into request_status, so a concurrent sweep can never reclaim a
+        room a sender is bringing up.
+
+        Room-lifecycle bookkeeping is a PREFILL-role facility: an object
+        without it never has senders, so the missing state is a no-op."""
+        lock = getattr(self, "_room_lifecycle_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._early_rooms.pop(bootstrap_room, None)
+
+    def note_room_concluded(self, bootstrap_room: int) -> None:
+        """Tombstone a room whose request is concluding, so a registration
+        racing with the teardown is dropped instead of being accepted for a
+        dead room. Must be taken BEFORE the conclusion pops the room tables:
+        that ordering makes a bootstrap_thread snapshot that reads neither
+        the tombstone nor a live state impossible.
+
+        See on_sender_created() for the missing-state no-op contract."""
+        lock = getattr(self, "_room_lifecycle_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._concluded_rooms[bootstrap_room] = time.monotonic()
+
+    def _start_housekeeping_thread(self) -> None:
+        self._housekeeping_shutdown = threading.Event()
+        t = threading.Thread(
+            target=self._housekeeping_loop,
+            name="MooncakeRoomHousekeeping",
+            daemon=True,
+        )
+        t.start()
+        self._worker_threads.append(t)
+
+    def _housekeeping_loop(self) -> None:
+        while not self._stopped:
+            self._housekeeping_shutdown.wait(15.0)
+            if self._stopped:
+                break
+            try:
+                self.sweep_stale_rooms()
+            except Exception:
+                logger.exception("mooncake room housekeeping sweep failed")
+
+    def sweep_stale_rooms(self, now: Optional[float] = None) -> None:
+        """Expire concluded-room tombstones and reclaim rooms whose early
+        registration was accepted but that no prefill request ever claimed
+        within early_room_ttl_s (the router dropped the /generate leg or the
+        room was never dispatched here).
+
+        Sender teardown and sender creation both synchronize on
+        _room_lifecycle_lock before touching the room tables' contents
+        (note_room_concluded before the pops; on_sender_created before the
+        sender inserts Bootstrapping), so a room still tracked in
+        _early_rooms is guaranteed to have no live sender.
+        """
+        if now is None:
+            now = time.monotonic()
+        with self._room_lifecycle_lock:
+            for room, concluded_at in list(self._concluded_rooms.items()):
+                if now - concluded_at > self.tombstone_ttl_s:
+                    del self._concluded_rooms[room]
+            expired_early = [
+                room
+                for room, registered_at in self._early_rooms.items()
+                if now - registered_at > self.early_room_ttl_s
+            ]
+            for room in expired_early:
+                del self._early_rooms[room]
+                # Mirror the sender teardown for a room no request owns, and
+                # conclude it: tombstone + a recorded root cause, so a
+                # registration the sweep races with is dropped (not
+                # re-accepted as early).
+                self._concluded_rooms[room] = now
+                self.record_failure(room, "Prefill request never claimed the room")
+                self.request_status.pop(room, None)
+                if hasattr(self, "req_to_decode_prefix_len"):
+                    self.req_to_decode_prefix_len.pop(room, None)
+                if hasattr(self, "transfer_infos"):
+                    self.transfer_infos.pop(room, None)
+                logger.info(
+                    "Reclaimed early-registration state for room %s "
+                    "(no prefill request claimed it within %.0fs)",
+                    room,
+                    self.early_room_ttl_s,
+                )
 
     def start_decode_thread(self):
         recv = self._make_worker_recv(self.server_socket)
@@ -3152,6 +3296,10 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
+        # Claim the room BEFORE the base class inserts it into
+        # request_status: sweep_stale_rooms() must never reclaim a room a
+        # sender is bringing up (early-registration lifecycle).
+        mgr.on_sender_created(bootstrap_room)
         super().__init__(
             mgr,
             bootstrap_addr,
@@ -3247,7 +3395,17 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         self.trace_ctx.trace_req_start()
 
+    def clear(self) -> None:
+        # Tombstone BEFORE super().clear() pops the room tables: a
+        # registration racing with this teardown must be dropped, not
+        # accepted for a concluded room.
+        self.kv_mgr.note_room_concluded(self.bootstrap_room)
+        super().clear()
+
     def abort(self):
+        # Same ordering as clear(): tombstone first so a registration
+        # racing with the abort is dropped, then the base failure state.
+        self.kv_mgr.note_room_concluded(self.bootstrap_room)
         super().abort()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
