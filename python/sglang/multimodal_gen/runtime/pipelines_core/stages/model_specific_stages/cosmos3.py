@@ -59,8 +59,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
-    RolloutDenoisingMixin,
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
+    prepare_rollout_if_enabled,
     rollout_transition,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
@@ -1060,7 +1062,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+class Cosmos3DenoisingStage(PipelineStage):
     def default_workload_iterations(
         self, batch: Req, num_inference_steps: int
     ) -> int | None:
@@ -1500,23 +1502,24 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-            self._maybe_prepare_rollout(batch)
-            self._maybe_init_denoising_env_collection(
-                batch=batch,
-                pipeline_config=server_args.pipeline_config,
-                image_kwargs={},
-                pos_cond_kwargs={
-                    "text_ids": cond_text_ids,
-                    "text_mask": cond_text_mask,
-                    "fps": fps,
-                },
-                neg_cond_kwargs={
-                    "text_ids": uncond_text_ids,
-                    "text_mask": uncond_text_mask,
-                    "fps": fps,
-                },
-                guidance=None,
-            )
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs={},
+            pos_cond_kwargs={
+                "text_ids": cond_text_ids,
+                "text_mask": cond_text_mask,
+                "fps": fps,
+            },
+            neg_cond_kwargs={
+                "text_ids": uncond_text_ids,
+                "text_mask": uncond_text_mask,
+                "fps": fps,
+            },
+            guidance=None,
+        )
         transition = rollout_transition(batch)
 
         do_cfg = guidance_scale > 1.0
@@ -1834,14 +1837,13 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # next request's steps.
         self.transformer.reset_denoising_step()
 
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=latents,
-                num_inference_steps=len(timesteps),
-                final_timestep=timesteps.new_zeros(()).cpu(),
-                server_args=server_args,
-            )
+        finalize_rollout_if_enabled(
+            batch=batch,
+            latents=latents,
+            num_inference_steps=len(timesteps),
+            final_timestep=timesteps.new_zeros(()).cpu(),
+            pipeline_config=server_args.pipeline_config,
+        )
 
         batch.latents = latents
         if action_latents is not None:

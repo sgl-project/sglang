@@ -36,7 +36,7 @@ class FlowRolloutController:
         shard_for_sp: Callable[[torch.Tensor], torch.Tensor],
         gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
-        latents_shape: tuple | None,
+        latents_shape: tuple,
     ) -> None:
         self.sde_type = sde_type
         self.noise_level = noise_level
