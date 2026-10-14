@@ -630,7 +630,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> KDAPrefillGraphMetadata:
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
-            num_tokens=forward_batch.positions.shape[0],
+            # DSA queries are CP-local; KDA recurrence retains global tokens.
+            num_tokens=(
+                forward_batch.attn_cp_metadata.total_seq_lens
+                if forward_batch.attn_cp_metadata is not None
+                else forward_batch.positions.shape[0]
+            ),
             max_seqs_cap=self.prefill_graph_max_seqs,
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).

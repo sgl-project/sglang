@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -53,6 +54,7 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
     tuple[ContextParallelStrategyKind, CPAttentionBackendKind]
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
+    (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSA),
 }
 
 
@@ -76,7 +78,23 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     except ValueError:
         # Other backends (or an unresolved backend/strategy) cannot use CP BCG.
         return False
-    return combination in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS
+    if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
+        return False
+    if combination == (
+        ContextParallelStrategyKind.INTERLEAVE,
+        CPAttentionBackendKind.DSA,
+    ):
+        # Qualify only GLM's head-TP KDA path. Other DSA models stay eager.
+        return (
+            "Glm5NextForConditionalGeneration"
+            in (model_config_of(cfg).hf_config.architectures or [])
+            and resolved.attn_cp_size > 1
+            and resolved.dsa_prefill_backend in ("tilelang", "flashmla_sparse_q8")
+            and cfg.dp_size == 1
+            and cfg.speculative_algorithm is None
+            and not cfg.enable_dsa_cache_layer_split
+        )
+    return True
 
 
 def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
@@ -195,6 +213,17 @@ class PrefillCPBCGInput:
         capture_num_tokens: list[int],
         max_padding_factor: int,
     ) -> Optional[int]:
+        from sglang.srt.runtime_context import process_model_config
+
+        # GLM KDA computes the full causal sequence. Do not replay a larger
+        # captured geometry over a shorter live recurrence or padded tail.
+        if (
+            isinstance(get_cp_strategy(), InterleaveCPStrategy)
+            and "Glm5NextForConditionalGeneration"
+            in (process_model_config().hf_config.architectures or [])
+            and num_tokens not in capture_num_tokens
+        ):
+            return None
         required_local_tokens = self.required_local_tokens(extend_seq_lens)
         if required_local_tokens is None:
             return None

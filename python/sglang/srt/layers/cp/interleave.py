@@ -238,6 +238,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         cp_size = self.cp_size
         cp_rank = self.cp_rank
 
+        # Static BCG request buffers are int64; splitter loop offsets are int32.
+        extend_seqs = extend_seqs.to(dtype=torch.int32)
         extra_seq = 0
         q_lens_cpu: List[int] = []
         for cur_len in extend_seqs_cpu:

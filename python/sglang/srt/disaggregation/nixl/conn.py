@@ -3709,6 +3709,10 @@ class NixlKVSender(CommonKVSender):
         )
         if should_skip:
             return
+        # An empty non-final CP shard emits no KV notification: do not advance
+        # its receiver-visible chunk ID. Final empty sends still carry state.
+        if len(kv_indices) == 0 and not is_last_chunk:
+            return
 
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None

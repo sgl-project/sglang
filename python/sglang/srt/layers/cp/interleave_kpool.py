@@ -46,5 +46,10 @@ def materialize_compression_inputs(key, score, positions, forward_batch):
     return (
         packed[..., :width].contiguous(),
         packed[..., width:].contiguous(),
-        forward_batch.positions,
+        # BCG replaces forward_batch.positions with its CP-local buffer.
+        # Compression still needs the original full causal positions.
+        get_cp_strategy().gather_kv_cache(positions, forward_batch)
+        if forward_batch.positions.shape[0]
+        < forward_batch.attn_cp_metadata.total_seq_lens
+        else forward_batch.positions,
     )
