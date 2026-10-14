@@ -35,8 +35,6 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
             "exchange the global QSA layer metadata needed to pair compact "
             "state descriptors across pipeline stages."
         )
-    if cfg.enable_unified_memory:
-        raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
     overrides: Dict[str, Any] = {}
 
     if cfg.ple_offload_embedding is None:

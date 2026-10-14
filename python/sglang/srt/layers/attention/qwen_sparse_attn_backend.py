@@ -228,6 +228,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
+        allocator = getattr(runner, "token_to_kv_pool_allocator", None)
+        self._full_v2p_page_table = getattr(allocator, "full_v2p_page_table", None)
+        self._unified_page_size = int(getattr(allocator, "page_size", 1))
+        self._translate_kv_loc = (
+            getattr(allocator, "translate_kv_loc", None)
+            if self._full_v2p_page_table is not None
+            and allocator.get_kvcache() is self.token_to_kv_pool
+            else None
+        )
+        if self._translate_kv_loc is None:
+            self._full_v2p_page_table = None
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
@@ -256,6 +267,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
+
+    def _physical_slots(self, slots: torch.Tensor) -> torch.Tensor:
+        if self._translate_kv_loc is None:
+            return slots
+        shape = slots.shape
+        return self._translate_kv_loc(slots.reshape(-1).long()).reshape(shape)
+
+    def _cache_write_loc(self, forward_batch):
+        if self._translate_kv_loc is None:
+            return forward_batch.out_cache_loc
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        return KVWriteLoc(
+            self.kv_index_translator.write_ids(forward_batch), physical=True
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -616,6 +642,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
             ].to(torch.int32)
+            if self._translate_kv_loc is not None:
+                token_slot_table = self._physical_slots(token_slot_table).to(
+                    torch.int32
+                )
             token_to_batch_idx = torch.arange(
                 sequence_lengths.numel(),
                 device=sequence_lengths.device,
@@ -632,6 +662,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
             ].to(torch.int32)
+            if self._translate_kv_loc is not None:
+                token_slot_table = self._physical_slots(token_slot_table).to(
+                    torch.int32
+                )
             positions = forward_batch.positions
             num_position_tokens = (
                 positions.shape[-1] if positions.ndim == 2 else positions.numel()
@@ -906,16 +940,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         speculative_paged = self._is_speculative_paged_mode(forward_mode)
         metadata_rows = num_tokens if speculative_paged else bs
         if speculative_paged:
-            row_lengths, row_req_pool_indices, row_prefix_lengths = (
-                self._graph_speculative_layout(
-                    bs,
-                    num_tokens,
-                    req_pool_indices,
-                    seq_lens[:bs].detach().cpu(),
-                    forward_mode,
-                    spec_info,
-                    num_padding=bs,
-                )
+            (
+                row_lengths,
+                row_req_pool_indices,
+                row_prefix_lengths,
+            ) = self._graph_speculative_layout(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens[:bs].detach().cpu(),
+                forward_mode,
+                spec_info,
+                num_padding=bs,
             )
             self._graph_prefix_lengths[:metadata_rows].copy_(
                 row_prefix_lengths.to(device=self.device)
@@ -1001,16 +1037,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             # slow-path readback, never the serving path.
             seq_lens_cpu = seq_lens[:bs].cpu()
         if self._is_speculative_paged_mode(forward_mode):
-            row_lengths, row_req_pool_indices, row_prefix_lengths = (
-                self._graph_speculative_layout(
-                    bs,
-                    metadata.sequence_lengths.numel(),
-                    req_pool_indices,
-                    seq_lens_cpu,
-                    forward_mode,
-                    spec_info,
-                    num_padding=num_padding or 0,
-                )
+            (
+                row_lengths,
+                row_req_pool_indices,
+                row_prefix_lengths,
+            ) = self._graph_speculative_layout(
+                bs,
+                metadata.sequence_lengths.numel(),
+                req_pool_indices,
+                seq_lens_cpu,
+                forward_mode,
+                spec_info,
+                num_padding=num_padding or 0,
             )
             metadata.sequence_lengths.copy_(row_lengths.to(device=self.device))
             metadata.row_req_pool_indices.copy_(row_req_pool_indices.to(torch.int32))
@@ -1040,7 +1078,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _stage_extend_lens(self, spec_info, bs: int, num_tokens: int):
-
         extend_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
         if extend_lens is not None and extend_lens.numel() >= bs:
             return extend_lens[:bs]
@@ -1361,6 +1398,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+        if self._translate_kv_loc is not None:
+            return None
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1453,7 +1492,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             if fused_output is not None:
                 return fused_output
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, self._cache_write_loc(forward_batch), k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
@@ -1521,6 +1560,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
+            v2p_pages=self._full_v2p_page_table,
+            page_size=self._unified_page_size,
         )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
@@ -1717,8 +1758,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # paged kernel always runs the bf16 q + bf16 KV path.
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            k_buffer.shape[-2],
+            k_buffer.shape[-1],
             q.dtype,
             k_buffer.device,
         )
@@ -1772,9 +1813,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 batch,
                 topk,
                 zero_fill_cols=stride,
+                v2p_pages=self._full_v2p_page_table,
+                page_size=self._unified_page_size,
             )
-        num_kv_heads = k_buffer.shape[1]
-        head_dim = k_buffer.shape[2]
+        num_kv_heads = k_buffer.shape[-2]
+        head_dim = k_buffer.shape[-1]
         kc = (
             packed_k[: batch * stride]
             .view(-1, page, num_kv_heads, head_dim)
@@ -1834,7 +1877,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             if fused_output is not None:
                 return fused_output
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, self._cache_write_loc(forward_batch), k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
@@ -1897,8 +1940,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            k_buffer.shape[-2],
+            k_buffer.shape[-1],
             q.dtype,
             k_buffer.device,
         )
@@ -1918,6 +1961,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            v2p_pages=self._full_v2p_page_table,
+            page_size=self._unified_page_size,
         )
         if is_hip():
             relative_indices = torch.arange(

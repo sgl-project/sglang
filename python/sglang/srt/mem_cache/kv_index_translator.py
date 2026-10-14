@@ -151,7 +151,9 @@ class KVIndexTranslator:
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
-            self.defer_read_translate = get_parallel().attn_dcp_size > 1
+            self.defer_read_translate = get_parallel().attn_dcp_size > 1 or bool(
+                getattr(token_to_kv_pool, "backend_resolves_kv_indices", False)
+            )
             # Keyed by the allocator, which owns the tables: a fused draft's
             # runner shares the target's full sub-pool, and so its key.
             self._spaces[IdSpaceKind.FULL] = IdSpace(
@@ -572,7 +574,10 @@ class KVIndexTranslator:
         for backend in backends:
             if backend is None:
                 continue
-            if backend.kv_index_translator is None:
+            # Lightweight composite backends need not inherit BaseAttentionBackend
+            # and therefore may not predeclare the hook. Binding the attribute is
+            # still the contract; their reachable child backends are bound too.
+            if getattr(backend, "kv_index_translator", None) is None:
                 backend.kv_index_translator = self
                 continue
             assert backend.kv_index_translator is self, (

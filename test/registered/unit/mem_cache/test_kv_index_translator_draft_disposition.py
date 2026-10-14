@@ -143,6 +143,17 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
+    def test_bind_accepts_a_lightweight_backend_wrapper(self):
+        _, allocator, _, draft_pool = _build()
+        translator = _source(allocator, draft_pool)
+        wrapper = SimpleNamespace()
+        child = SimpleNamespace(kv_index_translator=None)
+
+        translator.bind_and_verify_backends([wrapper, child])
+
+        self.assertIs(wrapper.kv_index_translator, translator)
+        self.assertIs(child.kv_index_translator, translator)
+
     def test_fused_draft_runner_translates_to_the_same_physical_ids(self):
         _, allocator, _, draft_pool = _build()
         src = _source(allocator, draft_pool)

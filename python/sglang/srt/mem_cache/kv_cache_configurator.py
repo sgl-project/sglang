@@ -852,6 +852,23 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
+        ple_kwargs = {}
+        if isinstance(config, Qwen4ExpTextConfig):
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=config.short_conv_state_shape,
+                ngram_context_len=config.ngram_context_len,
+                ngram_eos_token_id=int(config.eos_token_id),
+            )
+
         bundle = init_unified_mamba_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -900,6 +917,8 @@ class KVCacheConfigurator:
             # A draft worker sizes its own pool by token count; only the
             # target's unified buffer takes the profiled byte budget.
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            qsa_profile=qsa_profile,
+            **ple_kwargs,
         )
         return bundle
 
@@ -1029,6 +1048,21 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
 
         aux = self.spec_aux_config
+        # A QSA draft owns indexer state in addition to K/V. The fused draft
+        # page region currently carries K/V only; binding QSA to it would
+        # either omit the draft index cache or alias the target's independent
+        # QSA state. Decline fusion; the caller retains its existing budget
+        # guard for speculative algorithms that require a fused draft.
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        if parse_qsa_profile(self.model_config.hf_text_config) is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft KV disabled for QSA; "
+                "the draft requires independent QSA state."
+            )
+            return FusedDraftDecision(
+                declined="QSA requires private draft indexer state"
+            )
         host_has_fusable_full_pool = (
             self.is_hybrid_swa or self.mambaish_config is not None
         )

@@ -290,6 +290,12 @@ def _pack_qsa_prefill_kv(
     TOTAL_K,
     BS,
     COMPACT: tl.constexpr,
+    v2p_pages,
+    HAS_V2P: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    KV_PAGE_SIZE: tl.constexpr,
+    SK_PAGE: tl.constexpr,
+    SV_PAGE: tl.constexpr,
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     token = offsets // (HEADS * DIM)
@@ -319,16 +325,37 @@ def _pack_qsa_prefill_kv(
     head = offsets // DIM % HEADS
     dim = offsets % DIM
     slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
-    keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
-    values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
+    if HAS_V2P:
+        slot = (
+            tl.load(v2p_pages + slot // PAGE_SIZE, valid, 0).to(tl.int64) * PAGE_SIZE
+            + slot % PAGE_SIZE
+        )
+    page = slot // KV_PAGE_SIZE
+    offset = slot % KV_PAGE_SIZE
+    keys = tl.load(
+        k + page * SK_PAGE + offset * SK0 + head * SK1 + dim * SK2, valid, 0.0
+    )
+    values = tl.load(
+        v + page * SV_PAGE + offset * SV0 + head * SV1 + dim * SV2, valid, 0.0
+    )
     tl.store(packed_k + dst, keys, valid)
     tl.store(packed_v + dst, values, valid)
 
 
 def pack_qsa_prefill_kv(
-    *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
+    *,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    cu_k,
+    total_k,
+    max_k,
+    output_dtype=None,
+    v2p_pages=None,
+    page_size=1,
 ):
-    heads, dim = k.shape[1:]
+    heads, dim = k.shape[-2:]
     packed_k = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device
     )
@@ -353,8 +380,8 @@ def pack_qsa_prefill_kv(
         req_to_token,
         req_indices,
         cu_k,
-        *k.stride(),
-        *v.stride(),
+        *k.stride()[-3:],
+        *v.stride()[-3:],
         *req_to_token.stride(),
         HEADS=heads,
         DIM=dim,
@@ -362,6 +389,12 @@ def pack_qsa_prefill_kv(
         TOTAL_K=total_k,
         BS=batch_size,
         COMPACT=compact,
+        v2p_pages=v2p_pages,
+        HAS_V2P=v2p_pages is not None,
+        PAGE_SIZE=page_size,
+        KV_PAGE_SIZE=k.shape[1] if k.ndim == 4 else 1,
+        SK_PAGE=k.stride(0) if k.ndim == 4 else k.stride(0),
+        SV_PAGE=v.stride(0) if v.ndim == 4 else v.stride(0),
     )
     return packed_k, packed_v
 
@@ -531,6 +564,7 @@ def _compact_kv(
     cu_k,
     out_k,
     out_v,
+    v2p_pages,
     topk: tl.constexpr,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -540,6 +574,16 @@ def _compact_kv(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HAS_V2P: tl.constexpr,
+    PAGE_MAJOR_KV: tl.constexpr,
+    KV_PAGE_SIZE: tl.constexpr,
+    k_page_stride: tl.constexpr,
+    k_token_stride: tl.constexpr,
+    k_head_stride: tl.constexpr,
+    v_page_stride: tl.constexpr,
+    v_token_stride: tl.constexpr,
+    v_head_stride: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -555,10 +599,29 @@ def _compact_kv(
         mask=valid,
         other=0,
     )
-    # 64-bit element offsets: slot * heads * dim exceeds int32 once the pool holds
-    # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
-    # on one GPU does reach.
-    src = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+    if HAS_V2P:
+        virtual_page = slots // PAGE_SIZE
+        page_offset = slots % PAGE_SIZE
+        slots = tl.load(v2p_pages + virtual_page) * PAGE_SIZE + page_offset
+    slots = slots.to(tl.int64)
+    if PAGE_MAJOR_KV:
+        kv_page = slots // KV_PAGE_SIZE
+        kv_offset = slots % KV_PAGE_SIZE
+        src_k = (
+            kv_page[:, None] * k_page_stride
+            + kv_offset[:, None] * k_token_stride
+            + head * k_head_stride
+            + dims[None, :]
+        )
+        src_v = (
+            kv_page[:, None] * v_page_stride
+            + kv_offset[:, None] * v_token_stride
+            + head * v_head_stride
+            + dims[None, :]
+        )
+    else:
+        src_k = slots[:, None] * k_token_stride + head * k_head_stride + dims[None, :]
+        src_v = slots[:, None] * v_token_stride + head * v_head_stride + dims[None, :]
     dst = (
         (pack_start + cols).to(tl.int64)[:, None] * heads * dim
         + head * dim
@@ -580,12 +643,12 @@ def _compact_kv(
     out_dtype = out_k.dtype.element_ty
     tl.store(
         out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
+        tl.load(k + src_k, mask=load_mask, other=0.0).to(out_dtype),
         mask=store_mask,
     )
     tl.store(
         out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
+        tl.load(v + src_v, mask=load_mask, other=0.0).to(out_dtype),
         mask=store_mask,
     )
 
@@ -616,6 +679,8 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    v2p_pages=None,
+    page_size=1,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -633,7 +698,24 @@ def qwen_sparse_kv_extraction_compact_triton(
     the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
     count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
     """
-    _, heads, dim = k.shape
+    if k.ndim == 4:
+        _, kv_page_size, heads, dim = k.shape
+        if v.ndim != 4 or v.shape[-2:] != (heads, dim):
+            raise ValueError(
+                "page-major QSA K/V views must have matching head geometry"
+            )
+        page_major_kv = True
+        k_page_stride, k_token_stride, k_head_stride = k.stride()[:3]
+        v_page_stride, v_token_stride, v_head_stride = v.stride()[:3]
+    else:
+        _, heads, dim = k.shape
+        if v.ndim != 3 or v.shape[-2:] != (heads, dim):
+            raise ValueError("QSA K/V buffers must have matching head geometry")
+        kv_page_size = 1
+        page_major_kv = False
+        k_page_stride = v_page_stride = 0
+        k_token_stride, k_head_stride = k.stride()[:2]
+        v_token_stride, v_head_stride = v.stride()[:2]
     block_topk = 16
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
@@ -647,6 +729,7 @@ def qwen_sparse_kv_extraction_compact_triton(
         cu_k,
         out_k,
         out_v,
+        v2p_pages if v2p_pages is not None else req_to_token,
         topk,
         heads,
         dim,
@@ -656,6 +739,16 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        PAGE_SIZE=page_size,
+        HAS_V2P=v2p_pages is not None,
+        PAGE_MAJOR_KV=page_major_kv,
+        KV_PAGE_SIZE=kv_page_size,
+        k_page_stride=k_page_stride,
+        k_token_stride=k_token_stride,
+        k_head_stride=k_head_stride,
+        v_page_stride=v_page_stride,
+        v_token_stride=v_token_stride,
+        v_head_stride=v_head_stride,
         num_warps=8,
     )
 
