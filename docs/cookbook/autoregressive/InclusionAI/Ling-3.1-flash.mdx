@@ -88,7 +88,7 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
     <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K smoke 98/100, stop rate 100%, acceptance length 2.29; Mooncake/TCP prefetch verified on all 8 TP ranks. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated; unverified by SGLang</td><td style={{padding: "9px 12px"}}>Tuned configurations are available upstream; hardware was unavailable for independent verification.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated on the vendor fork</td><td style={{padding: "9px 12px"}}>TP-only FP8 shards (160-wide) are rejected by the upstream block-FP8 loader today; the fork's <code>allow_fp8_blockwise_tail</code> admission plumbing is being ported. Tuned kernel configs are already upstream.</td></tr>
   </tbody>
 </table>
 
