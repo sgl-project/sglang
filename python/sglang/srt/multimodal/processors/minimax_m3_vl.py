@@ -279,7 +279,12 @@ class MiniMaxM3VLProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
         artifacts = []
         for entry, grid, feature in zip(entries, grids, features.split(lengths)):
             # Own each image's storage so eviction releases its memory independently.
-            feature = feature.clone()
+            # A lone image usually owns the whole batch storage already.
+            if (
+                feature.untyped_storage().nbytes()
+                != feature.numel() * feature.element_size()
+            ):
+                feature = feature.clone()
             artifacts.append(
                 MiniMaxM3ImageArtifact(
                     content_digest=entry.content_digest,

@@ -55,6 +55,18 @@ class _ImageProcessor:
         return {"pixel_values": torch.cat(rows), "image_grid_thw": torch.tensor(grids)}
 
 
+class _RecordingImageProcessor:
+    def __init__(self, processor, outputs):
+        self.processor = processor
+        self.outputs = outputs
+        self.merge_size = processor.merge_size
+
+    def __call__(self, images, **kwargs):
+        result = self.processor(images, **kwargs)
+        self.outputs.append(result["pixel_values"])
+        return result
+
+
 class _Tokenizer:
     _SPECIAL = {
         MiniMaxM3VLProcessor.IMAGE_START_TOKEN: 98,
@@ -149,6 +161,22 @@ class TestMiniMaxM3Artifacts(unittest.TestCase):
         self.assertGreaterEqual(
             estimate_cache_size_bytes(first[0]),
             first[0].feature.numel() * first[0].feature.element_size(),
+        )
+
+    def test_single_image_miss_owns_storage_without_clone(self):
+        outputs = []
+        self.processor._processor.image_processor = _RecordingImageProcessor(
+            self.processor._processor.image_processor, outputs
+        )
+        artifact = asyncio.run(self.processor.prepare_media_artifacts([self.red]))[0]
+        feature = artifact.feature
+        self.assertEqual(
+            feature.untyped_storage().data_ptr(),
+            outputs[0].untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            feature.untyped_storage().nbytes(),
+            feature.numel() * feature.element_size(),
         )
 
     def test_prompt_reconstruction_and_no_feature_copy(self):
