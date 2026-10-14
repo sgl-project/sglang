@@ -2143,6 +2143,11 @@ class KimiK3DeltaAttention(nn.Module):
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False
+        if not fused_onorm and forward_batch.forward_mode.is_target_verify():
+            # Gated o_norm + o_proj, one launch
+            partial = self._k3_onorm_oproj(core_attn_out, g_proj_states)
+            if partial is not None:
+                return partial
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -2152,6 +2157,58 @@ class KimiK3DeltaAttention(nn.Module):
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
         return self.o_proj(core_attn_out)[0]
+
+    def _k3_onorm_oproj(
+        self, core_attn_out: torch.Tensor, g_proj_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """ROCm fused gated o_norm + o_proj for target verify. Returns the
+        TP-partial o_proj output (the decoder layer completes the reduction),
+        or None when not covered."""
+        if not _is_hip:
+            return None
+        m = g_proj_states.shape[0] if g_proj_states.dim() == 2 else -1
+        if not (0 < m <= 8):
+            return None
+        o_proj = self.o_proj
+        w = getattr(o_proj, "weight", None)
+        if (
+            self.all_reduce_fusion
+            or o_proj.reduce_results
+            or getattr(o_proj, "bias", None) is not None
+            or type(o_proj.quant_method).__name__ != "UnquantizedLinearMethod"
+            or not isinstance(w, torch.Tensor)
+            or type(w.data) is not torch.Tensor
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or self.o_norm.activation != "sigmoid"
+            or self.o_norm.weight is None
+            or self.o_norm.weight.shape != (core_attn_out.shape[-1],)
+            or not core_attn_out.is_contiguous()
+            or core_attn_out.dtype != torch.bfloat16
+            or core_attn_out.numel() != m * w.shape[1]
+            or g_proj_states.stride(-1) != 1
+            or g_proj_states.stride(0) % 8 != 0
+            or g_proj_states.shape[1] != w.shape[1]
+        ):
+            return None
+        from sglang.kernels.ops.gemm import k3_norm_gemm
+
+        if not k3_norm_gemm.hip_onorm_supported(
+            m, w.shape[1], w.shape[0], self.o_norm.weight.shape[0]
+        ):
+            return None
+        nw = self.__dict__.get("_k3_onorm_w32")
+        if nw is None:  # first (eager warm-up) call, before graph capture
+            nw = self.o_norm.weight.detach().float().contiguous()
+            self.__dict__["_k3_onorm_w32"] = nw
+        return k3_norm_gemm.kda_onorm_oproj_hip(
+            core_attn_out.view(m, -1),
+            g_proj_states,
+            nw,
+            float(self.o_norm.eps),
+            w,
+        )
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):

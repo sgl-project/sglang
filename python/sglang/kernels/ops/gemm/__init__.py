@@ -150,6 +150,15 @@ _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
 
 register_kernel(
     KernelSpec(
+        op="gemm.kda_onorm_oproj_hip",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.k3_norm_gemm:kda_onorm_oproj_hip",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="gemm.dual_gemm_swiglu",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu",

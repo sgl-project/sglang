@@ -217,7 +217,6 @@ def fused_kda_conv_gating_verify_kernel(
 
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
-
     for t in tl.static_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
         # then silu; accumulation order and dtypes mirror the unfused kernel) ----
@@ -496,6 +495,10 @@ def fused_kda_conv_gating_verify(
         and conv_weight.dtype == torch.float32
         and 3 <= B <= 16
     ):
+        BV = KDA_VERIFY_BLOCK_V_HIP
+    elif is_hip_runtime() and cache_ring and V == 128 and B >= 8:
+        # gfx950 ReplaySSM ring at 12 heads of 128 (Kimi-K3 TP8): from 8
+        # requests up the per-tile duplicated q/k conv work dominates.
         BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
