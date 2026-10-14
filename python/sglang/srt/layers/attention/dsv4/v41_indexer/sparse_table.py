@@ -303,16 +303,15 @@ class SparseTableBackend:
         assert published is not None
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         torch.cuda.current_stream().wait_event(published.ready)
-        logits = sparse_logits(
-            data.q_fp4,
-            data.q_sf,
-            data.k_cache,
-            data.weights.to(torch.bfloat16),
-            published.schedule,
-            published.blocks.shape[1],
-        )
-        topk_transform_sparse(
-            logits, published.valid_lens, published.phys_blocks, inputs.out_page_indices
+        select_sparse_table(
+            q_fp4=data.q_fp4,
+            q_sf=data.q_sf,
+            weights=data.weights,
+            k_cache=data.k_cache,
+            schedule=published.schedule,
+            blocks=published.phys_blocks,
+            valid_lens=published.valid_lens,
+            out_indices=inputs.out_page_indices,
         )
 
     def _get_request_ids(self, inputs: DecodeInputs, rows: int, device: torch.device):
@@ -443,14 +442,42 @@ def select_prefill_table(
     k_cache: torch.Tensor,
     out_positions: torch.Tensor,
 ) -> None:
-    rows, heads = data.q_sf.shape
-    logits = sparse_logits(
-        data.q_fp4.view(rows, 1, heads, 64),
-        data.q_sf.view(rows, 1, heads),
-        k_cache,
-        data.weights.to(torch.bfloat16),
-        table.schedule,
-        table.blocks.shape[1],
+    select_sparse_table(
+        q_fp4=data.q_fp4,
+        q_sf=data.q_sf,
+        weights=data.weights,
+        k_cache=k_cache,
+        schedule=table.schedule,
+        blocks=table.blocks,
+        valid_lens=table.valid_lens,
+        out_indices=out_positions,
     )
-    # request-relative compressed positions, -1 padded
-    topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
+
+
+def select_sparse_table(
+    *,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    weights: torch.Tensor,
+    k_cache: torch.Tensor,
+    schedule: torch.Tensor,
+    blocks: torch.Tensor,
+    valid_lens: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Consume an existing sparse schedule, without preparing runtime metadata.
+
+    Q may have the prefill [rows, heads, 64] or decode [rows, 1, heads, 64]
+    layout. Logical blocks emit request-relative positions; physical blocks
+    emit pool slots. The caller owns synchronization and final output mapping.
+    """
+    rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
+    logits = sparse_logits(
+        q_fp4.view(rows, 1, heads, 64),
+        q_sf.view(rows, 1, heads),
+        k_cache,
+        weights.to(torch.bfloat16),
+        schedule,
+        blocks.shape[1],
+    )
+    topk_transform_sparse(logits, valid_lens, blocks, out_indices)

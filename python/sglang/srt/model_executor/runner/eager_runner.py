@@ -363,14 +363,21 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
+            # Vision preparation needs global token order before CP sharding.
+            prepare_language = getattr(model, "prepare_language_model_inputs", None)
+            if prepare_language is not None:
+                input_ids, input_embeds = prepare_language(
+                    input_ids, forward_batch, input_embeds
+                )
             if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+                input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -380,7 +387,7 @@ class EagerRunner(BaseRunner):
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
@@ -423,7 +430,7 @@ class EagerRunner(BaseRunner):
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
-            forward_batch.input_ids,
+            input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,

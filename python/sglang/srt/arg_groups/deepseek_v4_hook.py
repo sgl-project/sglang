@@ -289,11 +289,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        # This validation runs before validate_deepseek_v4_cp resolves
+        # attn_cp_size from TP. Keep the existing interleave prefill CP path
+        # alongside DP-only attention; CP+DP remains unsupported.
         supported_prefill_cp = (
             cfg.disaggregation_mode == "prefill"
             and cfg.enable_prefill_cp
             and cfg.cp_strategy == "interleave"
+            and cfg.dp_size == 1
+            and cfg.attn_cp_size in (1, cfg.tp_size)
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
@@ -313,17 +317,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    cp_breakable_prefill = (
-        cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-        and cfg.tp_size > 1
-        and prefill_graph.backend == Backend.BREAKABLE
-    )
     if (
         prefill_graph.backend != Backend.DISABLED
         and prefill_graph.max_seq_len is None
-        and not cp_breakable_prefill
+        and prefill_graph.max_context_size is None
     ):
+        # Captured ratio-1/2 indexers use a static context width for both CP
+        # and non-CP; an explicit max-context is copied to max_seq_len later.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
