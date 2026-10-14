@@ -1,49 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Flow-matching rollout step utilities for log-prob computation."""
+"""Per-stream flow-matching rollout controller: the rollout transition and its log-probs."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Union
+from typing import Callable, Union
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_world_size,
-)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
 )
-from sglang.multimodal_gen.runtime.post_training.sp_utils import (
-    gather_stacked_latents_for_sp,
-)
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
-@dataclass
-class RolloutSessionData:
-    """Per-batch rollout state created by prepare_rollout(), lives on the batch object.
-
-    Cleared by setting ``batch._rollout_session_data = None``.
+class FlowRolloutController:
+    """Rollout controller of one latent stream of one request, shared by every
+    flow-matching model: its SDE/CPS/ODE transition and the per-step log-probs.
+    The denoising stage creates it in ``batch.rollout_controllers`` and clears
+    that dict when the loop ends.
     """
 
-    pipeline_config: Any = None
-    sigma_max: float = 0.0
-    latents_shape: tuple | None = None
-    noise_buffer: torch.Tensor | None = None
+    def __init__(
+        self,
+        *,
+        sde_type: str,
+        noise_level: float,
+        log_prob_no_const: bool,
+        debug_mode: bool,
+        sde_step_indices: list[int] | None,
+        shard_for_sp: Callable[[torch.Tensor], torch.Tensor],
+        gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
+        sigmas: torch.Tensor,
+        latents_shape: tuple | None,
+    ) -> None:
+        self.sde_type = sde_type
+        self.noise_level = noise_level
+        self.log_prob_no_const = log_prob_no_const
+        self.debug_mode = debug_mode
+        self.sde_step_indices = sde_step_indices
+        # Shard a full-shape tensor to this rank / gather [B, T, ...] stacks back.
+        self.shard_for_sp = shard_for_sp
+        self.gather_for_sp = gather_for_sp
+        # [T+1] sigma grid of the loop, terminal 0 included.
+        self.sigmas = sigmas
+        # FlowGRPO's sigma_max: sigmas[1], used in place of sigma == 1 so the SDE std
+        # never divides by 1 - sigma = 0.
+        self.sigma_max = sigmas[min(1, len(sigmas) - 1)].item()
+        self.latents_shape = latents_shape
+        self.noise_buffer: torch.Tensor | None = None
 
-    local_log_prob_sum: list[torch.Tensor] = field(default_factory=list)
-    local_log_prob_count: list[torch.Tensor] = field(default_factory=list)
+        self.local_log_prob_sum: list[torch.Tensor] = []
+        self.local_log_prob_count: list[torch.Tensor] = []
 
-    local_variance_noises: list[torch.Tensor] = field(default_factory=list)
-    local_prev_sample_means: list[torch.Tensor] = field(default_factory=list)
-    local_noise_std_devs: list[torch.Tensor] = field(default_factory=list)
-    local_model_outputs: list[torch.Tensor] = field(default_factory=list)
+        self.local_variance_noises: list[torch.Tensor] = []
+        self.local_prev_sample_means: list[torch.Tensor] = []
+        self.local_noise_std_devs: list[torch.Tensor] = []
+        self.local_model_outputs: list[torch.Tensor] = []
 
     def _reset_rollout_debug_tensors(self) -> None:
         self.local_variance_noises = []
@@ -76,7 +90,7 @@ class RolloutSessionData:
         self._reset_rollout_debug_tensors()
         return variance_noises, prev_sample_means, noise_std_devs, model_outputs
 
-    def collect_rollout_debug_tensors(self, batch: Req) -> RolloutDebugTensors:
+    def collect_rollout_debug_tensors(self) -> RolloutDebugTensors:
         """
         Consume rollout debug tensors and merge for all SP ranks.
 
@@ -86,22 +100,9 @@ class RolloutSessionData:
             self.consume_local_rollout_debug_tensors()
         )
 
-        pipeline_config = self.pipeline_config
-        variance_noises = gather_stacked_latents_for_sp(
-            pipeline_config=pipeline_config,
-            batch=batch,
-            stacked_latents=variance_noises,
-        )
-        prev_sample_means = gather_stacked_latents_for_sp(
-            pipeline_config=pipeline_config,
-            batch=batch,
-            stacked_latents=prev_sample_means,
-        )
-        model_outputs = gather_stacked_latents_for_sp(
-            pipeline_config=pipeline_config,
-            batch=batch,
-            stacked_latents=model_outputs,
-        )
+        variance_noises = self.gather_for_sp(variance_noises)
+        prev_sample_means = self.gather_for_sp(prev_sample_means)
+        model_outputs = self.gather_for_sp(model_outputs)
         # noise_std_devs is same on every device, not a sharded latent tensor.
 
         return RolloutDebugTensors(
@@ -131,7 +132,6 @@ class RolloutSessionData:
 
     def _rollout_variance_noise(
         self,
-        batch,
         model_output: torch.FloatTensor,
         generator: Union[torch.Generator, list[torch.Generator]],
     ) -> torch.FloatTensor:
@@ -161,9 +161,7 @@ class RolloutSessionData:
                 generator=generator[i],
             )
 
-        sharded_noise, _ = self.pipeline_config.shard_latents_for_sp(
-            batch=batch, latents=buffer
-        )
+        sharded_noise = self.shard_for_sp(buffer)
         if tuple(sharded_noise.shape) != local_shape:
             raise ValueError(
                 "Rollout SP noise shape mismatch after shard. "
@@ -173,7 +171,6 @@ class RolloutSessionData:
 
     def flow_sde_sampling(
         self,
-        batch,
         model_output: torch.FloatTensor,
         sample: torch.FloatTensor,
         current_sigma: torch.FloatTensor,
@@ -183,33 +180,27 @@ class RolloutSessionData:
     ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
 
-        ``rollout_sde_type`` (from batch SamplingParams):
+        ``sde_type`` (from the request's ``rollout_sde_type``):
 
         1. ``"sde"``: Standard stochastic differential equation transition (Gaussian).
         2. ``"cps"``: Coupled Particle Sampling.
         3. ``"ode"``: Deterministic ODE step (no diffusion noise).
         """
-        sde_type = batch.rollout_sde_type
-        noise_level = float(batch.rollout_noise_level)
-        log_prob_no_const = batch.rollout_log_prob_no_const
-        debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
-
-        if not log_prob_no_const and sde_type != "ode":
-            assert noise_level > 0, (
+        if not self.log_prob_no_const and self.sde_type != "ode":
+            assert self.noise_level > 0, (
                 "True log-probability computation requires a non-zero noise level."
             )
 
         dt = next_sigma - current_sigma
 
-        sde_step_indices = getattr(batch, "rollout_sde_step_indices", None)
         if (
-            sde_type != "ode"
-            and sde_step_indices is not None
-            and step_index not in sde_step_indices
+            self.sde_type != "ode"
+            and self.sde_step_indices is not None
+            and step_index not in self.sde_step_indices
         ):
             effective_sde_type = "ode"
         else:
-            effective_sde_type = sde_type
+            effective_sde_type = self.sde_type
 
         # sde/cps: cast to fp32 to match flowGRPO semantics and avoid the
         # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
@@ -220,9 +211,7 @@ class RolloutSessionData:
         if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(
-                batch, model_output, generator
-            )
+            variance_noise = self._rollout_variance_noise(model_output, generator)
             full_variance_noise = self.noise_buffer
             std_dev_t = (
                 torch.sqrt(
@@ -236,7 +225,7 @@ class RolloutSessionData:
                         )
                     )
                 )
-                * noise_level
+                * self.noise_level
             )
             noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
             prev_sample_mean = (
@@ -253,11 +242,9 @@ class RolloutSessionData:
         elif effective_sde_type == "cps":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(
-                batch, model_output, generator
-            )
+            variance_noise = self._rollout_variance_noise(model_output, generator)
             full_variance_noise = self.noise_buffer
-            std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
+            std_dev_t = next_sigma * math.sin(self.noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
             pred_original_sample = sample - current_sigma * model_output
             noise_estimate = sample + model_output * (1 - current_sigma)
@@ -283,13 +270,13 @@ class RolloutSessionData:
             )
             # Only enforce the "no full log-prob with ODE" constraint when the
             # user explicitly chose ODE globally.
-            if sde_type == "ode":
-                assert log_prob_no_const, (
+            if self.sde_type == "ode":
+                assert self.log_prob_no_const, (
                     "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
                 )
 
         else:
-            raise ValueError(f"Unsupported sde_type: {sde_type}")
+            raise ValueError(f"Unsupported sde_type: {self.sde_type}")
 
         reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
         local_elem_count = log_prob_no_const_val.new_full(
@@ -297,7 +284,7 @@ class RolloutSessionData:
             float(math.prod(log_prob_no_const_val.shape[1:])),
         )
 
-        if log_prob_no_const or effective_sde_type == "ode":
+        if self.log_prob_no_const or effective_sde_type == "ode":
             log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
         else:
             log_prob_local_sum = (
@@ -306,7 +293,7 @@ class RolloutSessionData:
                 - _LOG_SQRT_2PI
             ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
 
-        if debug_mode:
+        if self.debug_mode:
             self.append_local_rollout_debug_tensors(
                 variance_noise=variance_noise,
                 prev_sample_mean=prev_sample_mean,
@@ -336,7 +323,7 @@ class RolloutSessionData:
         self.local_log_prob_count = []
         return values_sum, values_count
 
-    def collect_rollout_log_probs(self) -> torch.Tensor | None:
+    def collect_rollout_log_probs(self) -> torch.Tensor:
         """Per-step sums are already computed on the full pre-shard noise
         buffer inside flow_sde_sampling, so every SP rank holds identical
         values here and no all-reduce is needed."""
@@ -346,34 +333,3 @@ class RolloutSessionData:
         )
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()
-
-
-class SchedulerRLMixin:
-    @staticmethod
-    def _get_rollout_session_data(batch) -> RolloutSessionData:
-        """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""
-        rollout_session_data = getattr(batch, "_rollout_session_data", None)
-        if rollout_session_data is None:
-            raise RuntimeError("prepare_rollout() not called before rollout")
-        return rollout_session_data
-
-    def release_rollout_resources(self, batch) -> None:
-        """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
-        batch._rollout_session_data = None
-
-    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
-        """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
-        if get_sp_world_size() > 1 and pipeline_config is None:
-            raise RuntimeError(
-                "SP rollout requires pipeline_config to be passed to prepare_rollout()."
-            )
-        batch._rollout_session_data = RolloutSessionData(
-            pipeline_config=pipeline_config,
-            sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
-            latents_shape=(
-                tuple(batch.latents.shape) if batch.latents is not None else None
-            ),
-        )
-
-    def already_prepared_rollout(self, batch) -> bool:
-        return getattr(batch, "_rollout_session_data", None) is not None

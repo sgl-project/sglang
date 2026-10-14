@@ -35,9 +35,6 @@ from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 from sglang.multimodal_gen.runtime.models.schedulers.sigma_schedule import (
     SigmaScheduleMixin,
 )
-from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-    SchedulerRLMixin,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -58,7 +55,7 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
 
 
 class FlowMatchEulerDiscreteScheduler(
-    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin, SigmaScheduleMixin
+    SchedulerMixin, ConfigMixin, BaseScheduler, SigmaScheduleMixin
 ):
     """
     Euler scheduler.
@@ -536,10 +533,9 @@ class FlowMatchEulerDiscreteScheduler(
             dt = sigma_next - sigma
 
         if batch is not None and batch.rollout:
-            if not self.already_prepared_rollout(batch):
+            if "visual" not in batch.rollout_controllers:
                 raise RuntimeError("Rollout not prepared before step")
-            prev_sample = self._get_rollout_session_data(batch).flow_sde_sampling(
-                batch,
+            prev_sample = batch.rollout_controllers["visual"].flow_sde_sampling(
                 model_output,
                 sample,
                 current_sigma,
