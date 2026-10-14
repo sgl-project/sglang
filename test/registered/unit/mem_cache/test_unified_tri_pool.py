@@ -1048,8 +1048,11 @@ class TestTriFactorySizing(unittest.TestCase):
                         kw = self._factory_kwargs()
                         model = SimpleNamespace(
                             get_num_kv_heads=lambda tp, dcp: 2,
+                            get_swa_num_kv_heads=lambda tp: 2,
                             head_dim=4,
                             v_head_dim=4,
+                            swa_head_dim=4,
+                            swa_v_head_dim=4,
                             context_len=16,
                             full_attention_layer_ids=[0],
                             swa_attention_layer_ids=[1],
