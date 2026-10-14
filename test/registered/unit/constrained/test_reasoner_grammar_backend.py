@@ -683,6 +683,21 @@ class TestReasonerGrammarBackend(CustomTestCase):
                 self.assertIs(grammar.grammar, backend._dispatch_result)
                 self.assertFalse(grammar._is_generation())
 
+    def test_inkling_constraint_defers_on_a_backend_that_cannot_frame(self):
+        """Backends without compile_framed_grammar keep the deferred constraint."""
+        backend = _DummyGrammarBackend()
+        backend._dispatch_result = MagicMock()
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            SimpleNamespace(detector=InklingDetector()),
+            _DummyTokenizer({}),
+        )
+        grammar = reasoner._init_value_dispatch(("json", "{}"), reasoning=True)
+
+        self.assertIsInstance(grammar, ReasonerGrammarObject)
+        self.assertIs(grammar.grammar, backend._dispatch_result)
+        self.assertFalse(grammar._is_generation())
+
     def test_full_assistant_ebnf_still_owns_its_boundaries(self):
         """Whole-assistant EBNF must keep control of the reasoning prefix."""
         for strict in (False, True):

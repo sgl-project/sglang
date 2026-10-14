@@ -5058,6 +5058,33 @@ class InklingTokenOutputTest(CustomTestCase):
             special("content_model_end_sampling"),
         ]
 
+    def test_request_switches_gate_the_token_parser(self):
+        """tool_choice="none" leaves a sampled call as text, and
+        separate_reasoning=False keeps thinking in content."""
+        payload = '{"name":"weather","args":{"city":"SF"}}'
+        cases = [
+            ({"tool_choice": "none"}, ("plan", payload), "stop"),
+            ({"separate_reasoning": False}, ("", "plan"), "tool_calls"),
+        ]
+        for update, expected, finish_type in cases:
+            request = self.request.model_copy(update=update)
+            _, _, tool_calls, finish_reason = self.inkling.parse_chat_response(
+                request=request,
+                output_ids=self._output_ids(),
+                finish_reason={"type": "stop", "matched": 200006},
+            )
+            results = self._reasoning_and_content(
+                request,
+                self._output_ids(),
+                {"type": "stop", "matched": 200006},
+            )
+            with self.subTest(update=update):
+                self.assertEqual(finish_reason["type"], finish_type)
+                self.assertEqual(tool_calls is None, finish_type == "stop")
+                for mode, result in results.items():
+                    with self.subTest(mode=mode):
+                        self.assertEqual(result, expected)
+
     def test_non_stream_maps_calls_and_finish_reason(self):
         reasoning, content, tool_calls, finish_reason = (
             self.inkling.parse_chat_response(
@@ -5154,8 +5181,8 @@ class InklingTokenOutputTest(CustomTestCase):
 
     def test_each_output_token_is_parsed_once(self):
         """Non-incremental chunks carry the cumulative ids and an incremental
-        abort chunk re-sends streamed ids; either way a token parsed twice
-        would duplicate text."""
+        abort chunk re-sends the last id, streamed or not; either way a token
+        parsed twice would duplicate text."""
         new_ids = serving_inkling.select_new_output_ids
         self.assertEqual(
             new_ids(
@@ -5177,16 +5204,18 @@ class InklingTokenOutputTest(CustomTestCase):
             ),
             [3, 4],
         )
-        self.assertEqual(
-            new_ids(
-                output_ids=[3, 4],
-                num_consumed_tokens=3,
-                completion_tokens=4,
-                finish_reason_type="abort",
-                incremental=True,
-            ),
-            [3],
-        )
+        for completion_tokens, expected in ((3, []), (4, [4])):
+            with self.subTest(completion_tokens=completion_tokens):
+                self.assertEqual(
+                    new_ids(
+                        output_ids=[4],
+                        num_consumed_tokens=3,
+                        completion_tokens=completion_tokens,
+                        finish_reason_type="abort",
+                        incremental=True,
+                    ),
+                    expected,
+                )
 
     def _stream_deltas(
         self,

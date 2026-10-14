@@ -181,6 +181,27 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(req.grammar_key, ("regex", "[a-z]+"))
 
+    def test_backend_specializes_the_key_from_the_prompt(self):
+        """The backend may pick a prompt-dependent grammar variant; that key, not
+        the sampling-param key, is what gets looked up and cached."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend.get_request_grammar_key.side_effect = (
+            lambda key, input_ids: (key[0] + ":variant", key[1])
+        )
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (Future(), False)
+
+        req = _make_req(regex="[a-z]+")
+        req.origin_input_ids = [1, 2, 3]
+        mgr.process_req_with_grammar(req)
+
+        mgr.grammar_backend.get_request_grammar_key.assert_called_once_with(
+            ("regex", "[a-z]+"), [1, 2, 3]
+        )
+        mgr.grammar_backend.get_cached_or_future_value.assert_called_once_with(
+            ("regex:variant", "[a-z]+"), False
+        )
+        self.assertEqual(req.grammar_key, ("regex:variant", "[a-z]+"))
+
     def test_ebnf_cache_miss(self):
         mgr = self._make_mgr()
         future = Future()
