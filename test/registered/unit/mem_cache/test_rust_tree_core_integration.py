@@ -4716,6 +4716,32 @@ def test_write_through_threshold_assignment_reaches_the_core():
     assert any(isinstance(action, BackupKV) for action in result.cache_actions)
 
 
+def test_chunked_write_through_insert_backs_up_each_new_suffix():
+    core = _tree_core()
+    core.set_hicache_enabled()
+    core.write_through_threshold = 1
+
+    first = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+            inserted_len=0,
+        ),
+    )
+    assert any(isinstance(action, BackupKV) for action in first.cache_actions)
+
+    second = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4, 5, 6]),
+            value=torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int64),
+            inserted_len=4,
+        ),
+    )
+    assert any(isinstance(action, BackupKV) for action in second.cache_actions)
+
+
 @pytest.mark.parametrize("backup_nodes", ["leaf", "parent_and_leaf", "parent"])
 def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
