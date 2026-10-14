@@ -5103,6 +5103,55 @@ class InklingTokenOutputTest(CustomTestCase):
         self.assertEqual(content, " 5, 7, 11")
         self.assertIsNone(tool_calls)
 
+    def test_stream_reads_only_its_chunk_of_the_live_output_list(self):
+        """Non-incremental chunks share the live output list; tokens appended after
+        a chunk was built (here the matched stop) must wait for their own chunk."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Yes?"}],
+            stop=["."],
+        )
+        live = [
+            special("message_model"),
+            special("content_text"),
+            *tokenizer.encode_ordinary("Yes"),
+        ]
+        first = {"completion_tokens": len(live), "finish_reason": None}
+        live.extend(tokenizer.encode_ordinary(" ."))
+        finish = {"type": "stop", "matched": "."}
+        final = {"completion_tokens": len(live), "finish_reason": finish}
+        chunks, parser_dict = [], {}
+        with get_context().override_server_args(incremental_streaming_output=False):
+            for meta_info, ids in ((first, live), (final, list(live))):
+                chunks += self.inkling.stream_chat_chunks(
+                    content={
+                        "output_ids": ids,
+                        "meta_info": {"id": "chatcmpl-1", **meta_info},
+                    },
+                    index=0,
+                    request=request,
+                    parser_dict=parser_dict,
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=meta_info["finish_reason"]
+                    and meta_info["finish_reason"]["type"],
+                    usage=None,
+                )
+        streamed = "".join(
+            json.loads(chunk[len("data: ") :])["choices"][0]["delta"].get("content")
+            or ""
+            for chunk in chunks
+        )
+        _, content, _, _ = self.inkling.parse_chat_response(
+            request=request, output_ids=list(live), finish_reason=finish
+        )
+        self.assertEqual(content, "Yes ")
+        self.assertEqual(streamed, content)
+
     def test_each_output_token_is_parsed_once(self):
         """Non-incremental chunks carry the cumulative ids and an incremental
         abort chunk re-sends streamed ids; either way a token parsed twice

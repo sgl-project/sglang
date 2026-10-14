@@ -116,7 +116,7 @@ class InklingSpecAdapter:
         new_output_ids = select_new_output_ids(
             output_ids=content["output_ids"],
             num_consumed_tokens=parser.num_consumed_tokens,
-            completion_tokens=content["meta_info"].get("completion_tokens", 0),
+            completion_tokens=content["meta_info"]["completion_tokens"],
             finish_reason_type=finish_reason_type,
             incremental=get_serving().incremental_streaming_output,
         )
@@ -250,9 +250,7 @@ class InklingResponsesStream:
         new_output_ids = select_new_output_ids(
             output_ids=chunk.get("output_ids") or [],
             num_consumed_tokens=self._parser.num_consumed_tokens,
-            completion_tokens=(chunk.get("meta_info") or {}).get(
-                "completion_tokens", 0
-            ),
+            completion_tokens=chunk["meta_info"]["completion_tokens"],
             finish_reason_type=finish_reason["type"] if finish_reason else None,
             incremental=self._incremental,
         )
@@ -284,7 +282,9 @@ def select_new_output_ids(
     incremental: bool,
 ) -> list[int]:
     if not incremental:
-        return output_ids[num_consumed_tokens:]
+        # Intermediate chunks share the live output list; completion_tokens is
+        # this chunk's snapshot, so later tokens wait for their own chunk.
+        return output_ids[num_consumed_tokens:completion_tokens]
     if finish_reason_type == "abort":
         # The abort chunk re-sends already-streamed tokens.
         return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
