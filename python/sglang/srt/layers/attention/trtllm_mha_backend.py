@@ -28,10 +28,16 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
+)
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    get_cuda_graph_max_batch_size,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -163,7 +169,7 @@ class TRTLLMMHAMetadata:
     mixed_prefill_tokens: int = 0
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -172,6 +178,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
+
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner) -> Optional[BaseSWAKVPool]:
+        """Return the SWA KV pool to translate against, or None for non-SWA models.
+
+        EAGLE-like draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's SWA
+        mapping for that draft pool. FROZEN_KV MTP is the exception: its draft
+        path reads target KV directly, so it still needs the allocator pool when
+        the active pool is not SWA.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, BaseSWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -187,17 +214,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        # AttentionBackend base init — no FlashInfer wrapper overhead
+        super().__init__()
+
+        # --- Inlined plumbing from the former FlashInferAttnBackend parent ---
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
+            model_runner
+        )
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
+
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+
+        # kv_indptr / kv_last_page_len buffers — allocate only when not provided
+        # by a wrapping MultiStepDraftBackend.
+        if kv_indptr_buf is None:
+            max_bs = get_cuda_graph_max_batch_size(
+                model_runner.req_to_token_pool.size
+            )
+            self.kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
+        else:
+            self.kv_indptr = kv_indptr_buf
+
+        if kv_last_page_len_buf is None:
+            max_bs = get_cuda_graph_max_batch_size(
+                model_runner.req_to_token_pool.size
+            )
+            self.kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device=model_runner.device
+            )
+        else:
+            self.kv_last_page_len = kv_last_page_len_buf
+        # --- End inlined plumbing ---
+
+        # Capture workspace size — unlike FlashInferAttnBackend, TRTLLM allocates
+        # its own zero-init workspace buffer and does not rely on the shared
+        # flashinfer_workspace buffer.
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
             env_var.get()
             if env_var.is_set()
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        )
-
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "trtllm_mha"

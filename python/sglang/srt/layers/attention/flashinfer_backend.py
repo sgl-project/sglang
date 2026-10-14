@@ -2385,7 +2385,7 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
-        self.attn_backends: List[FlashInferAttnBackend] = []
+        self.attn_backends: List[AttentionBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferAttnBackend(
