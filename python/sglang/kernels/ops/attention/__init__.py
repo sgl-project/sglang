@@ -268,6 +268,30 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    (
+        "k3_mla_absorb",
+        "k3_mla_absorb_q_cat_cache",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_mla_absorb",
+        "k3_mla_absorb_v_gate",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_mla_cat_cache_hip",
+        "k3_mla_cat_cache",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_mla_prefix_nocat",
+        "k3_mla_prefix_kv",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(

@@ -490,6 +490,43 @@ def _fused_bmm_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
+    # Model-owned decode / target-verify fusions (see KimiK3MLAAttention).
+    # Each returns None when not covered and the caller keeps the default path.
+    def _rocm_absorb_q_cache_target(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """(kv_buffer, loc) when core can fuse the W_UK absorb, the q cat and
+        the latent KV write; prepare then defers the absorb to core."""
+        return None
+
+    def _rocm_absorb_q_cat_cache(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """q = [q_nope @ W_UK | q_pe] with the latent KV write done."""
+        return None
+
+    def _rocm_mla_cat_cache(
+        self,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """q = [q_nope_out | q_pe] with the latent KV write done."""
+        return None
+
+    def _rocm_absorb_v_gate(
+        self, attn_output: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """The o_proj input (attn_output @ W_UV, with any pending output gate)."""
+        return None
+
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -670,6 +707,7 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        absorb_q_deferred = False
         # The fused kernel wins at decode-sized batches (decode, target verify,
         # draft extend); prefill shapes run faster as the two separate launches.
         fuse_bmm_rope_cache = (
@@ -719,6 +757,14 @@ class DeepseekMLARocmForwardMixin:
                 # The absorb is the first half of the kernel core will run, and
                 # that kernel wants q_nope un-absorbed. Nothing to do here.
                 q_nope_out = None
+            elif (
+                self._rocm_absorb_q_cache_target(forward_batch, q_nope.shape[0])
+                is not None
+            ):
+                # Core runs the absorb fused
+                # with the q cat + KV write; hand it q_nope un-absorbed.
+                q_nope_out = None
+                absorb_q_deferred = True
             else:
                 q_nope_out = rocm_absorb_q_bmm(
                     self, q_nope, is_capture_mode=get_is_capture_mode()
@@ -809,7 +855,7 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
-            q_nope if fuse_bmm_rope_cache else None,
+            q_nope if (fuse_bmm_rope_cache or absorb_q_deferred) else None,
         )
 
     def forward_absorb_rocm_core(
@@ -972,7 +1018,24 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            fused_q = None
+            if q_nope_out is None and q_nope_unabsorbed is not None:
+                # Prepare deferred W_UK here.
+                fused_q = self._rocm_absorb_q_cat_cache(
+                    q_nope_unabsorbed, q_pe, k_nope, k_pe, forward_batch
+                )
+                if fused_q is None:
+                    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                    q_nope_out = rocm_absorb_q_bmm(
+                        self, q_nope_unabsorbed, is_capture_mode=get_is_capture_mode()
+                    ).transpose(0, 1)
+            if fused_q is not None:
+                q = fused_q
+                # KV row already written; as on the cat-cache path below.
+                k = q[:, :1, :]
+                save_kv_cache = False
+            elif self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
@@ -982,6 +1045,15 @@ class DeepseekMLARocmForwardMixin:
                     positions,
                     forward_batch.out_cache_loc,
                 )
+                save_kv_cache = False
+            elif (
+                q := self._rocm_mla_cat_cache(
+                    q_nope_out, q_pe, k_nope, k_pe, forward_batch
+                )
+            ) is not None:
+                # KV row already written; the backend only reads k's shape
+                # (qk head dim) on this path, so hand it a [M, 1, D] view.
+                k = q[:, :1, :]
                 save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
@@ -1070,6 +1142,10 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
+        elif (
+            attn_bmm_output := self._rocm_absorb_v_gate(attn_output, forward_batch)
+        ) is not None:
+            pass
         else:
             attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 
