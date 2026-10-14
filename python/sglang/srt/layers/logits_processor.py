@@ -65,6 +65,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     is_cpu,
+    is_gfx1250_supported,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -74,6 +76,10 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
+_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+if _use_aiter_lm_head:
+    from aiter.tuned_gemm import tgemm
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -1013,6 +1019,12 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif (
+                _use_aiter_lm_head
+                and hidden_states.dim() == 2
+                and hidden_states.dtype == lm_head.weight.dtype == torch.bfloat16
+            ):
+                logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
