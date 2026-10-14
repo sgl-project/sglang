@@ -4942,7 +4942,7 @@ class Scheduler:
         if not batch_result.has_sampled_token_ids:
             return
         self.beam_coordinator.maybe_select_and_relay(
-            batch, batch_result, chunked_req=batch.chunked_req
+            batch, batch_result, self.pending, chunked_req=batch.chunked_req
         )
 
     def _copy_auxiliary_output_to_cpu(

@@ -74,6 +74,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -250,7 +251,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         return sorted(stop_ids)
 
     def maybe_select_and_relay(
-        self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        pending: PendingSteps,
+        chunked_req: Optional[Req] = None,
     ) -> None:
         """Per-forward relay hook: overwrite beam rows' relayed tokens with
         joint-selected ones. O(1) when no beam group is live."""
@@ -262,7 +267,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if logits_output is None or logits_output.next_token_logits is None:
             return
         if batch.forward_mode.is_decode():
-            self.select_and_relay_decode(batch, logits_output)
+            self.select_and_relay_decode(batch, logits_output, pending)
         elif batch.forward_mode.is_extend():
             capture = logits_output.beam
             leader_pos = {
@@ -350,13 +355,20 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.all_rows = torch.cat([leader_row, member_rows])
 
     def select_and_relay_decode(
-        self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        pending: PendingSteps,
     ) -> None:
         """Launch half: joint-select every group in this decode batch on device,
         reparent KV, and overwrite the relayed next tokens."""
         tail = batch.beam_tail
         if tail is None:
             return
+        # The relay runs at the step's launch, before the step is pending, or
+        # at its delayed sample, after.
+        newest = pending.newest()
+        step_is_pending = newest is not None and newest.step is batch
         capture = logits_output.beam
         for gi, entry in enumerate(tail.entries):
             group = entry.group
@@ -372,7 +384,16 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
             )
-            self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
+            # All rows are synchronized; the leader's KV through this step is
+            # its committed length plus the uncommitted steps up to this one.
+            seq_len = (
+                group.leader.kv.kv_committed_len
+                + pending.num_inflight_kv(group.leader)
+                + (0 if step_is_pending else 1)
+            )
+            self._apply_survivors(
+                group, next_tokens, parent_idx, batch.forward_iter, seq_len
+            )
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
         """Deferred half: fold staged selections into the DAG and apply
@@ -430,6 +451,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         next_tokens: torch.Tensor,
         parent_idx: Optional[torch.Tensor],
         tick: int,
+        seq_len: int,
     ) -> None:
         rows = group.all_rows
         if parent_idx is not None:
@@ -440,9 +462,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 rows=rows,
                 parent_idx=parent_idx,
                 prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's allocated length
-                # covers the KV computed through this step.
-                seq_len=group.leader.kv.kv_allocated_len,
+                seq_len=seq_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows
