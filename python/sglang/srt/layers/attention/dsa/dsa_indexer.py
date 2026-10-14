@@ -486,6 +486,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
             self._gfx950_fused = Gfx950FusedIndexer(self)
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported while the gfx950 fused "
+                "DSA indexer is enabled: it keeps one-time copies of k_norm (and "
+                "of [wk ; weights_proj] on bf16 checkpoints). Restart with "
+                "--no-enable-dsa-fused-indexer to allow online updates."
+            )
 
             # Take the workspace here, while weights load, so calculate_pool_sizes still
             # sees the real free memory. Deferring it left the pools sized against memory

@@ -173,8 +173,8 @@ class Gfx950FusedIndexer:
     # On the bf16 path w_q_b is a view and does track it, so a reload would
     # leave the two halves of the same GEMV on different weights; on the
     # block-FP8 path node 1 calls the live layers and only the norm is stale.
-    # There is no per-module update hook to subscribe to, so a deployment that
-    # hot-swaps weights must run with --no-enable-dsa-fused-indexer.
+    # Indexer declares this through _derived_weight_cache_error, so online
+    # weight updates are rejected rather than served stale.
     def _constants(self):
         if self._const is None:
             ix = self.indexer
