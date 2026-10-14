@@ -44,21 +44,12 @@ def _output_reqs(step: ScheduleBatch) -> List[Req]:
     return [req for req in step.reqs if req is not step.chunked_req]
 
 
-def _kv_commit_reqs(step: ScheduleBatch) -> List[Req]:
-    """The requests a step's commit adds one committed KV token to."""
-    if not step.spec_algorithm.is_none():
-        return []
-    return step.decode_reqs()
-
-
 class PendingSteps:
     def __init__(self):
         self._records: Deque[PendingStep] = deque()
-        # Per record, the requests its commit appends an output to, and those
-        # it commits a KV token to; built on the first query, so a push or
-        # commit costs nothing per request.
+        # Per record, the requests its commit appends an output to; built on
+        # the first query, so a push or commit costs nothing per request.
         self._output_sets: Deque[Optional[FrozenSet[Req]]] = deque()
-        self._kv_sets: Deque[Optional[FrozenSet[Req]]] = deque()
 
     def __len__(self) -> int:
         return len(self._records)
@@ -69,11 +60,9 @@ class PendingSteps:
     def push(self, record: PendingStep) -> None:
         self._records.append(record)
         self._output_sets.append(None)
-        self._kv_sets.append(None)
 
     def popleft(self) -> PendingStep:
         self._output_sets.popleft()
-        self._kv_sets.popleft()
         return self._records.popleft()
 
     def newest(self) -> Optional[PendingStep]:
@@ -87,21 +76,6 @@ class PendingSteps:
             if outputs is None:
                 outputs = self._output_sets[i] = frozenset(_output_reqs(record.step))
             num += req in outputs
-        return num
-
-    def num_inflight_kv(self, req: Req) -> int:
-        """The KV tokens the pending steps will add to req's kv_committed_len
-        at their commits (commit_step_counters): one per decode row of a
-        non-speculative step. A speculative verify adds its accepted run when
-        it resolves, so it counts none here."""
-        if req.finished() or req.is_retracted:
-            return 0
-        num = 0
-        for i, record in enumerate(self._records):
-            kv_reqs = self._kv_sets[i]
-            if kv_reqs is None:
-                kv_reqs = self._kv_sets[i] = frozenset(_kv_commit_reqs(record.step))
-            num += req in kv_reqs
         return num
 
     def plans_mamba_track_write(self, req: Req, position: int) -> bool:

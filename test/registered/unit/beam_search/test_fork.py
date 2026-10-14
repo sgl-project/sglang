@@ -15,14 +15,7 @@ from sglang.srt.beam_search.fork import (
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
-from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
-from sglang.srt.managers.scheduler_components.pending_steps import (
-    PendingStep,
-    PendingSteps,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -252,28 +245,36 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         self.assertEqual(coordinator._num_live_groups, 0)
 
 
-class _DecodeStep(SimpleNamespace):
-    decode_reqs = ScheduleBatch.decode_reqs
-
-
-class _Leader:
-    def __init__(self, kv):
-        self.kv = kv
-        self.output_ids = []
-        self.is_retracted = False
-
-    def finished(self):
-        return False
-
-
 class TestRelayReparentLength(CustomTestCase):
-    """The reparent covers the leader's KV through the relayed step: its
-    committed length plus every launched step not committed yet, the relayed
-    one included."""
+    """The reparent covers the KV through the relayed step: the leader's row
+    length in that step, not either of its live counters."""
 
-    def _relay_seq_len(self, pending, batch):
+    def test_seq_len_is_the_leader_row_length_of_the_step(self):
         from sglang.srt.beam_search import coordinator as coordinator_mod
+        from sglang.srt.beam_search.batch_tail import BeamTail, BeamTailEntry
+        from sglang.srt.beam_search.beam_group import BeamGroupState
 
+        # Later steps moved both counters past this one.
+        leader = SimpleNamespace(
+            kv=ReqKvInfo(kv_committed_len=14, kv_allocated_len=16), output_ids=[]
+        )
+        group = SimpleNamespace(
+            leader=leader,
+            retired=False,
+            state=BeamGroupState.DECODING,
+            num_candidates=2,
+            all_rows=torch.tensor([1, 2]),
+            prompt_len=4,
+            pending_orphans=[],
+        )
+        # The leader is the step's second row.
+        batch = SimpleNamespace(
+            beam_tail=BeamTail(
+                num_base_rows=2, entries=[BeamTailEntry(group, 1, 0, 1)]
+            ),
+            seq_lens_cpu=torch.tensor([20, 12, 12]),
+            forward_iter=3,
+        )
         coordinator = coordinator_mod.BeamCoordinator(
             model_config=None,
             spec_algorithm=None,
@@ -283,15 +284,13 @@ class TestRelayReparentLength(CustomTestCase):
             tree_cache=None,
             future_map=None,
         )
-        group = batch.beam_tail.entries[0].group
-        seq_lens = []
-
-        def remap(req_to_token, rows, parent_idx, prefix_len, seq_len):
-            seq_lens.append(seq_len)
-            return None, None
-
+        capture = SimpleNamespace(
+            leader_logits=torch.zeros(1, 8), tail_logits=torch.zeros(1, 8)
+        )
         with (
-            patch.object(coordinator_mod, "remap_kv_mapping", side_effect=remap),
+            patch.object(
+                coordinator_mod, "remap_kv_mapping", return_value=(None, None)
+            ) as remap,
             patch.object(
                 coordinator_mod.BeamCoordinator,
                 "_select_group",
@@ -299,76 +298,9 @@ class TestRelayReparentLength(CustomTestCase):
             ),
             patch.object(coordinator_mod.BeamCoordinator, "_stash_next_tokens"),
         ):
-            capture = SimpleNamespace(
-                leader_logits=torch.zeros(1, 8), tail_logits=torch.zeros(1, 8)
-            )
-            coordinator.select_and_relay_decode(
-                batch, SimpleNamespace(beam=capture), pending
-            )
-        group.leader.output_ids.clear()
-        return seq_lens[0]
+            coordinator.select_and_relay_decode(batch, SimpleNamespace(beam=capture))
 
-    def _decode_record(self, leader):
-        step = _DecodeStep(
-            reqs=[leader],
-            forward_mode=ForwardMode.DECODE,
-            num_decode_rows=0,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            chunked_req=None,
-        )
-        return PendingStep(
-            step=step,
-            result=None,
-            slot=ScheduleSlot(),
-            launch_ts=0.0,
-            after_idle_gap=False,
-        )
-
-    def test_seq_len_is_committed_plus_uncommitted_steps(self):
-        from sglang.srt.beam_search.batch_tail import BeamTail, BeamTailEntry
-        from sglang.srt.beam_search.beam_group import BeamGroupState
-
-        # Allocated runs past the KV of the launched steps, so reading it
-        # answers 13 everywhere.
-        leader = _Leader(kv=ReqKvInfo(kv_committed_len=10, kv_allocated_len=13))
-        group = SimpleNamespace(
-            leader=leader,
-            retired=False,
-            state=BeamGroupState.DECODING,
-            num_candidates=2,
-            all_rows=torch.tensor([0, 1]),
-            prompt_len=4,
-            pending_orphans=[],
-        )
-        leader.beam_group = group
-        batch = self._decode_record(leader).step
-        batch.beam_tail = BeamTail(
-            num_base_rows=1, entries=[BeamTailEntry(group, 0, 0, 1)]
-        )
-        batch.forward_iter = 3
-
-        # Sync launch: nothing pending; the relayed step is the only one.
-        self.assertEqual(self._relay_seq_len(PendingSteps(), batch), 11)
-
-        # Overlap launch: the previous step is pending, the relayed one is
-        # not pushed yet.
-        pending = PendingSteps()
-        pending.push(self._decode_record(leader))
-        self.assertEqual(self._relay_seq_len(pending, batch), 12)
-
-        # Delayed sample: the previous step committed, the relayed one is
-        # pending.
-        pending = PendingSteps()
-        pending.push(
-            PendingStep(
-                step=batch,
-                result=None,
-                slot=ScheduleSlot(),
-                launch_ts=0.0,
-                after_idle_gap=False,
-            )
-        )
-        self.assertEqual(self._relay_seq_len(pending, batch), 11)
+        self.assertEqual(remap.call_args.kwargs["seq_len"], 12)
 
 
 class TestNeutralParams(CustomTestCase):

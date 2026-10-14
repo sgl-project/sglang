@@ -4441,7 +4441,6 @@ class Scheduler:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
                 spec_algorithm=self.spec_algorithm,
-                pending=self.pending,
             ):
                 new_batch.mix_decode_rows(self._build_decode_step(decode_reqs))
 
@@ -4598,7 +4597,6 @@ class Scheduler:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             spec_algorithm=self.spec_algorithm,
-            pending=self.pending,
         )
         if kv_full_retract_flag and len(reqs) < sum(
             not req.is_prefill_only for req in slot.filter_decoding(self.decoding)
@@ -4675,7 +4673,6 @@ class Scheduler:
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             spec_algorithm=self.spec_algorithm,
-            pending=self.pending,
         )
         new_token_ratio = NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
             kept_reqs
@@ -4942,7 +4939,7 @@ class Scheduler:
         if not batch_result.has_sampled_token_ids:
             return
         self.beam_coordinator.maybe_select_and_relay(
-            batch, batch_result, self.pending, chunked_req=batch.chunked_req
+            batch, batch_result, chunked_req=batch.chunked_req
         )
 
     def _copy_auxiliary_output_to_cpu(

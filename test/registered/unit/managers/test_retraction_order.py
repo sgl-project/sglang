@@ -1,9 +1,14 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import get_decode_retraction_order
+from sglang.srt.managers.schedule_batch import (
+    ReqKvInfo,
+    get_decode_retraction_order,
+    new_tokens_required_next_decode,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +67,27 @@ class TestRetractionOrder(CustomTestCase):
     def test_priority_ties_fall_back_to_length(self):
         reqs = [_req(1, priority=1), _req(5, priority=1)]
         self.assertEqual(_order(reqs, _args("priority", low_first=True)), [1, 0])
+
+
+class TestNextDecodePages(CustomTestCase):
+    """The next decode appends at the allocated end, so a row needs a new page
+    when its allocated length sits on a page boundary, whatever its committed
+    length (launched steps allocate ahead of their commit)."""
+
+    def _num_tokens(self, committed: int, allocated: int) -> int:
+        req = SimpleNamespace(
+            kv=ReqKvInfo(kv_committed_len=committed, kv_allocated_len=allocated),
+            beam_group=None,
+        )
+        return new_tokens_required_next_decode(
+            [req], page_size=4, spec_algorithm=SpeculativeAlgorithm.NONE
+        )
+
+    def test_allocated_on_a_boundary_needs_a_page(self):
+        self.assertEqual(self._num_tokens(committed=6, allocated=8), 4)
+
+    def test_committed_on_a_boundary_needs_none(self):
+        self.assertEqual(self._num_tokens(committed=4, allocated=7), 0)
 
 
 if __name__ == "__main__":

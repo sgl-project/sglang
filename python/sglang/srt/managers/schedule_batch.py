@@ -143,7 +143,6 @@ if TYPE_CHECKING:
     from sglang.srt.dllm.req_state import DllmReqState
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
-    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -2277,19 +2276,12 @@ def commit_step_counters(step: ScheduleBatch) -> None:
 
 
 def new_tokens_required_next_decode(
-    reqs: List[Req],
-    page_size: int,
-    spec_algorithm: SpeculativeAlgorithm,
-    pending: PendingSteps,
+    reqs: List[Req], page_size: int, spec_algorithm: SpeculativeAlgorithm
 ) -> int:
     if spec_algorithm.is_none():
-        # The next decode writes after the KV of every launched step, the
-        # pending ones included.
-        new_pages = sum(
-            1
-            for r in reqs
-            if (r.kv.kv_committed_len + pending.num_inflight_kv(r)) % page_size == 0
-        )
+        # The next decode writes at the allocated end; steps in flight
+        # allocated their tokens already.
+        new_pages = sum(1 for r in reqs if r.kv.kv_allocated_len % page_size == 0)
         return new_pages * page_size + num_beam_member_rows(reqs)
 
     # Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation.
@@ -2309,7 +2301,6 @@ def check_decode_mem(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     spec_algorithm: SpeculativeAlgorithm,
-    pending: PendingSteps,
 ) -> bool:
     """Whether one decode step of reqs fits in the KV pool. The ALLOCATOR owns
     the capacity gate (eviction + any per-step reservations of its own) —
@@ -2317,7 +2308,7 @@ def check_decode_mem(
     shortfalls retract gracefully instead of tripping fail-loud alloc
     errors."""
     num_tokens = new_tokens_required_next_decode(
-        reqs, token_to_kv_pool_allocator.page_size, spec_algorithm, pending
+        reqs, token_to_kv_pool_allocator.page_size, spec_algorithm
     )
     return token_to_kv_pool_allocator.check_decode_capacity(
         num_tokens=num_tokens,
@@ -2335,7 +2326,6 @@ def retract_decode(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     spec_algorithm: SpeculativeAlgorithm,
-    pending: PendingSteps,
 ) -> Tuple[List[Req], List[Req], List[Req]]:
     """Release decoding requests until the rest fit one decode step.
 
@@ -2350,7 +2340,6 @@ def retract_decode(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             spec_algorithm=spec_algorithm,
-            pending=pending,
         )
 
     def release(req: Req, remaining: int, offload_kv: bool = True) -> bool:
