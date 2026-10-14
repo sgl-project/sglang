@@ -181,6 +181,7 @@ class LocalShmMapping:
         if descriptor.get("version") != 1 or not same_host(descriptor):
             raise ValueError("Incompatible local SHM descriptor")
         self.gpu_id = gpu_id
+        self.endpoint = descriptor["endpoint"]
         self.pending = set()
         self.buffer = None
         self.mapping = None
@@ -276,6 +277,19 @@ class LocalShmMapping:
                     handle.error = exc
                     handle.event = None
             return handle
+
+    def exporter_closed(self) -> bool:
+        """Only connection refusal proves this abstract endpoint is gone."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.settimeout(1)
+                conn.connect("\0" + self.endpoint)
+        except ConnectionRefusedError:
+            return True
+        except OSError:
+            # Timeout/resource pressure does not establish peer death.
+            return False
+        return False
 
     def close(self) -> None:
         from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
