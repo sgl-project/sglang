@@ -203,7 +203,7 @@ export const config = {
 
   modelNames: {
     nvfp4: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
-    mxfp4: "amd/Muse-Spark-open-816B-A42B-Quark-MXFP4",
+    mxfp4: "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
     bf16: "meta-models/Muse-Spark-Open-816B-A42B",
     int4: "intel-ai/Muse-Spark-open-816B-A42B-INT4",
   },
