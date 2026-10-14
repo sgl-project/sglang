@@ -101,14 +101,31 @@ def test_wrapper_raw_latents_and_original_encoder(model_name):
     assert wrapped.tiny.weight.dtype == wrapped.original.weight.dtype == torch.float64
 
 
-def test_ltx23_preserves_normalized_latents():
-    tiny = Capture()
-    wrapped = TinyVAEDecodeWrapper(
-        Original(), tiny, "taeltx2", config(video_decoder_variant="ltx_2_3")
+@pytest.mark.parametrize("variant", ["ltx_2_3", "ltx_2_5"])
+def test_ltx_incompatible_decoder_is_rejected(variant):
+    cfg = config(video_decoder_variant=variant)
+    cfg.tiny_vae_model, cfg.tiny_vae_path = "taeltx2", "tiny.pth"
+    with pytest.raises(ValueError, match="LTX-2.3/2.5"):
+        validate_tiny_vae_config(cfg)
+
+
+@pytest.mark.parametrize("model_name", ["taeh3", "taew2_1", "taew2_2"])
+def test_normalization_buffers_follow_module_dtype(model_name):
+    cfg = config(latents_mean=[2.0], latents_std=[3.0])
+    wrapped = TinyVAEDecodeWrapper(Original(), Capture(), model_name, cfg)
+    buffers = dict(wrapped.named_buffers())
+    assert "tiny_latents_mean" in buffers and "tiny_latents_std" in buffers
+    wrapped.to(dtype=torch.float64)
+    assert (
+        wrapped.tiny_latents_mean.dtype
+        == wrapped.tiny_latents_std.dtype
+        == torch.float64
     )
-    z = torch.randn(1, 1, 2, 1, 1)
-    wrapped.decode(z)
-    assert torch.equal(tiny.input, z)
+    # Decoding uses cached metadata, without rebuilding it from configuration.
+    cfg.vae_config.arch_config.latents_mean = None
+    cfg.vae_config.arch_config.latents_std = None
+    raw = torch.full((1, 1, 1, 1, 1), 5.0, dtype=torch.float64)
+    torch.testing.assert_close(wrapped._normalized_latents(raw), torch.ones_like(raw))
 
 
 def test_flux2_repatchifies_before_normalization():
@@ -261,7 +278,9 @@ def test_generation_stage_uses_tiny_decoder(monkeypatch):
     "name", ["lighttaew2_1", "lighttaew2_2", "lighttaehy1_5", "taeltx_2"]
 )
 def test_comfy_video_names(name):
-    cfg = config(video_decoder_variant="ltx_2")
+    cfg = config(
+        video_decoder_variant="ltx_2", latents_mean=[2.0], latents_std=[3.0]
+    )
     cfg.tiny_vae_model, cfg.tiny_vae_path = name, "tiny.pth"
     validate_tiny_vae_config(cfg)
     wrapped = TinyVAEDecodeWrapper(Original(), Capture(), name, cfg)
@@ -281,13 +300,22 @@ def test_torch_checkpoint_and_unexpected_weights(tmp_path):
         load_tiny_autoencoder(str(path), "taeh3", torch.float32)
 
 
-def test_loader_wraps_only_visual_component(monkeypatch):
+@pytest.mark.parametrize(
+    "high_precision,component_precisions",
+    [(None, {}), ("bf16", {}), ("fp32", {"video_vae": "bf16"})],
+)
+def test_loader_wraps_only_visual_component(
+    monkeypatch, high_precision, component_precisions
+):
     from sglang.multimodal_gen.runtime.models.vaes import tiny_vae
 
-    cfg = config()
+    cfg = config(latents_mean=[2.0], latents_std=[3.0])
     cfg.tiny_vae_model, cfg.tiny_vae_path = "taeh3", "tiny.pth"
     cfg.vae_precision, cfg.vae_decode_precision = "fp32", "bf16"
-    args = SimpleNamespace(pipeline_config=cfg, component_precisions={})
+    cfg.vae_decode_precision_high = high_precision
+    args = SimpleNamespace(
+        pipeline_config=cfg, component_precisions=component_precisions
+    )
     calls = []
 
     def load(path, name, dtype):
@@ -301,3 +329,20 @@ def test_loader_wraps_only_visual_component(monkeypatch):
     assert wrapped.original is original
     assert calls == [("tiny.pth", "taeh3", torch.bfloat16)]
     assert wrapped.tiny.weight.device == original.weight.device
+
+
+def test_loader_rejects_request_precision_changes_before_loading(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.vaes import tiny_vae
+
+    cfg = config()
+    cfg.tiny_vae_model, cfg.tiny_vae_path = "taeh3", "unused.pth"
+    cfg.vae_precision, cfg.vae_decode_precision = "fp32", "bf16"
+    cfg.vae_decode_precision_high = "fp32"
+    args = SimpleNamespace(pipeline_config=cfg, component_precisions={})
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("Incompatible precision must be rejected before loading weights")
+
+    monkeypatch.setattr(tiny_vae, "load_tiny_autoencoder", unexpected_load)
+    with pytest.raises(ValueError, match="request-scoped precision changes"):
+        with_tiny_vae(Original(), args, "video_vae")

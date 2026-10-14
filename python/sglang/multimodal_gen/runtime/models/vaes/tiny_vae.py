@@ -113,6 +113,18 @@ class TinyVAEDecodeWrapper(nn.Module):
         self.tiny = tiny
         self.model_name = TINY_VAE_ALIASES.get(model_name, model_name)
         self.pipeline_config = pipeline_config
+        if self.model_name in ("taeh3", "taew2_1", "taew2_2"):
+            arch = pipeline_config.vae_config.arch_config
+            device = next(tiny.parameters()).device
+            for name in ("latents_mean", "latents_std"):
+                value = torch.tensor(
+                    getattr(arch, name), device=device, dtype=torch.float32
+                ).view(1, -1, 1, 1, 1)
+                self.register_buffer(
+                    f"tiny_{name}",
+                    value,
+                    persistent=False,
+                )
 
     def __getattr__(self, name):
         try:
@@ -125,22 +137,13 @@ class TinyVAEDecodeWrapper(nn.Module):
 
     def _normalized_latents(self, latents):
         if self.model_name == "taeltx2":
-            # LTX-2.3's native decoder owns denormalization; older variants
-            # receive raw latents from the AV decoding stage.
-            arch = self.pipeline_config.vae_config.arch_config
-            if str(arch.video_decoder_variant) == "ltx_2_3":
-                return latents
+            # LTX-2 receives raw latents from the AV decoding stage.
             mean = self.original.latents_mean.to(latents).view(1, -1, 1, 1, 1)
             std = self.original.latents_std.to(latents).view(1, -1, 1, 1, 1)
             return (latents - mean) / std
         if self.model_name in ("taeh3", "taew2_1", "taew2_2"):
-            arch = self.pipeline_config.vae_config.arch_config
-            mean = torch.as_tensor(
-                arch.latents_mean, device=latents.device, dtype=latents.dtype
-            ).view(1, -1, 1, 1, 1)
-            std = torch.as_tensor(
-                arch.latents_std, device=latents.device, dtype=latents.dtype
-            ).view(1, -1, 1, 1, 1)
+            mean = self.tiny_latents_mean.to(latents)
+            std = self.tiny_latents_std.to(latents)
             return (latents - mean) / std
         if self.model_name == "taef2" and latents.shape[1] == 32:
             b, c, h, w = latents.shape
@@ -197,10 +200,16 @@ def with_tiny_vae(vae, server_args, component_name):
     validate_tiny_vae_config(config)
     from sglang.multimodal_gen.runtime.utils.precision import resolve_decode_precision
 
+    dtype = resolve_decode_precision(server_args, component_name)
+    if resolve_decode_precision(server_args, component_name, quality="high") != dtype:
+        raise ValueError(
+            "TinyVAE requires --vae-decode-precision-high to match the default "
+            "decode precision; request-scoped precision changes are unsupported"
+        )
     tiny = load_tiny_autoencoder(
         config.tiny_vae_path,
         config.tiny_vae_model,
-        resolve_decode_precision(server_args, component_name),
+        dtype,
     )
     tiny = tiny.to(device=next(vae.parameters()).device)
     return TinyVAEDecodeWrapper(vae, tiny, config.tiny_vae_model, config)

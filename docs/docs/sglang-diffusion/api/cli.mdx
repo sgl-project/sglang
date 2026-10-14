@@ -536,6 +536,9 @@ TinyVAE together. TinyVAE uses sequential temporal processing with fresh memory
 for each request; original VAE spatial tiling and parallel decode settings do not
 tile or distribute the TinyVAE decoder. Frame callbacks receive the completed clip.
 Layerwise VAE offload is unsupported; use resident or component offload placement.
+Request-scoped decode precision changes are unsupported with TinyVAE. If you set
+`--vae-decode-precision-high`, it must resolve to the same precision as the default
+decode, including any component precision override; otherwise loading fails.
 Start with `--vae-decode-precision fp32` when checking a new checkpoint, then
 validate reduced precision and output quality on your target hardware.
 
