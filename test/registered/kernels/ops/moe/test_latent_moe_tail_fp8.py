@@ -17,7 +17,7 @@ from sglang.kernels.ops.moe.kimi_k3_flydsl.latent_moe_tail_fp8 import (  # noqa:
 )
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=240, stage="jit-kernel-unit", runner_config="amd")
 
 LATENT_DIM = 3584
 HIDDEN_DIM = 7168
@@ -48,6 +48,7 @@ def test_support_predicate_fails_closed_on_cpu():
 @pytest.mark.parametrize(
     ("keyword", "value", "message"),
     [
+        ("tile_m", 0, "tile_m"),
         ("rows_per_wave", 0, "rows_per_wave"),
         ("cu_count", 257, "cu_count"),
         ("waves_per_eu", -1, "waves_per_eu"),
@@ -56,18 +57,28 @@ def test_support_predicate_fails_closed_on_cpu():
 )
 def test_builder_rejects_invalid_schedule(keyword: str, value: int, message: str):
     with pytest.raises(ValueError, match=message):
-        build_latent_moe_tail_fp8_persistent_module(num_tokens=1, **{keyword: value})
+        build_latent_moe_tail_fp8_persistent_module(**{keyword: value})
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
     reason="Kimi-K3 FP8 latent-tail specialization requires gfx950",
 )
+@pytest.mark.parametrize(
+    "num_tokens", [1, 2, 3, 4, 5, 8, 12, 16, 32, 64, 96, 112, 128, 256]
+)
 @torch.inference_mode()
-def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
+def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays(num_tokens):
     generator = torch.Generator(device="cpu").manual_seed(20260730)
-    routed = torch.randn((1, LATENT_DIM), generator=generator).bfloat16().cuda()
-    shared = torch.randn((1, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    routed = (
+        torch.randn((num_tokens, LATENT_DIM), generator=generator).bfloat16().cuda()
+    )
+    shared = (
+        torch.randn((num_tokens, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    )
+    prefix = (
+        torch.randn((num_tokens, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    )
     rms_weight = torch.randn(LATENT_DIM, generator=generator).bfloat16().cuda()
     up_weight = (
         torch.randn((HIDDEN_DIM, LATENT_DIM), generator=generator)
@@ -86,10 +97,16 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
         torch.mm(normalized.float(), dequantized.t()).bfloat16().float()
         + shared.float()
     ).bfloat16()
+    dequantized_oracle = (dequantized_oracle.float() + prefix.float()).bfloat16()
     bf16_oracle = (
         torch.mm(normalized.float(), up_weight.float().t()).bfloat16().float()
         + shared.float()
     ).bfloat16()
+    bf16_oracle = (bf16_oracle.float() + prefix.float()).bfloat16()
+
+    assert supports_latent_moe_tail_fp8(
+        routed, shared, rms_weight, packed, scale, EPSILON, prefix
+    )
 
     out = torch.empty_like(shared)
     warmup_stream = torch.cuda.Stream()
@@ -102,6 +119,7 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
             packed,
             scale,
             EPSILON,
+            prefix=prefix,
             out=out,
         )
     torch.cuda.current_stream().wait_stream(warmup_stream)
@@ -115,6 +133,7 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
             packed,
             scale,
             EPSILON,
+            prefix=prefix,
             out=out,
         )
     graph.replay()
@@ -127,7 +146,9 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
         torch.nn.functional.cosine_similarity(
             actual.float(),
             bf16_oracle.float(),
-        ).item()
+        )
+        .min()
+        .item()
         > 0.999
     )
 

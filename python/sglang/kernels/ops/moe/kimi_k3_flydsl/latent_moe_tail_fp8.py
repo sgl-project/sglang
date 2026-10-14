@@ -16,7 +16,15 @@ from sglang.kernels.ops.moe.kimi_k3_flydsl import is_gfx950
 _LATENT_DIM = 3584
 _HIDDEN_DIM = 7168
 _FP8_MAX = 448.0
-_TOKEN_BUCKETS = (1, 2, 4)
+MAX_TOKENS = 256
+_TILE_M_BUCKETS = (1, 2, 4, 8)
+
+
+def _tile_m_for_num_tokens(num_tokens: int) -> int:
+    for tile_m in _TILE_M_BUCKETS:
+        if num_tokens <= tile_m:
+            return tile_m
+    return _TILE_M_BUCKETS[-1]
 
 
 def quantize_latent_moe_tail_weight(
@@ -58,7 +66,7 @@ def supports_latent_moe_tail_fp8(
     epsilon: float,
     prefix: torch.Tensor | None = None,
 ) -> bool:
-    """Fail closed unless an exact MI355X TP8 token bucket is present."""
+    """Fail closed unless the MI355X runtime-M contract is present."""
 
     tensors = (routed, shared, rms_weight, up_weight, up_scale)
     if prefix is not None:
@@ -73,7 +81,7 @@ def supports_latent_moe_tail_fp8(
         and rms_weight.dtype == torch.bfloat16
         and up_weight.dtype == torch.float8_e4m3fn
         and up_scale.dtype == torch.float32
-        and num_tokens in _TOKEN_BUCKETS
+        and 1 <= num_tokens <= MAX_TOKENS
         and tuple(routed.shape) == (num_tokens, _LATENT_DIM)
         and tuple(shared.shape) == (num_tokens, _HIDDEN_DIM)
         and tuple(rms_weight.shape) == (_LATENT_DIM,)
@@ -95,14 +103,14 @@ def supports_latent_moe_tail_fp8(
 
 @functools.cache
 def _compiled_latent_moe_tail_fp8(
-    num_tokens: int, add_prefix: bool, skip_rms: bool = False
+    tile_m: int, add_prefix: bool, skip_rms: bool = False
 ):
     from .kernels.latent_moe_tail_fp8_gfx950 import (
         build_latent_moe_tail_fp8_persistent_module,
     )
 
     return build_latent_moe_tail_fp8_persistent_module(
-        num_tokens=num_tokens,
+        tile_m=tile_m,
         add_prefix=add_prefix,
         skip_rms=skip_rms,
         rows_per_wave=1,
@@ -151,7 +159,9 @@ def latent_moe_tail_fp8(
     from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
     prefix_arg = prefix if prefix is not None else shared
-    _compiled_latent_moe_tail_fp8(int(routed.shape[0]), prefix is not None, skip_rms)(
+    num_tokens = int(routed.shape[0])
+    tile_m = _tile_m_for_num_tokens(num_tokens)
+    _compiled_latent_moe_tail_fp8(tile_m, prefix is not None, skip_rms)(
         ptr_arg(routed),
         ptr_arg(shared),
         ptr_arg(rms_weight),
@@ -160,6 +170,8 @@ def latent_moe_tail_fp8(
         ptr_arg(prefix_arg),
         ptr_arg(out),
         float(epsilon),
+        num_tokens,
+        (num_tokens + tile_m - 1) // tile_m,
         stream=torch.cuda.current_stream(routed.device),
     )
     return out

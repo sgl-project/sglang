@@ -41,6 +41,9 @@ def init_moe_rocm_state(self) -> None:
         envs.SGLANG_OPT_HIP_K3_PREROUTE_PREACTIVATED_SHARED.get()
     )
     self._k3_latent_tail_fp8 = envs.SGLANG_OPT_HIP_K3_LATENT_TAIL_FP8.get()
+    self._k3_latent_tail_max_tokens = (
+        envs.SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS.get()
+    )
     self._partial_fused_front = False
     self._preroute_routed_weight: Optional[torch.Tensor] = None
     self._preroute_routed_scale: Optional[torch.Tensor] = None
@@ -195,6 +198,12 @@ def _prepare_latent_tail_fp8(self) -> None:
         or tuple(weight.shape) != (7168, 3584)
     ):
         return
+    if not 1 <= self._k3_latent_tail_max_tokens <= latent_tail_aiter_hip.max_tokens():
+        raise ValueError(
+            "SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS must be in "
+            f"[1, {latent_tail_aiter_hip.max_tokens()}], "
+            f"got {self._k3_latent_tail_max_tokens}"
+        )
     self._latent_tail_weight, self._latent_tail_scale = latent_tail_aiter_hip.pack(
         self.routed_expert_up_proj.weight
     )
@@ -204,6 +213,7 @@ def _prepare_latent_tail_fp8(self) -> None:
         up_weight=self._latent_tail_weight,
         up_scale=self._latent_tail_scale,
         epsilon=epsilon,
+        max_tokens=self._k3_latent_tail_max_tokens,
     )
 
 
@@ -383,8 +393,8 @@ def forward_fused_rocm(
     shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
     if (
-        num_tokens in latent_tail_aiter_hip.TOKEN_BUCKETS
-        and self._latent_tail_weight is not None
+        self._latent_tail_weight is not None
+        and num_tokens <= self._k3_latent_tail_max_tokens
     ):
         out = _try_latent_tail(self, latent, shared_output, prefix_sum)
         if out is not None:

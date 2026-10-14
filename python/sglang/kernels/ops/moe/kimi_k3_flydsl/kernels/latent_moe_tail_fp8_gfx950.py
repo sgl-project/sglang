@@ -3,11 +3,10 @@
 
 """Persistent-wave Kimi-K3 RMSNorm, FP8 GEMM, and shared-add kernel.
 
-The B1 schedule assigns output rows to persistent waves.  B2/B4 keep that
-schedule but accumulate all tokens while each FP8 weight vector is resident in
-registers, so weight traffic is independent of batch size.  Launching one B1
-grid per token would instead stream the 25.7 MB weight once per token and lose
-to the regular batched GEMM almost immediately.
+Each grid-y workgroup handles one fixed-size token tile.  M is a runtime
+argument, so one compiled TILE_M specialization covers arbitrary token counts
+and masks the final partial tile.  Within a tile, each FP8 weight vector is
+loaded once and reused by all token accumulators.
 """
 
 import flydsl.compiler as flyc
@@ -47,7 +46,7 @@ def _raw(value):
 
 
 def build_latent_moe_tail_fp8_persistent_module(
-    num_tokens: int = 1,
+    tile_m: int = 1,
     add_prefix: bool = False,
     skip_rms: bool = False,
     rows_per_wave: int = 2,
@@ -57,8 +56,8 @@ def build_latent_moe_tail_fp8_persistent_module(
 ):
     """Build a block-normalize/one-wave-per-output-group specialization."""
 
-    if num_tokens not in (1, 2, 4):
-        raise ValueError("num_tokens must be 1, 2, or 4")
+    if tile_m not in (1, 2, 4, 8):
+        raise ValueError("tile_m must be 1, 2, 4, or 8")
     if rows_per_wave not in (1, 2, 3, 4):
         raise ValueError("rows_per_wave must be 1, 2, 3, or 4")
     if not 1 <= cu_count <= 256:
@@ -78,12 +77,12 @@ def build_latent_moe_tail_fp8_persistent_module(
 
     @fx.struct
     class SharedStorage:
-        hidden: fx.Array[fx.BFloat16, num_tokens * _LATENT_DIM, 16]
-        rms_sums: fx.Array[fx.Float32, num_tokens * _NORMALIZE_WAVES, 16]
-        inverse_rms: fx.Array[fx.Float32, num_tokens, 16]
+        hidden: fx.Array[fx.BFloat16, tile_m * _LATENT_DIM, 16]
+        rms_sums: fx.Array[fx.Float32, tile_m * _NORMALIZE_WAVES, 16]
+        inverse_rms: fx.Array[fx.Float32, tile_m, 16]
 
     kernel_name = (
-        f"latent_moe_tail_b{num_tokens}_bf16_fp8_persistent_gfx950"
+        f"latent_moe_tail_tm{tile_m}_bf16_fp8_persistent_gfx950"
         f"_prefix{int(add_prefix)}_skiprms{int(skip_rms)}"
         f"_rpw{rows_per_wave}_cu{cu_count}_wpb{waves_per_block}"
         f"_wpe{waves_per_eu}_wcm{weight_cache_modifier}"
@@ -99,6 +98,7 @@ def build_latent_moe_tail_fp8_persistent_module(
         prefix: fx.Pointer,
         output: fx.Pointer,
         epsilon: fx.Float32,
+        num_tokens: fx.Int32,
     ):
         i1 = ir.IntegerType.get_signless(1)
         i32 = T.i32
@@ -125,6 +125,11 @@ def build_latent_moe_tail_fp8_persistent_module(
         vec8_bf16 = T.vec(_ELEMENTS_PER_LOAD, T.bf16)
         vec8_f32 = T.vec(_ELEMENTS_PER_LOAD, f32)
         zero_f32 = arith.constant(0.0, type=f32)
+        zero_bf16 = arith.constant(0.0, type=T.bf16)
+        zero_vec8_bf16 = vector.from_elements(
+            vec8_bf16, [zero_bf16] * _ELEMENTS_PER_LOAD
+        )
+        tile_token_base = ArithValue(gpu.block_idx.y) * arith.constant(tile_m, type=i32)
 
         def lds_load(ptr, index):
             return fx.ptr_load(ptr + fx.Int64(index))
@@ -228,29 +233,48 @@ def build_latent_moe_tail_fp8_persistent_module(
         )
         # Every persistent block needs the token rows in its own LDS. Under
         # skip_rms the caller already fused RMSNorm into the all-reduce, so
-        # just copy; otherwise normalize with B1's fixed reduction order.
+        # just copy; otherwise normalize with B1's fixed reduction order. The
+        # invalid rows in the final tile are zero-filled so the GEMV loop can
+        # remain branch-free.
         if const_expr(skip_rms):
-            for token_index in range_constexpr(num_tokens):
-                token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
+            for token_index in range_constexpr(tile_m):
+                token = tile_token_base + arith.constant(token_index, type=i32)
+                token_valid = arith.cmpi(CmpIPredicate.ult, token, _raw(num_tokens))
+                lds_token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
                 copy_if = scf.IfOp(normalize_thread)
                 with ir.InsertionPoint(copy_if.then_block):
                     row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
-                    element_index = token_base + row_element
-                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
-                    fx.ptr_store(routed_bf16, hidden_lds + element_index)
+                    global_element = (
+                        token * arith.constant(_LATENT_DIM, type=i32) + row_element
+                    )
+                    load_if = scf.IfOp(token_valid, results_=[vec8_bf16], has_else=True)
+                    with ir.InsertionPoint(load_if.then_block):
+                        routed_bf16 = load_bf16x8(routed_rsrc, global_element)
+                        scf.YieldOp([_raw(routed_bf16)])
+                    with ir.InsertionPoint(load_if.else_block):
+                        scf.YieldOp([_raw(zero_vec8_bf16)])
+                    fx.ptr_store(
+                        load_if.results[0],
+                        hidden_lds + lds_token_base + row_element,
+                    )
                     scf.YieldOp([])
                 gpu.barrier()
         else:
-            for token_index in range_constexpr(num_tokens):
-                token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
+            for token_index in range_constexpr(tile_m):
+                token = tile_token_base + arith.constant(token_index, type=i32)
+                token_valid = arith.cmpi(CmpIPredicate.ult, token, _raw(num_tokens))
+                lds_token_base = arith.constant(token_index * _LATENT_DIM, type=i32)
                 rms_base = arith.constant(token_index * _NORMALIZE_WAVES, type=i32)
-                token = arith.constant(token_index, type=i32)
+                lds_token = arith.constant(token_index, type=i32)
+                active_normalize = arith.andi(normalize_thread, token_valid)
 
-                normalize_if = scf.IfOp(normalize_thread, results_=[f32], has_else=True)
+                normalize_if = scf.IfOp(active_normalize, results_=[f32], has_else=True)
                 with ir.InsertionPoint(normalize_if.then_block):
                     row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
-                    element_index = token_base + row_element
-                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
+                    global_element = (
+                        token * arith.constant(_LATENT_DIM, type=i32) + row_element
+                    )
+                    routed_bf16 = load_bf16x8(routed_rsrc, global_element)
                     routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
                     local_square_sum = (routed_f32 * routed_f32).reduce(
                         ReductionOp.ADD, fastmath=fm_fast
@@ -295,21 +319,35 @@ def build_latent_moe_tail_fp8_persistent_module(
                     inverse = fmath.rsqrt(
                         variance + ArithValue(epsilon), fastmath=fm_fast
                     )
-                    lds_store(inverse_rms, _raw(inverse), token)
+                    lds_store(inverse_rms, _raw(inverse), lds_token)
                     scf.YieldOp([])
                 gpu.barrier()
 
                 normalize_store_if = scf.IfOp(normalize_thread)
                 with ir.InsertionPoint(normalize_store_if.then_block):
                     row_element = tid * arith.constant(_ELEMENTS_PER_LOAD, type=i32)
-                    element_index = token_base + row_element
-                    routed_bf16 = load_bf16x8(routed_rsrc, element_index)
-                    gamma_bf16 = load_bf16x8(rms_weight_rsrc, row_element)
-                    routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
-                    gamma_f32 = ArithValue(gamma_bf16).extf(vec8_f32)
-                    inverse = ArithValue(lds_load(inverse_rms, token))
-                    normalized = (routed_f32 * gamma_f32 * inverse).truncf(vec8_bf16)
-                    fx.ptr_store(normalized, hidden_lds + element_index)
+                    global_element = (
+                        token * arith.constant(_LATENT_DIM, type=i32) + row_element
+                    )
+                    normalize_valid_if = scf.IfOp(
+                        token_valid, results_=[vec8_bf16], has_else=True
+                    )
+                    with ir.InsertionPoint(normalize_valid_if.then_block):
+                        routed_bf16 = load_bf16x8(routed_rsrc, global_element)
+                        gamma_bf16 = load_bf16x8(rms_weight_rsrc, row_element)
+                        routed_f32 = ArithValue(routed_bf16).extf(vec8_f32)
+                        gamma_f32 = ArithValue(gamma_bf16).extf(vec8_f32)
+                        inverse = ArithValue(lds_load(inverse_rms, lds_token))
+                        normalized = (routed_f32 * gamma_f32 * inverse).truncf(
+                            vec8_bf16
+                        )
+                        scf.YieldOp([_raw(normalized)])
+                    with ir.InsertionPoint(normalize_valid_if.else_block):
+                        scf.YieldOp([_raw(zero_vec8_bf16)])
+                    fx.ptr_store(
+                        normalize_valid_if.results[0],
+                        hidden_lds + lds_token_base + row_element,
+                    )
                     scf.YieldOp([])
                 gpu.barrier()
 
@@ -333,7 +371,7 @@ def build_latent_moe_tail_fp8_persistent_module(
                 with ir.InsertionPoint(row_if.then_block):
                     # One accumulator per token, so the FP8 weight vector is
                     # loaded once and reused across every token's dot.
-                    local_dots = [ArithValue(zero_f32) for _ in range(num_tokens)]
+                    local_dots = [ArithValue(zero_f32) for _ in range(tile_m)]
                     for k_iteration in range_constexpr(
                         _LATENT_DIM // _K_PER_WAVE_ITERATION
                     ):
@@ -344,7 +382,7 @@ def build_latent_moe_tail_fp8_persistent_module(
                             row * arith.constant(_LATENT_DIM, type=i32) + k_element
                         )
                         weight_bf16 = load_fp8x8_as_bf16(up_weight_rsrc, weight_element)
-                        for token_index in range_constexpr(num_tokens):
+                        for token_index in range_constexpr(tile_m):
                             hidden_element = (
                                 arith.constant(token_index * _LATENT_DIM, type=i32)
                                 + k_element
@@ -365,7 +403,7 @@ def build_latent_moe_tail_fp8_persistent_module(
                     reduced = [
                         ArithValue(wave_reduce_add(local_dots[token_index]))
                         * ArithValue(scale)
-                        for token_index in range(num_tokens)
+                        for token_index in range(tile_m)
                     ]
                     is_lane_zero = arith.cmpi(
                         CmpIPredicate.eq,
@@ -374,44 +412,58 @@ def build_latent_moe_tail_fp8_persistent_module(
                     )
                     write_if = scf.IfOp(is_lane_zero)
                     with ir.InsertionPoint(write_if.then_block):
-                        for token_index in range_constexpr(num_tokens):
-                            output_element = (
-                                arith.constant(token_index * _HIDDEN_DIM, type=i32)
-                                + row
+                        for token_index in range_constexpr(tile_m):
+                            token = tile_token_base + arith.constant(
+                                token_index, type=i32
                             )
-                            # Match the BF16 Linear output boundary before the
-                            # add, independently for each token.
-                            projected_bf16 = arith.trunc_f(
-                                T.bf16, _raw(reduced[token_index])
+                            token_valid = arith.cmpi(
+                                CmpIPredicate.ult, token, _raw(num_tokens)
                             )
-                            projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
-                            shared_bf16 = buffer_ops.buffer_load(
-                                shared_rsrc,
-                                output_element,
-                                vec_width=1,
-                                dtype=T.bf16,
-                            )
-                            shared_f32 = ArithValue(arith.extf(f32, shared_bf16))
-                            result = arith.trunc_f(
-                                T.bf16,
-                                _raw(projected_f32 + shared_f32),
-                            )
-                            if const_expr(add_prefix):
-                                # Two BF16 boundaries, matching the unfused
-                                # code: (projected + shared), then + prefix.
-                                result_f32 = ArithValue(arith.extf(f32, result))
-                                prefix_bf16 = buffer_ops.buffer_load(
-                                    prefix_rsrc,
+                            valid_write_if = scf.IfOp(token_valid)
+                            with ir.InsertionPoint(valid_write_if.then_block):
+                                output_element = (
+                                    token * arith.constant(_HIDDEN_DIM, type=i32) + row
+                                )
+                                # Match the BF16 Linear output boundary before
+                                # the add, independently for each token.
+                                projected_bf16 = arith.trunc_f(
+                                    T.bf16, _raw(reduced[token_index])
+                                )
+                                projected_f32 = ArithValue(
+                                    arith.extf(f32, projected_bf16)
+                                )
+                                shared_bf16 = buffer_ops.buffer_load(
+                                    shared_rsrc,
                                     output_element,
                                     vec_width=1,
                                     dtype=T.bf16,
                                 )
-                                prefix_f32 = ArithValue(arith.extf(f32, prefix_bf16))
+                                shared_f32 = ArithValue(arith.extf(f32, shared_bf16))
                                 result = arith.trunc_f(
                                     T.bf16,
-                                    _raw(result_f32 + prefix_f32),
+                                    _raw(projected_f32 + shared_f32),
                                 )
-                            buffer_ops.buffer_store(result, output_rsrc, output_element)
+                                if const_expr(add_prefix):
+                                    # Two BF16 boundaries, matching the unfused
+                                    # code: (projected + shared), then + prefix.
+                                    result_f32 = ArithValue(arith.extf(f32, result))
+                                    prefix_bf16 = buffer_ops.buffer_load(
+                                        prefix_rsrc,
+                                        output_element,
+                                        vec_width=1,
+                                        dtype=T.bf16,
+                                    )
+                                    prefix_f32 = ArithValue(
+                                        arith.extf(f32, prefix_bf16)
+                                    )
+                                    result = arith.trunc_f(
+                                        T.bf16,
+                                        _raw(result_f32 + prefix_f32),
+                                    )
+                                buffer_ops.buffer_store(
+                                    result, output_rsrc, output_element
+                                )
+                                scf.YieldOp([])
                         scf.YieldOp([])
                     scf.YieldOp([])
 
@@ -425,6 +477,8 @@ def build_latent_moe_tail_fp8_persistent_module(
         prefix: fx.Pointer,
         output: fx.Pointer,
         epsilon: fx.Float32,
+        num_tokens: fx.Int32,
+        num_tiles: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         context = CompilationContext.get_current()
@@ -447,8 +501,9 @@ def build_latent_moe_tail_fp8_persistent_module(
             prefix,
             output,
             epsilon,
+            num_tokens,
         ).launch(
-            grid=(cu_count, 1, 1),
+            grid=(cu_count, fx.Int64(num_tiles), 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

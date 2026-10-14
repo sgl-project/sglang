@@ -10,9 +10,6 @@ import torch
 
 from sglang.srt.utils import is_hip
 
-# Token counts the tail kernel is compiled for.
-TOKEN_BUCKETS = (1, 2, 4)
-
 
 @functools.cache
 def _module() -> Optional[ModuleType]:
@@ -31,6 +28,11 @@ def _module() -> Optional[ModuleType]:
 
 def available() -> bool:
     return _module() is not None
+
+
+def max_tokens() -> int:
+    """Largest token count the runtime-M kernel takes."""
+    return _module().MAX_TOKENS
 
 
 def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -81,10 +83,12 @@ def warmup(
     up_weight: torch.Tensor,
     up_scale: torch.Tensor,
     epsilon: float,
+    max_tokens: int,
 ) -> None:
-    """Compile every token bucket and epilogue variant before graph capture."""
+    """Compile every token tile and epilogue variant the model will launch, before
+    graph capture; the token count itself is a runtime argument."""
     device = up_weight.device
-    for num_tokens in TOKEN_BUCKETS:
+    for num_tokens in sorted({min(tile, max_tokens) for tile in (1, 2, 4, 8)}):
         routed = torch.zeros((num_tokens, 3584), dtype=torch.bfloat16, device=device)
         shared = torch.zeros((num_tokens, 7168), dtype=torch.bfloat16, device=device)
         if not covered(routed, shared, rms_weight, up_weight, up_scale, epsilon):
