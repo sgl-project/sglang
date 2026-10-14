@@ -1302,9 +1302,10 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
+        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
         if (
-            info.enable_kv_cache_sharding
-            and self.is_mla_backend
+            self.is_mla_backend
+            and info.enable_kv_cache_sharding
             and info.attn_cp_size == 1
         ):
             # MLA KV sharded across prefill attn-TP: every decode rank pulls
