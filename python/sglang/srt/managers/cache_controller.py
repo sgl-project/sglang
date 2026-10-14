@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from queue import Empty, Queue
@@ -31,6 +32,13 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     count_pool_hits,
+    pool_transfer_misses,
+)
+from sglang.srt.mem_cache.storage_call_guard import (
+    HostSpan,
+    StorageCallGuard,
+    StorageCallKind,
+    StorageCallTimeouts,
 )
 
 if TYPE_CHECKING:
@@ -325,6 +333,9 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        # Bounds every storage backend call; attach_storage_backend installs
+        # one with the configured deadlines, detach restores the inline default.
+        self.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -620,6 +631,29 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    def _storage_io_lease(self):
+        return nullcontext()
+
+    def _bounded_storage_call(
+        self,
+        kind: StorageCallKind,
+        call: Callable,
+        *,
+        miss: Callable,
+        op: str,
+        num_keys: int,
+        spans: Optional[Callable[[], List[HostSpan]]] = None,
+    ):
+        return self.storage_call_guard.run(
+            kind,
+            call,
+            miss=miss,
+            op=op,
+            num_keys=num_keys,
+            spans=spans,
+            lease=self._storage_io_lease,
+        )
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -655,8 +689,16 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
+        storage_call_timeouts = StorageCallTimeouts.pop_from_extra_config(
+            storage_backend_extra_config
+        )
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
+        )
+        self.storage_call_guard = StorageCallGuard(
+            storage_call_timeouts,
+            label=f"tp{self.storage_config.tp_rank}",
+            stop_event=self.storage_stop_event,
         )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
@@ -746,6 +788,8 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.storage_call_guard.shutdown()
+            self.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
             raise
 
     def detach_storage_backend(self):
@@ -791,6 +835,10 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        # Orphaned calls keep running on their own workers and release their
+        # quarantined host spans when they return.
+        self.storage_call_guard.shutdown()
+        self.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -1280,14 +1328,24 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
-        # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        # Read from KV pool. The batch's host span stays quarantined for as long
+        # as a timed-out read may still be writing it.
+        batch_spans = lambda: [HostSpan(self.storage_host_pool, batch_host_indices)]
+        kv_hits = self._bounded_storage_call(
+            StorageCallKind.GET,
+            lambda: self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            ),
+            miss=lambda: 0,
+            op="page_get",
+            num_keys=len(batch_hashes),
+            spans=batch_spans,
         )
 
-        # Read from KV-derived sidecar pools, if any.
+        # Read from KV-derived sidecar pools, if any. A KV miss already decides
+        # the batch, so no second bounded call (and no second pin) is issued.
         sidecar_hits: dict[str, int] = {}
-        if len(kv_derived_transfers) > 0:
+        if len(kv_derived_transfers) > 0 and kv_hits > 0:
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
@@ -1296,8 +1354,17 @@ class HiCacheController:
                 )
                 for transfer in kv_derived_transfers
             ]
-            sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers, extra_info=extra_info
+            # PoolName is a str enum, so the all-False miss keys match whatever
+            # key type the backend returns and count as 0 hits per pool.
+            sidecar_results = self._bounded_storage_call(
+                StorageCallKind.GET,
+                lambda: self.storage_backend.batch_get_v2(
+                    current_kv_derived_transfers, extra_info=extra_info
+                ),
+                miss=lambda: pool_transfer_misses(current_kv_derived_transfers),
+                op="batch_get_v2",
+                num_keys=len(batch_hashes) * len(current_kv_derived_transfers),
+                spans=batch_spans,
             )
             sidecar_hits = count_pool_hits(sidecar_results)
 
@@ -1379,7 +1446,13 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            hit_page_num = self._bounded_storage_call(
+                StorageCallKind.QUERY,
+                lambda: self.storage_backend.batch_exists(batch_hashes, extra_info),
+                miss=lambda: 0,
+                op="batch_exists",
+                num_keys=len(batch_hashes),
+            )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1481,7 +1554,16 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = self._bounded_storage_call(
+                StorageCallKind.SET,
+                lambda: self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                ),
+                miss=lambda: False,
+                op="page_set",
+                num_keys=len(batch_hashes),
+                spans=lambda: [HostSpan(self.storage_host_pool, batch_host_indices)],
+            )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."

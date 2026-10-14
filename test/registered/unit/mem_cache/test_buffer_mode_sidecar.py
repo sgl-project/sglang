@@ -117,6 +117,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                         prefetch_hits_sync_groups=[],
                         storage_sync_failed=False,
                         _all_reduce=capture,
+                        _bounded_storage_call=lambda kind, call, **kwargs: call(),
                     )
                     controller._storage_sync_all_reduce = (
                         HybridCacheController._storage_sync_all_reduce.__get__(
