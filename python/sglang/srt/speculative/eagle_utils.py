@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -49,8 +50,12 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_is_gfx95 = is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
+
+# Measured on MI350X: from this vocab width the split argmax beats torch.argmax.
+_SPLIT_ARGMAX_MIN_VOCAB = 32768
 
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.speculative.tree import (
@@ -849,11 +854,25 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+    if _is_gfx95:
+        # One int32 buffer behind the three outputs, so the rank-0 broadcast
+        # below is a single collective.
+        num_predict = math.prod(predict_shape)
+        depth = verify_input.max_tree_depth
+        verify_out = torch.empty(
+            num_predict + bs * depth + bs, dtype=torch.int32, device=device
+        )
+        predict = verify_out[:num_predict].zero_()
+        accept_index = verify_out[num_predict : num_predict + bs * depth]
+        accept_index = accept_index.view(bs, depth).fill_(-1)
+        num_correct_drafts = verify_out[num_predict + bs * depth :]
+    else:
+        verify_out = None
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
@@ -865,7 +884,13 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        if _is_gfx95 and next_token_logits.shape[-1] >= _SPLIT_ARGMAX_MIN_VOCAB:
+            # torch.argmax reduces each row on one workgroup; this splits it.
+            from sglang.kernels.ops.speculative.topk1 import split_argmax
+
+            target_predict = split_argmax(next_token_logits)
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
@@ -889,7 +914,9 @@ def eagle_sample(
                 if is_dp_attention_enabled()
                 else get_parallel().tp_group
             )
-            if tp_group.world_size > 1:
+            if tp_group.world_size > 1 and verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            elif tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
