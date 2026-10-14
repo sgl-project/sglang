@@ -31,7 +31,7 @@ class StoragePrefetchRetries:
     def refetch(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
         self._pending[req_id] = _StoragePrefetchRetry(True, storage_hit_end)
 
-    def device_covered(self, req_id: str, covered_len: int) -> None:
+    def record_device_covered_len(self, req_id: str, covered_len: int) -> None:
         """Remember the device span that made an L3 read redundant."""
         self._device_covered_lens[req_id] = max(
             self._device_covered_lens.get(req_id, 0), covered_len

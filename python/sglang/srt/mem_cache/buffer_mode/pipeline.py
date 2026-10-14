@@ -1253,7 +1253,9 @@ class BufferModePipeline:
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
         covered = match.device_prefix_len >= len(key)
         if covered:
-            self._cache.storage_prefetch_retries.device_covered(request.rid, len(key))
+            self._cache.storage_prefetch_retries.record_device_covered_len(
+                request.rid, len(key)
+            )
         return covered
 
     def set_prefix_ctx(

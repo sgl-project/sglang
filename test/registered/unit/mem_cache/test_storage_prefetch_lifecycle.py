@@ -262,7 +262,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     self.assertEqual(req.storage_prefetch_last_match_len, 8)
                 # Abort/reset must not leak a boundary to another request attempt.
                 for cleanup in (lambda: retries.cancel(req.rid), retries.clear):
-                    retries.device_covered(req.rid, 8)
+                    retries.record_device_covered_len(req.rid, 8)
                     cleanup()
                     self.assertEqual(retries.pop_device_covered_len(req.rid), 0)
 
