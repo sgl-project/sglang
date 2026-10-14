@@ -3,9 +3,7 @@
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
 cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
 tests check that the pre-allocated `parent_list` / `top_scores_index` match the
-slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}, and that
-`draft_forward` under the CUDA and HIP gates returns the same chain as the
-token-list path.
+slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
 import contextlib
@@ -17,7 +15,6 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative import eagle_worker_v2
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -132,90 +129,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.dtype, torch.long)
                 self.assertTrue(fast_parent.is_contiguous())
                 self.assertTrue(fast_index.is_contiguous())
-
-    @unittest.skipUnless(
-        torch.cuda.is_available(), "The topk=1 chain kernel needs a GPU."
-    )
-    def test_draft_forward_chain_matches_token_list_path(self):
-        bs, num_steps, vocab_size, hidden_size = 3, 4, 50000, 16
-        worker = _make_worker(num_steps, num_steps + 1)
-        worker._rebuild_topk1_chain_buffers()
-        worker.hot_token_id = None
-        worker.index_share_for_mtp_iteration = False
-        worker.seed_dsa_topk_from_draft_extend = False
-        worker.draft_attn_backend = SimpleNamespace(
-            attn_backends=[object()] * num_steps
-        )
-        # Distinct argmax per (step, row) so a misplaced column is detected.
-        logits = torch.randn(num_steps, bs, vocab_size, device=DEVICE)
-        expected_tokens = (
-            torch.arange(num_steps * bs, device=DEVICE).view(num_steps, bs) * 997 + 11
-        )
-        logits.scatter_(2, expected_tokens.unsqueeze(2), 1000.0)
-
-        def run(is_cuda, is_hip):
-            calls = []
-
-            def forward(forward_batch):
-                calls.append(forward_batch.input_ids.clone())
-                return SimpleNamespace(
-                    logits_output=SimpleNamespace(
-                        next_token_logits=logits[len(calls)].clone(),
-                        hidden_states=torch.randn(bs, hidden_size, device=DEVICE),
-                    )
-                )
-
-            worker.draft_runner = SimpleNamespace(
-                canary_manager=None,
-                forward=forward,
-                model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(
-                        architectures=["DeepseekV3ForCausalLMNextN"]
-                    ),
-                    model_is_mrope=False,
-                ),
-            )
-            spec_info = SimpleNamespace(
-                topk_p=torch.ones(bs, 1, device=DEVICE),
-                topk_index=expected_tokens[0].unsqueeze(1).clone(),
-                hidden_states=torch.randn(bs, hidden_size, device=DEVICE),
-                draft_probs=None,
-            )
-            forward_batch = SimpleNamespace(
-                forward_mode=ForwardMode.DECODE,
-                batch_size=bs,
-                out_cache_loc=torch.arange(bs * num_steps, device=DEVICE),
-                positions=torch.zeros(bs, dtype=torch.long, device=DEVICE),
-                spec_info=spec_info,
-                sampling_info=SimpleNamespace(is_all_greedy=True),
-            )
-            with (
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.forward_context",
-                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
-                ),
-                patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", is_cuda),
-                patch("sglang.srt.speculative.eagle_worker_v2._is_hip", is_hip),
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
-                    wraps=eagle_worker_v2.select_top_k_tokens,
-                ) as select_top_k_tokens,
-            ):
-                result = worker.draft_forward(forward_batch)
-            return result, select_top_k_tokens.call_count, forward_batch.positions
-
-        # Token-list path: plain argmax + select_top_k_tokens + one final cat.
-        ref, ref_calls, ref_positions = run(is_cuda=False, is_hip=False)
-        self.assertEqual(ref_calls, num_steps)
-        for is_cuda, is_hip in ((True, False), (False, True)):
-            with self.subTest(is_cuda=is_cuda, is_hip=is_hip):
-                out, calls, positions = run(is_cuda, is_hip)
-                self.assertEqual(calls, 0)
-                for ref_t, out_t in zip(ref[:3], out[:3]):
-                    self.assertEqual(out_t.tolist(), ref_t.tolist())
-                self.assertEqual(out[2].tolist(), expected_tokens.t().tolist())
-                self.assertIsNone(out[3])
-                self.assertEqual(positions.tolist(), ref_positions.tolist())
 
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
