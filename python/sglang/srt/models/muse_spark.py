@@ -760,7 +760,8 @@ class MuseSpark1xMoE(nn.Module):
         sp_active = getattr(get_forward(), "sp_active", False)
         prepare_early = (
             self.nvfp4_checkpoint
-            and hidden_states.shape[0] <= 8
+            # Measured to help up to 128 tokens (decode c<=128); untested above.
+            and hidden_states.shape[0] <= 128
             and not sp_active
             and not getattr(self.experts, "use_marlin", False)
         )
