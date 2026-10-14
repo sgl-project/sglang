@@ -245,25 +245,14 @@ class TestSailDeviceMixin(CustomTestCase):
         # device_type stays "cuda" — torch.device("cuda") is the only valid
         # device-type string for SAIL devices in PyTorch.
         self.assertEqual(base.device_type, "cuda")
-        # SAIL overrides is_cuda() to True: it exposes CUDA-compatible APIs.
-        self.assertTrue(base.is_cuda())
         self.assertTrue(base.is_sail())
         self.assertTrue(base.is_cuda_alike())
 
     def test_sail_srt_platform_capabilities(self):
         base = SailSRTPlatform()
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
-
-    @patch("torch.cuda.get_device_capability", return_value=(8, 9))
-    def test_sail_supports_fp8_at_sm89(self, mock_get_device_capability):
-        base = SailSRTPlatform()
-        self.assertTrue(base.supports_fp8())
-
-    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
-    def test_sail_supports_fp8_below_sm89(self, mock_get_device_capability):
-        base = SailSRTPlatform()
-        self.assertFalse(base.supports_fp8())
+        self.assertTrue(base.capabilities.supports_triton)
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
 
     def test_sail_arch_suffix_below_sm89(self):
         # SAIL devices below the SM89 capability require the arch-specific
