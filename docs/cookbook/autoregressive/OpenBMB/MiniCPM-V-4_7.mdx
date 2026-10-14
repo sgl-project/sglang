@@ -148,36 +148,36 @@ OpenBMB also publishes AWQ, GPTQ, and GGUF exports and a 1B int4 checkpoint. The
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B BF16</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1.75 → 2.02</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>4.00 → 5.73</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1.56 → 1.65</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>4.43 → 6.27</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1.82 → 1.92</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>5.96 → 7.48</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1.60 → 1.51</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>5.09 → 6.63</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B BF16</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>2.99 → 2.80</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>11.17 → 13.69</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>3.56 → 3.02</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>13.51 → 11.92</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>2.97 → 2.56</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>11.12 → 16.38</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>3.60 → 2.71</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>13.48 → 11.33</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35B-A3B FP8</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>3.08 → 2.76</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>10.53 → 12.60</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>3.42 → 2.61</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>11.11 → 12.40</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>3.06 → 2.46</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>10.48 → 14.94</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>3.42 → 2.38</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>10.97 → 11.12</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B INT4</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>7.19 → 11.05</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>47.92 → 54.80</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>3.34 → 2.38</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>9.33 → 11.20</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>7.17 → 10.25</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>50.58 → 51.04</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>3.35 → 2.15</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>9.06 → 10.92</td>
     </tr>
   </tbody>
 </table>
 
-- Benchmark speculative decoding on real text. Random-token prompts collapse draft acceptance, so they say nothing about DSPARK. For a real-workload reference, GSM8K accept length is about 2.6 on 1B, 4.1 on 35B-A3B BF16, 4.0 on FP8, and 3.8 on INT4.
+- Benchmark speculative decoding on real text. Random-token prompts collapse draft acceptance, so they say nothing about DSPARK. For a real-workload reference, GSM8K accept length is about 4.5 on 1B (measured at the final PR head); in the sharegpt benchmark, accept length is about 2.5 on 1B and 3.2-3.3 on the 35B-A3B variants.
 - Every command carries `--reasoning-parser auto --tool-call-parser auto`. SGLang resolves both from the chat template, to `qwen3` for reasoning and `qwen3_coder` for tool calls, so the thinking trace lands in `message.reasoning_content` and tool calls in `message.tool_calls` (see §3.1 and §3.2). To turn either off, toggle it in the **Parsers** card of the [Playground](#playground).
 - Thinking is on by default. To get a direct answer for one request, pass `"chat_template_kwargs": {"enable_thinking": false}` (in the OpenAI Python client, `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); `reasoning_content` then comes back empty.
 - Image and video requests need no extra server flags.
