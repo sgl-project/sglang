@@ -85,6 +85,8 @@ def _make_model_runner(
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
     enable_unified_memory=False,
+    enable_hisparse=False,
+    hisparse_host_to_device_ratio=1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -152,7 +154,10 @@ def _make_model_runner(
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
         enable_unified_memory=enable_unified_memory,
-        enable_hisparse=False,
+        enable_hisparse=enable_hisparse,
+        hisparse_config=(
+            f'{{"host_to_device_ratio": {hisparse_host_to_device_ratio}}}'
+        ),
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
@@ -949,6 +954,52 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_draft_expanded_id_space_is_budgeted(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The dense draft pool spans HiSparse's host-expanded logical IDs."""
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+        indexer_bytes_per_token = 132
+        host_to_device_ratio = 4
+
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            enable_hisparse=True,
+            hisparse_host_to_device_ratio=host_to_device_ratio,
+        )
+        _configure_dsa_model(mr)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        actual_bytes_per_token = (
+            576 * num_layers
+            + indexer_bytes_per_token * num_layers * host_to_device_ratio
+            + (576 + indexer_bytes_per_token) * draft_num_layers * host_to_device_ratio
+        )
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000
@@ -994,11 +1045,11 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_resolved_hicache_override_prices_every_indexer_layer(
+    def test_resolved_hicache_override_prices_producer_layers_only(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        """HiCache sizing must follow the elided layout, not the dense one."""
         num_layers = 6
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
         _configure_dsa_model(mr)
@@ -1015,17 +1066,64 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
-        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+        # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
+        # producing index-K; the other 3 get a 0-row buffer and cost nothing.
+        producer_layers = 3
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_pd_prices_every_indexer_layer(
+    def test_ascend_pd_sizing_stays_dense_like_its_allocation(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """PD must retain dense index-K metadata until transports support sparsity."""
+        """Ascend PD allocates index-K for every layer, so sizing must price
+        every layer too; sizing used to elide while allocation did not, which
+        over-estimated KV capacity."""
+        num_layers = 6
+        producer_layers = 3
+        for is_npu, mode, priced_layers in (
+            (True, "prefill", num_layers),
+            (True, "null", producer_layers),
+            (False, "prefill", producer_layers),
+        ):
+            with self.subTest(is_npu=is_npu, mode=mode):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=num_layers,
+                    use_mla_backend=True,
+                    disaggregation_mode=mode,
+                )
+                _configure_dsa_model(mr)
+                mr.model_config.hf_config.index_topk_freq = 4
+                mr.model_config.hf_config.index_skip_topk_offset = 3
+
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator._is_npu",
+                        is_npu,
+                    ),
+                    mock_cpu_env(kv_size=1),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        DefaultPoolConfigurator,
+                    )
+
+                    cfg = DefaultPoolConfigurator(mr)
+
+                self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * priced_layers)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_pd_prices_producer_layers_only(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """PD sizing must follow the elided layout too."""
         num_layers = 6
         mr = _make_model_runner(
             self,
@@ -1044,7 +1142,10 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
-        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+        # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
+        # producing index-K; the other 3 get a 0-row buffer and cost nothing.
+        producer_layers = 3
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
 
 
 class TestFactory(CustomTestCase):
