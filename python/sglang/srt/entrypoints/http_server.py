@@ -2542,6 +2542,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    max_payload_size=10 * 1024 * 1024,
     tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
@@ -2566,7 +2567,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
-    from granian.http import HTTP2Settings
+    from granian.http import HTTP1Settings, HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2579,8 +2580,12 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=HTTP1Settings(
+            max_buffer_size=max_payload_size,
+        ),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
+            initial_stream_window_size=max_payload_size,
             max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
@@ -2723,6 +2728,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2741,6 +2747,7 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
+                    h11_max_incomplete_event_size=get_serving().max_payload_size,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2784,6 +2791,7 @@ def _setup_and_run_http_server(
                         or get_observability().log_level,
                         timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                         loop="uvloop",
+                        h11_max_incomplete_event_size=get_serving().max_payload_size,
                         ssl_keyfile=get_serving().ssl_keyfile,
                         ssl_certfile=get_serving().ssl_certfile,
                         ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2828,6 +2836,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     tokenizer_worker_num=get_serving().tokenizer_worker_num,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
@@ -2846,6 +2855,7 @@ def _setup_and_run_http_server(
                     timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
                     workers=get_serving().tokenizer_worker_num,
+                    h11_max_incomplete_event_size=get_serving().max_payload_size,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
