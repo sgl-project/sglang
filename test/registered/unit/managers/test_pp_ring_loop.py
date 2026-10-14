@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ModeStages,
@@ -56,6 +57,7 @@ class TestPPRingCommit(CustomTestCase):
             self, get_parallel().override(pp_size=2, pp_async_batch_depth=depth)
         )
         s = object.__new__(Scheduler)
+        s.lists = CoreLists()
         s.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         s.device = "cpu"
         s.pp_group = SimpleNamespace(is_last_rank=True)
@@ -150,13 +152,14 @@ class TestPPSlotTag(CustomTestCase):
         prefill chunk; another slot's step never decodes it while that slot's
         step may still be in flight."""
         s = object.__new__(Scheduler)
+        s.lists = CoreLists()
         s.disaggregation_mode = DisaggregationMode.NULL
         s.disagg_prefill = None
         s.disagg_decode = None
         s.dllm = None
         s.hisparse_coordinator = None
-        s.decoding = []
-        s.waiting_queue = []
+        s.lists.decoding = []
+        s.lists.waiting_queue = []
         s.pending = PendingSteps()
         s.enable_skip_finishing_decode = False
         s.init_mode_stages()
@@ -180,12 +183,13 @@ class TestPPSlotTag(CustomTestCase):
         counting only that slot's decoding requests."""
         enter_scope(self, published_topology(role="scheduler", pp_size=2))
         s = object.__new__(Scheduler)
-        s.decoding = []
+        s.lists = CoreLists()
+        s.lists.decoding = []
         for slot, num_reqs in ((0, 2), (1, 1)):
             for _ in range(num_reqs):
                 req = _Req()
                 req.ring_slot = slot
-                s.decoding.append(req)
+                s.lists.decoding.append(req)
         ready = [Mock() for _ in range(3)]
         owner = decode_owner_shell(
             ready=list(ready),
@@ -193,7 +197,7 @@ class TestPPSlotTag(CustomTestCase):
             req_to_token_pool=SimpleNamespace(size=16),
             max_running_requests=3,
             tree_cache=Mock(),
-            get_decoding=lambda: s.decoding,
+            core_lists=s.lists,
         )
 
         self.assertEqual(owner.pop_reqs_to_admit(ScheduleSlot(index=1)), ready[:2])
@@ -219,8 +223,9 @@ class TestPPSlotTag(CustomTestCase):
         owner = decode_owner_shell(
             enable_priority_scheduling=False,
             enable_hisparse=False,
-            get_decoding=lambda: decoding,
+            core_lists=CoreLists(),
         )
+        owner.core_lists.decoding = decoding
         owner.prealloc_queue.resume_retracted_reqs = lambda decoding, rids: record(
             decoding
         )[0]

@@ -39,6 +39,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -63,10 +64,9 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     # The step this iteration launched; None when it launched nothing.
     get_launched_step: Callable
-    get_decoding: Callable
+    # The decoding and the chunked request own their KV rows.
+    core_lists: CoreLists
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks; it owns its KV row.
-    get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -270,8 +270,8 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        reqs = list(self.get_decoding())
-        chunked_req = self.get_chunked_req()
+        reqs = list(self.core_lists.decoding)
+        chunked_req = self.core_lists.chunked_req
         if chunked_req is not None:
             reqs.append(chunked_req)
 

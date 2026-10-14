@@ -201,7 +201,9 @@ class ScriptedSchedulerHook:
             return
         # The chunked request once this step launches.
         chunked = (
-            batch.chunked_req if batch.prefill_reqs() else self.scheduler.chunked_req
+            batch.chunked_req
+            if batch.prefill_reqs()
+            else self.scheduler.lists.chunked_req
         )
         self._batch_log.append(
             ScriptedBatchRecord(

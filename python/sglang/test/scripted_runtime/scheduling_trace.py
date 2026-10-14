@@ -110,8 +110,8 @@ class SchedulingTraceWriter:
         # queue, and its chunked request into the chunked holder.
         prefilled = batch.prefill_reqs() if batch is not None else []
         admitted = set(prefilled)
-        waiting = [r for r in scheduler.waiting_queue if r not in admitted]
-        chunked = batch.chunked_req if prefilled else scheduler.chunked_req
+        waiting = [r for r in scheduler.lists.waiting_queue if r not in admitted]
+        chunked = batch.chunked_req if prefilled else scheduler.lists.chunked_req
         record: Dict[str, Any] = {
             "kind": "schedule",
             "step": self._step,
@@ -123,14 +123,14 @@ class SchedulingTraceWriter:
             record["prefix_lens"] = list(batch.prefix_lens)
         record.update(
             chunked=self._label(chunked.rid) if chunked is not None else None,
-            running=self._labels(scheduler.decoding),
+            running=self._labels(scheduler.lists.decoding),
             waiting=self._labels(waiting),
             batch_is_full=slot.batch_is_full,
             retracted=self._labels(
                 self._newly_retracted(
                     [
                         *batch_reqs,
-                        *scheduler.decoding,
+                        *scheduler.lists.decoding,
                         *waiting,
                         *([chunked] if chunked is not None else []),
                     ]

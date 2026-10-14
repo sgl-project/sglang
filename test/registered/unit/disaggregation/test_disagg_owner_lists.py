@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
@@ -274,7 +275,7 @@ class TestDisaggDecodeLists(CustomTestCase):
             polling_interval=1,
             req_to_token_pool=SimpleNamespace(size=8),
             max_running_requests=8,
-            get_decoding=lambda: [],
+            core_lists=CoreLists(),
             tree_cache=Mock(),
             release_aborted_request=Mock(),
             send_abort_output=Mock(),
@@ -317,7 +318,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         owner = self.owner
         owner.ready = [_decode_req("a"), _decode_req("b")]
         owner.max_running_requests = 2
-        owner.get_decoding = lambda: [object()]
+        owner.core_lists.decoding = [object()]
 
         admitted = owner.pop_reqs_to_admit(ScheduleSlot())
         self.assertEqual([r.rid for r in admitted], ["a"])

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -301,10 +302,11 @@ def _scheduler_stub(
     version, decoding, waiting, chunked=None, hisparse=None, mode=None
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.lists = CoreLists()
     scheduler.serving = _ServingStub(version)
-    scheduler.decoding = decoding
-    scheduler.waiting_queue = waiting
-    scheduler.chunked_req = chunked
+    scheduler.lists.decoding = decoding
+    scheduler.lists.waiting_queue = waiting
+    scheduler.lists.chunked_req = chunked
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=None)
     scheduler.dllm = None
     scheduler.hisparse_coordinator = hisparse

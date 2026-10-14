@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
+from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
@@ -50,6 +51,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.lists = CoreLists()
         scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
@@ -58,7 +60,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.enable_hicache_storage = False
         scheduler.enable_unified_cache_external_linker = False
         scheduler.processed_tokens_counter = 0
-        scheduler.waiting_queue = []
+        scheduler.lists.waiting_queue = []
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
@@ -159,7 +161,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     req.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 scheduler._prefetch_kvcache.assert_not_called()
-                self.assertEqual(scheduler.waiting_queue, [])
+                self.assertEqual(scheduler.lists.waiting_queue, [])
                 if scheduler.disagg_prefill is not None:
                     scheduler.disagg_prefill.bootstrap_queue.add.assert_not_called()
                 if scheduler.disagg_decode is not None:
@@ -176,7 +178,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.waiting_queue = [queued]
+                scheduler.lists.waiting_queue = [queued]
                 incoming = self._new_req(priority=priority)
 
                 with patch(
@@ -190,10 +192,10 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     rejected.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 if priority == 0:
-                    self.assertEqual(scheduler.waiting_queue, [queued])
+                    self.assertEqual(scheduler.lists.waiting_queue, [queued])
                     scheduler._prefetch_kvcache.assert_not_called()
                 else:
-                    self.assertEqual(scheduler.waiting_queue, [incoming])
+                    self.assertEqual(scheduler.lists.waiting_queue, [incoming])
                     scheduler._prefetch_kvcache.assert_called_once_with(incoming)
 
     def test_full_queue_skips_the_requests_a_step_admits(self):
@@ -211,7 +213,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 admitted.rid = "admitted"
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.waiting_queue = [admitted, queued]
+                scheduler.lists.waiting_queue = [admitted, queued]
                 preempted = self._new_req(priority=2)
                 preempted.rid = "preempted"
 
@@ -225,12 +227,14 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 if expected_abort is None:
                     send_output.assert_not_called()
                     self.assertEqual(
-                        scheduler.waiting_queue, [admitted, queued, preempted]
+                        scheduler.lists.waiting_queue, [admitted, queued, preempted]
                     )
                 else:
                     send_output.assert_called_once()
                     self.assertIs(send_output.call_args.args[1], queued)
-                    self.assertEqual(scheduler.waiting_queue, [admitted, preempted])
+                    self.assertEqual(
+                        scheduler.lists.waiting_queue, [admitted, preempted]
+                    )
 
 
 class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
@@ -438,9 +442,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.chunked_req = None
+        scheduler.lists = CoreLists()
+        scheduler.lists.chunked_req = None
         scheduler.mm_receiver = None
-        scheduler.waiting_queue = [MagicMock(rid="req")]
+        scheduler.lists.waiting_queue = [MagicMock(rid="req")]
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
@@ -451,7 +456,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             release_aborted_waiting_req=MagicMock()
         )
         scheduler.disagg_decode = None
-        scheduler.decoding = []
+        scheduler.lists.decoding = []
         scheduler.hisparse_coordinator = None
         scheduler.tree_cache = MagicMock()
 
@@ -544,7 +549,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.enable_priority_scheduling = True
         queue.schedule_low_priority_values_first = low_priority_values_first
-        queue.get_decoding = lambda: []
+        queue.core_lists = CoreLists()
+        queue.core_lists.decoding = []
         queue.get_ready = lambda: []
         queue.get_pending_lora_ids = MagicMock(return_value=set())
         queue.enable_hisparse = False
@@ -571,7 +577,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue = self._new_queue(reqs)
         queue.transfer_queue.queue = [transferring]
-        queue.get_decoding = lambda: [running.req]
+        queue.core_lists = CoreLists()
+        queue.core_lists.decoding = [running.req]
         # A step in flight still runs a request its predecessor's commit finished.
         queue.get_pending_lora_ids.return_value = {finished.req.lora_id}
         queue.get_ready = lambda: [waiting.req]
@@ -901,10 +908,11 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.lists = CoreLists()
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
-        scheduler.waiting_queue = []
-        scheduler.decoding = []
+        scheduler.lists.waiting_queue = []
+        scheduler.lists.decoding = []
         scheduler.disagg_decode = decode_owner_shell(
             kv_checksum_computer=None,
             enable_priority_scheduling=False,
@@ -922,7 +930,7 @@ class TestDecodeAdmission(unittest.TestCase):
             ngram_embedding_manager=MagicMock(),
             output_streamer=MagicMock(),
             device="cpu",
-            get_decoding=lambda: scheduler.decoding,
+            core_lists=scheduler.lists,
         )
         return scheduler
 
@@ -946,7 +954,7 @@ class TestDecodeAdmission(unittest.TestCase):
             admitted = owner.pop_reqs_to_admit(ScheduleSlot())
 
         owner.policy.calc_priority.assert_called_once_with(
-            original_ready, scheduler.decoding
+            original_ready, scheduler.lists.decoding
         )
         self.assertEqual([req.rid for req in admitted], ["high"])
         self.assertEqual([req.rid for req in owner.ready], ["low"])
@@ -957,7 +965,7 @@ class TestDecodeAdmission(unittest.TestCase):
         owner.req_to_token_pool = MagicMock(size=4)
         owner.max_running_requests = 4
         running = MagicMock(rid="running")
-        scheduler.decoding = [running]
+        scheduler.lists.decoding = [running]
         kept, finished = MagicMock(rid="kept"), MagicMock(rid="finished")
         owner.ready = [kept, finished]
         # The handoff token finished one of them at admission.
@@ -985,7 +993,7 @@ class TestDecodeAdmission(unittest.TestCase):
 
         self.assertIsNone(step)
         owner.commit_prefill_handoff.assert_called_once_with([kept, finished])
-        self.assertEqual(scheduler.decoding, [running, kept])
+        self.assertEqual(scheduler.lists.decoding, [running, kept])
         self.assertEqual(owner.ready, [])
 
     def test_overlap_waits_for_forward_before_seeding_admitted_reqs(self):

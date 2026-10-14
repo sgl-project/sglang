@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
@@ -32,12 +33,13 @@ class _Req(SimpleNamespace):
 class TestEmptyBatchFullLatch(CustomTestCase):
     def _scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.lists = CoreLists()
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = [SimpleNamespace(rid="req-0")]
-        s.decoding = []
-        s.chunked_req = None
+        s.lists.waiting_queue = [SimpleNamespace(rid="req-0")]
+        s.lists.decoding = []
+        s.lists.chunked_req = None
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
         s.processed_tokens_counter = 0
@@ -68,7 +70,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
 
         finishing, running = req("a", 2), req("b", 8)
         s = self._scheduler()
-        s.decoding = [finishing, running]
+        s.lists.decoding = [finishing, running]
         s.enable_skip_finishing_decode = True
         # One decode step of both is in flight.
         s.pending = PendingSteps()

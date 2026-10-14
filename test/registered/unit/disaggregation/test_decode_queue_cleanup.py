@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
 )
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import (
@@ -573,10 +574,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def _decode_scheduler(self, *, retracted=(), held=(), releasing=()):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.decoding = []
+        scheduler.lists = CoreLists()
+        scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.lists.chunked_req = None
+        scheduler.lists.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=MagicMock()
         )
@@ -656,12 +658,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager, (done, live, plain) = self._offloading(
             scheduler, ("done", True, [1, 2]), ("live", False, [3]), ("plain", True, [])
         )
-        scheduler.decoding = [done, live, plain]
+        scheduler.lists.decoding = [done, live, plain]
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
         scheduler.leave_finished_reqs(ScheduleSlot())
-        self.assertEqual(scheduler.decoding, [live])
+        self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)
         self.assertFalse(scheduler.is_fully_idle())

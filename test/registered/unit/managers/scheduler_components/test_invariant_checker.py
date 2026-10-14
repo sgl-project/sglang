@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -58,7 +59,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             req_to_token_pool=MagicMock(),
             pool_stats_observer=MagicMock(),
             get_launched_step=lambda: None,
-            get_decoding=lambda: [],
+            core_lists=CoreLists(),
             scheduler_stage_metrics=None,
         )
 
@@ -170,8 +171,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 )
             )
         self.launched_step = SimpleNamespace(reqs=[])
-        self.decoding = []
-        self.chunked_req = None
+        self.core_lists = CoreLists()
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
             token_to_kv_pool_allocator=self.allocator,
@@ -197,8 +197,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
             get_launched_step=lambda: self.launched_step,
-            get_decoding=lambda: self.decoding,
-            get_chunked_req=lambda: self.chunked_req,
+            core_lists=self.core_lists,
             scheduler_stage_metrics=None,
         )
 
@@ -247,7 +246,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             beam_group=None,
         )
         self.launched_step = SimpleNamespace(reqs=[req])
-        self.decoding = [req]
+        self.core_lists.decoding = [req]
         return req
 
     def test_balanced_and_skewed_cache_ownership_conserve_full_pool(self):
@@ -300,9 +299,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         # between prefill chunks instead of decoding.
         for parked in (False, True):
             with self.subTest(parked=parked):
-                self.chunked_req = req
+                self.core_lists.chunked_req = req
                 if parked:
-                    self.decoding = []
+                    self.core_lists.decoding = []
                 uncached, swa_uncached = checker._get_total_uncached_sizes()
                 self.assertEqual((uncached, swa_uncached), (self.PAGE_SIZE, 0))
                 stats = checker.pool_stats_observer.get_pool_stats()
@@ -320,9 +319,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         self.cache.session.slots["s"] = SessionSlot(kv=req.kv)
         for parked in (False, True):
             with self.subTest(parked=parked):
-                self.chunked_req = req
+                self.core_lists.chunked_req = req
                 if parked:
-                    self.decoding = []
+                    self.core_lists.decoding = []
                 self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
                 self.assertEqual(
                     checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE

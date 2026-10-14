@@ -22,6 +22,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -63,14 +64,15 @@ def _req(
 
 def _scheduler(waiting_queue, decoding=(), chunked_req=None):
     s = Scheduler.__new__(Scheduler)
-    s.waiting_queue = waiting_queue
+    s.lists = CoreLists()
+    s.lists.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
-    s.decoding = list(decoding)
-    s.chunked_req = chunked_req
+    s.lists.decoding = list(decoding)
+    s.lists.chunked_req = chunked_req
     s.disaggregation_mode = DisaggregationMode.NULL
     s.disagg_prefill = None
     s.disagg_decode = None
@@ -107,7 +109,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
-        self.assertEqual(s.waiting_queue, [])
+        self.assertEqual(s.lists.waiting_queue, [])
 
 
 class TestWaitingTimeout(CustomTestCase):
@@ -123,7 +125,7 @@ class TestWaitingTimeout(CustomTestCase):
         self.assertEqual([a.rid for a in aborts], ["stale"])
         self.assertEqual(aborts[0].finished_reason["type"], "abort")
         # The poll emits only; removal happens on every rank via the broadcast.
-        self.assertEqual([r.rid for r in s.waiting_queue], ["stale", "fresh"])
+        self.assertEqual([r.rid for r in s.lists.waiting_queue], ["stale", "fresh"])
 
     def test_unset_entry_time_is_never_emitted(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.

@@ -24,7 +24,7 @@ def assert_one_list_per_request(scheduler: Scheduler) -> None:
                 f"request {req.rid} is in both {owners[id(req)]} and {name}"
             )
             owners[id(req)] = name
-    for req in scheduler.decoding:
+    for req in scheduler.lists.decoding:
         assert not req.finished(), f"finished request {req.rid} is still decoding"
     for req in request_lists(scheduler).get("releasing", []):
         assert req.finished(), f"releasing request {req.rid} is not finished"

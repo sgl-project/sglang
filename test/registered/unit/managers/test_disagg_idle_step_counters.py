@@ -9,6 +9,7 @@ from parameterized import parameterized
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
@@ -373,6 +374,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.lists = CoreLists()
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler.flat_slot = ScheduleSlot()
@@ -398,11 +400,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6
-        scheduler.decoding = []
+        scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
         scheduler.recv_skipper = None
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.lists.chunked_req = None
+        scheduler.lists.waiting_queue = []
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )

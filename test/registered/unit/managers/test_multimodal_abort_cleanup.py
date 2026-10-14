@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -91,8 +92,9 @@ def _rank(rank):
 
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
-    scheduler.waiting_queue = [req]
-    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm = None
+    scheduler.lists = CoreLists()
+    scheduler.lists.waiting_queue = [req]
+    scheduler.lists.chunked_req = scheduler.mm_receiver = scheduler.dllm = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.disagg_prefill = None
     scheduler.disagg_decode = None
@@ -100,7 +102,7 @@ def _queued_scheduler(req):
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
     scheduler.grammar_manager = MagicMock()
-    scheduler.decoding = []
+    scheduler.lists.decoding = []
     scheduler.hisparse_coordinator = None
     return scheduler
 
@@ -114,7 +116,7 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
             scheduler = _queued_scheduler(req)
             with _rank(rank):
                 scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.waiting_queue == []
+            assert scheduler.lists.waiting_queue == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 

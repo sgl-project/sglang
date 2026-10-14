@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 
@@ -32,9 +33,10 @@ class TestHiSparseStagingList(unittest.TestCase):
         prefill commit finished leaves staging at that commit."""
         live, done = _Req("live", 0), _Req("done", 1)
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.waiting_queue = [live, done]
-        scheduler.decoding = []
-        scheduler.chunked_req = None
+        scheduler.lists = CoreLists()
+        scheduler.lists.waiting_queue = [live, done]
+        scheduler.lists.decoding = []
+        scheduler.lists.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.disagg_prefill = None
         scheduler.disagg_decode = None
@@ -54,8 +56,8 @@ class TestHiSparseStagingList(unittest.TestCase):
         )
 
         Scheduler.join_launched_step(scheduler, step, ScheduleSlot())
-        self.assertEqual(scheduler.waiting_queue, [])
-        self.assertEqual(scheduler.decoding, [])
+        self.assertEqual(scheduler.lists.waiting_queue, [])
+        self.assertEqual(scheduler.lists.decoding, [])
         self.assertEqual(scheduler.hisparse_coordinator.staging, [live, done])
 
         done.finished_reason = object()

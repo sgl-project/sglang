@@ -147,7 +147,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert req is not None and req in t.scheduler.waiting_queue, (
+        assert req is not None and req in t.scheduler.lists.waiting_queue, (
             f"pause(retract) did not park the req in waiting_queue; found {req!r}"
         )
 
@@ -181,7 +181,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert req is not None and req not in t.scheduler.waiting_queue, (
+        assert req is not None and req not in t.scheduler.lists.waiting_queue, (
             f"pause(in_place) should not retract the req to waiting_queue; found {req!r}"
         )
 

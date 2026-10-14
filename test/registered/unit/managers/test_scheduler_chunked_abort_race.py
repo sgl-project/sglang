@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
@@ -41,9 +42,10 @@ class _FakeReq:
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
-    sched.chunked_req = chunked_req
-    sched._pending_chunked_abort_req = pending_req
-    sched.waiting_queue = []
+    sched.lists = CoreLists()
+    sched.lists.chunked_req = chunked_req
+    sched.lists._pending_chunked_abort_req = pending_req
+    sched.lists.waiting_queue = []
     sched.dllm = None
     sched.grammar_manager = Mock()
     sched.disaggregation_mode = None
@@ -51,7 +53,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disagg_decode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
-    sched.decoding = list(running_reqs)
+    sched.lists.decoding = list(running_reqs)
     sched.hisparse_coordinator = None
     return sched
 
@@ -67,7 +69,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.process_pending_chunked_abort()
 
         self.assertIsNotNone(req.to_finish, "recorded abort was never applied")
-        self.assertIsNone(sched._pending_chunked_abort_req)
+        self.assertIsNone(sched.lists._pending_chunked_abort_req)
 
     def test_finished_req_only_clears_marker(self):
         req = _FakeReq("done_rid")
@@ -77,7 +79,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.process_pending_chunked_abort()
 
         self.assertIsNone(req.to_finish)
-        self.assertIsNone(sched._pending_chunked_abort_req)
+        self.assertIsNone(sched.lists._pending_chunked_abort_req)
 
     def test_discarded_chunk_keeps_its_abort_reason(self):
         req = _FakeReq("failed_load")

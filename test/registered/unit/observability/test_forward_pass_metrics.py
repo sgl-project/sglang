@@ -12,7 +12,7 @@ from unittest.mock import patch
 import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.request_lists import RequestList
+from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
@@ -134,8 +134,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
 
 class TestForwardPassMetrics(unittest.TestCase):
     def setUp(self):
-        self.scheduler = types.SimpleNamespace()
-        self.scheduler.waiting_queue = []
+        self.scheduler = types.SimpleNamespace(lists=CoreLists())
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
         self.reporter._fpm_worker_id = "worker-7"
@@ -168,7 +167,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.reporter._fpm_dp_rank = 3
-        self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
+        self.scheduler.lists.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
 
         prefill_a = _FakeReq(10)
         prefill_b = _FakeReq(14)
@@ -256,7 +255,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler.request_lists = lambda: {
             "bootstrap": RequestList(name="bootstrap", reqs=[_FakeReq(100)])
         }
-        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
+        self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
@@ -382,8 +381,7 @@ def _dp_balance_stats(
 class TestDPBalanceMetrics(CustomTestCase):
     def _reporter_with_collector(self, attn_dp_rank: int):
         scheduler = types.SimpleNamespace(
-            decoding=[],
-            waiting_queue=[],
+            lists=CoreLists(),
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -505,8 +503,7 @@ class TestDPBalanceMetrics(CustomTestCase):
 class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
-            decoding=[],
-            waiting_queue=[],
+            lists=CoreLists(),
             queued_reqs=lambda: [],
             grammar_manager=[],
             enable_priority_scheduling=False,
@@ -788,8 +785,7 @@ class TestEstimatedPrefillPerf(CustomTestCase):
     """Causal pair count behind ``est. prefill TFLOPS/s`` and ``estimated_flops``."""
 
     def setUp(self):
-        self.scheduler = types.SimpleNamespace()
-        self.scheduler.waiting_queue = []
+        self.scheduler = types.SimpleNamespace(lists=CoreLists())
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
         # One unit per query-key pair and nothing else, so the returned FLOPs

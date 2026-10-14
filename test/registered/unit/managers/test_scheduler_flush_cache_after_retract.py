@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 
@@ -34,16 +35,17 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.lists = CoreLists()
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.cur_batch = None
-        scheduler.chunked_req = None
+        scheduler.lists.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.disagg_prefill = None
         scheduler.disagg_decode = None
-        scheduler.decoding = []
+        scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
-        scheduler.waiting_queue = []
+        scheduler.lists.waiting_queue = []
         scheduler.dllm = None
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
@@ -61,7 +63,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [_make_req(is_retracted=True)]
+        scheduler.lists.waiting_queue = [_make_req(is_retracted=True)]
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
@@ -72,14 +74,14 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         """A request that was queued but never scheduled holds no KV/pool state
         either; a paused-engine flush must not starve on it."""
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [_make_req(is_retracted=False)]
+        scheduler.lists.waiting_queue = [_make_req(is_retracted=False)]
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
 
     def test_flush_cache_succeeds_on_mixed_queue_while_paused(self):
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [
+        scheduler.lists.waiting_queue = [
             _make_req(is_retracted=True),
             _make_req(is_retracted=False),
         ]
@@ -91,7 +93,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         """A PD-decode request whose KV has arrived waits holding its request
         row; a paused flush would free KV it still owns."""
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [
+        scheduler.lists.waiting_queue = [
             _make_req(is_retracted=False),
             _make_req(is_retracted=False, holds_kv=True),
         ]
@@ -103,7 +105,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         """Regression guard: every other is_fully_idle() caller passes no args,
         so a non-empty waiting_queue must still report not-idle by default."""
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [_make_req(is_retracted=True)]
+        scheduler.lists.waiting_queue = [_make_req(is_retracted=True)]
 
         self.assertFalse(scheduler.is_fully_idle())
         self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
@@ -113,7 +115,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         flush issued without pausing first must not be silently permissive."""
         scheduler = self._new_scheduler()
         scheduler._engine_paused = False
-        scheduler.waiting_queue = [_make_req(is_retracted=True)]
+        scheduler.lists.waiting_queue = [_make_req(is_retracted=True)]
 
         self.assertFalse(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_not_called()

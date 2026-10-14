@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
@@ -25,8 +26,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _new_scheduler() -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.lists = CoreLists()
     s.device = "cpu"
-    s.decoding = []
+    s.lists.decoding = []
     s.decode_rows = None
     s.pending = PendingSteps()
     s.flat_slot = ScheduleSlot()
@@ -66,7 +68,7 @@ class TestDecodeRowsReuse(CustomTestCase):
 
     def test_reuse_while_requests_keep_their_slots(self):
         s = _new_scheduler()
-        s.decoding = [_make_req("a", 1), _make_req("b", 2)]
+        s.lists.decoding = [_make_req("a", 1), _make_req("b", 2)]
 
         first = s.get_decode_step(s.flat_slot)
         second = s.get_decode_step(s.flat_slot)
@@ -77,15 +79,15 @@ class TestDecodeRowsReuse(CustomTestCase):
     def test_readmitted_request_decodes_with_its_new_slot(self):
         s = _new_scheduler()
         req = _make_req("a", 1)
-        s.decoding = [req]
+        s.lists.decoding = [req]
         first = s.get_decode_step(s.flat_slot)
 
         # Everything leaves decoding without a decode step (a retracting
         # pause, say), then the same request object is re-admitted elsewhere.
-        s.decoding = []
+        s.lists.decoding = []
         self.assertIsNone(s.get_decode_step(s.flat_slot))
         req.kv.req_pool_idx = 4
-        s.decoding = [req]
+        s.lists.decoding = [req]
         step = s.get_decode_step(s.flat_slot)
 
         self.assertEqual(step.slots, [4])
@@ -98,17 +100,17 @@ class TestDecodeRowsReuse(CustomTestCase):
         req_b = _make_req("b", 2, frequency_penalty=0.5)
         store.alloc(req_a)
         store.alloc(req_b)
-        s.decoding = [req_a]
+        s.lists.decoding = [req_a]
         first = s.get_decode_step(s.flat_slot)
 
         # Both are retracted, and req_a comes back to slot 1 but takes the row
         # req_b freed last.
-        s.decoding = []
+        s.lists.decoding = []
         store.free(1)
         store.free(2)
         store.alloc(req_a)
         self.assertNotEqual(store.row_of_slot[1], 0)
-        s.decoding = [req_a]
+        s.lists.decoding = [req_a]
         step = s.get_decode_step(s.flat_slot)
 
         self.assertEqual(step.slots, [1])

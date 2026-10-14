@@ -291,7 +291,7 @@ _DECLARED = {
 
 # The constructor parameter (or dataclass field) names that take a node.
 _PARAM = {
-    "CoreLists": ("lists",),
+    "CoreLists": ("core_lists",),
     "LaunchCounters": ("counters",),
     "EngineFlags": ("flags",),
     "PendingSteps": ("pending",),
@@ -323,6 +323,7 @@ _PARAM = {
 
 # Components in their final form: node -> (module under srt/, class).
 _BUILT = {
+    "CoreLists": ("managers/request_lists.py", "CoreLists"),
     "PendingSteps": ("managers/scheduler_components/pending_steps.py", "PendingSteps"),
     "IpcChannels": (
         "managers/scheduler_components/ipc_channels.py",
@@ -450,7 +451,6 @@ _CALLBACK_SITES = {
         _BOUND,
     ): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "is_engine_paused", _LAMBDA): 1,
-    ("maybe_init_disagg_decode", "DisaggDecode", "get_decoding", _LAMBDA): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
     (
         "maybe_init_disagg_decode",
@@ -500,13 +500,6 @@ _CALLBACK_SITES = {
         "init_invariant_checker",
         "SchedulerInvariantChecker",
         "get_launched_step",
-        _LAMBDA,
-    ): 1,
-    ("init_invariant_checker", "SchedulerInvariantChecker", "get_decoding", _LAMBDA): 1,
-    (
-        "init_invariant_checker",
-        "SchedulerInvariantChecker",
-        "get_chunked_req",
         _LAMBDA,
     ): 1,
     ("init_kv_events_publisher", "SchedulerKvEventsPublisher", "get_stats", _LAMBDA): 1,

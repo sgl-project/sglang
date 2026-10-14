@@ -98,7 +98,11 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
 
         t.abort_all()
         for _ in range(_DRAIN_STEPS):
-            if s.chunked_req is None and len(s.waiting_queue) == 0 and not s.decoding:
+            if (
+                s.lists.chunked_req is None
+                and len(s.lists.waiting_queue) == 0
+                and not s.lists.decoding
+            ):
                 break
             yield
         for _ in range(20):
@@ -171,7 +175,9 @@ class TestScriptedSwaMixedChunkDecodeFit(ScriptedTestCase):
                 and batch.forward_mode is not None
                 and batch.forward_mode.is_extend()
                 and not batch.forward_mode.is_mixed()
-                and any(r.rid in decoder_rids and not r.finished() for r in s.decoding)
+                and any(
+                    r.rid in decoder_rids and not r.finished() for r in s.lists.decoding
+                )
             ):
                 decode_held_back = True
             if all(h.finished for h in handles):

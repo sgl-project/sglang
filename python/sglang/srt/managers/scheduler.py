@@ -213,7 +213,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.request_lists import RequestList
+from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     DecodeRows,
@@ -1293,10 +1293,7 @@ class Scheduler:
         self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
-        self.waiting_queue: List[Req] = []
-        # The requests settled into decode (continuous batching): each from
-        # the launch of its last prefill chunk to the commit that finishes it.
-        self.decoding: List[Req] = []
+        self.lists = CoreLists()
         # The flat driver's schedule slot: every decoding request, and the
         # admission flag (the PP ring keeps one per microbatch slot).
         self.flat_slot = ScheduleSlot()
@@ -1341,8 +1338,6 @@ class Scheduler:
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1603,7 +1598,7 @@ class Scheduler:
             retire_beam_group=self.beam_coordinator.retire_group,
             release_finished_req=self.batch_result_processor.release_finished_req,
             is_engine_paused=lambda: self._engine_paused,
-            get_decoding=lambda: self.decoding,
+            core_lists=self.lists,
             get_pending_lora_ids=self.pending.lora_ids,
             policy=self.policy,
             max_running_requests=self.max_running_requests,
@@ -2123,7 +2118,7 @@ class Scheduler:
                 continue
             joined = intake() if intake is not None else None
             if joined:
-                self.waiting_queue.extend(joined)
+                self.lists.waiting_queue.extend(joined)
 
             # Schedule the step
             scheduled = False
@@ -2190,7 +2185,7 @@ class Scheduler:
                 self.on_idle()
             if after_commit is not None:
                 # Poll the KV transfers of the requests the commits handed over.
-                self.waiting_queue = after_commit(self.waiting_queue)
+                self.lists.waiting_queue = after_commit(self.lists.waiting_queue)
 
             # Run sample of the launched step. It depends on the result of the
             # pending one (e.g., grammar), so it runs after that commit.
@@ -2258,22 +2253,15 @@ class Scheduler:
         if not prefill_reqs:
             return
         admitted = set(prefill_reqs)
-        self.waiting_queue = [r for r in self.waiting_queue if r not in admitted]
-        self.chunked_req = step.chunked_req
+        self.lists.waiting_queue = [
+            r for r in self.lists.waiting_queue if r not in admitted
+        ]
+        self.lists.chunked_req = step.chunked_req
         launched = [r for r in prefill_reqs if r is not step.chunked_req]
         if stages.on_prefilled is not None:
             stages.on_prefilled(launched)
         else:
-            self.join_decoding(launched, slot)
-
-    def join_decoding(self, reqs: List[Req], slot: ScheduleSlot) -> None:
-        """Append requests to decoding: those whose last prefill chunk a launch
-        runs, and those whose previous step was committed elsewhere (PD decode
-        admission, HiSparse ready), which join at schedule. Each takes the PP
-        slot that launches it."""
-        for req in reqs:
-            req.ring_slot = slot.index
-        self.decoding.extend(reqs)
+            self.lists.join_decoding(launched, slot)
 
     def commit_pending_steps(self, keep: int = 0) -> int:
         """Commit the oldest pending steps until keep remain; return how many."""
@@ -2292,11 +2280,11 @@ class Scheduler:
         """Drop the requests a commit finished from decoding (PD decode holds
         those still releasing KV), and from the mode's own lists (HiSparse
         staging); the committed slot's admission reopens if decoding shrank."""
-        num_decoding = len(self.decoding)
+        num_decoding = len(self.lists.decoding)
         if (hold_finished := self.stages.hold_finished) is not None:
-            hold_finished([r for r in self.decoding if r.finished()])
-        self.decoding = [r for r in self.decoding if not r.finished()]
-        if len(self.decoding) < num_decoding:
+            hold_finished([r for r in self.lists.decoding if r.finished()])
+        self.lists.decoding = [r for r in self.lists.decoding if not r.finished()]
+        if len(self.lists.decoding) < num_decoding:
             slot.batch_is_full = False
         if (leave_finished := self.stages.leave_finished) is not None:
             leave_finished()
@@ -2670,8 +2658,7 @@ class Scheduler:
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             get_launched_step=lambda: self.cur_batch_for_debug,
-            get_decoding=lambda: self.decoding,
-            get_chunked_req=lambda: self.chunked_req,
+            core_lists=self.lists,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -3508,7 +3495,7 @@ class Scheduler:
             return
         memory = get_memory()
         for req, storage_hit_end in retries.pop_ready(
-            self.waiting_queue,
+            self.lists.waiting_queue,
             memory.hicache_storage_prefetch_retry_poll_interval,
             memory.hicache_storage_prefetch_retry_max_attempts,
         ):
@@ -3611,7 +3598,7 @@ class Scheduler:
                 self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
-            self.waiting_queue.append(req)
+            self.lists.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
 
@@ -3662,7 +3649,7 @@ class Scheduler:
         The requests in ``admitted`` belong to the step being built: they
         leave the queue at its launch, so they neither count nor are aborted.
         """
-        waiting = self.waiting_queue
+        waiting = self.lists.waiting_queue
         if admitted:
             waiting = [r for r in waiting if r not in admitted]
         if (
@@ -3690,7 +3677,7 @@ class Scheduler:
             )
             if abort_existing_req:
                 self._release_aborted_request(candidate_req)
-                self.waiting_queue.remove(candidate_req)
+                self.lists.waiting_queue.remove(candidate_req)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -3892,18 +3879,18 @@ class Scheduler:
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
-        req = self._pending_chunked_abort_req
+        req = self.lists._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if self.lists.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
-                self._pending_chunked_abort_req = None
+                self.lists._pending_chunked_abort_req = None
                 return
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
-            self._pending_chunked_abort_req = None
+            self.lists._pending_chunked_abort_req = None
             self.abort_request(AbortReq(rid=req.rid))
             return
 
@@ -3916,8 +3903,8 @@ class Scheduler:
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
+        self.lists.chunked_req = None
+        self.lists._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.ipc_channels.send_to_tokenizer.send_output(
@@ -3935,7 +3922,7 @@ class Scheduler:
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=self.device
         )
         self.future_map.stash(req_pool_indices, RelayPayload(bonus_tokens=last_tokens))
-        self.join_decoding(reqs, slot)
+        self.lists.join_decoding(reqs, slot)
 
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
@@ -3963,11 +3950,11 @@ class Scheduler:
         self._process_hicache_events()
         self._start_fpm_clock()
 
-        if self.chunked_req is not None:
+        if self.lists.chunked_req is not None:
             # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
             # extend_end at prefix_len: it computed no new KV, so nothing to stash.
-            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
-                self.stash_chunked_request(self.chunked_req)
+            if self.lists.chunked_req.extend_end > self.lists.chunked_req.prefix_len:
+                self.stash_chunked_request(self.lists.chunked_req)
 
         stages = self.stages
         if stages.collect_ready is not None:
@@ -4004,7 +3991,7 @@ class Scheduler:
 
     def _admit_dllm_step(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         """The dLLM owner takes the requests it runs; the rest stay waiting."""
-        step, self.waiting_queue = self.dllm.schedule(self.waiting_queue)
+        step, self.lists.waiting_queue = self.dllm.schedule(self.lists.waiting_queue)
         return step
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -4019,13 +4006,13 @@ class Scheduler:
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
         self._start_fpm_clock()
-        self.waiting_queue = self.disagg_prefill.resolve_waiting_bootstrap(
-            self.waiting_queue
+        self.lists.waiting_queue = self.disagg_prefill.resolve_waiting_bootstrap(
+            self.lists.waiting_queue
         )
         if process_chunk:
-            self.chunked_req, self.waiting_queue = (
+            self.lists.chunked_req, self.lists.waiting_queue = (
                 self.disagg_prefill.process_prefill_chunk(
-                    self.chunked_req, self.waiting_queue, self.pending
+                    self.lists.chunked_req, self.lists.waiting_queue, self.pending
                 )
             )
 
@@ -4033,14 +4020,14 @@ class Scheduler:
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def process_bootstrapped_queue(self):
-        self.waiting_queue.extend(self.disagg_prefill.intake())
+        self.lists.waiting_queue.extend(self.disagg_prefill.intake())
 
     def get_next_pp_disagg_prefill_batch_to_run(
         self, slot: ScheduleSlot
     ) -> Optional[ScheduleBatch]:
-        self.chunked_req, self.waiting_queue = (
+        self.lists.chunked_req, self.lists.waiting_queue = (
             self.disagg_prefill.process_prefill_chunk(
-                self.chunked_req, self.waiting_queue, self.pending
+                self.lists.chunked_req, self.lists.waiting_queue, self.pending
             )
         )
         self._process_hicache_events()
@@ -4048,8 +4035,8 @@ class Scheduler:
         return self.finalize_step(self.get_new_batch_prefill(slot), slot)
 
     def process_prefill_transfer_queue(self, release_rids: Optional[List[str]]) -> None:
-        self.waiting_queue = self.disagg_prefill.after_commit(
-            self.waiting_queue, release_rids
+        self.lists.waiting_queue = self.disagg_prefill.after_commit(
+            self.lists.waiting_queue, release_rids
         )
 
     def get_next_disagg_decode_batch_to_run(
@@ -4064,7 +4051,7 @@ class Scheduler:
         reqs = self.disagg_decode.pop_reqs_to_admit(slot)
         if reqs:
             self.disagg_decode.commit_prefill_handoff(reqs)
-            self.join_decoding([r for r in reqs if not r.finished()], slot)
+            self.lists.join_decoding([r for r in reqs if not r.finished()], slot)
 
         return self.finalize_step(self.get_decode_step(slot), slot)
 
@@ -4112,7 +4099,8 @@ class Scheduler:
         available = self.req_to_token_pool.available_size()
 
         available = max(
-            available - self.beam_coordinator.pending_member_rows(self.decoding), 0
+            available - self.beam_coordinator.pending_member_rows(self.lists.decoding),
+            0,
         )
         res = min(pp_budget, available)
         if beam_width is not None:
@@ -4164,22 +4152,22 @@ class Scheduler:
             slot.batch_is_full = False
         # Under PP only the scheduled slot's requests: a slot's batch size
         # is capped, and preemption must not pick a request in flight.
-        running_reqs = slot.filter_decoding(self.decoding)
+        running_reqs = slot.filter_decoding(self.lists.decoding)
         if not running_reqs:
             # With nothing decoding no decode step clears the flag, so
             # admission would stay shut.
             slot.batch_is_full = False
 
         if (
-            slot.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+            slot.batch_is_full or len(self.lists.waiting_queue) == 0
+        ) and self.lists.chunked_req is None:
             return None
 
         running_bs = len(running_reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
-            and self.chunked_req is None
+            and self.lists.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
@@ -4187,14 +4175,14 @@ class Scheduler:
         ):
             return None
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # Ignore the check if self.lists.chunked_req is not None.
+        # In the non-PP case, when self.lists.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and self.lists.chunked_req is None
             and not self.enable_priority_preemption
         ):
             slot.batch_is_full = True
@@ -4202,7 +4190,7 @@ class Scheduler:
 
         # Get priority queue
         self.policy.calc_priority(
-            self.waiting_queue,
+            self.lists.waiting_queue,
             running_reqs,
             processed_tokens=self.processed_tokens_counter,
         )
@@ -4215,8 +4203,8 @@ class Scheduler:
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
-            history_len = self.chunked_req.prefix_len
+        if self.lists.chunked_req is not None and self.dynamic_chunk_sizer is not None:
+            history_len = self.lists.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -4243,7 +4231,7 @@ class Scheduler:
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
-            waiting_queue_len=len(self.waiting_queue),
+            waiting_queue_len=len(self.lists.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
             req_to_token_pool=self.req_to_token_pool,
             hisparse_coordinator=self.hisparse_coordinator,
@@ -4251,12 +4239,12 @@ class Scheduler:
 
         # The chunked request after this step; the launch moves it into the
         # chunked holder (see join_launched_step).
-        chunked_req = self.chunked_req
+        chunked_req = self.lists.chunked_req
         if chunked_req is not None:
             chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 chunked_req,
-                self.waiting_queue,
+                self.lists.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
@@ -4265,23 +4253,23 @@ class Scheduler:
         if self.enable_lora:
             # The adapters of the decoding requests and of the steps in flight
             # (a request finished at the last commit may still run in one).
-            running_loras = {req.lora_id for req in self.decoding}
+            running_loras = {req.lora_id for req in self.lists.decoding}
             running_loras.update(self.pending.lora_ids())
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
-                    self.decoding,
+                    self.lists.waiting_queue,
+                    self.lists.decoding,
                 )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(self.lists.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in self.lists.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4384,8 +4372,8 @@ class Scheduler:
         # the request they made room for was not admitted.
         if adder.preempt_list:
             preempted = set(adder.preempt_list)
-            self.decoding = [r for r in self.decoding if r not in preempted]
-            running_reqs = slot.filter_decoding(self.decoding)
+            self.lists.decoding = [r for r in self.lists.decoding if r not in preempted]
+            running_reqs = slot.filter_decoding(self.lists.decoding)
             admitted = set(adder.can_run_list)
             for req in adder.preempt_list:
                 self._add_request_to_queue(req, admitted=admitted)
@@ -4415,7 +4403,7 @@ class Scheduler:
         # admit, and the chunked request's tokens past this chunk.
         admitted = set(can_run_list)
         num_pending_tokens = sum(
-            req.seqlen for req in self.waiting_queue if req not in admitted
+            req.seqlen for req in self.lists.waiting_queue if req not in admitted
         )
         if chunked_req is not None:
             num_pending_tokens += (
@@ -4491,7 +4479,7 @@ class Scheduler:
         leaves decoding at its commit."""
         candidates = [
             req
-            for req in slot.filter_decoding(self.decoding)
+            for req in slot.filter_decoding(self.lists.decoding)
             if not req.is_prefill_only
         ]
         num_pending = len(self.pending)
@@ -4608,7 +4596,7 @@ class Scheduler:
             spec_algorithm=self.spec_algorithm,
         )
         if kv_full_retract_flag and len(reqs) < sum(
-            not req.is_prefill_only for req in slot.filter_decoding(self.decoding)
+            not req.is_prefill_only for req in slot.filter_decoding(self.lists.decoding)
         ):
             # The pending result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
@@ -4689,8 +4677,8 @@ class Scheduler:
         # The kept requests decode in the retraction order from now on.
         kept = set(kept_reqs)
         left = set(retracted_reqs) | set(reqs_to_abort)
-        self.decoding = kept_reqs + [
-            r for r in self.decoding if r not in kept and r not in left
+        self.lists.decoding = kept_reqs + [
+            r for r in self.lists.decoding if r not in kept and r not in left
         ]
         if left:
             slot.batch_is_full = False
@@ -4785,7 +4773,7 @@ class Scheduler:
             if batch.chunked_req in failed:
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.
-                self._pending_chunked_abort_req = batch.chunked_req
+                self.lists._pending_chunked_abort_req = batch.chunked_req
 
         self._maybe_report_active_ranks()
 
@@ -5041,8 +5029,8 @@ class Scheduler:
             if self.dllm is not None:
                 self.dllm.commit_extend(batch, result)
             elif self.disagg_prefill is not None:
-                self.waiting_queue = self.disagg_prefill.commit_extend(
-                    batch, result, self.waiting_queue, self.chunked_req
+                self.lists.waiting_queue = self.disagg_prefill.commit_extend(
+                    batch, result, self.lists.waiting_queue, self.lists.chunked_req
                 )
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
@@ -5314,7 +5302,7 @@ class Scheduler:
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.queued_reqs())} "
-                    f"#running-req={len(self.decoding)}"
+                    f"#running-req={len(self.lists.decoding)}"
                 ),
             )
 
@@ -5370,7 +5358,7 @@ class Scheduler:
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.queued_reqs())} "
-                    f"#running-req={len(self.decoding)}"
+                    f"#running-req={len(self.lists.decoding)}"
                 ),
             )
 
@@ -5428,7 +5416,7 @@ class Scheduler:
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.queued_reqs())}, "
-                f"#running-req: {len(self.decoding)}"
+                f"#running-req: {len(self.lists.decoding)}"
             )
             success = False
         return success
@@ -5513,7 +5501,7 @@ class Scheduler:
         lists = [
             RequestList(
                 name="waiting",
-                reqs=self.waiting_queue,
+                reqs=self.lists.waiting_queue,
                 queued=True,
                 abort=self._abort_waiting_reqs,
                 health_check=True,
@@ -5528,7 +5516,7 @@ class Scheduler:
             ),
             RequestList(
                 name="decoding",
-                reqs=self.decoding,
+                reqs=self.lists.decoding,
                 inflight=True,
                 health_check=True,
                 retract_on_pause=True,
@@ -5537,7 +5525,9 @@ class Scheduler:
             # its KV sender still reads the KV a retraction would free.
             RequestList(
                 name="chunked",
-                reqs=[self.chunked_req] if self.chunked_req is not None else [],
+                reqs=[self.lists.chunked_req]
+                if self.lists.chunked_req is not None
+                else [],
                 inflight=True,
                 abort=self._defer_chunked_abort,
                 health_check=True,
@@ -5568,7 +5558,7 @@ class Scheduler:
     def _abort_waiting_reqs(self, recv_req: AbortReq) -> None:
         # Delete requests in the waiting queue
         to_del = []
-        for i, req in enumerate(self.waiting_queue):
+        for i, req in enumerate(self.lists.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
@@ -5577,7 +5567,7 @@ class Scheduler:
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.waiting_queue.pop(i)
+            req = self.lists.waiting_queue.pop(i)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5594,9 +5584,9 @@ class Scheduler:
 
     def _defer_chunked_abort(self, recv_req: AbortReq) -> None:
         """Mark the chunked request for `process_pending_chunked_abort`."""
-        if (chunked_req := self.chunked_req) is not None:
+        if (chunked_req := self.lists.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+                self.lists._pending_chunked_abort_req = chunked_req
 
     def _abort_inflight_reqs(self, reqs: List[Req], recv_req: AbortReq) -> None:
         # Abort the requests past admission
@@ -5670,7 +5660,7 @@ class Scheduler:
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
             )
-        self.decoding = []
+        self.lists.decoding = []
         if self.disagg_decode is not None:
             self.disagg_decode.hold_for_rebootstrap(retract_reqs)
         else:
@@ -5686,7 +5676,7 @@ class Scheduler:
         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if lists["chunked"].retract_on_pause:
-            self.chunked_req = None
+            self.lists.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

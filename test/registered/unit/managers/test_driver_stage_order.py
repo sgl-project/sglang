@@ -22,6 +22,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
     Scheduler,
@@ -183,13 +184,14 @@ class _Shell:
         self.ready_at = ready_at or {}
         self.results = {}
         s = self.s = Scheduler.__new__(Scheduler)
+        s.lists = CoreLists()
         s.gracefully_exit = False
         s._engine_paused = False
         s._deferred_input_requests = []
         s.scheduler_stage_metrics = None
-        s.waiting_queue = []
-        s.decoding = []
-        s.chunked_req = None
+        s.lists.waiting_queue = []
+        s.lists.decoding = []
+        s.lists.chunked_req = None
         s.pending = PendingSteps()
         s.flat_slot = ScheduleSlot()
         s.enable_skip_finishing_decode = False

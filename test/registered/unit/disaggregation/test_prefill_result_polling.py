@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
@@ -237,11 +238,9 @@ class _Scheduler:
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.pending = PendingSteps()
-        self.chunked_req = None
+        self.lists = CoreLists()
         self.decode_offload_manager = None
-        self.decoding = []
         self.flat_slot = ScheduleSlot()
-        self.waiting_queue = []
         self.recv_skipper = None
         self._sched_idled = False
         self.cur_batch_for_debug = None
@@ -600,7 +599,9 @@ class TestPrefillResultPolling(CustomTestCase):
             def get_new_batch_prefill(self, slot):
                 if self.iteration > 0 and not self.result_processes[1]:
                     self.admission_attempts.append(self.iteration)
-                    self.policy.calc_priority(self.waiting_queue, self.decoding)
+                    self.policy.calc_priority(
+                        self.lists.waiting_queue, self.lists.decoding
+                    )
                     return None
                 return super().get_new_batch_prefill(slot)
 
@@ -642,7 +643,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.disagg_prefill.kv_senders[req.rid] = SimpleNamespace(
                         poll=lambda: KVPoll.WaitingForInput
                     )
-                scheduler.waiting_queue = [head, paced]
+                scheduler.lists.waiting_queue = [head, paced]
                 retries.poll_miss(paced.rid)
 
                 with _single_rank_gloo_group():
@@ -699,7 +700,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 if self.readiness_source == "grammar":
                     if self.grammar_manager.has_waiting_grammars():
                         ready = self.grammar_manager.get_ready_grammar_requests()
-                        self.waiting_queue.extend(ready)
+                        self.lists.waiting_queue.extend(ready)
                         if ready:
                             self.ready_batches.append(self.batches[2])
                 elif (
@@ -834,7 +835,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 result = super().run_batch(batch)
                 if batch.forward_iter == 1:
                     self.ready_batches.append(second)
-                    self.waiting_queue.extend(second.reqs)
+                    self.lists.waiting_queue.extend(second.reqs)
                 return result
 
             def get_new_batch_prefill(self, slot):
@@ -1432,7 +1433,7 @@ class TestPrefillResultPolling(CustomTestCase):
                             and item.rid == "100"
                             for item in inputs
                         ):
-                            self.waiting_queue.extend(other.reqs)
+                            self.lists.waiting_queue.extend(other.reqs)
 
                 pause_at = 2 if yield_before_pause else (1 if depth == 1 else 3)
                 ready_at = {**{batch.forward_iter: 20 for batch in chunks}, 100: 7}
@@ -1483,10 +1484,10 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
                 )
-                self.assertEqual(scheduler.waiting_queue, [req])
+                self.assertEqual(scheduler.lists.waiting_queue, [req])
                 self.assertEqual(req.disagg.prefill_attempt_count, 1)
                 self.assertEqual(list(req.output_ids), [])
-                self.assertIsNone(scheduler.chunked_req)
+                self.assertIsNone(scheduler.lists.chunked_req)
                 self.assertEqual(
                     scheduler.result_processes,
                     {b.forward_iter: 1 for b in [*chunks, other]},

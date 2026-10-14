@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.test.disagg_owner_shells import prefill_owner_shell
@@ -24,6 +25,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
+        s.lists = CoreLists()
         s.scheduler_stage_metrics = None
         s.scripted_scheduler_hook = None
         s.enable_hierarchical_cache = True
@@ -33,7 +35,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
-        s.chunked_req = None
+        s.lists.chunked_req = None
         s.pending = []
         s.disagg_prefill = prefill_owner_shell(
             resolve_waiting_bootstrap=lambda waiting: waiting,
@@ -94,7 +96,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         slot = ScheduleSlot()
         for waiting_queue in ([], [SimpleNamespace(rid="pending_l3")]):
             with self.subTest(waiting=bool(waiting_queue)):
-                s.waiting_queue = waiting_queue
+                s.lists.waiting_queue = waiting_queue
                 self.calls.reset_mock()
                 for _ in range(2):
                     self.assertIsNone(s.get_next_disagg_prefill_batch_to_run(slot))
@@ -109,7 +111,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._abort_on_waiting_timeout = Mock()
         s._abort_on_running_timeout = Mock()
         s.disagg_prefill = None
-        s.chunked_req = None
+        s.lists.chunked_req = None
         s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer
@@ -140,7 +142,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.tp_worker = s.model_worker = s.future_map = None
         s.recv_skipper = None
         s.ingest_requests = Mock(return_value=[])
-        s.waiting_queue = []
+        s.lists.waiting_queue = []
         s.disagg_prefill.bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s.disagg_prefill.poll_transfer_rids = Mock(return_value=[])
         enter_scope(

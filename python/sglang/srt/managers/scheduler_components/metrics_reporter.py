@@ -461,7 +461,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.request_lists()["bootstrap"].reqs:
                 prefill_q.add(len(req.origin_input_ids))
-            for req in self.scheduler.waiting_queue:
+            for req in self.scheduler.lists.waiting_queue:
                 prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             lists = self.scheduler.request_lists()
@@ -470,7 +470,7 @@ class SchedulerMetricsReporter:
             for req in lists["transfer"].reqs:
                 decode_q.add(req.seqlen)
         else:
-            for req in self.scheduler.waiting_queue:
+            for req in self.scheduler.lists.waiting_queue:
                 if len(req.output_ids) > 0:
                     decode_q.add(req.seqlen)
                 else:
@@ -727,7 +727,7 @@ class SchedulerMetricsReporter:
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+            f"#queue-req: {len(self.scheduler.lists.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
@@ -828,7 +828,7 @@ class SchedulerMetricsReporter:
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
+                self.scheduler.lists.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -895,7 +895,7 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes += write_bytes
 
             if x := self.scheduler_status_logger:
-                x.maybe_dump(batch, self.scheduler.waiting_queue)
+                x.maybe_dump(batch, self.scheduler.lists.waiting_queue)
 
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:
@@ -1235,7 +1235,7 @@ class SchedulerMetricsReporter:
             # This gives a true measure of current load for autoscaling purposes
             active_lora_ids = {
                 req.lora_id
-                for req in self.scheduler.decoding
+                for req in self.scheduler.lists.decoding
                 if req.lora_id is not None
             }
 
@@ -1421,7 +1421,9 @@ class SchedulerMetricsReporter:
         # one (on PD prefill that is the last forward-batch snapshot, which
         # no later report zeroes). If it disagrees with the decoding requests
         # -- the true idle value -- publish now instead of waiting out the window.
-        gauge_stale = self.stats.num_running_reqs.total != len(self.scheduler.decoding)
+        gauge_stale = self.stats.num_running_reqs.total != len(
+            self.scheduler.lists.decoding
+        )
         if (
             not gauge_stale
             and not is_fwd_occupancy_stale
@@ -1441,7 +1443,7 @@ class SchedulerMetricsReporter:
 
         priority_enabled = self.scheduler.enable_priority_scheduling
         self.stats.num_running_reqs = QueueCount.from_reqs(
-            self.scheduler.decoding, priority_enabled
+            self.scheduler.lists.decoding, priority_enabled
         )
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(

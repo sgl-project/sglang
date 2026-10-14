@@ -40,9 +40,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
         # plan after resume already re-admits the retracted req into the batch.
         req = _Req(rid="a", retraction_count=0)
         scheduler = SimpleNamespace(
-            chunked_req=None,
-            waiting_queue=[req],
-            decoding=[],
+            lists=SimpleNamespace(chunked_req=None, waiting_queue=[req], decoding=[]),
             token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
             tree_cache=SimpleNamespace(evictable_size=lambda: 0),
             new_token_ratio_tracker=SimpleNamespace(current=0.5),

@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
@@ -294,14 +295,14 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
             disaggregation_mode=DisaggregationMode.NULL,
             disagg_prefill=None,
             disagg_decode=None,
-            waiting_queue=[],
+            lists=CoreLists(),
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.waiting_queue, [req])
+        self.assertEqual(sched.lists.waiting_queue, [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):

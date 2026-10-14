@@ -21,6 +21,7 @@ Usage:
 """
 
 from sglang.srt.disaggregation.req_state import DisaggReqState
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -641,7 +642,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         owner = decode_owner_shell(
             ready=[req],
-            get_decoding=lambda: [],
+            core_lists=CoreLists(),
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,

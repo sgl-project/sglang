@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import SchedulePolicy
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -446,7 +447,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
         retire_unadmitted_request: Callable[[Req], None],
-        get_decoding: Callable[[], List[Req]],
+        core_lists: CoreLists,
         get_ready: Callable[[], List[Req]],
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
         enable_overlap: bool,
@@ -482,7 +483,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.output_streamer = output_streamer
         self.pool_stats_observer = pool_stats_observer
         self.retire_unadmitted_request = retire_unadmitted_request
-        self.get_decoding = get_decoding
+        self.core_lists = core_lists
         self.get_ready = get_ready
         self.get_pending_lora_ids = get_pending_lora_ids
         self.enable_overlap = enable_overlap
@@ -1479,7 +1480,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.enable_lora:
             # The adapters of the decoding requests and of the steps in flight
             # (a request finished at the last commit may still run in one).
-            running_loras = {req.lora_id for req in self.get_decoding()}
+            running_loras = {req.lora_id for req in self.core_lists.decoding}
             running_loras.update(self.get_pending_lora_ids())
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.get_ready())
@@ -3160,7 +3161,7 @@ class DisaggDecode:
         retire_beam_group: Callable[[Req], None],
         release_finished_req: Callable[..., None],
         is_engine_paused: Callable[[], bool],
-        get_decoding: Callable[[], List[Req]],
+        core_lists: CoreLists,
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
         policy: SchedulePolicy,
         max_running_requests: int,
@@ -3187,7 +3188,7 @@ class DisaggDecode:
         self.metrics_reporter = metrics_reporter
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
-        self.get_decoding = get_decoding
+        self.core_lists = core_lists
         self.policy = policy
         self.max_running_requests = max_running_requests
         self.device = device
@@ -3280,7 +3281,7 @@ class DisaggDecode:
             output_streamer=output_streamer,
             pool_stats_observer=pool_stats_observer,
             retire_unadmitted_request=retire_unadmitted_request,
-            get_decoding=get_decoding,
+            core_lists=core_lists,
             get_ready=lambda: self.ready,
             get_pending_lora_ids=get_pending_lora_ids,
             enable_overlap=enable_overlap,
@@ -3500,7 +3501,9 @@ class DisaggDecode:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         # The flat driver's slot runs every decoding request.
-        resumed_reqs = self.prealloc_queue.resume_retracted_reqs(self.get_decoding())
+        resumed_reqs = self.prealloc_queue.resume_retracted_reqs(
+            self.core_lists.decoding
+        )
         self.ready.extend(resumed_reqs)
         if len(self.prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
@@ -3510,10 +3513,12 @@ class DisaggDecode:
 
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
-                req_conns, _ = self.prealloc_queue.pop_preallocated(self.get_decoding())
+                req_conns, _ = self.prealloc_queue.pop_preallocated(
+                    self.core_lists.decoding
+                )
                 self.transfer_queue.extend(req_conns)
             transferred_reqs = self.transfer_queue.pop_transferred(
-                self.get_decoding()
+                self.core_lists.decoding
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:
@@ -3522,7 +3527,9 @@ class DisaggDecode:
             self.ready.extend(transferred_reqs)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
-                req_conns, _ = self.prealloc_queue.pop_preallocated(self.get_decoding())
+                req_conns, _ = self.prealloc_queue.pop_preallocated(
+                    self.core_lists.decoding
+                )
                 self.transfer_queue.extend(req_conns)
 
     def _poll_rids(self, decode_reqs: List[DecodeRequest], *poll_statuses_group):
@@ -3588,7 +3595,7 @@ class DisaggDecode:
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
             resumed_reqs = self.prealloc_queue.resume_retracted_reqs(
-                slot.filter_decoding(self.get_decoding()), retract_rids
+                slot.filter_decoding(self.core_lists.decoding), retract_rids
             )
             self.ready.extend(resumed_reqs)
             return [req.rid for req in resumed_reqs]
@@ -3609,7 +3616,7 @@ class DisaggDecode:
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
             good_reqs, failed_reqs = self.prealloc_queue.pop_preallocated(
-                slot.filter_decoding(self.get_decoding()),
+                slot.filter_decoding(self.core_lists.decoding),
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
             )
@@ -3630,7 +3637,7 @@ class DisaggDecode:
         self.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs = self.transfer_queue.pop_transferred(
-                slot.filter_decoding(self.get_decoding()), release_rids
+                slot.filter_decoding(self.core_lists.decoding), release_rids
             )
             if self.enable_hisparse:
                 for req in released_reqs:
@@ -3646,7 +3653,7 @@ class DisaggDecode:
         if len(ready) == 0:
             return []
 
-        decoding = slot.filter_decoding(self.get_decoding())
+        decoding = slot.filter_decoding(self.core_lists.decoding)
         if self.enable_priority_scheduling:
             self.policy.calc_priority(ready, decoding)
 
