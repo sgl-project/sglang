@@ -18,20 +18,31 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
 
 
+# (decode with fused f_b, support predicate): the SGLang-vendored names, then the
+# ones ROCm/aiter#6026 exports from aiter.ops.flydsl with the same signatures.
+_OP_NAMES = (
+    ("flydsl_kimi_k3_kda_decode_with_f_b", "is_flydsl_kimi_k3_kda_decode_supported"),
+    ("flydsl_kda_decode_with_f_b", "is_flydsl_kda_decode_supported"),
+)
+
+
 def _ops():
     try:
         from sglang.kernels.ops.attention.kda_flydsl.source import load_module
 
         module = load_module(
             "sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode",
-            "aiter.ops.flydsl.kimi_k3_kda_decode",
+            "aiter.ops.flydsl",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None
-    return (
-        module.flydsl_kimi_k3_kda_decode_with_f_b,
-        module.is_flydsl_kimi_k3_kda_decode_supported,
-    )
+    for run_name, supported_name in _OP_NAMES:
+        try:
+            return getattr(module, run_name), getattr(module, supported_name)
+        except (AttributeError, ImportError):
+            # aiter.ops.flydsl without ROCm/aiter#6026 has neither name.
+            continue
+    return None, None
 
 
 def available(device: torch.device | None = None) -> bool:
