@@ -116,8 +116,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         truncation_align_size=None,
         context_len=context_len,
         beam_coordinator=None,
-        build_extend_step=None,
-        build_sampling_info=None,
+        step_builder=None,
         request_retirer=Mock(),
     )
 

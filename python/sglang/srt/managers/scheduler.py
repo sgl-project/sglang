@@ -2662,7 +2662,7 @@ class Scheduler:
             model_runner=target_worker.model_runner,
             flags=self.flags,
             spec_algorithm=self.spec_algorithm,
-            new_step=self.step_builder.new_step,
+            step_builder=self.step_builder,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
@@ -2848,8 +2848,7 @@ class Scheduler:
             truncation_align_size=self.truncation_align_size,
             context_len=self.model_config.context_len,
             beam_coordinator=self.beam_coordinator,
-            build_extend_step=self.step_builder.build_extend_step,
-            build_sampling_info=self.step_builder.build_sampling_info,
+            step_builder=self.step_builder,
             request_retirer=self.request_retirer,
         )
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Callable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
+    from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
     from sglang.srt.managers.utils import GenerationBatchResult
 
 
@@ -61,8 +62,7 @@ class DllmManager:
         truncation_align_size: Optional[int],
         context_len: int,
         beam_coordinator: BeamCoordinator,
-        build_extend_step: Callable[..., ScheduleBatch],
-        build_sampling_info: Callable,
+        step_builder: StepBuilder,
         request_retirer: RequestRetirer,
     ):
         tree_cache = kv.tree_cache
@@ -87,8 +87,7 @@ class DllmManager:
         self.truncation_align_size = truncation_align_size
         self.context_len = context_len
         self.beam_coordinator = beam_coordinator
-        self.build_extend_step = build_extend_step
-        self.build_sampling_info = build_sampling_info
+        self.step_builder = step_builder
         self.metrics_sink = metrics_sink
         self.output_streamer = output_streamer
         self.request_retirer = request_retirer
@@ -496,7 +495,7 @@ class DllmManager:
     ) -> ScheduleBatch:
         """Create and prepare a new DLLM batch."""
         # An FDFO block left unresolved rewrites the KV its request kept.
-        new_batch = self.build_extend_step(
+        new_batch = self.step_builder.build_extend_step(
             can_run_list,
             kv_reuse_lens=[
                 len(req.dllm.incomplete_ids) if req.kv.holds_kv else 0
@@ -520,7 +519,7 @@ class DllmManager:
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder, [], self.enable_priority_scheduling
         )
-        new_batch.sampling_info = self.build_sampling_info(can_run_list)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(can_run_list)
 
         return new_batch
 

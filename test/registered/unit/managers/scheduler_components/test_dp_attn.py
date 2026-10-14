@@ -299,7 +299,7 @@ class TestDPBalanceStats(CustomTestCase):
             model_runner=object(),
             flags=EngineFlags(),
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            new_step=lambda reqs: None,
+            step_builder=None,
             get_require_mlp_sync=lambda: True,
         )
 

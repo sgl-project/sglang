@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _decode_total_seq_lens,
     _prefill_attention_pairs,
@@ -46,6 +46,7 @@ from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+    from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -648,8 +649,8 @@ class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
     flags: EngineFlags
     spec_algorithm: SpeculativeAlgorithm
-    # The scheduler's step factory: an empty step of the given requests.
-    new_step: Callable[[List[Req]], ScheduleBatch]
+    # Builds the idle step.
+    step_builder: StepBuilder
     get_require_mlp_sync: Callable[[], bool]
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
 
@@ -728,6 +729,6 @@ class SchedulerDPAttnAdapter:
         batch.set_extend_view()
 
     def get_idle_batch(self) -> ScheduleBatch:
-        idle_batch = self.new_step([])
+        idle_batch = self.step_builder.new_step([])
         idle_batch.prepare_for_idle()
         return idle_batch

@@ -57,8 +57,9 @@ def _manager(**deps):
         beam_coordinator=SimpleNamespace(
             get_num_allocatable_reqs=lambda running_bs: 64
         ),
-        build_extend_step=_Step,
-        build_sampling_info=Mock(),
+        step_builder=SimpleNamespace(
+            build_extend_step=_Step, build_sampling_info=Mock()
+        ),
         request_retirer=Mock(),
     )
     kwargs.update(deps)
