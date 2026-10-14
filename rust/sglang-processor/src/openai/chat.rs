@@ -26,6 +26,10 @@ pub struct ChatModel {
     pub context_length: Option<u64>,
     /// `model_config.get_default_sampling_params()` under `--sampling-defaults model`.
     pub generation_config: Map<String, Value>,
+    /// The chat template always reasons: `template_detection` resolves its
+    /// reasoning config to `special_case="always"`.
+    #[serde(default)]
+    pub always_thinks: bool,
 }
 
 /// `ChatCompletionRequest` with Pydantic's defaults, for the fields that reach
@@ -172,6 +176,17 @@ pub fn lower_chat(
         Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
         None => None,
     };
+    // `_process_messages`: glm47 constrains a request with tools, `"none"`
+    // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
+    // does not accept.
+    if settings.tool_call_parser.as_deref() == Some("glm47")
+        && raw
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(Unsupported("tool_grammar"));
+    }
     let tools = request_tools(&raw)?;
     let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
         (Some(parser), Some(names)) => {
@@ -214,7 +229,8 @@ pub fn lower_chat(
     for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let thinking = parser.is_some() && kwargs.get("thinking") == Some(&Value::Bool(true));
+    let thinking = parser.is_some()
+        && (model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true)));
     // `_process_messages`: tool output keeps the parser's special tokens.
     if tools.is_some() {
         request.skip_special_tokens = false;
@@ -499,14 +515,15 @@ fn valid_message(message: &Value) -> bool {
     let Some(message) = message.as_object() else {
         return false;
     };
+    let role = message.get("role").and_then(Value::as_str);
+    // Thinking parts are valid only in assistant messages.
+    let assistant = role.is_some_and(|r| r.eq_ignore_ascii_case("assistant"));
     let text_content = |content: &Value| match content {
         Value::String(_) => true,
-        Value::Array(parts) => parts
-            .iter()
-            .all(|part| part["type"] == "text" && part["text"].is_string()),
+        Value::Array(parts) => parts.iter().all(|part| text_part(part, assistant)),
         _ => false,
     };
-    match message.get("role").and_then(Value::as_str) {
+    match role {
         // `ChatCompletionMessageUserParam`: the role is case-sensitive and content is required.
         Some("user") => message.get("content").is_some_and(text_content),
         Some(role) if GENERIC_ROLES.contains(&role.to_lowercase().as_str()) => {
@@ -526,6 +543,21 @@ fn valid_message(message: &Value) -> bool {
                 && optional(message, "tools", |tools| {
                     tools.as_array().is_some_and(Vec::is_empty)
                 })
+        }
+        _ => false,
+    }
+}
+
+/// A text, `tool_reference` or (in assistant messages) thinking content part.
+fn text_part(part: &Value, assistant: bool) -> bool {
+    match part["type"].as_str() {
+        Some("text") => part["text"].is_string(),
+        Some("tool_reference") => part["name"].is_string(),
+        // `ChatCompletionMessageContentThinkingPart`: exactly one of `thinking` and `text`.
+        Some("thinking" | "reasoning") if assistant => {
+            let set = |key: &str| !part[key].is_null();
+            let string = |key: &str| part[key].is_null() || part[key].is_string();
+            set("thinking") != set("text") && string("thinking") && string("text")
         }
         _ => false,
     }
@@ -1053,6 +1085,10 @@ mod tests {
             json!([{"role": "USER", "content": "hi"}]),
             json!([{"role": "bot", "content": "hi"}]),
             json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]),
+            json!([{"role": "user", "content": [{"type": "thinking", "thinking": "t"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "text": "x"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking"}]}]),
+            json!([{"role": "user", "content": [{"type": "tool_reference"}]}]),
             json!([{"role": "user", "content": [{"type": "text"}]}]),
             json!([{"role": "user", "content": 1}]),
             json!(["hi"]),
@@ -1075,7 +1111,8 @@ mod tests {
     fn text_messages_are_lowered() {
         let messages = json!([
             {"role": "System", "content": "be brief", "tools": []},
-            {"role": "user", "content": [{"type": "text", "text": "hi"}], "name": 1},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "tool_reference", "name": "f"}], "name": 1},
+            {"role": "Assistant", "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "a"}]},
             {"role": "assistant", "content": null, "phase": null, "tool_calls": [
                 {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
             ]},
