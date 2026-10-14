@@ -108,6 +108,18 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
 
+    def test_filter_batch_children_inherit_dcp_prefill_path(self):
+        """The DSA + DCP prefill path is chosen once per forward; both TBO
+        halves must attend through the same path as the parent."""
+        for owned, split in ((False, False), (True, False), (False, True)):
+            with self.subTest(owned=owned, split=split):
+                parent = _make_target_verify_batch(8)
+                parent.dcp_owned_prefill = owned
+                parent.dcp_split_indexer = split
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.dcp_owned_prefill, owned)
+                self.assertEqual(child.dcp_split_indexer, split)
+
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before
         the TBO split; children must not inherit it."""
