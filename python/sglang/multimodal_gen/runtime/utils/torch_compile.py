@@ -8,7 +8,9 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -20,13 +22,56 @@ def maybe_enable_inductor_compute_comm_overlap() -> None:
         pass
 
 
-def build_torch_compile_kwargs(*, mode: str | None) -> dict[str, object]:
+def apply_inductor_config(overrides: dict[str, Any]) -> None:
+    """Apply a model's torch._inductor.config overrides before it is compiled."""
+    import torch._inductor.config as _inductor_cfg
+
+    for name, value in overrides.items():
+        if not hasattr(_inductor_cfg, name):
+            logger.warning("Unknown torch._inductor.config option %r, ignoring", name)
+            continue
+        setattr(_inductor_cfg, name, value)
+    if overrides.get("multi_kernel_hints"):
+        # torch reads its saved multi-kernel pick through sub-kernels an
+        # FX-graph cache hit has not restored yet (triton _hash_lock is None),
+        # so every warm restart fails the compile -- under TP on one rank only,
+        # which deadlocks the others. Without the saved pick, each process
+        # re-picks during warmup.
+        os.environ.setdefault("TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE", "1")
+
+
+def build_torch_compile_kwargs(
+    *,
+    mode: str | None,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
+) -> dict[str, object]:
     compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-    if current_platform.is_npu():
+    if current_platform.is_out_of_tree():
+        backend = current_platform.get_compile_backend(mode)
+        compile_kwargs["backend"] = backend
+        if module is not None:
+            options = current_platform.get_compile_options(module)
+            if options is not None:
+                compile_kwargs["options"] = options
+        if (
+            "options" not in compile_kwargs
+            and backend == "inductor"
+            and mode is not None
+        ):
+            compile_kwargs["mode"] = mode
+    elif current_platform.is_npu():
+        from sglang.srt.utils.common import get_compiler_backend
+
         compile_kwargs["backend"] = get_compiler_backend()
         compile_kwargs["dynamic"] = False
     elif mode is not None:
         compile_kwargs["mode"] = mode
+    if (
+        enable_inductor_compute_comm_overlap
+        and compile_kwargs.get("backend", "inductor") == "inductor"
+    ):
+        maybe_enable_inductor_compute_comm_overlap()
     return compile_kwargs
 
 
@@ -43,6 +88,46 @@ def resolve_torch_compile_mode(
     if mode:
         return mode
     return default
+
+
+def resolve_torch_compile_kwargs(
+    *env_names: str,
+    config: object | None = None,
+    default: str,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
+) -> tuple[dict[str, object], str | None]:
+    mode = None
+    if not current_platform.is_npu():
+        mode = resolve_torch_compile_mode(*env_names, config=config, default=default)
+    compile_kwargs = build_torch_compile_kwargs(
+        mode=mode,
+        module=module,
+        enable_inductor_compute_comm_overlap=enable_inductor_compute_comm_overlap,
+    )
+    return compile_kwargs, mode
+
+
+def compile_matching_submodules(
+    module: nn.Module,
+    *,
+    compile_kwargs: dict[str, object],
+) -> int:
+    conditions = getattr(module, "_compile_conditions", ())
+    matches = [
+        submodule
+        for name, submodule in module.named_modules()
+        if name and any(condition(name, submodule) for condition in conditions)
+    ]
+    if not matches:
+        raise ValueError(
+            "regional compile found no matching submodules; "
+            f"check {type(module).__name__}._compile_conditions"
+        )
+
+    for submodule in matches:
+        submodule.compile(**compile_kwargs)
+    return len(matches)
 
 
 @dataclass
@@ -64,6 +149,22 @@ class CompiledModuleRegistry:
         module.compile(**compile_kwargs)
         self.module_ids.add(module_id)
         return True
+
+    def compile_regions_once(
+        self,
+        module: nn.Module,
+        *,
+        compile_kwargs: dict[str, object],
+    ) -> int:
+        module_id = id(module)
+        if module_id in self.module_ids:
+            return 0
+        compiled_count = compile_matching_submodules(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
+        self.module_ids.add(module_id)
+        return compiled_count
 
 
 class CallableModule(nn.Module):

@@ -1,13 +1,16 @@
 import asyncio
 import json
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
+from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
+from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
@@ -18,21 +21,27 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from sglang.srt.managers.template_detection import (  # noqa: E402
+from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
+    native_reasoning_history = False
+
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
+        self.supports_inline_system = detect_inline_system_support(chat_template)
+
+    def supports_native_reasoning_history(self):
+        return self.native_reasoning_history
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
@@ -49,12 +58,15 @@ class _FakeOpenAIServingChat:
 
 
 class _FakeNonStreamingErrorOpenAI:
-    """Returns a configurable error response from the OpenAI handler."""
+    """Returns an error response or raises an exception from the OpenAI handler."""
 
-    def __init__(self, status_code=400, body=None, content=None):
+    supports_inline_system = False
+
+    def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
         self._body = body
         self._content = content
+        self._exception = exception
 
     def _validate_request(self, chat_request):
         return None
@@ -65,6 +77,8 @@ class _FakeNonStreamingErrorOpenAI:
     async def _handle_non_streaming_request(
         self, adapted_request, processed_request, raw_request
     ):
+        if self._exception is not None:
+            raise self._exception
         if self._body is not None:
             # Build a response object exposing raw bytes via `.body`.
             return SimpleNamespace(status_code=self._status_code, body=self._body)
@@ -78,24 +92,6 @@ class _FakeNonStreamingErrorOpenAI:
                 }
             },
         )
-
-
-class _FakeNonStreamingOpenAI:
-    """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
-
-    def __init__(self, response):
-        self._response = response
-
-    def _validate_request(self, chat_request):
-        return None
-
-    def _convert_to_internal_request(self, chat_request, raw_request):
-        return SimpleNamespace(), chat_request
-
-    async def _handle_non_streaming_request(
-        self, adapted_request, processed_request, raw_request
-    ):
-        return self._response
 
 
 def _chunk(choices=None, usage=None):
@@ -134,22 +130,28 @@ async def _collect_anthropic_events(serving, anthropic_request):
 
 
 class TestAnthropicServing(unittest.TestCase):
-    # System-first guard (Qwen-style): rejects non-first system → must merge.
-    QWEN_SYSTEM_FIRST_TEMPLATE = (
-        "{%- for message in messages %}"
-        "{%- if message.role == 'system' and not loop.first %}"
-        "{{- raise_exception('system must be first') }}"
-        "{%- endif %}"
-        "{{- message.role }}: {{ message.content }}\n"
-        "{%- endfor %}"
-    )
-
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"
         "{{- message.role }}: {{ message.content }}\n"
         "{%- endfor %}"
     )
+    GLM_TOOL_RESULT_TEMPLATE = """
+{%- for message in messages if message.role == "tool" -%}
+{%- if loop.first -%}<|observation|>{%- endif -%}
+{%- if message.content is string -%}
+<tool_response>{{ message.content }}</tool_response>
+{%- elif message.content.0.type == "tool_reference" -%}
+<tool_response><tools>
+{%- for reference in message.content -%}
+{%- for tool in tools if tool.function.name == reference.name -%}
+{{ tool.function.name }}
+{%- endfor -%}
+{%- endfor -%}
+</tools></tool_response>
+{%- endif -%}
+{%- endfor -%}
+"""
 
     def _serving(self, stream_lines=None, chat_template=None):
         return AnthropicServing(_FakeOpenAIServingChat(stream_lines, chat_template))
@@ -163,6 +165,49 @@ class TestAnthropicServing(unittest.TestCase):
         }
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
+
+    def _non_streaming_exception_response(self, exception):
+        serving = AnthropicServing(_FakeNonStreamingErrorOpenAI(exception=exception))
+        return asyncio.run(
+            serving.handle_messages(self._anthropic_request(stream=False), object())
+        )
+
+    def _tool_result_request(self, content, tools=None):
+        overrides = {
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": content,
+                        }
+                    ],
+                }
+            ],
+        }
+        if tools is not None:
+            overrides["tools"] = tools
+        return self._anthropic_request(**overrides)
+
+    def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
+        """PD routers inject bootstrap fields into /v1/messages bodies; dropping
+        them in the Chat Completions conversion strands the decode request."""
+        request = self._anthropic_request(
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=2**62 + 17,
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.bootstrap_host, "prefill.internal")
+        self.assertEqual(converted.bootstrap_port, 8998)
+        self.assertEqual(converted.bootstrap_room, 2**62 + 17)
+        self.assertEqual(converted.routed_dp_rank, 3)
+        self.assertEqual(converted.disagg_prefill_dp_rank, 2)
 
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
@@ -383,6 +428,74 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("https://docs.sglang.ai", tool_message["content"])
         self.assertIn("Anthropic API notes", tool_message["content"])
 
+    def test_mixed_tool_reference_content_preserves_part_order(self):
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "text", "text": "Ready"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual([message["role"] for message in messages], ["tool"] * 3)
+        self.assertEqual(
+            [message["tool_call_id"] for message in messages], ["call_1"] * 3
+        )
+        self.assertEqual(messages[0]["content"], "Tool loaded: Bash")
+        self.assertEqual(
+            messages[1]["content"],
+            [{"type": "tool_reference", "name": "Bash"}],
+        )
+        self.assertEqual(messages[2]["content"], "Ready")
+
+    def test_mixed_tool_reference_content_renders_text_and_schema(self):
+        template = Environment().from_string(self.GLM_TOOL_RESULT_TEMPLATE)
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+            ],
+            tools=[
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": True,
+                }
+            ],
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        payload = chat_request.model_dump(exclude_none=True)
+        prompt = template.render(messages=payload["messages"], tools=payload["tools"])
+
+        self.assertIn("<tool_response>Tool loaded: Bash</tool_response>", prompt)
+        self.assertIn("<tools>Bash</tools>", prompt)
+        self.assertEqual(prompt.count("<|observation|>"), 1)
+
+    def test_reference_only_tool_result_remains_one_message(self):
+        request = self._tool_result_request(
+            [
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "tool_reference", "tool_name": "Read"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "tool_reference", "name": "Bash"},
+                {"type": "tool_reference", "name": "Read"},
+            ],
+        )
+
     def test_builtin_web_search_tool_without_schema_is_skipped(self):
         request = AnthropicMessagesRequest.model_validate(
             {
@@ -430,6 +543,83 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "context length exceeded")
+
+    def test_non_streaming_queue_full_http_exception_preserves_503(self):
+        for status_code in (503, HTTPStatus.SERVICE_UNAVAILABLE):
+            with self.subTest(status_code=status_code, code_type=type(status_code)):
+                response = self._non_streaming_exception_response(
+                    HTTPException(
+                        status_code=status_code,
+                        detail="The request queue is full: sensitive internals /opt/secret",
+                    )
+                )
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    json.loads(response.body),
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": "Internal server error",
+                        },
+                    },
+                )
+
+    def test_non_streaming_http_exception_4xx_preserves_status_and_message(self):
+        for status_code, expected_type in [
+            (400, "invalid_request_error"),
+            (418, "api_error"),
+        ]:
+            with self.subTest(status_code=status_code):
+                response = self._non_streaming_exception_response(
+                    HTTPException(status_code=status_code, detail="Request rejected")
+                )
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": expected_type, "message": "Request rejected"},
+                )
+
+    def test_non_streaming_http_exception_non_str_detail_is_stringified(self):
+        response = self._non_streaming_exception_response(
+            HTTPException(status_code=400, detail={"message": "Bad request"})
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {
+                "type": "invalid_request_error",
+                "message": "{'message': 'Bad request'}",
+            },
+        )
+
+    def test_non_streaming_http_exception_logs_original_detail(self):
+        detail = "worker rejected request: sensitive internals /opt/secret"
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+        ) as captured:
+            response = self._non_streaming_exception_response(
+                HTTPException(status_code=503, detail=detail)
+            )
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn(detail, message)
+        self.assertIn("503", message)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {"type": "overloaded_error", "message": "Internal server error"},
+        )
+
+    def test_non_streaming_unexpected_exception_returns_generic_500(self):
+        response = self._non_streaming_exception_response(
+            RuntimeError("sensitive internals: /opt/secret")
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {"type": "api_error", "message": "Internal server error"},
+        )
 
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
@@ -675,19 +865,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
-    def test_request_thinking_enabled_invokes_apply_reasoning_enabled(self):
-        """``thinking={"type":"enabled", "budget_tokens":N}`` flips reasoning on.
-
-        ``budget_tokens`` is required by the SDK shape on ``enabled``; the
-        local backend does not enforce it but accepts the value.
-        """
-        serving = self._serving()
-        request = self._anthropic_request(
-            thinking={"type": "enabled", "budget_tokens": 1024}, stream=False
-        )
-        serving._convert_to_chat_completion_request(request)
-        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
-
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
         serving = self._serving()
@@ -828,34 +1005,17 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.max_tokens, 16)
         self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
 
-    def test_request_task_budget_with_remaining_is_accepted(self):
-        """SDK's ``BetaTokenTaskBudgetParam`` has a ``remaining`` field
-        used for client-side compaction. Must round-trip cleanly."""
-        serving = self._serving()
-        request = self._anthropic_request(
-            output_config={
-                "task_budget": {"type": "tokens", "total": 32768, "remaining": 12000}
-            },
-            stream=False,
-        )
-        # Must not raise; pre-existing logging still works.
-        serving._convert_to_chat_completion_request(request)
-        self.assertEqual(request.output_config.task_budget.remaining, 12000)
-
     def test_request_betas_is_accepted_and_logged(self):
-        """The Anthropic SDK attaches ``betas`` to many requests; must not 400."""
+        """``betas`` is accepted and logged; the local backend has no beta system."""
         import logging
 
         serving = self._serving()
-        request = self._anthropic_request(
-            betas=["thinking-2025-08-04", "computer-use-2025-01-24"],
-            stream=False,
-        )
+        request = self._anthropic_request(betas=["thinking-2025-08-04"], stream=False)
         with self.assertLogs(
             "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
         ) as log:
             serving._convert_to_chat_completion_request(request)
-        self.assertTrue(any("betas" in r for r in log.output))
+        self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
 
     def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
         """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
@@ -894,6 +1054,63 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("<think>", joined)
         self.assertIn("ponder", joined)
         self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+
+    def test_assistant_thinking_history_uses_native_reasoning_content(self):
+        """Channel-framing encoders take thinking history as ``reasoning_content``.
+
+        Splicing the detector's markers into content would nest a reasoning block
+        inside the content channel and leave the real one empty, training the
+        model to emit raw markers as visible text.
+        """
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+            def wrap_reasoning_history(self, text):
+                raise AssertionError("must not rewrap for a native-history encoder")
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+
+    def test_thinking_only_turn_keeps_native_reasoning_content(self):
+        """An assistant turn that is only thinking still carries its reasoning."""
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "ponder"}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""
@@ -1152,18 +1369,6 @@ class TestAnthropicServing(unittest.TestCase):
             serving._convert_to_chat_completion_request(request)
         self.assertIn("tool_choice", str(ctx.exception))
 
-    def test_server_tool_only_with_tool_choice_auto_is_allowed(self):
-        """tool_choice=auto over server-only tools is a no-op (model decides)."""
-        serving = self._serving()
-        request = self._anthropic_request(
-            stream=False,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            tool_choice={"type": "auto"},
-        )
-        # Must not raise; the request just runs with no client-side tools.
-        chat_request = serving._convert_to_chat_completion_request(request)
-        self.assertIsNone(chat_request.tools)
-
     def test_tool_choice_named_custom_tool_is_resolved(self):
         """tool_choice={type:'tool', name:'X'} where X is a custom tool wires through."""
         serving = self._serving()
@@ -1359,6 +1564,28 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
+
+    def test_inline_system_support_comes_from_the_prompt_renderer(self):
+        """Native encoders have no Jinja template to probe, so Messages must use
+        the serving chat's renderer decision instead of hoisting inline system."""
+        chat = _FakeOpenAIServingChat(chat_template=None)
+        chat.supports_inline_system = True
+        serving = AnthropicServing(chat)
+        request = self._anthropic_request(
+            stream=False,
+            system="Stable instructions",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "New instruction"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        converted = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in converted.messages],
+            ["system", "user", "system", "user"],
+        )
+        self.assertEqual(converted.messages[0].content, "Stable instructions")
 
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages

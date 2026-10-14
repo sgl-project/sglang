@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Flow-matching rollout step utilities for log-prob computation."""
 
+from __future__ import annotations
+
 import math
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutSessionData,
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
 )
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
@@ -88,9 +92,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             assert B == 1, "Generator must be a list if batch size is not 1"
             generator = [generator]
         else:
-            assert (
-                len(generator) == B
-            ), "Generator list must have the same length as batch size"
+            assert len(generator) == B, (
+                "Generator list must have the same length as batch size"
+            )
 
         buffer = self._get_or_create_rollout_noise_buffer(
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
@@ -136,9 +140,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
         if not log_prob_no_const and sde_type != "ode":
-            assert (
-                noise_level > 0
-            ), "True log-probability computation requires a non-zero noise level."
+            assert noise_level > 0, (
+                "True log-probability computation requires a non-zero noise level."
+            )
 
         dt = next_sigma - current_sigma
 
@@ -230,9 +234,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             # Only enforce the "no full log-prob with ODE" constraint when the
             # user explicitly chose ODE globally.
             if sde_type == "ode":
-                assert (
-                    log_prob_no_const
-                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                assert log_prob_no_const, (
+                    "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                )
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")

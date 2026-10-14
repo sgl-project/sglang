@@ -4,15 +4,26 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoConfig
-from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DistilledDiTConfig,
+    Ideogram4DiTConfig,
+)
+from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
+    LingBotVideoMoEConfig,
+)
 from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
     LingBotWorldVideoConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.llada_image import LLaDAImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.dits.sana_video import SanaVideoConfig
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import WanAnimate2Config
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
@@ -20,10 +31,17 @@ __all__ = [
     "HeliosConfig",
     "HunyuanVideoConfig",
     "Ideogram4DiTConfig",
+    "Ideogram4DistilledDiTConfig",
     "LingBotWorldVideoConfig",
+    "LingBotVideoMoEConfig",
+    "LLaDAImageDitConfig",
+    "LongLive2VideoConfig",
+    "MiniMaxH3DiTConfig",
+    "WanAnimate2Config",
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
     "MOVAVideoConfig",
+    "SanaVideoConfig",
     "StableDiffusion3TransformerConfig",
 ]

@@ -13,10 +13,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 DEFAULT_ASR_PROMPT = (
-    f"<|im_start|>user\n"
-    f"{AUDIO_PLACEHOLDER}"
-    f"<|im_end|>\n"
-    f"<|im_start|>assistant\n"
+    f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
@@ -79,7 +76,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -33,26 +34,21 @@ def _disable_remote_official_gt_case_map(monkeypatch):
 
 
 def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
-    revision_path = f"/ci-data/{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
-
-    assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
-    assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
-    assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
-
-
-def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
-    class Response:
-        status_code = 404
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(test_utils.requests, "head", lambda *args, **kwargs: Response())
-
-    assert test_utils._remote_file_exists("https://example.com/missing.png") is False
+    # GT must be pinned to an immutable commit (not a moving branch) so results are
+    # reproducible and the per-URL download cache invalidates on regeneration.
+    assert test_utils.SGL_TEST_FILES_CI_DATA_REVISION != "main"
+    pinned_revision_path = (
+        f"/{test_utils.SGL_TEST_FILES_CI_DATA_REPO}/"
+        f"{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
+    )
+    assert (
+        pinned_revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    )
+    assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
 def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: None)
 
     files = test_utils._find_remote_consistency_gt_files(
@@ -62,9 +58,9 @@ def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
     )
 
     assert [filename for filename, _ in files] == [
-        "unit_video_1gpu_frame_0.png",
-        "unit_video_1gpu_frame_mid.png",
-        "unit_video_1gpu_frame_last.png",
+        "h100/unit_video_1gpu_frame_0.png",
+        "h100/unit_video_1gpu_frame_mid.png",
+        "h100/unit_video_1gpu_frame_last.png",
     ]
 
 
@@ -87,10 +83,10 @@ def test_remote_image_gt_prefers_official_when_present(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -116,10 +112,10 @@ def test_remote_image_gt_ignores_unmapped_official_file(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -141,24 +137,24 @@ def test_remote_video_gt_ignores_unmapped_official_files(monkeypatch):
 
     assert files == [
         (
-            f"{case_id}_2gpu_frame_0.png",
+            f"h100/{case_id}_2gpu_frame_0.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_0.png"
+                f"/h100/{case_id}_2gpu_frame_0.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_mid.png",
+            f"h100/{case_id}_2gpu_frame_mid.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_mid.png"
+                f"/h100/{case_id}_2gpu_frame_mid.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_last.png",
+            f"h100/{case_id}_2gpu_frame_last.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_last.png"
+                f"/h100/{case_id}_2gpu_frame_last.png"
             ),
         ),
     ]
@@ -178,7 +174,10 @@ def test_ltx_hq_remote_gt_uses_sglang_generated_when_official_declared(monkeypat
     files = test_utils._find_remote_consistency_gt_files(case_id, 1, is_video=True)
 
     assert files == [
-        (filename, f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/{filename}")
+        (
+            f"h100/{filename}",
+            f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}/h100/{filename}",
+        )
         for filename in filenames
     ]
 
@@ -201,10 +200,10 @@ def test_remote_image_gt_falls_back_to_sglang_when_official_missing(monkeypatch)
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -230,10 +229,10 @@ def test_remote_image_gt_skips_official_for_quarantined_case(monkeypatch):
 
     assert files == [
         (
-            expected_filename,
+            f"h100/{expected_filename}",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{expected_filename}"
+                f"/h100/{expected_filename}"
             ),
         )
     ]
@@ -252,8 +251,10 @@ def test_remote_platform_video_gt_prefers_platform_sglang_before_default_officia
     monkeypatch.setattr(
         test_utils,
         "_remote_file_exists",
-        lambda url: url.startswith(sglang_platform_prefix)
-        or url.startswith(official_default_prefix),
+        lambda url: (
+            url.startswith(sglang_platform_prefix)
+            or url.startswith(official_default_prefix)
+        ),
     )
 
     files = test_utils._find_remote_consistency_gt_files(
@@ -306,24 +307,24 @@ def test_remote_video_gt_skips_official_for_quarantined_case(monkeypatch):
 
     assert files == [
         (
-            f"{case_id}_2gpu_frame_0.png",
+            f"h100/{case_id}_2gpu_frame_0.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_0.png"
+                f"/h100/{case_id}_2gpu_frame_0.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_mid.png",
+            f"h100/{case_id}_2gpu_frame_mid.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_mid.png"
+                f"/h100/{case_id}_2gpu_frame_mid.png"
             ),
         ),
         (
-            f"{case_id}_2gpu_frame_last.png",
+            f"h100/{case_id}_2gpu_frame_last.png",
             (
                 f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
-                f"/{case_id}_2gpu_frame_last.png"
+                f"/h100/{case_id}_2gpu_frame_last.png"
             ),
         ),
     ]
@@ -374,6 +375,70 @@ def test_platform_gt_candidates_prefer_platform_then_default(monkeypatch):
         "unit_image_1gpu.png",
         "unit_image_1gpu.jpg",
         "unit_image_1gpu.webp",
+    ]
+
+
+def test_h100_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_consistency_gt_candidates(
+        "unit_image",
+        1,
+        is_video=False,
+        output_format="png",
+    ) == [
+        "h100/unit_image_1gpu.png",
+        "h100/unit_image_1gpu.jpg",
+        "h100/unit_image_1gpu.webp",
+        "unit_image_1gpu.png",
+        "unit_image_1gpu.jpg",
+        "unit_image_1gpu.webp",
+    ]
+
+
+def test_consistency_gt_case_alias_reuses_canonical_filename(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_consistency_gt_candidates(
+        "fsdp-inference",
+        2,
+        is_video=False,
+        output_format=None,
+    )[:3] == [
+        "h100/zimage_image_t2i_2_gpus_2gpu.jpg",
+        "h100/zimage_image_t2i_2_gpus_2gpu.png",
+        "h100/zimage_image_t2i_2_gpus_2gpu.webp",
+    ]
+
+
+def test_action_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_action_consistency_gt_candidates("unit_action", 1) == [
+        "h100/unit_action_1gpu.json",
+        "unit_action_1gpu.json",
+    ]
+
+
+def test_remote_action_gt_uses_sglang_generated(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_action_consistency_gt_files("unit_action", 1)
+
+    assert files == [
+        (
+            "h100/unit_action_1gpu.json",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/h100/unit_action_1gpu.json"
+            ),
+        )
     ]
 
 
@@ -552,3 +617,107 @@ def test_save_consistency_failure_artifact(tmp_path, monkeypatch):
     assert (
         tmp_path / "consistency_failures" / "generated" / "unit_image_fail_1gpu.png"
     ).exists()
+
+
+def _sine_wave(frequency: float, seconds: float = 1.0) -> np.ndarray:
+    t = np.arange(
+        int(test_utils.AUDIO_CONSISTENCY_SAMPLE_RATE * seconds), dtype=np.float32
+    )
+    return np.sin(
+        2.0 * np.pi * frequency * t / float(test_utils.AUDIO_CONSISTENCY_SAMPLE_RATE)
+    ).astype(np.float32)
+
+
+def _audio_thresholds() -> test_utils.AudioConsistencyThresholds:
+    return test_utils.AudioConsistencyThresholds(
+        spectral_similarity_threshold=0.95,
+        waveform_correlation_threshold=0.90,
+        rms_db_diff_threshold=1.0,
+        duration_diff_threshold=0.05,
+    )
+
+
+def test_audio_consistency_wav_round_trip_passes():
+    output = _sine_wave(440.0)
+    gt = test_utils.decode_audio_gt_wav(test_utils.encode_audio_gt_wav(output))
+
+    result = test_utils.compare_audio_with_gt(output, gt, _audio_thresholds())
+
+    assert result.passed
+    assert result.spectral_similarity > 0.999
+    assert result.waveform_correlation > 0.999
+    assert result.rms_db_diff < 0.001
+    assert result.duration_diff == 0.0
+
+
+def test_save_audio_gt_artifact(tmp_path):
+    path = test_utils.save_audio_gt_artifact(
+        str(tmp_path), "unit_audio", 2, _sine_wave(440.0)
+    )
+
+    assert path == tmp_path / "unit_audio_2gpu_audio.wav"
+    assert test_utils.decode_audio_gt_wav(path.read_bytes()).size > 0
+
+
+def test_audio_consistency_rejects_wrong_audio():
+    result = test_utils.compare_audio_with_gt(
+        _sine_wave(440.0),
+        _sine_wave(880.0),
+        _audio_thresholds(),
+    )
+
+    assert not result.passed
+    assert result.spectral_similarity < 0.95
+    assert result.waveform_correlation < 0.90
+
+
+def test_audio_gt_candidates_prefer_platform_directory(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_audio_consistency_gt_files("unit_audio", 2)
+
+    assert files == [
+        (
+            "h100/unit_audio_2gpu_audio.wav",
+            f"{sglang_prefix}h100/unit_audio_2gpu_audio.wav",
+        )
+    ]
+
+
+def test_probe_audio_stream_reads_positive_metadata(monkeypatch):
+    monkeypatch.setattr(
+        test_utils.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=(
+                '{"streams":[{"codec_type":"audio","sample_rate":"32000",'
+                '"channels":2,"duration":"4.0"}],"format":{"duration":"4.1"}}'
+            )
+        ),
+    )
+
+    info = test_utils.probe_audio_stream("output.mp4")
+
+    assert info == test_utils.AudioStreamInfo(32000, 2, 4.0)
+
+
+def test_validate_audio_output_rejects_silence(monkeypatch):
+    monkeypatch.setattr(
+        test_utils,
+        "probe_audio_stream",
+        lambda path: test_utils.AudioStreamInfo(32000, 2, 4.0),
+    )
+    monkeypatch.setattr(
+        test_utils,
+        "extract_audio_pcm",
+        lambda path: np.zeros(test_utils.AUDIO_CONSISTENCY_SAMPLE_RATE),
+    )
+
+    with pytest.raises(AssertionError, match="silent"):
+        test_utils.validate_audio_output("output.mp4")

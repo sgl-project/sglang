@@ -5,7 +5,28 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.multimodal_gen.runtime import server_args as server_args_module
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+from sglang.srt.utils.network import get_free_port_below_ephemeral
+
+
+@pytest.fixture(scope="module")
+def single_process_model_parallel():
+    with pytest.MonkeyPatch.context() as patch:
+        if not model_parallel_is_initialized():
+            for key, value in dict(
+                MASTER_ADDR="127.0.0.1",
+                MASTER_PORT=str(get_free_port_below_ephemeral()),
+                RANK="0",
+                LOCAL_RANK="0",
+                WORLD_SIZE="1",
+            ).items():
+                patch.setenv(key, value)
+            maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+        yield
 
 
 def _make_unit_server_args():
@@ -38,8 +59,11 @@ def _make_unit_server_args():
         comfyui_mode=False,
         disable_autocast=False,
         enable_cfg_parallel=False,
+        enable_breakable_cuda_graph=False,
         enable_layerwise_nvtx_marker=False,
         enable_torch_compile=False,
+        kv_gather_degree=1,
+        sp_split_auto=False,
         model_loaded={},
         model_paths={},
         pipeline_config=pipeline_config,

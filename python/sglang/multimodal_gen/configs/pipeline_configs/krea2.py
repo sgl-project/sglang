@@ -6,10 +6,17 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
 )
 
 # Resolution-interpolation endpoints for the time-shift `mu` (reference sampler):
@@ -74,8 +81,22 @@ class Krea2PipelineConfig(ImagePipelineConfig):
         img_ids[..., 2] = torch.arange(w_tok, device=device)[None, :]
         img_pos = img_ids.reshape(h_tok * w_tok, 3).unsqueeze(0).expand(b, -1, -1)
         txt_pos = torch.zeros(b, txt_len, 3, device=device)
-        pos = torch.cat([txt_pos, img_pos], dim=1)
 
+        sp_world_size = get_sp_world_size()
+        if sp_world_size > 1:
+            # Shard the image RoPE positions to match the denoise stage's latent
+            # sharding; the text prefix stays replicated (kept out of the all-to-all
+            # via num_replicated_prefix). The masked path is incompatible with
+            # replicated-prefix, so ragged multi-prompt batches aren't supported.
+            if text_mask is not None and not bool(text_mask.all()):
+                raise ValueError(
+                    "Krea-2 sequence parallelism does not support ragged/padded "
+                    "multi-prompt batches; use a single prompt or --tp-size."
+                )
+            img_pos = self._shard_img_pos_for_sp(img_pos, sp_world_size)
+            return {"pos": torch.cat([txt_pos, img_pos], dim=1), "mask": None}
+
+        pos = torch.cat([txt_pos, img_pos], dim=1)
         img_mask = torch.ones(b, h_tok * w_tok, dtype=torch.bool, device=device)
         if text_mask is None:
             txt_mask = torch.ones(b, txt_len, dtype=torch.bool, device=device)
@@ -83,6 +104,18 @@ class Krea2PipelineConfig(ImagePipelineConfig):
             txt_mask = text_mask.to(device=device).bool()
         mask = torch.cat([txt_mask, img_mask], dim=1)
         return {"pos": pos, "mask": mask}
+
+    @staticmethod
+    def _shard_img_pos_for_sp(img_pos, sp_world_size):
+        # This rank's contiguous image-position slice, padded to a multiple of
+        # sp_world_size (mirrors the latent sharder).
+        s = img_pos.shape[1]
+        if s % sp_world_size != 0:
+            pad = img_pos[:, -1:].repeat(1, sp_world_size - (s % sp_world_size), 1)
+            img_pos = torch.cat([img_pos, pad], dim=1)
+        local = img_pos.shape[1] // sp_world_size
+        rank = get_sp_parallel_rank()
+        return img_pos[:, rank * local : (rank + 1) * local]
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         text_mask = batch.prompt_embeds_mask[0] if batch.prompt_embeds_mask else None
@@ -116,16 +149,9 @@ class Krea2PipelineConfig(ImagePipelineConfig):
 
     # --- VAE decode (same as Qwen-Image: latents * std + mean) ---
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        vae_arch = self.vae_config.arch_config
-        scaling_factor = 1.0 / torch.tensor(vae_arch.latents_std, device=device).view(
-            1, vae_arch.z_dim, 1, 1, 1
-        ).to(device, dtype)
-        shift_factor = (
-            torch.tensor(vae_arch.latents_mean)
-            .view(1, vae_arch.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-        return scaling_factor, shift_factor
 
     def post_denoising_loop(self, latents, batch):
         latents, batch_size, channels, height, width = self._unpad_and_unpack_latents(
@@ -133,3 +159,17 @@ class Krea2PipelineConfig(ImagePipelineConfig):
         )
         latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.krea2 import (
+        Krea2SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Krea2SamplingParams,
+        pipeline_config_cls=Krea2PipelineConfig,
+        hf_model_paths=["krea/Krea-2"],
+        model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
+    )

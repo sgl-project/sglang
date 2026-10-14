@@ -4,7 +4,7 @@
 import enum
 import logging
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import orjson
 
@@ -13,15 +13,29 @@ from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+
+class _DefaultLoadGroup(enum.Enum):
+    DEFAULT = enum.auto()
+
+
+_DEFAULT_LOAD_GROUP = _DefaultLoadGroup.DEFAULT
+LoadGroup = Union["GroupCoordinator", _DefaultLoadGroup, None]
+
 
 class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
+    INSTANTTENSOR = "instanttensor"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
+    PRESHARDED = "presharded"
     GGUF = "gguf"
+    EXPERT_PACK = "expert_pack"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
@@ -34,6 +48,7 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    IPC_CACHE = "ipc_cache"
 
 
 @dataclass
@@ -47,6 +62,8 @@ class LoadConfig:
             not available.
         "pt" will load the weights in the pytorch bin format.
         "safetensors" will load the weights in the safetensors format.
+        "instanttensor" will load Safetensors weights using InstantTensor's
+            high-performance distributed loader.
         "npcache" will load the weights in pytorch format and store
             a numpy cache to speed up the loading.
         "dummy" will initialize the weights with random values, which is
@@ -103,6 +120,16 @@ class LoadConfig:
 
     # For multi-layer MTP
     draft_model_idx: Optional[int] = None
+
+    # Weight cache daemon options
+    weight_cache_mode: str = "off"  # "off", "daemon", "client"
+    weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
+
+    # Runtime-only load group, currently used by InstantTensor; None disables
+    # collective loading. Other distributed loaders, such as fastsafetensors
+    # and runai_model_streamer, could also benefit from honoring this group.
+    load_group: LoadGroup = field(default=_DEFAULT_LOAD_GROUP, repr=False)
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

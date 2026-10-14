@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_cache_group
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -30,6 +32,7 @@ class StageDedupMixin:
     deduplicated_output_fields: ClassVar[tuple[str, ...]] = ()
     deduplicated_tensor_tree_output_fields: ClassVar[tuple[str, ...]] = ()
     deduplicated_deepcopy_output_fields: ClassVar[tuple[str, ...]] = ()
+    deduplicated_extra_output_keys: ClassVar[tuple[str, ...]] = ()
     deduplicated_extra_tensor_tree_output_keys: ClassVar[tuple[str, ...]] = ()
 
     def run_grouped_requests(
@@ -60,6 +63,7 @@ class StageDedupMixin:
             cls.deduplicated_output_fields
             or cls.deduplicated_tensor_tree_output_fields
             or cls.deduplicated_deepcopy_output_fields
+            or cls.deduplicated_extra_output_keys
             or cls.deduplicated_extra_tensor_tree_output_keys
         )
 
@@ -89,16 +93,19 @@ class StageDedupMixin:
 
         results: list[Req | None] = [None] * len(batches)
 
-        for _, group in self._group_requests_by_fingerprint(
+        groups = self._group_requests_by_fingerprint(
             batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
-        ):
-            first_index, first_batch = group[0]
-            first_result = self(first_batch, server_args)
-            results[first_index] = first_result
+        )
+        # a single computed request needs no group memo or cache-hit collective
+        with conditioning_cache_group(enabled=len(groups) > 1):
+            for _, group in groups:
+                first_index, first_batch = group[0]
+                first_result = self(first_batch, server_args)
+                results[first_index] = first_result
 
-            for index, batch in group[1:]:
-                copy_outputs(first_result, batch)
-                results[index] = batch
+                for index, batch in group[1:]:
+                    copy_outputs(first_result, batch)
+                    results[index] = batch
 
         return [result for result in results if result is not None]
 
@@ -109,8 +116,8 @@ class StageDedupMixin:
         tensor references, which is the low-overhead path for read-only outputs
         such as embeddings. Tensor-tree fields recursively clone tensors.
         Deepcopy fields are for mutable request-local runtime objects, such as
-        scheduler instances. Extra keys clone selected ``Req.extra`` entries
-        without replacing the destination extra dict.
+        scheduler instances. Extra output keys follow the same shallow-copy
+        contract, while extra tensor-tree keys recursively clone tensors.
         """
         for field in self.deduplicated_output_fields:
             setattr(dst, field, self.copy_stage_output(getattr(src, field)))
@@ -118,6 +125,9 @@ class StageDedupMixin:
             setattr(dst, field, self.clone_tensor_tree(getattr(src, field)))
         for field in self.deduplicated_deepcopy_output_fields:
             setattr(dst, field, deepcopy(getattr(src, field)))
+        for key in self.deduplicated_extra_output_keys:
+            if key in src.extra:
+                dst.extra[key] = self.copy_stage_output(src.extra[key])
         for key in self.deduplicated_extra_tensor_tree_output_keys:
             if key in src.extra:
                 dst.extra[key] = self.clone_tensor_tree(src.extra[key])

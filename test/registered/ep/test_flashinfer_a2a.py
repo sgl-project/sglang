@@ -1,16 +1,16 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=360, stage="nightly", runner_config="4-gpu-b200")
 
 DEEPSEEK_V3_FP4_MODEL = "nvidia/DeepSeek-V3-0324-FP4"
 QWEN3_FP8_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
@@ -33,9 +33,8 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
                 "4",
                 "--ep",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "flashinfer",
                 "--moe-runner-backend",
@@ -51,7 +50,7 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -84,9 +83,8 @@ class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
                 "4",
                 "--ep",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "flashinfer",
                 "--moe-runner-backend",
@@ -104,7 +102,7 @@ class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

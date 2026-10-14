@@ -8,7 +8,6 @@ from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
-from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
 from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
@@ -17,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
@@ -36,7 +36,7 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         for buf in (cls._stdout_buf, cls._stderr_buf):
             if buf is not None:
                 buf.close()
@@ -73,6 +73,12 @@ class CanaryE2EBase(CapturedServerE2EBase):
     # test methods send N sequential batches so the SWA allocator's full→swa index mapping
     # diverges from identity. Default 1 keeps MHA tests fast.
     workload_n_batches: ClassVar[int] = 1
+    # Default workload for send_parallel_requests, tuned for the CUDA-kernel canary
+    # path; a slower backend retunes its own subclass here instead of passing sizes at
+    # every call site.
+    default_parallel_n: ClassVar[int] = 8
+    default_max_new_tokens: ClassVar[int] = 2048
+    default_request_timeout: ClassVar[float] = 240.0
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
@@ -121,14 +127,24 @@ class CanaryE2EBase(CapturedServerE2EBase):
 
     def send_parallel_requests(
         self,
-        n: int = 8,
+        n: Optional[int] = None,
         *,
         assert_all_success: bool = True,
-        max_new_tokens: int = 2048,
-        timeout: float = 240.0,
+        max_new_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
         ignore_eos: Optional[bool] = None,
     ) -> list[dict]:
-        """Fan out n parallel /generate requests; return list of response dicts."""
+        """Fan out n parallel /generate requests; return list of response dicts.
+
+        Unset sizes fall back to the ``default_*`` class attributes, so a subclass can
+        retune the whole workload for its backend in one place.
+        """
+        if n is None:
+            n = self.default_parallel_n
+        if max_new_tokens is None:
+            max_new_tokens = self.default_max_new_tokens
+        if timeout is None:
+            timeout = self.default_request_timeout
         if ignore_eos is None:
             ignore_eos = self.model_mode == "swa"
         results = post_parallel_generate(

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -500,6 +501,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, new_num_img, self._IN_C),
             extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(
             extra={
@@ -555,6 +559,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, new_grid_h * new_grid_w, self._IN_C),
             extra=self._make_ctx_extra(B, old_grid_h * old_grid_w, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(extra={"ideogram4": old_data})
 
@@ -594,6 +601,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, grid_h * grid_w, self._IN_C),
             extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(
             extra={

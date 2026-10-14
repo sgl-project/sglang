@@ -26,9 +26,15 @@ from math import ceil
 from pathlib import Path
 from typing import Dict, List
 
-# Shared with warmup_server.py. Wipe alongside /root/.cache/deep_gemm if you
-# clear the DeepGEMM JIT cache — a stale marker → in-test JIT compile.
-MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
+from sglang.srt.environ import envs
+
+# Shared with warmup_server.py. Uses the same root as DG_JIT_CACHE_DIR below,
+# so overriding SGLANG_CACHE_DIR moves the markers and the cache together.
+# If only one moved, a marker could report a model as warmed while its cache
+# is empty, and the test would pay for the JIT compilation it should skip.
+MARKER_DIR = os.path.join(
+    os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), "warmup_markers"
+)
 
 # Outer cap for stuck fallback subprocesses; CRASH_MARKERS abort sooner.
 FALLBACK_TIMEOUT_SEC = 600
@@ -37,21 +43,19 @@ FALLBACK_TIMEOUT_SEC = 600
 # cache key includes per-rank N/K (depends on tp/dp/ep) — must match each
 # model's `other_args` in test/registered/ or warmed shapes won't be hit.
 FALLBACK_ARGS: Dict[str, List[str]] = {
-    "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
-    "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
+    "deepseek-ai/DeepSeek-V3.2": ["--attn-dp-size", "8"],
+    "zai-org/GLM-5-FP8": ["--attn-dp-size", "8"],
     "XiaomiMiMo/MiMo-V2-Flash": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--attention-backend",
         "fa3",
     ],
     # --mm-enable-dp-encoder is required: without it DP0 runs the vision
     # encoder alone and DP1 deadlocks at the next collective.
     "XiaomiMiMo/MiMo-V2.5": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--mm-enable-dp-encoder",
         "--attention-backend",
         "fa3",
@@ -67,11 +71,10 @@ CRASH_MARKERS = (
     "Received sigquit from a child",
 )
 
-# Configure DeepGEMM cache before importing deep_gemm
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
-)
+# Configure DeepGEMM cache before importing deep_gemm. Read through envs so
+# this warms the directory the server will actually compile into; duplicating
+# the default here is what let the two drift apart.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 BLOCK_SIZE = 128
@@ -115,7 +118,7 @@ def compute_deepseek_v2v3_shapes(config, tp):
     Shape derivation based on:
     - MoE: python/sglang/srt/layers/moe/fused_moe_triton/layer.py
     - MLA: python/sglang/srt/models/deepseek_v2.py
-    - FP8: python/sglang/srt/layers/quantization/fp8_kernel.py
+    - FP8 GEMM: python/sglang/kernels/ops/gemm/fp8_kernel.py
     """
     shapes = []
 
@@ -510,9 +513,7 @@ def main():
     )
     print(f"=== DeepGEMM Lightweight Warmup ({len(model_tp_pairs)} model(s)) ===")
     print(f"    Fast warmup: {fast_warmup}")
-    print(
-        f"    Cache dir: {os.environ.get('DG_JIT_CACHE_DIR', '~/.cache/deep_gemm')}\n"
-    )
+    print(f"    Cache dir: {os.environ['DG_JIT_CACHE_DIR']}\n")
 
     # Load configs and deduplicate by architecture
     seen_keys = {}

@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +24,7 @@ def _set_dummy_server_args():
 
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
+    monkeypatch.setattr(hash_topk_module, "_is_xpu", False)
     monkeypatch.setattr(
         hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
@@ -33,11 +34,9 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         def on_select_experts(self, *, topk_ids):
             recorded["topk_ids"] = topk_ids.clone()
 
-    monkeypatch.setattr(
-        hash_topk_module,
-        "get_global_expert_distribution_recorder",
-        lambda: FakeRecorder(),
-    )
+    from sglang.srt.runtime_context import get_resources
+
+    monkeypatch.setattr(get_resources(), "expert_distribution_recorder", FakeRecorder())
 
     topk = HashTopK(
         topk=3,
@@ -65,7 +64,9 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     )
 
     with (
-        get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
+        get_parallel().override(
+            tp_size=4, attn_tp_size=4, moe_ep_size=4, moe_ep_rank=2
+        ),
         hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
     ):
         output = topk(

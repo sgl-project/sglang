@@ -17,12 +17,19 @@ from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=17, suite="stage-b-test-1-gpu-large-amd")
+# The XPU attention backend calls the same fused kernel (Triton XPU backend).
+register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
 
 
 def reference_normal_decode_set_metadata(
@@ -31,7 +38,6 @@ def reference_normal_decode_set_metadata(
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    strided_indices: torch.Tensor,
     max_seq_pages: int,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
@@ -45,6 +51,11 @@ def reference_normal_decode_set_metadata(
     """
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
     cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
+    # Page-start columns, derived internally (the wrapper's dead
+    # strided_indices parameter was removed alongside its v2p args).
+    strided_indices = torch.arange(
+        0, req_to_token.shape[1], page_size, device=req_to_token.device
+    )
     page_indices = req_to_token[
         req_pool_indices[:, None],
         strided_indices[:max_seq_pages][None, :],
@@ -56,12 +67,31 @@ def reference_normal_decode_set_metadata(
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+def page_table_live_mask(
+    seq_lens: torch.Tensor,
+    seq_len_delta: int,
+    page_size: int,
+    max_seq_pages: int,
+    width: int,
+) -> torch.Tensor:
+    """Per-row live region of the page table: the fused kernel self-guards on
+    seq_len and leaves columns past pages(seq_len + delta) untouched."""
+    live_pages = torch.clamp(
+        (seq_lens + seq_len_delta + page_size - 1) // page_size, max=max_seq_pages
+    )
+    cols = torch.arange(width, device=seq_lens.device)
+    return cols.view(1, -1) < live_pages.view(-1, 1)
+
+
+@unittest.skipIf(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    "Test requires CUDA or XPU",
+)
 class TestNormalDecodeSetMetadata(CustomTestCase):
     """Test fused Triton kernel in normal_decode_set_metadata."""
 
     def setUp(self):
-        self.device = "cuda"
+        self.device = get_device()
         self.dtype = torch.int32
 
     def _create_test_data(
@@ -197,7 +227,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             ref_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -213,7 +242,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -235,14 +263,26 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             f"cu_seqlens_k mismatch. Expected:\n{ref_data['cu_seqlens_k']}\nGot:\n{test_data['cu_seqlens_k']}",
         )
 
+        live_mask = page_table_live_mask(
+            test_data["seq_lens"],
+            test_data["seq_len_delta"],
+            page_size,
+            test_data["max_seq_pages"],
+            test_data["page_table"].shape[1],
+        )
         self.assertTrue(
-            torch.equal(test_data["page_table"], ref_data["page_table"]),
+            torch.equal(
+                test_data["page_table"][live_mask], ref_data["page_table"][live_mask]
+            ),
             f"page_table mismatch at bs={batch_size}, page_size={page_size}",
         )
 
         if has_swa:
             self.assertTrue(
-                torch.equal(test_data["swa_page_table"], ref_data["swa_page_table"]),
+                torch.equal(
+                    test_data["swa_page_table"][live_mask],
+                    ref_data["swa_page_table"][live_mask],
+                ),
                 f"swa_page_table mismatch at bs={batch_size}, page_size={page_size}",
             )
 
@@ -323,7 +363,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -380,7 +419,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             ref_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             0,
@@ -395,7 +433,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             0,
@@ -412,7 +449,18 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         self.assertTrue(
             torch.equal(test_data["cu_seqlens_k"], ref_data["cu_seqlens_k"])
         )
-        self.assertTrue(torch.equal(test_data["page_table"], ref_data["page_table"]))
+        live_mask = page_table_live_mask(
+            test_data["seq_lens"],
+            0,
+            page_size,
+            test_data["max_seq_pages"],
+            test_data["page_table"].shape[1],
+        )
+        self.assertTrue(
+            torch.equal(
+                test_data["page_table"][live_mask], ref_data["page_table"][live_mask]
+            )
+        )
 
 
 if __name__ == "__main__":

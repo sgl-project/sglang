@@ -75,7 +75,7 @@ def _resolve_tbo_child_contexts():
     """Return (child_ctx_a, child_ctx_b) derived from the active TboAttnBackend,
     or (None, None) if the active backend is not a TBO dispatcher (e.g. a
     backend that handles TBO splitting internally like DeepSeek MHA's
-    _resolve_attn_backend path)."""
+    resolve_attn_backend path)."""
     # Lazy import to avoid circular dependency at module load time.
     from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
@@ -191,9 +191,9 @@ class _StateDict:
         if key == "_data":
             super().__setattr__(key, value)
             return
-        assert (
-            key not in self._data
-        ), f"`{key}` already exist, are you sure you want to override it?"
+        assert key not in self._data, (
+            f"`{key}` already exist, are you sure you want to override it?"
+        )
         self._data[key] = value
 
     def __getattr__(self, item):

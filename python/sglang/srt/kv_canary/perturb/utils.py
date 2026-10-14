@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
+from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 
@@ -51,8 +51,7 @@ class WarmupGate:
             return
 
         logger.info(
-            "kv_canary perturb: disabled during warmup window "
-            "(first %d forward steps)",
+            "kv_canary perturb: disabled during warmup window (first %d forward steps)",
             warmup_steps,
         )
         self._warmup_disable_logged = True
