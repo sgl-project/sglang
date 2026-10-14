@@ -70,7 +70,7 @@ class TestRunningBatchFinished(unittest.TestCase):
 
         def get_new_batch_prefill(running_batch):
             seen.append((list(running_batch.reqs), running_batch.batch_is_full))
-            # Chunked prefill keeps admission busy: every step runs a prefill.
+            # Chunked prefill keeps going: every step runs a prefill, never a decode.
             prefill = _Batch([], extend=True)
             return NextBatchPlan(batch_to_run=prefill, running_batch=running_batch)
 
@@ -88,9 +88,8 @@ class TestRunningBatchFinished(unittest.TestCase):
         plan = s.get_next_batch_to_run(
             running_batch=running, last_batch=_Batch([short], extend=True)
         )
-        self.assertEqual(seen[-1][0], [live, short])
+        self.assertEqual(seen[-1], ([live, short], True))
 
-        # Its result finishes it; the next step is a prefill again.
         short.done = True
         s.get_next_batch_to_run(
             running_batch=plan.running_batch, last_batch=plan.batch_to_run
@@ -99,16 +98,6 @@ class TestRunningBatchFinished(unittest.TestCase):
         self.assertEqual(reqs, [live])
         self.assertFalse(batch_is_full)
         s.update_running_batch.assert_not_called()
-
-    def test_full_batch_without_finished_requests_stays_full(self):
-        seen = []
-        s = self._scheduler(seen)
-        running = _Batch([_Req(), _Req()], extend=False, batch_is_full=True)
-
-        s.get_next_batch_to_run(running_batch=running, last_batch=None)
-        reqs, batch_is_full = seen[-1]
-        self.assertEqual(len(reqs), 2)
-        self.assertTrue(batch_is_full)
 
 
 if __name__ == "__main__":

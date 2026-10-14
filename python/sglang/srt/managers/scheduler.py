@@ -3847,9 +3847,8 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # Drop finished requests before admission on every step: under overlap a
-        # prefill's requests merge before its result finishes them, and the
-        # decode-only cleanup never runs while chunked prefill keeps going.
+        # Every step, not only after a merge: overlap merges a prefill's requests
+        # before its result finishes them, and update_running_batch may never run.
         running_bs = running_batch.batch_size()
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
