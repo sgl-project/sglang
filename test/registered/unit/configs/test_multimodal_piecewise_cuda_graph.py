@@ -44,6 +44,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 16
         return runner
 
