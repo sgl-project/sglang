@@ -60,7 +60,7 @@ extension, which only changes the presentation.
 | Parallel | `parallel_mode` auto or manual; manual sets `tp_size`, `ulysses_degree`, `ring_degree`, whose product must equal `num_gpus` |
 | Attention | `attention_backend`: auto (model default), flash_attention, torch_sdpa, sage_attention2, sage_attention3, sol_attention (H3; needs the `sol-attn` package; picking it fills `attention_backend_config` with its defaults), and the H3 sparse backends; `attention_backend_config` |
 | Quantization | `quantization` (online, native directories only); `int8_gemm`: GEMM implementation for INT8 ConvRot weights, auto / sglang_jit / comfy_kitchen |
-| Cache-DiT | `enable_cache_dit` (lossy step caching; currently effective for the MiniMax H3 family) |
+| Cache | `cache_mode`: off, cache_dit, teacache, spectrum (lossy). For cache_dit, `cache_dit_tuning` auto keeps the defaults; manual sets warmup steps, residual threshold, max consecutive cached steps and Fn compute blocks |
 | Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
 | Memory | `memory_mode`: resident or DiT layerwise offload; `resident_layers`, `prefetch_layers` |
 
@@ -69,12 +69,14 @@ worker and raises instead of dropping a setting. Current limits in integrated mo
 
 | Option | Supported for |
 | --- | --- |
-| cuda_graph | MiniMax H3, without `enable_cache_dit` or layerwise offload |
+| cuda_graph | MiniMax H3, with `cache_mode` off and no layerwise offload |
 | torch_compile | all but FastH3 and VDN-H3 |
 | ring_degree > 1 | not FastH3 / VDN-H3; MiniMax H3 needs `fa` |
 | quantization | native model directories; ComfyUI files carry their own format |
+| cache_dit, spectrum | MiniMax H3 family (spectrum: sequence-parallel degree 1); other models send each sampler step as its own request, so a step cache needs per-run state first |
+| teacache | none yet |
 
-Changing anything but `enable_cache_dit` restarts the worker on the next run.
+Changing anything but the Cache group restarts the worker on the next run.
 
 For development, run `node --test web/options_state.test.mjs` in this plugin
 folder and `python -m pytest python/sglang/multimodal_gen/test/unit/test_comfyui_options.py`

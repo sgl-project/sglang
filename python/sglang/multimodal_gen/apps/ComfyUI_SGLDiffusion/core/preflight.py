@@ -114,6 +114,9 @@ def check_sgld_options(sgld_options: dict) -> None:
 
 H3_MODELS = ("minimax_h3", "fast_h3", "vdn_h3")
 _DISTILLED_H3 = ("fast_h3", "vdn_h3")
+# Every ComfyUI step is its own request, so a step cache needs a per-run state;
+# only the H3 step stage keeps one today.
+_CACHE_MODELS = {"cache_dit": H3_MODELS, "spectrum": H3_MODELS, "teacache": ()}
 _ATTENTION_BY_MODEL = {
     "generic": ("fa", "torch_sdpa", "sage_attn", "sage_attn_3"),
     "minimax_h3": (
@@ -142,6 +145,7 @@ def check_model_options(
     """Reject combinations the resolved model cannot run, instead of ignoring them."""
     _check_execution(model_type, sgld_options)
     _check_attention_for_model(model_type, sgld_options)
+    _check_cache(model_type, sgld_options)
     _check_weights(model_type, sgld_options, native_dir=native_dir)
 
 
@@ -150,8 +154,8 @@ def _check_execution(model_type: str, opts: dict) -> None:
     if graph:
         if model_type != "minimax_h3":
             raise _unsupported("cuda_graph", model_type)
-        if opts.get("enable_cache_dit"):
-            raise ValueError("cuda_graph cannot be combined with enable_cache_dit")
+        if opts.get("cache_mode", "off") != "off":
+            raise ValueError("cuda_graph requires cache_mode=off")
         if opts.get("dit_layerwise_offload"):
             raise ValueError("cuda_graph cannot be combined with layerwise offload")
     if model_type in _DISTILLED_H3:
@@ -177,6 +181,21 @@ def _check_attention_for_model(model_type: str, opts: dict) -> None:
             f"attention_backend={backend} does not apply to {model_type}; "
             f"choose auto or one of {list(allowed)}"
         )
+
+
+def _check_cache(model_type: str, opts: dict) -> None:
+    mode = opts.get("cache_mode", "off")
+    if mode == "off":
+        return
+    if model_type not in _CACHE_MODELS[mode]:
+        raise _unsupported(mode, model_type)
+    if mode == "spectrum":
+        sp = (opts.get("ulysses_degree") or 1) * (opts.get("ring_degree") or 1)
+        if sp > 1 or ("sp_degree" not in opts and (opts.get("num_gpus") or 1) > 1):
+            raise ValueError(
+                "spectrum requires sequence parallel degree 1; set parallel_mode "
+                "manual with ulysses_degree=ring_degree=1"
+            )
 
 
 def _check_weights(model_type: str, opts: dict, *, native_dir: bool) -> None:

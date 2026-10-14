@@ -150,6 +150,15 @@ _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
 NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
 
+def _apply_cache_mode(executor, plugin: dict) -> None:
+    """Per-request cache switches; they never restart the worker."""
+    mode = plugin.get("cache_mode")
+    # None (no cache_mode given) keeps the worker's environment default.
+    executor.enable_cache_dit = None if mode is None else mode == "cache_dit"
+    executor.cache_dit_params = plugin.get("cache_dit_params")
+    executor.enable_spectrum = mode == "spectrum"
+
+
 @contextlib.contextmanager
 def _worker_env(values: dict):
     """Set env vars the spawned worker inherits, then restore this process's."""
@@ -598,7 +607,7 @@ class SGLDiffusionGenerator:
             check_model_options(
                 self.model_type, {**sgld_options, **plugin}, native_dir=native_dir
             )
-            self.executor.enable_cache_dit = plugin.get("enable_cache_dit")
+            _apply_cache_mode(self.executor, plugin)
             return self._patcher
 
         comfyui_model, model_config, model_type = self.get_comfyui_model(
@@ -641,7 +650,7 @@ class SGLDiffusionGenerator:
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
         )
-        self.executor.enable_cache_dit = plugin.get("enable_cache_dit")
+        _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor

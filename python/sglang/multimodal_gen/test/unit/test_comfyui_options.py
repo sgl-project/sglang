@@ -5,6 +5,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     SGLDiffusionGenerator,
@@ -31,6 +32,7 @@ def test_defaults_leave_layout_and_attention_to_the_worker() -> None:
         "enable_breakable_cuda_graph": False,
         "dit_layerwise_offload": False,
         "int8_kernel": "auto",
+        "cache_mode": "off",
     }
 
 
@@ -38,6 +40,40 @@ def test_display_names_map_to_sglang_backends() -> None:
     options = _options(attention_backend="flash_attention", int8_gemm="sglang_jit")
     assert options["attention_backend"] == "fa"
     assert options["int8_kernel"] == "jit"
+
+
+def test_cache_mode_reaches_the_h3_request() -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _apply_cache_mode,
+    )
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        MiniMaxH3Executor,
+    )
+    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+        resolve_cache_dit_request_overrides,
+    )
+
+    assert "cache_dit_params" not in _options(cache_mode="cache_dit")
+    assert "cache_dit_params" not in _options(cache_dit_tuning="manual")
+    options = _options(
+        cache_mode="cache_dit", cache_dit_tuning="manual", cache_threshold=0.3
+    )
+    params = options["cache_dit_params"]
+    assert resolve_cache_dit_request_overrides(params) == params
+
+    executor = object.__new__(MiniMaxH3Executor)
+    torch.nn.Module.__init__(executor)
+    packed = SimpleNamespace(guidance_scale=1.0, height=512, width=512)
+    _apply_cache_mode(executor, options)
+    request = executor._sampling_params_kwargs(packed, torch.tensor(1.0))
+    assert request["enable_cache_dit"] is True
+    assert request["cache_dit_params"]["residual_diff_threshold"] == 0.3
+    assert "enable_spectrum" not in request
+
+    _apply_cache_mode(executor, _options(cache_mode="spectrum"))
+    request = executor._sampling_params_kwargs(packed, torch.tensor(1.0))
+    assert request["enable_cache_dit"] is False
+    assert request["enable_spectrum"] is True
 
 
 def test_manual_layout_derives_sp_and_checks_gpu_count() -> None:
@@ -70,9 +106,9 @@ def test_execution_mode_maps_to_exactly_one_server_flag() -> None:
         ),
         (
             "minimax_h3",
-            {"execution_mode": "cuda_graph", "enable_cache_dit": True},
+            {"execution_mode": "cuda_graph", "cache_mode": "cache_dit"},
             False,
-            "enable_cache_dit",
+            "cache_mode=off",
         ),
         (
             "minimax_h3",
@@ -112,6 +148,14 @@ def test_execution_mode_maps_to_exactly_one_server_flag() -> None:
         ),
         ("flux", {"quantization": "fp8"}, False, "native model directories"),
         ("lumina2", {"int8_gemm": "comfy_kitchen"}, False, "no effect"),
+        (
+            "qwen_image",
+            {"cache_mode": "cache_dit"},
+            False,
+            "cache_dit is not supported",
+        ),
+        ("minimax_h3", {"cache_mode": "teacache"}, False, "teacache is not supported"),
+        ("minimax_h3", {"num_gpus": 2, "cache_mode": "spectrum"}, False, "degree 1"),
     ],
 )
 def test_preflight_rejects_what_the_model_cannot_run(
@@ -127,7 +171,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("minimax_h3", {"execution_mode": "cuda_graph"}, False),
         (
             "minimax_h3",
-            {"enable_cache_dit": True, "attention_backend": "sage_attention2"},
+            {"cache_mode": "cache_dit", "attention_backend": "sage_attention2"},
             False,
         ),
         (
@@ -137,11 +181,11 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ),
         (
             "minimax_h3",
-            {"int8_gemm": "comfy_kitchen"},
+            {"int8_gemm": "comfy_kitchen", "cache_mode": "spectrum"},
             False,
         ),
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),
-        ("vdn_h3", {"quantization": "fp8", "enable_cache_dit": True}, True),
+        ("vdn_h3", {"quantization": "fp8", "cache_mode": "cache_dit"}, True),
         ("qwen_image", {"execution_mode": "torch_compile"}, False),
     ],
 )

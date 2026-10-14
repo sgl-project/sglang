@@ -4,7 +4,7 @@ export const GROUPS = {
   parallel: 'Parallel',
   attention: 'Attention',
   quantization: 'Quantization',
-  cache: 'Cache-DiT',
+  cache: 'Cache',
   execution: 'Execution',
   memory: 'Memory',
 };
@@ -19,8 +19,11 @@ const SHORT = {
   sage_attention2: 'sage 2',
   sage_attention3: 'sage 3',
   sol_attention: 'sol',
+  cache_dit: 'Cache-DiT',
 };
 const short = value => SHORT[value] ?? value;
+
+const CACHE_KNOBS = ['cache_warmup_steps', 'cache_threshold', 'cache_max_cached_steps', 'cache_fn_blocks'];
 
 // Written into an empty attention_backend_config when the backend is picked, so
 // its knobs are visible and editable; the values match the backend's defaults.
@@ -36,6 +39,8 @@ export function visibleField(name, v) {
   if (['tp_size', 'ulysses_degree', 'ring_degree'].includes(name)) return v.parallel_mode === 'manual';
   if (name === 'regional_compile') return v.execution_mode === 'torch_compile';
   if (['resident_layers', 'prefetch_layers'].includes(name)) return v.memory_mode === 'layerwise_offload';
+  if (name === 'cache_dit_tuning') return v.cache_mode === 'cache_dit';
+  if (CACHE_KNOBS.includes(name)) return v.cache_mode === 'cache_dit' && v.cache_dit_tuning === 'manual';
   return true;
 }
 
@@ -44,7 +49,7 @@ export function groupSummary(group, v) {
   switch (group) {
     case 'execution': return short(v.execution_mode);
     case 'attention': return short(v.attention_backend);
-    case 'cache': return v.enable_cache_dit ? 'on' : 'off';
+    case 'cache': return short(v.cache_mode);
     case 'memory': return short(v.memory_mode);
     case 'parallel': return v.parallel_mode === 'manual'
       ? `TP${v.tp_size} U${v.ulysses_degree} R${v.ring_degree}` : 'auto';

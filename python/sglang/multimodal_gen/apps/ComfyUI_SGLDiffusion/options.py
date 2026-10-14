@@ -31,6 +31,8 @@ ATTENTION_BACKENDS = [
 ]
 MEMORY_MODES = ["resident", "layerwise_offload"]
 QUANTIZATIONS = ["none", "fp8", "convrot_int8", "mxfp8"]
+CACHE_MODES = ["off", "cache_dit", "teacache", "spectrum"]
+CACHE_DIT_TUNINGS = ["auto", "manual"]
 # Display names -> SGLang backend names; the rest are passed through unchanged.
 _ATTENTION_IDS = {
     "flash_attention": "fa",
@@ -43,7 +45,8 @@ _INT8_GEMMS = {"auto": "auto", "sglang_jit": "jit", "comfy_kitchen": "comfy_kitc
 
 PLUGIN_KEYS = (
     "model_type",
-    "enable_cache_dit",
+    "cache_mode",
+    "cache_dit_params",
     "int8_kernel",
 )
 
@@ -157,12 +160,40 @@ class SGLDOptions:
                     "comfy_kitchen. auto prefers sglang_jit.",
                 ),
                 # ===== cache =====
-                "enable_cache_dit": _field(
-                    "BOOLEAN",
-                    False,
+                "cache_mode": _field(
+                    CACHE_MODES,
+                    "off",
                     "cache",
-                    "Lossy step caching. MiniMax H3 only for now; other models run "
-                    "each sampler step as its own request.",
+                    "Lossy step caching; changing it does not restart the worker. "
+                    "Models that cannot run the selected cache are rejected.",
+                ),
+                "cache_dit_tuning": _field(
+                    CACHE_DIT_TUNINGS,
+                    "auto",
+                    "cache",
+                    "auto keeps the Cache-DiT defaults; manual sets the values below.",
+                ),
+                "cache_warmup_steps": _field(
+                    "INT", 4, "cache", "Steps run in full before caching starts.", min=0
+                ),
+                "cache_threshold": _field(
+                    "FLOAT",
+                    0.24,
+                    "cache",
+                    "Residual difference below which a step is cached; higher is "
+                    "faster and further from the uncached output.",
+                    min=0.0,
+                    step=0.01,
+                ),
+                "cache_max_cached_steps": _field(
+                    "INT",
+                    3,
+                    "cache",
+                    "Most consecutive steps served from cache.",
+                    min=0,
+                ),
+                "cache_fn_blocks": _field(
+                    "INT", 1, "cache", "Leading blocks always computed.", min=0
                 ),
                 # ===== execution =====
                 "execution_mode": _field(
@@ -218,8 +249,14 @@ class SGLDOptions:
             options["quantization"] = v["quantization"]
         if v["attention_backend_config"]:
             options["attention_backend_config"] = v["attention_backend_config"]
-        if v["enable_cache_dit"]:
-            options["enable_cache_dit"] = True
+        options["cache_mode"] = v["cache_mode"]
+        if v["cache_mode"] == "cache_dit" and v["cache_dit_tuning"] == "manual":
+            options["cache_dit_params"] = {
+                "max_warmup_steps": v["cache_warmup_steps"],
+                "residual_diff_threshold": v["cache_threshold"],
+                "max_continuous_cached_steps": v["cache_max_cached_steps"],
+                "Fn_compute_blocks": v["cache_fn_blocks"],
+            }
         return (options,)
 
 

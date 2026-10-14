@@ -4,7 +4,7 @@ import { defaultBackendConfig, groupSummary, headerLabel, visibleField } from '.
 
 const base = {
   model_type: 'minimax_h3', num_gpus: 1, parallel_mode: 'auto', execution_mode: 'eager',
-  attention_backend: 'auto', enable_cache_dit: false, memory_mode: 'resident',
+  attention_backend: 'auto', cache_mode: 'off', cache_dit_tuning: 'auto', memory_mode: 'resident',
   tp_size: 1, ulysses_degree: 1, ring_degree: 1, quantization: 'none', int8_gemm: 'auto',
 };
 
@@ -14,6 +14,8 @@ test('dependent fields follow their selector', () => {
   assert.equal(visibleField('parallel_mode', base), true);
   assert.equal(visibleField('regional_compile', { ...base, execution_mode: 'torch_compile' }), true);
   assert.equal(visibleField('resident_layers', { ...base, memory_mode: 'layerwise_offload' }), true);
+  assert.equal(visibleField('cache_threshold', { ...base, cache_mode: 'cache_dit' }), false);
+  assert.equal(visibleField('cache_threshold', { ...base, cache_mode: 'cache_dit', cache_dit_tuning: 'manual' }), true);
 });
 
 test('sol_attention fills an empty backend config but never overwrites one', () => {
