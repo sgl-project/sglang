@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import struct
 from array import array
 from typing import Sequence, Union
@@ -8,6 +9,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.multimodal.transport.npu_ipc import NpuIpcTensorTransportProxy
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 # Stable wire IDs. Changing these requires updating the golden-wire test.
@@ -16,6 +18,7 @@ _MSGPACK_EXT_TORCH_TENSOR = 2
 _MSGPACK_EXT_NP_ARRAY = 3
 _MSGPACK_EXT_SHM_POINTER_MM_DATA = 4
 _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY = 5
+_MSGPACK_EXT_NPU_IPC_TENSOR_PROXY = 6
 _MSGPACK_BUFFER_METADATA_SIZE = struct.Struct(">I")
 
 
@@ -150,6 +153,47 @@ def _decode_cuda_ipc_tensor_proxy(
     return obj
 
 
+def _encode_npu_ipc_tensor_proxy(obj: NpuIpcTensorTransportProxy) -> object:
+    state = _to_msgpack_state(obj.proxy_state)
+    raw_ipc_extra = obj.proxy_state.get("ipc_extra")
+    encoded_ipc_extra = state.get("ipc_extra")
+    if isinstance(raw_ipc_extra, dict) and isinstance(encoded_ipc_extra, dict):
+        # NPU handles come from torch.multiprocessing reduce_tensor and carry
+        # function references, which msgpack cannot encode; travel as pickled
+        # bytes instead (the same form the pickle transport uses).
+        pool_handle = raw_ipc_extra.get("pool_handle")
+        if pool_handle is not None:
+            encoded_ipc_extra["pool_handle"] = {"__pickle__": pickle.dumps(pool_handle)}
+    return {
+        "proxy_state": state,
+        # The origin pid decides whether an acknowledgement counts; it must
+        # travel by value, never be re-derived from the decoding process.
+        "origin_pid": obj._origin_pid,
+        "total_consumer_count": obj.total_consumer_count,
+    }
+
+
+def _decode_npu_ipc_tensor_proxy(
+    state: dict[str, object],
+) -> NpuIpcTensorTransportProxy:
+    obj = NpuIpcTensorTransportProxy.__new__(NpuIpcTensorTransportProxy)
+    proxy_state = _from_msgpack_state(state["proxy_state"])
+    ipc_extra = proxy_state.get("ipc_extra")
+    if isinstance(ipc_extra, dict):
+        encoded = ipc_extra.get("pool_handle")
+        if isinstance(encoded, dict) and "__pickle__" in encoded:
+            ipc_extra["pool_handle"] = pickle.loads(encoded["__pickle__"])
+    obj.proxy_state = proxy_state
+    obj.reconstruct_tensor = None
+    obj._consumer_acknowledged = False
+    obj._sync_buffer = None
+    obj._sync_buffer_data = None
+    obj._pool_tensor = None
+    obj._origin_pid = state["origin_pid"]
+    obj.total_consumer_count = state["total_consumer_count"]
+    return obj
+
+
 def enc_hook(obj: object) -> object:
     if isinstance(obj, array):
         return _pack_buffer_ext(
@@ -182,6 +226,11 @@ def enc_hook(obj: object) -> object:
         return _pack_ext(
             _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
             _encode_cuda_ipc_tensor_proxy(obj),
+        )
+    if isinstance(obj, NpuIpcTensorTransportProxy):
+        return _pack_ext(
+            _MSGPACK_EXT_NPU_IPC_TENSOR_PROXY,
+            _encode_npu_ipc_tensor_proxy(obj),
         )
     if _is_shm_pointer_mm_data(obj):
         return _pack_ext(
@@ -225,6 +274,7 @@ def ext_hook(code: int, data: memoryview) -> object:
         _MSGPACK_EXT_NP_ARRAY,
         _MSGPACK_EXT_SHM_POINTER_MM_DATA,
         _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
+        _MSGPACK_EXT_NPU_IPC_TENSOR_PROXY,
     ):
         return msgspec.msgpack.Ext(code, bytes(data))
 
@@ -245,4 +295,6 @@ def ext_hook(code: int, data: memoryview) -> object:
         return _decode_shm_pointer_mm_data(_unpack_ext(data))
     if code == _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY:
         return _decode_cuda_ipc_tensor_proxy(_unpack_ext(data))
+    if code == _MSGPACK_EXT_NPU_IPC_TENSOR_PROXY:
+        return _decode_npu_ipc_tensor_proxy(_unpack_ext(data))
     raise AssertionError(f"Unhandled known MessagePack extension code: {code}")

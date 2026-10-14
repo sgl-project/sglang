@@ -341,7 +341,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(base_processor, "CudaMmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -363,7 +363,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(base_processor, "CudaMmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -376,6 +376,31 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
+    def test_npu_ipc_pool_is_selected_on_ascend(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with (
+            envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "_is_npu", True),
+            patch.object(base_processor, "NpuMmItemMemoryPool") as npu_memory_pool,
+            patch.object(base_processor, "CudaMmItemMemoryPool") as cuda_memory_pool,
+        ):
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("npu_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "npu_ipc")
+        self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.keep_mm_features_on_device)
+        npu_memory_pool.assert_called_once()
+        cuda_memory_pool.assert_not_called()
+
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
@@ -384,7 +409,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(base_processor, "CudaMmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -408,7 +433,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(base_processor, "CudaMmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),

@@ -30,6 +30,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
     MultimodalProcessorOutput,
+    is_ipc_tensor_transport_proxy,
 )
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
@@ -41,9 +42,12 @@ from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MmItemMemoryPool as CudaMmItemMemoryPool,
+)
+from sglang.srt.multimodal.transport.npu_ipc import (
+    MmItemMemoryPool as NpuMmItemMemoryPool,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
 from sglang.srt.runtime_context import (
@@ -262,10 +266,11 @@ class BaseMultimodalProcessor(ABC):
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
+            if configured_mm_feature_transport
+            in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_cuda_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
@@ -437,6 +442,10 @@ class BaseMultimodalProcessor(ABC):
         ]
 
         if self.use_cuda_ipc and not skip_mm_pool:
+            from sglang.srt.multimodal.transport.cuda_ipc import (
+                get_mm_feature_pool_size_per_worker,
+            )
+
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
@@ -455,7 +464,8 @@ class BaseMultimodalProcessor(ABC):
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+            pool_cls = NpuMmItemMemoryPool if _is_npu else CudaMmItemMemoryPool
+            self.cudaipc_mmfeature_pool = pool_cls(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
@@ -465,7 +475,7 @@ class BaseMultimodalProcessor(ABC):
     @property
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -1709,8 +1719,8 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        """helper function to turn a tensor into a cuda-ipc or npu-ipc tensor"""
+        if tensor.device.type not in ("cuda", "npu"):
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
@@ -2022,7 +2032,7 @@ class BaseMultimodalProcessor(ABC):
             rollback_errors = []
             for item, field, tensor, wrapped in reversed(updates):
                 try:
-                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
+                    if is_ipc_tensor_transport_proxy(wrapped):
                         self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
                 except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)

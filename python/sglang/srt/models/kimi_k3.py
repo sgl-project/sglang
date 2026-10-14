@@ -3616,13 +3616,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
 
             device_index = device.index
-            if device.type == "cuda" and device_index is None:
+            if device.type in ("cuda", "npu") and device_index is None:
                 device_index = torch.cuda.current_device()
 
             selected_items = []
             for image_index in image_indices:
                 item = items[image_index]
-                if device.type == "cuda":
+                if device.type in ("cuda", "npu"):
                     item.reconstruct(device_index)
                 selected_items.append(item)
 

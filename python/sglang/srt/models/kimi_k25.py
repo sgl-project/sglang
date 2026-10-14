@@ -727,13 +727,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
             lease until request cleanup so cache eviction can re-run the encoder.
             """
             device_index = device.index
-            if device.type == "cuda" and device_index is None:
+            if device.type in ("cuda", "npu") and device_index is None:
                 device_index = torch.cuda.current_device()
 
             features = []
             for image_index in image_indices:
                 item = items[image_index]
-                if device.type == "cuda":
+                if device.type in ("cuda", "npu"):
                     item.reconstruct(device_index)
                 feature = item.feature
                 if not isinstance(feature, torch.Tensor):

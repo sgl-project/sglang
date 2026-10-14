@@ -867,6 +867,53 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             handle_multimodal_feature_transport(server_args)
 
+    @override_platform(is_npu=True)
+    def test_npu_ipc_is_explicit_and_bounded(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="npu_ipc",
+            tokenizer_worker_num=4,
+            base_gpu_id=2,
+        )
+
+        with (
+            patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}),
+            envs.SGLANG_MM_FEATURE_CACHE_MB.override(512),
+        ):
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
+
+            self.assertEqual(
+                resolution_result(server_args, "mm_feature_transport"), "npu_ipc"
+            )
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("Using NPU IPC for multimodal features", output)
+        self.assertIn("512 MiB", output)
+        self.assertIn("base NPU 2", output)
+        self.assertIn("4 tokenizer worker", output)
+        self.assertIn("falls back to CPU transport", output)
+
+    @override_platform(is_npu=False)
+    def test_npu_ipc_rejects_non_ascend_platforms(self):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="npu_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires Ascend NPU"):
+            handle_multimodal_feature_transport(server_args)
+
+    @override_platform(is_npu=True)
+    def test_npu_ipc_rejects_multi_node(self):
+        """NPU IPC handles are node-local, so an explicit npu_ipc on a
+        multi-node layout must be refused at resolution rather than boot a
+        server whose second node can never open the pool."""
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="npu_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "npu_ipc only supports a single node"):
+            handle_multimodal_feature_transport(server_args)
+
 
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):

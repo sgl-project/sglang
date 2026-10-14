@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.npu_ipc import NpuIpcTensorTransportProxy
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
@@ -345,6 +346,112 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 torch.tensor([1.0, 2.0], device="cpu"),
             )
         )
+
+    def test_npu_ipc_proxy_round_trip_with_real_reduced_handle(self):
+        # The production proxy carries a torch.multiprocessing reduce_tensor
+        # handle, whose tuple holds function references that msgpack cannot
+        # encode; the codec must move it as pickled bytes and restore it.
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        pool = torch.empty(4096, dtype=torch.int8)
+        handle = reduce_tensor(pool)
+
+        proxy = NpuIpcTensorTransportProxy.__new__(NpuIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": {
+                "pool_handle": handle,
+                "pool_byte_offset": 0,
+                "pool_device_index": 0,
+                "shape": torch.Size([4096]),
+                "dtype": torch.int8,
+                "stride": (1,),
+                "recons_shape": torch.Size([4096]),
+                "recons_dtype": torch.int8,
+                "sync_buffer_meta": None,
+                "use_pool_handle_cache": True,
+            }
+        }
+        proxy.reconstruct_tensor = None
+        proxy._consumer_acknowledged = False
+        proxy._sync_buffer = None
+        proxy._sync_buffer_data = None
+        proxy._pool_tensor = None
+        proxy._origin_pid = 4321
+        proxy.total_consumer_count = 1
+
+        encoded = msgspec.msgpack.encode(proxy, enc_hook=enc_hook)
+        decoded_proxy = msgspec.msgpack.decode(encoded, ext_hook=ext_hook)
+
+        self.assertIsInstance(decoded_proxy, NpuIpcTensorTransportProxy)
+        decoded_handle = decoded_proxy.proxy_state["ipc_extra"]["pool_handle"]
+        self.assertIsInstance(decoded_handle, tuple)
+        self.assertTrue(callable(decoded_handle[0]))
+        # The handle must still rebuild a usable storage.
+        rebuilt = decoded_handle[0](*decoded_handle[1])
+        self.assertEqual(rebuilt.numel(), 4096)
+
+    def test_npu_ipc_proxy_round_trip_preserves_ack_state(self):
+        proxy = NpuIpcTensorTransportProxy.__new__(NpuIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": {
+                "pool_handle": (b"pool-handle", 0),
+                "pool_byte_offset": 4096,
+                "pool_device_index": 0,
+                "shape": torch.Size([2, 3]),
+                "dtype": torch.bfloat16,
+                "stride": (3, 1),
+                "recons_shape": torch.Size([2, 3]),
+                "recons_dtype": torch.bfloat16,
+                "sync_buffer_meta": {
+                    "handle": "dummy",
+                    "shape": (4,),
+                    "dtype": np.dtype("int32"),
+                },
+                "use_pool_handle_cache": True,
+            }
+        }
+        proxy.reconstruct_tensor = None
+        proxy._consumer_acknowledged = False
+        proxy._sync_buffer = None
+        proxy._sync_buffer_data = None
+        proxy._pool_tensor = None
+        proxy._origin_pid = 4321
+        proxy.total_consumer_count = 4
+
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
+        self.assertIsInstance(decoded_proxy, NpuIpcTensorTransportProxy)
+        # The origin pid must travel by value: re-deriving it in the decoding
+        # process would suppress every acknowledgement.
+        self.assertEqual(decoded_proxy._origin_pid, 4321)
+        self.assertEqual(decoded_proxy.total_consumer_count, 4)
+        self.assertFalse(decoded_proxy._consumer_acknowledged)
+        self.assertIsNone(decoded_proxy.reconstruct_tensor)
+        ipc_extra = decoded_proxy.proxy_state["ipc_extra"]
+        self.assertIsInstance(ipc_extra["shape"], torch.Size)
+        self.assertEqual(ipc_extra["shape"], torch.Size([2, 3]))
+        self.assertEqual(ipc_extra["dtype"], torch.bfloat16)
+        self.assertIsInstance(ipc_extra["pool_handle"], tuple)
+        sync_meta = decoded_proxy.sync_data_meta
+        self.assertIsInstance(sync_meta["shape"], tuple)
+        self.assertIsInstance(sync_meta["dtype"], np.dtype)
 
     def test_evs_model_specific_data_round_trip(self):
         mm_inputs = self._make_mm_inputs()
