@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,69 @@ elif _is_mps:
     apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
+
+# Allowed characters for filename components: alphanumeric plus safe separators.
+_SAFE_FILENAME_RE = re.compile(r"^[a-zA-Z0-9._-]*$")
+
+
+def _sanitize_filename_component(value: str, field_name: str) -> str:
+    """Validate a user-supplied filename component used to construct profiler
+    output paths.
+
+    The profiler builds trace filenames by joining ``profile_prefix`` and
+    ``profile_id`` with an output directory. Without sanitization an attacker
+    could use path separators, ``..`` traversal segments, absolute paths or
+    null bytes to escape the configured output directory (CWE-22).
+
+    This helper rejects any value that is not a pure filename component: it
+    must be non-null, contain no directory separators, no ``..`` traversal,
+    no null bytes, and match a strict allow-list of characters.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Invalid {field_name}: expected a string, got {type(value).__name__}"
+        )
+
+    if "\x00" in value:
+        raise ValueError(
+            f"Invalid {field_name}: null bytes are not allowed"
+        )
+
+    # Reject any path separator regardless of OS convention.
+    if "/" in value or "\\" in value or os.path.sep in value:
+        raise ValueError(
+            f"Invalid {field_name}: path separators are not allowed"
+        )
+
+    # Reject traversal components (both standalone and embedded variants).
+    normalized = value.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    if any(part == ".." for part in parts):
+        raise ValueError(
+            f"Invalid {field_name}: '..' path traversal is not allowed"
+        )
+    # Guard against edge cases like "." or filenames that resolve to "."
+    if value in (".", ".."):
+        raise ValueError(
+            f"Invalid {field_name}: '{value}' is not a safe filename component"
+        )
+
+    # Absolute-path guard.
+    if value.startswith("/") or value.startswith("\\") or (
+        len(value) >= 2 and value[1] == ":" and value[0].isalpha()
+    ):
+        raise ValueError(
+            f"Invalid {field_name}: absolute paths are not allowed"
+        )
+
+    # Strict allow-list.
+    if not _SAFE_FILENAME_RE.match(value):
+        raise ValueError(
+            f"Invalid {field_name}: only alphanumeric characters, '.', '_', "
+            f"and '-' are allowed"
+        )
+
+    return value
 
 
 @dataclass(kw_only=True)
@@ -101,6 +165,25 @@ class SchedulerProfilerManager:
         detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
+        # --- Input validation for filename components (security fix for
+        # path traversal, issue #44189). Both V1 and V2 profilers use these
+        # values to build filenames that get joined to an output directory,
+        # so sanitize them once at the entry point.
+        try:
+            profile_id = _sanitize_filename_component(profile_id, "profile_id")
+        except ValueError as e:
+            return ProfileReqOutput(success=False, message=str(e))
+
+        # profile_prefix is optional (default ""); allow empty strings to
+        # continue, only validate non-empty ones.
+        if profile_prefix:
+            try:
+                profile_prefix = _sanitize_filename_component(
+                    profile_prefix, "profile_prefix"
+                )
+            except ValueError as e:
+                return ProfileReqOutput(success=False, message=str(e))
+
         if envs.SGLANG_PROFILE_V2.get():
             self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
