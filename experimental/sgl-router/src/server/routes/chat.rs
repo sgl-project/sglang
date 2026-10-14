@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forward;
+mod openai;
 mod preparation;
 mod reorg;
 
@@ -25,7 +26,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +46,24 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, CHAT_PATH, headers, body).await
+}
+
+/// OpenAI completions; see [`PreparedRequest::openai`].
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, COMPLETIONS_PATH, headers, body).await
+}
+
+async fn openai_route(
+    ctx: &AppContext,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -52,15 +72,10 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-    let routing = ModelRouting::lookup(&ctx, &model)?;
-    let request = PreparedRequest::chat(
-        &ctx,
-        model,
-        fields,
-        body,
-        routing.needs_request_tokens(&ctx),
-    )?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let routing = ModelRouting::lookup(ctx, &model)?;
+    let tokens = routing.needs_request_tokens(ctx);
+    let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;
+    routing.dispatch(ctx, request, headers, start).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -158,7 +173,9 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Select workers for `request` and forward it to them.
+    /// Select workers for `request` and forward it to them. An attempt that
+    /// fails before any response reaches the client is retried, after a
+    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
     async fn dispatch(
         &self,
         ctx: &AppContext,
@@ -166,9 +183,46 @@ impl<'a> ModelRouting<'a> {
         headers: HeaderMap,
         start: Instant,
     ) -> Result<Response<Body>, ApiError> {
-        let workers = self.select_workers(ctx, &request, &headers, &[]).await?;
-        let duration = RequestDurationGuard::new(ctx, &request.model, start);
-        forward_request(ctx, &mut request, workers, headers, start, &duration).await
+        let mut excluded = Vec::new();
+        let mut failed = None;
+        let mut duration = None;
+        for attempt in 0..ctx.config.proxy.max_attempts.get() {
+            if attempt > 0 {
+                // A retry never starts past the request's stale deadline, so the
+                // backoff is capped by what remains of it. Backing off before
+                // selecting lets the pick see fresh breaker and load state.
+                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    break;
+                };
+                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+                if start.elapsed() >= deadline {
+                    break;
+                }
+            }
+            let workers = match self
+                .select_workers(ctx, &request, &headers, &excluded)
+                .await
+            {
+                Ok(workers) => workers,
+                // Every eligible worker already failed this request: report the last failure.
+                Err(error) => return failed.ok_or(error),
+            };
+            if failed.is_some() {
+                ctx.metrics.record_retry(&request.model.0);
+            }
+            let duration = duration
+                .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let attempt =
+                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
+                    .await?;
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
+            }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
+        }
+        Ok(failed.expect("at least one attempt"))
     }
 
     /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
