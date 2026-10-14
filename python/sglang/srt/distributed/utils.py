@@ -60,6 +60,11 @@ def get_global_tcp_store() -> Optional[TCPStore]:
     return store
 
 
+def get_group_rank_size(group) -> Tuple[int, int]:
+    """Read rank and size from a retained owner; None denotes an unsharded layout."""
+    return (0, 1) if group is None else (group.rank_in_group, group.world_size)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(

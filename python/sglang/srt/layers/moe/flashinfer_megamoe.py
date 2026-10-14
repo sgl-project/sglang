@@ -138,9 +138,7 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 
 
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    import inspect
-
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+    if mega.supports_output_view:
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -287,26 +285,46 @@ def _ensure_flashinfer_megamoe_layer(
         layer.hidden_size,
     )
 
+    process_group = None
+    if world_size > 1:
+        from sglang.srt.runtime_context import get_parallel
+
+        process_group = get_parallel().moe_ep_group.device_group
+    bootstrap = BootstrapConfig(
+        world_size=world_size,
+        rank=rank,
+        device=torch.cuda.current_device(),
+        process_group=process_group,
+    )
+    fleet_params = FleetParams(
+        num_experts=layer.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        token_hidden_size=layer.hidden_size,
+    )
+    backend = MegaConfig(
+        megakernel=megakernel_config,
+        preprocess_weights=False,
+        transformed_weights=transformed_weights,
+    )
     mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(
-            world_size=world_size, rank=rank, device=torch.cuda.current_device()
-        ),
-        fleet_params=FleetParams(
-            num_experts=layer.num_experts,
-            max_tokens_per_rank=max_tokens_per_rank,
-            token_hidden_size=layer.hidden_size,
-        ),
+        bootstrap=bootstrap,
+        fleet_params=fleet_params,
         # weights already preprocessed in prepare_*; with transformed_weights set
         # the kernel never reads `weights` (see MoEEpMegaLayer), so pass None.
         weights=None,
-        backend=MegaConfig(
-            megakernel=megakernel_config,
-            preprocess_weights=False,
-            transformed_weights=transformed_weights,
-        ),
+        backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+    if hasattr(megakernel_config, "knobs"):
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            MegaMoeTunedForward,
+        )
+
+        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
+            bootstrap, fleet_params, backend
+        )
+    else:
+        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
 
@@ -360,12 +378,9 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
-            fc1_alpha=layer.g1_alphas,
-            fc2_alpha=layer.g2_alphas,
-            fc1_norm_const=layer.w2_input_scale_quant,
         ),
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
@@ -386,7 +401,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -536,49 +551,6 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
-def _ensure_shared_workspace(mega: Any) -> None:
-    """Share this layer's workspace across MegaMOE layers with identical
-    fleet/kernel geometry.
-    FlashInfer's own workspace pool keys by fc1_alpha/fc2_alpha/fc1_norm_const
-    tensor identity, but sglang binds distinct tensor objects per layer, so
-    its pool never hits across layers; key on geometry instead, since those
-    values are re-staged into the workspace per forward rather than baked
-    into the compiled kernel. Creation is collective, so it must only happen
-    on a layer's first forward, under warmup's cross-rank lockstep.
-    """
-    if mega._workspace is not None:
-        return
-    fp = mega._fleet_params
-    kc = mega._megakernel_config
-    mc = mega._mega_config
-    from sglang.srt.runtime_context import get_resources
-
-    key = (
-        getattr(kc, "kernel_name", kc.__class__.__name__),
-        mega._bootstrap.world_size,
-        fp.num_experts,
-        fp.max_tokens_per_rank,
-        fp.token_hidden_size,
-        kc.top_k,
-        kc.intermediate_size,
-        getattr(kc, "gate_up_clamp", None),
-        getattr(kc, "activation_clamp", None),
-        getattr(kc, "apply_topk_in_fc1", None),
-        getattr(kc, "kind", None),
-        getattr(kc, "in_kernel_fc2_reduce", None),
-        getattr(kc, "combine_dtype", None),
-        getattr(kc, "token_back_by_dispatch", None),
-        getattr(kc, "fast_math", None),
-        mc.quantize_input,
-    )
-    workspaces = get_resources().flashinfer_megamoe_workspaces
-    shared = workspaces.get(key)
-    if shared is None:
-        workspaces[key] = mega._ensure_workspace()
-    else:
-        mega._workspace = shared
-
-
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
@@ -599,7 +571,6 @@ def run_flashinfer_megamoe(
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
-    _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
@@ -607,6 +578,7 @@ def run_flashinfer_megamoe(
         # directly into its final int64 workspace buffer. Keep this path copy-free.
         topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
+        # Stage per-layer scales on every call so FlashInfer can pool workspaces.
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
