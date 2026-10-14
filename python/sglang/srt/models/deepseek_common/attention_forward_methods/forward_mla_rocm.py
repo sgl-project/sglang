@@ -1100,8 +1100,10 @@ class DeepseekMLARocmForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
         """
+        # The fused write targets the unsharded loc and its core path takes no LSE.
         return (
             _use_aiter_gfx95
+            and self.dcp_size == 1
             and self.current_attention_backend in ("dsa", "nsa")
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")

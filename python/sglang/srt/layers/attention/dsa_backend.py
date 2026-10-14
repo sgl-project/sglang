@@ -2208,6 +2208,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
@@ -2295,6 +2296,18 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if self.dcp_size > 1:
+                assert topk_transform_method == TopkTransformMethod.PAGED
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -2552,6 +2565,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2623,6 +2637,17 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if self.dcp_size > 1:
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3424,6 +3449,51 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
         )
+
+    def _forward_triton_dcp(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        layer: RadixAttention,
+        topk_indices: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend the owned slots of the global top-k; one query row per token."""
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        rows, heads = q_nope.shape[0], q_nope.shape[1]
+        if rows == 0:
+            return (
+                q_nope.new_empty((rows, heads, v_head_dim), dtype=torch.bfloat16),
+                q_nope.new_empty((rows, heads), dtype=torch.float32),
+            )
+        local_page_table, _ = localize_dcp_page_table(
+            self._dcp_page_table_cache,
+            metadata=self.forward_metadata,
+            layer_id=layer.layer_id,
+            topk_indices=topk_indices,
+            page_table=page_table_1[:rows].contiguous(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+        )
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=local_page_table.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            workspace=workspace,
+            return_lse=True,
+        )
+        return out.view(rows, heads, v_head_dim), lse
 
     def _forward_intel_xpu_sparse_decode(
         self,

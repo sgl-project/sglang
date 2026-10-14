@@ -112,6 +112,8 @@ def _sparse_mla_decode_fused_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_I64_PAGE: tl.constexpr = True,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -259,6 +261,10 @@ def _sparse_mla_decode_fused_kernel(
         acc2 = tl.where(l_i[:, None] > 0.0, acc2 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 4:
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
+    if STORE_LSE:
+        # Finite floor: the DCP merge weights an empty rank by exp2(lse - max).
+        lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
+        tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
     o_base = out_ptr + t * H * D_V
     tl.store(
@@ -505,7 +511,8 @@ def triton_sparse_mla_decode_splitk(
     d_v: int = 512,
     kv_splits: int | None = None,
     workspace: _SplitKWorkspace | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
     q_nope:  [bs, H, d_v] fp8/bf16
@@ -513,7 +520,7 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    returns: [1, bs, H, d_v] bf16
+    returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8
@@ -582,6 +589,11 @@ def triton_sparse_mla_decode_splitk(
         kv_splits = min(kv_splits, max_kv_splits)
 
     qk_scale = float(sm_scale) * LOG2E
+    lse = (
+        torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
 
     if kv_splits == 1:
         fused_num_warps = 4
@@ -616,10 +628,12 @@ def triton_sparse_mla_decode_splitk(
                     and topk >= 2048
                     and _page_offsets_fit_i32(kv.shape[0], kv_dim)
                 ),
+                lse_out_ptr=lse,
+                STORE_LSE=return_lse,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
-        return out.unsqueeze(0)
+        return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
@@ -677,9 +691,11 @@ def triton_sparse_mla_decode_splitk(
         ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
+        lse_out_ptr=lse,
+        STORE_LSE=return_lse,
         num_warps=4,
     )
-    return out.unsqueeze(0)
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
