@@ -9,6 +9,7 @@
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
+/python/sglang/kernels/ops/mono/common_hip @HaiShaw @kkHuang-amd @kevin-mii
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @HaiShaw @BowenBao @OrangeRedeng @TallMessiWu
