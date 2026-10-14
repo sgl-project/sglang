@@ -20,8 +20,11 @@ def stated_tp_group():
         yield
 
 
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
-@pytest.mark.parametrize("num_tokens", [0, 1, 6, 8, 17, 32, 64])
+@pytest.mark.parametrize(
+    "hidden_size,num_tokens",
+    # 16 tokens is the GLM fused-boundary cutoff, which only the 4096 checks need.
+    [(h, m) for h in (4096, 7168) for m in (0, 1, 6, 8, 17, 32, 64)] + [(4096, 16)],
+)
 @pytest.mark.parametrize("use_norm", [False, True])
 def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch, hidden_size, num_tokens, use_norm, stated_tp_group
@@ -100,17 +103,18 @@ def test_mhc_fused_post_pre_matches_unfused(
         norm_eps=norm_eps,
     )
 
-    if hidden_size == 4096 and num_tokens in (0, 1, 6, 17):
-        _check_glm_boundary(
-            x,
-            residual,
-            post_prev,
-            comb_prev,
-            fn,
-            hc_scale,
-            hc_base,
-            use_norm=use_norm,
-        )
+    if hidden_size == 4096 and num_tokens in (0, 1, 6, 16, 17):
+        for check in (_check_glm_boundary, _check_glm_attn_boundary):
+            check(
+                x=x,
+                residual=residual,
+                post=post_prev,
+                comb=comb_prev,
+                fn=fn,
+                scale=hc_scale,
+                base=hc_base,
+                use_norm=use_norm,
+            )
 
     torch.cuda.synchronize()
     if num_tokens == 0:
@@ -141,10 +145,7 @@ def test_mhc_fused_post_pre_matches_unfused(
     torch.testing.assert_close(layer_out, layer_ref, atol=layer_atol, rtol=layer_rtol)
 
 
-def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.layer_boundary import MHCState
-    from sglang.srt.layers.layernorm import RMSNorm
+def _glm_mhc_layer():
     from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
 
     layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
@@ -156,6 +157,15 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
         hc_eps=1e-6,
         hc_sinkhorn_iters=20,
     )
+    return layer
+
+
+def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.layer_boundary import MHCState
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    layer = _glm_mhc_layer()
     layer.hc_ffn_fn = torch.nn.Parameter(fn)
     layer.hc_ffn_scale = torch.nn.Parameter(scale)
     layer.hc_ffn_base = torch.nn.Parameter(base)
@@ -175,7 +185,9 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     # Literal, not derived from the cutoff constant: deriving it makes this a
     # mirror that stays green when the cutoff moves. None is the empty batch,
     # which update_and_read_ffn_input short-circuits before reaching the callback.
-    fused_expected = {1: True, 6: True, 17: False}[x.shape[0]] if x.shape[0] else None
+    fused_expected = (
+        {1: True, 6: True, 16: True, 17: False}[x.shape[0]] if x.shape[0] else None
+    )
     with envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True):
         if x.shape[0] > 0:
             declined = (
@@ -207,6 +219,106 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
         atol=2e-3,
         rtol=2e-2,
     )
+
+
+def _check_glm_attn_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
+    """The attention read must use the previous layer's coefficients,
+    this layer's attention parameters, and clear the previous layer's."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.layer_boundary import MHCState
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    layer = _glm_mhc_layer()
+    layer.hc_attn_fn = torch.nn.Parameter(fn)
+    layer.hc_attn_scale = torch.nn.Parameter(scale)
+    layer.hc_attn_base = torch.nn.Parameter(base)
+    # Distinct FFN parameters: a read that takes them must not match.
+    layer.hc_ffn_fn = torch.nn.Parameter(fn.flip(0))
+    layer.hc_ffn_scale = torch.nn.Parameter(scale.flip(0))
+    layer.hc_ffn_base = torch.nn.Parameter(base + 0.5)
+    norm = RMSNorm(x.shape[-1], eps=1e-6).to(x) if use_norm else None
+
+    def state(**kwargs):
+        return MHCState(
+            hc_mult=4,
+            hc_attn_pre=layer.hc_attn_pre,
+            hc_ffn_pre=layer.hc_ffn_pre,
+            hc_post=layer.hc_post,
+            **kwargs,
+        )
+
+    previous = [
+        state(
+            hc_attn_post_pre=layer.hc_attn_post_pre,
+            h_res=comb.flatten(1),
+            h_post=post.flatten(1),
+        )
+        for _ in range(2)
+    ]
+    current = [state(hc_attn_post_pre=c) for c in (None, layer.hc_attn_post_pre)]
+    fused_expected = (
+        {1: True, 6: True, 16: True, 17: False}[x.shape[0]] if x.shape[0] else None
+    )
+    with envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True):
+        if x.shape[0] > 0:
+            declined = (
+                layer.hc_attn_post_pre(
+                    hidden_states=x,
+                    residual=residual.flatten(1),
+                    h_res=comb.flatten(1),
+                    h_post=post.flatten(1),
+                    out_norm_weight=None,
+                    out_norm_eps=None,
+                )
+                is None
+            )
+            assert declined is not fused_expected, (
+                f"num_tokens={x.shape[0]} fused={not declined}, "
+                f"expected fused={fused_expected}"
+            )
+        outputs = [
+            cur.residual_ops().attn_readout.update_and_read(
+                update=prev.residual_ops().ffn_update,
+                hidden_states=x,
+                residual=residual.flatten(1),
+                norm=norm,
+            )
+            for prev, cur in zip(previous, current)
+        ]
+        if x.shape[0] > 0:
+            # Independent of MHCState's wiring: hc_post, then this layer's hc_attn_pre.
+            expected_residual = layer.hc_post(
+                hidden_states=x,
+                residual=residual.flatten(1),
+                h_res=comb.flatten(1),
+                h_post=post.flatten(1),
+            )
+            expected_input, expected_comb, expected_post, norm_fused = (
+                layer.hc_attn_pre(
+                    hidden_states=expected_residual,
+                    out_norm_weight=None if norm is None else norm.weight.data,
+                    out_norm_eps=None if norm is None else norm.variance_epsilon,
+                )
+            )
+            if norm is not None and not norm_fused:
+                expected_input = norm(expected_input)
+            torch.testing.assert_close(
+                outputs[0][0], expected_input, atol=2e-2, rtol=2e-2
+            )
+            torch.testing.assert_close(
+                current[0].h_res, expected_comb, atol=1e-3, rtol=1e-3
+            )
+            torch.testing.assert_close(
+                current[0].h_post, expected_post, atol=1e-3, rtol=1e-3
+            )
+    torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=0, rtol=0)
+    torch.testing.assert_close(current[0].h_res, current[1].h_res, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        current[0].h_post, current[1].h_post, atol=1e-3, rtol=1e-3
+    )
+    for prev in previous:
+        assert prev.h_res is None and prev.h_post is None
 
 
 def _hopper_mhc_layer(norm, w, scale, base):

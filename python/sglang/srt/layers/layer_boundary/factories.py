@@ -503,15 +503,16 @@ def _reject_unsupported(stage):
     cannot bind, naming the combination. The rejections that depend on the
     rows of one edge are made where that edge binds (``_bind_stage``)."""
     parallel = get_parallel()
-    if stage.update.applied_at_exit:
+    # Non-plain FFN updates, at exit or deferred, have never run with these layouts.
+    if stage.kind is StageKind.FFN and not stage.update.is_plain_add:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
-                "an update applied at the stage's exit with a MoE gathered over "
+                "an FFN update other than a plain add with a MoE gathered over "
                 "the MoE-CP group"
             )
         if parallel.attn_cp_size > 1 and input_scattered_configured():
             raise NotImplementedError(
-                "an update applied at the stage's exit with input-scattered "
+                "an FFN update other than a plain add with input-scattered "
                 "attention under attention CP"
             )
     if stage.kind is StageKind.FFN and stage.sparse and parallel.attn_cp_size > 1:

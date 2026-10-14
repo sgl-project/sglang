@@ -286,13 +286,14 @@ def _bind_stage(
     variants = {}
     for variant, edge in incoming.entries.items():
         if (
-            declaration.update.applied_at_exit
+            declaration.kind is StageKind.FFN
+            and not declaration.update.is_plain_add
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()
         ):
             raise NotImplementedError(
-                "an update applied at the stage's exit with a gather over attention CP"
+                "an FFN update other than a plain add with a gather over attention CP"
             )
         attn_input_adapter = None
         if declaration.kind is StageKind.ATTENTION:
