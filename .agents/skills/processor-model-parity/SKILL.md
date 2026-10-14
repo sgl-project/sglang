@@ -54,10 +54,12 @@ renders the model:
   `PromptFormatter`, replace that branch.
 - **Python calls `apply_chat_template`** (Jinja, spec `None`): give the model a
   variant holding Dynamo's Jinja `PromptFormatter`, picked in
-  `ChatFormatter::from_tokenizer_config` from the template text as
-  `parser/template_detection.py` picks it, and build the template context that
-  `_process_messages` and `_apply_jinja_template` build, like GLM-5.3
-  (`models/glm53.rs`).
+  `ChatFormatter::from_tokenizer_config` from the template text (as
+  `parser/template_detection.py` picks it, where it has a detector), and build the
+  template context that `_process_messages` and `_apply_jinja_template` build, like
+  GLM-5.3 (`models/glm53.rs`) and Qwen3.8 (`models/qwen38.rs`). Dynamo's formatter
+  rewrites shapes its load-time probes find the template rejects (a later system
+  turn, for one); SGLang raises on them, so check those before rendering.
 
 ## Method
 

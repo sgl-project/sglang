@@ -14,14 +14,11 @@ register_cuda_ci(
     est_time=700,
     stage="extra-b",
     runner_config="8-gpu-b300",
-    disabled="Temporarily disabled: NaN in EAGLE verify target logits on B300.",
 )
 
 GLM52_NVFP4_MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
 
-# Also skip selective reruns, which bypass the registry's disabled marker.
-@unittest.skip("Temporarily disabled: NaN in EAGLE verify target logits on B300")
 class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     """1P1D GLM-5.2 MTP with HiSparse target KV and dense draft KV transfer."""
 
@@ -53,7 +50,12 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 6}',
     ]
-    extra_prefill_args = common_args
+    # PD transfers KV bytes without converting layouts. Match FlashMLA decode's
+    # packed FP8 layout; Blackwell defaults prefill to TRT-LLM's raw FP8 layout.
+    extra_prefill_args = common_args + [
+        "--dsa-prefill-backend",
+        "flashmla_kv",
+    ]
     extra_decode_args = common_args + [
         "--attn-dp-size",
         "4",
