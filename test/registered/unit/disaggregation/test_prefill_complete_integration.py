@@ -1,13 +1,16 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
 import threading
+import time
 import unittest
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
@@ -19,15 +22,25 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,13 +49,41 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class _BroadcastGroup:
+    """Stands in for the PP group's object broadcast in one process."""
+
+    def __init__(self):
+        self.obj = None
+
+    def broadcast_object(self, obj, src=0):
+        if obj is not None:
+            self.obj = obj
+        return self.obj
+
+
 class TestAllocationConfiguration(CustomTestCase):
+    def test_pp_prefill_keeps_optimistic_prefill_only_for_prefill_complete(self):
+        for policy, attempts in (("prefill_complete", 1), ("early", 0)):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    disaggregation_decode_allocation_policy=policy,
+                    optimistic_prefill_attempts=1,
+                    pp_size=4,
+                )
+                handle_pd_disaggregation(args)
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolving_view(args).optimistic_prefill_attempts, attempts
+                )
+
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
             {"disaggregation_mode": "null"},
             {"disaggregation_transfer_backend": "nixl"},
             {"tp_size": 2},
-            {"pp_size": 2},
+            {"disaggregation_mode": "decode", "pp_size": 2},
             {"attn_cp_size": 2},
             {"dcp_size": 2},
             {"enable_hisparse": True},
@@ -121,30 +162,53 @@ class TestAllocationIntegration(CustomTestCase):
     def flush(self):
         while self.wire:
             endpoint, msg = self.wire.popleft()
-            if endpoint == "tcp://prefill:1":
-                self.prefill._handle_bootstrap_message(msg)
-            else:
-                self.assertEqual(endpoint, "tcp://decode:2")
-                room, status, rank, reason = self.decode.parse_kv_status_message(msg)
-                self.decode.apply_prefill_status(
-                    bootstrap_room=room,
-                    status=status,
-                    prefill_rank=rank,
-                    failure_reason=reason,
-                )
+            ip, port = endpoint.removeprefix("tcp://").split(":")
+            mgr = self.endpoints[(ip, int(port))]
+            if mgr is not self.decode:
+                mgr._handle_bootstrap_message(msg)
+                continue
+            room, status, rank, reason = self.decode.parse_kv_status_message(msg)
+            self.decode.apply_prefill_status(
+                bootstrap_room=room,
+                status=status,
+                prefill_rank=rank,
+                failure_reason=reason,
+            )
+
+    def pp_stages(self, pp_size):
+        """Prefill managers of one PP server; stage statuses replicate to stage 0."""
+        group = _BroadcastGroup()
+        stages = [self.prefill]
+        for pp_rank in range(1, pp_size):
+            stages.append(self.manager("prefill", 1 + 2 * pp_rank))
+        for pp_rank, mgr in enumerate(stages):
+            mgr.request_status = PPConsensusStore(pp_size, pp_rank, group)
+            self.addCleanup(mgr.request_status.close)
+            mgr._prefill_unique_rank = Mock(return_value=pp_rank)
+            self.endpoints[(mgr.local_ip, mgr.rank_port)] = mgr
+        return stages
+
+    def wait_until(self, condition):
+        deadline = time.monotonic() + 5
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, "condition not met")
+            time.sleep(0.01)
 
     def sender(self, room=1):
         return MooncakeKVSender(self.prefill, "prefill:8998", room)
 
-    def receiver(self, room=1, policy="prefill_complete"):
+    def receiver(self, room=1, policy="prefill_complete", stages=None):
+        stages = stages or [self.prefill]
         receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
-        receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
+        receiver.bootstrap_infos = [
+            {"rank_ip": mgr.local_ip, "rank_port": mgr.rank_port} for mgr in stages
+        ]
         self.decode.prefill_info_table = {
             receiver.bootstrap_addr: PrefillServerInfo(
                 attn_tp_size=1,
                 attn_cp_size=1,
                 dp_size=1,
-                pp_size=1,
+                pp_size=len(stages),
                 page_size=1,
                 kv_cache_dtype=None,
                 follow_bootstrap_room=True,
@@ -152,17 +216,20 @@ class TestAllocationIntegration(CustomTestCase):
                 target_tp_rank=0,
                 target_tp_ranks=[0],
                 target_cp_ranks=[0],
-                target_pp_ranks=[0],
+                target_pp_ranks=list(range(len(stages))),
                 required_dst_info_num=1,
-                required_prefill_response_num=1,
+                required_prefill_response_num=len(stages),
             )
         }
-        sock = SimpleNamespace(
-            send_multipart=lambda msg: self.wire.append(("tcp://prefill:1", msg))
-        )
-        receiver._connect_to_bootstrap_server = Mock(
-            return_value=(sock, threading.Lock())
-        )
+
+        def connect(info):
+            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            sock = SimpleNamespace(
+                send_multipart=lambda msg: self.wire.append((endpoint, msg))
+            )
+            return sock, threading.Lock()
+
+        receiver._connect_to_bootstrap_server = Mock(side_effect=connect)
         with patch.object(receiver, "_setup_bootstrap_infos"):
             receiver.init(0)
         return receiver
@@ -557,6 +624,167 @@ class TestAllocationIntegration(CustomTestCase):
 
             scheduler.process_disagg_prefill_inflight_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
+
+    def test_pp_prefill_room_succeeds_only_after_every_stage(self):
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        receiver = self.receiver(stages=stages)
+        self.flush()
+        # Stage 0 finishes the last chunk first; its readiness alone admits the room.
+        senders[0].mark_prefill_complete()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        stages[0].conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        senders[0].clear()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        # The last stage's readiness can trail stage 0's Success, never its own.
+        senders[1].mark_prefill_complete()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        stages[1].conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        senders[1].clear()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def pp_parked_schedulers(self, senders, queued_senders=None):
+        """One scheduler per PP stage, each holding the same parked request and,
+        if given, the same request waiting in the bootstrap queue."""
+        polls_from_stage0 = []
+        self.pp_syncs = []
+
+        def sync_polls(polls, pp_group, pp_rank, pp_size, work_list):
+            self.pp_syncs.append(pp_rank)
+            if pp_rank == 0:
+                polls_from_stage0.append(polls)
+            return polls_from_stage0[-1]
+
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.disaggregation.utils.pp_sync_polls", side_effect=sync_polls
+            ),
+        )
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.disaggregation.utils._all_reduce_polls",
+                side_effect=lambda polls, group: polls,
+            ),
+        )
+
+        def finalize(req):
+            req.pending_bootstrap = False
+            return True
+
+        schedulers = []
+        for pp_rank, sender in enumerate(senders):
+            req = SimpleNamespace(
+                rid="parked", disagg_kv_sender=sender, pending_bootstrap=True
+            )
+            scheduler = self.inflight_scheduler([req])
+            scheduler.pp_group = None
+            scheduler.waiting_queue = []
+            scheduler.handle_bootstrap_failure = Mock()
+            queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+            queue.queue = []
+            if queued_senders is not None:
+                queue.queue.append(
+                    SimpleNamespace(
+                        rid="queued",
+                        disagg_kv_sender=queued_senders[pp_rank],
+                        prefill_attempt_count=0,
+                        is_retracted=False,
+                        metadata_buffer_index=0,
+                        time_stats=MagicMock(),
+                    )
+                )
+            queue.pp_rank, queue.pp_size = pp_rank, len(senders)
+            queue.pp_poll_sync_work_list = []
+            scheduler.processed_tokens_counter = 0
+            queue.scheduler = scheduler
+            queue.scheduler_stage_metrics = None
+            queue.finalize_bootstrap = Mock(side_effect=finalize)
+            scheduler.disagg_prefill_bootstrap_queue = queue
+            schedulers.append(scheduler)
+        return schedulers
+
+    def pp_step(self, schedulers):
+        """One PP loop iteration's bootstrap step, in PP rank order."""
+        for scheduler in schedulers:
+            self.pp_syncs.clear()
+            SchedulerPPMixin.process_bootstrapped_queue(scheduler)
+            # A stage's send of a poll sync completes only once the next stage
+            # receives it in the same iteration; a second sync would deadlock.
+            self.assertLessEqual(len(self.pp_syncs), 1)
+
+    def test_pp_stages_finalize_parked_prefill_on_consensus_only(self):
+        """Finalizing re-checkpoints the radix cache, so a stage acting on its own
+        poll would schedule against a different cache than the other stages."""
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        queued = [MooncakeKVSender(mgr, "prefill:8998", 2) for mgr in stages]
+        schedulers = self.pp_parked_schedulers(senders, queued_senders=queued)
+        reqs = [scheduler.disagg_prefill_inflight_queue[0] for scheduler in schedulers]
+        # Decode destinations reach the last stage first.
+        stages[1].update_status(1, KVPoll.WaitingForInput)
+        self.wait_until(
+            lambda: (
+                stages[0].request_status.collect(1)
+                == [KVPoll.Bootstrapping, KVPoll.WaitingForInput]
+            )
+        )
+        self.pp_step(schedulers)
+        for scheduler, req in zip(schedulers, reqs):
+            scheduler.send_kv_chunk.assert_not_called()
+            self.assertTrue(req.pending_bootstrap)
+            # The queued request is admitted on the same shared poll.
+            self.assertEqual([r.rid for r in scheduler.waiting_queue], ["queued"])
+            self.assertEqual(scheduler.disagg_prefill_bootstrap_queue.queue, [])
+        stages[0].update_status(1, KVPoll.WaitingForInput)
+        self.wait_until(
+            lambda: (
+                stages[0].request_status.collect(1)
+                == [KVPoll.WaitingForInput, KVPoll.WaitingForInput]
+            )
+        )
+        self.pp_step(schedulers)
+        for scheduler, req in zip(schedulers, reqs):
+            scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
+            self.assertFalse(req.pending_bootstrap)
+            self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+
+    def test_pp_stage_local_bootstrap_failure_drops_parked_prefill_everywhere(self):
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        schedulers = self.pp_parked_schedulers(senders)
+        reqs = [scheduler.disagg_prefill_inflight_queue[0] for scheduler in schedulers]
+        # Decode's cancellation reached the last stage only.
+        senders[1].abort()
+        self.wait_until(lambda: stages[0].request_status.collect(1)[1] == KVPoll.Failed)
+        self.pp_step(schedulers)
+        for scheduler, req in zip(schedulers, reqs):
+            scheduler.handle_bootstrap_failure.assert_called_once_with(req)
+            self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+            scheduler.send_kv_chunk.assert_not_called()
+
+    def test_pp_chunked_prefill_ignores_stage_local_bootstrap_failure(self):
+        """Releasing a chunked request on one stage's poll desynchronizes the PP
+        stages, which keep scheduling its next chunk."""
+        for pp_size in (1, 2):
+            with self.subTest(pp_size=pp_size):
+                sender = self.sender(room=pp_size)
+                sender.abort()
+                req = SimpleNamespace(
+                    rid="chunked", disagg_kv_sender=sender, pending_bootstrap=True
+                )
+                scheduler = self.inflight_scheduler([])
+                scheduler.handle_bootstrap_failure = Mock()
+                with get_parallel().override(pp_size=pp_size):
+                    self.assertFalse(scheduler.check_bootstrap(req))
+                self.assertEqual(
+                    scheduler.handle_bootstrap_failure.call_count, int(pp_size == 1)
+                )
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()

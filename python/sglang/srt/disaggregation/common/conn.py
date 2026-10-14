@@ -934,7 +934,8 @@ class CommonKVManager(BaseKVManager):
             logger.debug("Dropping late status for cleared room %s", bootstrap_room)
             return
         if status == KVPoll.WaitingForInput and self.defer_decode_allocation:
-            # The policy currently requires one authoritative prefill rank.
+            # Any prefill rank's readiness admits the room: each PP stage sends
+            # its readiness before its own Success on the same socket.
             # Do not mix this notification into the transfer-success counter.
             self.update_status(bootstrap_room, KVPoll.WaitingForInput)
             return
@@ -2533,9 +2534,9 @@ class CommonKVReceiver(BaseKVReceiver):
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
         elif policy == "prefill_complete" and (
-            info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
+            info.attn_tp_size != 1 or info.attn_cp_size != 1
         ):
-            reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+            reason = "prefill_complete requires peer attention TP1/CP1"
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)

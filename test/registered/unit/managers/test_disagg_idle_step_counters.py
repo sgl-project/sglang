@@ -194,7 +194,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             patch(
                                 f"{PP_MODULE}.get_disagg",
                                 return_value=SimpleNamespace(
-                                    disaggregation_decode_enable_offload_kvcache=False
+                                    disaggregation_decode_enable_offload_kvcache=False,
+                                    disaggregation_decode_allocation_policy="early",
                                 ),
                             ),
                             patch(f"{PP_MODULE}.set_time_batch"),
