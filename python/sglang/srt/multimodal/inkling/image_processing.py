@@ -86,8 +86,9 @@ def _load_image_bytes(image) -> bytes:
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
         path = image[len("file://") :] if image.startswith("file://") else image
-        with open(path, "rb") as f:
-            return f.read()
+        from sglang.srt.utils.common import _read_local_media_file
+
+        return _read_local_media_file(path)
 
     from PIL import Image
 

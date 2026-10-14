@@ -39,6 +39,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1853,6 +1854,43 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+def _reject_oversized_local_media(max_bytes: int) -> None:
+    raise ValueError(f"Local media exceeds the {max_bytes} byte size limit")
+
+
+def _assert_local_media_file(path: str) -> os.stat_result:
+    # Same byte cap as download_remote_media; 0 disables it. Stat before open,
+    # because opening a FIFO blocks and a device read does not reach EOF.
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("Local media path is not a regular file")
+    max_bytes = _media_url_max_file_size_bytes
+    if max_bytes and st.st_size > max_bytes:
+        _reject_oversized_local_media(max_bytes)
+    return st
+
+
+def _read_local_media_file(path: str) -> bytes:
+    _assert_local_media_file(path)
+    max_bytes = _media_url_max_file_size_bytes
+    content = bytearray()
+    with open(path, "rb") as handle:
+        # The path can be replaced between the stat above and this open.
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("Local media path is not a regular file")
+        if max_bytes and st.st_size > max_bytes:
+            _reject_oversized_local_media(max_bytes)
+        while True:
+            chunk = handle.read(64 * 1024)
+            if not chunk:
+                break
+            if max_bytes and len(content) + len(chunk) > max_bytes:
+                _reject_oversized_local_media(max_bytes)
+            content.extend(chunk)
+    return bytes(content)
+
+
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
 CLIENT_MEDIA_EXCEPTIONS = (
@@ -1893,6 +1931,7 @@ def load_audio(
     if isinstance(source, bytes):
         header = source[:16]
     else:
+        _assert_local_media_file(source)
         with open(source, "rb") as audio_stream:
             header = audio_stream.read(16)
 
@@ -2145,9 +2184,16 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
+    # file:// is not stripped here; the rust loader strips it on purpose.
+    if image_file.startswith("file://"):
         with open(image_file, "rb") as f:
             return f.read()
+    if image_file.startswith("/"):
+        try:
+            return _read_local_media_file(image_file)
+        except FileNotFoundError:
+            with open(image_file, "rb") as f:
+                return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
@@ -2175,8 +2221,12 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
+            path = unquote(urlparse(video_file).path)
+            _assert_local_media_file(path)
+            return path
         elif os.path.isfile(unquote(urlparse(video_file).path)):
+            path = unquote(urlparse(video_file).path)
+            _assert_local_media_file(path)
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)
@@ -2193,8 +2243,7 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
     if isinstance(source, bytes):
         return source
     if isinstance(source, str):
-        with open(source, "rb") as f:
-            return f.read()
+        return _read_local_media_file(source)
     raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 

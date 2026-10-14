@@ -41,8 +41,9 @@ def _load_audio_bytes(audio) -> bytes:
         return audio.read()
     if isinstance(audio, str):
         path = audio[len("file://") :] if audio.startswith("file://") else audio
-        with open(path, "rb") as f:
-            return f.read()
+        from sglang.srt.utils.common import _read_local_media_file
+
+        return _read_local_media_file(path)
     raise TypeError(
         f"Unsupported audio input type for Inkling audio extractor: {type(audio)}"
     )
