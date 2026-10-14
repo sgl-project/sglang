@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda_alike
 
 
 def vision_topk(
@@ -43,7 +43,7 @@ def vision_topk(
         correction_bias_vl = torch.zeros_like(correction_bias_vl)
     num_shared_topk_slots = config.num_shared_topk_slots
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    if is_cuda():
+    if is_cuda_alike():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
         # Same admission as _fused_gate_emits_packed_ids: the shared-expert slots
