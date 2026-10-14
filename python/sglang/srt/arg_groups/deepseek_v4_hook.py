@@ -27,10 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 def _mega_attention_available() -> bool:
-    try:
-        from sgl_kernel.flash_mla_mega import is_flash_mla_mega_available
-    except ImportError:
-        return False
+    from sgl_kernel.flash_mla_mega import is_flash_mla_mega_available
+
     return is_flash_mla_mega_available()
 
 
@@ -43,38 +41,30 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         model.hf_config.model_type != "deepseek_v41"
         or cfg.device != "cuda"
         or not is_sm100_supported()
+        or not _mega_attention_available()
     ):
         return "flashmla"
     text = model.hf_text_config
     layout = envs.SGLANG_DSV4_KV_LAYOUT
     quant = getattr(model.hf_config, "quantization_config", None) or {}
-    attn_tp_size = cfg.tp_size // (cfg.attn_dp_size or 1)
-    if attn_tp_size < 1:
-        return "flashmla"
+    attn_tp_size = cfg.tp_size // cfg.attn_dp_size
     if (
         cfg.kv_cache_dtype != "fp8_e4m3"
         or cfg.cuda_graph_config.prefill.backend
         not in (Backend.DISABLED, Backend.BREAKABLE)
         or cfg.enable_encoder_swa_bounded_replay
-        or cfg.enable_hisparse
         or cfg.disaggregation_mode != "null"
-        or cfg.attn_cp_size > 1
-        or cfg.dcp_size > 1
         or cfg.enable_prefill_cp
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
-        or getattr(text, "q_head_norm", True)
-        or getattr(text, "head_dim", None) != 512
-        or getattr(text, "qk_rope_head_dim", None) != 64
-        or getattr(text, "num_attention_heads", 0) != 8 * getattr(text, "o_groups", 0)
-        or getattr(text, "num_attention_heads", 0) // attn_tp_size
-        != 8 * (getattr(text, "o_groups", 0) // attn_tp_size)
-        or not 8 <= getattr(text, "num_attention_heads", 0) // attn_tp_size <= 128
+        or text.num_attention_heads != 8 * text.o_groups
+        or text.o_groups % attn_tp_size
+        or text.num_attention_heads // attn_tp_size > 128
+        # Fp8 WO-A keeps its absorb GEMM; the fused path takes BF16 WO-A only.
         or (
             envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
             and quant.get("quant_method") == "fp8"
             and quant.get("weight_block_size") == [128, 128]
         )
-        or not _mega_attention_available()
     ):
         return "flashmla"
     return "flashmla_mega"

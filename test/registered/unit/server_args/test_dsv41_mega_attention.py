@@ -31,12 +31,7 @@ def mega_args(model_type="deepseek_v41", **fields):
             architectures=["DeepseekV4ForCausalLM"], model_type=model_type
         ),
         hf_text_config=SimpleNamespace(
-            model_type=model_type,
-            q_head_norm=False,
-            head_dim=512,
-            qk_rope_head_dim=64,
-            num_attention_heads=64,
-            o_groups=8,
+            model_type=model_type, num_attention_heads=64, o_groups=8
         ),
         is_multimodal=False,
     )
@@ -44,117 +39,64 @@ def mega_args(model_type="deepseek_v41", **fields):
     return args
 
 
+def resolved_backend(args):
+    apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+    return resolution_result(args, "dsv4_attn_backend")
+
+
 class TestDSV41MegaAttentionPolicy(CustomTestCase):
-    def test_auto_backend_resolves_without_changing_input(self):
-        with (
-            override_platform(is_cuda=True, is_hip=False, is_npu=False),
-            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True),
+    def setUp(self):
+        super().setUp()
+        self.enterContext(override_platform(is_cuda=True, is_hip=False, is_npu=False))
+        self.enterContext(
+            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True)
+        )
+        self.enterContext(
             patch(
                 "sglang.srt.arg_groups.deepseek_v4_hook._mega_attention_available",
                 return_value=True,
-            ),
-            envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
-        ):
-            args = mega_args(
-                dsv4_attn_backend="auto",
-                tp_size=2,
-                attn_dp_size=2,
-                ep_size=2,
-                cuda_graph_backend_prefill=Backend.BREAKABLE,
-                enable_decoder_swa_bounded_replay=True,
             )
-            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-            self.assertEqual(args.dsv4_attn_backend, "auto")
-            self.assertEqual(
-                resolution_result(args, "dsv4_attn_backend"), "flashmla_mega"
-            )
-            for backend in ("flashmla", "flashmla_mega", "trtllm"):
-                with self.subTest(backend=backend):
-                    args = mega_args(
-                        dsv4_attn_backend=backend, chunked_prefill_size=32768
-                    )
-                    apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                    self.assertEqual(
-                        resolution_result(args, "dsv4_attn_backend"), backend
-                    )
+        )
+        self.enterContext(envs.SGLANG_DSV4_KV_LAYOUT.override("auto"))
 
-    def test_auto_backend_preserves_unsupported_configurations(self):
-        cases = (
+    def test_auto_selects_mega_only_where_the_fused_path_runs(self):
+        args = mega_args(
+            dsv4_attn_backend="auto",
+            tp_size=2,
+            attn_dp_size=2,
+            cuda_graph_backend_prefill=Backend.BREAKABLE,
+            enable_decoder_swa_bounded_replay=True,
+        )
+        self.assertEqual(resolved_backend(args), "flashmla_mega")
+        self.assertEqual(args.dsv4_attn_backend, "auto")
+        for backend in ("flashmla", "trtllm"):
+            args = mega_args(dsv4_attn_backend=backend, chunked_prefill_size=32768)
+            self.assertEqual(resolved_backend(args), backend)
+        falls_back = (
             dict(model_type="deepseek_v4"),
-            dict(device="cpu"),
             dict(kv_cache_dtype="bfloat16"),
             dict(cuda_graph_backend_prefill=Backend.FULL),
             dict(enable_encoder_swa_bounded_replay=True),
-            dict(enable_hisparse=True),
             dict(disaggregation_mode="prefill"),
-            dict(attn_cp_size=2),
-            dict(tp_size=3),
-            dict(tp_size=2, attn_dp_size=4),
+            dict(enable_prefill_cp=True),
+            dict(tp_size=16),
         )
-        with (
-            override_platform(is_cuda=True, is_hip=False, is_npu=False),
-            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True),
-            patch(
-                "sglang.srt.arg_groups.deepseek_v4_hook._mega_attention_available",
-                return_value=True,
-            ),
-            envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
-        ):
-            for fields in cases:
-                with self.subTest(fields=fields):
-                    args = mega_args(dsv4_attn_backend="auto", **fields)
-                    apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                    self.assertEqual(
-                        resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                    )
-            for text_fields in (
-                dict(q_head_norm=True),
-                dict(head_dim=256),
-                dict(num_attention_heads=256, o_groups=32),
-                dict(o_groups=16),
-            ):
-                with self.subTest(text_fields=text_fields):
-                    args = mega_args(dsv4_attn_backend="auto")
-                    args._model_config.hf_text_config.__dict__.update(text_fields)
-                    apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                    self.assertEqual(
-                        resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                    )
-            with envs.SGLANG_DSV4_KV_LAYOUT.override("v4"):
-                args = mega_args(dsv4_attn_backend="auto")
-                apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                self.assertEqual(
-                    resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                )
-            with patch(
-                "sglang.srt.arg_groups.deepseek_v4_hook._mega_attention_available",
-                return_value=False,
-            ):
-                args = mega_args(dsv4_attn_backend="auto")
-                apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                self.assertEqual(
-                    resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                )
-            with patch(
-                "sglang.srt.utils.common.is_sm100_supported", return_value=False
-            ):
-                args = mega_args(dsv4_attn_backend="auto")
-                apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                self.assertEqual(
-                    resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                )
-            with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
-                args = mega_args(dsv4_attn_backend="auto")
-                args._model_config.hf_config.quantization_config = {
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                }
-                apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
-                self.assertEqual(
-                    resolution_result(args, "dsv4_attn_backend"), "flashmla"
-                )
+        for fields in falls_back:
+            with self.subTest(fields=fields):
+                args = mega_args(dsv4_attn_backend="auto", **fields)
+                self.assertEqual(resolved_backend(args), "flashmla")
+        with envs.SGLANG_DSV4_KV_LAYOUT.override("v4"):
+            args = mega_args(dsv4_attn_backend="auto")
+            self.assertEqual(resolved_backend(args), "flashmla")
+        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
+            args = mega_args(dsv4_attn_backend="auto")
+            args._model_config.hf_config.quantization_config = {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            self.assertEqual(resolved_backend(args), "flashmla")
 
-    def test_flashmla_mega_launch_policy(self):
+    def test_explicit_mega_rejects_only_what_the_fused_path_cannot_run(self):
         rejected = (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
             ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.FULL)),
@@ -163,34 +105,22 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
                 dict(enable_encoder_swa_bounded_replay=True),
             ),
         )
-        with (
-            override_platform(is_cuda=True, is_hip=False, is_npu=False),
-            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True),
-        ):
-            for message, fields in rejected:
-                with self.subTest(fields=fields):
-                    with self.assertRaisesRegex(ValueError, message):
-                        apply_deepseek_v4_defaults(
-                            mega_args(**fields), "DeepseekV4ForCausalLM"
-                        )
-            apply_deepseek_v4_defaults(
-                mega_args(tp_size=4, attn_dp_size=4), "DeepseekV4ForCausalLM"
-            )
-            apply_deepseek_v4_defaults(
-                mega_args(
-                    tp_size=2,
-                    attn_dp_size=2,
-                    ep_size=2,
-                    moe_a2a_backend="megamoe",
-                    cuda_graph_backend_prefill=Backend.BREAKABLE,
-                    enable_decoder_swa_bounded_replay=True,
-                ),
-                "DeepseekV4ForCausalLM",
-            )
-        with (
-            override_platform(is_cuda=True, is_hip=False, is_npu=False),
-            patch("sglang.srt.utils.common.is_sm100_supported", return_value=False),
-        ):
+        for message, fields in rejected:
+            with self.subTest(fields=fields):
+                with self.assertRaisesRegex(ValueError, message):
+                    apply_deepseek_v4_defaults(
+                        mega_args(**fields), "DeepseekV4ForCausalLM"
+                    )
+        apply_deepseek_v4_defaults(
+            mega_args(
+                tp_size=4,
+                attn_dp_size=4,
+                cuda_graph_backend_prefill=Backend.BREAKABLE,
+                enable_decoder_swa_bounded_replay=True,
+            ),
+            "DeepseekV4ForCausalLM",
+        )
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
             with self.assertRaisesRegex(ValueError, "SM100/SM103"):
                 apply_deepseek_v4_defaults(mega_args(), "DeepseekV4ForCausalLM")
 

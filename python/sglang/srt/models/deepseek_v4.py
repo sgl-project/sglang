@@ -2519,10 +2519,7 @@ class MQALayer(MqaAttentionBase):
                     forward_batch.forward_mode.is_extend()
                     and is_in_breakable_cuda_graph()
                 ):
-                    o = q.new_empty(
-                        (q.shape[0], self.n_local_groups, self.o_lora_rank),
-                        dtype=torch.bfloat16,
-                    )
+                    o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
                     bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
                 else:
                     data, scale = attn_backend.forward(

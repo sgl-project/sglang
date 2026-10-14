@@ -10,20 +10,14 @@ from sglang.srt.runtime_context import get_buffer
 
 def use_mega_paged_prefill(
     num_query_tokens: int,
-    seq_lens: list[int],
+    seq_lens_cpu: torch.Tensor,
     compress_ratio: int,
     num_heads: int,
 ) -> bool:
-    if (
-        num_heads != 64
-        or compress_ratio not in (1, 2)
-        or not 0 < num_query_tokens <= 1024
-        or not seq_lens
-    ):
+    if num_heads != 64 or compress_ratio not in (1, 2) or num_query_tokens > 1024:
         return False
-    # Gathered prefill dequantizes each request's live compressed history.
-    # GB300 sweeps favor paged reads when this cost dominates a short extension.
-    gather_tokens = sum(length // compress_ratio for length in seq_lens)
+    # GB300 sweeps: paged reads win once the dequantized history dominates a short extension.
+    gather_tokens = int(seq_lens_cpu.sum()) // compress_ratio
     return gather_tokens >= max(32768, 192 * num_query_tokens)
 
 

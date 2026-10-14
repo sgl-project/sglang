@@ -3554,10 +3554,7 @@ class DeepseekV4AttnBackend(
                 self.mega_attn
                 and forward_batch.seq_lens_cpu is not None
                 and use_mega_paged_prefill(
-                    num_qo_tokens,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    compress_ratio,
-                    num_heads,
+                    num_qo_tokens, forward_batch.seq_lens_cpu, compress_ratio, num_heads
                 )
             )
             or self.tail_forward_metadata is not None
@@ -3738,17 +3735,12 @@ class DeepseekV4AttnBackend(
                 )
 
             use_mega_paged = (
-                self.mega_attn
-                and cos_sin_cache is not None
+                cos_sin_cache is not None
                 and extra_k_cache is not None
                 and extra_k_cache.shape[-1] == 288
                 and forward_batch.forward_mode.is_extend_without_speculative()
-                and forward_batch.seq_lens_cpu is not None
                 and use_mega_paged_prefill(
-                    q.shape[0],
-                    forward_batch.seq_lens_cpu.tolist(),
-                    compress_ratio,
-                    q.shape[-2],
+                    q.shape[0], forward_batch.seq_lens_cpu, compress_ratio, q.shape[-2]
                 )
             )
 
@@ -3781,7 +3773,7 @@ class DeepseekV4AttnBackend(
                     cos_sin_cache=cos_sin_cache,
                 )
 
-            if self.mega_attn and cos_sin_cache is not None:
+            if cos_sin_cache is not None:
                 from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
                 data, scale, _ = flash_mla_mega_decode(
@@ -3966,7 +3958,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if self.mega_attn and cos_sin_cache is not None:
+        if cos_sin_cache is not None:
             from sgl_kernel.flash_mla_mega import flash_mla_mega_prefill
 
             data, scale, _, _ = flash_mla_mega_prefill(
