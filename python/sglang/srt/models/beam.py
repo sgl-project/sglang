@@ -380,7 +380,7 @@ class BeamMoE(nn.Module):
                 router_gemm_bf16x3_cutile,
             )
 
-            self.cutile_router_gemm = router_gemm_bf16x3_cutile
+            self.router_gemm_bf16x3_cutile = router_gemm_bf16x3_cutile
             self.gate.quant_method = BeamRouterLinearMethod()
         # Tiny GEMM up to 16 tokens.
         self.use_fp32_router = (
@@ -415,7 +415,9 @@ class BeamMoE(nn.Module):
                 hidden_states, self.gate.weight, out_dtype=torch.float32
             )
         if self.use_cutile_router:
-            return self.cutile_router_gemm(hidden_states, self.gate.bf16x3_weight)
+            return self.router_gemm_bf16x3_cutile(
+                hidden_states, self.gate.bf16x3_weight
+            )
         if router_gemv_supported(hidden_states, self.gate.weight):
             return router_gemv(hidden_states, self.gate.weight)
         return router_gemm_bf16x3_cublas(hidden_states, self.gate.weight)

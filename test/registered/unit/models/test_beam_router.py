@@ -83,7 +83,7 @@ def test_router_refresh_and_dispatch(m, nvfp4):
     weight_ptr = router.gate.weight.data_ptr()
     x = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
     with patch.object(
-        router, "cutile_router_gemm", wraps=router.cutile_router_gemm
+        router, "router_gemm_bf16x3_cutile", wraps=router.router_gemm_bf16x3_cutile
     ) as gemm:
         router._router_logits(x)
         assert gemm.call_count == int(m > 16)
