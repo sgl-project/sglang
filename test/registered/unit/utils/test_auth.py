@@ -1,15 +1,38 @@
 """Unit tests for srt/utils/auth.py — no server, no model loading."""
 
 import unittest
+from pathlib import Path
 
 from sglang.srt.utils.auth import (
+    ADMIN_API_KEY_HELP,
+    API_KEY_HELP,
     AuthDecision,
     AuthLevel,
     auth_level,
     decide_request_auth,
+    single_key_authorizes_admin_optional,
+    warn_single_key_admin_optional,
+)
+
+# Paths named by #43706. Literals, so dropping one from the warning or help fails here.
+_ADMIN_OPTIONAL_EXAMPLES = (
+    "/update_weights_from_disk",
+    "/load_lora_adapter",
+    "/start_profile",
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_SERVER_ARGS_DOC = (
+    _REPO_ROOT / "docs" / "docs" / "advanced_features" / "server_arguments.mdx"
+)
+_SERVING_FIELDS = (
+    _REPO_ROOT / "python" / "sglang" / "srt" / "arg_groups" / "fields" / "serving.py"
+)
+_HTTP_SERVER = (
+    _REPO_ROOT / "python" / "sglang" / "srt" / "entrypoints" / "http_server.py"
+)
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -313,6 +336,103 @@ class TestDecideRequestAuth(CustomTestCase):
             auth_level=AuthLevel.NORMAL,
         )
         self.assertTrue(decision.allowed)
+
+    def test_admin_optional_legacy_single_key_compat(self):
+        """Ordinary keys still authorize ADMIN_OPTIONAL management routes.
+
+        The single-key fallback is the #15908 compatibility path. Issue #43706
+        warns about it; flipping this branch would reject existing deployments
+        that call management endpoints with only --api-key.
+        """
+        path = "/update_weights_from_disk"
+        cases = (
+            ("no_credential", None, "user-secret", None, False),
+            ("ordinary_api_key", "Bearer user-secret", "user-secret", None, True),
+            ("wrong_ordinary_key", "Bearer wrong", "user-secret", None, False),
+            (
+                "both_keys_ordinary_rejected",
+                "Bearer user-secret",
+                "user-secret",
+                "admin-secret",
+                False,
+            ),
+            (
+                "both_keys_admin_accepted",
+                "Bearer admin-secret",
+                "user-secret",
+                "admin-secret",
+                True,
+            ),
+            ("neither_key_open", None, None, None, True),
+            ("empty_strings_count_as_unset", None, "", "", True),
+        )
+        for name, header, api_key, admin_api_key, allowed in cases:
+            with self.subTest(name=name):
+                decision = decide_request_auth(
+                    method="POST",
+                    path=path,
+                    authorization_header=header,
+                    api_key=api_key,
+                    admin_api_key=admin_api_key,
+                    auth_level=AuthLevel.ADMIN_OPTIONAL,
+                )
+                self.assertIs(decision.allowed, allowed)
+
+
+class TestSingleKeyAdminOptionalWarning(CustomTestCase):
+    """Startup warning for the legacy single-key management credential."""
+
+    def test_warns_only_for_the_single_key_shape(self):
+        shapes = (
+            ("ordinary_only", "user-secret", None, True),
+            ("both_keys", "user-secret", "admin-secret", False),
+            ("neither_key", None, None, False),
+            ("admin_only", None, "admin-secret", False),
+            ("empty_ordinary_key", "", None, False),
+            ("empty_admin_key_counts_as_unset", "user-secret", "", True),
+        )
+        for name, api_key, admin_api_key, expect_warning in shapes:
+            with self.subTest(name=name):
+                self.assertIs(
+                    single_key_authorizes_admin_optional(api_key, admin_api_key),
+                    expect_warning,
+                )
+                if expect_warning:
+                    with self.assertLogs(
+                        "sglang.srt.utils.auth", level="WARNING"
+                    ) as logs:
+                        warn_single_key_admin_optional(api_key, admin_api_key)
+                    text = "\n".join(logs.output)
+                    self.assertEqual(len(logs.records), 1)
+                    self.assertEqual(logs.records[0].levelname, "WARNING")
+                    for path in _ADMIN_OPTIONAL_EXAMPLES:
+                        self.assertIn(path, text)
+                    self.assertIn("--admin-api-key", text)
+                    self.assertNotIn(str(api_key), text)
+                else:
+                    with self.assertNoLogs("sglang.srt.utils.auth", level="WARNING"):
+                        warn_single_key_admin_optional(api_key, admin_api_key)
+
+    def test_help_and_docs_name_the_exposure(self):
+        """Operators can see the single-key exposure without reading the issue."""
+        for help_text in (API_KEY_HELP, ADMIN_API_KEY_HELP):
+            for path in _ADMIN_OPTIONAL_EXAMPLES:
+                self.assertIn(path, help_text)
+            self.assertIn("--admin-api-key", help_text)
+        self.assertIn("do not accept --api-key", ADMIN_API_KEY_HELP)
+
+        serving_source = _SERVING_FIELDS.read_text(encoding="utf-8")
+        self.assertIn("API_KEY_HELP", serving_source)
+        self.assertIn("ADMIN_API_KEY_HELP", serving_source)
+
+        http_server = _HTTP_SERVER.read_text(encoding="utf-8")
+        self.assertIn("warn_single_key_admin_optional(", http_server)
+
+        doc = _SERVER_ARGS_DOC.read_text(encoding="utf-8")
+        for path in _ADMIN_OPTIONAL_EXAMPLES:
+            self.assertGreaterEqual(doc.count(path), 2)
+        self.assertIn("ordinary API key also authorizes", doc)
+        self.assertIn("ordinary key also authorizes", doc)
 
 
 if __name__ == "__main__":
