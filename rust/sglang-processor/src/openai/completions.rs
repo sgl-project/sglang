@@ -198,7 +198,7 @@ fn generate_body(
     settings: &OpenAiSettings,
 ) -> Value {
     let logit_bias = float_logit_bias(&request.logit_bias);
-    let sampling = json!({
+    let mut sampling = json!({
         "temperature": request.temperature,
         "max_new_tokens": request.max_tokens,
         "min_new_tokens": request.min_tokens,
@@ -221,8 +221,11 @@ fn generate_body(
         "logit_bias": logit_bias,
         "custom_params": request.custom_params,
         "sampling_seed": request.seed,
-        "watermark": request.watermark,
     });
+    // Only when set: engines older than the `watermark` sampling param reject the key.
+    if let Some(watermark) = &request.watermark {
+        sampling["watermark"] = json!(watermark);
+    }
     let (prompt_key, prompt) = match &request.prompt {
         Prompt::Text(text) => ("text", json!(text)),
         Prompt::TextBatch(texts) => ("text", json!(texts)),
