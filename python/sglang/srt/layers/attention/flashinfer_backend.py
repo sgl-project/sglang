@@ -291,6 +291,25 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+def _set_paged_forward_attrs(wrapper, *, causal, sm_scale, window_left, logits_soft_cap):
+    """Inject the scheduling attributes ``run()`` reads, mirroring the
+    deprecated ``forward()`` exactly (pos_encoding_mode=NONE, rope defaults).
+
+    ``BatchPrefillWithPagedKVCacheWrapper.run()`` does not accept
+    causal/sm_scale/logits_soft_cap as keyword arguments; passing them raises
+    TypeError *inside* the tvm-ffi call frame, which aborts through the C++
+    unwinder and surfaces as a bogus 'Segfault' backtrace with no core dump.
+    """
+    wrapper._causal = causal
+    wrapper._pos_encoding_mode = "NONE"
+    wrapper._use_fp16_qk_reduction = False
+    wrapper._window_left = window_left
+    wrapper._logits_soft_cap = logits_soft_cap
+    wrapper._sm_scale = sm_scale
+    wrapper._rope_scale = 1.0
+    wrapper._rope_theta = 10000.0
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -355,9 +374,18 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
+        self.prefill_uses_native_fp4 = (
+            self.prefill_kv_access is not None
+            and self.prefill_kv_access.kind
+            == KVCacheAttentionAccessKind.NATIVE_FP4
+            and self.prefill_kv_access.scale_recipe == "nvfp4"
+        )
+        # Native FP4 prefill hands FlashInfer packed uint8 KV + block scales.
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
-            torch.float8_e4m3fn
+            torch.uint8
+            if self.prefill_uses_native_fp4
+            else torch.float8_e4m3fn
             if (
                 self.prefill_uses_dequant_workspace
                 or self.decode_uses_dequant_workspace
@@ -367,7 +395,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=self.flashinfer_kv_cache_dtype,
+            kv_cache_dtype=(
+                torch.float8_e4m3fn
+                if self.prefill_uses_native_fp4
+                else self.flashinfer_kv_cache_dtype
+            ),
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
@@ -1337,7 +1369,19 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
-        if self.prefill_uses_dequant_workspace:
+        native_kv_sf = None
+        if self.prefill_uses_native_fp4:
+            assert not layer.is_cross_attention, (
+                "NVFP4 native FP4 prefill does not support cross-attention"
+            )
+            # Packed KV + token-linear block scales feed the fa2 kernel
+            # directly; no FP8 workspace, no per-chunk re-dequant.
+            k_packed, v_packed, k_block_sf, v_block_sf = pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+            kv_cache = (k_packed, v_packed)
+            native_kv_sf = (k_block_sf, v_block_sf)
+        elif self.prefill_uses_dequant_workspace:
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -1373,30 +1417,54 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_cache,
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+            _paged_window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
             )
+            if native_kv_sf is not None:
+                # Pool global FP32 scales (same pair the dequant route uses);
+                # block scales travel as kv_cache_sf, not as k_scale/v_scale.
+                _gk, _gv = self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
+                _set_paged_forward_attrs(
+                    prefill_wrapper_paged,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=_paged_window_left,
+                    logits_soft_cap=logits_soft_cap,
+                )
+                # run(), not forward(): forward() is the deprecated shim that
+                # injects these settings as wrapper attributes and cannot pass
+                # kv_cache_sf through to the kernel.
+                o = prefill_wrapper_paged.run(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    window_left=_paged_window_left,
+                    k_scale=_gk,
+                    v_scale=_gv,
+                    kv_cache_sf=native_kv_sf,
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=_paged_window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -1448,17 +1516,38 @@ class FlashInferAttnBackend(AttentionBackend):
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    kv_cache,
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
-                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
-                )
+                if native_kv_sf is not None:
+                    _gk, _gv = self.kv_cache_quant_method.get_bmm_scales(
+                        layer.layer_id
+                    )
+                    _set_paged_forward_attrs(
+                        prefill_wrapper_paged,
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o2, s2 = prefill_wrapper_paged.run(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        kv_cache,
+                        window_left=swa_window_left,
+                        k_scale=_gk,
+                        v_scale=_gv,
+                        kv_cache_sf=native_kv_sf,
+                        return_lse=True,
+                    )
+                else:
+                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        kv_cache,
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                        # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                    )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
