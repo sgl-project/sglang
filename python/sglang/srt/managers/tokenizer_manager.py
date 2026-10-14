@@ -1398,6 +1398,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
             )
+        if isinstance(obj, GenerateReqInput) and not self.is_generation:
+            raise ValueError(
+                "This model is served as an embedding model and cannot generate text. "
+                "Use /v1/embeddings or /encode, or launch the server without "
+                "`--is-embedding`."
+            )
 
         # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):

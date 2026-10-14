@@ -1018,6 +1018,24 @@ class TestOpenAIV1Rerank(CustomTestCase):
         self.assertTrue(isinstance(response[0]["index"], int))
         self.assertTrue(isinstance(response[1]["index"], int))
 
+    def test_generation_request_is_rejected(self):
+        # A generation request used to reach the embedding model's forward and
+        # fail its assertion, which took the scheduler down.
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for path, body in (
+            ("/generate", {"text": "hi", "sampling_params": {"max_new_tokens": 2}}),
+            ("/v1/completions", {"model": self.model, "prompt": "hi", "max_tokens": 2}),
+        ):
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}{path}", headers=headers, json=body
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("cannot generate", response.text)
+        response = self.run_rerank(
+            TEST_RERANK_QUERY_DOCS[0]["query"], TEST_RERANK_QUERY_DOCS[0]["documents"]
+        )
+        self.assertEqual(len(response), 1)
+
 
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
     @classmethod
