@@ -11,6 +11,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -33,6 +37,8 @@ class _Req(SimpleNamespace):
 class TestEmptyBatchFullLatch(CustomTestCase):
     def _scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
         s.lists = CoreLists()
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
@@ -42,7 +48,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.lists.chunked_req = None
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
-        s.processed_tokens_counter = 0
+        s.counters.processed_tokens_counter = 0
         # Reaching the policy means the admission gates were passed.
         s.policy = SimpleNamespace(calc_priority=Mock(side_effect=_AdmissionAttempted))
         return s
@@ -71,7 +77,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         finishing, running = req("a", 2), req("b", 8)
         s = self._scheduler()
         s.lists.decoding = [finishing, running]
-        s.enable_skip_finishing_decode = True
+        s.flags.enable_skip_finishing_decode = True
         # One decode step of both is in flight.
         s.pending = PendingSteps()
         step = SimpleNamespace(

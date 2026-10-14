@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -58,7 +59,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             token_to_kv_pool_allocator=MagicMock(),
             req_to_token_pool=MagicMock(),
             pool_stats_observer=MagicMock(),
-            get_launched_step=lambda: None,
+            counters=LaunchCounters(),
             core_lists=CoreLists(),
             scheduler_stage_metrics=None,
         )
@@ -170,7 +171,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     tree_components=(ComponentType.FULL,),
                 )
             )
-        self.launched_step = SimpleNamespace(reqs=[])
+        self.counters = LaunchCounters(cur_batch_for_debug=SimpleNamespace(reqs=[]))
         self.core_lists = CoreLists()
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
@@ -196,7 +197,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             token_to_kv_pool_allocator=self.allocator,
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
-            get_launched_step=lambda: self.launched_step,
+            counters=self.counters,
             core_lists=self.core_lists,
             scheduler_stage_metrics=None,
         )
@@ -245,7 +246,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             ),
             beam_group=None,
         )
-        self.launched_step = SimpleNamespace(reqs=[req])
+        self.counters.cur_batch_for_debug = SimpleNamespace(reqs=[req])
         self.core_lists.decoding = [req]
         return req
 

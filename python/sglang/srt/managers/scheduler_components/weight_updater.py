@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -90,12 +91,11 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
-    is_engine_paused: Callable[[], bool]
+    flags: EngineFlags
     record_weight_version_change: Callable[[Optional[str]], None]
     # The PD owners, read at call time: a role switch rebuilds them.
     get_disagg_owners: Callable[[], Tuple[Any, ...]]
     metrics_collector: Optional[Any] = None
-    offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
@@ -340,7 +340,7 @@ class SchedulerWeightUpdaterManager:
         # Held releases are dropped with the pool below (the PD decode
         # transfer queue's release_memory_occupation).
         assert self.is_fully_idle(
-            ignore_waiting=self.is_engine_paused(),
+            ignore_waiting=self.flags._engine_paused,
             ignore_releasing=True,
         ), "release_memory_occupation should be called only when server is idle."
 
@@ -350,7 +350,7 @@ class SchedulerWeightUpdaterManager:
             tags = GPU_MEMORY_ALL_TYPES
 
         for tag in tags:
-            self.offload_tags.add(tag)
+            self.flags.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             for owner in self.get_disagg_owners():
@@ -381,7 +381,7 @@ class SchedulerWeightUpdaterManager:
             tags = GPU_MEMORY_ALL_TYPES
 
         for tag in tags:
-            self.offload_tags.remove(tag)
+            self.flags.offload_tags.remove(tag)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)

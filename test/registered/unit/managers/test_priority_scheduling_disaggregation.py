@@ -23,6 +23,10 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
@@ -51,15 +55,16 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
         scheduler.abort_on_priority_when_disabled = False
         scheduler.enable_hierarchical_cache = False
-        scheduler.enable_hicache_storage = False
         scheduler.enable_unified_cache_external_linker = False
-        scheduler.processed_tokens_counter = 0
+        scheduler.counters.processed_tokens_counter = 0
         scheduler.lists.waiting_queue = []
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
@@ -147,7 +152,6 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler = self._new_scheduler(mode)
                 scheduler.enable_priority_scheduling = False
                 scheduler.abort_on_priority_when_disabled = True
-                scheduler.enable_hicache_storage = True
                 scheduler.tree_cache = MagicMock(spec=["finish"])
                 req = self._new_req(priority=10)
 
@@ -173,7 +177,6 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler = self._new_scheduler(DisaggregationMode.NULL)
                 del scheduler._abort_on_queued_limit  # Exercise the real queue check.
                 scheduler.max_queued_requests = 1
-                scheduler.enable_hicache_storage = True
                 scheduler.tree_cache = MagicMock(spec=["finish"])
                 scheduler.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
@@ -274,7 +277,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue.attn_cp_cpu_group = None
         queue.attn_tp_cpu_group = None
         queue.tree_cache = cache
-        queue.get_processed_tokens_counter = lambda: 0
+        queue.counters = LaunchCounters()
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
         queue.kv_senders = {"req": object()}
         req = SimpleNamespace(
@@ -442,12 +445,13 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.lists.chunked_req = None
         scheduler.mm_receiver = None
         scheduler.lists.waiting_queue = [MagicMock(rid="req")]
         scheduler.beam_coordinator = MagicMock()
-        scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.dllm = None
@@ -908,6 +912,8 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False

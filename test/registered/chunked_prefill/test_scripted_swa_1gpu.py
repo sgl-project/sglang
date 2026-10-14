@@ -169,7 +169,7 @@ class TestScriptedSwaMixedChunkDecodeFit(ScriptedTestCase):
         decoder_rids = {h.rid for h in decoders}
         for _ in range(_MIXED_MAX_STEPS):
             # The step the last iteration launched.
-            batch = s.cur_batch_for_debug
+            batch = s.counters.cur_batch_for_debug
             if (
                 batch is not None
                 and batch.forward_mode is not None

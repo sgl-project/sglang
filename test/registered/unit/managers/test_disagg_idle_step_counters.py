@@ -12,6 +12,10 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -214,7 +218,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             batch.split_index = split_index
             self.launch_batch(scheduler, batch, launch_ts)
 
-        self.assertEqual(scheduler.forward_ct, 3)
+        self.assertEqual(scheduler.counters.forward_ct, 3)
         self.assertEqual(batch.forward_iter, 3)
         self.assertEqual(batch.split_prefill_start, (1, 0.0))
         self.assertTrue(batch.after_idle_gap)
@@ -324,7 +328,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         if poll_pending_copy:
             self.assertTrue(all(event.query.call_count > 1 for event in copy_events))
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
-        self.assertEqual(scheduler.forward_ct, 4)
+        self.assertEqual(scheduler.counters.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
         if mode == ForwardMode.EXTEND:
             # A prefill is charged from the previous prefill's result, or from
@@ -375,16 +379,18 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.lists = CoreLists()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.tp_size = get_parallel().tp_size
-        scheduler.gracefully_exit = False
+        scheduler.flags.gracefully_exit = False
         scheduler.flat_slot = ScheduleSlot()
-        scheduler._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler._deferred_input_requests = []
         scheduler._sched_idled = False
         scheduler._prev_step = None
         scheduler._prev_prefill_end_ts = None
-        scheduler.forward_ct = 0
-        scheduler.processed_tokens_counter = 0
+        scheduler.counters.forward_ct = 0
+        scheduler.counters.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.enable_overlap = True
         scheduler.is_generation = True

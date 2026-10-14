@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -503,7 +504,7 @@ class TestAllocationIntegration(CustomTestCase):
             clear_pending_chunk_send=Mock(),
             req_to_metadata_buffer_idx_allocator=Mock(),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
-            get_processed_tokens_counter=lambda: 0,
+            counters=LaunchCounters(),
         )
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),

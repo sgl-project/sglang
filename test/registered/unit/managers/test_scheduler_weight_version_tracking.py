@@ -8,6 +8,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -149,7 +150,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
-            is_engine_paused=lambda: False,
+            flags=EngineFlags(),
             record_weight_version_change=lambda new_version: self.recorded.append(
                 new_version
             ),

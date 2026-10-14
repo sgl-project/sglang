@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import SchedulePolicy
+    from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         SchedulerMetricsReporter,
     )
@@ -3160,7 +3161,7 @@ class DisaggDecode:
         send_abort_output: Callable[..., None],
         retire_beam_group: Callable[[Req], None],
         release_finished_req: Callable[..., None],
-        is_engine_paused: Callable[[], bool],
+        flags: EngineFlags,
         core_lists: CoreLists,
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
         policy: SchedulePolicy,
@@ -3203,7 +3204,7 @@ class DisaggDecode:
         self.send_abort_output = send_abort_output
         self.retire_beam_group = retire_beam_group
         self.release_finished_req = release_finished_req
-        self.is_engine_paused = is_engine_paused
+        self.flags = flags
         # The requests whose KV has arrived: they own it and wait for a row of
         # the running set.
         self.ready: List[Req] = []
@@ -3354,7 +3355,7 @@ class DisaggDecode:
                 name="retracted",
                 reqs=prealloc_queue.retracted_queue,
                 abort=self._abort_retracted_reqs,
-                health_check=not self.is_engine_paused(),
+                health_check=not self.flags._engine_paused,
             ),
             # Held for rebootstrap until resume. They own no KV, so the paused
             # flush, which ignores waiting requests, skips them.

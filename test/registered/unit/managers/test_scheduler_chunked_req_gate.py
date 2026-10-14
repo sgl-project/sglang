@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -68,7 +73,6 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.enable_fpm = False
     # Exercise the unconditional scheduler-loop HiCache event-drain point.
     s.enable_hierarchical_cache = True
-    s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
@@ -103,6 +107,9 @@ class TestStashGatePreservesPrefix(CustomTestCase):
     POOL_IDX = 4
     INITIAL_PREFIX_LEN = 8  # what was really cached last iter
     POST_RESET_FILL_LEN = 32  # length after init_next_round_input rebuilds
+
+    def setUp(self):
+        enter_scope(self, published_topology())
 
     def _build(self, *, fill_len: int):
         cache = _make_tree_cache()

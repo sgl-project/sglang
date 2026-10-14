@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 def _last_step(ctx: ScriptedContext) -> Optional[ScheduleBatch]:
     """The step the last scheduler iteration launched; None when it launched
     nothing."""
-    return ctx.scheduler.cur_batch_for_debug
+    return ctx.scheduler.counters.cur_batch_for_debug
 
 
 def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:

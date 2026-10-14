@@ -8,6 +8,7 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -375,7 +376,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
                 retracted_queue=[retracted_req],
                 held_rebootstrap_reqs=[held_req],
             ),
-            is_engine_paused=lambda: True,
+            flags=EngineFlags(_engine_paused=True),
         )
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")

@@ -20,6 +20,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ModeStages,
     ScheduleSlot,
@@ -57,6 +61,8 @@ class TestPPRingCommit(CustomTestCase):
             self, get_parallel().override(pp_size=2, pp_async_batch_depth=depth)
         )
         s = object.__new__(Scheduler)
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
         s.lists = CoreLists()
         s.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         s.device = "cpu"
@@ -152,6 +158,8 @@ class TestPPSlotTag(CustomTestCase):
         prefill chunk; another slot's step never decodes it while that slot's
         step may still be in flight."""
         s = object.__new__(Scheduler)
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
         s.lists = CoreLists()
         s.disaggregation_mode = DisaggregationMode.NULL
         s.disagg_prefill = None
@@ -161,7 +169,7 @@ class TestPPSlotTag(CustomTestCase):
         s.lists.decoding = []
         s.lists.waiting_queue = []
         s.pending = PendingSteps()
-        s.enable_skip_finishing_decode = False
+        s.flags.enable_skip_finishing_decode = False
         s.init_mode_stages()
         reqs = [_Req() for _ in range(3)]
         slots = [ScheduleSlot(index=0), ScheduleSlot(index=1)]
@@ -183,6 +191,8 @@ class TestPPSlotTag(CustomTestCase):
         counting only that slot's decoding requests."""
         enter_scope(self, published_topology(role="scheduler", pp_size=2))
         s = object.__new__(Scheduler)
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
         s.lists = CoreLists()
         s.lists.decoding = []
         for slot, num_reqs in ((0, 2), (1, 1)):

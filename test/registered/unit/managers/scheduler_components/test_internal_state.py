@@ -46,7 +46,6 @@ def _controller(scheduler: Scheduler) -> SchedulerInternalStateController:
         startup_available_gpu_memory_gb=0.0,
         metrics_reporter=None,
         rust_server=None,
-        get_disaggregation_mode=lambda: scheduler.disaggregation_mode,
         get_request_lists=scheduler.request_lists,
         get_startup_time=lambda: None,
         record_step_time=False,

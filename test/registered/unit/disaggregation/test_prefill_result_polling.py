@@ -35,6 +35,10 @@ from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -138,7 +142,7 @@ class _Owner(DisaggPrefill):
         self.result_completion_status = torch.empty(1, dtype=torch.int32)
         self.enable_staging = False
         self.kv_checksum_computer = None
-        self.get_processed_tokens_counter = lambda: scheduler.processed_tokens_counter
+        self.counters = scheduler.counters
 
     def after_commit(self, waiting, rids_to_check=None):
         self.scheduler.actions.append((self.scheduler.iteration, "inflight", None))
@@ -243,9 +247,8 @@ class _Scheduler:
         self.flat_slot = ScheduleSlot()
         self.recv_skipper = None
         self._sched_idled = False
-        self.cur_batch_for_debug = None
-        self._engine_paused = False
-        self.gracefully_exit = False
+        self.counters = LaunchCounters()
+        self.flags = EngineFlags()
         self.enable_overlap = True
         self.require_mlp_sync = False
         self.enable_unified_memory = False
@@ -405,7 +408,7 @@ def _run_loop(scheduler, enabled=True, **topology):
             _dispatch_event_loop_once(scheduler)
         except _StopLoop:
             return
-        if scheduler.gracefully_exit:
+        if scheduler.flags.gracefully_exit:
             return
     raise AssertionError("Scheduler exited before all arrivals were polled")
 
@@ -612,7 +615,12 @@ class TestPrefillResultPolling(CustomTestCase):
                     arrivals[2:12] = [_batch(i) for i in range(2, 12)]
                 scheduler = CapacityBlockedScheduler(arrivals, {1: _result()}, {1: 13})
                 scheduler.enable_hierarchical_cache = True
-                scheduler.enable_hicache_storage = True
+                storage = patch(
+                    "sglang.srt.managers.scheduler.hicache_storage_enabled",
+                    return_value=True,
+                )
+                storage.start()
+                self.addCleanup(storage.stop)
                 scheduler.reissues = []
                 retries = StoragePrefetchRetries()
                 radix_cache = RadixCache.create_simulated()
@@ -736,7 +744,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.enable_hierarchical_cache = readiness_source == "cache"
                     scheduler.enable_unified_cache_external_linker = False
                     scheduler.enable_lmcache = False
-                    scheduler.enable_hicache_storage = False
 
                     def drain_cache_events():
                         # Readiness is visible only after the real cache-drain path.
@@ -1156,7 +1163,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     _run_loop(scheduler, enabled=enabled)
 
-                    self.assertTrue(scheduler.gracefully_exit)
+                    self.assertTrue(scheduler.flags.gracefully_exit)
                     self.assertEqual(
                         scheduler.admission_attempts, list(range(shutdown_at))
                     )
@@ -1196,7 +1203,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
                 _run_loop(scheduler)
 
-                self.assertTrue(scheduler.gracefully_exit)
+                self.assertTrue(scheduler.flags.gracefully_exit)
                 self.assertEqual(
                     [a for a in scheduler.actions if a[1] == "launch"],
                     [
@@ -1240,7 +1247,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     _run_loop(scheduler)
 
-                    self.assertTrue(scheduler.gracefully_exit)
+                    self.assertTrue(scheduler.flags.gracefully_exit)
                     self.assertEqual(
                         [a for a in scheduler.actions if a[1] == "dispatch"][-3:],
                         [
@@ -1456,7 +1463,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         ),
                     }
                 )
-                scheduler.processed_tokens_counter = 0
+                scheduler.counters.processed_tokens_counter = 0
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
 

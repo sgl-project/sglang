@@ -27,6 +27,10 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (
     ModeStages,
     ScheduleSlot,
@@ -574,6 +578,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def _decode_scheduler(self, *, retracted=(), held=(), releasing=()):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
@@ -585,7 +591,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm = None
         scheduler.hisparse_coordinator = None
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler.disagg_prefill = None
         scheduler.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(

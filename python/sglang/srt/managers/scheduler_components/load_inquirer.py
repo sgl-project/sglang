@@ -14,7 +14,7 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    get_disaggregation_mode: Callable[[], DisaggregationMode]
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -51,7 +50,10 @@ class SchedulerLoadInquirer:
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
-        if self.get_disaggregation_mode() == DisaggregationMode.DECODE:
+        if (
+            DisaggregationMode(get_disagg().disaggregation_mode)
+            == DisaggregationMode.DECODE
+        ):
             return 0
         lists = self.get_request_lists()
         waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
@@ -70,7 +72,7 @@ class SchedulerLoadInquirer:
 
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
-        disaggregation_mode = self.get_disaggregation_mode()
+        disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         stats = self.metrics_reporter.stats
         lists = self.get_request_lists()
         num_running_reqs = len(lists["decoding"].reqs)

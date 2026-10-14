@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -68,7 +69,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
     def test_paused_iterations_record_reader_values(self):
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(
-            _engine_paused=False,
+            flags=EngineFlags(),
             load_inquirer=SimpleNamespace(
                 get_loads=lambda: SimpleNamespace(
                     num_running_reqs=0, num_waiting_reqs=1
@@ -83,7 +84,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
             writer = SchedulingTraceWriter(path, {})
             writer._labels(inflight)
             writer.observe_readers(scheduler)
-            scheduler._engine_paused = True
+            scheduler.flags._engine_paused = True
             writer.observe_readers(scheduler)
             writer.close()
             records = load_trace(path)

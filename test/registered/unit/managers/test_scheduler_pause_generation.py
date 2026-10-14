@@ -25,6 +25,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -75,11 +79,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
-        scheduler._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler.enable_overlap = False
-        scheduler.enable_skip_finishing_decode = False
-        scheduler.cur_batch_for_debug = None
+        scheduler.flags.enable_skip_finishing_decode = False
+        scheduler.counters.cur_batch_for_debug = None
         scheduler.lists.chunked_req = None
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
@@ -251,7 +257,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _retract_by_kv_full(self, scheduler: Scheduler, req: Req):
         scheduler.lists.decoding = [req]
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.forward_ct = 1
+        scheduler.counters.forward_ct = 1
         scheduler.token_to_kv_pool_allocator.page_size = 1
         scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
         scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
@@ -263,20 +269,20 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
         scheduler = self._new_scheduler()
-        scheduler.cur_batch_for_debug = MagicMock()
+        scheduler.counters.cur_batch_for_debug = MagicMock()
         scheduler.lists.chunked_req = MagicMock()
         running = [self._make_req("run")]
         scheduler.lists.decoding = running
 
-        original_cur_batch = scheduler.cur_batch_for_debug
+        original_cur_batch = scheduler.counters.cur_batch_for_debug
         original_chunked_req = scheduler.lists.chunked_req
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        self.assertTrue(scheduler._engine_paused)
+        self.assertTrue(scheduler.flags._engine_paused)
         # All state must be preserved — no mutation
         self.assertIs(scheduler.lists.decoding, running)
-        self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
+        self.assertIs(scheduler.counters.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.lists.chunked_req, original_chunked_req)
 
     def test_paused_engine_accounting_uses_current_scheduler_state(self):
@@ -307,7 +313,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        self.assertTrue(scheduler._engine_paused)
+        self.assertTrue(scheduler.flags._engine_paused)
         self.assertEqual(len(scheduler.pending), 1)
 
     def test_abort_mode_rejected_at_scheduler(self):
@@ -327,12 +333,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_retract_clears_the_launched_step(self):
         """retract mode should clear cur_batch_for_debug."""
         scheduler = self._new_scheduler()
-        scheduler.cur_batch_for_debug = MagicMock()
+        scheduler.counters.cur_batch_for_debug = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        self.assertTrue(scheduler._engine_paused)
-        self.assertIsNone(scheduler.cur_batch_for_debug)
+        self.assertTrue(scheduler.flags._engine_paused)
+        self.assertIsNone(scheduler.counters.cur_batch_for_debug)
 
     def test_retract_requeues_decoding_requests_in_order(self):
         """retract releases and requeues the decoding requests in list order,
@@ -467,7 +473,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        self.assertTrue(scheduler._engine_paused)
+        self.assertTrue(scheduler.flags._engine_paused)
         self.assertEqual(len(scheduler.lists.waiting_queue), 0)
         self.assertEqual(scheduler.lists.decoding, [])
 
@@ -658,14 +664,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode = decode_owner_shell(prealloc_queue=MagicMock())
-        scheduler._engine_paused = True
+        scheduler.flags._engine_paused = True
 
         scheduler.continue_generation(
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
 
         scheduler.disagg_decode.prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
-        self.assertFalse(scheduler._engine_paused)
+        self.assertFalse(scheduler.flags._engine_paused)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_re
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -296,7 +297,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
             disagg_prefill=None,
             disagg_decode=None,
             lists=CoreLists(),
-            processed_tokens_counter=0,
+            counters=LaunchCounters(),
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),

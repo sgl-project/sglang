@@ -39,6 +39,7 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
@@ -107,7 +108,7 @@ class PPRing:
         commit_step: Callable[[PendingStep], None],
         run_batch: Callable[..., GenerationBatchResult],
         on_idle: Callable[[], None],
-        set_cur_batch: Callable[[Optional[ScheduleBatch]], None],
+        counters: LaunchCounters,
         mark_idle: Callable[[], None],
         pp_group,
         device,
@@ -133,7 +134,7 @@ class PPRing:
         self.commit_step = commit_step
         self.run_batch = run_batch
         self.on_idle = on_idle
-        self.set_cur_batch = set_cur_batch
+        self.counters = counters
         self.mark_idle = mark_idle
         # What the forward and the output relay read.
         self.pp_group = pp_group
@@ -214,7 +215,7 @@ class PPRing:
                     step = (
                         pd.schedule(slot) if pd is not None else stages.schedule(slot)
                     )
-                self.set_cur_batch(step)
+                self.counters.cur_batch_for_debug = step
                 if step:
                     self.slots[mb_id].last_step = step
                 pp_proxy_tensors = None

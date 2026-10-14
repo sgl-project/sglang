@@ -324,6 +324,15 @@ _PARAM = {
 # Components in their final form: node -> (module under srt/, class).
 _BUILT = {
     "CoreLists": ("managers/request_lists.py", "CoreLists"),
+    "LaunchCounters": (
+        "managers/scheduler_components/engine_state.py",
+        "LaunchCounters",
+    ),
+    "EngineFlags": ("managers/scheduler_components/engine_state.py", "EngineFlags"),
+    "ProfilerManager": (
+        "managers/scheduler_components/profiler_manager.py",
+        "SchedulerProfilerManager",
+    ),
     "PendingSteps": ("managers/scheduler_components/pending_steps.py", "PendingSteps"),
     "IpcChannels": (
         "managers/scheduler_components/ipc_channels.py",
@@ -409,7 +418,6 @@ _CALLBACK_SITES = {
     ("init_pp_ring", "PPRing", "commit_step", _BOUND): 1,
     ("init_pp_ring", "PPRing", "run_batch", _BOUND): 1,
     ("init_pp_ring", "PPRing", "on_idle", _BOUND): 1,
-    ("init_pp_ring", "PPRing", "set_cur_batch", _BOUND): 1,
     ("init_pp_ring", "PPRing", "mark_idle", _BOUND): 1,
     # RPC dispatch and the PD role switch, which name the scheduler itself.
     ("handle_rpc_request", "getattr", "", _SELF): 1,
@@ -425,13 +433,6 @@ _CALLBACK_SITES = {
     # The request lists name the core lists' abort entries.
     ("request_lists", "RequestList", "abort", _BOUND): 2,
     # To be removed.
-    ("init_idle_sleeper", "IdleSleeper", "can_empty_cache", _LAMBDA): 1,
-    (
-        "maybe_init_disagg_prefill",
-        "DisaggPrefill",
-        "get_processed_tokens_counter",
-        _LAMBDA,
-    ): 1,
     (
         "maybe_init_disagg_prefill",
         "DisaggPrefill",
@@ -450,7 +451,6 @@ _CALLBACK_SITES = {
         "maybe_send_health_check_signal",
         _BOUND,
     ): 1,
-    ("maybe_init_disagg_decode", "DisaggDecode", "is_engine_paused", _LAMBDA): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
     (
         "maybe_init_disagg_decode",
@@ -460,13 +460,6 @@ _CALLBACK_SITES = {
     ): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "release_aborted_request", _BOUND): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "send_abort_output", _BOUND): 1,
-    ("init_profiler", "SchedulerProfilerManager", "get_forward_ct", _LAMBDA): 1,
-    (
-        "init_weight_updater",
-        "SchedulerWeightUpdaterManager",
-        "is_engine_paused",
-        _LAMBDA,
-    ): 1,
     (
         "init_weight_updater",
         "SchedulerWeightUpdaterManager",
@@ -486,7 +479,6 @@ _CALLBACK_SITES = {
         "record_weight_version_change",
         _BOUND,
     ): 1,
-    ("maybe_init_rust_server", "RustServerIdleSleeper", "can_empty_cache", _LAMBDA): 1,
     ("maybe_init_rust_server", "self.get_rust_server_class().launch", "", _SELF): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (
@@ -496,19 +488,7 @@ _CALLBACK_SITES = {
         _LAMBDA,
     ): 1,
     ("init_dp_attn_adapter", "SchedulerDPAttnAdapter", "new_step", _BOUND): 1,
-    (
-        "init_invariant_checker",
-        "SchedulerInvariantChecker",
-        "get_launched_step",
-        _LAMBDA,
-    ): 1,
     ("init_kv_events_publisher", "SchedulerKvEventsPublisher", "get_stats", _LAMBDA): 1,
-    (
-        "init_load_inquirer",
-        "SchedulerLoadInquirer",
-        "get_disaggregation_mode",
-        _LAMBDA,
-    ): 1,
     (
         "init_load_inquirer",
         "SchedulerLoadInquirer",
@@ -534,24 +514,6 @@ _CALLBACK_SITES = {
         _LAMBDA,
     ): 1,
     ("init_load_inquirer", "SchedulerLoadInquirer", "get_request_lists", _BOUND): 1,
-    (
-        "init_output_streamer",
-        "self.get_output_streamer_class()",
-        "get_disaggregation_mode",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_output_streamer",
-        "self.get_output_streamer_class()",
-        "enable_hicache_storage",
-        _LAMBDA,
-    ): 1,
-    (
-        "init_internal_state",
-        "SchedulerInternalStateController",
-        "get_disaggregation_mode",
-        _LAMBDA,
-    ): 1,
     (
         "init_internal_state",
         "SchedulerInternalStateController",

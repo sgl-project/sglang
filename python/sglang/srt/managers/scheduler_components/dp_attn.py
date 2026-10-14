@@ -45,6 +45,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -645,7 +646,7 @@ def prepare_mlp_sync_batch_raw(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
-    offload_tags: set[str]
+    flags: EngineFlags
     spec_algorithm: SpeculativeAlgorithm
     # The scheduler's step factory: an empty step of the given requests.
     new_step: Callable[[List[Req]], ScheduleBatch]
@@ -674,7 +675,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(),
             draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
-            offload_tags=self.offload_tags,
+            offload_tags=self.flags.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
         )

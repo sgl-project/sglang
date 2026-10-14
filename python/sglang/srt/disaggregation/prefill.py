@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         SchedulerMetricsReporter,
     )
@@ -203,7 +204,7 @@ class PrefillBootstrapQueue:
         attn_tp_cpu_group: Any,
         pp_group: Any,
         output_streamer: SchedulerOutputStreamer,
-        get_processed_tokens_counter: Callable[[], int],
+        counters: LaunchCounters,
         retire_unadmitted_request: Callable[[Req], None],
         handle_bootstrap_failure: Callable[[Req], None],
     ):
@@ -236,7 +237,7 @@ class PrefillBootstrapQueue:
         self.attn_tp_cpu_group = attn_tp_cpu_group
         self.pp_group = pp_group
         self.output_streamer = output_streamer
-        self.get_processed_tokens_counter = get_processed_tokens_counter
+        self.counters = counters
         self.retire_unadmitted_request = retire_unadmitted_request
         self.handle_bootstrap_failure = handle_bootstrap_failure
         self.pp_poll_sync_work_list: List = []
@@ -548,7 +549,9 @@ class PrefillBootstrapQueue:
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
-                    req.arrival_processed_tokens = self.get_processed_tokens_counter()
+                    req.arrival_processed_tokens = (
+                        self.counters.processed_tokens_counter
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -559,7 +562,7 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
-                req.arrival_processed_tokens = self.get_processed_tokens_counter()
+                req.arrival_processed_tokens = self.counters.processed_tokens_counter
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -618,7 +621,7 @@ class DisaggPrefill:
         metrics_reporter: SchedulerMetricsReporter,
         metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
-        get_processed_tokens_counter: Callable[[], int],
+        counters: LaunchCounters,
         retire_unadmitted_request: Callable[[Req], None],
         release_aborted_request: Callable[[Req], None],
         maybe_send_health_check_signal: Callable[[], None],
@@ -640,7 +643,7 @@ class DisaggPrefill:
         self.metrics_reporter = metrics_reporter
         self.metrics_collector = metrics_collector
         self.batch_result_processor = batch_result_processor
-        self.get_processed_tokens_counter = get_processed_tokens_counter
+        self.counters = counters
         self.release_aborted_request = release_aborted_request
         self.maybe_send_health_check_signal = maybe_send_health_check_signal
 
@@ -677,7 +680,7 @@ class DisaggPrefill:
             attn_tp_cpu_group=attn_tp_cpu_group,
             pp_group=pp_group,
             output_streamer=output_streamer,
-            get_processed_tokens_counter=get_processed_tokens_counter,
+            counters=counters,
             retire_unadmitted_request=retire_unadmitted_request,
             handle_bootstrap_failure=self.handle_bootstrap_failure,
         )
@@ -1740,6 +1743,6 @@ class DisaggPrefill:
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
-            req.arrival_processed_tokens = self.get_processed_tokens_counter()
+            req.arrival_processed_tokens = self.counters.processed_tokens_counter
             waiting = [req, *waiting]
         return waiting

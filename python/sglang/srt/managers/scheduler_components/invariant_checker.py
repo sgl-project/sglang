@@ -5,7 +5,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Deque,
     List,
     Optional,
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     # The step this iteration launched; None when it launched nothing.
-    get_launched_step: Callable
+    counters: LaunchCounters
     # The decoding and the chunked request own their KV rows.
     core_lists: CoreLists
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
@@ -303,7 +303,7 @@ class SchedulerInvariantChecker:
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
     def self_check_during_busy(self):
-        if self.get_launched_step() is None:
+        if self.counters.cur_batch_for_debug is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
@@ -487,21 +487,22 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing:
+        if scheduler.flags.is_initializing:
             return ""
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
         return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
+            f"{scheduler.counters.cur_batch_for_debug.batch_size()=}\n"
+            f"{scheduler.counters.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
         )
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        get_counter=lambda: scheduler.counters.forward_ct,
         is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+            scheduler.flags.is_initializing
+            or scheduler.counters.cur_batch_for_debug is not None
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,

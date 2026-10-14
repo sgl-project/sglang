@@ -14,7 +14,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_disagg, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -50,7 +50,6 @@ class SchedulerInternalStateController:
     startup_available_gpu_memory_gb: float
     metrics_reporter: SchedulerMetricsReporter
     rust_server: Any
-    get_disaggregation_mode: Callable[[], DisaggregationMode]
     get_request_lists: Callable[[], Dict[str, RequestList]]
     # Set once the scheduler finishes starting, after this is built.
     get_startup_time: Callable[[], Any]
@@ -106,7 +105,7 @@ class SchedulerInternalStateController:
         # PD role switch: report this instance's role and the decode CUDA graph
         # batch sizes it captured, which a router feeds back as
         # PdRoleSwitchReqInput.decode_cuda_graph_bs.
-        mode = self.get_disaggregation_mode()
+        mode = DisaggregationMode(get_disagg().disaggregation_mode)
         graph_memory = state["memory_usage"]["graph"]
         state["disaggregation_mode"] = mode.value
         state["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()

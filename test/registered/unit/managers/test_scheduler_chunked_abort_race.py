@@ -51,7 +51,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disaggregation_mode = None
     sched.disagg_prefill = None
     sched.disagg_decode = None
-    sched.enable_hicache_storage = False
     sched.mm_receiver = None
     sched.lists.decoding = list(running_reqs)
     sched.hisparse_coordinator = None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import zmq
 
@@ -9,6 +9,7 @@ from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -24,10 +25,10 @@ class IdleSleeper:
     data that needs handling immediately.
     """
 
-    def __init__(self, sockets, can_empty_cache=None):
+    def __init__(self, sockets, flags: Optional[EngineFlags] = None):
         self.poller = zmq.Poller()
         self.last_empty_time = real_time()
-        self.can_empty_cache = can_empty_cache
+        self.flags = flags
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
@@ -40,7 +41,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            if self.can_empty_cache is None or self.can_empty_cache():
+            if self.flags is None or not self.flags._engine_paused:
                 current_platform.empty_cache()
 
 
@@ -55,12 +56,15 @@ class RustServerIdleSleeper:
     """
 
     def __init__(
-        self, rust_server: RustServer, timeout_ms: int = 1000, can_empty_cache=None
+        self,
+        rust_server: RustServer,
+        timeout_ms: int = 1000,
+        flags: Optional[EngineFlags] = None,
     ):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
-        self.can_empty_cache = can_empty_cache
+        self.flags = flags
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
     def maybe_sleep(self):
@@ -70,5 +74,5 @@ class RustServerIdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            if self.can_empty_cache is None or self.can_empty_cache():
+            if self.flags is None or not self.flags._engine_paused:
                 current_platform.empty_cache()

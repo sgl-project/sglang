@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.minicpm.cache import (
 )
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -195,7 +196,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
-        get_launched_step=lambda: None,
+        counters=LaunchCounters(),
         core_lists=CoreLists(),
         scheduler_stage_metrics=None,
     )
@@ -286,7 +287,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         pool_stats_observer=SimpleNamespace(
             session_held_mamba_slots=lambda: 0,
         ),
-        get_launched_step=lambda: None,
+        counters=LaunchCounters(),
         core_lists=CoreLists(),
         scheduler_stage_metrics=None,
     )

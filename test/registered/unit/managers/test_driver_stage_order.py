@@ -28,6 +28,10 @@ from sglang.srt.managers.scheduler import (  # noqa: E402
     Scheduler,
     _dispatch_event_loop_once,
 )
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
@@ -184,9 +188,11 @@ class _Shell:
         self.ready_at = ready_at or {}
         self.results = {}
         s = self.s = Scheduler.__new__(Scheduler)
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
         s.lists = CoreLists()
-        s.gracefully_exit = False
-        s._engine_paused = False
+        s.flags.gracefully_exit = False
+        s.flags._engine_paused = False
         s._deferred_input_requests = []
         s.scheduler_stage_metrics = None
         s.lists.waiting_queue = []
@@ -194,9 +200,9 @@ class _Shell:
         s.lists.chunked_req = None
         s.pending = PendingSteps()
         s.flat_slot = ScheduleSlot()
-        s.enable_skip_finishing_decode = False
+        s.flags.enable_skip_finishing_decode = False
         s._sched_idled = False
-        s.cur_batch_for_debug = None
+        s.counters.cur_batch_for_debug = None
         s.recv_skipper = None
         s.enable_overlap = False
         s.enable_unified_memory = False
@@ -256,7 +262,7 @@ class _Shell:
             raise _Stop
         self.log("ingest", stop_at_pause) if stop_at_pause else self.log("ingest")
         if self.iteration == self.shutdown_at:
-            self.s.gracefully_exit = True
+            self.s.flags.gracefully_exit = True
         return []
 
     def hicache_events(self, should_retry_storage_prefetch=True):
@@ -355,7 +361,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             + _at(2, "ingest", ("commit", "d1"))
             + _at(3, "ingest", "idle"),
         )
-        self.assertTrue(shell.s.enable_skip_finishing_decode)
+        self.assertTrue(shell.s.flags.enable_skip_finishing_decode)
 
     def test_shutdown_stops_new_launches(self):
         """The pass that receives the shutdown commits what is pending and
@@ -470,7 +476,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
                     + _at(1, *schedule, ("decode", None), *_FINALIZE_NONE)
                     + _at(1, ("commit", "d0") if overlap else "idle", "dd.prefetch"),
                 )
-                self.assertFalse(shell.s.enable_skip_finishing_decode)
+                self.assertFalse(shell.s.flags.enable_skip_finishing_decode)
 
 
 class _RingShell(_Shell):

@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    hicache_storage_enabled,
     publish,
     spawn_world_rank,
 )
@@ -238,6 +239,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
+)
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
@@ -471,12 +476,9 @@ class Scheduler:
         # with minimal glue. Move substantial component-specific logic into
         # dedicated methods instead of adding inline blocks here.
         self.init_startup_timing_begin()
-        self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
-        self.forward_ct: int = 0
-        # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
-        self.processed_tokens_counter: int = 0
-        self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        self.counters = LaunchCounters()
+        self.flags = EngineFlags()
         self.init_soft_watchdog()
 
         # Parse args
@@ -506,7 +508,6 @@ class Scheduler:
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
-        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -728,7 +729,7 @@ class Scheduler:
 
         self.init_rank_consensus_checker()
 
-        self.is_initializing = False
+        self.flags.is_initializing = False
         self.init_startup_timing_summary()
 
     def init_startup_timing_begin(self) -> None:
@@ -843,7 +844,7 @@ class Scheduler:
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
-                can_empty_cache=lambda: not self._engine_paused,
+                flags=self.flags,
             )
         else:
             self.idle_sleeper = None
@@ -1291,8 +1292,6 @@ class Scheduler:
         # Set if a role switch tore down the old role but failed to rebuild
         # either the new or the old role; the instance can no longer serve.
         self._pd_role_switch_unhealthy = False
-        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
-        self.gracefully_exit = False
         self.lists = CoreLists()
         # The flat driver's schedule slot: every decoding request, and the
         # admission flag (the PP ring keeps one per microbatch slot).
@@ -1302,10 +1301,6 @@ class Scheduler:
         # The last decode step's request inputs, shared with the next decode
         # step of the same requests.
         self.decode_rows: Optional[DecodeRows] = None
-        # The current forward batch
-        self.cur_batch_for_debug: Optional[ScheduleBatch] = None
-        self.enable_skip_finishing_decode = False
-        self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -1314,8 +1309,6 @@ class Scheduler:
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
-        self.forward_sleep_time = None
-        self._engine_paused = False
         self._deferred_input_requests: List = []
 
     def init_chunked_prefill(self):
@@ -1541,7 +1534,7 @@ class Scheduler:
             metrics_reporter=self.metrics_reporter,
             metrics_collector=self.metrics_collector,
             batch_result_processor=self.batch_result_processor,
-            get_processed_tokens_counter=lambda: self.processed_tokens_counter,
+            counters=self.counters,
             retire_unadmitted_request=self.retire_unadmitted_request,
             release_aborted_request=self._release_aborted_request,
             maybe_send_health_check_signal=self.maybe_send_health_check_signal,
@@ -1597,7 +1590,7 @@ class Scheduler:
             send_abort_output=self._send_abort_output,
             retire_beam_group=self.beam_coordinator.retire_group,
             release_finished_req=self.batch_result_processor.release_finished_req,
-            is_engine_paused=lambda: self._engine_paused,
+            flags=self.flags,
             core_lists=self.lists,
             get_pending_lora_ids=self.pending.lora_ids,
             policy=self.policy,
@@ -1978,7 +1971,7 @@ class Scheduler:
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation:
         a step commits in the next iteration, after that iteration's launch."""
-        self.enable_skip_finishing_decode = True
+        self.flags.enable_skip_finishing_decode = True
         self.run_flat_loop(overlap=True)
 
     @torch.no_grad()
@@ -2054,7 +2047,7 @@ class Scheduler:
             commit_step=self.commit_step,
             run_batch=self.run_batch,
             on_idle=self.on_idle,
-            set_cur_batch=self.set_cur_batch_for_debug,
+            counters=self.counters,
             mark_idle=self.mark_sched_idled,
             pp_group=self.pp_group,
             device=self.device,
@@ -2070,9 +2063,6 @@ class Scheduler:
             copy_stream_ctx=self.copy_stream_ctx,
             forward_stream_ctx=self.forward_stream_ctx,
         )
-
-    def set_cur_batch_for_debug(self, batch: Optional[ScheduleBatch]):
-        self.cur_batch_for_debug = batch
 
     def mark_sched_idled(self):
         self._sched_idled = True
@@ -2103,16 +2093,16 @@ class Scheduler:
         # launched was processed: once per launched step, not per pass.
         last_step, chunk_processed = None, False
         while True:
-            if self.gracefully_exit:
+            if self.flags.gracefully_exit:
                 break
 
             # Receive requests
-            if prefetch is not None and not self._engine_paused:
+            if prefetch is not None and not self.flags._engine_paused:
                 # Pending rooms from the prior cycle can overlap request intake
                 # and the tail of the in-flight decode graph.
                 prefetch()
             received = self.ingest_requests(waiting_for_result)
-            if self._engine_paused:
+            if self.flags._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
@@ -2123,7 +2113,7 @@ class Scheduler:
             # Schedule the step
             scheduled = False
             if is_result_ready is None:
-                if not self.gracefully_exit:
+                if not self.flags.gracefully_exit:
                     step = schedule(slot)
                     scheduled = True
             else:
@@ -2131,7 +2121,7 @@ class Scheduler:
                     skip_schedule = False
                 if (
                     len(self.pending) < 2
-                    and not self.gracefully_exit
+                    and not self.flags.gracefully_exit
                     and not self._deferred_input_requests
                     and not skip_schedule
                 ):
@@ -2149,7 +2139,7 @@ class Scheduler:
             # them first.
             record = None
             if scheduled:
-                self.cur_batch_for_debug = step
+                self.counters.cur_batch_for_debug = step
                 if may_sync_overlap and self.is_disable_overlap_for_batch(step):
                     self.commit_pending_steps()
                     # Opportunistic flush at the disable_overlap sync boundary:
@@ -2170,7 +2160,7 @@ class Scheduler:
             elif len(self.pending) > (1 if record is not None else 0):
                 if (
                     is_result_ready is not None
-                    and not self.gracefully_exit
+                    and not self.flags.gracefully_exit
                     and not is_result_ready(next(iter(self.pending)).result)
                 ):
                     waiting_for_result = True
@@ -2514,7 +2504,7 @@ class Scheduler:
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
-            get_forward_ct=lambda: self.forward_ct,
+            counters=self.counters,
         )
 
     def init_weight_updater(self) -> None:
@@ -2524,7 +2514,7 @@ class Scheduler:
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
-            is_engine_paused=lambda: self._engine_paused,
+            flags=self.flags,
             record_weight_version_change=self.record_weight_version_change,
             get_disagg_owners=lambda: (self.disagg_decode, self.disagg_prefill),
             metrics_collector=self.metrics_collector,
@@ -2588,9 +2578,7 @@ class Scheduler:
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
-        self.idle_sleeper = RustServerIdleSleeper(
-            rust_server, can_empty_cache=lambda: not self._engine_paused
-        )
+        self.idle_sleeper = RustServerIdleSleeper(rust_server, flags=self.flags)
 
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
@@ -2623,7 +2611,7 @@ class Scheduler:
         )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=target_worker.model_runner,
-            offload_tags=self.weight_updater.offload_tags,
+            flags=self.flags,
             spec_algorithm=self.spec_algorithm,
             new_step=self._new_step,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
@@ -2657,7 +2645,7 @@ class Scheduler:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_launched_step=lambda: self.cur_batch_for_debug,
+            counters=self.counters,
             core_lists=self.lists,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -2705,7 +2693,6 @@ class Scheduler:
         self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
-            get_disaggregation_mode=lambda: self.disaggregation_mode,
             # The worker reports logical DCP capacity; add KV shard widening.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
@@ -2731,10 +2718,6 @@ class Scheduler:
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
-            get_disaggregation_mode=lambda: self.disaggregation_mode,
-            enable_hicache_storage=lambda: (
-                self.enable_hicache_storage or self.enable_lmcache
-            ),
             rust_server=self.rust_server,
         )
 
@@ -2818,7 +2801,6 @@ class Scheduler:
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
             metrics_reporter=self.metrics_reporter,
             rust_server=self.rust_server,
-            get_disaggregation_mode=lambda: self.disaggregation_mode,
             get_request_lists=self.request_lists,
             get_startup_time=lambda: self.startup_time,
             record_step_time=RECORD_STEP_TIME,
@@ -3438,7 +3420,7 @@ class Scheduler:
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_hicache_storage or self.enable_lmcache:
+        if hicache_storage_enabled() or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3600,7 +3582,7 @@ class Scheduler:
             self._prefetch_kvcache(req)
             self.lists.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
-            req.arrival_processed_tokens = self.processed_tokens_counter
+            req.arrival_processed_tokens = self.counters.processed_tokens_counter
 
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""
@@ -3936,7 +3918,7 @@ class Scheduler:
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
-            if self.enable_hicache_storage and should_retry_storage_prefetch:
+            if hicache_storage_enabled() and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -4192,7 +4174,7 @@ class Scheduler:
         self.policy.calc_priority(
             self.lists.waiting_queue,
             running_reqs,
-            processed_tokens=self.processed_tokens_counter,
+            processed_tokens=self.counters.processed_tokens_counter,
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -4303,7 +4285,7 @@ class Scheduler:
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if hicache_storage_enabled() or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4323,12 +4305,12 @@ class Scheduler:
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
-            if self.enable_hicache_storage and (
+            if hicache_storage_enabled() and (
                 self._prefetch_after_device_hit_loss(req)
             ):
                 continue
             if (
-                self.enable_hicache_storage
+                hicache_storage_enabled()
                 and buffer_pipeline is not None
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
@@ -4384,7 +4366,7 @@ class Scheduler:
             return None
 
         retries = self.tree_cache.storage_prefetch_retries
-        if self.enable_hicache_storage and retries is not None:
+        if hicache_storage_enabled() and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
 
@@ -4483,7 +4465,7 @@ class Scheduler:
             if not req.is_prefill_only
         ]
         num_pending = len(self.pending)
-        if not self.enable_skip_finishing_decode or num_pending == 0:
+        if not self.flags.enable_skip_finishing_decode or num_pending == 0:
             return candidates
         # Each pending step commits at most one output to a request, so only a
         # request within num_pending outputs of max_new_tokens can finish in
@@ -4569,7 +4551,7 @@ class Scheduler:
             self.spec_algorithm,
             chunked_req=chunked_req,
             kv_reuse_lens=kv_reuse_lens,
-            forward_iter=self.forward_ct + 1,
+            forward_iter=self.counters.forward_ct + 1,
         )
 
     def _build_decode_step(
@@ -4604,7 +4586,7 @@ class Scheduler:
 
         # Check if decode out of memory
         if kv_full_retract_flag or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+            TEST_RETRACT and self.counters.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             reqs = self._retract_decode_reqs(reqs, kv_full_retract_flag, slot)
         else:
@@ -4739,20 +4721,20 @@ class Scheduler:
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
-        self.forward_ct += 1
+        self.counters.forward_ct += 1
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
         if batch.extend_num_tokens:
-            self.processed_tokens_counter += batch.extend_num_tokens
+            self.counters.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
-        if self.forward_sleep_time is not None:
-            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
-            time.sleep(self.forward_sleep_time)
+        if self.flags.forward_sleep_time is not None:
+            logger.info(f"Scheduler.run_batch sleep {self.flags.forward_sleep_time}s")
+            time.sleep(self.flags.forward_sleep_time)
 
         if (before_forward := self.stages.before_forward) is not None:
             before_forward(batch)
@@ -5179,7 +5161,7 @@ class Scheduler:
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             if (
-                self.enable_hicache_storage
+                hicache_storage_enabled()
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
             ):
@@ -5324,7 +5306,6 @@ class Scheduler:
             logger.exception("Attach HiCache storage backend failed with exception.")
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
-            self.enable_hicache_storage = True
             hicache_fields = {
                 "hicache_storage_backend": recv_req.hicache_storage_backend
             }
@@ -5376,9 +5357,8 @@ class Scheduler:
             logger.exception("Detach HiCache storage backend failed with exception.")
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
-        if ok or (not self.enable_hicache_storage):
+        if ok or (not hicache_storage_enabled()):
             # Treat "already disabled / nothing to do" as success for idempotence.
-            self.enable_hicache_storage = False
             get_context().override(
                 "scheduler.detach_hicache",
                 hicache_storage_backend=None,
@@ -5393,8 +5373,8 @@ class Scheduler:
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self._engine_paused):
-            self.cur_batch_for_debug = None
+        if self.is_fully_idle(ignore_waiting=self.flags._engine_paused):
+            self.counters.cur_batch_for_debug = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5618,7 +5598,7 @@ class Scheduler:
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
-        self._engine_paused = True
+        self.flags._engine_paused = True
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
@@ -5641,7 +5621,7 @@ class Scheduler:
             if not req.finished()
         ]
 
-        self.cur_batch_for_debug = None
+        self.counters.cur_batch_for_debug = None
 
         if self.disagg_decode is not None and self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
@@ -5708,7 +5688,7 @@ class Scheduler:
         # weights.
         if self.disagg_decode is not None:
             self.disagg_decode.prealloc_queue.enqueue_held_rebootstrap()
-        self._engine_paused = False
+        self.flags._engine_paused = False
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
@@ -5844,7 +5824,7 @@ class Scheduler:
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
             t = None
-        self.forward_sleep_time = t
+        self.flags.forward_sleep_time = t
         return SlowDownReqOutput()
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
@@ -5895,7 +5875,7 @@ class Scheduler:
 
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.
-        self.gracefully_exit = True
+        self.flags.gracefully_exit = True
         return None
 
     def configure_logging(self, recv_req: ConfigureLoggingReq):
@@ -5964,7 +5944,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
-    scheduler.enable_skip_finishing_decode = False
+    scheduler.flags.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if get_parallel().pp_size > 1:
         # The ring takes each mode's stages, PD consensus included.
@@ -6124,7 +6104,7 @@ def run_scheduler_process(
             scheduler.metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
+            if scheduler.flags.gracefully_exit:
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()

@@ -31,7 +31,14 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_observability,
+    get_parallel,
+    get_serving,
+    hicache_storage_enabled,
+)
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -56,8 +63,6 @@ class SchedulerOutputStreamer:
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
-    get_disaggregation_mode: Callable[[], DisaggregationMode]
-    enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -102,9 +107,11 @@ class SchedulerOutputStreamer:
             }
             # In PD mode the L3 hit is produced on prefill and reported on
             # decode via metadata, while decode may not have a local storage backend.
-            if req.cached_tokens_storage > 0 or self.enable_hicache_storage():
+            if req.cached_tokens_storage > 0 or (
+                hicache_storage_enabled() or get_memory().enable_lmcache
+            ):
                 details["storage"] = req.cached_tokens_storage
-            if self.enable_hicache_storage():
+            if hicache_storage_enabled() or get_memory().enable_lmcache:
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
 
@@ -169,7 +176,7 @@ class SchedulerOutputStreamer:
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.get_disaggregation_mode(),
+            disaggregation_mode=DisaggregationMode(get_disagg().disaggregation_mode),
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,

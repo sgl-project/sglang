@@ -19,6 +19,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (  #
     advance_grammar_fsm,
     commit_pending_grammar,
 )
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
@@ -80,7 +84,9 @@ class TestGrammarCommitOverlap(CustomTestCase):
         processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
 
         s = Scheduler.__new__(Scheduler)
-        s.gracefully_exit = False
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
+        s.flags.gracefully_exit = False
         s.flat_slot = ScheduleSlot()
         s.disaggregation_mode = DisaggregationMode.NULL
         s.disagg_prefill = None
@@ -88,7 +94,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
         s.dllm = None
         s.hisparse_coordinator = None
         s.ingest_requests = MagicMock(side_effect=[[], [], StopIteration])
-        s._engine_paused = False
+        s.flags._engine_paused = False
         s._sched_idled = False
         s.pending = PendingSteps()
         s.require_mlp_sync = False

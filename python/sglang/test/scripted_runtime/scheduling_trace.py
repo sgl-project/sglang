@@ -98,7 +98,7 @@ class SchedulingTraceWriter:
                 "waiting": load.num_waiting_reqs,
             },
         }
-        if scheduler._engine_paused:
+        if scheduler.flags._engine_paused:
             self._write({"kind": "paused", "step": self._step, **self._readers})
 
     def record_schedule(

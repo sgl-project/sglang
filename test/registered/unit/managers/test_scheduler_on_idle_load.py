@@ -10,7 +10,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -21,10 +26,12 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestOnIdleStallPublish(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
-        s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()

@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 
@@ -26,12 +27,19 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.lists = CoreLists()
+        s.counters = LaunchCounters()
         s.scheduler_stage_metrics = None
         s.scripted_scheduler_hook = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
-        s.enable_hicache_storage = True
+        self.storage_enabled = enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler.hicache_storage_enabled",
+                return_value=True,
+            ),
+        )
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
@@ -80,7 +88,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 s = self.scheduler
                 s.enable_hierarchical_cache = hierarchical
                 s.enable_unified_cache_external_linker = linker
-                s.enable_hicache_storage = storage
+                self.storage_enabled.return_value = storage
                 s._process_hicache_events()
                 expected = [call.drain()] if hierarchical or flexkv or linker else []
                 if storage:

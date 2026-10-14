@@ -716,7 +716,7 @@ class SchedulerMetricsReporter:
         batch_iter = (
             batch.forward_iter
             if batch is not None and batch.forward_iter is not None
-            else self.scheduler.forward_ct
+            else self.scheduler.counters.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
@@ -924,7 +924,7 @@ class SchedulerMetricsReporter:
         batch_iter = (
             batch.forward_iter
             if batch is not None and batch.forward_iter is not None
-            else self.scheduler.forward_ct
+            else self.scheduler.counters.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"

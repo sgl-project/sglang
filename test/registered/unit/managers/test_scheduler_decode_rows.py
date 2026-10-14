@@ -13,6 +13,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.runtime_context import publish, reset_context
@@ -26,15 +30,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _new_scheduler() -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.counters = LaunchCounters()
+    s.flags = EngineFlags()
     s.lists = CoreLists()
     s.device = "cpu"
     s.lists.decoding = []
     s.decode_rows = None
     s.pending = PendingSteps()
     s.flat_slot = ScheduleSlot()
-    s.enable_skip_finishing_decode = False
+    s.flags.enable_skip_finishing_decode = False
     s.spec_algorithm = SpeculativeAlgorithm.NONE
-    s.forward_ct = 1
+    s.counters.forward_ct = 1
     s.tree_cache = MagicMock()
     s.token_to_kv_pool_allocator = MagicMock(page_size=1)
     s.token_to_kv_pool_allocator.check_decode_capacity.return_value = True

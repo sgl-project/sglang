@@ -9,6 +9,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -35,8 +39,10 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
-        scheduler._engine_paused = True
+        scheduler.flags._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.cur_batch = None
         scheduler.lists.chunked_req = None
@@ -114,7 +120,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         """ignore_waiting is gated on _engine_paused inside flush_cache — a
         flush issued without pausing first must not be silently permissive."""
         scheduler = self._new_scheduler()
-        scheduler._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler.lists.waiting_queue = [_make_req(is_retracted=True)]
 
         self.assertFalse(scheduler.flush_cache())
