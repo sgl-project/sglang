@@ -14,7 +14,9 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -153,6 +155,23 @@ class BaseSpecWorker(ABC):
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
         self._additional_graph_time_usage: dict[str, float] = {}
+
+    @abstractmethod
+    def forward_batch_generation(
+        self,
+        batch: "ScheduleBatch",
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
+    ) -> "GenerationBatchResult":
+        """Entry point called by the scheduler's non-overlap speculative path.
+
+        All spec-v2 workers must implement this method with a uniform
+        signature so the scheduler can dispatch without keyword-argument
+        mismatches (see #40155). Implementations should pass
+        ``pp_proxy_tensors`` through to the target worker when a prefill
+        forward is issued.
+        """
 
     @property
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
