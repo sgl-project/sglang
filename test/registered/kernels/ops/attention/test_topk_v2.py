@@ -416,6 +416,27 @@ def _assert_topk_values(window, indices, k):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("batch,seq", [(4, 8192), (513, 32768), (40, 131072)])
+@torch.inference_mode()
+def test_topk_v2_coarse_bucket_overflow(batch: int, seq: int) -> None:
+    """Register, streaming and long-row dispatch must not truncate coarse ties."""
+    k = 2048
+    columns = torch.arange(seq, dtype=torch.int32, device="cuda")
+    # These unequal FP32 values share both the 10-bit and 12-bit coarse bins.
+    # More than 2048 of them survive, so the tie arena alone is insufficient.
+    bits = 0x3F800000 + ((columns * 37) % 8192)
+    scores = bits.view(torch.float32).expand(batch, -1).clone()
+    scores[:, :257] = 4.0
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    out = torch.full((batch, k), -2, dtype=torch.int32, device="cuda")
+
+    # Keep plan production adjacent: its consumers must honor the dependency.
+    plan = plan_topk_v2(lengths)
+    topk_transform_paged_v2(scores, lengths, None, out, PAGE_SIZE, plan)
+    for row in range(batch):
+        _assert_topk_values(scores[row], out[row], k)
+
+
 @pytest.mark.parametrize("num_ties", [48, 96])
 @torch.inference_mode()
 def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:

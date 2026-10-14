@@ -115,6 +115,29 @@ def test_fast_topk_duplicate_heavy(topk, fill):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.parametrize("batch,length", [(4, 8192), (1, 131072)])
+@torch.inference_mode()
+def test_aot_fast_topk_coarse_bucket_overflow(batch, length):
+    """The AOT selector must rescan unequal scores beyond its bounded bucket."""
+    from sgl_kernel import fast_topk_v2
+
+    # 8192 distinct FP32 values share one fp16 coarse bin. Arbitrarily retaining
+    # the first 4096 candidates loses real winners; exact ties remain unordered.
+    columns = torch.arange(length + 4, dtype=torch.int32, device="cuda")
+    bits = 0x3F800000 + ((columns * 37) % 8192)
+    score = bits.view(torch.float32).expand(batch, -1).clone()
+    score[:, :3] = 100.0  # outside the unaligned visible window
+    score[:, 3:260] = 4.0  # some winners are above the overflowing coarse bin
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    starts = torch.full_like(lengths, 3)
+
+    indices = fast_topk_v2(score, lengths, 2048, row_starts=starts)
+    assert ((indices >= 0) & (indices < length)).all()
+    ordered = indices.sort(dim=1).values
+    assert (ordered[:, 1:] != ordered[:, :-1]).all()
+    _check_topk_values(score, lengths, indices, 2048, starts)
+
+
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_negative_and_zero(topk):
     torch.manual_seed(0)

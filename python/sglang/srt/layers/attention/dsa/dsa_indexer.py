@@ -409,6 +409,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        from .dosa import prepare_indexer_backend
+
+        self._dosa_prefill_prepared = prepare_indexer_backend(self)
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
         # runtime half is dsa/utils.gfx950_fused_indexer_runtime_ok.
@@ -1518,6 +1521,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
+        from .dosa import try_paged_prefill
+
+        if try_paged_prefill(
+            self, forward_batch, layer_id, q_fp8, weights, metadata,
+            ks, ke, block_tables, topk_result, get_token_to_kv_pool(),
+        ):
+            return topk_result
+
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
@@ -1595,11 +1606,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
+            from .dosa import publish_stock_paged_prior
+
+            publish_stock_paged_prior(
+                self, forward_batch, layer_id, metadata,
+                block_tables, topk_result, rows=q_offset,
+            )
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
+        # The contiguous SM100/H32 kernel schedules four queries per task.
+        align_mqa_query_waves = (
+            _is_cuda
+            and device.type == "cuda"
+            and q_fp8.dtype == torch.float8_e4m3fn
+            and q_fp8.shape[1:] == (32, 128)
+            and weights.dtype == torch.float32
+            and weights.shape[1:] == (32,)
+            and torch.cuda.get_device_capability(device) == (10, 0)
+        )
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None
@@ -1616,9 +1643,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         start = 0
         while start < q_offset:
-            end = min(start + max_rows, q_offset)
-
             with self._with_real_sm_count():
+                chunk_rows = max_rows
+                if align_mqa_query_waves:
+                    # Use the effective count under this launch's PP reservation.
+                    wave_queries = 4 * deep_gemm.get_num_sms()
+                    if 0 < wave_queries <= chunk_rows:
+                        chunk_rows = chunk_rows // wave_queries * wave_queries
+                end = min(start + chunk_rows, q_offset)
                 if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -1678,10 +1710,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
+                single_request_table=(
+                    forward_batch.batch_size == 1
+                    and batch_size == 1
+                    and not self.dsa_enable_prefill_cp
+                ),
             )
             topk_result[start:end] = raw_topk_chunk
             start = end
+            # Retire consumed buffers before allocating the next logits chunk.
+            del logits_chunk, raw_topk_chunk
 
+        from .dosa import publish_stock_paged_prior
+
+        publish_stock_paged_prior(
+            self, forward_batch, layer_id, metadata,
+            block_tables, topk_result, rows=q_offset,
+        )
         return topk_result
 
     def _forward_cuda_k_only(

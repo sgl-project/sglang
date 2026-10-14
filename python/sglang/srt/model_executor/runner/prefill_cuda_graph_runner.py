@@ -1909,6 +1909,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
             batch_size=bs,
+            rids=forward_batch.rids,
             input_ids=input_ids,
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,

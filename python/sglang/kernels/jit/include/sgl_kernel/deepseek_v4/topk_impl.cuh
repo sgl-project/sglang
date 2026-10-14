@@ -421,6 +421,8 @@ struct TopKRadixBase : TopKConfig {
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
+    uint32_t threshold_bin;
+    uint32_t threshold_count;
     float v_hi;
     float v_lo;
     uint32_t warp_sum[kNumWarps];
@@ -481,6 +483,62 @@ struct TopKRadixBase : TopKConfig {
     vec.store(histogram, tx);
   }
 
+  // A coarse bin can contain more unequal FP32 scores than the tie arena can
+  // hold. Refine its threshold with full-row radix passes before collecting.
+  // At the last byte all remaining keys are identical, so any topk of them
+  // suffices. The cluster invokes this only on rank 0, before publishing bounds;
+  // its peers are still waiting and do not use rank 0's histogram overlay.
+  template <typename Smem>
+  SGL_DEVICE static void refine_bounds(const TopKProblem& problem, Smem* smem) {
+    if (smem->threshold_count <= kMaxNumTie) return;
+    const auto tx = threadIdx.x;
+    uint32_t prefix = 0, mask = 0, remain = problem.topk;
+    int shift = 24;
+    for (; shift >= 0; shift -= 8) {
+      if (tx < kRadixSize) smem->histogram[tx] = 0;
+      __syncthreads();
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        // Ragged windows mask <=3 alignment-prefix values with NaN. They are
+        // outside the problem, and must not enter the exact-key histogram.
+        const uint32_t key = extract_exact_bin(val);
+        if (idx >= problem.input_start && (key & mask) == prefix) {
+          atomicAdd(&smem->histogram[(key >> shift) & 255u], 1);
+        }
+      });
+      __syncthreads();
+      if (tx == 0) {
+        uint32_t above = 0;
+        for (int bin = 255; bin >= 0; --bin) {
+          const uint32_t count = smem->histogram[bin];
+          if (above < remain && above + count >= remain) {
+            smem->threshold_bin = bin;
+            smem->count_gt = above;
+            smem->count_eq = count;
+            break;
+          }
+          above += count;
+        }
+      }
+      __syncthreads();
+      prefix |= smem->threshold_bin << shift;
+      mask |= 255u << shift;
+      remain -= smem->count_gt;
+      if (smem->count_eq <= kMaxNumTie || shift == 0) break;
+    }
+    if (tx == 0) {
+      const auto value_from_key = [](uint64_t key) {
+        if (key < 0x007FFFFFull) return -infinity_value();
+        if (key > 0xFF800000ull) return infinity_value();
+        const auto bits = static_cast<uint32_t>(key);
+        return __uint_as_float((bits & 0x80000000u) ? (bits ^ 0x80000000u) : ~bits);
+      };
+      smem->v_lo = value_from_key(prefix);
+      smem->v_hi = value_from_key(uint64_t(prefix) + (1ull << shift));
+      smem->count_gt = smem->count_eq = 0;
+    }
+    __syncthreads();
+  }
+
   /// Same, but scanning a histogram that need not be `smem`'s own -- the cluster
   /// path merges into one rank's copy and scans it there.
   template <typename Smem, typename Fn>
@@ -519,6 +577,8 @@ struct TopKRadixBase : TopKConfig {
         const auto next = static_cast<int32_t>(local_exc_sum[i + 1]);
         if (remained >= prev && remained < next) target = tx * kItems + i;
       }
+      smem->threshold_bin = target;
+      smem->threshold_count = hist_vec[target % kItems];
       fn(target);
     }
 
@@ -593,6 +653,7 @@ struct TopKRegister : TopKRadixBase<12> {
       smem->v_hi = v_hi;
       smem->v_lo = v_lo;
     });
+    refine_bounds(problem, smem);
 
     // Phase 3: collect by two fp32 boundaries
     const auto topk = problem.topk;
@@ -672,6 +733,7 @@ struct TopKStreaming : TopKRadixBase<12> {
       smem->v_hi = v_hi;
       smem->v_lo = v_lo;
     });
+    refine_bounds(problem, smem);
 
     // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
     // from the threshold bin instead of recomputing the fp16 bin per element: an
@@ -727,6 +789,8 @@ struct TopKCluster : TopKRadixBase<10> {
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
+    uint32_t threshold_bin;
+    uint32_t threshold_count;
     uint32_t local_start_eq;
     uint32_t local_start_gt;
     float v_lo;
@@ -856,6 +920,7 @@ struct TopKCluster : TopKRadixBase<10> {
         smem->v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
         smem->v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
       });
+      refine_bounds(problem, smem);
 
       barrier_cluster_arrive_release();  // bar-2 arrive: publishes v_hi / v_lo
       barrier_cluster_wait();            // bar-2 wait
