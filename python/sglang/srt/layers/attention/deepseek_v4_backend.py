@@ -1813,7 +1813,7 @@ class DeepseekV4AttnBackend(
         )
         gather_index = owner_rank * max_local + slot
 
-        local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
+        local_tail_rows = (owner_rank == cp_rank).nonzero(as_tuple=True)[0]
         pad_rows = max_local - counts[cp_rank]
         # Give each rank distinct padding rows in the compact tail metadata.
         pad_start = total + sum(max_local - c for c in counts[:cp_rank])
