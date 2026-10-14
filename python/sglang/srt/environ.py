@@ -361,7 +361,6 @@ class Envs:
     # IPC, broadcasters, and ports
     # ===================================================================
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
-    SGLANG_OPT_DETOK_TOKENIZER_GROUP_SEND = EnvBool(False)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
