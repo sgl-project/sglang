@@ -1,7 +1,5 @@
 from typing import Any, Optional
 
-import numpy as np
-import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -19,6 +17,9 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.srt.state_capturer.routed_experts_wire import (
+    extract_routed_experts_from_meta_info as extract_routed_experts_from_meta_info,
+)
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -148,17 +149,6 @@ def destroy_global_experts_capturer():
     if (capturer := get_resources().experts_capturer) is not None:
         capturer.destroy()
     get_resources().experts_capturer = None
-
-
-def extract_routed_experts_from_meta_info(data):
-    # To solve the performance issue, we return the experts_ids in base64
-    # We left this function for user to change it back to normal int32
-    # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
-    routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
-    )
-    return routed_experts
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:

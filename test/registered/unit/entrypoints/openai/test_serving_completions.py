@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -63,7 +63,7 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingCompletionTestCase(unittest.TestCase):
+class ServingCompletionTestCase(CustomTestCase):
     """Bundle all prompt/echo tests in one TestCase."""
 
     # ---------- shared test fixtures ----------
@@ -625,6 +625,64 @@ class ServingCompletionTestCase(unittest.TestCase):
             chunk["sglext"] for chunk in single_parsed if "sglext" in chunk
         )["spec_tokens_details"]
         self.assertIsInstance(single_details, dict)
+
+    def test_routed_experts_dtype_survives_native_to_openai_response(self):
+        """Dtype must accompany the same routing payload in both response modes."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                req = CompletionRequest(
+                    model="x", prompt="Hi", stream=stream, return_routed_experts=True
+                )
+                ret = {
+                    "text": "Response",
+                    "meta_info": {
+                        "id": "cmpl-routing",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "routed_experts": "AAH+/w==",
+                        "routed_experts_dtype": "uint8",
+                        "finish_reason": {"type": "stop", "matched": None},
+                        "weight_version": "default",
+                    },
+                    "index": 0,
+                }
+                if stream:
+
+                    async def generate(*args, **kwargs):
+                        yield ret
+
+                    self.sc.tokenizer_manager.generate_request = generate
+                    adapted, _ = self.sc._convert_to_internal_request(req)
+
+                    async def collect():
+                        return [
+                            chunk
+                            async for chunk in self.sc._generate_completion_stream(
+                                adapted, req, self.fastapi_request
+                            )
+                        ]
+
+                    chunks = get_or_create_event_loop().run_until_complete(collect())
+                    responses = [
+                        json.loads(chunk[len("data: ") :])
+                        for chunk in chunks
+                        if chunk.strip() != "data: [DONE]"
+                    ]
+                    extensions = [
+                        item["sglext"] for item in responses if "sglext" in item
+                    ]
+                    self.assertEqual(len(extensions), 1)
+                    extension = extensions[0]
+                else:
+                    response = self.sc._build_completion_response(
+                        req, [ret], 1234567890
+                    )
+                    extension = response.model_dump()["sglext"]
+                self.assertEqual(
+                    extension,
+                    {"routed_experts": "AAH+/w==", "routed_experts_dtype": "uint8"},
+                )
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""

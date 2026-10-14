@@ -274,6 +274,19 @@ def process_routed_experts_from_ret(
     return ret_item["meta_info"].get("routed_experts", None)
 
 
+def process_routed_experts_dtype_from_ret(
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> str | None:
+    """Process routed experts dtype from a ret item in non-streaming response."""
+    if not getattr(request, "return_routed_experts", False):
+        return None
+    meta_info = ret_item["meta_info"]
+    if meta_info.get("routed_experts", None) is None:
+        return None
+    return meta_info.get("routed_experts_dtype", None)
+
+
 def cached_tokens_details_from_dict(
     details: dict[str, Any],
 ) -> CachedTokensDetails:

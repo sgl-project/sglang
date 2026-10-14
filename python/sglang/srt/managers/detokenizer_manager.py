@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts_wire import encode_routed_experts_for_wire
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
@@ -441,6 +442,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    @staticmethod
+    def _b64_encode_routed_experts(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+    ) -> tuple[Optional[List[Optional[str]]], Optional[List[Optional[str]]]]:
+        if data_list is None:
+            return None, None
+        encoded: List[Optional[str]] = []
+        dtypes: List[Optional[str]] = []
+        for item in data_list:
+            if item is None:
+                encoded.append(None)
+                dtypes.append(None)
+                continue
+            payload, dtype_name = encode_routed_experts_for_wire(item)
+            encoded.append(payload)
+            dtypes.append(dtype_name)
+        return encoded, dtypes
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
@@ -457,7 +476,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts, routed_experts_dtype = self._b64_encode_routed_experts(
+            recv_obj.routed_experts
+        )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -498,6 +519,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            routed_experts_dtype=routed_experts_dtype,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,

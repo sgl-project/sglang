@@ -83,6 +83,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
+    process_routed_experts_dtype_from_ret,
     process_routed_experts_from_ret,
     process_spec_tokens_details_from_ret,
     should_include_usage,
@@ -1392,9 +1393,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
@@ -1989,6 +1990,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        routed_experts_dtype = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
         image_tokens = {}
@@ -2030,6 +2032,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                routed_experts_dtype[index] = content["meta_info"].get(
+                    "routed_experts_dtype", None
+                )
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
@@ -2184,10 +2189,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             sglext_routed = None
+            sglext_routed_dtype = None
             if request.return_routed_experts and routed_experts:
-                sglext_routed = next(
-                    (v for v in routed_experts.values() if v is not None), None
+                first_routed = next(
+                    ((i, v) for i, v in routed_experts.items() if v is not None), None
                 )
+                if first_routed is not None:
+                    routed_index, sglext_routed = first_routed
+                    sglext_routed_dtype = routed_experts_dtype.get(routed_index)
 
             sglext_cached_tokens_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
@@ -2224,6 +2233,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_full = SglExt(
                 routed_experts=sglext_routed,
+                routed_experts_dtype=sglext_routed_dtype,
                 cached_tokens_details=sglext_cached_tokens_details,
                 spec_tokens_details=sglext_spec_tokens_details,
                 input_ids=sglext_input_ids,
@@ -2358,6 +2368,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.return_meta_info
             else process_routed_experts_from_ret(first_ret, request)
         )
+        routed_experts_dtype = (
+            None
+            if request.return_meta_info
+            else process_routed_experts_dtype_from_ret(first_ret, request)
+        )
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
@@ -2382,6 +2397,7 @@ class OpenAIServingChat(OpenAIServingBase):
         response_sglext = None
         if (
             routed_experts
+            or routed_experts_dtype
             or cached_tokens_details
             or spec_tokens_details
             or input_ids is not None
@@ -2389,6 +2405,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
+                routed_experts_dtype=routed_experts_dtype,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,
