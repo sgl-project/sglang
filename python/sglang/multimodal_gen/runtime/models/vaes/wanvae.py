@@ -175,7 +175,12 @@ def _run_cached_causal_conv(
             [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
             dim=2,
         )
-    out = conv(x, payload, residual=residual, skip_bias=skip_bias)
+    if isinstance(conv, WanCausalConv3d):
+        out = conv(x, payload, residual=residual, skip_bias=skip_bias)
+    else:
+        out = conv(x, payload)
+        if residual is not None:
+            out = out + residual
     cache_list[idx] = cache_x
     return out
 
@@ -416,7 +421,7 @@ def residual_block_forward(self, x):
 
     # conv1's bias is deferred into norm2 (fused RMSNorm+SiLU absorbs it in
     # the same pass; the eager norm adds it first with the same arithmetic).
-    defer_bias = self.conv1.bias is not None
+    defer_bias = isinstance(self.conv1, WanCausalConv3d) and self.conv1.bias is not None
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
@@ -428,7 +433,7 @@ def residual_block_forward(self, x):
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv1(x, skip_bias=defer_bias)
+        x = self.conv1(x, skip_bias=True) if defer_bias else self.conv1(x)
 
     # Second normalization and activation
     x = self.norm2(x, conv_bias=self.conv1.bias if defer_bias else None)
@@ -448,7 +453,10 @@ def residual_block_forward(self, x):
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv2(x, residual=h)
+        if isinstance(self.conv2, WanCausalConv3d):
+            x = self.conv2(x, residual=h)
+        else:
+            x = self.conv2(x) + h
     return x
 
 
