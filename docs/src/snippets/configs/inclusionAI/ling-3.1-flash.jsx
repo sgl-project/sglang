@@ -176,7 +176,6 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
