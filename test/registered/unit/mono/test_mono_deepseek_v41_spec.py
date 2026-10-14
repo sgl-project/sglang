@@ -33,22 +33,18 @@ def test_flash_spans():
     assert spans == {i: (dsv41.LAYER,) for i in range(40)}
 
 
-def test_other_layers_keep_the_normal_path_or_the_ffn_span():
+def test_other_layers_keep_the_normal_path():
     hashed = SimpleNamespace(**{**vars(FLASH), "num_hash_layers": 4})
     spans = dsv41.SPEC.spans(hashed)
     assert 0 not in spans and 3 not in spans  # hash-routed MoE
     assert spans[4] == (dsv41.LAYER,)  # K1 folds in the normal path's pending post
     ratio4 = SimpleNamespace(**{**vars(FLASH), "compress_ratios": [4] * 43})
-    assert set(dsv41.SPEC.spans(ratio4).values()) == {(dsv41.FFN,)}
+    assert dsv41.SPEC.spans(ratio4) == {}  # another compress ratio
 
 
-def test_spans_are_the_whole_layer_or_from_wo_b():
+def test_the_span_is_the_whole_layer():
     assert (dsv41.LAYER.start, dsv41.LAYER.end) == (
         SpanPoint.LAYER_IN,
-        SpanPoint.LAYER_OUT,
-    )
-    assert (dsv41.FFN.start, dsv41.FFN.end) == (
-        SpanPoint.ATTN_PARTIAL,
         SpanPoint.LAYER_OUT,
     )
 

@@ -21,12 +21,13 @@ spec's LAYER_IN and LAYER_OUT, and each span returns what the fused boundary
     between the launches, as SGLang runs it before the layer's attention, and K2
     builds the key table from the top-k it selected.
   - A window-only layer (ratio 0) reads no compressed cache.
-- ``ffn`` (ATTN_PARTIAL -> LAYER_OUT), backend_state: a layer outside these (another
-  compress ratio).
 
-Under a plan the covered layers (every layer after the hash-routed ones) take
-DSpark's captures, the residual each target layer's boundary rebuilds, so the
-layers before them keep their post pending.
+A layer of another compress ratio keeps the normal path; DeepSeek-V4.1-Flash has
+none. The FFN launch (``layer.build_mono_ffn``) serves no span: the kernel checks
+use it as the reference for K2's FFN half.
+
+Under a plan the covered layers take DSpark's captures, the residual each target
+layer's boundary rebuilds, so the layers before them keep their post pending.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
 each covered layer's FP8 shared expert (this rank's shard, kept at load, because
@@ -62,7 +63,6 @@ from sglang.kernels.ops.mono.spec import (
 
 MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
 LAYER = Span("layer", SpanPoint.LAYER_IN, SpanPoint.LAYER_OUT)  # K1, then K2
-FFN = Span("ffn", SpanPoint.ATTN_PARTIAL, SpanPoint.LAYER_OUT, reason="backend_state")
 
 _SHARED = ("gate_proj", "up_proj", "down_proj")
 
@@ -208,8 +208,9 @@ NUMERICS = Numerics(
 def _layer_spans(config) -> dict[int, tuple[Span, ...]]:
     first = getattr(config, "num_hash_layers", 0) or 0  # hash-routed MoE: normal path
     return {
-        i: (LAYER,) if config.compress_ratios[i] in (0, 1, 2) else (FFN,)
+        i: (LAYER,)
         for i in range(first, config.num_hidden_layers)
+        if config.compress_ratios[i] in (0, 1, 2)
     }
 
 
@@ -266,7 +267,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
 
     heads = Dims(get_parallel().tp_size).heads
     reasons, unseen = [], []
-    for i, spans in _layer_spans(hf_config).items():
+    for i in _layer_spans(hf_config):
         layer = model.layers[i]
         a, moe = layer.self_attn, layer.mlp
         if not layer.hc_boundary_fused or moe.is_nextn or moe.is_hash:
@@ -279,8 +280,6 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             for k in ("weight", "scale")
         ):
             unseen.append(i)
-        if LAYER not in spans:
-            continue
         if a.q_head_norm or not a.fuse_wqa_wkv or a.n_local_heads != heads:
             reasons.append(
                 f"layer {i}: K1 needs the fused wqkv_a, {heads} local heads and no "
@@ -336,7 +335,7 @@ class _Layer:
     i: int
     module: Any
     ffn: Any  # FFNWeights
-    k1: Any = None  # K1Weights; None: the layer takes the ffn span
+    k1: Any = None  # K1Weights
     k2: Any = None  # K2Weights
     ratio: int = 0  # the compress ratio: which sparse key table K1 reads (0: none)
     # an index source: SGLang's compressor and indexer run between K1 and K2
@@ -364,7 +363,7 @@ def _codes(copies: dict, i: int, name: str, lin) -> torch.Tensor:
     )
 
 
-def _weights(copies: dict, tables: list, layer, i: int, spans) -> _Layer:
+def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     """Layer i's tensors as the launches read them."""
     from sglang.kernels.ops.mono.deepseek_v41_hip.attention.plan import Dims
     from sglang.kernels.ops.mono.deepseek_v41_hip.runner import (
@@ -409,8 +408,6 @@ def _weights(copies: dict, tables: list, layer, i: int, spans) -> _Layer:
     )
     ffn.check(p.tp_size)
     L = _Layer(i, layer, ffn)
-    if LAYER not in spans:
-        return L
     cos_sin = rope_table(a.freqs_cis, tables)
     L.k1 = K1Weights(
         hc_fn=layer.hc_attn_fn,
@@ -465,12 +462,9 @@ class _Built:
         self.model, self.runner, self._layers = model, runner, layers
         self._normal_moe = model.layers[min(layers)].mlp
         self._targets_checked = False
-        self._kernels = {}
-        for i, L in layers.items():
-            if L.k1 is None:
-                self._kernels[i, SpanPoint.ATTN_PARTIAL] = partial(self._ffn, L)
-            else:
-                self._kernels[i, SpanPoint.LAYER_IN] = partial(self._layer, L)
+        self._kernels = {
+            (i, SpanPoint.LAYER_IN): partial(self._layer, L) for i, L in layers.items()
+        }
 
     def kernel(self, layer_id: int, point: SpanPoint, key):
         return self._kernels.get((layer_id, point))
@@ -540,16 +534,6 @@ class _Built:
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
-    def _ffn(self, L, plan, part, residual, coefficients, defer_post):
-        """ATTN_PARTIAL -> LAYER_OUT: wo_b's unreduced output and the attention
-        seam's residual and mixing coefficients in; the fused boundary's outputs
-        out (the attention TP reduce, the FFN seam, the MoE and its all-reduce)."""
-        self._warm_normal_moe()
-        self._capture(plan, L, residual)
-        pre, post, comb = coefficients.tensors()
-        out = self.runner.ffn(L.ffn, part, residual, post, comb, pre)
-        return _boundary_out(L.module, defer_post, *out)
-
     def _capture(self, plan, L, residual) -> None:
         """DSpark reads the mean of each target layer's input residual; under a plan
         the model loop leaves these captures to the spans."""
@@ -588,8 +572,8 @@ def _build(model, hf_config, ctx) -> _Built:
 
     tables: list = []
     layers = {
-        i: _weights(ctx.copies, tables, model.layers[i], i, spans)
-        for i, spans in _layer_spans(hf_config).items()
+        i: _weights(ctx.copies, tables, model.layers[i], i)
+        for i in _layer_spans(hf_config)
     }
     for n, (_, t) in enumerate(tables):
         ctx.copies["rope table", n] = t
@@ -598,18 +582,16 @@ def _build(model, hf_config, ctx) -> _Built:
     device = model.layers[0].input_layernorm.weight.device
     runner = DSV41MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
-    whole = [L for L in layers.values() if L.k1 is not None]
     # K1 with and without the owed post (the residual arrives settled on the
     # first layer and after an Engram write), K2 with and without top-k rows
-    k1 = {(fold, L.index) for L in whole for fold in (True, False)}
-    k2 = {(L.ratio > 0, L.index) for L in whole}
-    ffn = len(whole) < len(layers)
+    k1 = {(fold, L.index) for L in layers.values() for fold in (True, False)}
+    k2 = {(L.ratio > 0, L.index) for L in layers.values()}
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        runner.precompile(m, k1=k1, k2=k2, ffn=ffn)
+        runner.precompile(m, k1=k1, k2=k2)
     return _Built(model, runner, layers)
 
 
