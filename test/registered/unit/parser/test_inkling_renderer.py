@@ -200,6 +200,30 @@ class TestInklingOutputParser(unittest.TestCase):
                     self.assertEqual(parsed.tool_calls, ())
                     self.assertEqual(parsed.content, payload + "after")
 
+    def test_truncated_message_surfaces_unstreamed_payload(self):
+        """A message cut off before <|end_message|> (max_tokens) keeps what the
+        model generated: a call payload becomes content, streamed text is not repeated."""
+        cases = [
+            (
+                (
+                    "<|message_model|>",
+                    "get_weather",
+                    "<|content_invoke_tool_json|>",
+                    '{"name":"get_weather","args":{"city":"San Fr',
+                ),
+                '{"name":"get_weather","args":{"city":"San Fr',
+            ),
+            (("<|message_model|>", "<|content_text|>", "partial"), "partial"),
+        ]
+        for pieces, expected in cases:
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(expected=expected, mode=mode):
+                    parsed = parse(
+                        _ids(*pieces), separate_reasoning=True, parse_tool_calls=True
+                    )
+                    self.assertEqual(parsed.tool_calls, ())
+                    self.assertEqual(parsed.content, expected)
+
     def test_buffered_reasoning_survives_truncation(self):
         """With stream_reasoning=False a thinking block is held until it
         closes; a max_tokens cut inside it must still flush the held text."""

@@ -160,8 +160,20 @@ class InklingOutputParser:
             return delta.build()
         for update in updates:
             self._apply(update.update, delta)
+        self._surface_unclosed_message(delta)
         self._release_held_reasoning(delta)
         return delta.build()
+
+    def _surface_unclosed_message(self, delta: _DeltaBuilder) -> None:
+        # A message cut off (e.g. by max_tokens) never completes; only text kinds
+        # streamed, so a call payload would otherwise vanish.
+        if not self._model_authored or not any(
+            token_id in self._content_kind_ids for token_id in self._message_ids
+        ):
+            return
+        text = self._payload_text()
+        if text.startswith(self._streamed):
+            delta.content.append(text[len(self._streamed) :])
 
     def _feed_token(self, token_id: int, delta: _DeltaBuilder) -> None:
         is_special = self._tml.tokenizer.is_special_token(token_id)
