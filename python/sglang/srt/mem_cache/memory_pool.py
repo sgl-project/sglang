@@ -101,7 +101,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
-    from sglang.srt.sampling.penaltylib import PenaltyStore
+    from sglang.srt.sampling.penalties import PenaltyStore
 
 
 logger = logging.getLogger(__name__)

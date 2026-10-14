@@ -35,7 +35,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.sampling.penaltylib.penalty_store import (
+from sglang.srt.sampling.penalties import (
     PenaltyStore,
     StepPenalties,
     apply_scaling_penalties,

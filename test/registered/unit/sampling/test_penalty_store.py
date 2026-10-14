@@ -11,7 +11,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib import PenaltyStore, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStore, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci

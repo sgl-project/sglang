@@ -750,7 +750,7 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib import apply_scaling_penalties
+    from sglang.srt.sampling.penalties import apply_scaling_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,

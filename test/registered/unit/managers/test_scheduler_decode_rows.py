@@ -15,7 +15,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.runtime_context import publish, reset_context
-from sglang.srt.sampling.penaltylib.penalty_store import PenaltyStore
+from sglang.srt.sampling.penalties import PenaltyStore
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

@@ -159,7 +159,7 @@ if TYPE_CHECKING:
     from sglang.srt.observability.scheduler_stage_metrics import (
         SchedulerStageMetricsRecorder,
     )
-    from sglang.srt.sampling.penaltylib import PenaltyStore
+    from sglang.srt.sampling.penalties import PenaltyStore
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
