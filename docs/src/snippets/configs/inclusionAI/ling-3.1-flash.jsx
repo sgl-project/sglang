@@ -4,7 +4,7 @@ export const config = {
   groupHardware: false,
   variants: [{ id: "default", label: "Ling-3.1-flash" }],
   quantizations: [{ id: "fp8", label: "FP8" }],
-  strategies: [{ id: "high-throughput", label: "High-Throughput" }, { id: "hicache", label: "HiCache + Mooncake" }],
+  strategies: [{ id: "low-latency", label: "Low-Latency" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
   modelNames: { "default|fp8": "inclusionAI/Ling-3.1-flash" },
   placeholders: {
@@ -17,7 +17,7 @@ export const config = {
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
   },
   curl: "curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"model\":\"{{MODEL_NAME}}\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 15% of 240?\"}]}'",
-  dockerImages: { h200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-cu13-ling-3.1-flash" },
+  dockerImages: { h200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-ling-3.1-flash" },
   dockerHostNetworkWhen: (_sel, { flags }) =>
     flags.some((flag) => flag === "--hicache-storage-backend mooncake"),
   benchmarkCommands: {
@@ -26,8 +26,79 @@ export const config = {
   accuracyLabels: [["gsm8k_pct", "GSM8K (1319 questions)", "%"], ["stop_rate_pct", "Stop rate", "%"]],
   github: { cookbookModel: "inclusionAI/Ling-3.1-flash" },
   playgroundFeatures: {
-    attention: { knobs: [{ id: "tp", label: "TP", values: [null, 4, 8] }] },
-    moe: { ep: { label: "EP", values: [null, 4, 8] } },
+    attention: {
+      knobs: [
+        {
+          id: "tp",
+          label: "TP",
+          values: [
+            null,
+            {
+              value: 4,
+              disable: { hw: ["h200"] },
+              disableReason: "The FP8 H200 recipe requires eight GPUs for model capacity.",
+            },
+            { value: 8, disable: { hw: ["gb300"] }, disableReason: "This single-node GB300 recipe has four GPUs." },
+          ],
+        },
+        {
+          id: "cp",
+          label: "CP",
+          values: [
+            null,
+            {
+              value: 2,
+              disable: true,
+              disableReason: "BailingKDA does not implement the sequence gather/state handling required for prefill context parallelism.",
+            },
+            {
+              value: 4,
+              disable: true,
+              disableReason: "BailingKDA does not implement the sequence gather/state handling required for prefill context parallelism.",
+            },
+          ],
+        },
+        {
+          id: "dpAttn",
+          label: "DP-Attention",
+          values: [
+            null,
+            false,
+            1,
+            2,
+            4,
+            {
+              value: 8,
+              disable: { hw: ["gb300"] },
+              disableReason: "DP-Attention size must divide TP; the GB300 recipe uses TP4.",
+            },
+          ],
+          labels: { auto: "Auto", false: "Off" },
+        },
+      ],
+    },
+    moe: {
+      backend: {
+        options: [
+          { id: null, label: "Inherited" },
+          { id: "auto", label: "Auto", flags: ["--moe-runner-backend auto"] },
+          { id: "deep_gemm", label: "DeepGEMM", flags: ["--moe-runner-backend deep_gemm"] },
+          { id: "triton", label: "Triton", flags: ["--moe-runner-backend triton"] },
+        ],
+      },
+      ep: {
+        label: "EP",
+        values: [
+          null,
+          4,
+          {
+            value: 8,
+            disable: { hw: ["gb300"] },
+            disableReason: "EP cannot exceed the four TP ranks in the GB300 recipe.",
+          },
+        ],
+      },
+    },
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser ling3" },
@@ -38,11 +109,7 @@ export const config = {
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off" },
-        {
-          id: "nextn",
-          label: "NEXTN (built-in MTP)",
-          flags: ["--speculative-algorithm NEXTN"],
-        },
+        { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
         {
           id: "dspark",
           label: "DSpark — checkpoint pending",
@@ -86,66 +153,41 @@ export const config = {
         ],
       },
     ],
+    pdDisagg: {
+      modes: [{ id: "off", label: "Off" }, { id: "prefill", label: "Prefill role" }, { id: "decode", label: "Decode role" }],
+      transferBackends: [{ id: "mooncake", label: "Mooncake" }],
+      ibDevices: [{ id: "auto", label: "Auto" }],
+    },
   },
   cells: [
     {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
-        "--reasoning-parser ling3",
-        "--tool-call-parser ling3",
+        "--revision b426279f1833b8e097c7c3781d1efa08aba19309",
+        "--speculative-algorithm NEXTN",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--reasoning-parser ling3",
-        "--tool-call-parser ling3",
+        "--revision b426279f1833b8e097c7c3781d1efa08aba19309",
+        "--speculative-algorithm NEXTN",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
-    },
-    {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
-      verified: false,
-      env: [
-        "SGLANG_ENABLE_FP8_BLOCK_GEMV=1",
-        "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1",
-        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
-        "MOONCAKE_PROTOCOL=tcp",
-        "MC_MS_AUTO_DISC=0",
-        "MOONCAKE_DEVICE=",
-        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
-        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
-      ],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--ep-size 8",
-        "--reasoning-parser ling3",
-        "--tool-call-parser ling3",
-        "--enable-hierarchical-cache",
-        "--hicache-storage-backend mooncake",
-        "--hicache-io-backend direct",
-        "--hicache-mem-layout page_first_direct",
-        "--mamba-radix-cache-strategy extra_buffer",
-        "--enable-cache-report",
-        "--hicache-storage-prefetch-policy wait_complete",
-        "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
+      warn: "Current-revision NEXTN validation pending: {{GB300_NEXTN_SMOKE}}; batch-size-1 speed: {{GB300_NEXTN_BS1}}.",
     },
   ],
 };

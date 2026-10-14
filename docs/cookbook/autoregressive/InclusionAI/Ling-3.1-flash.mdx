@@ -23,7 +23,7 @@ docker pull lmsysorg/sglang:dev-ling-3.1-flash
 <Tab title="GB300 (CUDA 13)">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-cu13-ling-3.1-flash
+docker pull lmsysorg/sglang:dev-ling-3.1-flash
 ```
 
 </Tab>
@@ -33,13 +33,14 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 
 </Accordion>
 
-Pick your hardware and recipe to generate the launch command:
+Pick your hardware to generate the launch command:
 
-- **High-Throughput** — the standard FP8 recipe: H200 TP8 + EP8 or GB300 TP4 + EP4. Select **NEXTN** in the Playground for built-in MTP speculative decoding (verified, acceptance length ~2.4).
-- **HiCache + Mooncake** — H200 TP8 + EP8 with Mooncake L3 prefix storage over TCP. Start the services in §3.3 before launching this recipe.
+- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. The H200 recipe is verified; the GB300 recipe is awaiting current-revision validation.
+
+For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. That combination remains unverified pending its rerun.
 
 <Warning>
-DSpark is **checkpoint pending**: a Ling-3.1-flash compatible draft is not yet available. NEXTN is verified for the current checkpoint revision; see the verification table and §2.
+DSpark is **checkpoint pending**: a Ling-3.1-flash compatible draft is not yet available. NEXTN verification applies to the checkpoint revision and H200 configuration listed below.
 </Warning>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -82,10 +83,9 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
     </tr>
   </thead>
   <tbody>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.19% (1282/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + HiCache L3</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.27%; stop rate 99.92%. Mooncake/TCP prefetch verified on all TP ranks (measured with NEXTN; MTP is verified for the current checkpoint revision).</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>GSM8K 97.42% (1285/1319); stop rate 99.92%. Decode gates enabled.</td></tr>
-    <tr><td style={{padding: "9px 12px"}}>NEXTN</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>Acceptance length 2.13 on real-text probes (2.61 on the random-token bench). Matched full GSM8K (identical sampling and seed): NEXTN 96.89% vs standard decoding 96.97%; stop rate 99.85% vs 99.77%. bs=1 output throughput: 251.2 tok/s with NEXTN vs 103.4 tok/s without accepted drafts (2.4×).</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN</td><td style={{padding: "9px 12px"}}>Verified</td><td style={{padding: "9px 12px"}}>Revision <code>b426279f1833b8e097c7c3781d1efa08aba19309</code>, with BF16 <code>model.layers.72.eh_proj</code> excluded from quantization. Matched full GSM8K: NEXTN 96.89% vs standard 96.97%; stop rate 99.85% vs 99.77%. Acceptance length 2.61 on random tokens and 2.13 on real text.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>GB300 TP4 + EP4 + NEXTN</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{GB300_NEXTN_SMOKE}}"}</code>; batch-size-1 speed: <code>{"{{GB300_NEXTN_BS1}}"}</code>.</td></tr>
+    <tr><td style={{padding: "9px 12px"}}>H200 TP8 + EP8 + NEXTN + HiCache L3</td><td style={{padding: "9px 12px"}}>Unverified — rerun pending</td><td style={{padding: "9px 12px"}}><code>{"{{HICACHE_NEXTN_SMOKE}}"}</code>. Enable Mooncake in the Playground on the H200 Low-Latency base.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>DSpark</td><td style={{padding: "9px 12px"}}>Unverified — checkpoint pending</td><td style={{padding: "9px 12px"}}>A compatible Ling-3.1-flash draft is not yet available.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>256K context</td><td style={{padding: "9px 12px"}}>Unverified</td><td style={{padding: "9px 12px"}}>Configured model limit; full-length serving has not been revalidated for 3.1.</td></tr>
     <tr><td style={{padding: "9px 12px"}}>H20-3e</td><td style={{padding: "9px 12px"}}>Vendor-validated; unverified by SGLang</td><td style={{padding: "9px 12px"}}>Tuned configurations are available upstream; hardware was unavailable for independent verification.</td></tr>
@@ -96,20 +96,27 @@ Accuracy uses the full 1,319-question GSM8K set. Stop rate is reported separatel
 
 - Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
-- Leave `--mem-fraction-static` at its default. The explicit `ling3` parser flags make the recipe clear; SGLang also selects these parsers automatically for this architecture.
-- **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. It requires the current checkpoint revision, whose config excludes the BF16 `model.layers.72.eh_proj` from quantization; clients on an older download (acceptance length 1.00) should re-download. Measured acceptance length is 2.43.
+- Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
+- **NEXTN:** the launch recipes pin evaluated revision `b426279f1833b8e097c7c3781d1efa08aba19309` and include `--speculative-algorithm NEXTN`. This revision excludes the BF16 `model.layers.72.eh_proj` from quantization. Verify this exclusion when using a local checkpoint. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
 - **DSpark:** the [Ling-3.0-flash draft](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) targets a 2,560-wide, 42-layer model. Ling-3.1-flash uses width 4,096 and 72 layers, so that draft is incompatible. Wait for a 3.1-compatible draft.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
+### Playground support
+
+- **Attention:** BailingKDA shards its projections on attention TP, so DP-attention is available as an unverified override. Its size must divide TP. Prefill CP is disabled because BailingKDA does not implement the required sequence gather and recurrent-state handling.
+- **MoE:** Auto, DeepGEMM, and Triton use the FP8 MoE runner paths. Explicit backend and EP overrides are unverified combinations; EP must divide TP.
+- **PD disaggregation:** the Playground exposes separate prefill and decode roles with Mooncake transfer. The runtime has hybrid recurrent-state transfer support, but this model's PD deployment has not been verified. Provision separate workers and route requests through a PD-aware gateway; select the role-specific command for each worker.
+- **HiCache:** enabling Mooncake on the H200 base preserves NEXTN and adds direct page-first I/O, hybrid-KDA prefix settings, and TCP storage endpoints. Its Playground badge remains unverified until the exact combination is measured.
+
 ### Performance
 
-With the decode gates enabled, H200 TP8 + EP8 measured **103.39 output tokens/s** at batch size 1, with **9.18 ms TPOT**, using random 2,048-token inputs and 512-token outputs. GB300 TP4 + EP4 measured **74.04 output tokens/s** at batch size 1 in steady state. These are hardware-specific measurements, not a matched-workload comparison.
+At evaluated revision `b426279f1833b8e097c7c3781d1efa08aba19309`, H200 TP8 + EP8 with NEXTN and the decode gates enabled measured **251.2 output tokens/s** at batch size 1, with mean acceptance length **2.61** on the random-token benchmark. Real-text probes measured acceptance length **2.13**. GB300 NEXTN batch-size-1 result: `{{GB300_NEXTN_BS1}}`.
 
-The image includes KDA normalization/quantization fusion, FP8 block GEMV, router-gate matrix-vector kernels, and a 512-expert top-k router. A separate H200 batch-size-1 comparison measured **10.1%** higher throughput (94.57 → 104.15 tokens/s) with the gated optimizations, and **7.5%** on Ling-3.0-flash-fp8.
+The image includes KDA normalization/quantization fusion, FP8 block GEMV, router-gate matrix-vector kernels, and a 512-expert top-k router.
 
 <Accordion title="Reproduce the H200 speed workload">
 
-Launch the H200 **High-Throughput** recipe, then run:
+Launch the H200 **Low-Latency** recipe, then run:
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -134,7 +141,7 @@ sgl-eval run gsm8k \
   --num-threads 32
 ```
 
-Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. Compare the stop rate with the measured 99.92%; accuracy alone can hide generations that reach the token limit.
+Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. For the H200 NEXTN recipe, compare the stop rate with the measured 99.85%; accuracy alone can hide generations that reach the token limit.
 
 </Accordion>
 
@@ -144,15 +151,49 @@ Evaluate all 1,319 questions and inspect completion reasons as well as accuracy.
 
 The `ling3` parser returns reasoning in `message.reasoning_content` and the final answer in `message.content`. Thinking is enabled by default. To request a direct answer, pass `"chat_template_kwargs": {"enable_thinking": false}` in the request body, or `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` with the OpenAI Python client.
 
-Use the command panel's cURL request to query the selected deployment. See the [request guide](/docs/basic_usage/send_request) for client examples.
+<Accordion title="Thinking-on request (Python)">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
+<Accordion title="Thinking-off request (Python)">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
 
 ### 3.2 Tool calling
 
 The `ling3` tool-call parser returns structured calls in `message.tool_calls`, with `finish_reason` set to `tool_calls`. Send tools through the OpenAI-compatible `tools` field and return each tool result with its matching `tool_call_id`. Read both `reasoning_content` and `content` on the follow-up assistant turn.
 
+<Accordion title="Tool-calling request and follow-up (Python)">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
 ### 3.3 HiCache with Mooncake
 
-The verified H200 recipe uses Mooncake as L3 prefix storage over TCP. Start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
+The H200 HiCache combination uses Mooncake as L3 prefix storage over TCP and is awaiting a current-revision NEXTN rerun: `{{HICACHE_NEXTN_SMOKE}}`. Start the metadata server, master, and storage client before launching SGLang. Run these services on the same host as the SGLang container:
 
 <Accordion title="Start Mooncake services">
 
@@ -177,8 +218,14 @@ docker run --rm --network host --ipc=host \
 
 </Accordion>
 
-Then select **H200 → HiCache + Mooncake** in Deployment. Docker commands use host networking so the SGLang container can reach these localhost services. Change the master and metadata endpoints in the **Env** dialog for a remote store.
+<Accordion title="Example Output">
 
-The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. Verification confirmed L3 prefetch on every TP rank.
+{/* TODO: fill from /tmp/cb-f6-examples (coordinator) */}
+
+</Accordion>
+
+Select **H200 → Low-Latency** in Deployment, then enable **HiCache → Mooncake** in the Playground. Keep NEXTN inherited from the base. Docker commands use host networking so the SGLang container can reach these localhost services. Change the master and metadata endpoints in the **Env** dialog for a remote store.
+
+The TCP recipe leaves `MOONCAKE_DEVICE` and `--device_names` empty. The generated command includes `extra_buffer`, direct page-first I/O, and `hicache_storage_pass_prefix_keys=true` for hybrid KDA prefix reuse. Check that L3 prefetch completes on every TP rank when validating this combination.
 
 For storage sizing and backend details, see [HiCache best practices](/docs/advanced_features/hicache_best_practices).
