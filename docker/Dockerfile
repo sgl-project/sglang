@@ -636,10 +636,12 @@ ENV SGLANG_RUST_BUILD_MODE=never
 
 
 # Install pre-built gateway artifacts from parallel builder
+# --reinstall re-resolves the wheel's dependencies; the constraints keep the
+# frozen pins, including the Dynamo-compatible pydantic recorded above.
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --reinstall /tmp/gateway_wheels/*.whl \
+    uv pip install --reinstall -c /sgl-workspace/constraints.txt /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
