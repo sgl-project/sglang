@@ -11,7 +11,9 @@
 //! those actions into KVCM `ReportEvent` mutations — REPORT becomes
 //! `BLOCK_ADD` (one component spec per resident component), REVOKE becomes
 //! `BLOCK_DELETE`, and the reporter identity is the indexer `worker_id`, so
-//! `GetHostCacheState` answers map straight back onto workers.
+//! `GetHostCacheState` answers map straight back onto workers, and
+//! `CLEAR_ALL_AT_TIER` becomes an empty `BLOCK_SNAPSHOT` — KVCM's only
+//! synchronous "this reporter owns nothing" primitive, sent in action order.
 //!
 //! Query side: `MatchExternalKvPrefix` is answered by `GetHostCacheState`
 //! (`QT_PREFIX_MATCH`), whose per-host result is the longest contiguous run of
@@ -19,20 +21,26 @@
 //! the rule engine's answer for a component-aware worker, so a worker whose
 //! cache spec requires SWA or MAMBA rules, or that reports components without
 //! a spec, is excluded from the query answer (see [`batch_is_kvcm_eligible`]):
-//! the answer stays a lower bound, never an over-report — except for the
-//! stale placements a skipped `CLEAR_ALL_AT_TIER` leaves behind (documented
-//! below). The per-block placement query (`MatchExternalKv`) has no KVCM
+//! the answer stays a lower bound, never an over-report — except that a
+//! dropped flush (see [`Inner::report_flush_snapshot`]) leaves placements
+//! behind on purpose, and a clear covers every medium of the channel rather
+//! than one tier. The per-block placement query (`MatchExternalKv`) has no KVCM
 //! equivalent -- KVCM answers hosts, not per-block location lists -- so it
 //! fails `UNIMPLEMENTED` and the prefix query is the only routing signal.
 //!
 //! # Deliberate limitations
 //!
-//! `CLEAR_ALL_AT_TIER` has no KVCM equivalent and is skipped with a warning;
-//! host-dram placements are not reported by default; the instance is registered
-//! only when auto-registration is configured; the reporter→address map is
-//! process-local, so a restart loses the join and not the placements; and
-//! `snapshot_required` marks a reporter lifecycle rather than a fault. The
-//! README carries the operational contract and the failure mode behind each.
+//! Flushes are best-effort in three ways that the protocol imposes, not this
+//! backend: they cover the whole reporter × channel across every medium (no
+//! tier granularity), KVCM rate-limits them per reporter (a flush inside the
+//! cooldown is dropped with a warning instead of failing the batch), and the
+//! first one switches a delta-only reporter to strict visibility, so this
+//! indexer must be its only writer on that channel. Host-dram placements are
+//! not reported by default; the instance is registered only when
+//! auto-registration is configured; the reporter→address map is process-local,
+//! so a restart loses the join and not the placements; and `snapshot_required`
+//! marks a reporter lifecycle rather than a fault. The README carries the
+//! operational contract and the failure mode behind each.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -46,10 +54,11 @@ use tonic::{Request, Status};
 use crate::client::parse_endpoint;
 use crate::kvcm_pb::meta_service_client::MetaServiceClient;
 use crate::kvcm_pb::{
-    event_item, BlockAddEventParams, BlockDeleteEventParams, CommonResponseHeader, ErrorCode,
-    EventItem, GetHostCacheStateRequest, GetHostCacheStateResponse, HeartbeatEventParams,
-    HostCacheMatch, LocationSpec, LocationSpecInfo, ModelDeployment, NodeRegisterEventParams,
-    QueryType, RegisterInstanceRequest, ReportEventRequest, ReportEventType, StorageType,
+    event_item, BlockAddEventParams, BlockDeleteEventParams, BlockSnapshotEventParams,
+    CommonResponseHeader, ErrorCode, EventItem, GetHostCacheStateRequest,
+    GetHostCacheStateResponse, HeartbeatEventParams, HostCacheMatch, LocationSpec,
+    LocationSpecInfo, ModelDeployment, NodeRegisterEventParams, QueryType, RegisterInstanceRequest,
+    ReportEventRequest, ReportEventResponse, ReportEventType, StorageType,
 };
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
@@ -505,6 +514,28 @@ fn block_delete_event(hash: i64, medium: &str) -> EventItem {
     }
 }
 
+/// `CLEAR_ALL_AT_TIER` as KVCM can express it: one complete snapshot with an
+/// empty block set. KVCM defines empty as "this reporter owns no blocks" for
+/// the whole (instance, reporter, storage channel), commits it synchronously,
+/// and immediately fences every older location of that reporter behind strict
+/// visibility -- the closest thing to a clear the protocol has. It must travel
+/// alone in its request: KVCM rejects a snapshot mixed with deltas
+/// (`CacheManager::ReportEvent`).
+fn block_snapshot_event() -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventBlockSnapshot as i32,
+        event_params: Some(event_item::EventParams::BlockSnapshot(
+            BlockSnapshotEventParams {
+                // The deprecated single-medium form stays at its default: the
+                // block set below is the complete one, and an empty set names
+                // no medium at all.
+                blocks: Vec::new(),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
 fn heartbeat_event() -> EventItem {
     EventItem {
         event_type: ReportEventType::EventHeartbeat as i32,
@@ -531,17 +562,25 @@ fn carries_delta(events: &[EventItem]) -> bool {
     })
 }
 
-/// One apply batch, translated. Event order matches action order.
+/// One apply batch, translated: the requests it takes to apply it, in order.
 struct TranslatedBatch {
-    events: Vec<EventItem>,
-    /// `CLEAR_ALL_AT_TIER` actions with no KVCM equivalent (skipped, warned).
-    skipped_clears: usize,
+    segments: Vec<TranslatedSegment>,
 }
 
-/// Pure translation of one validated apply batch into KVCM report events.
-/// Actions on tiers outside `report_tiers` are dropped before translation;
-/// `prepend_node_register` re-registers a reporter KVCM has forgotten (or
-/// never accepted).
+/// One wire request's worth of work, in action order.
+enum TranslatedSegment {
+    /// ADD/DELETE events for a run of actions (chunked on the wire as before).
+    Delta(Vec<EventItem>),
+    /// `CLEAR_ALL_AT_TIER`: an empty all-medium snapshot, alone in its request.
+    /// `register` marks the request that carries the reporter's pending
+    /// `NODE_REGISTER` (a snapshot may share a request with one).
+    Clear { register: bool },
+}
+
+/// Pure translation of one validated apply batch into the requests it takes to
+/// apply it, in action order. Actions on tiers outside `report_tiers` are
+/// dropped before translation; `prepend_node_register` re-registers a reporter
+/// KVCM has forgotten (or never accepted), riding the batch's first request.
 fn translate_batch(
     request: &ApplyExternalKvBatchRequest,
     prepend_node_register: bool,
@@ -549,11 +588,11 @@ fn translate_batch(
     mediums: &[String],
     uri_prefix: &str,
 ) -> TranslatedBatch {
-    let mut events = Vec::new();
-    if prepend_node_register {
-        events.push(node_register_event(mediums));
-    }
-    let mut skipped_clears = 0;
+    let mut segments: Vec<TranslatedSegment> = Vec::new();
+    let mut events: Vec<EventItem> = Vec::new();
+    // The pending registration rides the first request the batch sends: a
+    // delta chunk, or the clear's snapshot when a clear opens the batch.
+    let mut register_pending = prepend_node_register;
     for action in &request.actions {
         // The service layer already rejects unknown tiers and action types;
         // `batch_is_kvcm_eligible` re-checks both for direct callers.
@@ -593,15 +632,41 @@ fn translate_batch(
                 }
             }
             Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                skipped_clears += 1;
+                // The clear's position is its meaning: mutations before it are
+                // fenced off by the snapshot, mutations after it land on the
+                // fresh generation. Emit the pending deltas first.
+                let register = if events.is_empty() {
+                    // A clear that opens the batch carries the registration
+                    // itself; a snapshot may share a request with one.
+                    std::mem::take(&mut register_pending)
+                } else {
+                    // The registration has to ride the batch's *first* request,
+                    // which is the delta segment below. Leaving it for the
+                    // snapshot would send it one request late: a reporter KVCM
+                    // has forgotten would fail that delta and lose the batch.
+                    if register_pending {
+                        events.insert(0, node_register_event(mediums));
+                        register_pending = false;
+                    }
+                    false
+                };
+                if !events.is_empty() {
+                    segments.push(TranslatedSegment::Delta(std::mem::take(&mut events)));
+                }
+                segments.push(TranslatedSegment::Clear { register });
             }
             Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {}
         }
     }
-    TranslatedBatch {
-        events,
-        skipped_clears,
+    if register_pending {
+        // Nothing in this batch is forwardable, but the reporter still has to
+        // be registered (the batch that discovered it owes KVCM that).
+        events.insert(0, node_register_event(mediums));
     }
+    if !events.is_empty() {
+        segments.push(TranslatedSegment::Delta(events));
+    }
+    TranslatedBatch { segments }
 }
 
 /// The outcome a KVCM response header carries.
@@ -729,18 +794,15 @@ impl Inner {
         }
     }
 
-    /// Forwards one `ReportEvent` and maintains the reporter's registration
-    /// flag: a successful report carrying `NODE_REGISTER` marks it registered,
-    /// and a `NODE_NOT_REGISTERED` failure resets it so the next report
-    /// re-registers.
-    async fn report_event_checked(
+    /// One `ReportEvent` on the wire, unclassified: the delta path and the
+    /// flush path disagree on what a failure means (deltas fail the batch,
+    /// a rate-limited flush must not), so only the transport lives here.
+    async fn report_event_response(
         &self,
         host: &str,
         events: Vec<EventItem>,
         timeout: Duration,
-    ) -> Result<(), Status> {
-        let registered_node = carries_node_register(&events);
-        let has_delta = carries_delta(&events);
+    ) -> Result<ReportEventResponse, Status> {
         let mut client = self.client.clone();
         let mut request = Request::new(ReportEventRequest {
             trace_id: self.next_trace("apply"),
@@ -753,7 +815,35 @@ impl Inner {
         let response = tokio::time::timeout(timeout, client.report_event(request))
             .await
             .map_err(|_| Status::deadline_exceeded("KVCM ReportEvent timed out"))??;
-        let response = response.into_inner();
+        Ok(response.into_inner())
+    }
+
+    /// Forwards one `ReportEvent` and maintains the reporter's registration
+    /// flag: a successful report carrying `NODE_REGISTER` marks it registered,
+    /// and a `NODE_NOT_REGISTERED` failure resets it so the next report
+    /// re-registers.
+    async fn report_event_checked(
+        &self,
+        host: &str,
+        events: Vec<EventItem>,
+        timeout: Duration,
+    ) -> Result<(), Status> {
+        let registered_node = carries_node_register(&events);
+        let has_delta = carries_delta(&events);
+        let response = self.report_event_response(host, events, timeout).await?;
+        self.classify_report_response(host, &response, registered_node, has_delta)
+    }
+
+    /// Turns one `ReportEvent` response into the status the caller should see,
+    /// and keeps the reporter's registration flag in step. Shared by the delta
+    /// and flush paths: they differ only in what they do with a failure.
+    fn classify_report_response(
+        &self,
+        host: &str,
+        response: &ReportEventResponse,
+        carried_register: bool,
+        carried_delta: bool,
+    ) -> Result<(), Status> {
         if let HeaderOutcome::Failed {
             code: ErrorCode::NodeNotRegistered,
             ..
@@ -766,7 +856,7 @@ impl Inner {
             // what creates the version KVCM is asking about, while a beat from
             // a reporter that never wrote one is only worth a debug line. This
             // backend holds no placement state and cannot reconcile either way.
-            if has_delta {
+            if carried_delta {
                 tracing::info!(
                     host,
                     "KVCM has no committed snapshot for this reporter; it stays delta-only"
@@ -802,10 +892,111 @@ impl Inner {
                 status(tonic::Code::Internal, "transient")
             });
         }
-        if registered_node {
+        if carried_register {
             self.set_node_registered(host, true);
         }
         Ok(())
+    }
+
+    /// Applies one `CLEAR_ALL_AT_TIER` as an empty all-medium snapshot, in a
+    /// request of its own, and returns once KVCM has committed the fence.
+    ///
+    /// The retry policy is deliberately asymmetric:
+    ///
+    /// * `SNAPSHOT_IN_PROGRESS` is a transient race (another snapshot of this
+    ///   reporter, or a delta drain that timed out): the complete snapshot is
+    ///   re-sent after a short backoff, bounded so the batch keeps its budget.
+    /// * `SNAPSHOT_RATE_LIMITED` **drops the flush with a warning instead of
+    ///   failing the batch**. KVCM's cooldown (30s by default) cannot be waited
+    ///   out inside an apply budget, and a failed batch costs more than a missed
+    ///   flush: the bridge sees the error, reconnects, and does not replay, so
+    ///   every delta that rode in the same batch would be lost as well. The
+    ///   placements simply stay until a later clear gets through.
+    /// * `NODE_NOT_REGISTERED` means KVCM forgot this reporter (a liveness
+    ///   cleanup): the retry carries a fresh `NODE_REGISTER`, so a flush is
+    ///   never lost just because the registration lapsed first.
+    ///
+    /// Anything else keeps the delta path's classification. A committed
+    /// snapshot leaves no local state to drop -- this backend keeps none, the
+    /// answer comes from KVCM, whose visibility now fences the reporter.
+    async fn report_flush_snapshot(
+        &self,
+        host: &str,
+        with_register: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Status> {
+        const ATTEMPTS: usize = 3;
+        const IN_PROGRESS_BACKOFF: Duration = Duration::from_millis(100);
+        let mut register = with_register;
+        for attempt in 1..=ATTEMPTS {
+            let mut events = Vec::with_capacity(2);
+            if register {
+                events.push(node_register_event(&self.mediums));
+            }
+            events.push(block_snapshot_event());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Status::deadline_exceeded(
+                    "KVCM apply budget exhausted before the flush snapshot was sent",
+                ));
+            }
+            let response = self.report_event_response(host, events, remaining).await?;
+            let outcome = header_outcome(response.header.as_ref());
+            // KVCM answers a request-level failure in the header alone, and a
+            // per-item failure in both the header (naming the same code) and
+            // `item_results`. A header naming a different fault means this is
+            // not our code, whatever the item list says.
+            let failed_with = |code: ErrorCode| match &outcome {
+                HeaderOutcome::Failed { code: found, .. } => *found == code,
+                HeaderOutcome::Ok => response.item_results.contains(&(code as i32)),
+            };
+            if matches!(outcome, HeaderOutcome::Ok) && response.item_results.is_empty() {
+                if register {
+                    self.set_node_registered(host, true);
+                }
+                tracing::info!(
+                    host,
+                    commit = %response.committed_snapshot_version,
+                    report_tiers = self.config.report_tiers.len(),
+                    "CLEAR_ALL_AT_TIER applied as an empty BLOCK_SNAPSHOT: every placement this reporter owns on the channel is fenced"
+                );
+                return Ok(());
+            }
+            if failed_with(ErrorCode::SnapshotRateLimited) {
+                // Dropped on purpose: see the doc comment. The flush is a
+                // best-effort improvement over a stale answer, not a promise
+                // worth losing the rest of the batch for.
+                tracing::warn!(
+                    host,
+                    retry_after_ms = response.retry_after_ms,
+                    report_tiers = self.config.report_tiers.len(),
+                    "flush dropped, placements stay: KVCM rate-limited the snapshot; a later clear retries"
+                );
+                return Ok(());
+            }
+            if failed_with(ErrorCode::NodeNotRegistered) {
+                // KVCM forgot the reporter: re-register on the retry rather
+                // than leaving the flush to the next batch.
+                self.set_node_registered(host, false);
+                register = true;
+                if attempt < ATTEMPTS {
+                    continue;
+                }
+                return self.classify_report_response(host, &response, register, true);
+            }
+            if failed_with(ErrorCode::SnapshotInProgress) && attempt < ATTEMPTS {
+                tokio::time::sleep(IN_PROGRESS_BACKOFF * attempt as u32).await;
+                continue;
+            }
+            // Not a flush-specific outcome: let the delta path's classification
+            // decide, so the batch fails exactly as it would for a delta.
+            return self.classify_report_response(host, &response, register, true);
+        }
+        // Every branch above returns on the final attempt; this keeps the
+        // signature total without inventing a panic path.
+        Err(Status::unavailable(
+            "KVCM reported a snapshot in progress on every flush attempt",
+        ))
     }
 
     async fn get_host_cache_state(
@@ -1042,27 +1233,41 @@ impl KvIndexerBackend for KvcmIndexerBackend {
                 reporter_uri_authority(&request.worker_address, &request.worker_id)
             ),
         );
-        if translated.skipped_clears > 0 {
-            tracing::warn!(
-                worker = %request.worker_id,
-                count = translated.skipped_clears,
-                "CLEAR_ALL_AT_TIER has no KVCM equivalent; stale placements remain until KVCM capacity eviction removes them"
-            );
-        }
         // One deadline for the whole batch: a slow KVCM must not turn four
         // chunk RPCs into four full timeouts while the bridge's own channel
         // timeout expires underneath and drops the batch.
         let deadline = tokio::time::Instant::now() + self.inner.config.apply_timeout;
-        for chunk in translated.events.chunks(MAX_EVENTS_PER_REPORT_EVENT) {
+        for segment in translated.segments {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(Status::deadline_exceeded(
-                    "KVCM apply budget exhausted before all chunks were forwarded",
+                    "KVCM apply budget exhausted before all events were forwarded",
                 ));
             }
-            self.inner
-                .report_event_checked(&request.worker_id, chunk.to_vec(), remaining)
-                .await?;
+            match segment {
+                TranslatedSegment::Delta(events) => {
+                    for chunk in events.chunks(MAX_EVENTS_PER_REPORT_EVENT) {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(Status::deadline_exceeded(
+                                "KVCM apply budget exhausted before all chunks were forwarded",
+                            ));
+                        }
+                        self.inner
+                            .report_event_checked(&request.worker_id, chunk.to_vec(), remaining)
+                            .await?;
+                    }
+                }
+                TranslatedSegment::Clear { register } => {
+                    // Synchronous by design: the fence must be committed before
+                    // the actions that follow it are sent, or they would land
+                    // on the generation this clear ends.
+                    self.inner
+                        .report_flush_snapshot(&request.worker_id, register, deadline)
+                        .await?;
+                }
+            }
         }
         Ok(ApplyExternalKvBatchResponse::default())
     }
@@ -1124,6 +1329,20 @@ impl KvIndexerBackend for KvcmIndexerBackend {
 
 #[cfg(test)]
 mod tests {
+    /// The batch's delta events, in order. Most assertions are about what the
+    /// translation produces, not where the request boundaries fell; the tests
+    /// that care about the segmentation inspect `segments` directly.
+    fn delta_events(batch: &TranslatedBatch) -> Vec<EventItem> {
+        batch
+            .segments
+            .iter()
+            .flat_map(|segment| match segment {
+                TranslatedSegment::Delta(events) => events.clone(),
+                TranslatedSegment::Clear { .. } => Vec::new(),
+            })
+            .collect()
+    }
+
     use super::*;
     use crate::pb::{ExternalKvAction, MatchExternalKvPrefixRequest};
 
@@ -1256,11 +1475,11 @@ mod tests {
             &["hbm".into()],
             "event_report://worker-0",
         );
-        assert_eq!(translated.skipped_clears, 0);
+        let events = delta_events(&translated);
         let EventItem {
             event_type,
             event_params: Some(event_item::EventParams::NodeRegister(register)),
-        } = &translated.events[0]
+        } = &events[0]
         else {
             panic!("first event must be NODE_REGISTER");
         };
@@ -1269,7 +1488,7 @@ mod tests {
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
-        } = &translated.events[1]
+        } = &events[1]
         else {
             panic!("expected BLOCK_ADD");
         };
@@ -1282,7 +1501,7 @@ mod tests {
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
-        } = &translated.events[2]
+        } = &events[2]
         else {
             panic!("expected BLOCK_ADD");
         };
@@ -1296,7 +1515,7 @@ mod tests {
         let EventItem {
             event_params: Some(event_item::EventParams::BlockDelete(delete)),
             ..
-        } = &translated.events[3]
+        } = &events[3]
         else {
             panic!("expected BLOCK_DELETE");
         };
@@ -1305,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_batch_drops_unreported_tiers_and_counts_clears() {
+    fn translate_batch_keeps_the_clear_position() {
         let request = apply(
             "worker-0",
             "http://w0:30000",
@@ -1331,8 +1550,14 @@ mod tests {
             &["hbm".into()],
             "event_report://worker-0",
         );
-        assert_eq!(translated.events.len(), 1);
-        assert_eq!(translated.skipped_clears, 1);
+        // The unreported DRAM action produces no delta at all; the clear is
+        // its own segment, and the registration rides with it.
+        assert_eq!(translated.segments.len(), 1);
+        assert!(matches!(
+            translated.segments[0],
+            TranslatedSegment::Clear { register: true }
+        ));
+        assert!(delta_events(&translated).is_empty());
         // A later batch with nothing to forward sends nothing.
         let translated = translate_batch(
             &request,
@@ -1341,7 +1566,140 @@ mod tests {
             &["hbm".into()],
             "event_report://worker-0",
         );
-        assert!(translated.events.is_empty());
+        assert_eq!(translated.segments.len(), 1);
+        assert!(matches!(
+            translated.segments[0],
+            TranslatedSegment::Clear { .. }
+        ));
+        assert!(delta_events(&translated).is_empty());
+    }
+
+    /// The pending registration rides the batch's first request whatever it
+    /// is. A reporter KVCM has forgotten fails its very first delta when the
+    /// registration was left behind on the clear's snapshot (one request too
+    /// late), and the batch is lost.
+    #[test]
+    fn translate_batch_registers_on_the_first_request_of_a_batch() {
+        let clear = || ExternalKvAction {
+            r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+            tier: hbm(),
+            hashes: Vec::new(),
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
+            parent_block_hash: None,
+        };
+        let report = |hash: i64| report_action(hbm(), &[hash], &[COMPONENT_FULL]);
+
+        // [REPORT, CLEAR]: the registration rides the delta, not the snapshot.
+        let request = apply(
+            "worker-0",
+            "http://w0:30000",
+            vec![report(1), clear()],
+            None,
+        );
+        let translated = translate_batch(
+            &request,
+            true,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
+        let TranslatedSegment::Delta(events) = &translated.segments[0] else {
+            panic!("the deltas come first");
+        };
+        assert_eq!(
+            events[0].event_type,
+            ReportEventType::EventNodeRegister as i32
+        );
+        assert!(matches!(
+            translated.segments[1],
+            TranslatedSegment::Clear { register: false }
+        ));
+
+        // [CLEAR, REPORT]: nothing precedes the clear, so it carries it.
+        let request = apply(
+            "worker-0",
+            "http://w0:30000",
+            vec![clear(), report(2)],
+            None,
+        );
+        let translated = translate_batch(
+            &request,
+            true,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
+        assert!(matches!(
+            translated.segments[0],
+            TranslatedSegment::Clear { register: true }
+        ));
+    }
+
+    /// A clear's position is its meaning: deltas before it belong to the
+    /// generation it ends, deltas after it belong to the fresh one.
+    #[test]
+    fn translate_batch_orders_deltas_around_a_clear() {
+        let clear = || ExternalKvAction {
+            r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+            tier: hbm(),
+            hashes: Vec::new(),
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
+            parent_block_hash: None,
+        };
+        let report = |hash: i64| report_action(hbm(), &[hash], &[COMPONENT_FULL]);
+        // [REPORT 1, CLEAR, REPORT 2, CLEAR]: the second clear emits no empty
+        // delta of its own, and the last one is followed by nothing.
+        let request = apply(
+            "worker-0",
+            "http://w0:30000",
+            vec![report(1), clear(), report(2), clear()],
+            None,
+        );
+        let translated = translate_batch(
+            &request,
+            false,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
+        let shape: Vec<&str> = translated
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                TranslatedSegment::Delta(events) => {
+                    assert_eq!(events.len(), 1, "one ADD per report action");
+                    "delta"
+                }
+                TranslatedSegment::Clear { .. } => "clear",
+            })
+            .collect();
+        assert_eq!(shape, ["delta", "clear", "delta", "clear"]);
+
+        // A batch that opens with a clear has no leading delta to send.
+        let request = apply(
+            "worker-0",
+            "http://w0:30000",
+            vec![clear(), report(3)],
+            None,
+        );
+        let translated = translate_batch(
+            &request,
+            false,
+            &[TierType::TierHbm],
+            &["hbm".into()],
+            "event_report://worker-0",
+        );
+        let shape: Vec<&str> = translated
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                TranslatedSegment::Delta(_) => "delta",
+                TranslatedSegment::Clear { .. } => "clear",
+            })
+            .collect();
+        assert_eq!(shape, ["clear", "delta"]);
     }
 
     #[test]
@@ -1359,11 +1717,12 @@ mod tests {
             &["hbm".into()],
             "event_report://worker-0",
         );
-        assert_eq!(translated.events.len(), 1);
+        let events = delta_events(&translated);
+        assert_eq!(events.len(), 1);
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
-        } = &translated.events[0]
+        } = &events[0]
         else {
             panic!("expected BLOCK_ADD");
         };
@@ -1387,10 +1746,11 @@ mod tests {
             &["hbm".into()],
             "event_report://worker-0",
         );
+        let events = delta_events(&translated);
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
             ..
-        } = &translated.events[0]
+        } = &events[0]
         else {
             panic!("expected BLOCK_ADD");
         };

@@ -37,13 +37,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
 use sgl_kv_indexer::kvcm_pb::meta_service_client::MetaServiceClient;
 use sgl_kv_indexer::kvcm_pb::{
-    block_mask, BlockAddEventParams, BlockDeleteEventParams, BlockMask, CacheLocation,
-    CommonResponse, CommonResponseHeader, ErrorCode, EventItem, FinishWriteCacheRequest,
-    GetCacheMetaRequest, GetCacheMetaResponse, GetHostCacheStateRequest, GetHostCacheStateResponse,
-    HeartbeatEventParams, LocationSpec, LocationSpecInfo, ModelDeployment, NodeRegisterEventParams,
-    QueryType, RegisterInstanceRequest, RegisterInstanceResponse, ReportEventRequest,
-    ReportEventResponse, ReportEventType, StartWriteCacheRequest, StartWriteCacheResponse,
-    StorageType,
+    block_mask, event_item, BlockAddEventParams, BlockDeleteEventParams, BlockMask,
+    BlockSnapshotEventParams, CacheLocation, CommonResponse, CommonResponseHeader, ErrorCode,
+    EventItem, FinishWriteCacheRequest, GetCacheMetaRequest, GetCacheMetaResponse,
+    GetHostCacheStateRequest, GetHostCacheStateResponse, HeartbeatEventParams, LocationSpec,
+    LocationSpecInfo, ModelDeployment, NodeRegisterEventParams, QueryType, RegisterInstanceRequest,
+    RegisterInstanceResponse, ReportEventRequest, ReportEventResponse, ReportEventType,
+    StartWriteCacheRequest, StartWriteCacheResponse, StorageType,
 };
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
@@ -283,18 +283,35 @@ fn revoke_batch(
     batch
 }
 
+/// The wire form of a clear: an empty complete snapshot, alone in its request.
+fn empty_snapshot_event() -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventBlockSnapshot as i32,
+        event_params: Some(event_item::EventParams::BlockSnapshot(
+            BlockSnapshotEventParams {
+                blocks: Vec::new(),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn clear_action() -> ExternalKvAction {
+    ExternalKvAction {
+        r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+        tier: TierType::TierHbm as i32,
+        hashes: Vec::new(),
+        component_masks: Vec::new(),
+        block_sizes: Vec::new(),
+        parent_block_hash: None,
+    }
+}
+
 fn clear_batch(worker: &str, address: &str, seq: u64) -> ApplyExternalKvBatchRequest {
     ApplyExternalKvBatchRequest {
         worker_id: worker.to_string(),
         seq,
-        actions: vec![ExternalKvAction {
-            r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
-            tier: TierType::TierHbm as i32,
-            hashes: Vec::new(),
-            component_masks: Vec::new(),
-            block_sizes: Vec::new(),
-            parent_block_hash: None,
-        }],
+        actions: vec![clear_action()],
         worker_address: address.to_string(),
         cache_spec: None,
     }
@@ -1478,12 +1495,13 @@ async fn l2_channel_accepts_vineyard_reports() {
     );
 }
 
-/// `CLEAR_ALL_AT_TIER` has no KVCM equivalent, so the backend drops it and the
-/// cleared blocks stay indexed. Pinned here so the documented limitation fails
-/// loudly if KVCM ever grows an equivalent.
+/// `CLEAR_ALL_AT_TIER` reaches KVCM as an empty `BLOCK_SNAPSHOT`: the reporter
+/// genuinely owns no blocks afterwards, so the prefix answer goes with it.
+/// This is the wave4 gap closing (`flush_cache` used to leave 100% of the
+/// placements behind).
 #[tokio::test]
 #[ignore]
-async fn cleared_tiers_leave_stale_placements() {
+async fn a_clear_removes_every_placement_of_the_reporter() {
     let env = live_env!();
     let instance = unique("clear");
     let backend = auto_registering_backend(&env, &instance, 128);
@@ -1494,15 +1512,178 @@ async fn cleared_tiers_leave_stale_placements() {
         .apply_external_kv_batch(report_batch(&worker, address, 1, &[151, 152, 153]))
         .await
         .expect("report succeeds");
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[151, 152, 153], 0).await),
+        HashMap::from([(address.to_string(), 3)]),
+        "the blocks are placed before the clear"
+    );
+
     backend
         .apply_external_kv_batch(clear_batch(&worker, address, 2))
         .await
-        .expect("a clear is skipped, not failed");
+        .expect("an empty snapshot commits");
 
     let answer = prefix(&backend, &[151, 152, 153], 0).await;
     assert_eq!(
         prefixes_by_address(&answer),
-        HashMap::from([(address.to_string(), 3)]),
-        "skipped clears leave the stale placements indexed"
+        HashMap::new(),
+        "the reporter owns nothing after the clear"
+    );
+}
+
+/// A report after the clear lands on the snapshot's fresh generation, so it is
+/// visible immediately while the pre-clear blocks stay gone. KVCM stamps the
+/// new token server-side; the client never carries one.
+#[tokio::test]
+#[ignore]
+async fn a_report_after_a_clear_is_immediately_visible() {
+    let env = live_env!();
+    let instance = unique("clear-then-report");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30012";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[161, 162]))
+        .await
+        .expect("report succeeds");
+    backend
+        .apply_external_kv_batch(clear_batch(&worker, address, 2))
+        .await
+        .expect("an empty snapshot commits");
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 3, &[163]))
+        .await
+        .expect("the post-clear report succeeds");
+
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[161], 0).await),
+        HashMap::new(),
+        "blocks reported before the clear stay fenced off"
+    );
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[163], 0).await),
+        HashMap::from([(address.to_string(), 1)]),
+        "the block reported after the clear is visible"
+    );
+}
+
+/// A batch that reports and then clears, arriving after liveness reclaimed the
+/// reporter: the registration has to ride the batch's *first* request (the
+/// deltas). Left for the snapshot, KVCM would reject the unregistered deltas
+/// with the tombstone, the whole batch would be lost (the bridge does not
+/// replay), and the registration would never be reached.
+#[tokio::test]
+#[ignore]
+async fn a_report_then_clear_batch_gets_through_a_reclaimed_reporter() {
+    let env = live_env!();
+    let instance = unique("forgotten-clear");
+    // Registered directly so that no heartbeating backend owns the reporter:
+    // silence is what this test needs (as in the liveness case).
+    let _raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let silent = backend(&env, &instance, None);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30014";
+
+    silent
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[201, 202]))
+        .await
+        .expect("the first report registers the reporter");
+
+    // Wait for the tombstone, probing with a revoke so the wait writes nothing
+    // the metadata sweep could interleave with.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seq = 2;
+    loop {
+        match silent
+            .apply_external_kv_batch(revoke_batch(&worker, address, seq, &[999]))
+            .await
+        {
+            Err(error) => {
+                assert!(
+                    error.message().contains("NodeNotRegistered"),
+                    "unexpected error before the tombstone: {error}"
+                );
+                break;
+            }
+            Ok(_) => {
+                seq += 1;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "KVCM never unregistered the silent reporter"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    // The shape under test: deltas first, then the clear, in one batch.
+    let mut mixed = report_batch(&worker, address, seq, &[203, 204]);
+    mixed.actions.push(clear_action());
+    silent
+        .apply_external_kv_batch(mixed)
+        .await
+        .expect("the registration rides the first request, so the batch gets through");
+
+    // The clear committed: this reporter is claimed to own nothing. (Whether
+    // the two deltas survive the concurrent sweep is a race the metadata side
+    // owns; the fence hides them either way, which is the point of the clear.)
+    assert_eq!(
+        prefixes_by_address(&prefix(&silent, &[203, 204], 0).await),
+        HashMap::new(),
+        "the clear takes effect even on the batch that re-registered the reporter"
+    );
+}
+
+/// KVCM rate-limits snapshots per (instance, channel, reporter), 30s by
+/// default. A second flush inside that window is dropped with a warning rather
+/// than failing the batch: the bridge would reconnect and not replay, so the
+/// deltas riding with the flush would be lost too.
+#[tokio::test]
+#[ignore]
+async fn a_rate_limited_clear_degrades_to_a_warning() {
+    let env = live_env!();
+    let instance = unique("clear-rate-limited");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30012";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[171, 172]))
+        .await
+        .expect("report succeeds");
+    backend
+        .apply_external_kv_batch(clear_batch(&worker, address, 2))
+        .await
+        .expect("the first clear commits");
+
+    // Prove the cooldown is live for this reporter and channel, so the second
+    // clear below really takes the degradation path: a raw empty snapshot is
+    // answered SNAPSHOT_RATE_LIMITED with the remaining cooldown. A failed
+    // snapshot does not extend the window, so this probe is free.
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let probe = raw
+        .report(
+            &worker,
+            StorageType::StEventReportL1p5,
+            vec![empty_snapshot_event()],
+        )
+        .await;
+    assert_eq!(
+        header_code(probe.header.as_ref()),
+        ErrorCode::SnapshotRateLimited,
+        "the snapshot cooldown is live"
+    );
+    assert!(probe.retry_after_ms > 0, "KVCM reports the cooldown");
+
+    backend
+        .apply_external_kv_batch(clear_batch(&worker, address, 3))
+        .await
+        .expect("a rate-limited flush is dropped, not failed");
+
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[171, 172], 0).await),
+        HashMap::new(),
+        "the first clear's fence still stands"
     );
 }

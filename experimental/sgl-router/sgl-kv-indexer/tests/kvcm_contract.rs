@@ -58,6 +58,10 @@ struct MockState {
     /// Canned partial-failure `item_results` for `ReportEvent`.
     report_item_results: Vec<i32>,
     report_snapshot_required: bool,
+    /// Canned per-snapshot failures, one popped per snapshot request (empty
+    /// means "commit"). KVCM answers a failed snapshot with the code in both
+    /// the header and `item_results`, plus `retry_after_ms` when rate-limited.
+    snapshot_failures: Vec<ErrorCode>,
     /// Spec names per registered instance, as `RegisterInstance` declared
     /// them: KVCM checks every reported name against this set.
     registered_specs: HashMap<String, Vec<String>>,
@@ -111,13 +115,53 @@ fn err_header(code: ErrorCode, message: &str) -> CommonResponseHeader {
 /// instance). A registration replaces this set for that instance.
 const DEPLOYMENT_SPEC_NAMES: [&str; 3] = ["full", "swa", "mamba"];
 
+/// How KVCM answers a rejected request: the whole request or nothing, or a
+/// per-event `item_results` entry.
+enum ReportViolation {
+    /// Request-level checks run before any event is inspected and answer with
+    /// a header error (`CacheManager::ReportEvent`).
+    Request(String),
+    /// Per-event checks answer per item.
+    Items(String),
+}
+
 /// The KVCM acceptance rules the backend's generated events must satisfy
 /// (mirrors cache_manager.cc: BLOCK_ADD specs carry a channel-scheme URI and
 /// name a spec the instance declared, BLOCK_DELETE names a declared spec,
 /// NODE_REGISTER declares mediums). Returns the first violation's reason.
-fn validate_report_events(request: &ReportEventRequest, registered: &[String]) -> Option<String> {
+fn validate_report_events(
+    request: &ReportEventRequest,
+    registered: &[String],
+) -> Option<ReportViolation> {
     use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
     use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
+    // The snapshot rules `CacheManager::ReportEvent` enforces before it looks
+    // at a single event: a complete snapshot travels alone, and only one per
+    // request. An empty block set is legal and means "this reporter owns
+    // nothing".
+    let snapshots = request
+        .events
+        .iter()
+        .filter(|event| event.event_type == T::EventBlockSnapshot as i32)
+        .count();
+    let deltas = request
+        .events
+        .iter()
+        .filter(|event| {
+            event.event_type == T::EventBlockAdd as i32
+                || event.event_type == T::EventBlockDelete as i32
+        })
+        .count();
+    if snapshots > 0 && deltas > 0 {
+        return Some(ReportViolation::Request(
+            "snapshot and delta mutations must use separate ReportEvent requests".into(),
+        ));
+    }
+    if snapshots > 1 {
+        return Some(ReportViolation::Request(
+            "a ReportEvent request may contain only one complete snapshot".into(),
+        ));
+    }
     let expected_scheme = match StorageType::try_from(request.storage_type) {
         Ok(StorageType::StEventReportL2) => "vineyard://",
         _ => "event_report://",
@@ -130,17 +174,20 @@ fn validate_report_events(request: &ReportEventRequest, registered: &[String]) -
                     continue;
                 };
                 if add.specs.is_empty() {
-                    return Some("BLOCK_ADD without specs".into());
+                    return Some(ReportViolation::Items("BLOCK_ADD without specs".into()));
                 }
                 for spec in &add.specs {
                     if !spec.uri.starts_with(expected_scheme) {
-                        return Some(format!(
+                        return Some(ReportViolation::Items(format!(
                             "BLOCK_ADD spec `{}` URI `{}` lacks channel scheme `{expected_scheme}`",
                             spec.name, spec.uri
-                        ));
+                        )));
                     }
                     if !declared(&spec.name) {
-                        return Some(format!("BLOCK_ADD names undeclared spec `{}`", spec.name));
+                        return Some(ReportViolation::Items(format!(
+                            "BLOCK_ADD names undeclared spec `{}`",
+                            spec.name
+                        )));
                     }
                 }
             }
@@ -149,11 +196,15 @@ fn validate_report_events(request: &ReportEventRequest, registered: &[String]) -
                     continue;
                 };
                 if delete.spec_names.is_empty() {
-                    return Some("BLOCK_DELETE without spec_names".into());
+                    return Some(ReportViolation::Items(
+                        "BLOCK_DELETE without spec_names".into(),
+                    ));
                 }
                 for name in &delete.spec_names {
                     if !declared(name) {
-                        return Some(format!("BLOCK_DELETE names undeclared spec `{name}`"));
+                        return Some(ReportViolation::Items(format!(
+                            "BLOCK_DELETE names undeclared spec `{name}`"
+                        )));
                     }
                 }
             }
@@ -162,7 +213,9 @@ fn validate_report_events(request: &ReportEventRequest, registered: &[String]) -
                     continue;
                 };
                 if register.mediums.is_empty() {
-                    return Some("NODE_REGISTER without mediums".into());
+                    return Some(ReportViolation::Items(
+                        "NODE_REGISTER without mediums".into(),
+                    ));
                 }
             }
             _ => {}
@@ -266,33 +319,68 @@ impl MetaService for MockKvcm {
         // server (see cache_manager.cc ValidateEventLocationSpec). The declared
         // spec names come from the instance's registration, exactly as KVCM
         // resolves them.
-        let (violation, error) = {
+        let (violation, error, snapshot_failure, item_results, snapshot_required) = {
             let mut state = MockState::lock(&self.state);
             let declared = state.declared_specs(&request.instance_id);
             let violation = validate_report_events(&request, &declared);
+            // Scripted snapshot outcomes, one per snapshot request.
+            let is_snapshot = request.events.iter().any(|event| {
+                event.event_type
+                    == sgl_kv_indexer::kvcm_pb::ReportEventType::EventBlockSnapshot as i32
+            });
+            let snapshot_failure = if is_snapshot && !state.snapshot_failures.is_empty() {
+                Some(state.snapshot_failures.remove(0))
+            } else {
+                None
+            };
+            let item_results = std::mem::take(&mut state.report_item_results);
+            let snapshot_required = state.report_snapshot_required;
+            let error = state.report_error.clone();
             state.reports.push(request);
-            (violation, state.report_error.clone())
+            (
+                violation,
+                error,
+                snapshot_failure,
+                item_results,
+                snapshot_required,
+            )
         };
         let header = match error {
             Some((code, message)) => err_header(code, &message),
             None => ok_header(),
         };
-        let (mut item_results, snapshot_required) = {
-            let mut state = MockState::lock(&self.state);
-            (
-                std::mem::take(&mut state.report_item_results),
-                state.report_snapshot_required,
-            )
-        };
-        if let Some(reason) = violation {
-            item_results = vec![ErrorCode::InvalidArgument as i32];
+        if let Some(code) = snapshot_failure {
+            return Ok(Response::new(ReportEventResponse {
+                header: Some(err_header(code, "canned snapshot failure")),
+                item_results: vec![code as i32],
+                committed_snapshot_version: String::new(),
+                retry_after_ms: if code == ErrorCode::SnapshotRateLimited {
+                    30_000
+                } else {
+                    0
+                },
+                snapshot_required,
+                extra_info: String::new(),
+            }));
+        }
+        if let Some(violation) = violation {
+            let (header, item_results, extra_info) = match violation {
+                ReportViolation::Request(reason) => (
+                    err_header(ErrorCode::InvalidArgument, &reason),
+                    Vec::new(),
+                    String::new(),
+                ),
+                ReportViolation::Items(reason) => {
+                    (header, vec![ErrorCode::InvalidArgument as i32], reason)
+                }
+            };
             return Ok(Response::new(ReportEventResponse {
                 header: Some(header),
                 item_results,
                 committed_snapshot_version: String::new(),
                 retry_after_ms: 0,
                 snapshot_required,
-                extra_info: reason,
+                extra_info,
             }));
         }
         Ok(Response::new(ReportEventResponse {
@@ -504,10 +592,13 @@ async fn apply_translates_report_revoke_and_registers_node() {
 }
 
 #[tokio::test]
-async fn apply_skips_unreported_tiers_and_clears() {
+async fn apply_clears_with_an_empty_snapshot_of_its_own() {
+    use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
+    use sgl_kv_indexer::kvcm_pb::ReportEventType;
     let (backend, state) = start_backend().await;
-    // DRAM is outside the default report tiers; CLEAR has no KVCM equivalent.
-    // A first-seen worker still registers itself on its reported mediums.
+    // DRAM is outside the default report tiers, so its REPORT is dropped; the
+    // CLEAR is applied as an empty snapshot, in a request of its own, and the
+    // registration for the first-seen worker rides that snapshot.
     backend
         .apply_external_kv_batch(apply_request(
             "worker-0",
@@ -523,10 +614,23 @@ async fn apply_skips_unreported_tiers_and_clears() {
     {
         let state = MockState::lock(&state);
         assert_eq!(state.reports.len(), 1);
-        assert_eq!(state.reports[0].events.len(), 1);
+        let request = &state.reports[0];
+        assert_eq!(request.storage_type, StorageType::StEventReportL1p5 as i32);
+        assert_eq!(request.events.len(), 2);
         assert_eq!(
-            state.reports[0].events[0].event_type,
-            sgl_kv_indexer::kvcm_pb::ReportEventType::EventNodeRegister as i32
+            request.events[0].event_type,
+            ReportEventType::EventNodeRegister as i32
+        );
+        let EventParams::BlockSnapshot(snapshot) = request.events[1]
+            .event_params
+            .as_ref()
+            .expect("snapshot carries params")
+        else {
+            panic!("expected BLOCK_SNAPSHOT");
+        };
+        assert!(
+            snapshot.blocks.is_empty(),
+            "a clear is an empty complete snapshot"
         );
     }
 
@@ -541,6 +645,292 @@ async fn apply_skips_unreported_tiers_and_clears() {
         .await
         .expect("apply succeeds");
     assert_eq!(MockState::lock(&state).reports.len(), 1);
+}
+
+/// A pending registration rides the batch's *first* request. For a first-seen
+/// worker whose batch reports blocks and then clears, that is the delta: a
+/// reporter KVCM has forgotten would fail the unregistered delta and lose the
+/// whole batch otherwise, and the registration on the snapshot would never be
+/// reached (the review's wire probe: `apply-1 node_register_count=0`, then
+/// `apply-2 node_register_count=1`).
+/// One request as the KVCM access log would phrase it.
+fn wire_shape(request: &ReportEventRequest) -> String {
+    use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
+    let count = |kind: T| {
+        request
+            .events
+            .iter()
+            .filter(|event| event.event_type == kind as i32)
+            .count()
+    };
+    format!(
+        "node_register={} block_add={} block_delete={} block_snapshot={}",
+        count(T::EventNodeRegister),
+        count(T::EventBlockAdd),
+        count(T::EventBlockDelete),
+        count(T::EventBlockSnapshot),
+    )
+}
+
+#[tokio::test]
+async fn a_first_batch_that_reports_then_clears_registers_on_its_first_request() {
+    use sgl_kv_indexer::kvcm_pb::ReportEventType;
+    let (backend, state) = start_backend().await;
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            1,
+            vec![
+                action(ExternalKvActionType::ActionReport, hbm(), &[1]),
+                action(ExternalKvActionType::ActionClearAllAtTier, hbm(), &[]),
+            ],
+        ))
+        .await
+        .expect("apply succeeds");
+
+    let reports = MockState::lock(&state).reports.clone();
+    let shape: Vec<String> = reports.iter().map(wire_shape).collect();
+    assert_eq!(
+        shape,
+        [
+            "node_register=1 block_add=1 block_delete=0 block_snapshot=0",
+            "node_register=0 block_add=0 block_delete=0 block_snapshot=1",
+        ],
+        "the registration rides the first request; the snapshot goes alone"
+    );
+    assert_eq!(
+        reports[0].events[0].event_type,
+        ReportEventType::EventNodeRegister as i32
+    );
+    assert_eq!(
+        reports[0].events[1].event_type,
+        ReportEventType::EventBlockAdd as i32
+    );
+}
+
+/// A flush is best-effort: KVCM's rate limit (30s by default) cannot be waited
+/// out inside an apply budget, and failing the batch would cost more than a
+/// missed flush -- the bridge reconnects and does not replay, so every delta
+/// that rode in the same batch would be lost too.
+#[tokio::test]
+async fn a_rate_limited_clear_succeeds_without_retrying() {
+    use sgl_kv_indexer::kvcm_pb::ReportEventType;
+    let (backend, state) = start_backend().await;
+    MockState::lock(&state).snapshot_failures = vec![ErrorCode::SnapshotRateLimited];
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            1,
+            vec![action(
+                ExternalKvActionType::ActionClearAllAtTier,
+                hbm(),
+                &[],
+            )],
+        ))
+        .await
+        .expect("a rate-limited flush must not fail the batch");
+
+    let state = MockState::lock(&state);
+    let snapshots = state
+        .reports
+        .iter()
+        .filter(|request| {
+            request
+                .events
+                .iter()
+                .any(|event| event.event_type == ReportEventType::EventBlockSnapshot as i32)
+        })
+        .count();
+    assert_eq!(snapshots, 1, "the cooldown is not retried inside the batch");
+}
+
+/// KVCM forgets a reporter it has not heard from; the flush re-registers it in
+/// the retry rather than leaving the clear to the next batch.
+#[tokio::test]
+async fn a_clear_registers_a_forgotten_reporter_and_retries() {
+    use sgl_kv_indexer::kvcm_pb::ReportEventType;
+    let (backend, state) = start_backend().await;
+    // The reporter is known (it just reported blocks), so the flush request
+    // itself carries no registration -- only the retry does.
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &[1])],
+        ))
+        .await
+        .expect("the report registers the reporter");
+    MockState::lock(&state).snapshot_failures = vec![ErrorCode::NodeNotRegistered];
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            2,
+            vec![action(
+                ExternalKvActionType::ActionClearAllAtTier,
+                hbm(),
+                &[],
+            )],
+        ))
+        .await
+        .expect("the flush re-registers and succeeds");
+
+    let state = MockState::lock(&state);
+    let snapshots: Vec<&ReportEventRequest> = state
+        .reports
+        .iter()
+        .filter(|request| {
+            request
+                .events
+                .iter()
+                .any(|event| event.event_type == ReportEventType::EventBlockSnapshot as i32)
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 2, "one rejected attempt, one retry");
+    assert!(
+        !snapshots[0]
+            .events
+            .iter()
+            .any(|event| event.event_type == ReportEventType::EventNodeRegister as i32),
+        "the first attempt has nothing to register with"
+    );
+    assert_eq!(
+        snapshots[1].events[0].event_type,
+        ReportEventType::EventNodeRegister as i32,
+        "the retry carries a fresh NODE_REGISTER"
+    );
+}
+
+/// A concurrent snapshot is a transient race, not a failure: the complete
+/// snapshot is re-sent after a short backoff.
+#[tokio::test]
+async fn a_snapshot_in_progress_clear_is_retried_until_it_commits() {
+    use sgl_kv_indexer::kvcm_pb::ReportEventType;
+    let (backend, state) = start_backend().await;
+    MockState::lock(&state).snapshot_failures =
+        vec![ErrorCode::SnapshotInProgress, ErrorCode::SnapshotInProgress];
+    backend
+        .apply_external_kv_batch(apply_request(
+            "worker-0",
+            "http://w0:30000",
+            1,
+            vec![action(
+                ExternalKvActionType::ActionClearAllAtTier,
+                hbm(),
+                &[],
+            )],
+        ))
+        .await
+        .expect("the third attempt commits");
+
+    let state = MockState::lock(&state);
+    let snapshots = state
+        .reports
+        .iter()
+        .filter(|request| {
+            request
+                .events
+                .iter()
+                .any(|event| event.event_type == ReportEventType::EventBlockSnapshot as i32)
+        })
+        .count();
+    assert_eq!(snapshots, 3, "two in-progress answers, then a commit");
+}
+
+/// The mock's snapshot rules are KVCM's, so the empty snapshot the flush
+/// relies on stays accepted and a mixed request fails loudly here instead of
+/// only against a real manager (`CacheManager::ReportEvent`).
+#[tokio::test]
+async fn mock_snapshot_accepts_empty_and_rejects_mixed_requests() {
+    use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
+    use sgl_kv_indexer::kvcm_pb::meta_service_client::MetaServiceClient;
+    use sgl_kv_indexer::kvcm_pb::{
+        BlockAddEventParams, BlockSnapshotEventParams, EventItem, ReportEventType,
+    };
+
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    // `start_mock_kvcm` hands back the address before its task binds, so the
+    // first connect can race the listener (the backend's own client connects
+    // lazily and never sees it).
+    let mut client = None;
+    for _ in 0..50 {
+        match MetaServiceClient::connect(format!("http://{addr}")).await {
+            Ok(connected) => {
+                client = Some(connected);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let mut client = client.expect("the mock is reachable");
+
+    let snapshot = || EventItem {
+        event_type: ReportEventType::EventBlockSnapshot as i32,
+        event_params: Some(EventParams::BlockSnapshot(BlockSnapshotEventParams {
+            blocks: Vec::new(),
+            ..Default::default()
+        })),
+    };
+    let add = |hash: i64| EventItem {
+        event_type: ReportEventType::EventBlockAdd as i32,
+        event_params: Some(EventParams::BlockAdd(BlockAddEventParams {
+            block_key: hash.to_string(),
+            medium: "hbm".into(),
+            specs: Vec::new(),
+            ..Default::default()
+        })),
+    };
+    let request = |events: Vec<EventItem>| ReportEventRequest {
+        trace_id: "mock-rules".into(),
+        instance_id: "test-instance".into(),
+        host_ip_port: "worker-0".into(),
+        events,
+        storage_type: StorageType::StEventReportL1p5 as i32,
+    };
+    let code_of = |response: &ReportEventResponse| {
+        ErrorCode::try_from(
+            response
+                .header
+                .as_ref()
+                .and_then(|header| header.status.as_ref())
+                .expect("every response carries a status")
+                .code,
+        )
+        .expect("the mock answers known codes")
+    };
+
+    let answer = client
+        .report_event(request(vec![snapshot()]))
+        .await
+        .expect("the mock answers")
+        .into_inner();
+    assert_eq!(
+        code_of(&answer),
+        ErrorCode::Ok,
+        "an empty snapshot is legal"
+    );
+
+    let answer = client
+        .report_event(request(vec![snapshot(), add(7)]))
+        .await
+        .expect("the mock answers")
+        .into_inner();
+    assert_eq!(
+        code_of(&answer),
+        ErrorCode::InvalidArgument,
+        "a snapshot mixed with deltas is a request-level rejection"
+    );
+
+    let answer = client
+        .report_event(request(vec![snapshot(), snapshot()]))
+        .await
+        .expect("the mock answers")
+        .into_inner();
+    assert_eq!(code_of(&answer), ErrorCode::InvalidArgument);
 }
 
 #[tokio::test]

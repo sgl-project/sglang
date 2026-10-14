@@ -341,10 +341,24 @@ Semantics and limitations:
   set for routing-only deployments. A report tier outside HBM/DRAM (`SSD`) is
   not servable by the prefix rules: legacy workers still report it, but every
   worker declaring a cache spec is excluded from answers (warned at startup).
-- `CLEAR_ALL_AT_TIER` has no KVCM equivalent (a `BLOCK_SNAPSHOT` replaces every
-  medium at once). It is skipped with a `WARN`; the worker keeps heartbeating,
-  so its stale placements stay indexed until KVCM's capacity eviction removes
-  them.
+- `CLEAR_ALL_AT_TIER` is applied as an **empty `BLOCK_SNAPSHOT`**, the one
+  KVCM primitive with clear semantics: it commits synchronously and fences the
+  reporter's older locations behind strict visibility, so the prefix answer
+  stops claiming them immediately. Three caveats are inherent to that
+  primitive. The scope is the whole reporter × storage channel across **every
+  medium**, so a clear on one tier also drops the other reported tiers. The
+  request is sent alone (KVCM rejects a snapshot mixed with deltas) and, when
+  the actions around it are interleaved, in its action order: reports before
+  the clear end up fenced, reports after it land on the fresh generation.
+  Finally, KVCM rate-limits snapshots per (instance, channel, reporter) — 30s
+  by default: a flush inside that window is dropped with a `WARN`
+  (`flush dropped, placements stay`) rather than failing the batch, because a
+  failed batch costs the bridge a reconnect without a replay. The first flush
+  of a delta-only reporter also switches it to strict visibility, which is what
+  hides the pre-clear blocks: the indexer must be the only writer of that
+  reporter's placements on that channel (another component writing under its
+  own reporter identity, or through the data plane, is unaffected). A
+  per-medium `CLEAR` remains a KVCM-side ask.
 - `MatchExternalKv` (per-block placement) has no KVCM equivalent and answers
   `UNIMPLEMENTED`; `GetExternalKvHitCounts` stays empty. The prefix query is
   the only routing signal.
