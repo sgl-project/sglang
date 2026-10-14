@@ -68,10 +68,11 @@ if TYPE_CHECKING:
     # copy-engine all-to-all for Ulysses groups of any size on one host; off by
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
-    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
-    # attention over the copy-engine transport: -1 picks a count that divides
-    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
-    # keeps the sequential exchange, N >= 2 forces N groups
+    # head groups for pipelining the Ulysses exchange against dense attention
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # -1 picks the most groups that divide the heads per rank while each group's
+    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
+    # 1 keeps the sequential exchange; N >= 2 forces N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
@@ -105,6 +106,14 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff). Opt-in, off by default.
+    SGLANG_HI3_COND_ENCODE_BATCHING: bool = False
+    # HunyuanImage-3: apply the post-decode output geometry (native crop/pad
+    # and exact-size resample) to hit the requested aspect ratio. On by
+    # default; set 0 to skip the plan and return the full decoded native
+    # bucket untouched.
+    SGLANG_HI3_OUTPUT_CROP: bool = True
     SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
     SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
     SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
@@ -461,6 +470,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff on OOM). Opt-in, off by
+    # default; the AR backbone resident on the same device makes full-batch
+    # encoding tight on memory, so it must be explicitly enabled.
+    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool("SGLANG_HI3_COND_ENCODE_BATCHING"),
+    # HunyuanImage-3: post-decode output geometry (native crop/pad plus
+    # exact-size resample). On by default; 0 returns the raw native bucket.
+    "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"

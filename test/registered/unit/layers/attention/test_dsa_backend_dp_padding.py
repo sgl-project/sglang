@@ -105,6 +105,8 @@ class TestDSABackendDPPadding(unittest.TestCase):
             _multi_ctas_kv_counter_buffer=None,
             device="cpu",
             num_q_heads=2,
+            num_dcp_q_heads=2,
+            dcp_size=1,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
