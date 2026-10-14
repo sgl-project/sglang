@@ -358,7 +358,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
                     )
             cu_seqlens_q = metadata.cu_seqlens_q
@@ -779,10 +779,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            )
+                        page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                            metadata.page_table
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k

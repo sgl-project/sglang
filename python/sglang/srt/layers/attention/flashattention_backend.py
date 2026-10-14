@@ -603,8 +603,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Refill the SWA write-target buffer (bound as a metadata view in
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
+        swa_out_cache_loc = (
+            self._get_swa_write_locations(forward_batch)
+            if self.use_sliding_window_kv_pool and out_cache_loc is not None
+            else None
+        )
+        # None: this runner has no SWA write space (a frozen-KV draft writes nothing).
+        if swa_out_cache_loc is not None:
             n = swa_out_cache_loc.shape[0]
             assert_buffer_fits(
                 n,
@@ -823,11 +828,14 @@ class FlashAttentionBackend(AttentionBackend):
                 # The runner-built capture batch writes the page-0 sink.
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
             else:
-                self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                    self.kv_index_translator.write_ids(
-                        forward_batch, IdSpaceKind.SLIDING_WINDOW
-                    )
+                swa_write_ids = self.kv_index_translator.write_ids(
+                    forward_batch, IdSpaceKind.SLIDING_WINDOW
                 )
+                # None: no SWA write space on this runner (a frozen-KV draft).
+                if swa_write_ids is not None:
+                    self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
+                        swa_write_ids
+                    )
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
