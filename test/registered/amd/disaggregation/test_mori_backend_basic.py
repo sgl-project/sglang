@@ -176,14 +176,13 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 2 only. Both prefill layers must still be sent;
         # reading dst_lens[i] instead of dst_lens[j] drops layer 3.
         calls = self._send([3, 4], [2, 3, 4], [132, 132], [0, 132, 132])
-        self.assertEqual(
-            calls, [call("s3", "d3", "plan"), call("s4", "d4", "plan")]
-        )
+        self.assertEqual(calls, [call("s3", "d3", "plan"), call("s4", "d4", "plan")])
 
     def test_elided_dst_entry_is_never_written(self):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
         self.assertEqual(calls, [call("s5", "d5", "plan")])
+
 
 if __name__ == "__main__":
     unittest.main()
