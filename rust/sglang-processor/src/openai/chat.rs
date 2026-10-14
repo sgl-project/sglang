@@ -753,11 +753,8 @@ fn generate_body(
         "custom_params": request.custom_params,
         "sampling_seed": request.seed,
         "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
+        "watermark": request.watermark,
     });
-    // Only when set: engines older than the `watermark` sampling param reject the key.
-    if let Some(watermark) = &request.watermark {
-        sampling["watermark"] = json!(watermark);
-    }
     if let Ok(Some(schema)) =
         format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
     {
