@@ -1192,11 +1192,6 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
-        # Prefill CUDA graph tail block (bounded replay inside the graph): row
-        # capacity, persistent index/location buffers, held metadata per block size.
-        self._bcg_tail_capacity: Optional[int] = None
-        self._bcg_tail_buffers: Optional[tuple] = None
-        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
@@ -1614,6 +1609,17 @@ class DeepseekV4AttnBackend(
             )
         return self._bcg_tail_buffers
 
+    def _prefill_graph_tail_routing_bound(
+        self, non_padded: torch.Tensor, real_rows: int
+    ) -> torch.Tensor:
+        # Captured MoE kernels read the bound by address, so every replay clamps
+        # into one persistent scalar; an idle DP peer's zero stays zero.
+        if self._bcg_tail_num_token_non_padded is None:
+            self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+        return torch.clamp(
+            non_padded, max=real_rows, out=self._bcg_tail_num_token_non_padded
+        )
+
     def _build_late_layer_tail_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1866,9 +1872,9 @@ class DeepseekV4AttnBackend(
         )
         tail = tail_metadata.late_layer_tail
         # Inside the prefill CUDA graph the tail block is padded to a fixed capacity;
-        # the eager breaks (attention, low-ratio sources) clip their inputs to the
-        # batch's non-padded count, so point it at the real tail rows while the
-        # late layers run.
+        # the eager breaks (attention, low-ratio sources) and the captured MoE
+        # routing clip their inputs to the batch's non-padded counts, so point
+        # them at the real tail rows while the late layers run.
         saved = saved + (
             forward_batch.global_num_token_non_padded_cpu,
             forward_batch.global_num_token_non_padded,
@@ -1876,21 +1882,12 @@ class DeepseekV4AttnBackend(
         )
         if tail.real_rows_count is not None:
             forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
-            non_padded = forward_batch.global_num_token_non_padded
-            if non_padded is not None:
-                if self._bcg_tail_num_token_non_padded is None:
-                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
-                # Late-layer MoE graphs must read a persistent tail bound. Keep
-                # an idle DP peer at zero and preserve the full-prefill scalar.
-                torch.clamp(
-                    non_padded,
-                    max=tail.real_rows_count,
-                    out=self._bcg_tail_num_token_non_padded,
+            if forward_batch.global_num_token_non_padded is not None:
+                bound = self._prefill_graph_tail_routing_bound(
+                    forward_batch.global_num_token_non_padded, tail.real_rows_count
                 )
-                forward_batch.global_num_token_non_padded = (
-                    self._bcg_tail_num_token_non_padded
-                )
-                forward_batch.num_token_non_padded = self._bcg_tail_num_token_non_padded
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
