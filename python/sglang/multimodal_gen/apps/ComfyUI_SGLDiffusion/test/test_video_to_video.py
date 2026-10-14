@@ -1,4 +1,7 @@
-"""Video-to-video: the generic video node forwards a VIDEO input as video_path."""
+"""Video-to-video: the generic video node forwards a VIDEO input to the server.
+
+A local clip is uploaded as `video_reference`; anything else goes as `video_path`.
+"""
 
 import sys
 from pathlib import Path
@@ -17,8 +20,11 @@ def _run_node(**node_kwargs):
     client = SERVER_API.SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")
     captured = {}
 
-    def fake_post(url, json=None, headers=None, timeout=None):
-        captured.update(json)
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        captured.update(json or data)
+        captured["uploads"] = {
+            key: (name, fh.read()) for key, (name, fh, _) in (files or {}).items()
+        }
         return FakeResponse({"id": "job-1"})
 
     def fake_get(url, headers=None, timeout=None):
@@ -36,19 +42,21 @@ def _run_node(**node_kwargs):
     return captured
 
 
-def test_video_input_is_sent_as_video_path(tmp_path):
+def test_local_video_input_is_uploaded(tmp_path):
     src = tmp_path / "clip.mp4"
     src.write_bytes(b"x")
     video = UTILS.SGLDVideoInput(str(src), height=480, width=832)
 
     payload = _run_node(video=video)
 
-    assert payload["video_path"] == str(src)
+    assert payload["uploads"] == {"video_reference": ("clip.mp4", b"x")}
+    assert "video_path" not in payload
     assert "input_reference" not in payload
 
 
 def test_no_video_input_omits_video_path():
-    assert "video_path" not in _run_node()
+    payload = _run_node()
+    assert "video_path" not in payload and not payload["uploads"]
 
 
 def test_video_and_image_inputs_are_both_forwarded(tmp_path):
@@ -60,7 +68,8 @@ def test_video_and_image_inputs_are_both_forwarded(tmp_path):
     with mock.patch(f"{PKG}.nodes.get_image_path", return_value="/tmp/ref.png"):
         payload = _run_node(video=video, image=image)
 
-    assert payload["video_path"] == str(src)
+    assert payload["uploads"] == {"video_reference": ("clip.mp4", b"x")}
+    # not a file on this machine, so it is sent as a string
     assert payload["input_reference"] == "/tmp/ref.png"
 
 
