@@ -353,6 +353,10 @@ _BUILT = {
         "managers/scheduler_components/request_intake.py",
         "RequestIntake",
     ),
+    "StepPlanner": (
+        "managers/scheduler_components/step_planner.py",
+        "StepPlanner",
+    ),
 }
 
 # The modules whose classes sit below ModeOwners.

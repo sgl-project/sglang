@@ -4,7 +4,7 @@ selection and retraction, and the retract/reset half of pause and flush."""
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -70,6 +70,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
+    from sglang.srt.managers.scheduler_components.request_intake import (
+        RequestIntake,
+    )
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
@@ -114,8 +117,7 @@ class StepPlanner:
         draft_worker,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         mode_owners: ModeOwners,
-        add_request_to_queue: Callable[..., None],
-        prefetch_after_device_hit_loss: Callable[[Req], bool],
+        request_intake: RequestIntake,
         prefill_delayer: Optional[PrefillDelayer],
         prefill_bs_tracker: RecentPrefillBatchSizeTracker,
         min_free_slots_delayer: Optional[MinFreeSlotsDelayer],
@@ -154,8 +156,7 @@ class StepPlanner:
         self.request_registry = request_registry
         # A PD role switch replaces the owners in place.
         self.mode_owners = mode_owners
-        self.add_request_to_queue = add_request_to_queue
-        self.prefetch_after_device_hit_loss = prefetch_after_device_hit_loss
+        self.request_intake = request_intake
         self.prefill_delayer = prefill_delayer
         self.prefill_bs_tracker = prefill_bs_tracker
         self.min_free_slots_delayer = min_free_slots_delayer
@@ -232,7 +233,7 @@ class StepPlanner:
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self.add_request_to_queue(req)
+                self.request_intake.add_request_to_queue(req)
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -422,7 +423,9 @@ class StepPlanner:
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
-            if hicache_storage_enabled() and (self.prefetch_after_device_hit_loss(req)):
+            if hicache_storage_enabled() and (
+                self.request_intake.prefetch_after_device_hit_loss(req)
+            ):
                 continue
             if (
                 hicache_storage_enabled()
@@ -475,7 +478,7 @@ class StepPlanner:
             running_reqs = slot.filter_decoding(self.core_lists.decoding)
             admitted = set(adder.can_run_list)
             for req in adder.preempt_list:
-                self.add_request_to_queue(req, admitted=admitted)
+                self.request_intake.add_request_to_queue(req, admitted=admitted)
 
         # The admitted requests stay in the waiting queue until the launch.
         can_run_list: List[Req] = adder.can_run_list
@@ -700,7 +703,7 @@ class StepPlanner:
         logger.warning(msg_prefix + msg_details)
 
         for req in retracted_reqs:
-            self.add_request_to_queue(req, is_retracted=True)
+            self.request_intake.add_request_to_queue(req, is_retracted=True)
         return kept_reqs
 
     def retract_for_pause(self, slot: ScheduleSlot) -> None:
@@ -743,7 +746,7 @@ class StepPlanner:
             self.mode_owners.disagg_decode.hold_for_rebootstrap(retract_reqs)
         else:
             for req in retract_reqs:
-                self.add_request_to_queue(req)
+                self.request_intake.add_request_to_queue(req)
         # Under PP the ring slots keep their flags: as before, a slot whose
         # decoding requests all left reopens at its next schedule.
         slot.batch_is_full = False

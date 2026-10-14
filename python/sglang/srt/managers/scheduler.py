@@ -2560,10 +2560,7 @@ class Scheduler:
             draft_worker=self.draft_worker,
             decode_offload_manager=self.decode_offload_manager,
             mode_owners=self.mode_owners,
-            add_request_to_queue=self.request_intake.add_request_to_queue,
-            prefetch_after_device_hit_loss=(
-                self.request_intake.prefetch_after_device_hit_loss
-            ),
+            request_intake=self.request_intake,
             prefill_delayer=self.prefill_delayer,
             prefill_bs_tracker=self.prefill_bs_tracker,
             min_free_slots_delayer=self.min_free_slots_delayer,
