@@ -122,33 +122,31 @@ class _RetractionCase(CustomTestCase):
         req.output_ids = array("q", output)
         req.reasoning_tokens = len(output) + 1 if reasoning else 0
         req.extra_key = None
-        self.pool.alloc([req])
         req.init_next_round_input(self.cache)
         req.lock = self.cache.lock(req.last_node)
-        matched = len(req.prefix_indices)
+        prefix = self.cache.prefix_device_indices(req)
+        self.pool.alloc([req])
         self.pool.write(
-            (req.kv.req_pool_idx, slice(0, matched)),
-            req.prefix_indices.to(torch.int32),
+            (req.kv.req_pool_idx, slice(0, req.prefix_len)), prefix.to(torch.int32)
         )
-        req.kv.kv_committed_len = req.kv.kv_allocated_len = matched
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = req.prefix_len
         return req
 
-    def _extend(self, req, start, end):
-        req.set_extend_range(start, end)
+    def _extend(self, req, end):
+        req.extend_end = end
         self.pool.write(
-            (req.kv.req_pool_idx, slice(start, end)), self._slots(end - start)
+            (req.kv.req_pool_idx, slice(req.prefix_len, end)),
+            self._slots(end - req.prefix_len),
         )
         req.kv.kv_committed_len = req.kv.kv_allocated_len = end
 
     def _prefill_and_decode(self, req, chunk_end=None):
         """Prefill prompt + output (a re-prefill when output is non-empty),
         checkpoint it as the scheduler does, then decode AFTER tokens."""
-        start = len(req.prefix_indices)  # the admission match
         if chunk_end is not None:
-            self._extend(req, start, chunk_end)
+            self._extend(req, chunk_end)
             checkpoint_kv_cache(req, self.cache)  # stash_chunked_request
-            start = chunk_end
-        self._extend(req, start, len(req.full_untruncated_fill_ids))
+        self._extend(req, len(req.full_untruncated_fill_ids))
         checkpoint_kv_cache(req, self.cache)  # batch_result_processor, unfinished
         for _ in range(AFTER):
             self.pool.write(
@@ -214,10 +212,10 @@ class TestStripThinkingAfterRetraction(_RetractionCase):
                 # A request without reasoning cached prompt + the first output
                 # tokens, so the re-prefill's match alone passes the prompt.
                 other = self._admit(PROMPT, EARLIER_OUTPUT[:4], reasoning=False)
-                self._extend(other, 0, PROMPT + 4)
+                self._extend(other, PROMPT + 4)
                 self._release(other, finish=True)
                 req = self._admit(PROMPT, EARLIER_OUTPUT)
-                self.assertEqual(len(req.prefix_indices), PROMPT + 4)
+                self.assertEqual(req.prefix_len, PROMPT + 4)
                 self._prefill_and_decode(req)
                 self._release_and_check(req, finish=finish)
 
