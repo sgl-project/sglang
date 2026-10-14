@@ -449,6 +449,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.copy_stream = scheduler.copy_stream_ctx = None
         scheduler.req_to_token_pool = scheduler.token_to_kv_pool_allocator = None
         scheduler.tp_worker = scheduler.model_worker = scheduler.future_map = None
+        scheduler.pp_spec_forward = None
         enter_scope(self, patch("sglang.srt.managers.scheduler.PPChannel"))
         enter_scope(
             self,

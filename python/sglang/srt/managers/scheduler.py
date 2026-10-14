@@ -297,6 +297,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing
+from sglang.srt.managers.scheduler_components.pp_spec_forward import PPSpecForward
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -653,6 +654,9 @@ class Scheduler:
         self.init_overlap()
         self.finalize_schedule_stream()
         self.init_streams()
+
+        # Init the speculative forward of a PP stage
+        self.maybe_init_pp_spec_forward()
 
         # Init the launch of a step: its forward and its result's copy to host
         self.init_forward_launch()
@@ -1728,6 +1732,22 @@ class Scheduler:
             copy_stream=self.copy_stream,
         )
 
+    def maybe_init_pp_spec_forward(self) -> None:
+        """The forward a speculative step runs under pipeline parallelism."""
+        self.pp_spec_forward = (
+            PPSpecForward(
+                kv=self.kv,
+                streams=self.streams,
+                future_map=self.future_map,
+                tp_worker=self.tp_worker,
+                model_worker=self.model_worker,
+                pp_group=self.pp_group,
+                spec_algorithm=self.spec_algorithm,
+            )
+            if get_parallel().pp_size > 1 and not self.spec_algorithm.is_none()
+            else None
+        )
+
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
@@ -2060,14 +2080,12 @@ class Scheduler:
             on_idle=self.on_idle,
             counters=self.counters,
             mark_idle=self.mark_sched_idled,
+            pp_spec_forward=self.pp_spec_forward,
             pp_group=self.pp_group,
             device=self.device,
             device_module=self.device_module,
-            spec_algorithm=self.spec_algorithm,
-            req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tp_worker=self.tp_worker,
-            model_worker=self.model_worker,
             future_map=self.future_map,
             schedule_stream=self.schedule_stream,
             copy_stream=self.copy_stream,
@@ -4631,7 +4649,7 @@ class Scheduler:
             self.forward_step = self.model_worker.forward_batch_generation
             self.finish_launch = self._finish_overlap_launch
         elif get_parallel().pp_size > 1 and not self.spec_algorithm.is_none():
-            self.forward_step = self._pp_spec_forward
+            self.forward_step = self.pp_spec_forward.spec_forward
             # The ring brings the result back from the last stage.
             self.finish_launch = lambda step, result: None
         elif self.spec_algorithm.is_none():
@@ -4642,19 +4660,6 @@ class Scheduler:
             # draft input into FutureMap.
             self.forward_step = self.model_worker.forward_batch_generation
             self.finish_launch = self._finish_sync_spec_launch
-
-    def _pp_spec_forward(
-        self,
-        step: ScheduleBatch,
-        *,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        pending_grammar: Optional[PendingSteps] = None,
-    ) -> GenerationBatchResult:
-        """A speculative step under pipeline parallelism: the ring verifies
-        the trees its relay keeps in the rows' slots."""
-        return self.pp_ring.spec_forward(
-            step, pp_proxy_tensors=pp_proxy_tensors, pending_grammar=pending_grammar
-        )
 
     def _forward_embedding(
         self,

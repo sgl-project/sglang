@@ -74,6 +74,7 @@ class TestPPRingCommit(CustomTestCase):
         s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
         s.pending = PendingSteps()
         s.recv_skipper = None
+        s.pp_spec_forward = None
         s._sched_idled = False
         s.ingest_requests = Mock(return_value=[])
         s.forward_stream_ctx = nullcontext()

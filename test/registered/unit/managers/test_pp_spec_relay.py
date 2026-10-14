@@ -19,6 +19,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing  # noqa: E402
+from sglang.srt.managers.scheduler_components.pp_spec_forward import (  # noqa: E402
+    PPSpecForward,
+)
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardMode,
@@ -58,6 +61,9 @@ class TestPPSpecRelay(CustomTestCase):
         )
         self.s = object.__new__(PPRing)
         self.s.pp_spec_relay = PPSpecRelay(req_pool_size=8, device="cpu")
+        # The forward verifies the trees the ring's relay wrote.
+        self.fwd = object.__new__(PPSpecForward)
+        self.fwd.pp_spec_relay = self.s.pp_spec_relay
 
     def commit(self, step: ScheduleBatch, tensors) -> None:
         """What the ring does when the relay brings the step's outputs back."""
@@ -73,7 +79,7 @@ class TestPPSpecRelay(CustomTestCase):
     def launch(self, step: ScheduleBatch, is_last_rank: bool):
         """Launch a verify round; return the verify input's tree inputs and
         the batch the forward ran on."""
-        s = self.s
+        s = self.fwd
         s.pp_group = SimpleNamespace(is_last_rank=is_last_rank)
         s.device = "cpu"
         s.tp_worker = SimpleNamespace(
@@ -102,7 +108,7 @@ class TestPPSpecRelay(CustomTestCase):
                 prepare_verify,
             ),
         ):
-            result = PPRing.spec_forward(s, step, pp_proxy_tensors=None)
+            result = PPSpecForward.spec_forward(s, step, pp_proxy_tensors=None)
         if is_last_rank:
             (forward_batch,), _ = s.model_worker.forward_batch_generation.call_args
         else:

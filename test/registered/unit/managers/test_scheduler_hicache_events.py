@@ -155,6 +155,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.copy_stream_ctx = s.forward_stream_ctx = s.spec_algorithm = None
         s.req_to_token_pool = s.token_to_kv_pool_allocator = None
         s.tp_worker = s.model_worker = s.future_map = None
+        s.pp_spec_forward = None
         s.recv_skipper = None
         s.ingest_requests = Mock(return_value=[])
         s.lists.waiting_queue = []

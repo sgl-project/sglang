@@ -496,6 +496,7 @@ class _RingShell(_Shell):
         s.schedule_stream = s.forward_stream = s.copy_stream = None
         s.copy_stream_ctx = s.future_map = s.req_to_token_pool = None
         s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
+        s.pp_spec_forward = None
         self.channel = SimpleNamespace(
             is_first_rank=True,
             is_last_rank=False,
