@@ -71,6 +71,15 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// `/weights_checker`'s control request: every scheduler rank runs the
+    /// weight checker's `action` on the runners `selector` names.
+    CheckWeightsReqInput {
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -124,6 +133,24 @@ impl GetInternalStateReq {
     }
 }
 
+impl CheckWeightsReqInput {
+    pub fn new(
+        rid: String,
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    ) -> Self {
+        Self {
+            rid,
+            action,
+            allow_quant_error,
+            skip_tensor_list,
+            selector,
+        }
+    }
+}
+
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
@@ -155,6 +182,34 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    #[test]
+    fn check_weights_req_msgpack_shape() {
+        let b = CheckWeightsReqInput::new(
+            "7".into(),
+            "fingerprint".into(),
+            true,
+            Some(vec!["lm_head".into()]),
+            "target".into(),
+        )
+        .encode()
+        .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            7,
+            "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
+             allow_quant_error, skip_tensor_list, selector]"
+        );
+        assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("fingerprint"));
+        assert_eq!(arr[4].as_bool(), Some(true));
+        assert_eq!(arr[5][0].as_str(), Some("lm_head"));
+        assert_eq!(arr[6].as_str(), Some("target"));
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /

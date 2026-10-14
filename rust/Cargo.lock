@@ -3789,6 +3789,7 @@ dependencies = [
  "sglang-api-types",
  "sglang-mm",
  "sglang-processor",
+ "sha2",
  "socket2",
  "thiserror",
  "tokio",
