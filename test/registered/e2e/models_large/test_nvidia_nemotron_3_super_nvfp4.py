@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -10,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1600, stage="nightly", runner_config="4-gpu-b200")
@@ -114,7 +114,8 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
@@ -141,7 +142,8 @@ class TestNvidiaNemotron3SuperNVFP4PerToken(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         _run_gsm8k(self, threshold=0.93)
@@ -162,7 +164,8 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
@@ -185,7 +188,8 @@ class TestNvidiaNemotron3SuperNVFP4EPLB(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
@@ -212,7 +216,8 @@ class TestNvidiaNemotron3SuperNVFP4DPAttentionEP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
