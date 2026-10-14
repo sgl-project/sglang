@@ -748,8 +748,13 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
     ):
+        del pp_proxy_tensors
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
