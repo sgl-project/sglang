@@ -1033,6 +1033,9 @@ class Envs:
     # DSA prefill: each attention-TP rank computes every head for its slice of
     # the tokens. Consumes no ranks. Off under DCP, which all-gathers the query.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

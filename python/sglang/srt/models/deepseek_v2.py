@@ -82,6 +82,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.dcp.layout import dcp_extend_gathers_kv
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -3459,7 +3460,25 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         create_chunked_prefix_cache_kv_indices_fn,
     ):
         if _is_npu:
-            return None
+            # NPU decode and short-tail extends gather the query (#37787) and
+            # read rank-local metadata off the attention backend. A DSA extend
+            # whose prefix is cheaper to move than its queries gathers the KV
+            # instead, which needs this; its presence is what selects that path.
+            if not self.use_dsa:
+                return None
+            prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
+            parallel = get_parallel()
+            if not dcp_extend_gathers_kv(
+                [prefix_sum],
+                [seq_lens_sum - prefix_sum],
+                self.config.num_attention_heads
+                * parallel.attn_dcp_size
+                // parallel.attn_tp_size,
+                self.config.kv_lora_rank,
+                self.config.qk_rope_head_dim,
+                kv_cache_dtype.itemsize,
+            ):
+                return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
