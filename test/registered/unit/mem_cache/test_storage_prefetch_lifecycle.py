@@ -55,6 +55,7 @@ def _staged_fixture(full_match=2):
     cache.host_memory_mode = "buffer_only"
     cache.linker = None
     cache.storage_prefetch_retries = StoragePrefetchRetries()
+    cache._storage_prefetch_wait = {}
     cache.prefetch_loaded_tokens_by_reqid = {_REQ: 6}
     cache.prefetch_loaded_storage_start_by_reqid = {_REQ: 2}
     cache._storage_prefetch_hit_remaining_by_reqid = {}

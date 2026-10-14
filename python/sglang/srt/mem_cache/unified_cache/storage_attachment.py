@@ -446,3 +446,4 @@ class StorageAttachment:
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()
+        cache._storage_prefetch_wait.clear()

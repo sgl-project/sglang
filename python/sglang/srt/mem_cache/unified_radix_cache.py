@@ -10,6 +10,7 @@ from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -170,6 +171,14 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+class _StoragePrefetchWait(msgspec.Struct):
+    """One attempt's `timeout` budget: the deadline runs from its first blocked
+    admission poll and survives re-issues; once spent, no lookup is issued."""
+
+    deadline: Optional[float] = None
+    expired: bool = False
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -410,6 +419,7 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
+        self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
@@ -2006,6 +2016,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
+        wait = self._storage_prefetch_wait.get(request)
+        if wait is not None and wait.expired:
+            # The admission budget is spent: the request recomputes instead.
+            return
         submission = self.cache_controller.get_prefetch_submission(req_id)
         if submission is not None:
             return submission.decision
@@ -2164,12 +2178,79 @@ class UnifiedRadixCache(BasePrefixCache):
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
-    def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
-        return (
-            time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+    def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
+        if operation.handle in self._storage_prefetch_wait:
+            return
+        # Queue residence before this poll and later re-issues do not extend it.
+        pages = operation.stats_requested_tokens // self.page_size
+        self._storage_prefetch_wait[operation.handle] = _StoragePrefetchWait(
+            deadline=time.monotonic()
+            + self.prefetch_timeout_base
+            + pages * self.prefetch_timeout_per_page
         )
+
+    def _storage_prefetch_wait_lapsed(
+        self, operation: PrefetchOperation, now: float
+    ) -> bool:
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        return wait is not None and (
+            wait.expired or (wait.deadline is not None and now > wait.deadline)
+        )
+
+    def _retire_lapsed_prefetches(self) -> None:
+        """Cut every ongoing prefetch past its `timeout` budget, decided by one
+        MAX vote per tick over the rank-agreed operation order.
+
+        The admission polls read the stored verdict, so their count may differ
+        per rank (batch_is_full exits) without changing the collective count.
+        Operations issued after this tick's vote wait for the next one.
+        """
+        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+            return
+        operations = [info.operation for info in self.ongoing_prefetch.values()]
+        now = time.monotonic()
+        lapsed = torch.tensor(
+            [int(self._storage_prefetch_wait_lapsed(op, now)) for op in operations],
+            dtype=torch.int,
+            device="cpu",
+        )
+        # Wall clocks differ across ranks: TP takes MAX (any rank timed out).
+        # Same sync shape as the storage drain (_sync_hicache_ready_counts):
+        # PP0 decides and broadcasts along PP, except in PP ticket mode, where
+        # every stage drains its own storage queues and votes on its own.
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(lapsed, torch.distributed.ReduceOp.MAX)
+        else:
+            self._all_reduce(lapsed, torch.distributed.ReduceOp.MAX)
+        for operation, verdict in zip(operations, lapsed.tolist()):
+            if verdict:
+                self._retire_lapsed_prefetch(operation)
+
+    def _retire_lapsed_prefetch(self, operation: PrefetchOperation) -> None:
+        request = operation.handle
+        operation.deadline_expired = True
+        self.storage_prefetch_retries.cancel(request.rid)
+        # A rank that never polled this attempt still receives the verdict.
+        self._storage_prefetch_wait.setdefault(
+            request, _StoragePrefetchWait()
+        ).expired = True
+        self.cache_controller.terminate_prefetch(operation)
+        logger.info(
+            "HiCache prefetch deadline req=%s phase=%s requested=%d hit=%d completed=%d",
+            request.rid,
+            "query" if operation.host_indices is None else "transfer",
+            operation.stats_requested_tokens,
+            operation.storage_hit_count,
+            operation.completed_tokens,
+        )
+        if operation.host_indices is None:
+            # Unlike a store miss, a spent budget arms no paced re-query.
+            self._finish_storage_prefetch(
+                request, fulfilled_tokens=0, reason="deadline"
+            )
+            self.revoke_pending_prefetch(request)
+        else:
+            self._handle_prefetch_result(operation)
 
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
@@ -2180,16 +2261,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
         if self.prefetch_stop_policy == "timeout":
-            # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
-            if self.pp_rank == 0:
-                should_terminate = self._prefetch_timeout_check_linear_func(operation)
-            should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            # The budget runs from this first blocked poll; the per-tick vote in
+            # check_hicache_events retires lapsed operations before any poll.
+            self._start_storage_prefetch_wait(operation)
+            return operation.deadline_expired
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -2314,7 +2389,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="storage_transfer",
+                reason="deadline" if operation.deadline_expired else "storage_transfer",
             )
         if (
             completed_tokens > 0
@@ -2442,7 +2517,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if pool_transfers and not all_succeeded:
             # Drop each pool's beliefs beyond what it served (KV and its
             # sidecars beyond the completed span); the next insert re-writes
-            # only the missing pools.
+            # only the missing pools. A deadline is not evidence of absent data.
             invalidation_hashes = (
                 operation.sidecar_hash_values
                 if operation.sidecar_hash_values is not None
@@ -2451,7 +2526,7 @@ class UnifiedRadixCache(BasePrefixCache):
             trimmed_pages = len(invalidation_hashes) - len(hash_value)
             keep_pages = trimmed_pages + completed_tokens // self.page_size
             beliefs = self.storage_existence_cache
-            if keep_pages < len(invalidation_hashes):
+            if not operation.deadline_expired and keep_pages < len(invalidation_hashes):
                 self._belief_policy(
                     PoolName.KV, PoolHitPolicy.ALL_PAGES
                 ).heal_from_transfer(
@@ -2467,15 +2542,18 @@ class UnifiedRadixCache(BasePrefixCache):
                             keep_pages,
                         )
             for transfer, count in zip(pool_transfers, pool_hit_pages):
-                if transfer.keys is not None and count < len(transfer.keys):
+                if (
+                    not operation.deadline_expired
+                    and transfer.keys is not None
+                    and count < len(transfer.keys)
+                ):
                     self._belief_policy(
                         transfer.name, transfer.hit_policy
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            self._finish_storage_prefetch(
-                request, fulfilled_tokens=0, reason="storage_transfer"
-            )
+            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self._retire_ongoing_prefetch(
@@ -2486,12 +2564,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_tokens_by_reqid[request] = 0
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d aux_pool_hit_pages=%s",
+                "HiCache hybrid prefetch discarded req=%s reason=%s completed=%d "
+                "requested=%d kv_beliefs_kept_pages=%s aux_pool_hit_pages=%s",
                 request.rid,
+                reason,
                 completed_tokens,
                 expected_tokens,
-                keep_pages,
+                None if operation.deadline_expired else keep_pages,
                 {
                     getattr(transfer.name, "value", transfer.name): count
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
@@ -2588,6 +2667,7 @@ class UnifiedRadixCache(BasePrefixCache):
         Buffer mode resolves at the H2D completion ack instead, because its
         host allocation is transport staging rather than a resident L2 hit.
         """
+        self._storage_prefetch_wait.pop(request, None)
         if self.host_memory_mode == "cache":
             self._finish_storage_prefetch(request, fulfilled_tokens, reason)
 
@@ -2609,6 +2689,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def pop_prefetch_loaded_tokens(self, request: CacheRequestHandle) -> int:
+        # The PD decode consumer; it re-issues no lookup, so the budget ends here.
+        self._storage_prefetch_wait.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         return self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
 
@@ -2629,6 +2711,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
+        self._storage_prefetch_wait.pop(request, None)
         if (
             self.buffer_pipeline is not None
             and self.cache_controller.pp_prefetch_command_group is not None
@@ -2702,7 +2785,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode != "buffer_only":
             return
         chain = operation.all_hash_values
-        if chain is None:
+        if chain is None or operation.deadline_expired:
+            # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
@@ -3552,6 +3636,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            self._retire_lapsed_prefetches()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

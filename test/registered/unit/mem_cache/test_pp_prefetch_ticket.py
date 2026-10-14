@@ -90,6 +90,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache.prefetch_loaded_storage_start_by_reqid = {}
         cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache._storage_prefetch_wait = {}
         cache.linker = None
         cache.root_node_handle = Mock(return_value=0)
         cache.buffer_pipeline = Mock(spec=BufferModePipeline)

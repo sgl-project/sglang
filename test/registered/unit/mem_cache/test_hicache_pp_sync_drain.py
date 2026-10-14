@@ -55,6 +55,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.pp_rank = pp_rank
         cache.pp_size = 2
         cache.host_memory_mode = "cache"
+        cache.prefetch_stop_policy = "wait_complete"
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
