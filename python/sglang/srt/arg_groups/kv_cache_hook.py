@@ -107,6 +107,11 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
         )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "MXFP8 KV cache does not yet support --enable-unified-memory: "
+            "the unified MHA pool does not allocate the MXFP8 scale buffers."
+        )
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:
