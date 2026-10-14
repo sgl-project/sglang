@@ -680,6 +680,7 @@ def enable_cache_on_dual_transformer(
     model_name: str = "wan2.2",
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    has_separate_cfg: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
@@ -861,7 +862,7 @@ def enable_cache_on_dual_transformer(
             params_modifiers=[primary_modifier, secondary_modifier],
             check_forward_pattern=adapter_spec.check_forward_pattern,
             check_num_outputs=adapter_spec.check_num_outputs,
-            has_separate_cfg=adapter_spec.has_separate_cfg,
+            has_separate_cfg=adapter_spec.has_separate_cfg and has_separate_cfg,
         ),
         parallelism_config=None,
     )

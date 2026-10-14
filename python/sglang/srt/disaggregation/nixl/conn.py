@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -1797,14 +1798,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the paired entries must have identical layouts.
                 if dst_item_lens is not None:
                     for i, j in pairs:
+                        if is_elided_entry(item_lens[i], dst_item_lens, j):
+                            # A shared-topk layer carries no index-K. One peer
+                            # may elide it while the other does not -- HiSparse
+                            # runs decode-side only -- and neither reads it.
+                            continue
                         if item_lens[i] != dst_item_lens[j]:
                             raise RuntimeError(
                                 f"{state_type} item length mismatch for paired "
                                 f"entries src[{i}]={item_lens[i]} "
                                 f"dst[{j}]={dst_item_lens[j]}"
                             )
+                # DSA index-K elision leaves a 0-row buffer on every shared-topk
+                # layer. Neither side registered it, so a descriptor built from
+                # it would fail in initialize_xfer(); drop it when either peer
+                # elided the entry.
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                    for i, j in pairs
+                    if not is_elided_entry(item_lens[i], dst_item_lens, j)
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1812,6 +1824,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                mapped_dst_lens = None
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1819,6 +1836,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
+                    if not is_elided_entry(
+                        item_lens[layer_id], mapped_dst_lens, layer_id
+                    )
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
@@ -2519,7 +2539,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes. "
-            f"Prefill attn_tp_size={self.attn_tp_size}, "
+            f"Prefill attn_tp_size={self.state_tp_size}, "
             f"Decode attn_tp_size={decode_tp_size}."
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
@@ -2538,7 +2558,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_layer_ids=dst_layer_ids,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
 
         src_addrs = []
@@ -2581,7 +2601,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=self.state_tp_size,
                 dst_attn_tp_size=decode_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
@@ -2741,7 +2761,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
-                if self.attn_tp_size != decode_tp_size:
+                if self.state_tp_size != decode_tp_size:
                     if 0 in src_dims:
                         raise RuntimeError(
                             "Replicated Mamba PD state transfer currently requires "
@@ -2836,7 +2856,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
-                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                # QSA state is whole on every rank, so it pairs by state TP.
+                src_tp_size = (
+                    self.state_tp_size
+                    if st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                    else self.attn_tp_size
+                )
+                if not self.is_mla_backend and src_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
