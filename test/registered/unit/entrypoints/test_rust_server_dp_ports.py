@@ -55,6 +55,7 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
     scheduler = _scheduler_for_typed_config()
     with (
         get_context().override_server_args(grpc_port=50051, **legacy_args),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
@@ -67,6 +68,40 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+
+
+@pytest.mark.parametrize(
+    "server_args,ranks,expected",
+    [
+        ({"tp_size": 4, "attn_dp_size": 4}, {"attn_dp_rank": 2, "dp_rank": None}, 2),
+        ({"dp_size": 2}, {"attn_dp_rank": 0, "dp_rank": 1}, 1),
+        ({}, {"attn_dp_rank": 0, "dp_rank": None}, 0),
+    ],
+    ids=["attention-dp", "replica-dp", "no-dp"],
+)
+def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
+    """Each DP listener must advertise its own rank, matching its KV-event
+    source; a per-listener orchestrator cannot otherwise tell listeners apart."""
+    extension = SimpleNamespace(
+        DisaggregationMode=SimpleNamespace(
+            Null="null", Prefill="prefill", Decode="decode"
+        ),
+        ModelConfig=MagicMock(return_value="model-config"),
+        DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
+        ServerArgs=MagicMock(return_value="server-args"),
+    )
+    with (
+        get_context().override_server_args(**server_args),
+        get_parallel().override(**ranks),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["dp_rank"] == expected
 
 
 @pytest.mark.parametrize(

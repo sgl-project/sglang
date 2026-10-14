@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_device,
@@ -63,7 +64,11 @@ def _build_server_args(
         "node_rank": get_parallel().node_rank,
         "nnodes": get_parallel().nnodes,
         "dp_size": get_parallel().num_dp_ranks,
-        "dp_rank": getattr(scheduler, "dp_rank", None),
+        "dp_rank": select_kv_publisher_dp_rank(
+            get_parallel().attn_dp_size,
+            get_parallel().attn_dp_rank,
+            get_parallel().dp_rank,
+        ),
         "dist_init_addr": get_parallel().dist_init_addr,
         "base_gpu_id": get_device().base_gpu_id,
         "page_size": get_schedule().page_size,
