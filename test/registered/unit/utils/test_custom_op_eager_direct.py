@@ -17,6 +17,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 calls = []  # (function, its caller's frame name)
@@ -128,7 +132,3 @@ def test_compile_traces_the_registered_op():
         lambda a, b: eager_direct_add(a, b) * 2, fullgraph=True, backend="eager"
     )
     assert torch.equal(compiled(x, y), (x + y) * 2)
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
