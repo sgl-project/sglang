@@ -43,9 +43,9 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. Everything after `extra_key` (the last
+        /// field emitted) has a msgspec default in Python and is omitted
+        /// (short arrays decode with defaulted tails).
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +53,14 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        /// The scheduler decodes this header by position (Python's
+        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so the
+        /// fields between `disagg_prefill_dp_rank` and `extra_key` must be sent,
+        /// at their defaults, for `extra_key` to land in its slot.
+        routing_key: (),
+        require_reasoning: bool,
+        priority: (),
+        extra_key: Option<&'a str>,
     }
 }
 
@@ -114,6 +122,10 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: false,
+            priority: (),
+            extra_key: req.extra_key.as_deref(),
         }
     }
 }
@@ -180,9 +192,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); we emit 36 (through
+        // `extra_key`). Trailing defaulted fields are omitted.
+        assert_eq!(arr.len(), 36, "header ends at extra_key");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -216,7 +228,7 @@ mod tests {
     /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.
     #[test]
-    fn header_bootstrap_block_is_positionally_aligned() {
+    fn header_bootstrap_block_and_extra_key_are_positionally_aligned() {
         let req = GenerateRequest {
             rid: "r1".into(),
             text: Some("hi".into()),
@@ -227,6 +239,7 @@ mod tests {
             decode_tp_size: Some(2),
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
+            extra_key: Some("salt".into()),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -245,5 +258,9 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        assert!(arr[32].is_nil(), "routing_key at 32");
+        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
+        assert!(arr[34].is_nil(), "priority at 34");
+        assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
     }
 }
