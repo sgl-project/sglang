@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import sglang.srt.managers.mm_utils as mm_utils
+from sglang.srt.layers import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
@@ -206,6 +207,17 @@ class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
+    ):
+        # Covers the text embedding norm too; the decoder's own scope nests.
+        with expert_tp.default_fused_ops_for_single_request(forward_batch):
+            return self._forward_omni(input_ids, positions, forward_batch, input_embeds)
+
+    def _forward_omni(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
     ):
         if input_ids is None:
             if input_embeds is None:

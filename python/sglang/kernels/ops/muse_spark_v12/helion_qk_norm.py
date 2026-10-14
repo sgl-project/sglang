@@ -34,14 +34,12 @@ QK_NORM_CONFIGS: dict[str, helion.Config] = {
         range_multi_buffers=[None],
         range_num_stages=[0],
         range_unroll_factors=[0],
-        reduction_loops=[None],
     ),
     "long": helion.Config(
         block_sizes=[32],
         num_stages=1,
         num_warps=8,
         pid_type="flat",
-        reduction_loops=[None],
     ),
 }
 
