@@ -332,6 +332,9 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            # An offset can truncate inherited media.
+            if not abort and not session_params.offset:
+                new_req.inherit_mm_token_counts(last_req)
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
