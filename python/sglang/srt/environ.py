@@ -1317,6 +1317,23 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
+    # DCP extend on NPU: master switch for gathering the prefix KV on extends
+    # (the gather and its prefetch). On by default; set 0 to keep the base
+    # query-gather path for every extend, no rebuild needed.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_KV_GATHER = EnvBool(True)
+    # DCP extend on NPU: gather the next layer's prefix KV on a side stream,
+    # one layer ahead of its attention, off the critical path. On by default;
+    # set 0 to fall back to the inline gather on the main stream.
+    # The verb-less alias below keeps the existing benchmark setups working.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_KV_PREFETCH = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NPU_DCP_EXTEND_KV_PREFETCH"
+    )
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa

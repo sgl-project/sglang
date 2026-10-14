@@ -87,6 +87,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import (
     get_cp_decode_attn_tp_ctx,
 )
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -263,6 +264,7 @@ if _is_cuda:
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
+        dcp_extend_kv_gather_wants_metadata,
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
         forward_mha_core_npu,
@@ -3626,7 +3628,24 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu or is_deepseek_dsa(self.config):
+        if _is_npu:
+            # NPU keeps the query-gather extend (#37787) unless the DSA
+            # KV-gather path claims this batch; the NPU module owns that call.
+            parallel = get_parallel()
+            if not dcp_extend_kv_gather_wants_metadata(
+                use_dsa=self.use_dsa,
+                kv_cache_dtype=kv_cache_dtype,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                seq_lens_sum=seq_lens_sum,
+                num_attention_heads=self.config.num_attention_heads,
+                kv_lora_rank=self.config.kv_lora_rank,
+                qk_rope_head_dim=self.config.qk_rope_head_dim,
+                kv_elem_size=kv_cache_dtype.itemsize,
+                attn_dcp_size=parallel.attn_dcp_size,
+                attn_tp_size=parallel.attn_tp_size,
+            ):
+                return None
+        elif is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

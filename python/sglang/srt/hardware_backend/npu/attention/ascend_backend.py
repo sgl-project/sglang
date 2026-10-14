@@ -1625,6 +1625,96 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
         return output
+    def _forward_sparse_dcp_gathered(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        gathered: tuple[torch.Tensor, torch.Tensor],
+        topk_indices: Optional[torch.Tensor],
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """DCP extend over the context the model gathered, one contiguous run
+        per request: TND keys, cumulative lengths, no block table.
+
+        Relative indices, cumulative lengths. Three of the four conventions
+        return plausible garbage: re-probe before changing.
+        """
+        if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                f"KV cache dtype {self.kv_cache_dtype} with decode context "
+                "parallelism is not supported: the gathered extend path is "
+                "bf16/fp16 only."
+            )
+        key_nope, key_rope = gathered
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        seq_lengths_kv = forward_batch.attn_dcp_metadata.dcp_kv_indptr[1:]
+        # The indexer skips top-k and fills a row with -1 when the context fits
+        # index_topk, meaning "attend the full context". The gathered operator
+        # indexes the TND run arithmetically and a -1 offset reads before the
+        # buffer, so rewrite each all-(-1) row to that request's full range --
+        # the exact layout a non-skipping indexer emits for small contexts.
+        if topk_indices is not None:
+            kv_ends = seq_lengths_kv.to(topk_indices.device).long()
+            kv_lens = kv_ends - torch.cat([kv_ends.new_zeros((1,)), kv_ends[:-1]])
+            q_ends = actual_seq_qlen.to(topk_indices.device).long()
+            q_lens = q_ends - torch.cat([q_ends.new_zeros((1,)), q_ends[:-1]])
+            row_kv_len = kv_lens.repeat_interleave(q_lens)
+            if row_kv_len.shape[0] < topk_indices.shape[0]:
+                row_kv_len = torch.cat(
+                    [
+                        row_kv_len,
+                        row_kv_len.new_zeros(
+                            topk_indices.shape[0] - row_kv_len.shape[0]
+                        ),
+                    ]
+                )
+            positions = torch.arange(topk_indices.shape[1], device=topk_indices.device)
+            full_range = torch.where(
+                positions.unsqueeze(0) < row_kv_len.unsqueeze(1),
+                positions,
+                torch.full_like(positions, -1),
+            ).to(topk_indices.dtype)
+            skipped = (topk_indices < 0).all(dim=-1, keepdim=True) & (
+                row_kv_len.unsqueeze(1) <= topk_indices.shape[1]
+            )
+            topk_indices = torch.where(skipped, full_range, topk_indices)
+        # The gathered caller slices the query to its DCP head block before
+        # this call. Beyond one attention-TP shard of heads the operator
+        # faults the device (an MTE read before the gathered buffer), so a
+        # layout drift must stop here instead.
+        assert q_nope.shape[1] <= layer.tp_q_head_num, (
+            f"DCP gathered sparse attention got {q_nope.shape[1]} query heads, "
+            f"more than this rank's shard ({layer.tp_q_head_num}); the caller "
+            "must slice the merged head layout before this call"
+        )
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=key_nope,
+            value=key_nope,
+            query_rope=q_pe,
+            key_rope=key_rope,
+            sparse_indices=_expand_dsa_sparse_indices(topk_indices),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            # layout_kv must equal layout_query unless it is PA_BSND. The block
+            # table is omitted, not passed as None: to a tiling function the two
+            # are not always the same thing.
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return attn_out
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -2138,6 +2228,19 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            # Set by the model only for a DCP extend that gathered the KV.
+            gathered = getattr(forward_batch, "npu_dcp_extend_kv", None)
+            if gathered is not None:
+                return self._forward_sparse_dcp_gathered(
+                    q_nope,
+                    q_pe,
+                    gathered,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    forward_batch,
+                )
+
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
