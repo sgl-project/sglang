@@ -32,6 +32,26 @@ logger = init_logger(__name__)
 
 _MANIFEST = "manifest.json"
 _DISK_HEADROOM = 1.15
+_MAX_STORES = 4
+
+
+def _file_fingerprint(path: str) -> str:
+    """Identity of an adapter file's content: name, size, mtime and inode.
+
+    An HF snapshot file is a symlink to a blob named by its sha256, so the
+    resolved name carries the content hash; for a local file, mtime and inode
+    catch a retrain that overwrote the file at the same size.
+    """
+    stat = os.stat(path)
+    return "|".join(
+        [
+            os.path.basename(path),
+            os.path.basename(os.path.realpath(path)),
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+            str(stat.st_ino),
+        ]
+    )
 
 
 def lora_merge_cache_key(
@@ -40,21 +60,39 @@ def lora_merge_cache_key(
 ) -> str:
     """Key of one merged-weights combination.
 
-    `base_paths` are the component checkpoint paths (HF snapshot paths carry
-    the revision hash); `adapters` are ordered (lora_path, strength, alpha)
-    triples — order matters, merges compose in order. Include adapter file
-    modification times so same-size local checkpoint updates invalidate the cache.
+    `base_paths` are the component identifiers: a local checkpoint directory is
+    resolved (an HF snapshot path carries the revision hash), anything else
+    (a repo id, a module name) is used verbatim so the key does not depend on
+    the working directory. `adapters` are ordered (local adapter file,
+    strength, alpha) triples whose files are fingerprinted by content identity;
+    order matters, merges compose in order.
     """
-    parts = [os.path.realpath(p) for p in sorted(base_paths)]
+    # Only entries with a separator are paths; a bare module name such as
+    # "transformer" must not resolve against whatever the cwd contains.
+    parts = [
+        os.path.realpath(p) if os.sep in p and os.path.isdir(p) else p
+        for p in sorted(base_paths)
+    ]
     for path, strength, alpha in adapters:
-        real = os.path.realpath(path)
-        try:
-            stat = os.stat(real)
-            size, mtime_ns = stat.st_size, stat.st_mtime_ns
-        except OSError:
-            size, mtime_ns = -1, -1
-        parts.append(f"{real}|{size}|{mtime_ns}|{strength}|{alpha}")
+        parts.append(f"{_file_fingerprint(path)}|{strength}|{alpha}")
     return hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
+
+
+def evict_old_stores(root: str, keep: str, max_stores: int = _MAX_STORES) -> None:
+    """Drop the oldest merged stores so strength sweeps do not fill the disk."""
+    parent = os.path.dirname(root)
+    try:
+        stores = [
+            entry.path
+            for entry in os.scandir(parent)
+            if entry.is_dir() and entry.path != keep
+        ]
+        stores.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        return
+    for stale in stores[max(max_stores - 1, 0) :]:
+        shutil.rmtree(stale, ignore_errors=True)
+        logger.info("Evicted old LoRA merge cache %s", stale)
 
 
 class LoraMergeCache:
@@ -85,6 +123,10 @@ class LoraMergeCache:
             if not os.path.exists(os.path.join(self.root, meta.get("file", ""))):
                 return False
         self._entries = entries
+        try:
+            os.utime(self.root)  # mark as recently used so eviction spares it
+        except OSError:
+            pass
         return True
 
     def get(
@@ -100,7 +142,13 @@ class LoraMergeCache:
         meta = self._entries.get(name)
         if meta is None:
             return None
-        mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        try:
+            mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        except Exception as exc:
+            # e.g. the store was evicted by another process after adoption
+            logger.warning("LoRA merge cache entry for %s unreadable (%s)", name, exc)
+            self._entries = {}
+            return None
         tensor = mapped.get("weight")
         if (
             tensor is None
@@ -154,8 +202,8 @@ class LoraMergeCache:
             return None
         fname = hashlib.sha1(name.encode()).hexdigest()[:16] + ".safetensors"
         path = os.path.join(self.root, fname)
+        tmp = f"{path}.tmp.{os.getpid()}"
         try:
-            tmp = f"{path}.tmp.{os.getpid()}"
             safetensors_save_file({"weight": merged.contiguous()}, tmp)
             os.replace(tmp, path)
             mapped = safetensors_load_file(path)["weight"]
@@ -167,8 +215,8 @@ class LoraMergeCache:
                 exc,
             )
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             except OSError:
                 pass
             return None
@@ -194,6 +242,7 @@ class LoraMergeCache:
         except OSError as exc:
             logger.warning("LoRA merge cache manifest not written (%s)", exc)
             return
+        evict_old_stores(self.root, keep=self.root)
         logger.info(
             "Merged weights cached to %s (%d layers); anonymous host memory "
             "no longer holds them",

@@ -669,13 +669,15 @@ class DiffGenerator:
             "Failed to unmerge LoRA weights",
         )
 
-    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
+    def merge_lora_weights(
+        self, target: str = "all", strength: float | None = None
+    ) -> None:
         """
         Merge LoRA weights into the base model.
 
         Args:
             target: Which transformer(s) to merge.
-            strength: LoRA strength for merge, default 1.0.
+            strength: Optional override for every adapter; None keeps their own.
         """
         req = MergeLoraWeightsReq(target=target, strength=strength)
         self._send_lora_request(
