@@ -14,10 +14,9 @@ Sliding window and attention sink features are supported.
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
@@ -35,10 +34,6 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    get_cuda_graph_max_batch_size,
-)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -48,10 +43,14 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    get_cuda_graph_max_batch_size,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -90,8 +89,8 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 
 def _native_fp4_decode_output_capacity(
     max_running_requests: int,
-    max_draft_tokens: Optional[int],
-    max_cuda_graph_bs: Optional[int] = None,
+    max_draft_tokens: int | None,
+    max_cuda_graph_bs: int | None = None,
 ) -> int:
     """Maximum FP8 output rows for eager/graph decode and target verify."""
     request_capacity = max(max_running_requests, max_cuda_graph_bs or 0)
@@ -180,7 +179,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
     supports_ragged_verify_graph: bool = True
 
     @staticmethod
-    def _resolve_swa_kv_pool(model_runner) -> Optional[BaseSWAKVPool]:
+    def _resolve_swa_kv_pool(model_runner) -> BaseSWAKVPool | None:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
 
         EAGLE-like draft workers share the target allocator for token bookkeeping,
@@ -193,9 +192,11 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         if isinstance(active_pool, BaseSWAKVPool):
             return active_pool
 
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
+        if (
+            model_runner.is_draft_worker
+            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return None
 
         kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
         return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
@@ -210,8 +211,8 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: torch.Tensor | None = None,
+        kv_last_page_len_buf: torch.Tensor | None = None,
         speculative_step_id: int = 0,
     ):
         # AttentionBackend base init — no FlashInfer wrapper overhead
@@ -221,7 +222,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
-        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
+        self._swa_kv_pool: BaseSWAKVPool | None = self._resolve_swa_kv_pool(
             model_runner
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
@@ -231,9 +232,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         # kv_indptr / kv_last_page_len buffers — allocate only when not provided
         # by a wrapping MultiStepDraftBackend.
         if kv_indptr_buf is None:
-            max_bs = get_cuda_graph_max_batch_size(
-                model_runner.req_to_token_pool.size
-            )
+            max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
@@ -241,9 +240,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
             self.kv_indptr = kv_indptr_buf
 
         if kv_last_page_len_buf is None:
-            max_bs = get_cuda_graph_max_batch_size(
-                model_runner.req_to_token_pool.size
-            )
+            max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
             self.kv_last_page_len = torch.ones(
                 (max_bs,), dtype=torch.int32, device=model_runner.device
             )
@@ -378,7 +375,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
-        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self._swa_kv_pool: SWAKVPool | None = self._resolve_swa_kv_pool(model_runner)
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
@@ -402,7 +399,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         ) // self.page_size
 
         # Forward metadata
-        self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+        self.forward_metadata: TRTLLMMHAMetadata | None = None
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -553,7 +550,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         return output.to(self.q_data_type)
 
     @staticmethod
-    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> SWAKVPool | None:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
 
         EAGLE draft workers share the target allocator for token bookkeeping,
@@ -566,9 +563,11 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         if isinstance(active_pool, SWAKVPool):
             return active_pool
 
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
+        if (
+            model_runner.is_draft_worker
+            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return None
 
         allocator = model_runner.token_to_kv_pool_allocator
         kvcache = allocator.get_kvcache()
@@ -576,7 +575,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Allocate a SWA page_table buffer, or return None for non-SWA models."""
         if self._swa_kv_pool is None:
             return None
@@ -715,7 +714,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         self,
         max_bs: int,
         max_num_tokens: int,
-        kv_indices_buf: Optional[torch.Tensor] = None,
+        kv_indices_buf: torch.Tensor | None = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
         max_num_pages = self.max_num_pages
@@ -952,8 +951,8 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        out_cache_loc: Optional[torch.Tensor] = None,
+        spec_info: SpecInput | None,
+        out_cache_loc: torch.Tensor | None = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1055,7 +1054,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def update_verify_buffers_to_fill_after_draft(
-        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+        self, spec_info: SpecInput, cuda_graph_bs: int | None
     ):
         pass
 
@@ -1428,12 +1427,12 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         bmm1_scale,
         bmm2_scale,
         window_left: int,
-        sinks: Optional[torch.Tensor],
+        sinks: torch.Tensor | None,
         q_len_per_req: int = 1,
         kv_cache_sf=None,
-        out: Optional[torch.Tensor] = None,
-        out_dtype: Optional[torch.dtype] = None,
-        mask: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1693,9 +1692,7 @@ class TRTLLMHAAttnBackend(AttentionBackend):
         )
 
         q_scale = 1.0
-        if uses_native_fp4:
-            q = q.to(torch.float8_e4m3fn)
-        elif (
+        if uses_native_fp4 or (
             self.data_type == torch.float8_e4m3fn
             and (not self.is_xqa_impl or not uses_decode_kernel)
             and not use_fused_qkv

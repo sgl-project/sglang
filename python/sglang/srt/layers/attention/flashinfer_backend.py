@@ -16,13 +16,13 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
@@ -81,7 +81,6 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
-
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
@@ -138,10 +137,10 @@ class MultiItemScoringParams:
 
     """
 
-    prefix_len_ptr: Optional[torch.Tensor] = None
-    token_pos_in_items_ptr: Optional[torch.Tensor] = None
+    prefix_len_ptr: torch.Tensor | None = None
+    token_pos_in_items_ptr: torch.Tensor | None = None
     token_pos_in_items_len: int = 0
-    max_item_len_ptr: Optional[torch.Tensor] = None
+    max_item_len_ptr: torch.Tensor | None = None
 
     def is_enabled(self) -> bool:
         """Check if multi-item scoring is enabled."""
@@ -150,18 +149,18 @@ class MultiItemScoringParams:
 
 @dataclass
 class DecodeMetadata:
-    decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    decode_wrappers: list[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
-    swa_out_cache_loc: Optional[torch.Tensor] = None
+    swa_out_cache_loc: torch.Tensor | None = None
 
 
 @dataclass
 class PrefillMetadata:
-    prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
+    prefill_wrappers: list[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
-    multi_item_params: Optional[MultiItemScoringParams] = None
-    swa_out_cache_loc: Optional[torch.Tensor] = None
+    multi_item_params: MultiItemScoringParams | None = None
+    swa_out_cache_loc: torch.Tensor | None = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -187,19 +186,19 @@ def fast_prefill_plan(
     num_kv_heads: int,
     head_dim_qk: int,
     page_size: int,
-    head_dim_vo: Optional[int] = None,
-    custom_mask: Optional[torch.Tensor] = None,
+    head_dim_vo: int | None = None,
+    custom_mask: torch.Tensor | None = None,
     causal: bool = False,
     window_left: int = -1,
-    q_data_type: Union[str, torch.dtype] = "float16",
-    kv_data_type: Optional[Union[str, torch.dtype]] = None,
-    o_data_type: Optional[Union[str, torch.dtype]] = None,
+    q_data_type: str | torch.dtype = "float16",
+    kv_data_type: str | torch.dtype | None = None,
+    o_data_type: str | torch.dtype | None = None,
     non_blocking: bool = True,
-    fixed_split_size: Optional[int] = None,
-    prefix_len_ptr: Optional[torch.Tensor] = None,
-    token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+    fixed_split_size: int | None = None,
+    prefix_len_ptr: torch.Tensor | None = None,
+    token_pos_in_items_ptr: torch.Tensor | None = None,
     token_pos_in_items_len: int = 0,
-    max_item_len_ptr: Optional[torch.Tensor] = None,
+    max_item_len_ptr: torch.Tensor | None = None,
     # Required host-known metadata: lets us skip the per-replay device-to-host
     # copies upstream plan() always issues. Keyword-only with no default so a
     # caller that forgets them fails at the call boundary, not with a cryptic
@@ -302,8 +301,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: torch.Tensor | None = None,
+        kv_last_page_len_buf: torch.Tensor | None = None,
         init_new_workspace: bool = False,
     ):
         super().__init__()
@@ -313,7 +312,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
-        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
+        self._swa_kv_pool: BaseSWAKVPool | None = self._resolve_swa_kv_pool(
             model_runner
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
@@ -537,7 +536,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
 
         # Other metadata
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata: PrefillMetadata | DecodeMetadata = None
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
@@ -545,9 +544,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
         # Created lazily on first capture in _prepare_cuda_graph_metadata.
-        self.full_cg_prefill_wrappers: Optional[
-            List[BatchPrefillWithPagedKVCacheWrapper]
-        ] = None
+        self.full_cg_prefill_wrappers: (
+            list[BatchPrefillWithPagedKVCacheWrapper] | None
+        ) = None
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -560,7 +559,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     @staticmethod
-    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> BaseSWAKVPool | None:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
 
         EAGLE-like draft workers share the target allocator for token bookkeeping,
@@ -573,9 +572,11 @@ class FlashInferAttnBackend(AttentionBackend):
         if isinstance(active_pool, BaseSWAKVPool):
             return active_pool
 
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
+        if (
+            model_runner.is_draft_worker
+            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return None
 
         kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
         return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
@@ -1061,7 +1062,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self,
         max_bs: int,
         max_num_tokens: int,
-        kv_indices_buf: Optional[torch.Tensor] = None,
+        kv_indices_buf: torch.Tensor | None = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -1277,7 +1278,7 @@ class FlashInferAttnBackend(AttentionBackend):
         bs: int,
         num_tokens: int,
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        spec_info: SpecInput | None,
     ) -> None:
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
@@ -1583,13 +1584,13 @@ class FlashInferIndicesUpdaterDecode:
     def update(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: Optional[bool] = None,
+        decode_wrappers: list[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool | None = None,
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
@@ -1600,13 +1601,13 @@ class FlashInferIndicesUpdaterDecode:
     def update_single_wrapper(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: Optional[bool] = None,
+        decode_wrappers: list[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool | None = None,
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
@@ -1629,13 +1630,13 @@ class FlashInferIndicesUpdaterDecode:
     def update_sliding_window(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: Optional[bool] = None,
+        decode_wrappers: list[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool | None = None,
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
@@ -1684,13 +1685,13 @@ class FlashInferIndicesUpdaterDecode:
     def update_cross_attention(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: Optional[bool] = None,
+        decode_wrappers: list[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool | None = None,
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
@@ -1730,11 +1731,11 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
+        spec_info: SpecInput | None,
+        seq_lens_cpu: torch.Tensor | None,
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: Optional[bool] = None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool | None = None,
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
@@ -1875,18 +1876,18 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        prefix_lens: Optional[torch.Tensor],
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefix_lens: torch.Tensor | None,
+        prefill_wrappers: list[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
-        extend_prefix_lens_cpu: Optional[List[int]] = None,
-        custom_kv_indices: Optional[torch.Tensor] = None,
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        multi_item_params: MultiItemScoringParams | None = None,
+        cross_attention_custom_mask: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: list[int] | None = None,
+        custom_kv_indices: torch.Tensor | None = None,
         *,
         plan: KVLocPlan,
     ):
@@ -1897,18 +1898,18 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        prefix_lens: Optional[torch.Tensor],
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefix_lens: torch.Tensor | None,
+        prefill_wrappers: list[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
-        extend_prefix_lens_cpu: Optional[List[int]] = None,
-        custom_kv_indices: Optional[torch.Tensor] = None,
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        multi_item_params: MultiItemScoringParams | None = None,
+        cross_attention_custom_mask: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: list[int] | None = None,
+        custom_kv_indices: torch.Tensor | None = None,
         *,
         plan: KVLocPlan,
     ):
@@ -1948,18 +1949,18 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        prefix_lens: Optional[torch.Tensor],
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefix_lens: torch.Tensor | None,
+        prefill_wrappers: list[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
-        extend_prefix_lens_cpu: Optional[List[int]] = None,
-        custom_kv_indices: Optional[torch.Tensor] = None,
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        multi_item_params: MultiItemScoringParams | None = None,
+        cross_attention_custom_mask: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: list[int] | None = None,
+        custom_kv_indices: torch.Tensor | None = None,
         *,
         plan: KVLocPlan,
     ):
@@ -2065,7 +2066,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         kv_start_idx: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Custom SWA mask for the paged wrapper in the ragged merge_state EXTEND path.
 
         Paged KV covers absolute positions [kv_start_idx[i], prefix_lens[i]).
@@ -2082,7 +2083,7 @@ class FlashInferIndicesUpdaterPrefill:
             return None
 
         device = prefix_lens.device
-        mask_parts: List[torch.Tensor] = []
+        mask_parts: list[torch.Tensor] = []
         need_mask = False
         for prefix_len, extend_len, kv_start in zip(
             prefix_lens_cpu, extend_lens_cpu, kv_start_cpu
@@ -2105,18 +2106,18 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor | None,
         seq_lens_sum: int,
-        prefix_lens: Optional[torch.Tensor],
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefix_lens: torch.Tensor | None,
+        prefill_wrappers: list[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInput],
-        fixed_split_size: Optional[int] = None,
-        multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
-        extend_prefix_lens_cpu: Optional[List[int]] = None,
-        custom_kv_indices: Optional[torch.Tensor] = None,
+        encoder_lens: torch.Tensor | None,
+        spec_info: SpecInput | None,
+        fixed_split_size: int | None = None,
+        multi_item_params: MultiItemScoringParams | None = None,
+        cross_attention_custom_mask: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: list[int] | None = None,
+        custom_kv_indices: torch.Tensor | None = None,
         *,
         plan: KVLocPlan,
     ):
@@ -2165,18 +2166,18 @@ class FlashInferIndicesUpdaterPrefill:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
-        prefix_lens: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor | None,
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[SpecInput],
+        spec_info: SpecInput | None,
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: Optional[int] = None,
-        multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-        custom_kv_indices: Optional[torch.Tensor] = None,
+        fixed_split_size: int | None = None,
+        multi_item_params: MultiItemScoringParams | None = None,
+        cross_attention_custom_mask: torch.Tensor | None = None,
+        seq_lens_cpu: torch.Tensor | None = None,
+        custom_kv_indices: torch.Tensor | None = None,
         window_left: int = -1,
         *,
         plan: KVLocPlan,
@@ -2320,13 +2321,13 @@ class FlashInferIndicesUpdaterPrefill:
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
             kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
-            paged_plan_kwargs = dict(
-                qo_indptr_host=qo_indptr_host,
-                kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
-                max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
-            )
+            paged_plan_kwargs = {
+                "qo_indptr_host": qo_indptr_host,
+                "kv_indptr_host": kv_indptr_host,
+                "kv_lens_host": seq_lens_cpu_i32,
+                "max_q_len": num_tokens_per_req,
+                "max_kv_len": int(seq_lens_cpu_i32.max()),
+            }
 
         if window_left >= 0:
             # selects the module with the per-element window mask compiled in
@@ -2385,7 +2386,7 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
-        self.attn_backends: List[AttentionBackend] = []
+        self.attn_backends: list[AttentionBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferAttnBackend(
@@ -2559,13 +2560,10 @@ def should_use_tensor_core(
     try:
         from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
-        if not _grouped_size_compiled_for_decode_kernels(
+        return not _grouped_size_compiled_for_decode_kernels(
             num_attention_heads,
             num_kv_heads,
-        ):
-            return True
-        else:
-            return False
+        )
     except (ImportError, AttributeError):
         pass
 
