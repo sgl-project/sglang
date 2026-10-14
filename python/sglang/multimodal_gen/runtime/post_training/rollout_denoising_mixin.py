@@ -9,9 +9,12 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-    SchedulerRLMixin,
+    FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
@@ -38,44 +41,49 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 class RolloutDenoisingMixin:
     def _maybe_prepare_rollout(self, batch: Req):
-        """Prepare denoising loop for rollout."""
-        scheduler = batch.scheduler
-        if not isinstance(scheduler, SchedulerRLMixin):
-            if batch.rollout:
-                raise ValueError(
-                    f"Scheduler {type(scheduler)} does not support rollout"
-                )
-            return
+        """Create the rollout controller of the visual stream of this request.
 
-        scheduler.release_rollout_resources(batch)
-        if batch.rollout:
-            scheduler.prepare_rollout(
-                batch=batch,
-                pipeline_config=self.server_args.pipeline_config,
+        Must run before SP sharding so the controller records the full latent shape.
+        """
+        scheduler = batch.scheduler
+        if not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
+            raise ValueError(f"Scheduler {type(scheduler)} does not support rollout")
+
+        pipeline_config = self.server_args.pipeline_config
+        batch.rollout_controllers = {
+            "visual": FlowRolloutController(
+                sde_type=batch.rollout_sde_type,
+                noise_level=float(batch.rollout_noise_level),
+                log_prob_no_const=batch.rollout_log_prob_no_const,
+                debug_mode=batch.rollout_debug_mode,
+                sde_step_indices=batch.rollout_sde_step_indices,
+                shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
+                    batch=batch, latents=latents
+                )[0],
+                gather_for_sp=lambda stacked_latents: gather_stacked_latents_for_sp(
+                    pipeline_config=pipeline_config,
+                    batch=batch,
+                    stacked_latents=stacked_latents,
+                ),
+                sigmas=scheduler.sigmas,
+                latents_shape=(
+                    tuple(batch.latents.shape) if batch.latents is not None else None
+                ),
             )
+        }
 
     def _maybe_collect_rollout_log_probs(self, batch: Req):
-        scheduler = batch.scheduler
-        if not isinstance(scheduler, SchedulerRLMixin):
-            if batch.rollout:
-                raise ValueError(
-                    f"Scheduler {type(scheduler)} does not support rollout"
-                )
-            return
-
-        if batch.rollout:
-            if batch.rollout_trajectory_data is None:
-                batch.rollout_trajectory_data = RolloutTrajectoryData()
-            batch.rollout_trajectory_data.rollout_log_probs = (
-                scheduler._get_rollout_session_data(batch).collect_rollout_log_probs()
+        rollout = batch.rollout_controllers["visual"]
+        if batch.rollout_trajectory_data is None:
+            batch.rollout_trajectory_data = RolloutTrajectoryData()
+        batch.rollout_trajectory_data.rollout_log_probs = (
+            rollout.collect_rollout_log_probs()
+        )
+        if batch.rollout_debug_mode:
+            batch.rollout_trajectory_data.rollout_debug_tensors = (
+                rollout.collect_rollout_debug_tensors()
             )
-            if batch.rollout_debug_mode:
-                batch.rollout_trajectory_data.rollout_debug_tensors = (
-                    scheduler._get_rollout_session_data(
-                        batch
-                    ).collect_rollout_debug_tensors(batch)
-                )
-            scheduler.release_rollout_resources(batch)
+        batch.rollout_controllers = {}
 
     def _postprocess_rollout_outputs(
         self,

@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -198,6 +201,8 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    # Rollout controllers of this request, keyed by latent stream.
+    rollout_controllers: dict[str, FlowRolloutController] = field(default_factory=dict)
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
