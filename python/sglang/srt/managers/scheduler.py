@@ -308,6 +308,9 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.request_registry import (
+    RequestRegistry,
+)
 from sglang.srt.managers.scheduler_components.request_retirer import (
     RequestRetirer,
     make_abort_req,
@@ -707,6 +710,8 @@ class Scheduler:
         self.maybe_init_disagg_prefill()
 
         self.maybe_init_disagg_decode()
+
+        self.init_request_registry()
 
         self.maybe_init_disagg_move_gate()
 
@@ -1591,6 +1596,24 @@ class Scheduler:
             ngram_embedding_manager=self.ngram_embedding_manager,
         )
 
+    def init_request_registry(self) -> None:
+        """Built after the mode owners; a PD role switch rebuilds it."""
+        self.request_registry = RequestRegistry(
+            core_lists=self.lists,
+            grammar_manager=self.grammar_manager,
+            request_retirer=self.request_retirer,
+            beam_coordinator=self.beam_coordinator,
+            ipc_channels=self.ipc_channels,
+            kv=self.kv,
+            mm_receiver=self.mm_receiver,
+            pending=self.pending,
+            decode_offload_manager=self.decode_offload_manager,
+            disagg_prefill=self.disagg_prefill,
+            disagg_decode=self.disagg_decode,
+            dllm=self.dllm,
+            hisparse_coordinator=self.hisparse_coordinator,
+        )
+
     def maybe_init_disagg_move_gate(self) -> None:
         """Unified-memory compaction on a PD node waits for the owner's KV
         transfers; every page mover runs on the scheduler thread."""
@@ -2346,7 +2369,7 @@ class Scheduler:
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
         ):
-            local_reqs = self._poll_timeout_aborts()
+            local_reqs = self.request_registry.poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         self._deferred_input_requests.extend(
             self.request_receiver.recv_requests(local_reqs=local_reqs)
@@ -2378,9 +2401,9 @@ class Scheduler:
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
+            if is_health_check_generate_req(
+                recv_req
+            ) and not self.request_registry.is_fully_idle(for_health_check=True):
                 self.output_streamer.defer_health_check(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
@@ -3674,51 +3697,6 @@ class Scheduler:
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
-    def _poll_timeout_aborts(self) -> List[AbortReq]:
-        """Emit aborts only; every rank must drop the same requests in the
-        same iteration, or the extend-vs-decode decision splits and the
-        collectives hang.
-        """
-        aborts: List[AbortReq] = []
-
-        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
-            deadline = time.perf_counter() - timeout_s
-            for req in self.queued_reqs():
-                entry_time = req.time_stats.wait_queue_entry_time
-                if 0 < entry_time < deadline:
-                    aborts.append(
-                        AbortReq(
-                            rid=req.rid,
-                            abort_message="Request waiting timeout reached.",
-                            finished_reason={
-                                "type": "abort",
-                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                                "message": "Request waiting timeout reached.",
-                            },
-                        )
-                    )
-
-        if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
-            deadline = time.perf_counter() - timeout_s
-            for req in self.collect_inflight_reqs():
-                # Polling must not re-emit an abort awaiting result processing.
-                if req.finished() or req.to_finish is not None:
-                    continue
-                if 0 < req.time_stats.forward_entry_time < deadline:
-                    aborts.append(
-                        AbortReq(
-                            rid=req.rid,
-                            abort_message="Request running timeout reached.",
-                            finished_reason={
-                                "type": "abort",
-                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                                "message": "Request running timeout reached.",
-                            },
-                        )
-                    )
-
-        return aborts
-
     def handle_embedding_request(
         self,
         recv_req: TokenizedEmbeddingReqInput,
@@ -3869,7 +3847,7 @@ class Scheduler:
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
             self.lists._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
+            self.request_registry.abort_request(AbortReq(rid=req.rid))
             return
 
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
@@ -5146,7 +5124,7 @@ class Scheduler:
         # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        fully_idle = self.is_fully_idle()
+        fully_idle = self.request_registry.is_fully_idle()
         if not fully_idle:
             self.metrics_sink.record_scheduler_active(time.monotonic_ns())
             now = time.monotonic()
@@ -5222,49 +5200,10 @@ class Scheduler:
         self.metrics_sink.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
-        if self.is_fully_idle():
+        if self.request_registry.is_fully_idle():
             self.metrics_sink.record_scheduler_idle()
         else:
             self.metrics_sink.record_scheduler_active(time.monotonic_ns())
-
-    def is_fully_idle(
-        self, for_health_check=False, ignore_waiting=False, ignore_releasing=False
-    ) -> bool:
-        # The request lists, and the steps not committed yet. The health check
-        # piggybacks on running requests in process_output, so it counts only
-        # the lists whose requests run soon (`RequestList.health_check`).
-        idle = len(self.pending) == 0 and not any(
-            entry.keeps_busy(
-                for_health_check=for_health_check,
-                ignore_waiting=ignore_waiting,
-                ignore_releasing=ignore_releasing,
-            )
-            for entry in self.request_lists().values()
-        )
-
-        if not for_health_check:
-            # PD decode KV offload: copies in flight still read device KV.
-            if self.decode_offload_manager is not None:
-                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
-            # destructive operations like attach/detach/flush_cache.
-            if get_memory().enable_hierarchical_cache:
-                tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
-                if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
-                    if get_memory().hicache_host_memory_mode == "buffer_only":
-                        # Queued writes, staged prefetches, and in-flight
-                        # storage writes still hold host staging
-                        # (buffer-mode unified tree only).
-                        idle &= tc.buffer_pipeline.is_idle()
-            elif get_memory().enable_lmcache:
-                idle &= not self.tree_cache.has_pending_cache_operations()
-
-        return idle
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -5274,12 +5213,12 @@ class Scheduler:
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        if not self.request_registry.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
                     "Reject attach: scheduler is not idle. "
-                    f"#queue-req={len(self.queued_reqs())} "
+                    f"#queue-req={len(self.request_registry.queued_reqs())} "
                     f"#running-req={len(self.lists.decoding)}"
                 ),
             )
@@ -5329,12 +5268,12 @@ class Scheduler:
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        if not self.request_registry.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
                     "Reject detach: scheduler is not idle. "
-                    f"#queue-req={len(self.queued_reqs())} "
+                    f"#queue-req={len(self.request_registry.queued_reqs())} "
                     f"#running-req={len(self.lists.decoding)}"
                 ),
             )
@@ -5369,7 +5308,9 @@ class Scheduler:
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.flags._engine_paused):
+        if self.request_registry.is_fully_idle(
+            ignore_waiting=self.flags._engine_paused
+        ):
             self.counters.cur_batch_for_debug = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
@@ -5391,7 +5332,7 @@ class Scheduler:
         else:
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.queued_reqs())}, "
+                f"#queue-req: {len(self.request_registry.queued_reqs())}, "
                 f"#running-req: {len(self.lists.decoding)}"
             )
             success = False
@@ -5445,142 +5386,31 @@ class Scheduler:
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
         live_reqs = [
-            req for entry in self.request_lists().values() for req in entry.reqs
+            req
+            for entry in self.request_registry.request_lists().values()
+            for req in entry.reqs
         ]
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
 
-    def queued_reqs(self) -> List[Req]:
-        """The requests waiting for admission, in list order."""
-        return [
-            req
-            for entry in self.request_lists().values()
-            if entry.queued
-            for req in entry.reqs
-        ]
-
-    def collect_inflight_reqs(self) -> List[Req]:
-        """The requests past prefill admission that a step may still run, in
-        list order (the same on every rank)."""
-        return [
-            req
-            for entry in self.request_lists().values()
-            if entry.inflight
-            for req in entry.reqs
-        ]
-
+    # The abort RPC handler, and the callbacks of the components built before
+    # the registry (a PD role switch rebuilds it).
     def request_lists(self) -> Dict[str, RequestList]:
-        """The lists that own the live requests, by name: the core lists, then
-        those of the PD mode and of the add-ons."""
-        lists = [
-            RequestList(
-                name="waiting",
-                reqs=self.lists.waiting_queue,
-                queued=True,
-                abort=self._abort_waiting_reqs,
-                health_check=True,
-                waiting=True,
-            ),
-            # Abort method 2: call `set_finish_with_abort`. The request still
-            # runs one prefill forward, with its input cut to one token.
-            RequestList(
-                name="grammar",
-                reqs=self.grammar_manager.grammar_queue,
-                abort=self.grammar_manager.abort_requests,
-            ),
-            RequestList(
-                name="decoding",
-                reqs=self.lists.decoding,
-                inflight=True,
-                health_check=True,
-                retract_on_pause=True,
-            ),
-            # A PD prefill node keeps a live mid-chunk request across a pause:
-            # its KV sender still reads the KV a retraction would free.
-            RequestList(
-                name="chunked",
-                reqs=[self.lists.chunked_req]
-                if self.lists.chunked_req is not None
-                else [],
-                inflight=True,
-                abort=self._defer_chunked_abort,
-                health_check=True,
-                retract_on_pause=self.disagg_prefill is None,
-            ),
-        ]
-        if self.disagg_prefill is not None:
-            lists += self.disagg_prefill.lists()
-        if self.disagg_decode is not None:
-            lists += self.disagg_decode.lists()
-        if self.dllm is not None:
-            lists += self.dllm.lists()
-        if self.hisparse_coordinator is not None:
-            lists += self.hisparse_coordinator.lists()
-        return {entry.name: entry for entry in lists}
+        return self.request_registry.request_lists()
+
+    def is_fully_idle(
+        self, for_health_check=False, ignore_waiting=False, ignore_releasing=False
+    ) -> bool:
+        return self.request_registry.is_fully_idle(
+            for_health_check=for_health_check,
+            ignore_waiting=ignore_waiting,
+            ignore_releasing=ignore_releasing,
+        )
 
     def abort_request(self, recv_req: AbortReq):
-        # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
-            self.mm_receiver.abort_waiting_requests(recv_req)
-
-        for entry in self.request_lists().values():
-            if entry.abort is not None:
-                entry.abort(recv_req)
-            if entry.inflight:
-                self._abort_inflight_reqs(entry.reqs, recv_req)
-
-    def _abort_waiting_reqs(self, recv_req: AbortReq) -> None:
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.lists.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                to_del.append(i)
-
-        # Sort in reverse order to avoid index issues when deleting
-        for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.lists.waiting_queue.pop(i)
-            self.request_retirer.release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
-            # Without the initiator's reason the tokenizer falls back to a
-            # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                make_abort_req(req, finished_reason=recv_req.finished_reason), req
-            )
-            if self.disagg_prefill is not None:
-                self.disagg_prefill.release_aborted_waiting_req(req)
-            # For mamba radix cache
-            elif req.kv.holds_mamba:
-                release_kv_cache(req, self.tree_cache, checkpoint=False)
-            logger.debug(f"Abort queued request. {req.rid=}")
-
-    def _defer_chunked_abort(self, recv_req: AbortReq) -> None:
-        """Mark the chunked request for `process_pending_chunked_abort`."""
-        if (chunked_req := self.lists.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self.lists._pending_chunked_abort_req = chunked_req
-
-    def _abort_inflight_reqs(self, reqs: List[Req], recv_req: AbortReq) -> None:
-        # Abort the requests past admission
-        for req in reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.debug(f"Abort running request. {req.rid=}")
-                if recv_req.abort_message:
-                    # Timeout aborts carry an SLA message + 503 for the client.
-                    req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
-                    )
-                else:
-                    req.to_finish = FINISH_ABORT()
+        self.request_registry.abort_request(recv_req)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -5601,7 +5431,7 @@ class Scheduler:
         if self.pending and get_parallel().pp_size == 1:
             self.commit_pending_steps()
 
-        lists = self.request_lists()
+        lists = self.request_registry.request_lists()
         retract_reqs = [
             req
             for entry in lists.values()

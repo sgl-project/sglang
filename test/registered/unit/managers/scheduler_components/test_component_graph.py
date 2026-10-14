@@ -416,8 +416,6 @@ _CALLBACK_SITES = {
         "scheduler",
         _SELF,
     ): 1,
-    # The request lists name the core lists' abort entries.
-    ("request_lists", "RequestList", "abort", _BOUND): 2,
     # To be removed.
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
     (

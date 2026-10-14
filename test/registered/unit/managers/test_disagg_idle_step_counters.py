@@ -397,7 +397,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dllm = None
         scheduler.hisparse_coordinator = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler._poll_timeout_aborts = Mock(return_value=[])
+        scheduler.request_registry = SimpleNamespace(
+            poll_timeout_aborts=Mock(return_value=[])
+        )
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_sink = SimpleNamespace(record_scheduler_active=Mock())
         scheduler.scripted_scheduler_hook = SimpleNamespace(

@@ -1,7 +1,6 @@
 """The dLLM owner's request lists: which list holds a request at each stage."""
 
 import time
-import types
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -14,9 +13,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -114,22 +113,9 @@ class _Step:
         return len(self.reqs)
 
 
-def _scheduler_over(manager):
-    """A scheduler whose request lists are the manager's, with the scheduler's
-    own readers and abort."""
-    scheduler = SimpleNamespace(
-        mm_receiver=None,
-        request_lists=lambda: {e.name: e for e in manager.lists()},
-    )
-    for name in (
-        "queued_reqs",
-        "collect_inflight_reqs",
-        "_poll_timeout_aborts",
-        "abort_request",
-        "_abort_inflight_reqs",
-    ):
-        setattr(scheduler, name, types.MethodType(getattr(Scheduler, name), scheduler))
-    return scheduler
+def _registry_over(manager):
+    """A registry whose only live requests are the manager's."""
+    return make_request_registry(dllm=manager)
 
 
 def _fdfo_result(blocks, accept_lengths, algo_states):
@@ -352,7 +338,7 @@ class TestDllmManagerLists(unittest.TestCase):
         manager.staging = [staging]
         manager.between_blocks = [between]
 
-        _scheduler_over(manager).abort_request(AbortReq(abort_all=True))
+        _registry_over(manager).abort_request(AbortReq(abort_all=True))
 
         # Waiting and between blocks: popped and released. Staging: finished
         # at its commit.
@@ -378,14 +364,14 @@ class TestDllmManagerLists(unittest.TestCase):
         stale = time.perf_counter() - 10
         started.time_stats.forward_entry_time = stale
         taken.time_stats.forward_entry_time = stale
-        scheduler = _scheduler_over(manager)
+        registry = _registry_over(manager)
 
-        self.assertEqual(scheduler.collect_inflight_reqs(), [started])
+        self.assertEqual(registry.collect_inflight_reqs(), [started])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            aborts = scheduler._poll_timeout_aborts()
+            aborts = registry.poll_timeout_aborts()
         self.assertEqual([abort.rid for abort in aborts], ["started"])
 
-        scheduler.abort_request(aborts[0])
+        registry.abort_request(aborts[0])
 
         self._assert_lists(manager, waiting=[taken], staging=[])
         manager.request_retirer.send_abort_output.assert_called_once_with(started)

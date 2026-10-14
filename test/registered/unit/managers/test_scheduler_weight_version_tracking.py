@@ -47,10 +47,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
     def _scheduler(self, **lists) -> SimpleNamespace:
         return SimpleNamespace(
-            request_lists=lambda: {
-                name: RequestList(name=name, reqs=list(reqs))
-                for name, reqs in lists.items()
-            }
+            request_registry=SimpleNamespace(
+                request_lists=lambda: {
+                    name: RequestList(name=name, reqs=list(reqs))
+                    for name, reqs in lists.items()
+                }
+            )
         )
 
     def test_a_new_version_is_adopted(self):

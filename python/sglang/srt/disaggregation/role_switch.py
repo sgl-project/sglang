@@ -70,7 +70,7 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.is_fully_idle():
+    if not scheduler.request_registry.is_fully_idle():
         return _fail(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
@@ -122,6 +122,7 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
+            scheduler.init_request_registry()
             scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
         except Exception as e:

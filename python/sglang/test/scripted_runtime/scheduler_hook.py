@@ -88,7 +88,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
+        if proxy.work_reqs_seen > 0 and scheduler.request_registry.is_fully_idle():
             idle_streak += 1
         else:
             idle_streak = 0
@@ -110,7 +110,7 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if scheduler.is_fully_idle():
+        if scheduler.request_registry.is_fully_idle():
             break
     else:
         raise RuntimeError(

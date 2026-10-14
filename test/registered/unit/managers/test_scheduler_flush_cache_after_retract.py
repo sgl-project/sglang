@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
 )
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.runtime_context import get_context
+from sglang.test.scheduler_request_lists import request_registry_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -72,6 +73,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_sink = MagicMock()
+        scheduler.request_registry = request_registry_of(scheduler)
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
@@ -120,8 +122,8 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler = self._new_scheduler()
         scheduler.lists.waiting_queue = [_make_req(is_retracted=True)]
 
-        self.assertFalse(scheduler.is_fully_idle())
-        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertFalse(scheduler.request_registry.is_fully_idle())
+        self.assertTrue(scheduler.request_registry.is_fully_idle(ignore_waiting=True))
 
     def test_flush_cache_does_not_ignore_waiting_reqs_while_unpaused(self):
         """ignore_waiting is gated on _engine_paused inside flush_cache — a

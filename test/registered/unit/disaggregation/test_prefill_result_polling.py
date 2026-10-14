@@ -51,7 +51,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import result_processor_shell
-from sglang.test.scheduler_request_lists import assert_one_list_per_request
+from sglang.test.scheduler_request_lists import (
+    assert_one_list_per_request,
+    request_registry_of,
+)
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -200,9 +203,6 @@ class _Scheduler:
     commit_step = Scheduler.commit_step
     commit_pending_steps = Scheduler.commit_pending_steps
     leave_finished_reqs = Scheduler.leave_finished_reqs
-    request_lists = Scheduler.request_lists
-    _abort_waiting_reqs = Scheduler._abort_waiting_reqs
-    _defer_chunked_abort = Scheduler._defer_chunked_abort
 
     def __init__(
         self,
@@ -307,8 +307,10 @@ class _Scheduler:
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
         pass
 
-    def _poll_timeout_aborts(self):
-        return []
+    @property
+    def request_registry(self):
+        # Over the collaborators as the tests last replaced them.
+        return request_registry_of(self)
 
     def ingest_requests(self, stop_at_pause=False):
         assert_one_list_per_request(self)
@@ -541,7 +543,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     scheduler = SimpleNamespace(
                         _deferred_input_requests=[],
-                        _poll_timeout_aborts=Mock(return_value=[]),
+                        request_registry=SimpleNamespace(
+                            poll_timeout_aborts=Mock(return_value=[])
+                        ),
                         request_receiver=SimpleNamespace(recv_requests=receiver),
                         metrics_sink=Mock(),
                         process_input_requests=Mock(),
@@ -560,7 +564,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.assertEqual(receiver.call_count, 5)
                     # A held pause must not accumulate repeated timeout aborts.
                     self.assertEqual(
-                        scheduler._poll_timeout_aborts.call_count,
+                        scheduler.request_registry.poll_timeout_aborts.call_count,
                         2 if stop_at_pause else 5,
                     )
                     self.assertFalse(scheduler._deferred_input_requests)

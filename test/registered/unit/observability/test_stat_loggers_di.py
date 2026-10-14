@@ -297,9 +297,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disagg_decode=SimpleNamespace(
                 transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
             ),
-            request_lists=_empty_decode_lists,
             lists=SimpleNamespace(decoding=[], waiting_queue=[]),
-            queued_reqs=lambda: [],
+            request_registry=SimpleNamespace(
+                request_lists=_empty_decode_lists, queued_reqs=lambda: []
+            ),
             grammar_manager=[],
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
@@ -379,9 +380,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     queue=[], retracted_queue=[], num_tokens_pre_allocated=0
                 ),
             ),
-            request_lists=_empty_decode_lists,
             lists=SimpleNamespace(decoding=batch.reqs, waiting_queue=[]),
-            queued_reqs=lambda: [],
+            request_registry=SimpleNamespace(
+                request_lists=_empty_decode_lists, queued_reqs=lambda: []
+            ),
             grammar_manager=[],
             max_total_num_tokens=1,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),

@@ -33,7 +33,7 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
-        scheduler.is_fully_idle = lambda: True
+        scheduler.request_registry = SimpleNamespace(is_fully_idle=lambda: True)
         scheduler.tree_cache = SimpleNamespace(
             attach_storage_backend=lambda **kwargs: (True, "attached"),
             detach_storage_backend=lambda: (True, "detached"),

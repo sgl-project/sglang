@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -81,6 +82,14 @@ def _scheduler(waiting_queue, decoding=(), chunked_req=None):
     return s
 
 
+def _registry(waiting_queue, decoding=(), chunked_req=None):
+    core_lists = CoreLists()
+    core_lists.waiting_queue = waiting_queue
+    core_lists.decoding = list(decoding)
+    core_lists.chunked_req = chunked_req
+    return make_request_registry(core_lists=core_lists)
+
+
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
@@ -129,26 +138,28 @@ class TestWaitingTimeout(CustomTestCase):
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)
         fresh = _req("fresh", wait_entry=now)
-        s = _scheduler([stale, fresh])
+        r = _registry([stale, fresh])
 
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
-            aborts = s._poll_timeout_aborts()
+            aborts = r.poll_timeout_aborts()
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
         self.assertEqual(aborts[0].finished_reason["type"], "abort")
         # The poll emits only; removal happens on every rank via the broadcast.
-        self.assertEqual([r.rid for r in s.lists.waiting_queue], ["stale", "fresh"])
+        self.assertEqual(
+            [r.rid for r in r.core_lists.waiting_queue], ["stale", "fresh"]
+        )
 
     def test_unset_entry_time_is_never_emitted(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.
-        s = _scheduler([_req("unstamped", wait_entry=0.0)])
+        r = _registry([_req("unstamped", wait_entry=0.0)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-9):
-            self.assertEqual(s._poll_timeout_aborts(), [])
+            self.assertEqual(r.poll_timeout_aborts(), [])
 
     def test_disabled_timeout_is_a_no_op(self):
-        s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
+        r = _registry([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):
-            self.assertEqual(s._poll_timeout_aborts(), [])
+            self.assertEqual(r.poll_timeout_aborts(), [])
 
 
 class TestRunningTimeout(CustomTestCase):
@@ -160,10 +171,10 @@ class TestRunningTimeout(CustomTestCase):
         stale = _req("stale", forward_entry=now - 10)
         fresh = _req("fresh", forward_entry=now)
         done = _req("done", forward_entry=now - 10, finished=True)
-        s = _scheduler([], decoding=[stale, fresh, done])
+        r = _registry([], decoding=[stale, fresh, done])
 
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            aborts = s._poll_timeout_aborts()
+            aborts = r.poll_timeout_aborts()
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
         # to_finish is set by abort_request() on every rank, not by the poll.
@@ -174,26 +185,25 @@ class TestRunningTimeout(CustomTestCase):
     def test_chunked_request_between_chunks_is_polled(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
         fresh = _req("fresh", forward_entry=time.perf_counter())
-        s = _scheduler([], decoding=[fresh], chunked_req=stale)
+        r = _registry([], decoding=[fresh], chunked_req=stale)
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            aborts = s._poll_timeout_aborts()
+            aborts = r.poll_timeout_aborts()
         self.assertEqual([a.rid for a in aborts], ["stale"])
 
     def test_pending_abort_is_not_emitted_again_while_forward_is_running(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
         fresh = _req("fresh", forward_entry=time.perf_counter())
-        s = _scheduler([], decoding=[stale, fresh])
-        s.mm_receiver = None
+        r = _registry([], decoding=[stale, fresh])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            aborts = s._poll_timeout_aborts()
+            aborts = r.poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])
             # The broadcast abort marks to_finish before the GPU result arrives.
-            s.abort_request(aborts[0])
+            r.abort_request(aborts[0])
             self.assertIsInstance(stale.to_finish, FINISH_ABORT)
             self.assertIsNone(fresh.to_finish)
             self.assertFalse(stale.finished())
             for _ in range(3):
-                self.assertEqual(s._poll_timeout_aborts(), [])
+                self.assertEqual(r.poll_timeout_aborts(), [])
 
     def test_requests_stay_visible_until_their_commit(self):
         """A request leaves decoding only at the commit that finishes it, so
@@ -201,27 +211,27 @@ class TestRunningTimeout(CustomTestCase):
         now = time.perf_counter()
         older = _req("older", forward_entry=now - 10)
         newer = _req("newer", forward_entry=now - 10)
-        s = _scheduler([], decoding=[older, newer])
+        r = _registry([], decoding=[older, newer])
 
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            aborts = s._poll_timeout_aborts()
+            aborts = r.poll_timeout_aborts()
         # Abort and weight-version updates share this request inventory.
-        self.assertEqual(s.collect_inflight_reqs(), [older, newer])
+        self.assertEqual(r.collect_inflight_reqs(), [older, newer])
         self.assertEqual([a.rid for a in aborts], ["older", "newer"])
 
     def test_unset_forward_entry_time_is_never_emitted(self):
-        s = _scheduler([], decoding=[_req("unstamped", forward_entry=0.0)])
+        r = _registry([], decoding=[_req("unstamped", forward_entry=0.0)])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1e-9):
-            self.assertEqual(s._poll_timeout_aborts(), [])
+            self.assertEqual(r.poll_timeout_aborts(), [])
 
     def test_empty_batch_and_disabled_timeout_are_no_ops(self):
-        s = _scheduler([])
+        r = _registry([])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            self.assertEqual(s._poll_timeout_aborts(), [])
+            self.assertEqual(r.poll_timeout_aborts(), [])
         stale = _req("stale", forward_entry=time.perf_counter() - 100)
-        s = _scheduler([], decoding=[stale])
+        r = _registry([], decoding=[stale])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(0):
-            self.assertEqual(s._poll_timeout_aborts(), [])
+            self.assertEqual(r.poll_timeout_aborts(), [])
 
 
 if __name__ == "__main__":

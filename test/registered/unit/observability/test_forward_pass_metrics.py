@@ -258,7 +258,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        self.scheduler.request_lists = lambda: {
+        self.scheduler.request_registry = types.SimpleNamespace()
+        self.scheduler.request_registry.request_lists = lambda: {
             "bootstrap": RequestList(name="bootstrap", reqs=[_FakeReq(100)])
         }
         self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
@@ -277,7 +278,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_disagg_decode_queued_metrics(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        self.scheduler.request_lists = lambda: {
+        self.scheduler.request_registry = types.SimpleNamespace()
+        self.scheduler.request_registry.request_lists = lambda: {
             "prealloc": RequestList(
                 name="prealloc",
                 reqs=[_FakeReq(10, output_len=5), _FakeReq(20, output_len=10)],
@@ -512,7 +514,7 @@ class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             lists=CoreLists(),
-            queued_reqs=lambda: [],
+            request_registry=types.SimpleNamespace(queued_reqs=lambda: []),
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -561,7 +563,7 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disagg_decode = types.SimpleNamespace(
             transfer_queue=transfer_queue
         )
-        self.scheduler.request_lists = lambda: {
+        self.scheduler.request_registry.request_lists = lambda: {
             "prealloc": RequestList(name="prealloc", reqs=[]),
             "transfer": RequestList(name="transfer", reqs=transfer_queue.queue),
         }

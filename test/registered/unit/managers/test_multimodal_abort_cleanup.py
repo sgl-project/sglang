@@ -34,6 +34,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -114,16 +115,37 @@ def _queued_scheduler(req):
     return scheduler
 
 
+def _queued_registry(req):
+    core_lists = CoreLists()
+    core_lists.waiting_queue = [req]
+    kv = SimpleNamespace(tree_cache=MagicMock())
+    beam_coordinator = MagicMock()
+    ipc_channels = MagicMock()
+    return make_request_registry(
+        core_lists=core_lists,
+        grammar_manager=MagicMock(),
+        request_retirer=RequestRetirer(
+            kv=kv,
+            beam_coordinator=beam_coordinator,
+            output_streamer=MagicMock(),
+            ipc_channels=ipc_channels,
+        ),
+        beam_coordinator=beam_coordinator,
+        ipc_channels=ipc_channels,
+        kv=kv,
+    )
+
+
 def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
     """Client cancellations before prefill must not exhaust the bounded pool."""
     for _ in range(3):
         for rank, item in enumerate(_publish(vmm_pool)):
             req = Req("queued-image", "", [1], SamplingParams())
             req.multimodal_inputs = MultimodalInputs(mm_items=[item])
-            scheduler = _queued_scheduler(req)
+            registry = _queued_registry(req)
             with _rank(rank):
-                scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.lists.waiting_queue == []
+                registry.abort_request(AbortReq(rid=req.rid))
+            assert registry.core_lists.waiting_queue == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 
@@ -198,7 +220,7 @@ def test_aborted_session_turn_releases_new_media_not_history(vmm_pool):
         req.multimodal_inputs = MultimodalInputs(mm_items=[history])
         req.extend_image_inputs(MultimodalInputs(mm_items=[item]))
         with _rank(rank):
-            _queued_scheduler(req).abort_request(AbortReq(rid=req.rid))
+            _queued_registry(req).abort_request(AbortReq(rid=req.rid))
         assert torch.equal(history.feature, torch.ones(3))
         assert not session._inflight
     vmm_pool._recycle_chunks()

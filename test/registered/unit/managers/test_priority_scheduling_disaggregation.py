@@ -40,6 +40,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -451,43 +452,38 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         self.assertNotIn(req.rid, owner.kv_senders)
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.counters = LaunchCounters()
-        scheduler.flags = EngineFlags()
-        scheduler.lists = CoreLists()
-        scheduler.lists.chunked_req = None
-        scheduler.mm_receiver = None
-        scheduler.lists.waiting_queue = [MagicMock(rid="req")]
-        scheduler.beam_coordinator = MagicMock()
-        scheduler.ipc_channels = MagicMock()
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler.dllm = None
-        scheduler.grammar_manager = MagicMock()
-        scheduler.disagg_prefill = prefill_owner_shell(
-            release_aborted_waiting_req=MagicMock()
-        )
-        scheduler.disagg_decode = None
-        scheduler.lists.decoding = []
-        scheduler.hisparse_coordinator = None
-        scheduler.tree_cache = MagicMock()
-        scheduler.request_retirer = RequestRetirer(
-            kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
-            beam_coordinator=MagicMock(),
-            output_streamer=MagicMock(),
-            ipc_channels=scheduler.ipc_channels,
+        core_lists = CoreLists()
+        core_lists.waiting_queue = [MagicMock(rid="req")]
+        kv = SimpleNamespace(tree_cache=MagicMock())
+        ipc_channels = MagicMock()
+        disagg_prefill = prefill_owner_shell(release_aborted_waiting_req=MagicMock())
+        registry = make_request_registry(
+            core_lists=core_lists,
+            grammar_manager=MagicMock(),
+            request_retirer=RequestRetirer(
+                kv=kv,
+                beam_coordinator=MagicMock(),
+                output_streamer=MagicMock(),
+                ipc_channels=ipc_channels,
+            ),
+            ipc_channels=ipc_channels,
+            kv=kv,
+            disagg_prefill=disagg_prefill,
         )
 
         with (
             patch(
                 "sglang.srt.managers.scheduler_components.request_retirer.get_serving"
             ) as get_serving,
-            patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_registry.release_kv_cache"
+            ) as release,
         ):
             get_serving.return_value.weight_version = None
-            scheduler.abort_request(AbortReq(rid="req"))
+            registry.abort_request(AbortReq(rid="req"))
 
-        scheduler.disagg_prefill.release_aborted_waiting_req.assert_called_once()
-        scheduler.tree_cache.finish.assert_called_once()
+        disagg_prefill.release_aborted_waiting_req.assert_called_once()
+        kv.tree_cache.finish.assert_called_once()
         release.assert_not_called()
 
 

@@ -89,10 +89,14 @@ class SchedulingTraceWriter:
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {
-            "idle": scheduler.is_fully_idle(),
-            "idle_ignore_waiting": scheduler.is_fully_idle(ignore_waiting=True),
+            "idle": scheduler.request_registry.is_fully_idle(),
+            "idle_ignore_waiting": scheduler.request_registry.is_fully_idle(
+                ignore_waiting=True
+            ),
             # A set, so sorted; each req was labeled by an earlier schedule record.
-            "inflight": sorted(self._labels(scheduler.collect_inflight_reqs())),
+            "inflight": sorted(
+                self._labels(scheduler.request_registry.collect_inflight_reqs())
+            ),
             "load": {
                 "running": load.num_running_reqs,
                 "waiting": load.num_waiting_reqs,

@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import request_registry_of
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -52,6 +53,13 @@ class _PendingCopy:
         self.done = True
 
 
+class _Scheduler(Scheduler):
+    @property
+    def request_registry(self):
+        # Over the lists and owners as each test last set them.
+        return request_registry_of(self)
+
+
 def _all_reduce_with_peer(ops, peer_queue_sizes, peer_pending):
     # One simulated peer rank: its (write, backup) ack counts before the drain and
     # its pending flag after it.
@@ -78,7 +86,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.addCleanup(reset_context)
 
     def _new_scheduler(self) -> Scheduler:
-        scheduler = Scheduler.__new__(Scheduler)
+        scheduler = _Scheduler.__new__(_Scheduler)
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -287,12 +295,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.lists.chunked_req, original_chunked_req)
 
     def test_paused_engine_accounting_uses_current_scheduler_state(self):
-        scheduler = self._new_scheduler()
-        scheduler.is_fully_idle = MagicMock()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.metrics_sink = MagicMock()
+        scheduler.request_registry = MagicMock()
 
         for is_idle in (True, False):
             with self.subTest(is_idle=is_idle):
-                scheduler.is_fully_idle.return_value = is_idle
+                scheduler.request_registry.is_fully_idle.return_value = is_idle
                 scheduler.metrics_sink.reset_mock()
 
                 scheduler._record_scheduler_state_for_paused_engine()

@@ -35,7 +35,9 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.output_streamer = MagicMock()
-        s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
+        s.request_registry = MagicMock(
+            **{"is_fully_idle.return_value": False}
+        )  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()

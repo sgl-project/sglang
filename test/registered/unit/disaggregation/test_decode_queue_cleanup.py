@@ -41,7 +41,10 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
-from sglang.test.scheduler_request_lists import assert_one_list_per_request
+from sglang.test.scheduler_request_lists import (
+    assert_one_list_per_request,
+    request_registry_of,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -612,15 +615,17 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = self._decode_scheduler(retracted=[object()])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
 
     def test_held_rebootstrap_requests_keep_scheduler_non_idle(self):
         scheduler = self._decode_scheduler(held=[MagicMock(**{"kv.holds_kv": False})])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
         # The paused flush ignores waiting requests; held ones own no KV.
-        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertTrue(registry.is_fully_idle(ignore_waiting=True))
 
     def _offloading(self, scheduler, *reqs):
         """Give the decode owner an offload manager with each request's copies
@@ -667,6 +672,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             scheduler, ("done", True, [1, 2]), ("live", False, [3]), ("plain", True, [])
         )
         scheduler.lists.decoding = [done, live, plain]
+        registry = scheduler.request_registry = request_registry_of(scheduler)
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
@@ -674,7 +680,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
 
         # Its first copy and the live request's land: it waits for the second.
         self._land(manager, 1, 3)
@@ -695,8 +701,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         owner.releasing = [done]
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
+        registry = request_registry_of(scheduler)
 
-        scheduler.abort_request(AbortReq(abort_all=True))
+        registry.abort_request(AbortReq(abort_all=True))
 
         self.assertEqual(owner.releasing, [done])
         manager._release_finished_req.assert_not_called()
@@ -707,14 +714,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_releasing_requests_keep_scheduler_non_idle(self):
         # A failed transfer held until prefill stops writing its pages.
         scheduler = self._decode_scheduler(releasing=[object()])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
         # The paused flush would clear pages a release frees later.
-        self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertFalse(registry.is_fully_idle(ignore_waiting=True))
         # Releasing memory drops the held releases with the pool.
-        self.assertTrue(scheduler.is_fully_idle(ignore_releasing=True))
+        self.assertTrue(registry.is_fully_idle(ignore_releasing=True))
         # The health check reads running requests only.
-        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
+        self.assertTrue(registry.is_fully_idle(for_health_check=True))
 
     def test_abort_reaches_held_rebootstrap_requests(self):
         held, kept = MagicMock(rid="held-1"), MagicMock(rid="other")
@@ -732,8 +740,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         retirer.release_aborted_request = release_aborted_request
         scheduler.disagg_decode.request_retirer = retirer
+        registry = request_registry_of(scheduler)
 
-        scheduler.abort_request(AbortReq(rid="held"))
+        registry.abort_request(AbortReq(rid="held"))
 
         self.assertEqual(
             scheduler.disagg_decode.prealloc_queue.held_rebootstrap_reqs, [kept]

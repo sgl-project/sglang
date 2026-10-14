@@ -75,9 +75,11 @@ class TestSchedulingTraceWriter(CustomTestCase):
                     num_running_reqs=0, num_waiting_reqs=1
                 )
             ),
-            is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
-            # The record sorts the labels.
-            collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+            request_registry=SimpleNamespace(
+                is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
+                # The record sorts the labels.
+                collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+            ),
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "t.jsonl")

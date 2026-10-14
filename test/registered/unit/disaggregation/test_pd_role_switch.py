@@ -41,13 +41,14 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         rc.get_context().set_server_args(sa)
         s.server_args = sa
-        s.is_fully_idle = MagicMock(return_value=idle)
+        s.request_registry = MagicMock(**{"is_fully_idle.return_value": idle})
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
         s.maybe_init_disagg_prefill = MagicMock()
         s.maybe_init_disagg_decode = MagicMock()
+        s.init_request_registry = MagicMock()
         s.init_mode_stages = MagicMock()
         s.disagg_prefill = None
         s.disagg_decode = None
@@ -170,7 +171,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
         s.maybe_init_disagg_decode.assert_called_once()
-        # The new owner's stages replace the old one's.
+        # The new owner's registry and stages replace the old one's.
+        s.init_request_registry.assert_called_once()
         s.init_mode_stages.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).

@@ -12,6 +12,7 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.test.scheduler_request_lists import request_registry_of
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -62,7 +63,8 @@ class TestHiSparseStagingList(unittest.TestCase):
         done.finished_reason = object()
         Scheduler.leave_finished_reqs(scheduler, ScheduleSlot())
         self.assertEqual(scheduler.hisparse_coordinator.staging, [live])
-        self.assertEqual(Scheduler.collect_inflight_reqs(scheduler), [live])
+        registry = request_registry_of(scheduler)
+        self.assertEqual(registry.collect_inflight_reqs(), [live])
 
     def test_ready_stops_at_a_prefill_not_committed(self):
         """Readiness is a prefix of staging: a request whose prefill has not

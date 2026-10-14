@@ -22,6 +22,7 @@ from sglang.srt.utils.weight_versions import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell
+from sglang.test.scheduler_request_lists import request_registry_of
 from sglang.test.test_utils import (
     CustomTestCase,
     enter_scope,
@@ -316,6 +317,7 @@ def _scheduler_stub(
     scheduler.disaggregation_mode = mode or DisaggregationMode.NULL
     scheduler.disagg_prefill = None
     scheduler.disagg_decode = None
+    scheduler.request_registry = request_registry_of(scheduler)
     return scheduler
 
 
@@ -380,6 +382,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ),
             flags=EngineFlags(_engine_paused=True),
         )
+        scheduler.request_registry = request_registry_of(scheduler)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
