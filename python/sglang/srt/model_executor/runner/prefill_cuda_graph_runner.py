@@ -109,17 +109,21 @@ from sglang.srt.model_executor.runner_backend.utils import (
 )
 
 
-def _is_full_graph_backend(backend: Any) -> bool:
-    return (
-        isinstance(backend, FullCudaGraphBackend)
-        or getattr(backend, "__class__", None).__name__ == "FullXPUGraphBackend"
+def _full_graph_backend_types() -> tuple[type, ...]:
+    from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+        FullXPUGraphBackend,
     )
+
+    return (FullCudaGraphBackend, FullXPUGraphBackend)
+
+
+def _is_full_graph_backend(backend: Any) -> bool:
+    return isinstance(backend, _full_graph_backend_types())
 
 
 def _is_full_or_bcg_backend(backend: Any) -> bool:
-    return (
-        isinstance(backend, (BreakableCudaGraphBackend, FullCudaGraphBackend))
-        or getattr(backend, "__class__", None).__name__ == "FullXPUGraphBackend"
+    return isinstance(
+        backend, (BreakableCudaGraphBackend, *_full_graph_backend_types())
     )
 
 
