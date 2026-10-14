@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
@@ -28,8 +28,8 @@ from sglang.srt.runtime_context import (
     get_flags,
 )
 from sglang.srt.utils import (
+    ceil_align,
     get_cuda_graph_batch_size_alignment,
-    get_cuda_graph_max_batch_size,
 )
 
 if TYPE_CHECKING:
@@ -62,7 +62,10 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, captured_req_width: int = 1
+    model_runner: ModelRunner,
+    captured_req_width: int = 1,
+    *,
+    gathered_buffer_required: Optional[bool] = None,
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -73,7 +76,9 @@ def get_batch_sizes_to_capture(
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
-    mul_base = get_cuda_graph_batch_size_alignment()
+    mul_base = get_cuda_graph_batch_size_alignment(
+        gathered_buffer_required=gathered_buffer_required
+    )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
@@ -81,7 +86,7 @@ def get_batch_sizes_to_capture(
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
+    num_max_requests = ceil_align(num_max_requests, mul_base)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -131,6 +136,27 @@ class BaseCudaGraphRunner(BaseRunner):
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
+
+    def cuda_graph_output_rows(self, output: Any) -> Optional[int]:
+        """Rows of graph output that must be preserved for post-replay work.
+
+        The default graph key is a request count, which is also the output row
+        count for ordinary decode. A graph that returns per-token hidden states
+        for an eager tail can instead produce ``requests * tokens_per_request``
+        rows. Such a runner must return that actual row count here. ``None``
+        keeps the backend's default request-count behavior.
+        """
+        return None
+
+    def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
+        """Capacity required by the output buffer shared across graph keys.
+
+        The breakable backend allocates this buffer once, while capturing its
+        first shape. A runner whose output uses token rows rather than request
+        rows must return the largest possible output here so later graph shapes
+        fit. ``None`` uses the current graph key as the capacity.
+        """
+        return None
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

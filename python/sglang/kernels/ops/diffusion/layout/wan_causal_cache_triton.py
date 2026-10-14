@@ -22,8 +22,10 @@ import triton.language as tl  # type: ignore
 _MAX_INT32 = 2**31 - 1
 
 
-@triton.jit
-def _cat_pad_cl3d_kernel(
+_CAT_PAD_SIZES = ["T", "H", "W", "out_t", "out_h", "out_w"]
+
+
+def _cat_pad_cl3d(
     x_ptr,
     cache_ptr,
     out_ptr,
@@ -97,6 +99,17 @@ def _cat_pad_cl3d_kernel(
         tl.store(keep_ptr + k_off, vals, mask=keep)
 
 
+# The per-request sizes only index. The channel count, ``total`` and the
+# strides stay specialized for the channel vectorization, and the per-layer
+# padding and cache length for their constant folding (1.5% of kernel time).
+_cat_pad_cl3d_kernel = triton.jit(do_not_specialize=_CAT_PAD_SIZES)(_cat_pad_cl3d)
+# The strides of a channels-first input change with the resolution, and its
+# loads gather along the channels whatever their values.
+_cat_pad_cl3d_gather_kernel = triton.jit(
+    do_not_specialize=_CAT_PAD_SIZES + ["sxb", "sxc", "sxt", "sxh"]
+)(_cat_pad_cl3d)
+
+
 def cat_pad_channels_last_3d(
     x: torch.Tensor,
     cache_x: torch.Tensor | None,
@@ -117,7 +130,7 @@ def cat_pad_channels_last_3d(
     pw_l, pw_r, ph_t, ph_b, pt_front, pt_back = padding
     if pw_l != pw_r or ph_t != ph_b or pt_back != 0:
         return None
-    if x.dim() != 5 or not x.is_cuda:
+    if x.dim() != 5 or x.device.type not in ("cuda", "xpu"):
         return None
     cache_t = 0
     if cache_x is not None:
@@ -167,10 +180,11 @@ def cat_pad_channels_last_3d(
         scb, scc, sct, sch, scw = cache_x.stride()
     sxb, sxc, sxt, sxh, sxw = x.stride()
 
+    kernel = _cat_pad_cl3d_kernel if sxc == 1 else _cat_pad_cl3d_gather_kernel
     BLOCK = 512
     grid = (triton.cdiv(total, BLOCK),)
     with torch.get_device_module().device(x.device):
-        _cat_pad_cl3d_kernel[grid](
+        kernel[grid](
             x,
             cache_arg,
             out,
@@ -207,7 +221,36 @@ def cat_pad_channels_last_3d(
     return out
 
 
-@triton.jit
+# Sizes and strides change with the resolution, so only unit strides stay
+# specialized. The other strides of main and out, and out_w when W is the
+# innermost dim, come in units of VEC: that tells the compiler, as their
+# specialization did, that each run of VEC outputs is contiguous and aligned.
+@triton.jit(
+    do_not_specialize=[
+        "out_t",
+        "out_h",
+        "out_w",
+        "t_offset",
+        # scaled by VEC in both traversals, never the unit stride
+        "smb",
+        "smt",
+        "smh",
+        "sob",
+        "sot",
+        "soh",
+    ],
+    do_not_specialize_on_alignment=[
+        "smc",
+        "smw",
+        "soc",
+        "sow",
+        "ssb",
+        "ssc",
+        "sst",
+        "ssh",
+        "ssw",
+    ],
+)
 def _dup_up3d_add_kernel(
     main_ptr,
     src_ptr,
@@ -237,6 +280,7 @@ def _dup_up3d_add_kernel(
     FS: tl.constexpr,
     REPEATS: tl.constexpr,
     CHANNELS_INNER: tl.constexpr,
+    VEC: tl.constexpr,
     IDX64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -245,6 +289,12 @@ def _dup_up3d_add_kernel(
     else:
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
+    smb = smb * VEC
+    smt = smt * VEC
+    smh = smh * VEC
+    sob = sob * VEC
+    sot = sot * VEC
+    soh = soh * VEC
 
     # Logical (B, C_out, out_t, out_h, out_w) index; the output tensor keeps
     # ``main``'s stride order (``empty_like`` preserve), matching what the
@@ -254,6 +304,8 @@ def _dup_up3d_add_kernel(
     # follows the output's memory order (channels innermost for NHWC-style
     # ``main``) so stores and ``main`` loads stay coalesced.
     if CHANNELS_INNER:
+        smw = smw * VEC
+        sow = sow * VEC
         oc = offs % C_out
         rest = offs // C_out
         ow = rest % out_w
@@ -263,6 +315,9 @@ def _dup_up3d_add_kernel(
         o_t = rest % out_t
         ob = rest // out_t
     else:
+        smc = smc * VEC
+        soc = soc * VEC
+        out_w = out_w * VEC
         ow = offs % out_w
         rest = offs // out_w
         oh = rest % out_h
@@ -295,6 +350,17 @@ def _dup_up3d_add_kernel(
     tl.store(out_ptr + o_off, vals, mask=mask)
 
 
+# Each thread holds BLOCK / (32 * num_warps) = 4 consecutive outputs.
+_MAX_VEC = 4
+
+
+def _vec_width(inner: int, strides) -> int:
+    vec = _MAX_VEC
+    while vec > 1 and (inner % vec or any(s % vec for s in strides)):
+        vec //= 2
+    return vec
+
+
 def dup_up3d_add(
     main: torch.Tensor,
     src: torch.Tensor,
@@ -318,7 +384,10 @@ def dup_up3d_add(
         return None
     if repeats <= 0 or repeats & (repeats - 1):
         return None
-    if not main.is_cuda or not src.is_cuda:
+    if main.device.type not in ("cuda", "xpu") or src.device.type not in (
+        "cuda",
+        "xpu",
+    ):
         return None
     if main.dtype != src.dtype or main.device != src.device:
         return None
@@ -345,6 +414,19 @@ def dup_up3d_add(
     smb, smc, smt, smh, smw = main.stride()
     ssb, ssc, sst, ssh, ssw = src.stride()
     sob, soc, sot, soh, sow = out.stride()
+    channels_inner = out.stride(1) == 1 and exp_shape[1] > 1
+    out_w = exp_shape[4]
+    if channels_inner:
+        unit, inner, scaled = (smc, soc), exp_shape[1], (smw, sow)
+    else:
+        unit, inner, scaled = (smw, sow), out_w, (smc, soc)
+    common = (smb, smt, smh, sob, sot, soh)
+    vec = _vec_width(inner, common + scaled) if unit == (1, 1) else 1
+    smb, smt, smh, sob, sot, soh = (s // vec for s in common)
+    if channels_inner:
+        smw, sow = smw // vec, sow // vec
+    else:
+        smc, soc, out_w = smc // vec, soc // vec, out_w // vec
     BLOCK = 512
     grid = (triton.cdiv(total, BLOCK),)
     with torch.get_device_module().device(main.device):
@@ -356,7 +438,7 @@ def dup_up3d_add(
             exp_shape[1],
             exp_shape[2],
             exp_shape[3],
-            exp_shape[4],
+            out_w,
             t_offset,
             smb,
             smc,
@@ -376,7 +458,8 @@ def dup_up3d_add(
             FT=factor_t,
             FS=factor_s,
             REPEATS=repeats,
-            CHANNELS_INNER=out.stride(1) == 1 and exp_shape[1] > 1,
+            CHANNELS_INNER=channels_inner,
+            VEC=vec,
             IDX64=total >= _MAX_INT32,
             BLOCK=BLOCK,
         )

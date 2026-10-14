@@ -67,11 +67,10 @@ def make_row_source(
     layer_buffer: torch.Tensor,
     read_bytes: int,
 ) -> Tuple[RealKvSource, ...]:
-    contiguous = layer_buffer.contiguous()
-    num_slots = int(contiguous.shape[0])
+    num_slots = int(layer_buffer.shape[0])
     if num_slots == 0 or read_bytes == 0:
         return ()
-    flat = contiguous.view(torch.uint8).reshape(num_slots, -1)
+    flat = layer_buffer.view(torch.uint8).view(num_slots, -1)
     num_bytes_per_token = int(flat.shape[1])
     clipped = _clip_read_bytes_aligned(
         requested=read_bytes, num_bytes_per_token=num_bytes_per_token
@@ -83,33 +82,6 @@ def make_row_source(
             tensor=flat,
             page_size=1,
             num_bytes_per_token=num_bytes_per_token,
-            read_bytes=clipped,
-        ),
-    )
-
-
-def make_packed_source(
-    *,
-    page_buffer: torch.Tensor,
-    page_size: int,
-    bytes_per_token: int,
-    read_bytes: int,
-) -> Tuple[RealKvSource, ...]:
-    if read_bytes == 0 or page_buffer.numel() == 0:
-        return ()
-    flat = page_buffer.contiguous().view(torch.uint8)
-    if flat.ndim == 1:
-        flat = flat.reshape(1, -1)
-    clipped = _clip_read_bytes_aligned(
-        requested=read_bytes, num_bytes_per_token=bytes_per_token
-    )
-    if clipped == 0:
-        return ()
-    return (
-        RealKvSource(
-            tensor=flat,
-            page_size=page_size,
-            num_bytes_per_token=bytes_per_token,
             read_bytes=clipped,
         ),
     )

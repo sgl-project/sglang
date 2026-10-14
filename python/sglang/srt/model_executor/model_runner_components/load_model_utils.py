@@ -16,12 +16,16 @@ from sglang.srt.arg_groups.overrides import (
     modelexpress_url_of,
 )
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadFormat,
+    LoadGroup,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -34,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -202,6 +207,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -231,6 +237,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        load_group=load_group,
     )
 
 
@@ -373,12 +380,12 @@ def dist_barrier_after_load(
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
         if not is_ep_joiner:
-            dist.barrier(group=get_tp_group().cpu_group)
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
         try:
             dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
+                group=get_parallel().tp_group.cpu_group,
                 timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
                 wait_all_ranks=True,
             )

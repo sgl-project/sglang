@@ -174,6 +174,16 @@ def graph_pool_borrow_enabled() -> bool:
     return get_global_graph_memory_pool() is not None
 
 
+def prewarm_graph_pool_borrow() -> None:
+    """Initialize cuBLAS's persistent workspace outside borrowed storage.
+
+    Run on the forward stream before final KV sizing. Otherwise the first
+    borrowed GEMM leaves a cached workspace alive across graph replay.
+    """
+    if graph_pool_borrow_enabled():
+        torch.cuda.current_blas_handle()
+
+
 @contextmanager
 def graph_pool_user_scope(user: str) -> Iterator[None]:
     state = _get_graph_pool_borrow_state()

@@ -27,16 +27,19 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -46,7 +49,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -61,6 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -76,7 +79,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
     get_platform,
 )
@@ -89,7 +91,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -135,8 +137,11 @@ class TinyGemmLinear(ReplicatedLinear):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # tinygemm serves only up to 128 tokens, so with it a token's router
+        # logits would depend on how many tokens share its batch.
         self._use_tinygemm = (
             _is_tinygemm_supported
+            and not get_exec().deterministic.enable_deterministic_inference
             and not self.skip_bias_add
             and self.weight.is_contiguous()
             and self.weight.shape[0] % 16 == 0
@@ -208,7 +213,6 @@ class GptOssSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.activation = config.hidden_act
@@ -318,7 +322,7 @@ class GptOssSparseMoeBlock(nn.Module):
         # unpadded slice so the small bf16 router GEMM dimensions stay
         # untouched, while the experts call gets to keep the padded view
         # and skip the duplicate pad inside the MXFP4 method. The output
-        # is then trimmed back to the unpadded width so postprocess_layer
+        # is then trimmed back to the unpadded width so the FFN boundary
         # can pair it with the (M, hidden_dim_unpadded) residual.
         num_tokens = hidden_states.shape[0]
         hidden_dim_unpadded = self.hidden_size
@@ -334,11 +338,6 @@ class GptOssSparseMoeBlock(nn.Module):
             router_logits, _ = self.router(router_input)
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
@@ -388,7 +387,6 @@ class GptOssAttention(nn.Module):
         self.hidden_size = hidden_size
         self.sliding_window_size = sliding_window_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -410,7 +408,6 @@ class GptOssAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -420,8 +417,7 @@ class GptOssAttention(nn.Module):
             bias=attention_bias,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -438,8 +434,7 @@ class GptOssAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             params_dtype=params_dtype,
             prefix=add_prefix("o_proj", prefix),
@@ -565,22 +560,8 @@ class GptOssDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
-        # GptOss all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        self.is_nextn = False
-        is_previous_layer_sparse = True
-        is_next_layer_sparse = True
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = GptOssSparseMoeBlock(
@@ -610,13 +591,23 @@ class GptOssDecoderLayer(nn.Module):
             x_pad_to_multiple=post_attn_pad_multiple,
         )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(
-                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: GptOssConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares: the model's shared
+        declaration function (see make_layers)."""
+        # GptOss all layers are sparse
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -625,10 +616,10 @@ class GptOssDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if hidden_states.shape[0] != 0:
@@ -638,35 +629,13 @@ class GptOssDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return hidden_states
 
 
 class GptOssModel(nn.Module):
@@ -680,7 +649,7 @@ class GptOssModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if _is_npu:
             config.hidden_act = "npu_swiglu_oai"
@@ -697,7 +666,7 @@ class GptOssModel(nn.Module):
 
         # Use the provided decoder layer type or default to GptOssDecoderLayer
         decoder_layer_type = decoder_layer_type or GptOssDecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -705,9 +674,8 @@ class GptOssModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -729,44 +697,44 @@ class GptOssModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.
-        aux_hidden_states = []
-        if self.start_layer in self.layers_to_capture:
-            aux_hidden_states.append(
-                hidden_states + residual if residual is not None else hidden_states
-            )
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
-                if i + 1 in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    capture=aux_hidden_states.capture
+                    if self.end_layer in self.layers_to_capture
+                    else None,
+                )
+            elif self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    residual_batch.snapshot(hidden_states, forward_batch)
+                )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -790,7 +758,7 @@ class GptOssForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = GptOssModel(
@@ -988,11 +956,6 @@ class GptOssForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         mxfp4_block = 32
 
-        moe_tp_rank = get_parallel().moe_tp_rank
-        moe_tp_size = get_parallel().moe_tp_size
-        moe_ep_rank = get_parallel().moe_ep_rank
-        moe_ep_size = get_parallel().moe_ep_size
-
         intermediate_size = self.config.intermediate_size
         original_intermediate_size = getattr(
             self.config, "original_intermediate_size", intermediate_size
@@ -1002,29 +965,48 @@ class GptOssForCausalLM(nn.Module):
         )
         intermediate_size_block = intermediate_size // mxfp4_block
 
-        per_rank_intermediate_size_block = math.ceil(
-            intermediate_size_block / moe_tp_size
-        )
-
-        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
-
-        # Calculate common slicing bounds for current rank
-        assert self.config.num_local_experts % moe_ep_size == 0
-        moe_num_global_experts = self.config.num_local_experts
-        moe_num_local_experts = self.config.num_local_experts // moe_ep_size
-
-        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
-        moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
-        )
-
-        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
-        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
-
         weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
             weight = weight.to(weight_device)
+
+            if not any(
+                suffix in name
+                for suffix in (
+                    "gate_up_proj_blocks",
+                    "down_proj_blocks",
+                    "gate_up_proj_scales",
+                    "down_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_bias",
+                )
+            ):
+                continue
+            experts = self.get_submodule(name.rsplit(".", 1)[0])
+            moe_tp_rank = experts.moe_tp_rank
+            moe_tp_size = experts.moe_tp_size
+            moe_ep_rank = experts.moe_ep_rank
+            moe_ep_size = experts.moe_ep_size
+
+            per_rank_intermediate_size_block = math.ceil(
+                intermediate_size_block / moe_tp_size
+            )
+
+            per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+            # Calculate common slicing bounds for current rank
+            assert self.config.num_local_experts % moe_ep_size == 0
+            moe_num_global_experts = self.config.num_local_experts
+            moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
+            moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+            moe_tp_rank_end = min(
+                (moe_tp_rank + 1) * per_rank_intermediate_size,
+                original_intermediate_size,
+            )
+
+            moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+            moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1286,8 +1268,10 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
-                    if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
-                        loaded_weight = loaded_weight.zero_()
+                    if "w2_weight_bias" in name:
+                        experts = self.get_submodule(name.rsplit(".", 1)[0])
+                        if experts.moe_tp_rank != 0:
+                            loaded_weight = loaded_weight.zero_()
 
                     weight_loader(
                         param,
@@ -1304,8 +1288,11 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = get_parallel().attn_tp_rank * param.numel()
-                            tp_size = get_parallel().tp_size
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            tp_rank, tp_size = get_group_rank_size(projection.tp_group)
+                            start = tp_rank * param.numel()
                             full_shard_size = param.numel() * tp_size
                             # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
                             # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.

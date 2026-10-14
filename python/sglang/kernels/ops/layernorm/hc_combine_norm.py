@@ -8,7 +8,16 @@ from sglang.kernels.ops.layernorm.mxfp8_epilogue import mxfp8_epilogue
 
 
 @triton.jit
-def _hc_combine_norm(X, P, W, Y, SX: tl.constexpr, SP: tl.constexpr, EPS: tl.constexpr):
+def _hc_combine_norm(
+    X,
+    P,
+    W,
+    Y,
+    SX: tl.constexpr,
+    SP: tl.constexpr,
+    EPS: tl.constexpr,
+    PARTS: tl.constexpr,
+):
     row, part = tl.program_id(0), tl.program_id(1)
     h = tl.arange(0, 8192)
     value = tl.full((8192,), 0, tl.float32)
@@ -19,7 +28,7 @@ def _hc_combine_norm(X, P, W, Y, SX: tl.constexpr, SP: tl.constexpr, EPS: tl.con
     # The unfused combine stores BF16 before RMSNorm reads it.
     value = value.to(tl.bfloat16).to(tl.float32)
     inv_rms = tl.rsqrt(tl.sum(value * value, 0) / 5120 + EPS)
-    mask = (h >= part * 1280) & (h < (part + 1) * 1280)
+    mask = (h >= part * (5120 // PARTS)) & (h < (part + 1) * (5120 // PARTS))
     weight = tl.load(W + h, mask, 0).to(tl.float32)
     tl.store(Y + row * 5120 + h, value * inv_rms * weight, mask)
 
@@ -46,9 +55,12 @@ def _hc_combine_norm_prefill(
 def hc_combine_norm(
     x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120."""
+    """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120.
+
+    Every row count takes the same per-row reduction in the same order, so the
+    result is batch-invariant across the grid-split variants below."""
     m = x.shape[0]
-    assert (0 < m <= 8 or 4096 <= m <= 65536) and x.shape == (m, 20480)
+    assert x.shape == (m, 20480)
     assert pre.shape == (m, 4) and pre.stride(1) == 1
     assert weight.shape == (5120,) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
@@ -59,9 +71,11 @@ def hc_combine_norm(
         )
         return y
     # Four CTAs per row trade redundant statistics for more concurrent loads
-    # when only a few speculative tokens are being processed.
-    _hc_combine_norm[(m, 4)](
-        x, pre, weight, y, x.stride(0), pre.stride(0), eps, num_warps=8
+    # when only a few speculative tokens are being processed; wider batches have
+    # enough rows to split the 5120 columns fewer ways.
+    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    _hc_combine_norm[(m, parts)](
+        x, pre, weight, y, x.stride(0), pre.stride(0), eps, parts, num_warps=8
     )
     return y
 
@@ -122,7 +136,7 @@ def hc_combine_norm_mxfp8(
 ):
     """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
     m = x.shape[0]
-    assert 0 < m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
+    assert m <= 128, "the MXFP8 scale swizzle addresses a single 128-row tile"
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)
