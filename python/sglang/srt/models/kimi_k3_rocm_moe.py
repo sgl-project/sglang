@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.kernels.ops.moe import latent_tail_aiter_hip, moe_preroute_aiter_hip
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -44,6 +45,10 @@ def init_moe_rocm_state(self) -> None:
     self._k3_latent_tail_max_tokens = (
         envs.SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS.get()
     )
+    self._k3_latent_mxfp4 = envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4.get()
+    self._k3_latent_mxfp4_min_tokens = (
+        envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4_MIN_TOKENS.get()
+    )
     self._partial_fused_front = False
     self._preroute_routed_weight: Optional[torch.Tensor] = None
     self._preroute_routed_scale: Optional[torch.Tensor] = None
@@ -55,6 +60,12 @@ def init_moe_rocm_state(self) -> None:
     self._preroute_shared_down_scale: Optional[torch.Tensor] = None
     self._latent_tail_weight: Optional[torch.Tensor] = None
     self._latent_tail_scale: Optional[torch.Tensor] = None
+    # Router (+ shared gate-up) rows of the merged front, and MXFP4 latent copies.
+    self._front_head: Optional[torch.Tensor] = None
+    self._front_down_w4: Optional[torch.Tensor] = None
+    self._front_down_scale4: Optional[torch.Tensor] = None
+    self._latent_up_w4: Optional[torch.Tensor] = None
+    self._latent_up_scale4: Optional[torch.Tensor] = None
     self._situ_beta = 0.0
     self._situ_linear_beta = 0.0
 
@@ -72,9 +83,11 @@ def select_front_modules(self) -> Optional[list]:
         ]
         if _is_unquantized_mergeable([m.weight for m in full_front]):
             return full_front
-    if self._k3_preroute_fp8 and envs.SGLANG_K3_FUSED_FRONT.get():
+    if (
+        self._k3_preroute_fp8 or self._k3_latent_mxfp4
+    ) and envs.SGLANG_K3_FUSED_FRONT.get():
         # Quark quantizes the shared experts but leaves the router and latent
-        # projections dense; only the pre-route front uses this partial merge.
+        # projections dense; only the pre-route and MXFP4 fronts use this merge.
         return [self.gate, self.routed_expert_down_proj]
     return None
 
@@ -103,6 +116,7 @@ def prepare_moe_rocm(self) -> None:
     )
     _prepare_preroute_fp8(self)
     _prepare_latent_tail_fp8(self)
+    _prepare_latent_mxfp4(self)
     _keep_correction_bias_in_logit_dtype(self)
 
 
@@ -217,6 +231,35 @@ def _prepare_latent_tail_fp8(self) -> None:
     )
 
 
+def _prepare_latent_mxfp4(self) -> None:
+    if (
+        not self._k3_latent_mxfp4
+        or not (self._eligible_for_fused_front or self._partial_fused_front)
+        or not latent_mxfp4_aiter_hip.supported()
+    ):
+        return
+    head_rows = sum(self._front_sizes[:-1])
+    down = self._front_w[head_rows:]
+    up = self.routed_expert_up_proj.weight
+    if (
+        tuple(down.shape) != (3584, 7168)
+        or tuple(up.shape) != (7168, 3584)
+        or down.dtype != torch.bfloat16
+        or up.dtype != torch.bfloat16
+    ):
+        return
+    self._front_head = self._front_w[:head_rows]
+    self._front_down_w4, self._front_down_scale4 = latent_mxfp4_aiter_hip.pack(down)
+    self._latent_up_w4, self._latent_up_scale4 = latent_mxfp4_aiter_hip.pack(up)
+
+
+def _use_latent_mxfp4(self, num_tokens: int) -> bool:
+    return (
+        self._front_down_w4 is not None
+        and num_tokens >= self._k3_latent_mxfp4_min_tokens
+    )
+
+
 def _try_preroute_front(self, hidden_states: torch.Tensor):
     """(routed_input, gate_up, router_logits, shared_is_preactivated) from the
     FP8 pre-route kernels, or None."""
@@ -275,6 +318,15 @@ def _run_front(self, hidden_states: torch.Tensor):
     if preroute is not None:
         routed_input, gate_up, router_logits, shared_is_preactivated = preroute
         return gate_up, router_logits, routed_input, shared_is_preactivated
+    if _use_latent_mxfp4(self, hidden_states.shape[0]):
+        head = _k3_bf16_gemm(hidden_states, self._front_head)
+        routed_input = latent_mxfp4_aiter_hip.run(
+            hidden_states, self._front_down_w4, self._front_down_scale4
+        )
+        if self._partial_fused_front:
+            return None, head, routed_input, False
+        gate_up, router_logits = torch.split(head, self._front_sizes[:2], dim=-1)
+        return gate_up, router_logits, routed_input, False
     fused = _k3_bf16_gemm(hidden_states, self._front_w)
     if self._partial_fused_front:
         router_logits, routed_input = torch.split(fused, self._front_sizes, dim=-1)
@@ -399,5 +451,11 @@ def forward_fused_rocm(
         out = _try_latent_tail(self, latent, shared_output, prefix_sum)
         if out is not None:
             return out
-    out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+    latent = self._latent_norm(latent)
+    if _use_latent_mxfp4(self, num_tokens):
+        out = latent_mxfp4_aiter_hip.run(
+            latent, self._latent_up_w4, self._latent_up_scale4
+        )
+    else:
+        out, _ = self.routed_expert_up_proj(latent)
     return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
