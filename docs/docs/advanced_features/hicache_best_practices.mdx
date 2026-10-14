@@ -84,6 +84,8 @@ Every storage backend call made by the HiCache controller runs under a deadline.
 
 The values above are the defaults, in seconds per batch call (one existence query / page read / page write covers up to 128 pages, not a whole request); `0` or `null` disables the bound for that kind. Keep them well above the backend's healthy tail latency (about 10x its p99 is a good start): a call that is merely slow is cut and recomputed, and under `wait_complete` every request queued behind a hung call waits until its bound expires. At most 4 hung calls per kind are kept alive per rank; their host memory (4 x 128 pages per kind) stays pinned until they return, and further calls of that kind are refused as misses in the meantime.
 
+A storage worker that cannot be stopped at all (a bound disabled with `0`, or a worker stuck in a rank-sync collective) no longer takes the scheduler down on `/flush_cache`: the flush completes with fresh workers, the stuck one keeps its host memory quarantined, the request reports `Cache flushed, but ...` with the worker's name, and L3 prefetch/backup is disabled on every rank (`sglang:hicache_storage_healthy` drops to 0) until the storage backend is detached and re-attached, which is possible once the stuck worker has returned.
+
 ### Integration with PD Disaggregation
 
 HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:

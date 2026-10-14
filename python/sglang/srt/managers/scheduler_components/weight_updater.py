@@ -89,7 +89,7 @@ class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
     memory_saver_adapter: Any
-    flush_cache: Callable[..., bool]
+    flush_cache: Callable[..., Tuple[bool, str]]
     is_fully_idle: Callable[..., bool]
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
@@ -122,14 +122,16 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Flush the cache the old weights produced. A flush refused because
         requests are still running or queued fails the update call."""
-        if recv_req.flush_cache and not self.flush_cache(
-            empty_cache=recv_req.torch_empty_cache
-        ):
-            return False, (
-                "Weights were updated, but the cache was not flushed because "
-                "requests are still running or queued. Retract or finish them, "
-                "then call /flush_cache."
+        if recv_req.flush_cache:
+            flushed, flush_message = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
             )
+            if not flushed:
+                return False, (
+                    "Weights were updated, but the cache flush failed: "
+                    f"{flush_message} Retract or finish requests, then call "
+                    "/flush_cache."
+                )
         return success, message
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:

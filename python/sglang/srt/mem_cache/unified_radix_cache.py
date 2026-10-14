@@ -14,7 +14,10 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheStorageWedgedError,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -423,9 +426,12 @@ class UnifiedRadixCache(BasePrefixCache):
             # The dropped writes' content no longer reaches a storage ack.
             self.storage_existence_cache.clear_inflight()
 
+        storage_wedged_reason = None
         if self.cache_controller is not None:
-            self.cache_controller.reset()
-            self.cache_controller.mem_pool_host.clear()
+            storage_wedged_reason = self.cache_controller.reset()
+            # Must follow reset(): it quarantines what a stuck worker still
+            # touches before the pool hands its pages out again.
+            self.cache_controller.clear_host_pool()
             self.enable_storage = self.cache_controller.enable_storage
             if self.enable_storage and self.storage_unavailable:
                 # reset restarts the workers but keeps the sync groups; the
@@ -437,6 +443,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
         self.tree_core.kv_events.record_all_cleared()
+        if storage_wedged_reason is not None:
+            raise HiCacheStorageWedgedError(storage_wedged_reason)
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""

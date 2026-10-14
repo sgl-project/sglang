@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -58,6 +59,21 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+# Seconds a reset waits for each storage thread before declaring it wedged.
+_STORAGE_THREAD_JOIN_TIMEOUT_S = 10
+
+
+class HiCacheStorageWedgedError(RuntimeError):
+    """A storage worker did not stop during a reset. The reset completed with
+    fresh workers; the stuck one keeps its host memory quarantined, and the
+    rank-agreed storage health bit degrades L3 at the next drain."""
+
+
+class _WorkerGeneration(threading.local):
+    def __init__(self):
+        # None on threads that are not storage workers (the scheduler thread).
+        self.value: Optional[int] = None
 
 
 def storage_model_name(
@@ -258,6 +274,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Host spans a reset quarantined because the worker inside this
+        # operation would not stop; that worker releases them when it returns.
+        self.quarantined_spans: List[HostSpan] = []
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -371,6 +390,7 @@ class HiCacheController:
         self.storage_failure_policy = "disable"
         # Seconds; None keeps torch's default group timeout (30 min on gloo).
         self.storage_sync_timeout: Optional[float] = None
+        self._init_storage_worker_tracking()
 
         # Storage worker threads, started by _start_storage_threads and reset.
         self.prefetch_thread: Optional[threading.Thread] = None
@@ -528,7 +548,7 @@ class HiCacheController:
         scheduler drain. Read it after the storage queue sizes: a worker sets
         the failure flag before it publishes the failed item, so a counted
         item implies a 0 bit in the same round."""
-        if self.storage_sync_failed:
+        if self.storage_sync_failed or self.storage_wedged_reason is not None:
             return False
         return all(
             thread is not None and thread.is_alive()
@@ -538,6 +558,8 @@ class HiCacheController:
     def storage_health_reason(self) -> Optional[str]:
         if self.storage_sync_failure is not None:
             return self.storage_sync_failure
+        if self.storage_wedged_reason is not None:
+            return self.storage_wedged_reason
         dead = [
             "not started" if thread is None else thread.name
             for thread in self._storage_worker_threads()
@@ -547,6 +569,77 @@ class HiCacheController:
             return f"storage worker thread(s) exited: {dead}"
         return None
 
+    def _init_storage_worker_tracking(self) -> None:
+        # Bumped by every worker (re)start, so a worker a reset could not join
+        # stays on its dead generation: it neither consumes from nor publishes
+        # into the live queues and issues no collective.
+        self._storage_generation = 0
+        self._worker_generation = _WorkerGeneration()
+        # Workers a reset abandoned. While one is alive the sync groups and the
+        # backend cannot be torn down, so detach refuses.
+        self._wedged_threads: List[threading.Thread] = []
+        self.storage_wedged_reason: Optional[str] = None
+        # The operations the transfer / backup workers are inside: a reset
+        # quarantines their host spans when the worker will not stop.
+        self._inflight_prefetch_op: Optional[PrefetchOperation] = None
+        self._inflight_backup_op: Optional[StorageOperation] = None
+        self._inflight_lock = threading.Lock()
+
+    def _enter_storage_worker(self) -> None:
+        self._worker_generation.value = self._storage_generation
+
+    def _storage_worker_is_live(self) -> bool:
+        """False on a worker thread whose generation a reset has replaced."""
+        generation = self._worker_generation.value
+        return generation is None or generation == self._storage_generation
+
+    def _publish(self, queue: Queue, item) -> None:
+        """Workers publish only while their generation is live; an abandoned
+        worker's late result would otherwise land in a successor's queue."""
+        if self._storage_worker_is_live():
+            queue.put(item)
+
+    def _begin_inflight(self, operation: StorageOperation, prefetch: bool) -> None:
+        with self._inflight_lock:
+            if prefetch:
+                self._inflight_prefetch_op = operation
+            else:
+                self._inflight_backup_op = operation
+
+    def _end_inflight(self, operation: StorageOperation, prefetch: bool) -> None:
+        with self._inflight_lock:
+            if prefetch:
+                self._inflight_prefetch_op = None
+            else:
+                self._inflight_backup_op = None
+            spans = operation.quarantined_spans
+            operation.quarantined_spans = []
+        for span in spans:
+            span.pool.release_quarantine(span.indices)
+
+    def _operation_host_spans(self, operation: StorageOperation) -> List[HostSpan]:
+        return [HostSpan(self.storage_host_pool, operation.host_indices)]
+
+    def _host_pools(self) -> list:
+        return [self.mem_pool_host]
+
+    def abandoned_thread_idents(self) -> set[int]:
+        """Threads still inside a storage call nobody waits for: orphaned guard
+        workers and the workers a reset abandoned."""
+        idents = self.storage_call_guard.orphan_thread_idents()
+        for thread in self._wedged_threads:
+            if thread.is_alive() and thread.ident is not None:
+                idents.add(thread.ident)
+        return idents
+
+    def clear_host_pool(self) -> None:
+        """Clear the host pool(s) for a cache flush. Pages an abandoned call may
+        still touch stay quarantined, and its layout lease is not waited for."""
+        abandoned = self.abandoned_thread_idents()
+        for domain in shared_host_layout_domains(self._host_pools()):
+            domain.abandoned_lease_holders = frozenset(abandoned)
+        self.mem_pool_host.clear()
+
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
 
@@ -555,6 +648,7 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
+        self._storage_generation += 1
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
@@ -581,11 +675,7 @@ class HiCacheController:
         self.prefetch_sync_thread.start()
         self.backup_thread.start()
 
-    def _stop_storage_threads(self):
-        """Stop storage prefetch/backup threads and drain internal queues.
-
-        Caller should ensure no in-flight requests.
-        """
+    def _signal_storage_threads_stop(self) -> None:
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
@@ -599,37 +689,60 @@ class HiCacheController:
                 self.prefetch_queue.put_nowait(None)
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
-            if hasattr(self, "prefetch_buffer"):
+            if self.prefetch_buffer is not None:
                 self.prefetch_buffer.put_nowait(None)
-            if hasattr(self, "prefetch_sync_queue"):
+            if self.prefetch_sync_queue is not None:
                 self.prefetch_sync_queue.put_nowait(None)
         except Exception:
             pass
 
-        # Best-effort joins (threads are daemon, but join keeps state clean).
-        threads = []
-        if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
-        if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
-        if hasattr(self, "prefetch_sync_thread"):
-            threads.append(self.prefetch_sync_thread)
+    def _join_storage_threads(self) -> List[threading.Thread]:
+        """Request a stop and join every storage thread; returns the wedged ones."""
+        self._signal_storage_threads_stop()
+        threads = [t for t in self._storage_worker_threads() if t is not None]
+        for thread in threads:
+            thread.join(timeout=_STORAGE_THREAD_JOIN_TIMEOUT_S)
+        return [thread for thread in threads if thread.is_alive()]
 
-        for t in threads:
-            try:
-                t.join(timeout=10)
-            except Exception:
-                pass
+    def _stop_storage_threads(self):
+        """Stop storage prefetch/backup threads and drain internal queues.
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        Caller should ensure no in-flight requests.
+        """
+        alive = self._join_storage_threads()
         if alive:
             logger.error(
                 "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                [thread.name for thread in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+    def _abandon_wedged_storage_threads(self, wedged: List[threading.Thread]) -> str:
+        """Leave the threads that would not stop on their dead generation.
+
+        The operations the transfer and backup workers are inside keep their
+        host memory quarantined until those workers return, because a stuck
+        backend call may still read or write it.
+        """
+        with self._inflight_lock:
+            for operation in (self._inflight_prefetch_op, self._inflight_backup_op):
+                if operation is None or operation.host_indices is None:
+                    continue
+                spans = self._operation_host_spans(operation)
+                for span in spans:
+                    span.pool.quarantine(span.indices)
+                operation.quarantined_spans = spans
+        self._wedged_threads = [
+            thread for thread in self._wedged_threads if thread.is_alive()
+        ] + wedged
+        self.storage_wedged_reason = (
+            f"HiCache storage worker(s) {[t.name for t in wedged]} did not stop "
+            f"within {_STORAGE_THREAD_JOIN_TIMEOUT_S}s and were abandoned with their "
+            "host memory quarantined; L3 is degraded on every rank until the storage "
+            "backend is re-attached, which needs the abandoned worker(s) to return."
+        )
+        logger.error(self.storage_wedged_reason)
+        return self.storage_wedged_reason
 
     def _storage_io_lease(self):
         return nullcontext()
@@ -672,7 +785,9 @@ class HiCacheController:
             storage_backend_extra_config = {}
         # Validated before any side effect, so a bad value leaves the
         # controller exactly as it was.
-        self._apply_storage_sync_config(storage_backend_extra_config)
+        storage_call_timeouts = self._apply_storage_extra_config(
+            storage_backend_extra_config
+        )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -689,9 +804,6 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        storage_call_timeouts = StorageCallTimeouts.pop_from_extra_config(
-            storage_backend_extra_config
-        )
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
@@ -798,6 +910,16 @@ class HiCacheController:
         Requirement: no in-flight requests. This will stop storage threads and release
         the backend instance (best-effort close).
         """
+        abandoned = [
+            thread.name for thread in self._wedged_threads if thread.is_alive()
+        ]
+        if abandoned:
+            # Their sync groups and backend are still in use by the stuck call.
+            raise RuntimeError(
+                f"Cannot detach the HiCache storage backend: storage worker(s) "
+                f"{abandoned} abandoned by a flush are still inside a backend call "
+                "or collective; retry once they return, or restart the server."
+            )
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
         # previous partial detach. We attempt cleanup whenever possible.
@@ -842,9 +964,15 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
-    def _apply_storage_sync_config(self, storage_backend_extra_config: dict) -> None:
-        """Pop the controller's own sync knobs so backends never see them, and
-        clear the failure state: attach creates fresh sync groups."""
+    def _apply_storage_extra_config(
+        self, storage_backend_extra_config: dict
+    ) -> StorageCallTimeouts:
+        """Pop the controller's own knobs (sync policy and timeout, per-call
+        deadlines) so backends never see them, and clear the failure state:
+        attach creates fresh sync groups and workers."""
+        storage_call_timeouts = StorageCallTimeouts.pop_from_extra_config(
+            storage_backend_extra_config
+        )
         policy = storage_backend_extra_config.pop("storage_failure_policy", "disable")
         if policy not in STORAGE_FAILURE_POLICIES:
             raise ValueError(
@@ -865,6 +993,8 @@ class HiCacheController:
         self.storage_sync_timeout = None if timeout is None else float(timeout)
         self.storage_sync_failed = False
         self.storage_sync_failure = None
+        self.storage_wedged_reason = None
+        return storage_call_timeouts
 
     def _generate_storage_config(
         self,
@@ -929,10 +1059,17 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
         )
 
-    def reset(self):
-        # Reuse detach's queue wakeups and bounded joins, and fail if any
-        # storage thread remains alive before clearing shared state.
-        self._stop_storage_threads()
+    def reset(self) -> Optional[str]:
+        """Restart the storage workers around a cache flush.
+
+        A worker that cannot be joined is abandoned on its dead generation with
+        its operation's host memory quarantined; the returned message reports
+        it, and the rank-agreed health bit degrades L3 at the next drain.
+        """
+        wedged = self._join_storage_threads()
+        wedged_reason = None
+        if wedged:
+            wedged_reason = self._abandon_wedged_storage_threads(wedged)
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -952,6 +1089,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
+            self._storage_generation += 1
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
@@ -968,6 +1106,7 @@ class HiCacheController:
             self.prefetch_io_aux_thread.start()
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
+        return wedged_reason
 
     def has_inflight_device_transfers(self) -> bool:
         """Whether queued or unacknowledged L2 transfers still use device rows."""
@@ -1212,7 +1351,8 @@ class HiCacheController:
         return operation.completed_tokens, operation.hash_value
 
     def append_host_mem_release(self, host_indices: torch.Tensor):
-        if host_indices.numel() == 0:
+        # An abandoned worker's pages were already cleared with the pool.
+        if host_indices.numel() == 0 or not self._storage_worker_is_live():
             return
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
@@ -1310,7 +1450,7 @@ class HiCacheController:
                 completed_tokens=completed_pages * self.page_size,
                 operation=operation,
             )
-            self.prefetch_sync_queue.put(ack)
+            self._publish(self.prefetch_sync_queue, ack)
         return completed_pages
 
     def _page_transfer_kv_batch(
@@ -1375,22 +1515,26 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
-        while not self.storage_stop_event.is_set():
+        self._enter_storage_worker()
+        while self._storage_worker_is_live() and not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
             except Empty:
                 continue
             if operation is None:
                 continue
+            self._begin_inflight(operation, prefetch=True)
             try:
                 self._page_transfer(operation)
             finally:
-                self.prefetch_sync_queue.put(
+                self._end_inflight(operation, prefetch=True)
+                self._publish(
+                    self.prefetch_sync_queue,
                     PrefetchAck(
                         rid=operation.request_id,
                         completed_req=True,
                         operation=operation,
-                    )
+                    ),
                 )
 
     def prefetch_rate_limited(self) -> bool:
@@ -1466,7 +1610,10 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
-        while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
+        self._enter_storage_worker()
+        while self._storage_worker_is_live() and (
+            (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty()
+        ):
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
@@ -1485,6 +1632,10 @@ class HiCacheController:
                     )
                     hash_value, storage_hit_count = [], 0
 
+                if not self._storage_worker_is_live():
+                    # Abandoned by a reset while inside the query: a collective
+                    # now would pair with the live workers' next one.
+                    continue
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
@@ -1495,7 +1646,7 @@ class HiCacheController:
                     : (storage_hit_count // self.page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
-                self.prefetch_hit_queue.put(operation)
+                self._publish(self.prefetch_hit_queue, operation)
 
             except Empty:
                 continue
@@ -1586,28 +1737,34 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
-        while not self.storage_stop_event.is_set():
+        self._enter_storage_worker()
+        while self._storage_worker_is_live() and not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup_or_log(operation)
-                self.ack_backup_queue.put(operation)
+                self._begin_inflight(operation, prefetch=False)
+                try:
+                    if not self.backup_skip:
+                        self._page_backup_or_log(operation)
+                finally:
+                    self._end_inflight(operation, prefetch=False)
+                self._publish(self.ack_backup_queue, operation)
 
             except Empty:
                 continue
 
     def prefetch_sync_thread_func(self):
         """Synchronize prefetch results across all PP and TP ranks."""
-        while not self.storage_stop_event.is_set():
+        self._enter_storage_worker()
+        while self._storage_worker_is_live() and not self.storage_stop_event.is_set():
             try:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
-                if ack is None:
+                if ack is None or not self._storage_worker_is_live():
                     continue
                 self._reduce_prefetch_ack(ack)
-                self.ack_prefetch_queue.put(ack)
+                self._publish(self.ack_prefetch_queue, ack)
             except Empty:
                 continue
 

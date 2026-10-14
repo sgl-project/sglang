@@ -1183,6 +1183,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         cc = HybridCacheController.__new__(HybridCacheController)
         cc.storage_backend = FailingStorage()
         cc.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
+        cc._init_storage_worker_tracking()
         cc.prefetch_sync_queue = Queue()
         operation = PrefetchOperation(
             CacheRequestHandle("r", 0),

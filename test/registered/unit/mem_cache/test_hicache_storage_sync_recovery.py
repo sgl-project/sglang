@@ -23,6 +23,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import (
+    StorageCallGuard,
+    StorageCallTimeouts,
+)
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
@@ -92,6 +96,8 @@ def _controller(hits_group, completion_group, backend) -> HybridCacheController:
     cc.storage_sync_failure = None
     cc._storage_sync_lock = threading.Lock()
     cc.storage_failure_policy = "disable"
+    cc.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
+    cc._init_storage_worker_tracking()
     cc.pp_prefetch_command_group = None
     cc.pp_prefetch_command_thread = None
     cc.pp_prefetch_decisions = {}
@@ -432,7 +438,7 @@ class TestStorageSyncRecovery(unittest.TestCase):
         cc = HiCacheController.__new__(HiCacheController)
         cc.storage_sync_failed, cc.storage_sync_failure = True, "stale"
         extra = {"storage_failure_policy": "raise", "storage_sync_timeout": 30, "x": 1}
-        cc._apply_storage_sync_config(extra)
+        cc._apply_storage_extra_config(extra)
         self.assertEqual(extra, {"x": 1})
         self.assertEqual(
             (cc.storage_failure_policy, cc.storage_sync_timeout), ("raise", 30.0)
@@ -440,7 +446,7 @@ class TestStorageSyncRecovery(unittest.TestCase):
         self.assertEqual(
             (cc.storage_sync_failed, cc.storage_sync_failure), (False, None)
         )
-        cc._apply_storage_sync_config({})
+        cc._apply_storage_extra_config({})
         self.assertEqual(
             (cc.storage_failure_policy, cc.storage_sync_timeout), ("disable", None)
         )
@@ -451,7 +457,7 @@ class TestStorageSyncRecovery(unittest.TestCase):
             {"storage_sync_timeout": True},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                cc._apply_storage_sync_config(bad)
+                cc._apply_storage_extra_config(bad)
 
         # The timeout reaches the gloo groups the controller creates.
         cc.attn_cp_group = cc.attn_tp_group = cc.pp_group = None

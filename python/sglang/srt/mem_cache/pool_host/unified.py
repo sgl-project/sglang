@@ -203,6 +203,12 @@ class _SharedPageEnvelopeHostBacking:
         # the backend returns. Compaction blocks new leases and drains both.
         self._layout_condition = threading.Condition(self.lock)
         self._layout_users = 0
+        # Thread idents holding a lease. Those in abandoned_lease_holders are
+        # inside a storage call nobody waits for (an orphaned or abandoned
+        # worker): compaction does not wait for them and leaves the pages they
+        # may still write where they are.
+        self._layout_holders: dict[int, int] = {}
+        self.abandoned_lease_holders: frozenset[int] = frozenset()
         self._layout_lease_state = self._LayoutLeaseState()
         self._compacting = False
         self._pending_transfer_events = {}
@@ -347,19 +353,25 @@ class _SharedPageEnvelopeHostBacking:
             )
         self._compacting = True
         deadline = None if timeout is None else time.monotonic() + timeout
-        while self._layout_users:
+        while self._awaited_layout_users():
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 self._finish_compaction()
                 raise RuntimeError(
                     "Unified host pool layout is still leased by an in-flight "
-                    "storage call (a timed-out backend call that has not "
-                    "returned); it cannot be cleared until that call returns."
+                    "storage call; it cannot be cleared until that call returns."
                 )
             self._layout_condition.wait(remaining)
         events = list(self._pending_transfer_events.values())
         self._pending_transfer_events = {}
         return events
+
+    def _awaited_layout_users(self) -> int:
+        return sum(
+            1
+            for ident in self._layout_holders
+            if ident not in self.abandoned_lease_holders
+        )
 
     def _finish_compaction(self) -> None:
         self._compacting = False
@@ -374,6 +386,7 @@ class _SharedPageEnvelopeHostBacking:
             while self._compacting:
                 self._layout_condition.wait()
             self._layout_users += 1
+            self._layout_holders[threading.get_ident()] = 1
             self._layout_lease_state.depth = 1
 
     def _prune_completed_transfer_events_locked(self) -> None:
@@ -404,7 +417,8 @@ class _SharedPageEnvelopeHostBacking:
             if self._layout_lease_state.depth:
                 return
             self._layout_users -= 1
-            if self._layout_users == 0:
+            self._layout_holders.pop(threading.get_ident(), None)
+            if self._awaited_layout_users() == 0:
                 self._layout_condition.notify_all()
 
     @contextmanager
@@ -417,15 +431,28 @@ class _SharedPageEnvelopeHostBacking:
 
     def _compact_side(self, side: _Side) -> None:
         reverse = side.grow_direction == "down"
-        live = sorted(side.physical_to_logical.items(), reverse=reverse)
-        if reverse:
-            targets = range(side.page_num - 1, side.page_num - 1 - len(live), -1)
-        else:
-            targets = range(len(live))
+        # Quarantined pages may still be written by an abandoned storage call
+        # whose lease compaction did not wait for, so they stay in place.
+        pinned = side.page_quarantine.pinned()
+        immovable = {
+            physical
+            for physical, logical in side.physical_to_logical.items()
+            if logical in pinned
+        }
+        live = sorted(
+            (
+                item
+                for item in side.physical_to_logical.items()
+                if item[0] not in immovable
+            ),
+            reverse=reverse,
+        )
+        slots = range(side.page_num - 1, -1, -1) if reverse else range(side.page_num)
+        targets = (slot for slot in slots if slot not in immovable)
 
         new_logical_to_physical = {}
         new_physical_to_logical = {}
-        for (source, logical), target in zip(live, targets, strict=True):
+        for (source, logical), target in zip(live, targets):
             if source != target:
                 source_offset = source * side.page_bytes
                 target_offset = target * side.page_bytes
@@ -434,13 +461,31 @@ class _SharedPageEnvelopeHostBacking:
                 )
             new_logical_to_physical[logical] = target
             new_physical_to_logical[target] = logical
+        for physical in immovable:
+            logical = side.physical_to_logical[physical]
+            new_logical_to_physical[logical] = physical
+            new_physical_to_logical[physical] = logical
 
         side.logical_to_physical = new_logical_to_physical
         side.physical_to_logical = new_physical_to_logical
-        side.free_physical_pages.clear()
-        side.watermark = (
-            len(live) if side.grow_direction == "up" else side.page_num - 1 - len(live)
-        )
+        self._reset_physical_free_state(side)
+
+    @staticmethod
+    def _reset_physical_free_state(side: _Side) -> None:
+        """Rebuild the watermark and the holes behind it from the live pages."""
+        occupied = set(side.physical_to_logical)
+        if side.grow_direction == "up":
+            side.watermark = max(occupied) + 1 if occupied else 0
+            side.free_physical_pages = {
+                page for page in range(side.watermark) if page not in occupied
+            }
+        else:
+            side.watermark = min(occupied) - 1 if occupied else side.page_num - 1
+            side.free_physical_pages = {
+                page
+                for page in range(side.watermark + 1, side.page_num)
+                if page not in occupied
+            }
 
     def _compact(self) -> None:
         events = self._begin_compaction()
@@ -663,21 +708,36 @@ class _SharedPageEnvelopeHostBacking:
 
     def clear(self, name: str) -> None:
         with self.lock:
-            # An orphaned storage call holds a layout lease until it returns, so
-            # once the wait ends nothing is still writing and no page stays
-            # quarantined; a lease held past the bound fails the clear instead
-            # of blocking the scheduler forever.
+            # Leases of abandoned storage calls are not waited for: the pages
+            # they may still write stay mapped and quarantined. Any other lease
+            # held past the bound fails the clear instead of blocking the
+            # scheduler forever.
             events = self._begin_compaction(timeout=_CLEAR_LEASE_WAIT_S)
             try:
                 for event in events:
                     event.synchronize()
                 side = self.sides[name]
-                side.free_logical_extents = [(0, side.page_num)]
-                side.logical_to_physical.clear()
-                side.physical_to_logical.clear()
-                side.free_physical_pages.clear()
-                side.watermark = 0 if side.grow_direction == "up" else side.page_num - 1
-                side.page_quarantine = HostSlotQuarantine()
+                kept = {
+                    logical: side.logical_to_physical[logical]
+                    for logical in sorted(side.page_quarantine.pinned())
+                    if logical in side.logical_to_physical
+                }
+                side.logical_to_physical = dict(kept)
+                side.physical_to_logical = {
+                    physical: logical for logical, physical in kept.items()
+                }
+                extents = []
+                start = 0
+                for logical in kept:
+                    if logical > start:
+                        extents.append((start, logical))
+                    start = logical + 1
+                if start < side.page_num:
+                    extents.append((start, side.page_num))
+                side.free_logical_extents = extents
+                self._reset_physical_free_state(side)
+                # The owner of every kept page is gone with the clear.
+                side.page_quarantine.hold_all_pinned()
             finally:
                 self._finish_compaction()
 

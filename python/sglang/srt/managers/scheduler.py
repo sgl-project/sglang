@@ -117,6 +117,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.cache_controller import HiCacheStorageWedgedError
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -5364,12 +5365,17 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(self, empty_cache: bool = True) -> tuple[bool, str]:
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
+            storage_error = None
+            try:
+                self.tree_cache.reset()
+            except HiCacheStorageWedgedError as e:
+                # The tree is reset; only the stuck storage worker is reported.
+                storage_error = str(e)
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -5381,19 +5387,21 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
+            if storage_error is not None:
+                logger.error("Cache flushed, but %s", storage_error)
+                return False, f"Cache flushed, but {storage_error}"
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
-            success = True
-        else:
-            logging.warning(
-                f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
-            )
-            success = False
-        return success
+            return True, ""
+        message = (
+            "Cache not flushed because there are pending requests. "
+            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#running-req: {len(self.running_batch.reqs)}"
+        )
+        logging.warning(message)
+        return False, message
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)

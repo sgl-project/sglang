@@ -160,11 +160,13 @@ class _Orphan:
         spans: Sequence[HostSpan],
         op: str,
         started_at: float,
+        thread_ident: Optional[int],
     ):
         self.kind = kind
         self.spans = spans
         self.op = op
         self.started_at = started_at
+        self.thread_ident = thread_ident
 
 
 class _Lane:
@@ -343,7 +345,9 @@ class StorageCallGuard:
             worker.inbox.put(None)
             orphan_id = lane.next_orphan_id
             lane.next_orphan_id += 1
-            lane.orphans[orphan_id] = _Orphan(kind, held, op, started_at)
+            lane.orphans[orphan_id] = _Orphan(
+                kind, held, op, started_at, worker.thread.ident
+            )
             for span in held:
                 span.pool.quarantine(span.indices)
         future.add_done_callback(
@@ -400,6 +404,16 @@ class StorageCallGuard:
             message += " (%d similar warnings suppressed)"
             args = (*args, suppressed)
         logger.warning(self._log_prefix() + message, *args, exc_info=exc_info)
+
+    def orphan_thread_idents(self) -> set[int]:
+        """Threads still running an orphaned call."""
+        with self._lock:
+            return {
+                orphan.thread_ident
+                for lane in self._lanes.values()
+                for orphan in lane.orphans.values()
+                if orphan.thread_ident is not None
+            }
 
     def take_stats(self) -> StorageCallGuardStats:
         """Snapshot the counters; timeouts and errors reset to zero."""

@@ -195,12 +195,20 @@ class HostSlotQuarantine:
         self._held.update(indices[pinned_mask].tolist())
         return indices[~pinned_mask]
 
+    def pinned(self) -> set[int]:
+        return set(self._pins)
+
+    def hold_all_pinned(self) -> None:
+        """A pool-wide clear freed every slot: hold the pinned ones until
+        their calls return."""
+        self._held = set(self._pins)
+
     def carve_after_clear(self, free_slots: torch.Tensor) -> torch.Tensor:
         """A pool-wide clear freed every slot: keep the pinned ones out of the
         rebuilt free list and hold them until their calls return."""
         if not self._pins:
             return free_slots
-        self._held = set(self._pins)
+        self.hold_all_pinned()
         return free_slots[~torch.isin(free_slots, self._pinned_tensor)]
 
     def unpin(self, indices: torch.Tensor) -> torch.Tensor:

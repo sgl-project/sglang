@@ -110,6 +110,9 @@ def _controller(kind, backend, timeouts=None, swa_pool=None):
         setattr(cc, name, Queue())
     cc.prefetch_hits_sync_groups = []
     cc.prefetch_completion_sync_groups = []
+    cc.storage_sync_failed, cc.storage_sync_failure = False, None
+    cc._storage_sync_lock = threading.Lock()
+    cc._init_storage_worker_tracking()
     cc.backup_skip = False
     cc.page_get_func = cc._page_get_zero_copy
     cc.page_set_func = cc._page_set_zero_copy
