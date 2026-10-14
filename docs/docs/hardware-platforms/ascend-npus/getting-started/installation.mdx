@@ -211,17 +211,18 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `cann9.1.0-a3-B080`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes. CANN 9.1.0 has no stable image yet, so use the daily build tag for now.
+
+{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
 </Tip>
 
 <Tabs>
   <Tab title="Ascend A3 Series">
 
 ```bash Command
-# Stable release
-docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
-
-# Daily build
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
 docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
 ```
 
