@@ -928,10 +928,12 @@ class KVCacheConfigurator:
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
         else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+            v_head_dim = self.model_config.v_head_dim
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            swa_head_dim = self.model_config.swa_head_dim
+            swa_v_head_dim = self.model_config.swa_v_head_dim
 
         # Not the HF config's full_attention_layer_ids: that one returns ALL layers.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
@@ -1308,10 +1310,12 @@ class KVCacheConfigurator:
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
         else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+            v_head_dim = self.model_config.v_head_dim
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            swa_head_dim = self.model_config.swa_head_dim
+            swa_v_head_dim = self.model_config.swa_v_head_dim
 
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
