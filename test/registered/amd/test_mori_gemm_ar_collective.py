@@ -49,10 +49,12 @@ def _setup(rank, world):
     )
     cpu_group = dist.new_group(ranks=list(range(world)), backend="gloo")
 
-    import sglang.srt.distributed as dist_mod
+    from sglang.srt.runtime_context import get_parallel
 
     group = _Group(rank, world, cpu_group)
-    dist_mod.get_tp_group = lambda: group
+    # Permanent rather than scoped: the workers read it from several call
+    # depths and there is nothing to restore in a process that exits after.
+    get_parallel().override_permanently(tp_group=group, tp_size=world)
     return group
 
 

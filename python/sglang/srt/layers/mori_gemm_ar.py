@@ -40,6 +40,7 @@ import triton.language as tl
 # reliably reach it.
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quant
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -332,9 +333,7 @@ def _can_ever_fuse(layer) -> bool:
         return False
     if not mxfp8_ready(layer):
         return False
-    from sglang.srt.distributed import get_tp_group
-
-    world_size = get_tp_group().world_size
+    world_size = get_parallel().tp_size
     n, k = mxfp8_shape(layer)
     ceiling = _prefill_ceiling()
     if not ceiling:
@@ -364,9 +363,7 @@ def prepare_fused_wo_b(layers) -> None:
     if not candidates:
         return
 
-    from sglang.srt.distributed import get_tp_group
-
-    world_size = get_tp_group().world_size
+    world_size = get_parallel().tp_size
     n, k = mxfp8_shape(candidates[0])
     m_max = _window_m_max(_padded_m(_prefill_ceiling() or 1, world_size), world_size)
 
@@ -435,9 +432,7 @@ class _FusedWoB:
         from mori.cco import Communicator, UniqueId
         from mori.ops.gemm_ar import GemmAllReduceOp
 
-        from sglang.srt.distributed import get_tp_group
-
-        tp = get_tp_group()
+        tp = get_parallel().tp_group
         self.rank = tp.rank_in_group
         self.world_size = tp.world_size
         self.n, self.k, self.m_max = n, k, m_max
@@ -584,9 +579,7 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
     """
     global _state, _disabled
 
-    from sglang.srt.distributed import get_tp_group
-
-    tp = get_tp_group()
+    tp = get_parallel().tp_group
 
     state = None
     err = None
@@ -764,7 +757,6 @@ def _reduces_over_tp_group(layer) -> bool:
     ``skip_all_reduce`` is the caller's own argument, and it passes False
     whenever it reaches here.
     """
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.utils import get_group_rank_size
 
     _, tp_size = get_group_rank_size(layer.tp_group)
@@ -775,7 +767,7 @@ def _reduces_over_tp_group(layer) -> bool:
         return False
     # Equal size would do while attn_tp is a subgroup of tp, but comparing the
     # ranks says what is meant and does not rest on that staying true.
-    return tuple(layer.tp_group.ranks) == tuple(get_tp_group().ranks)
+    return tuple(layer.tp_group.ranks) == tuple(get_parallel().tp_group.ranks)
 
 
 def _substitutes_layer_all_reduce(layer) -> bool:
@@ -844,7 +836,6 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
         return None
 
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Fp8GridActivation
-    from sglang.srt.distributed import get_tp_group
 
     if not _substitutes_layer_all_reduce(layer):
         return None
@@ -868,7 +859,7 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     n, w_k = mxfp8_shape(layer)
     if w_k != k:
         return None
-    world_size = get_tp_group().world_size
+    world_size = get_parallel().tp_size
     # Computed once and threaded through: it was recomputed in `_eligible`, in
     # `_record_shape` and again below, and it is a call into mori.
     m_pad = _padded_m(m, world_size)

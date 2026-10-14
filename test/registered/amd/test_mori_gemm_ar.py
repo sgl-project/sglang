@@ -16,6 +16,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,7 +67,7 @@ class _Layer:
 def tp_group(ranks=range(8)):
     group = _Group(ranks)
     with (
-        patch("sglang.srt.distributed.get_tp_group", lambda: group),
+        get_parallel().override(tp_group=group, tp_size=group.world_size),
         patch(
             "sglang.srt.distributed.utils.get_group_rank_size",
             lambda g: (0, g.world_size),
