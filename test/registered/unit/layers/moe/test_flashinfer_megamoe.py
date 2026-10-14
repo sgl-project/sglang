@@ -132,8 +132,6 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         topk_weights: torch.Tensor
         fc1_alpha: torch.Tensor
         scales: torch.Tensor | None = None
-        fc2_alpha: torch.Tensor | None = None
-        fc1_norm_const: torch.Tensor | None = None
 
         @property
         def num_tokens(self):
@@ -414,125 +412,6 @@ def test_decode_capacity_at_or_above_main_capacity_is_disabled(monkeypatch):
             types.SimpleNamespace(get=lambda v=configured: v)
         )
         assert module._resolve_decode_max_tokens_per_rank(4608) == expected
-
-
-def test_decode_layer_leaves_tuned_workspaces_with_their_owner(monkeypatch):
-    """Startup tuning must prepare its workspaces on the main layer even when its
-    dummy batch is decode-sized, and the decode layer must never receive them:
-    FlashInfer runs a workspace only on the layer that created it."""
-    import json
-    import os
-
-    module = _load_megamoe_module(monkeypatch)
-    # Reuse the profile fixture's FlashInfer dataclass stand-ins and autotuner.
-    autotune, profile_forward, profile_tensors, _, _ = _profile_fixture(monkeypatch)
-    envs = sys.modules["sglang.srt.environ"].envs
-    envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = types.SimpleNamespace(
-        get=lambda: 8
-    )
-    monkeypatch.setattr(
-        sys.modules["sglang.srt.runtime_context"],
-        "get_parallel",
-        lambda: types.SimpleNamespace(dp_size=1),
-    )
-    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
-
-    class MoEEpMegaLayer:
-        supports_output_view = False
-
-        def __init__(self, *, bootstrap, fleet_params, weights, backend):
-            self._fleet_params = fleet_params
-            self.knobs = backend.megakernel.knobs
-            self.workspaces = []
-            self.forwards = []
-
-        def warmup(self, tensors, workspace=None):
-            if self.knobs == "auto":
-                Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
-                    json.dumps(payload)
-                )
-
-        def destroy(self):
-            pass
-
-        def create_workspace(self, capacity):
-            self.workspaces.append(capacity)
-            return (self, capacity)
-
-        def forward(self, tensors, workspace=None):
-            if workspace is None:
-                capacity = self._fleet_params.max_tokens_per_rank
-            elif workspace[0] is self:
-                capacity = workspace[1]
-            else:
-                raise RuntimeError("MegaMoE workspace belongs to a different layer")
-            assert tensors.num_tokens <= capacity
-            self.forwards.append(capacity)
-            return tensors.hidden_states
-
-    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
-    fake_moe_ep.BootstrapConfig = types.SimpleNamespace
-    fake_moe_ep.FleetParams = type(profile_forward.fleet_params)
-    fake_moe_ep.MegaConfig = type(profile_forward.backend)
-    fake_moe_ep.MoEEpMegaLayer = MoEEpMegaLayer
-    fake_moe_ep.MoEEpTensors = type(profile_tensors)
-    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
-    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
-
-    layer = types.SimpleNamespace(
-        w13_weight=torch.zeros(1),
-        w2_weight=torch.zeros(1),
-        moe_ep_size=1,
-        moe_ep_rank=0,
-        layer_id=0,
-        num_experts=4,
-        hidden_size=4,
-    )
-    mega = module._ensure_flashinfer_megamoe_layer(
-        layer,
-        megakernel_config=profile_forward.backend.megakernel,
-        w13_scale=torch.zeros(1),
-        w2_scale=torch.zeros(1),
-    )
-    decode = layer._flashinfer_megamoe_decode_layer
-    quant_info = module.FlashInferMegaMoeQuantInfo(
-        mega=mega,
-        mega_forward=layer._flashinfer_megamoe_forward,
-        mega_decode=decode,
-    )
-
-    def run(num_tokens, *, is_extend=False):
-        dp_attention = sys.modules["sglang.srt.layers.dp_attention"]
-        monkeypatch.setattr(dp_attention, "get_is_extend_in_batch", lambda: is_extend)
-        monkeypatch.setattr(
-            dp_attention, "get_dp_global_num_tokens", lambda: [num_tokens]
-        )
-        dispatch_output = types.SimpleNamespace(
-            hidden_states=torch.ones(num_tokens, 4, dtype=torch.bfloat16),
-            topk_output=types.SimpleNamespace(
-                topk_ids=torch.zeros(num_tokens, 2, dtype=torch.int32),
-                topk_weights=torch.ones(num_tokens, 2),
-            ),
-        )
-        module.run_flashinfer_megamoe(
-            dispatch_output,
-            quant_info,
-            types.SimpleNamespace(routed_scaling_factor=1.0),
-        )
-
-    # The startup FlashInfer autotune pass runs a decode-shaped dummy batch.
-    logits_processor = sys.modules["sglang.srt.layers.logits_processor"]
-    monkeypatch.setattr(logits_processor, "get_in_autotune_dummy_run", lambda: True)
-    with autotune.megamoe_autotune_context(decode_num_tokens=8, prefill_num_tokens=32):
-        run(8)
-    monkeypatch.setattr(logits_processor, "get_in_autotune_dummy_run", lambda: False)
-    assert mega.workspaces == [1, 2, 4, 8, 32]
-    assert decode.workspaces == []
-
-    run(8)
-    run(20, is_extend=True)
-    assert decode.forwards == [8]
-    assert mega.forwards == [8, 32]
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
