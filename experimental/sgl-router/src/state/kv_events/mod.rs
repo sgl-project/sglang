@@ -25,6 +25,8 @@ pub mod bootstrap;
 pub mod discovery;
 pub mod hash;
 pub mod index;
+pub mod pending;
+pub mod prefix_provider;
 pub mod subscriber;
 pub mod tally;
 pub mod tree;
@@ -34,10 +36,12 @@ pub use block_size_oracle::BlockSizeOracle;
 pub use bootstrap::{BootstrapState, BootstrapTracker, PeerRegistry, WireWorker};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
-pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
+pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64, CacheNamespace};
 pub use index::{KvEventIndex, KvIndexMetrics};
+pub use pending::PendingPrefixes;
+pub use prefix_provider::{PrefixLookupResult, RadixTreePrefixProvider};
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-pub use tally::{EventKind, EventTally, TallyRow};
+pub use tally::{EventKind, EventTally, ReplayOutcome, TallyRow};
 pub use tree::{
     HashTree, KvWorkerId, MatchResult, SnapshotNode, TierCounts, Tiers, ACCOUNTING_REASONS,
     TIER_SLOT_COUNT,

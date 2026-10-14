@@ -91,6 +91,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
+    # Scheduler lengths for the breakable prefill indexer.
+    prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -139,7 +141,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
+        sequence_lengths_list = self.prefill_sequence_lengths_cpu
+        if sequence_lengths_list is None:
+            sequence_lengths_list = sequence_lengths.tolist()
         for sequence_id in range(len(sequence_lengths_list)):
             complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
             if complete_blocks == 0:

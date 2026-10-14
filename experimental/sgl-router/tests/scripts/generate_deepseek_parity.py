@@ -46,6 +46,19 @@ class RecordingTokenizer:
         return getattr(self.tokenizer, name)
 
 
+def template_tools(request):
+    """The `tools` `_process_messages` passes on: none under `tool_choice="none"`,
+    and only the named tool for a named choice."""
+    if not request.tools or request.tool_choice == "none":
+        return None
+    if isinstance(request.tool_choice, str):
+        return [tool.model_dump() for tool in request.tools]
+    name = request.tool_choice.function.name
+    return [
+        tool.model_dump() for tool in request.tools if tool.function.name == name
+    ] or None
+
+
 def main():
     ROOT.mkdir(exist_ok=True)
     for family, (model, revision) in MODELS.items():
@@ -77,7 +90,7 @@ def main():
                 if effort is not None:
                     request.reasoning_effort = effort
             ids = server._apply_jinja_template(
-                request, tools=None, is_multimodal=False
+                request, tools=template_tools(request), is_multimodal=False
             ).prompt_ids
             case.update(
                 prompt="".join(tok.texts),
