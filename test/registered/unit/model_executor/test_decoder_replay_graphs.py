@@ -226,6 +226,49 @@ class TestLateLayersInPrefillGraph(CustomTestCase):
         torch.testing.assert_close(out[1][:3], pre[tail_idx])
 
 
+class TestLateConsumersInPrefillGraph(CustomTestCase):
+    """Inside a prefill-graph step the captured source layer publishes no candidates;
+    the late layers' eager consumers then take the full top-k, as the graph does."""
+
+    def _route(self, *, published, cover_window):
+        try:
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttnBackend,
+            )
+        except (ImportError, OSError) as e:
+            self.skipTest(f"backend not importable here: {e}")
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                candidate_metadata=published, candidates_cover_window=cover_window
+            ),
+            _make_low_ratio_prefill_indexer_inputs=lambda *a: "inputs",
+            prefill_candidates=MagicMock(),
+            full_topk_indexer=MagicMock(),
+        )
+        layer = SimpleNamespace(
+            compress_ratio=2,
+            indexer=SimpleNamespace(is_candidate_source=False, uses_candidates=True),
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: False, is_target_verify=lambda: False
+            )
+        )
+        DeepseekV4AttnBackend._low_ratio_index_topk(
+            backend, layer, None, None, None, None, batch
+        )
+        return backend
+
+    def test_full_topk_only_without_candidates_inside_the_window(self):
+        b = self._route(published=None, cover_window=True)
+        b.full_topk_indexer.topk_prefill.assert_called_once_with("inputs")
+        b.prefill_candidates.consume_prefill.assert_not_called()
+        b = self._route(published="table", cover_window=True)
+        b.prefill_candidates.consume_prefill.assert_called_once_with("inputs", "table")
+        b = self._route(published=None, cover_window=False)
+        b.prefill_candidates.consume_prefill.assert_called_once_with("inputs", None)
+
+
 class TestStepCaches(CustomTestCase):
     def test_off_under_the_prefill_graph_unless_in_a_replay_graph(self):
         for breakable, replay, allowed in (

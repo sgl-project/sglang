@@ -978,6 +978,9 @@ class DSV4Metadata:
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
     candidate_metadata: Optional[CandidateMetadata] = None
+    # Late layers run eagerly inside a prefill-graph step: the captured source layer
+    # published no candidates, and inside the graph's window the full top-k applies.
+    candidates_cover_window: bool = False
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -1931,6 +1934,7 @@ class DeepseekV4AttnBackend(
         live.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
         block_metadata = self.tail_forward_metadata
         self.tail_forward_metadata = self._build_late_layer_tail_metadata(live)
+        self.tail_forward_metadata.candidates_cover_window = True
         try:
             tail = self.tail_forward_metadata.late_layer_tail
             return self.enter_late_layer_tail(forward_batch), tail
@@ -3482,7 +3486,9 @@ class DeepseekV4AttnBackend(
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
                 self._publish_candidate_metadata(published)
-            elif is_consumer:
+            elif is_consumer and not (
+                published is None and self.forward_metadata.candidates_cover_window
+            ):
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
                 self.full_topk_indexer.topk_prefill(inputs)
