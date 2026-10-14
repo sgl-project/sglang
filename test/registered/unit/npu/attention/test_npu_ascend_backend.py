@@ -606,52 +606,8 @@ class TestMlaPrefixFia(unittest.TestCase):
         weights = torch.stack(lse).softmax(0).unsqueeze(-1)
         return (torch.stack(outputs) * weights).sum(0), None
 
-    @classmethod
-    def _ring_reference(cls, **kwargs):
-        first_ring = kwargs["calc_type"] == "calc_type_first_ring"
-        lengths = kwargs["seqlen"]
-        q_lens = lengths if first_ring else lengths[0]
-        kv_lens = lengths if first_ring else lengths[1]
-        assert kwargs["kernel_type"] == "kernel_type_high_precision"
-        assert kwargs["mask_type"] == ("mask_type_triu" if first_ring else "no_mask")
-        output, lse = cls._fia_reference(
-            query=kwargs["q_nope"].contiguous(),
-            key=kwargs["k_nope"].contiguous(),
-            value=kwargs["value"].contiguous(),
-            query_rope=kwargs["q_rope"].contiguous(),
-            key_rope=kwargs["k_rope"].contiguous(),
-            input_layout="TND",
-            num_query_heads=kwargs["head_num"],
-            num_key_value_heads=kwargs["kv_head_num"],
-            actual_seq_qlen=q_lens.cumsum(0).tolist(),
-            actual_seq_kvlen=kv_lens.cumsum(0).tolist(),
-            softmax_scale=kwargs["qk_scale"],
-            sparse_mode=3 if first_ring else 0,
-            next_tokens=0,
-            atten_mask=kwargs["mask"].bool() if first_ring else None,
-            return_softmax_lse=True,
-        )
-        if first_ring:
-            assert kwargs["pre_out"] is None and kwargs["prev_lse"] is None
-        else:
-            start = 0
-            for q_len, kv_len in zip(q_lens.tolist(), kv_lens.tolist()):
-                if kv_len == 0:
-                    output[start : start + q_len].zero_()
-                    lse[start : start + q_len].fill_(-float("inf"))
-                start += q_len
-            previous_lse = kwargs["prev_lse"].T.unsqueeze(-1)
-            merged_lse = torch.logaddexp(previous_lse, lse)
-            output = (
-                kwargs["pre_out"].float() * (previous_lse - merged_lse).exp()
-                + output.float() * (lse - merged_lse).exp()
-            )
-            lse = merged_lse
-        kwargs["output"].copy_(output)
-        kwargs["softmax_lse"].copy_(lse.squeeze(-1).T)
-
     def _check_prefix(
-        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=True
+        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=False
     ):
         torch.manual_seed(47)
         tokens, prefix_tokens = sum(query_lens), sum(prefix_lens)
@@ -675,7 +631,6 @@ class TestMlaPrefixFia(unittest.TestCase):
         backend.qk_nope_head_dim = 128
         backend.qk_rope_head_dim = 64
         backend.fia_mask = torch.ones(2048, 2048, dtype=torch.bool).triu(1)
-        backend.ringmla_mask = torch.ones(512, 512, dtype=dtype).triu(1)
         backend.forward_metadata = ForwardMetadata(
             extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
             prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
@@ -713,15 +668,11 @@ class TestMlaPrefixFia(unittest.TestCase):
                 f"{module_name}.torch_npu.npu_attention_update",
                 side_effect=self._update_reference,
             ) as update,
-            patch(
-                f"{module_name}.torch_npu.atb.npu_ring_mla",
-                side_effect=self._ring_reference,
-            ) as ring,
+            patch(f"{module_name}.torch_npu.atb", None),
         ):
             actual = backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
-        self.assertEqual(fia.call_count, 2 if use_fia else 0)
-        self.assertEqual(update.call_count, 1 if use_fia else 0)
-        self.assertEqual(ring.call_count, 0 if use_fia else 2)
+        self.assertEqual(fia.call_count, 2)
+        self.assertEqual(update.call_count, 1)
 
         prefix_k, prefix_v = (
             project(cached[indices])[0]
@@ -772,10 +723,13 @@ class TestMlaPrefixFia(unittest.TestCase):
     def test_large_logits_merge_stably(self):
         self._check_prefix([3, 2], [4, 7], torch.bfloat16, 1, 4, magnitude=8)
 
-    def test_fia_disabled_keeps_ring_mla(self):
+    def test_prefix_ignores_fia_flag(self):
         for dtype in (torch.float16, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                self._check_prefix([3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=False)
+            for use_fia in (False, True):
+                with self.subTest(dtype=dtype, use_fia=use_fia):
+                    self._check_prefix(
+                        [3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=use_fia
+                    )
 
 
 if __name__ == "__main__":

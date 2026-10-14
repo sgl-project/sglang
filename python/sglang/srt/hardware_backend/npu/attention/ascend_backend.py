@@ -109,15 +109,13 @@ class ForwardMetadata:
 
 
 class AscendAttnMaskBuilder:
-    def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
+    def __init__(self, model_runner: ModelRunner, device):
         """
         Initialize the AscendAttnMaskBuilder class.
 
         :param model_runner: ModelRunner instance for model execution.
         :param device: Device to run the model on (e.g., 'cuda', 'npu').
-        :param use_fia: Boolean flag to indicate if environment variable ASCEND_USE_FIA is set to 1.
         """
-        self.use_fia = use_fia
         self.model_runner = model_runner
         self.device = device
 
@@ -138,13 +136,6 @@ class AscendAttnMaskBuilder:
         # Initialize mixed chunk mask cache
         mixed_mask_len = 2048
         self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask(mixed_mask_len)
-
-        if use_mla:
-            # Initialize RingMla mask
-            ringmla_mask_len = 512
-            self.ringmla_mask = self.generate_attn_mask(
-                ringmla_mask_len, "norm", torch.bfloat16
-            ).to(self.device)
 
     @staticmethod
     def generate_mask_flag(max_seq_len):
@@ -386,17 +377,13 @@ class AscendAttnBackend(AttentionBackend):
                     int(self.speculative_num_draft_tokens), is_draft_worker=True
                 )
             )
-        self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
-            model_runner, self.device, self.use_fia, self.use_mla
-        )
+        self.ascend_attn_mask_builder = AscendAttnMaskBuilder(model_runner, self.device)
         self.mask, self.fia_mask, self.mtp_mask, self.mix_mask = (
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
-        if self.use_mla:
-            self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
@@ -1856,176 +1843,85 @@ class AscendAttnBackend(AttentionBackend):
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
 
-                if self.use_fia:
-                    query_lens = self.forward_metadata.extend_seq_lens_cpu_int
-                    cu_query_lens = query_lens.cumsum(0).tolist()
-                    q_nope, q_rope = q_nope.contiguous(), q_rope.contiguous()
+                query_lens = self.forward_metadata.extend_seq_lens_cpu_int
+                cu_query_lens = query_lens.cumsum(0).tolist()
+                q_nope, q_rope = q_nope.contiguous(), q_rope.contiguous()
 
-                    attn_output, attn_lse = (
-                        torch_npu.npu_fused_infer_attention_score_v2(
-                            query=q_nope,
-                            key=k_nope.contiguous(),
-                            value=v.contiguous(),
-                            query_rope=q_rope,
-                            key_rope=k_rope.contiguous(),
-                            num_query_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="TND",
-                            actual_seq_qlen=cu_query_lens,
-                            actual_seq_kvlen=cu_query_lens,
-                            atten_mask=self.fia_mask,
-                            sparse_mode=3,
-                            next_tokens=0,
-                            softmax_scale=layer.scaling,
-                            return_softmax_lse=True,
-                        )
-                    )
+                attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                    query=q_nope,
+                    key=k_nope.contiguous(),
+                    value=v.contiguous(),
+                    query_rope=q_rope,
+                    key_rope=k_rope.contiguous(),
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    actual_seq_qlen=cu_query_lens,
+                    actual_seq_kvlen=cu_query_lens,
+                    atten_mask=self.fia_mask,
+                    sparse_mode=3,
+                    next_tokens=0,
+                    softmax_scale=layer.scaling,
+                    return_softmax_lse=True,
+                )
 
-                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                    kv_cached = gather_mla_cache_pages(
-                        k_buffer,
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        is_nz=is_fia_nz(),
-                    )
-                    k_rope_cached = gather_mla_cache_pages(
-                        v_buffer,
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        is_nz=is_fia_nz(),
-                    ).flatten(0, 1)
+                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                kv_cached = gather_mla_cache_pages(
+                    k_buffer,
+                    self.forward_metadata.flatten_prefix_block_tables,
+                    is_nz=is_fia_nz(),
+                )
+                k_rope_cached = gather_mla_cache_pages(
+                    v_buffer,
+                    self.forward_metadata.flatten_prefix_block_tables,
+                    is_nz=is_fia_nz(),
+                ).flatten(0, 1)
 
-                    assert layer.kv_b_proj is not None
-                    kv = layer.kv_b_proj(kv_cached)[0].view(
-                        -1,
-                        layer.tp_k_head_num,
-                        self.qk_nope_head_dim + layer.v_head_dim,
-                    )
-                    k_nope, v = kv.split(
-                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-                    )
+                assert layer.kv_b_proj is not None
+                kv = layer.kv_b_proj(kv_cached)[0].view(
+                    -1,
+                    layer.tp_k_head_num,
+                    self.qk_nope_head_dim + layer.v_head_dim,
+                )
+                k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
 
-                    k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-                    prefix_lens = self.forward_metadata.prefix_lens
-                    prefix_output, prefix_lse = (
-                        torch_npu.npu_fused_infer_attention_score_v2(
-                            query=q_nope,
-                            key=k_nope.contiguous(),
-                            value=v.contiguous(),
-                            query_rope=q_rope,
-                            key_rope=k_rope.contiguous(),
-                            num_query_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="TND",
-                            actual_seq_qlen=cu_query_lens,
-                            actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
-                            sparse_mode=0,
-                            softmax_scale=layer.scaling,
-                            return_softmax_lse=True,
-                        )
+                k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+                prefix_lens = self.forward_metadata.prefix_lens
+                prefix_output, prefix_lse = (
+                    torch_npu.npu_fused_infer_attention_score_v2(
+                        query=q_nope,
+                        key=k_nope.contiguous(),
+                        value=v.contiguous(),
+                        query_rope=q_rope,
+                        key_rope=k_rope.contiguous(),
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        actual_seq_qlen=cu_query_lens,
+                        actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
+                        sparse_mode=0,
+                        softmax_scale=layer.scaling,
+                        return_softmax_lse=True,
                     )
+                )
 
-                    query_start = 0
-                    for query_end, prefix_len in zip(
-                        cu_query_lens, prefix_lens.tolist()
-                    ):
-                        if prefix_len == 0:
-                            prefix_output[query_start:query_end].zero_()
-                            prefix_lse[query_start:query_end].fill_(-float("inf"))
-                        query_start = query_end
+                query_start = 0
+                for query_end, prefix_len in zip(cu_query_lens, prefix_lens.tolist()):
+                    if prefix_len == 0:
+                        prefix_output[query_start:query_end].zero_()
+                        prefix_lse[query_start:query_end].fill_(-float("inf"))
+                    query_start = query_end
 
-                    attn_output, _ = torch_npu.npu_attention_update(
-                        (attn_lse.reshape(-1), prefix_lse.reshape(-1)),
-                        (
-                            attn_output.float().reshape(-1, layer.v_head_dim),
-                            prefix_output.float().reshape(-1, layer.v_head_dim),
-                        ),
-                        0,
-                    )
-                    attn_output = attn_output.to(q.dtype)
-                else:
-                    num_tokens = q_nope.size(0)
-                    attn_output = torch.zeros(
-                        num_tokens,
-                        layer.tp_q_head_num,
-                        layer.v_head_dim,
-                        dtype=q_nope.dtype,
-                        device=q_nope.device,
-                    )
-                    attn_lse = torch.zeros(
-                        layer.tp_q_head_num,
-                        num_tokens,
-                        dtype=torch.float32,
-                        device=q_nope.device,
-                    )
-                    torch_npu.atb.npu_ring_mla(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        k_nope=k_nope,
-                        k_rope=k_rope,
-                        value=v,
-                        mask=self.ringmla_mask,
-                        seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
-                        head_num=layer.tp_q_head_num,
-                        kv_head_num=layer.tp_k_head_num,
-                        pre_out=None,
-                        prev_lse=None,
-                        qk_scale=layer.scaling,
-                        kernel_type="kernel_type_high_precision",
-                        mask_type="mask_type_triu",
-                        calc_type="calc_type_first_ring",
-                        output=attn_output,
-                        softmax_lse=attn_lse,
-                    )
-
-                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                    kv_cached = gather_mla_cache_pages(
-                        k_buffer,
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        is_nz=is_fia_nz(),
-                    )
-                    k_rope_cached = gather_mla_cache_pages(
-                        v_buffer,
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        is_nz=is_fia_nz(),
-                    ).flatten(0, 1)
-
-                    assert layer.kv_b_proj is not None
-                    kv = layer.kv_b_proj(kv_cached)[0].view(
-                        -1,
-                        layer.tp_k_head_num,
-                        self.qk_nope_head_dim + layer.v_head_dim,
-                    )
-                    k_nope, v = kv.split(
-                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
-                    )
-
-                    k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-                    seq_len = torch.stack(
-                        [
-                            self.forward_metadata.extend_seq_lens_cpu_int,
-                            self.forward_metadata.prefix_lens,
-                        ]
-                    )
-                    torch_npu.atb.npu_ring_mla(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        k_nope=k_nope,
-                        k_rope=k_rope,
-                        value=v,
-                        mask=self.ringmla_mask,
-                        seqlen=seq_len,
-                        head_num=layer.tp_q_head_num,
-                        kv_head_num=layer.tp_k_head_num,
-                        pre_out=attn_output,
-                        prev_lse=attn_lse,
-                        qk_scale=layer.scaling,
-                        kernel_type="kernel_type_high_precision",
-                        mask_type="no_mask",
-                        calc_type="calc_type_default",
-                        output=attn_output,
-                        softmax_lse=attn_lse,
-                    )
+                attn_output, _ = torch_npu.npu_attention_update(
+                    (attn_lse.reshape(-1), prefix_lse.reshape(-1)),
+                    (
+                        attn_output.float().reshape(-1, layer.v_head_dim),
+                        prefix_output.float().reshape(-1, layer.v_head_dim),
+                    ),
+                    0,
+                )
+                attn_output = attn_output.to(q.dtype)
                 attn_output = attn_output.reshape(
                     [-1, layer.tp_q_head_num, layer.v_head_dim]
                 )
