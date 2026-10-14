@@ -257,12 +257,14 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+# The vendored Triton tile-64 kernel is written against Hopper and Blackwell
+# block-sparse geometry; older architectures fail closed.
+VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+
+
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
-
-    # The vendored Triton tile-64 kernel is written against Hopper and
-    # Blackwell block-sparse geometry; older architectures fail closed.
-    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
+    supported_capabilities = VSA_H3_CAPABILITIES
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -588,15 +590,6 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
 
     @classmethod
