@@ -36,7 +36,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    maybe_enable_silu_fp4_quant_fusion,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -408,6 +411,7 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=False,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
 
         norm_kwargs = (
             dict(
