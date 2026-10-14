@@ -304,6 +304,17 @@ pub struct SamplingParams {
     /// the number of returned sequences (n \<= beam_width).
     #[prost(int64, optional, tag = "26")]
     pub beam_width: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "27")]
+    pub watermark: ::core::option::Option<WatermarkRequestConfig>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatermarkRequestConfig {
+    #[prost(bool, optional, tag = "1")]
+    pub enabled: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "2")]
+    pub key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "3")]
+    pub context_window: ::core::option::Option<i64>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
