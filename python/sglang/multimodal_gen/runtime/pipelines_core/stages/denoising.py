@@ -173,6 +173,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
+    apply_inductor_config,
     resolve_torch_compile_kwargs,
 )
 
@@ -584,6 +585,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return
 
         dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+        if not current_platform.is_npu():
+            apply_inductor_config(
+                getattr(dit_config, "torch_compile_inductor_config", {})
+            )
         compile_kwargs, mode = resolve_torch_compile_kwargs(
             "SGLANG_TORCH_COMPILE_MODE",
             config=dit_config,
@@ -2063,6 +2068,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
+        # The warmup traced the offload hooks, whose graph breaks inside the
+        # block loop make Dynamo skip the DiT frame for good. Forget it, so
+        # this request compiles whole graphs from the cached autotune results.
+        torch._dynamo.reset()
         yield
 
     def forward(

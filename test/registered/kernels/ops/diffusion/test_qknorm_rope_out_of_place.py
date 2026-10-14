@@ -46,25 +46,38 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
 
 
 # each case JIT-builds two modules, so these cover the branches, not the product:
-# H3's own config both ways, then the FP32-cache, FP16, int32 and rope-width paths
+# H3's own config both ways, the FP32-cache, FP16, int32 and rope-width paths, then
+# the other layouts that run two rows per warp (FLUX / Qwen-Image / FLUX 3 / Krea2 /
+# Joy take the interleaved FP32 path; LongCat the rounded interleaved full-width one)
 @pytest.mark.parametrize(
-    "out_of_place,rope_dim,dtype,cache_dtype,pos_dtype",
+    "out_of_place,rope_dim,is_neox,round_norm,full_width,dtype,cache_dtype,pos_dtype",
     [
-        (False, 96, torch.bfloat16, torch.bfloat16, torch.int64),
-        (True, 96, torch.bfloat16, torch.bfloat16, torch.int64),
-        (True, 32, torch.bfloat16, torch.float32, torch.int32),
-        (False, 128, torch.float16, torch.float16, torch.int32),
+        (False, 96, True, True, False, torch.bfloat16, torch.bfloat16, torch.int64),
+        (True, 96, True, True, False, torch.bfloat16, torch.bfloat16, torch.int64),
+        (True, 32, True, True, False, torch.bfloat16, torch.float32, torch.int32),
+        (False, 128, True, True, False, torch.float16, torch.float16, torch.int32),
+        (False, 128, False, False, False, torch.bfloat16, torch.float32, torch.int64),
+        (True, 128, False, False, False, torch.bfloat16, torch.float32, torch.int64),
+        (False, 128, False, True, True, torch.bfloat16, torch.bfloat16, torch.int64),
+        (False, 120, False, True, False, torch.bfloat16, torch.float32, torch.int32),
+        (True, 64, False, False, True, torch.float16, torch.float16, torch.int32),
+        (False, 128, True, True, True, torch.bfloat16, torch.bfloat16, torch.int64),
+        (False, 64, False, False, False, torch.bfloat16, torch.bfloat16, torch.int64),
+        (True, 96, False, False, True, torch.bfloat16, torch.float32, torch.int32),
     ],
 )
 def test_two_rows_per_warp_match_one_row_per_warp(
     out_of_place: bool,
     rope_dim: int,
+    is_neox: bool,
+    round_norm: bool,
+    full_width: bool,
     dtype: torch.dtype,
     cache_dtype: torch.dtype,
     pos_dtype: torch.dtype,
 ) -> None:
-    """head_dim 128 with the norm rounded before NeoX RoPE runs two rows per
-    warp; its bytes must equal the one-row-per-warp kernel's on every arch."""
+    """head_dim 128 runs two rows per warp; its bytes must equal the
+    one-row-per-warp kernel's on every arch, RoPE layout and rounding mode."""
     from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
         _jit_qknorm_rope_module,
     )
@@ -76,7 +89,7 @@ def test_two_rows_per_warp_match_one_row_per_warp(
     k = qkv[:, H * D : 2 * H * D].view(T, H, D)
     qw = (torch.rand(D, generator=g) + 0.5).to("cuda", dtype)
     kw = (torch.rand(D, generator=g) + 0.5).to("cuda", dtype)
-    freqs = 50 * torch.randn(T, rope_dim // 2, generator=g)
+    freqs = 50 * torch.randn(T, rope_dim if full_width else rope_dim // 2, generator=g)
     cache = torch.cat((freqs.cos(), freqs.sin()), -1).to("cuda", cache_dtype)
     pos = torch.randperm(T, generator=g).to("cuda", pos_dtype)
     outputs = []
@@ -84,12 +97,12 @@ def test_two_rows_per_warp_match_one_row_per_warp(
         module = _jit_qknorm_rope_module(
             D,
             rope_dim,
-            True,
+            is_neox,
             dtype,
             cache_dtype,
-            True,
+            round_norm,
             False,
-            False,
+            full_width,
             out_of_place,
             half_warp=half_warp,
         )

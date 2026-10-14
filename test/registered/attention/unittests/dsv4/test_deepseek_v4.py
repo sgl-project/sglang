@@ -772,9 +772,35 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.subTest(max_seq_len=max_seq_len):
                 cache = self._make_sparse_prefill_cache(max_seq_len)
                 gather = cache.ensure_compressed(4, page_table, c_page_size=64)
-                expected_extent = max(max_seq_len // 4, 1)
+                expected_extent = max_seq_len // 4
                 self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
                 self.assertEqual(gather.compressed_base.tolist(), [0, expected_extent])
+
+    def test_sparse_prefill_compressed_gather_packs_request_lengths(self):
+        for ratio in (1, 2, 4):
+            with self.subTest(ratio=ratio):
+                cache = self._make_sparse_prefill_cache(257)
+                cache.seq_lens = torch.tensor([257, 9], dtype=torch.int32)
+                cache.seq_lens_cpu = [257, 9]
+                cache.swa_offsets = torch.tensor([0, 8, 12], dtype=torch.int32)
+                # Deliberately non-contiguous, non-monotonic physical pages.
+                table = torch.tensor(
+                    [[7, 0, 2, 0, 11, 0, 4, 0, 13, 0], [9, 0, 3, 0, 8, 0, 12, 0, 5, 0]],
+                    dtype=torch.int32,
+                )[:, ::2]
+                gather = cache.ensure_compressed(ratio, table, c_page_size=64)
+                lengths = [257 // ratio, 9 // ratio]
+                expected = [
+                    int(table[r, pos // 64]) * 64 + pos % 64
+                    for r, length in enumerate(lengths)
+                    for pos in range(length)
+                ]
+                self.assertEqual(gather.flat_token_ids.tolist(), expected)
+                self.assertEqual(gather.compressed_base.tolist(), [0, lengths[0]])
+                self.assertEqual(
+                    gather.swa_base.tolist(), [sum(lengths), sum(lengths) + 8]
+                )
+                self.assertIs(cache.ensure_compressed(ratio, table, 64), gather)
 
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
