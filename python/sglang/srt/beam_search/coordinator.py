@@ -372,8 +372,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
             )
-            # All rows are synchronized; the leader's row length in this step
-            # covers the KV computed through it.
+            # TODO: read the group's own length (prompt_len plus its generated
+            # count) instead of the step's attention input; needed for spec.
             seq_len = int(batch.seq_lens_cpu[entry.leader_idx])
             self._apply_survivors(
                 group, next_tokens, parent_idx, batch.forward_iter, seq_len

@@ -1516,7 +1516,8 @@ class SchedulerBatchResultProcessor:
 
         if batch.spec_algorithm.is_none():
             if batch.mamba_track_mask_cpu is not None and batch.mamba_track_mask_cpu[i]:
-                return True, int(batch.seq_lens_cpu[i])
+                # The counters have advanced: committed ends at this step.
+                return True, req.kv.kv_committed_len
         elif result.accept_lens is not None:
             cur = req.seqlen - 1
             num_non_draft = result.num_non_draft_tokens_per_req

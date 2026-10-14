@@ -617,6 +617,8 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
 
     batch.maybe_evict_swa()
 
+    # TODO: read kv_allocated_len, not the step's attention input, for where
+    # the allocation appends.
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 

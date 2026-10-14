@@ -394,6 +394,7 @@ class TestMambaLazyInPlaceTrack(unittest.TestCase):
             self.assertEqual(step.mamba_track_mask_cpu, [True])
             self.assertEqual(step.mamba_track_indices.tolist(), [_LAZY_CHECKPOINT_SLOT])
             self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+            commit_step_counters(step)
             _make_processor()._mamba_prefix_cache_update(req, step, _make_result(), 0)
 
         self.assertEqual(req.kv.mamba_last_track_seqlen, 2 * TRACK_INTERVAL)
