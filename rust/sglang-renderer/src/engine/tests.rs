@@ -137,3 +137,110 @@ async fn cancellation_releases_pending_submissions_and_unpolled_streams() {
         assert_eq!(transport.dropped.load(Ordering::SeqCst), 3);
     }
 }
+
+#[tokio::test]
+async fn later_submission_error_releases_pending_and_unpolled_choices() {
+    struct FailingTransport(Arc<AtomicUsize>);
+
+    impl GenerateTransport for FailingTransport {
+        fn generate(
+            &self,
+            request: GenerateRequest,
+        ) -> BoxFuture<'_, Result<TokenStream, ResponseError>> {
+            Box::pin(async move {
+                let guard = DropNotice(self.0.clone());
+                match request.rid.as_str() {
+                    "pending" => futures::future::pending::<()>().await,
+                    "rejected" => {
+                        return Err(ResponseError {
+                            kind: crate::ResponseErrorKind::Unavailable,
+                            message: "choice rejected".into(),
+                        });
+                    }
+                    _ => {}
+                }
+                Ok(async_stream::stream! {
+                    let _guard = guard;
+                    futures::future::pending::<()>().await;
+                    yield Ok(TokenDelta::default());
+                }
+                .boxed())
+            })
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let service = GenerationService::new(
+        Arc::new(FailingTransport(dropped.clone())),
+        TokenDecoder::new(tiny_tokenizer()),
+    );
+    let inputs = ["pending", "accepted", "rejected"]
+        .map(|rid| GenerateRequest {
+            rid: rid.into(),
+            ..request()
+        })
+        .to_vec();
+    let result = service
+        .generate_many(inputs)
+        .now_or_never()
+        .expect("a later rejection must not wait for an earlier pending submission");
+    let error = result
+        .err()
+        .expect("the rejected choice must fail the batch");
+    assert_eq!(error.message, "choice rejected");
+    assert_eq!(dropped.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn out_of_order_submissions_preserve_input_order() {
+    struct ReorderedTransport {
+        release_first: tokio::sync::Notify,
+        completed: Mutex<Vec<String>>,
+    }
+
+    impl GenerateTransport for ReorderedTransport {
+        fn generate(
+            &self,
+            request: GenerateRequest,
+        ) -> BoxFuture<'_, Result<TokenStream, ResponseError>> {
+            Box::pin(async move {
+                if request.rid == "first" {
+                    self.release_first.notified().await;
+                } else {
+                    self.release_first.notify_one();
+                }
+                self.completed.lock().unwrap().push(request.rid);
+                Ok(futures::stream::once(async move {
+                    Ok(TokenDelta {
+                        token_ids: request.input_ids,
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        finish_reason: Some(GenerationFinishReason::Length),
+                        ..Default::default()
+                    })
+                })
+                .boxed())
+            })
+        }
+    }
+
+    let transport = Arc::new(ReorderedTransport {
+        release_first: tokio::sync::Notify::new(),
+        completed: Mutex::new(Vec::new()),
+    });
+    let service = GenerationService::new(transport.clone(), TokenDecoder::new(tiny_tokenizer()));
+    let inputs = [("first", 65), ("second", 66)]
+        .map(|(rid, token)| GenerateRequest {
+            rid: rid.into(),
+            input_ids: vec![token],
+            ..request()
+        })
+        .to_vec();
+    let streams = service.generate_many(inputs).await.unwrap();
+    assert_eq!(*transport.completed.lock().unwrap(), ["second", "first"]);
+    let mut outputs = Vec::new();
+    for mut stream in streams {
+        outputs.push(stream.next().await.unwrap().unwrap().token_ids);
+    }
+    assert_eq!(outputs, [vec![65], vec![66]]);
+}

@@ -62,10 +62,21 @@ impl GenerationService {
         &self,
         inputs: Vec<GenerateRequest>,
     ) -> Result<Vec<GenerationStream>, ResponseError> {
-        futures::stream::iter(inputs.into_iter().map(|input| self.generate(input)))
-            .buffered(CONCURRENT_ENGINE_SUBMISSIONS)
-            .try_collect()
-            .await
+        let mut streams: Vec<_> = futures::stream::iter(
+            inputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, input)| async move {
+                    self.generate(input).await.map(|stream| (index, stream))
+                }),
+        )
+        // Observe failures immediately, even when an earlier choice is still
+        // waiting for response headers. Dropping the batch releases its siblings.
+        .buffer_unordered(CONCURRENT_ENGINE_SUBMISSIONS)
+        .try_collect()
+        .await?;
+        streams.sort_unstable_by_key(|(index, _)| *index);
+        Ok(streams.into_iter().map(|(_, stream)| stream).collect())
     }
 }
 

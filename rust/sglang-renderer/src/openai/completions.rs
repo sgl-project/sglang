@@ -16,7 +16,7 @@ use crate::{
     GenerationStream, MatchedStop, RendererService, ResponseError, engine::TokenDecoder,
 };
 use dynamo_protocols::types::{CompletionUsage, Prompt};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use serde::Serialize;
 
 pub(crate) struct SubmittedChoice {
@@ -161,24 +161,33 @@ pub(crate) async fn unary_completion(
     echo: bool,
     want_logprobs: bool,
 ) -> Result<CompletionResponseWire, ResponseError> {
-    // Every request is already submitted, so draining in choice order does not
-    // serialize generation. The non-streaming native path sends one terminal
-    // result, and the accumulator also tolerates intermediate frames.
-    let mut choices = Vec::with_capacity(submitted.len());
+    // Poll every submitted stream so a later error releases pending siblings
+    // immediately, then restore the response's choice order on success.
+    let mut collected: Vec<_> = submitted
+        .into_iter()
+        .map(|choice| async move {
+            collect_output(choice.events)
+                .await
+                .map(|output| (choice.index, choice.prompt_index, choice.echo, output))
+        })
+        .collect::<FuturesUnordered<_>>()
+        .try_collect()
+        .await?;
+    collected.sort_unstable_by_key(|(index, ..)| *index);
+
+    let mut choices = Vec::with_capacity(collected.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
 
-    for choice in submitted {
-        let output = collect_output(choice.events).await?;
-
+    for (index, prompt_index, prompt_echo, output) in collected {
         prompt_tokens
-            .entry(choice.prompt_index)
+            .entry(prompt_index)
             .or_insert(output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let response_choice = completion_choice(
-            choice.index,
+            index,
             if echo {
-                choice.echo + &output.text
+                prompt_echo + &output.text
             } else {
                 output.text.clone()
             },
@@ -621,6 +630,81 @@ mod tests {
         assert!(value.get("system_fingerprint").is_none());
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn unary_completion_observes_later_errors_and_drops_pending_choices() {
+        for choice_count in [2, 64] {
+            for truncated in [false, true] {
+                let (choices, mut senders): (Vec<_>, Vec<_>) =
+                    (0..choice_count).map(|index| submitted(index, 0)).unzip();
+                let last = senders.pop().unwrap();
+                if !truncated {
+                    last.send(Err(ResponseError {
+                        kind: crate::ResponseErrorKind::Unavailable,
+                        message: "later choice failed".into(),
+                    }))
+                    .await
+                    .unwrap();
+                }
+                drop(last);
+
+                let response =
+                    unary_completion(choices, "cmpl-test".into(), "model".into(), 1, false, false);
+                futures::pin_mut!(response);
+                let std::task::Poll::Ready(result) = futures::poll!(response.as_mut()) else {
+                    panic!("later error waited for an earlier choice: {choice_count}, {truncated}");
+                };
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    if truncated {
+                        crate::ResponseErrorKind::Internal
+                    } else {
+                        crate::ResponseErrorKind::Unavailable
+                    }
+                );
+                assert!(senders.iter().all(|sender| sender.is_closed()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_completion_collects_out_of_order_and_preserves_metadata() {
+        let (mut choice0, tx0) = submitted(0, 0);
+        let (mut choice1, tx1) = submitted(1, 0);
+        let (mut choice2, tx2) = submitted(2, 1);
+        choice0.echo = "prompt-a:".into();
+        choice1.echo = "prompt-a:".into();
+        choice2.echo = "prompt-b:".into();
+        tx2.send(chunk("c", true)).await.unwrap();
+        tx1.send(chunk("b", true)).await.unwrap();
+
+        let response = unary_completion(
+            vec![choice0, choice1, choice2],
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            true,
+            false,
+        );
+        futures::pin_mut!(response);
+        assert!(futures::poll!(response.as_mut()).is_pending());
+        assert!(tx1.is_closed());
+        assert!(tx2.is_closed());
+        tx0.send(chunk("a", true)).await.unwrap();
+
+        let value = serde_json::to_value(response.await.unwrap()).unwrap();
+        for (index, text) in ["prompt-a:a", "prompt-a:b", "prompt-b:c"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(value["choices"][index]["index"], index);
+            assert_eq!(value["choices"][index]["text"], *text);
+            assert_eq!(value["choices"][index]["matched_stop"], "</s>");
+        }
+        assert_eq!(value["usage"]["prompt_tokens"], 10);
+        assert_eq!(value["usage"]["completion_tokens"], 3);
     }
 
     #[tokio::test]
