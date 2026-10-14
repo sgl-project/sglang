@@ -2279,6 +2279,67 @@ class UnifiedRadixCacheSuite:
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_swa_unfinished_req_repoints_whole_insert_below_window(self):
+        # A request whose live SWA tail inside the inserted range is shorter
+        # than the window must still end up protected for the whole insert:
+        # the tree owns those slots now, and a shorter protected length lets
+        # the request free tree-owned SWA pages and re-insert them at finish.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        # Live SWA is [6, 8): two tokens, below the window of four.
+        evicted_len = 6
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        # The window already slid past [0, 6): those SWA slots are freed.
+        allocator.free_swa(kv_indices[:evicted_len])
+        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+
+        cache.checkpoint(req, up_to=req.extend_end)
+
+        inserted = len(tokens) - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, inserted)
+        torch.testing.assert_close(
+            req_to_token_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)],
+            kv_indices,
+            check_dtype=False,
+        )
+        # A fresh matcher still needs a full live window and gets nothing.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(m.device_prefix_len, 0)
+
+        finish_req(cache, req, len(tokens))
+        req.kv.mark_kv_released()
+        cache.sanity_check()
+        # Everything the request held is now tree-owned exactly once.
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
