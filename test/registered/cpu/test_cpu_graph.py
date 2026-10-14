@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
-"""
-
 import copy
 import os
 import unittest
@@ -13,20 +8,26 @@ import torch
 
 import sglang.srt.model_executor.cpu_graph_runner as cpu_graph_runner_module
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+    handle_cuda_graph_config,
+)
+from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
-    check_cpu_graph_backend,
     default_prefill_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -37,7 +38,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=315, suite="stage-a-tp-test-cpu-intel")
 
 
 def _make_cpu_graph_runner():
@@ -70,49 +71,52 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
 
 
 class TestCPUGraph(CustomTestCase):
-
     def _resolve_cpu_graph_args(self, **overrides):
         args = ServerArgs(model_path="dummy", device="cpu", **overrides)
-        args._parse_cuda_graph_config()
-        model_config = SimpleNamespace(is_multimodal=False)
-        args.model_config = model_config
-        with patch.object(args, "use_mla_backend", return_value=False), patch.object(
-            args, "get_model_config", return_value=model_config
+        args._model_config = SimpleNamespace(
+            is_multimodal=False,
+            is_generation=True,
+            is_encoder_decoder=False,
+            is_mrope=False,
+            is_deepseek_v4=False,
+            attention_arch=None,
+            is_mla=False,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            head_dim=128,
+            num_hidden_layers=32,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        handle_cuda_graph_config(args)
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend", return_value=False
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
         ):
-            args._handle_gpu_memory_settings(None)
-        return args
+            handle_gpu_memory_settings(args)
+        return resolved_view(args)
 
     def test_cpu_prefill_backend_defaults_to_disabled(self):
         self.assertEqual(default_prefill_backend(), Backend.DISABLED)
 
     def test_cpu_graph_backend_requires_intel_amx_for_both_phases(self):
-        model_runner = SimpleNamespace(
-            device="cpu",
-            prefill_attention_backend_str="intel_amx",
-            decode_attention_backend_str="intel_amx",
-        )
-        with patch(
-            "sglang.srt.model_executor.cuda_graph_config.check_cuda_graph_backend",
-            side_effect=lambda phase, backend: backend == Backend.FULL,
-        ), patch(
-            "sglang.srt.runtime_context.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=True)
-            ),
-        ):
-            self.assertTrue(check_cpu_graph_backend(model_runner, "decode"))
+        mr = ModelRunner.__new__(ModelRunner)
+        mr.device = "cpu"
+        mr.prefill_attention_backend_str = "intel_amx"
+        mr.decode_attention_backend_str = "intel_amx"
+        self.assertTrue(mr._uses_cpu_graph_attention_backend())
 
-        model_runner.decode_attention_backend_str = "torch_native"
-        with patch(
-            "sglang.srt.model_executor.cuda_graph_config.check_cuda_graph_backend",
-            side_effect=lambda phase, backend: backend == Backend.FULL,
-        ), patch(
-            "sglang.srt.runtime_context.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=True)
-            ),
-        ):
-            self.assertFalse(check_cpu_graph_backend(model_runner, "decode"))
+        mr.decode_attention_backend_str = "torch_native"
+        self.assertFalse(mr._uses_cpu_graph_attention_backend())
+
+        mr.decode_attention_backend_str = "intel_amx"
+        mr.prefill_attention_backend_str = "torch_native"
+        self.assertFalse(mr._uses_cpu_graph_attention_backend())
 
     def test_prefill_graph_dispatches_inner_language_model(self):
         class ToyLanguageModel(torch.nn.Module):
@@ -218,7 +222,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.FULL)
         self.assertEqual(
             args.cuda_graph_config.prefill.bs,
-            args._generate_prefill_cuda_graph_batch_sizes(
+            generate_prefill_cuda_graph_batch_sizes(
                 args.cuda_graph_config.prefill.max_bs
             ),
         )
@@ -230,22 +234,6 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.decode.bs[-1], 4)
 
         args = self._resolve_cpu_graph_args(
-            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=4))
-        )
-        self.assertEqual(args.torch_compile_max_bs, 4)
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
-        self.assertEqual(args.cuda_graph_config.decode.bs[-1], 4)
-
-        args = self._resolve_cpu_graph_args(
-            torch_compile_max_bs=4,
-            cuda_graph_max_bs_decode=8,
-        )
-        self.assertEqual(args.torch_compile_max_bs, 8)
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 8)
-        self.assertEqual(args.cuda_graph_config.decode.bs[-1], 8)
-
-        args = self._resolve_cpu_graph_args(
-            cuda_graph_max_bs_decode=8,
             cuda_graph_bs_decode=[1, 2, 4],
         )
         self.assertEqual(args.torch_compile_max_bs, 4)
@@ -259,17 +247,17 @@ class TestCPUGraph(CustomTestCase):
             is_draft_worker=False,
             prefill_attention_backend_str="intel_amx",
             decode_attention_backend_str="intel_amx",
+            _uses_cpu_graph_attention_backend=lambda: True,
         )
 
-        with patch(
-            "sglang.srt.model_executor.cuda_graph_config.check_cuda_graph_backend",
-            side_effect=lambda phase, backend: backend == graph_setup.Backend.FULL,
-        ), patch.object(
-            graph_setup, "CPUGraphRunner", return_value=eager_runner
-        ), patch(
-            "sglang.srt.runtime_context.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=True)
+        with (
+            patch.object(graph_setup, "CPUGraphRunner", return_value=eager_runner),
+            patch.object(
+                graph_setup,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
             ),
         ):
             capture = graph_setup.capture_prefill_graph(
@@ -279,14 +267,15 @@ class TestCPUGraph(CustomTestCase):
 
         self.assertIs(capture.runner, eager_runner)
 
-        model_runner.prefill_attention_backend_str = "torch_native"
-        with patch(
-            "sglang.srt.model_executor.cuda_graph_config.check_cuda_graph_backend",
-            side_effect=lambda phase, backend: backend == graph_setup.Backend.FULL,
-        ), patch(
-            "sglang.srt.runtime_context.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=True)
+        model_runner._uses_cpu_graph_attention_backend = lambda: False
+        with (
+            patch.object(graph_setup, "CPUGraphRunner", return_value=eager_runner),
+            patch.object(
+                graph_setup,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
             ),
         ):
             capture = graph_setup.capture_prefill_graph(
@@ -295,29 +284,6 @@ class TestCPUGraph(CustomTestCase):
             )
 
         self.assertIsNone(capture.runner)
-
-    def test_cpu_prefill_graph_rejects_unsupported_backend(self):
-        model_runner = SimpleNamespace(
-            device="cpu",
-            is_draft_worker=False,
-            prefill_attention_backend_str="intel_amx",
-            decode_attention_backend_str="intel_amx",
-        )
-
-        with patch(
-            "sglang.srt.model_executor.cuda_graph_config.check_cuda_graph_backend",
-            return_value=False,
-        ), patch(
-            "sglang.srt.runtime_context.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=True)
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "only supports the 'full'"):
-                graph_setup.capture_prefill_graph(
-                    model_runner=model_runner,
-                    eager_runner=object(),
-                )
 
     def test_encoder_decoder_decode_graph_reuses_cpu_runner(self):
         cpu_graph_runner = CPUGraphRunner.__new__(CPUGraphRunner)
@@ -333,10 +299,19 @@ class TestCPUGraph(CustomTestCase):
             model_config=SimpleNamespace(is_encoder_decoder=True),
         )
 
-        with patch.object(
-            graph_setup,
-            "check_cpu_graph_backend",
-            return_value=True,
+        with (
+            patch.object(
+                graph_setup,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
+            ),
+            patch.object(
+                graph_setup,
+                "get_model",
+                return_value=SimpleNamespace(model_impl="auto"),
+            ),
         ):
             capture = graph_setup.capture_decode_graph(
                 model_runner=model_runner,
@@ -449,12 +424,12 @@ class TestCPUGraph(CustomTestCase):
             "--enable-torch-compile",
             "--torch-compile-max-bs",
             "2",
-            "--cuda-graph-bs",
-            "2",
-            "--cuda-graph-bs-prefill",
-            "128",
+            "--cuda-graph-bs-decode",
+            "1,2",
             "--cuda-graph-backend-prefill",
             "full",
+            "--cuda-graph-bs-prefill",
+            "128",
         ],
         min_throughput=7,
     )
@@ -468,6 +443,7 @@ class TestCPUGraph(CustomTestCase):
         n_numa_node = len(cpu_ids_by_node)
         env = copy.deepcopy(os.environ)
         env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
+        env["SGLANG_TORCH_DYNAMIC_SHAPE"] = "1"
         process = popen_launch_server(
             model,
             base_url,
@@ -481,8 +457,12 @@ class TestCPUGraph(CustomTestCase):
                 "--trust-remote-code",
                 "--disable-overlap-schedule",
                 "--enable-torch-compile",
-                "--cuda-graph-bs",
-                "2",
+                "--cuda-graph-bs-decode",
+                "1,2",
+                "--cuda-graph-backend-prefill",
+                "full",
+                "--cuda-graph-max-bs-prefill",
+                "512",
                 "--tp",
                 f"{n_numa_node}",
             ],
@@ -498,7 +478,7 @@ class TestCPUGraph(CustomTestCase):
                 num_threads=32,
             )
 
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             if is_in_ci():
                 self.assertGreater(metrics["score"], 0.45)
         finally:
