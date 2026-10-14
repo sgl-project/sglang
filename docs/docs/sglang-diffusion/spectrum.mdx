@@ -106,3 +106,7 @@ acceleration (latency from single runs, indicative only):
 | `--cfg-gate-step 0.9` | 46.1–47.1 dB | 0.001 | 57 s |
 
 At guidance 5.0 the accelerated settings lose another 1–7 dB.
+
+Wan therefore caps gating at the last 5 steps: an earlier gate is moved to step
+`num_steps - 5` with a warning, so at 50 steps `--cfg-gate-step 0.3` and `0.7`
+run as `0.9`. The 0.3 and 0.7 rows above were measured without the cap.

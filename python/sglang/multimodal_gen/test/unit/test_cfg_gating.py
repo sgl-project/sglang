@@ -273,6 +273,41 @@ class TestCFGGating(CustomTestCase):
                         )
         self.assertIsNone(Flux2PipelineConfig().cfg_gate_max_reused_steps)
 
+    def test_wan_gate_reuses_at_most_five_steps(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            Wan2_2_T2V_A14B_Config,
+            WanI2V480PConfig,
+            WanT2V480PConfig,
+        )
+
+        stage = DenoisingStage.__new__(DenoisingStage)
+        for steps in (20, 50):
+            for parallel in (False, True):
+                # 0.3 is capped; 0.95 already reuses fewer than five steps.
+                for fraction in (0.3, 0.95, 1.0):
+                    with self.subTest(
+                        steps=steps, parallel=parallel, fraction=fraction
+                    ):
+                        ctx = SimpleNamespace(
+                            timesteps=torch.arange(steps), extra={}, is_warmup=True
+                        )
+                        args = self._make_server_args(parallel)
+                        args.pipeline_config = WanT2V480PConfig()
+                        stage._init_cfg_gate_state(
+                            ctx, self._make_batch(fraction), args
+                        )
+                        state = ctx.extra["cfg_gate_state"]
+                        active = fraction < 1 and not parallel
+                        self.assertEqual(state["active"], active)
+                        expected = (
+                            max(int(steps * fraction), steps - 5)
+                            if active
+                            else steps + 1
+                        )
+                        self.assertEqual(state["gate_step"], expected)
+        for config in (WanI2V480PConfig(), Wan2_2_T2V_A14B_Config()):
+            self.assertEqual(config.cfg_gate_max_reused_steps, 5)
+
     def test_rejects_invalid_gate_fraction(self):
         stage = DenoisingStage.__new__(DenoisingStage)
         ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
