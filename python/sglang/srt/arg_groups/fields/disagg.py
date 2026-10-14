@@ -84,7 +84,7 @@ class Disagg(msgspec.Struct):
     ] = None
     disaggregation_decode_enable_radix_cache: A[
         bool,
-        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
+        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, --disaggregation-transfer-backend fake, and speculative algorithms other than EAGLE, EAGLE3, and DSPARK.",
     ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
@@ -178,5 +178,5 @@ class Disagg(msgspec.Struct):
     sm_group_num: A[int, "Number of sm partition groups."] = 8
     disaggregation_decode_host_receive_threshold: A[
         float,
-        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 0 disables host receive. Size with --hicache-size or --hicache-ratio; requires dense MHA and a transfer backend that supports host destinations. No built-in backend currently supports this.",
-    ] = 0.0
+        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 1 disables host receive (default), 0 always uses host receive. Size with --hicache-size or --hicache-ratio; requires dense NHD MHA buffers (including separate paged SWA pools) and a transfer backend that supports host destinations. No built-in backend currently supports this.",
+    ] = 1.0

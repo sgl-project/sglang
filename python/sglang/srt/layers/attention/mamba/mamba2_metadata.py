@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
@@ -64,6 +65,7 @@ class ForwardMetadata:
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    state_checkpoint_indices: Optional[torch.Tensor] = None
     track_ssm_seq_idx: Optional[torch.Tensor] = None
     track_ssm_end_locs: Optional[torch.Tensor] = None
     track_ssm_recompute_dst: Optional[torch.Tensor] = None
