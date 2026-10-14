@@ -2667,7 +2667,9 @@ def _setup_and_run_http_server(
         # This is only supported in single tokenizer mode.
         #
         # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - api_key only: behavior matches legacy (all endpoints require api_key,
+        #   including ADMIN_OPTIONAL management endpoints). The warning below
+        #   tells operators to set --admin-api-key; it does not reject the key.
         # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
         #   admin_api_key is not configured.
         if (
@@ -2675,8 +2677,14 @@ def _setup_and_run_http_server(
             or get_serving().admin_api_key
             or app_has_admin_force_endpoints(app)
         ):
-            from sglang.srt.utils.auth import add_api_key_middleware
+            from sglang.srt.utils.auth import (
+                add_api_key_middleware,
+                warn_single_key_admin_optional,
+            )
 
+            warn_single_key_admin_optional(
+                get_serving().api_key, get_serving().admin_api_key
+            )
             add_api_key_middleware(
                 app,
                 api_key=get_serving().api_key,
