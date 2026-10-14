@@ -30,6 +30,7 @@ def _router_gemm_bf16x3_kernel(
     col, row, part = ct.bid(0), ct.bid(1), ct.bid(2)
     if PDL:
         ct.grid_dependency_control_launch_dependents()
+        ct.grid_dependency_control_wait()
     steps = ct.cdiv(ct.cdiv(X.shape[1], BK), SPLIT_K)
     if EXPERT_MAJOR:
         total = ct.full((4 * BN, BM), 0, ct.float32)

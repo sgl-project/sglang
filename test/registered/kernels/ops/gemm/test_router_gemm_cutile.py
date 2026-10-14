@@ -11,6 +11,8 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-
 
 pytest.importorskip("cuda.tile")
 
+import cuda.tile as ct  # noqa: E402
+
 from sglang.kernels.ops.gemm.router_gemm_cutile import (  # noqa: E402
     router_gemm_bf16x3_cutile,
 )
@@ -152,6 +154,47 @@ def test_cuda_graph_replay(m):
         x.normal_()
         w.normal_(std=0.02)
         split_fp32_to_bf16x3(w, out=parts)
+        graph.replay()
+        _check(out, x, w)
+
+
+@ct.kernel
+def _pdl_producer(source, output):
+    ct.grid_dependency_control_launch_dependents()
+    # Keep input production pending after releasing the dependent GEMM.
+    delay = ct.astype(ct.load(source, (0,), (32,)), ct.float32)
+    for _ in range(1024):
+        delay = ct.sin(delay) + 0.001
+    offset = ct.sum(delay, axis=0) / 32
+    for block in range(ct.bid(0), ct.cdiv(source.shape[0], 1024), 32):
+        value = ct.load(source, (block,), (1024,), padding_mode=ct.PaddingMode.ZERO)
+        ct.store(output, (block,), ct.astype(value + offset, ct.bfloat16))
+
+
+@pytest.mark.parametrize("m", [512, 1024])
+def test_pdl_producer_graph_replay(m):
+    torch.manual_seed(1)
+    source = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
+    x = torch.empty_like(source)
+    w = torch.randn(256, 5120, device="cuda") * 0.02
+    parts = split_fp32_to_bf16x3(w)
+    ct.launch(
+        torch.cuda.current_stream(), (32,), _pdl_producer, (source.view(-1), x.view(-1))
+    )
+    torch.cuda.synchronize()
+    router_gemm_bf16x3_cutile(x, parts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ct.launch(
+            torch.cuda.current_stream(),
+            (32,),
+            _pdl_producer,
+            (source.view(-1), x.view(-1)),
+        )
+        out = router_gemm_bf16x3_cutile(x, parts)
+    for _ in range(3):
+        source.normal_()
+        x.fill_(float("nan"))
         graph.replay()
         _check(out, x, w)
 
