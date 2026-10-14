@@ -468,7 +468,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             tree_cache=tree,
             metrics_sink=SimpleNamespace(enable_metrics=False),
             counters=LaunchCounters(),
-            release_aborted_request=lambda req: None,
+            request_retirer=SimpleNamespace(release_aborted_request=lambda req: None),
             clear_pending_chunk_send=lambda req: None,
         )
         with patch(

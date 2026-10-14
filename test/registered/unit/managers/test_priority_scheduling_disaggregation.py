@@ -30,6 +30,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E40
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -80,6 +81,12 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             else None
         )
         scheduler.ipc_channels = MagicMock()
+        scheduler.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
+            beam_coordinator=MagicMock(),
+            output_streamer=MagicMock(),
+            ipc_channels=scheduler.ipc_channels,
+        )
         return scheduler
 
     def _new_req(self, priority=None):
@@ -137,7 +144,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = self._new_req(priority=10)
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
             scheduler._add_request_to_queue(req)
@@ -152,16 +159,16 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler = self._new_scheduler(mode)
                 get_context().override("test", enable_priority_scheduling=False)
                 get_context().override("test", abort_on_priority_when_disabled=True)
-                scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
                 req = self._new_req(priority=10)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(req)
 
-                scheduler.tree_cache.finish.assert_called_once_with(
+                scheduler.request_retirer.tree_cache.finish.assert_called_once_with(
                     req.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 scheduler._prefetch_kvcache.assert_not_called()
@@ -177,7 +184,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler = self._new_scheduler(DisaggregationMode.NULL)
                 del scheduler._abort_on_queued_limit  # Exercise the real queue check.
                 scheduler.max_queued_requests = 1
-                scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
                 scheduler.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
@@ -185,13 +192,13 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 incoming = self._new_req(priority=priority)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(incoming)
 
                 rejected = incoming if priority == 0 else queued
-                scheduler.tree_cache.finish.assert_called_once_with(
+                scheduler.request_retirer.tree_cache.finish.assert_called_once_with(
                     rejected.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 if priority == 0:
@@ -210,7 +217,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler = self._new_scheduler(DisaggregationMode.NULL)
                 del scheduler._abort_on_queued_limit  # Exercise the real queue check.
                 scheduler.max_queued_requests = limit
-                scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.request_retirer.tree_cache = MagicMock(spec=["finish"])
                 scheduler.beam_coordinator = MagicMock()
                 admitted = self._new_req(priority=0)
                 admitted.rid = "admitted"
@@ -221,7 +228,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 preempted.rid = "preempted"
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(preempted, admitted={admitted})
@@ -463,9 +470,17 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.lists.decoding = []
         scheduler.hisparse_coordinator = None
         scheduler.tree_cache = MagicMock()
+        scheduler.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
+            beam_coordinator=MagicMock(),
+            output_streamer=MagicMock(),
+            ipc_channels=scheduler.ipc_channels,
+        )
 
         with (
-            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.get_serving"
+            ) as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None

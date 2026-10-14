@@ -25,6 +25,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -84,7 +85,7 @@ class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -105,6 +106,12 @@ class TestQueuedLimitAbort(CustomTestCase):
             enable_hierarchical_cache=True,
         )
         s.tree_cache = MagicMock(spec=["finish"])
+        s.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=s.tree_cache),
+            beam_coordinator=s.beam_coordinator,
+            output_streamer=MagicMock(),
+            ipc_channels=s.ipc_channels,
+        )
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
 

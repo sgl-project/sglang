@@ -84,7 +84,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched._release_aborted_request = Mock()
+        sched.request_retirer = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 

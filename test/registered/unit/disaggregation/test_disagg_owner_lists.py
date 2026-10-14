@@ -72,7 +72,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             send_kv_chunk=Mock(),
             output_streamer=Mock(),
             metrics_sink=SimpleNamespace(enable_metrics=False),
-            release_aborted_request=Mock(),
+            request_retirer=Mock(),
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
         )
@@ -153,7 +153,7 @@ class TestDisaggPrefillLists(CustomTestCase):
 
         bootstrap.abort(AbortReq(rid="r"))
 
-        owner.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
         owner.kv_senders["r"].abort.assert_called_once_with()
         owner.kv_senders["other"].abort.assert_not_called()
 
@@ -274,8 +274,7 @@ class TestDisaggDecodeLists(CustomTestCase):
             max_running_requests=8,
             core_lists=CoreLists(),
             tree_cache=Mock(),
-            release_aborted_request=Mock(),
-            send_abort_output=Mock(),
+            request_retirer=Mock(),
             retire_beam_group=Mock(),
             batch_result_processor=SimpleNamespace(release_finished_req=Mock()),
         )
@@ -357,7 +356,7 @@ class TestDisaggDecodeLists(CustomTestCase):
 
         self.assertEqual(_names(owner)["retracted"], ["x"])
         discard.assert_called_once()
-        owner.send_abort_output.assert_called_once()
+        owner.request_retirer.send_abort_output.assert_called_once()
 
     def test_abort_from_held(self):
         owner = self.owner
@@ -367,7 +366,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("held", "r")
 
         self.assertEqual(_names(owner)["held"], ["x"])
-        owner.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
 
     def test_abort_from_transfer_aborts_the_receiver(self):
         owner = self.owner
@@ -388,7 +387,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("ready", "r")
 
         self.assertEqual(_names(owner)["ready"], ["x"])
-        owner.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
         owner.batch_result_processor.release_finished_req.assert_called_once_with(
             req, checkpoint=True
         )

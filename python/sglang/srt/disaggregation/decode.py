@@ -167,6 +167,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.observability.metrics_collector import (
         SchedulerMetricsCollector,
     )
@@ -455,7 +458,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
-        retire_unadmitted_request: Callable[[Req], None],
+        request_retirer: RequestRetirer,
         core_lists: CoreLists,
         get_ready: Callable[[], List[Req]],
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
@@ -491,7 +494,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
         self.pool_stats_observer = pool_stats_observer
-        self.retire_unadmitted_request = retire_unadmitted_request
+        self.request_retirer = request_retirer
         self.core_lists = core_lists
         self.get_ready = get_ready
         self.get_pending_lora_ids = get_pending_lora_ids
@@ -885,7 +888,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.retire_unadmitted_request(req)
+            self.request_retirer.retire_unadmitted_request(req)
             return
         if is_retracted and dsv41_dspark_needs_rebootstrap(
             self.token_to_kv_pool_allocator
@@ -3159,9 +3162,7 @@ class DisaggDecode:
         metrics_collector: Optional[SchedulerMetricsCollector],
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
-        retire_unadmitted_request: Callable[[Req], None],
-        release_aborted_request: Callable[[Req], None],
-        send_abort_output: Callable[..., None],
+        request_retirer: RequestRetirer,
         retire_beam_group: Callable[[Req], None],
         batch_result_processor: SchedulerBatchResultProcessor,
         flags: EngineFlags,
@@ -3213,8 +3214,7 @@ class DisaggDecode:
         self.ngram_embedding_manager = ngram_embedding_manager
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.decode_offload_manager = decode_offload_manager
-        self.release_aborted_request = release_aborted_request
-        self.send_abort_output = send_abort_output
+        self.request_retirer = request_retirer
         self.retire_beam_group = retire_beam_group
         self.batch_result_processor = batch_result_processor
         self.flags = flags
@@ -3294,7 +3294,7 @@ class DisaggDecode:
             metrics_collector=metrics_collector,
             output_streamer=output_streamer,
             pool_stats_observer=pool_stats_observer,
-            retire_unadmitted_request=retire_unadmitted_request,
+            request_retirer=request_retirer,
             core_lists=core_lists,
             get_ready=lambda: self.ready,
             get_pending_lora_ids=get_pending_lora_ids,
@@ -3436,7 +3436,7 @@ class DisaggDecode:
                         self.tree_cache,
                         get_disagg().disaggregation_decode_retraction_backup,
                     )
-                    self.send_abort_output(decode_req)
+                    self.request_retirer.send_abort_output(decode_req)
                 else:
                     remaining_retracted.append(decode_req)
             self.prealloc_queue.retracted_queue = remaining_retracted
@@ -3452,8 +3452,10 @@ class DisaggDecode:
                 r for r in held if r not in aborted
             ]
             for req in aborted:
-                self.release_aborted_request(req)
-                self.send_abort_output(req, finished_reason=recv_req.finished_reason)
+                self.request_retirer.release_aborted_request(req)
+                self.request_retirer.send_abort_output(
+                    req, finished_reason=recv_req.finished_reason
+                )
 
     def _abort_transfer_reqs(self, recv_req: AbortReq) -> None:
         # Abort requests waiting for kvcache to release tree cache
@@ -3481,11 +3483,13 @@ class DisaggDecode:
             # Abort method 1: directly pop from the list.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.ready.pop(i)
-            self.release_aborted_request(req)
+            self.request_retirer.release_aborted_request(req)
             self.retire_beam_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.send_abort_output(req, finished_reason=recv_req.finished_reason)
+            self.request_retirer.send_abort_output(
+                req, finished_reason=recv_req.finished_reason
+            )
             # The request in the ready list has KV cache allocated.
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 discard_kv_cache_backup(req, self.tree_cache, "host_pool")

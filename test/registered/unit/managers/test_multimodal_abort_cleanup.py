@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -104,6 +105,12 @@ def _queued_scheduler(req):
     scheduler.grammar_manager = MagicMock()
     scheduler.lists.decoding = []
     scheduler.hisparse_coordinator = None
+    scheduler.request_retirer = RequestRetirer(
+        kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
+        beam_coordinator=scheduler.beam_coordinator,
+        output_streamer=MagicMock(),
+        ipc_channels=scheduler.ipc_channels,
+    )
     return scheduler
 
 

@@ -113,6 +113,9 @@ if TYPE_CHECKING:
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.observability.metrics_collector import (
@@ -207,7 +210,7 @@ class PrefillBootstrapQueue:
         pp_group: Any,
         output_streamer: SchedulerOutputStreamer,
         counters: LaunchCounters,
-        retire_unadmitted_request: Callable[[Req], None],
+        request_retirer: RequestRetirer,
         handle_bootstrap_failure: Callable[[Req], None],
     ):
         parallel = get_parallel()
@@ -240,7 +243,7 @@ class PrefillBootstrapQueue:
         self.pp_group = pp_group
         self.output_streamer = output_streamer
         self.counters = counters
-        self.retire_unadmitted_request = retire_unadmitted_request
+        self.request_retirer = request_retirer
         self.handle_bootstrap_failure = handle_bootstrap_failure
         self.pp_poll_sync_work_list: List = []
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -473,7 +476,7 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.retire_unadmitted_request(req)
+            self.request_retirer.retire_unadmitted_request(req)
             return
         if not self.create_sender(req, num_kv_heads):
             return
@@ -618,8 +621,7 @@ class DisaggPrefill:
         metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
-        retire_unadmitted_request: Callable[[Req], None],
-        release_aborted_request: Callable[[Req], None],
+        request_retirer: RequestRetirer,
     ):
         token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         draft_token_to_kv_pool = kv.draft_token_to_kv_pool
@@ -649,7 +651,7 @@ class DisaggPrefill:
         self.metrics_collector = metrics_collector
         self.batch_result_processor = batch_result_processor
         self.counters = counters
-        self.release_aborted_request = release_aborted_request
+        self.request_retirer = request_retirer
 
         # *2 for the headroom.
         buffer_size = max_running_requests * 2
@@ -685,7 +687,7 @@ class DisaggPrefill:
             pp_group=pp_group,
             output_streamer=output_streamer,
             counters=counters,
-            retire_unadmitted_request=retire_unadmitted_request,
+            request_retirer=request_retirer,
             handle_bootstrap_failure=self.handle_bootstrap_failure,
         )
         self.kv_checksum_computer = self.bootstrap_queue.kv_checksum_computer
@@ -749,7 +751,7 @@ class DisaggPrefill:
         for req in self.bootstrap_queue.queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.release_aborted_request(req)
+                self.request_retirer.release_aborted_request(req)
 
                 if hasattr(self.kv_senders[req.rid], "abort"):
                     self.kv_senders[req.rid].abort()
@@ -1287,7 +1289,7 @@ class DisaggPrefill:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self.release_aborted_request(req)
+        self.request_retirer.release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1707,7 +1709,7 @@ class DisaggPrefill:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self.release_aborted_request(req)
+        self.request_retirer.release_aborted_request(req)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)

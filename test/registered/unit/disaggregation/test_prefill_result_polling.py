@@ -41,6 +41,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -163,7 +164,7 @@ for _name, _source in (
     ("metrics_collector", "metrics_collector"),
     ("batch_result_processor", "batch_result_processor"),
     ("send_kv_chunk", "send_kv_chunk"),
-    ("release_aborted_request", "_release_aborted_request"),
+    ("request_retirer", "request_retirer"),
 ):
     setattr(_Owner, _name, property(lambda self, n=_source: getattr(self.scheduler, n)))
 
@@ -1441,8 +1442,6 @@ class TestPrefillResultPolling(CustomTestCase):
                 other = _batch(100)
 
                 class OptimisticScheduler(_Scheduler):
-                    _release_aborted_request = Scheduler._release_aborted_request
-
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
@@ -1469,6 +1468,12 @@ class TestPrefillResultPolling(CustomTestCase):
                     pause_at=pause_at,
                     resume_at=pause_at + 2,
                     pause_mode="retract",
+                )
+                scheduler.request_retirer = RequestRetirer(
+                    kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
+                    beam_coordinator=None,
+                    output_streamer=None,
+                    ipc_channels=None,
                 )
                 scheduler.disagg_prefill.pending_chunk_rids = set()
                 scheduler.disagg_prefill.kv_senders.update(

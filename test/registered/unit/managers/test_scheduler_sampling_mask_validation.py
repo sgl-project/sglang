@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -48,6 +49,12 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler._add_request_to_queue = MagicMock()
                 scheduler.output_streamer = MagicMock()
+                scheduler.request_retirer = RequestRetirer(
+                    kv=MagicMock(),
+                    beam_coordinator=MagicMock(),
+                    output_streamer=scheduler.output_streamer,
+                    ipc_channels=MagicMock(),
+                )
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
@@ -62,7 +69,9 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         return_value=1,
                     ),
                     patch("sglang.srt.managers.scheduler.Req", return_value=req),
-                    patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
+                    patch(
+                        "sglang.srt.managers.scheduler_components.request_retirer.prepare_abort"
+                    ) as abort,
                 ):
                     scheduler.handle_generate_request(recv_req)
                 abort.assert_called_once()

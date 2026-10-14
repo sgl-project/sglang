@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
         NewTokenRatioTracker,
     )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.managers.utils import GenerationBatchResult
 
 
@@ -60,8 +63,7 @@ class DllmManager:
         beam_coordinator: BeamCoordinator,
         build_extend_step: Callable[..., ScheduleBatch],
         build_sampling_info: Callable,
-        release_aborted_request: Callable[[Req], None],
-        send_abort_output: Callable[[Req], None],
+        request_retirer: RequestRetirer,
     ):
         tree_cache = kv.tree_cache
         req_to_token_pool = kv.req_to_token_pool
@@ -89,8 +91,7 @@ class DllmManager:
         self.build_sampling_info = build_sampling_info
         self.metrics_sink = metrics_sink
         self.output_streamer = output_streamer
-        self.release_aborted_request = release_aborted_request
-        self.send_abort_output = send_abort_output
+        self.request_retirer = request_retirer
 
         self.waiting: List[Req] = []
         self.staging: List[Req] = []
@@ -157,8 +158,8 @@ class DllmManager:
         if not aborted:
             return reqs
         for req in aborted:
-            self.release_aborted_request(req)
-            self.send_abort_output(req)
+            self.request_retirer.release_aborted_request(req)
+            self.request_retirer.send_abort_output(req)
             if req.kv.holds_kv or req.kv.holds_mamba:
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort dLLM queued request. {req.rid=}")

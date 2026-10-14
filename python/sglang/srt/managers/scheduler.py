@@ -150,7 +150,6 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
-    FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -309,6 +308,10 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    RequestRetirer,
+    make_abort_req,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -322,7 +325,6 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
@@ -395,7 +397,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
-    compute_weight_version_spans,
     record_weight_version_events,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -698,6 +699,8 @@ class Scheduler:
         self.init_services()
 
         self.init_batch_result_processor()
+
+        self.init_request_retirer()
 
         self.maybe_init_dllm()
 
@@ -1542,8 +1545,7 @@ class Scheduler:
             metrics_collector=self.metrics_collector,
             batch_result_processor=self.batch_result_processor,
             counters=self.counters,
-            retire_unadmitted_request=self.retire_unadmitted_request,
-            release_aborted_request=self._release_aborted_request,
+            request_retirer=self.request_retirer,
         )
 
     def maybe_init_disagg_decode(self) -> None:
@@ -1577,9 +1579,7 @@ class Scheduler:
             metrics_collector=self.metrics_collector,
             pool_stats_observer=self.pool_stats_observer,
             decode_offload_manager=self.decode_offload_manager,
-            retire_unadmitted_request=self.retire_unadmitted_request,
-            release_aborted_request=self._release_aborted_request,
-            send_abort_output=self._send_abort_output,
+            request_retirer=self.request_retirer,
             retire_beam_group=self.beam_coordinator.retire_group,
             batch_result_processor=self.batch_result_processor,
             flags=self.flags,
@@ -2787,6 +2787,14 @@ class Scheduler:
             pending=self.pending,
         )
 
+    def init_request_retirer(self) -> None:
+        self.request_retirer = RequestRetirer(
+            kv=self.kv,
+            beam_coordinator=self.beam_coordinator,
+            output_streamer=self.output_streamer,
+            ipc_channels=self.ipc_channels,
+        )
+
     def maybe_init_dllm(self) -> None:
         if get_exec().dllm.dllm_algorithm is None:
             self.dllm = None
@@ -2810,8 +2818,7 @@ class Scheduler:
             beam_coordinator=self.beam_coordinator,
             build_extend_step=self.build_extend_step,
             build_sampling_info=self._build_sampling_info,
-            release_aborted_request=self._release_aborted_request,
-            send_abort_output=self._send_abort_output,
+            request_retirer=self.request_retirer,
         )
 
     def init_internal_state(self) -> None:
@@ -3251,7 +3258,7 @@ class Scheduler:
             return
 
         if self.dllm is not None and (error_msg := self.dllm.validate_request(req)):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3288,7 +3295,7 @@ class Scheduler:
                     self.disagg_prefill or self.disagg_decode
                 ).metadata_buffers.enable_sampling_mask
             ):
-                self._reject_sampling_mask_request(
+                self.request_retirer.reject_sampling_mask_request(
                     req,
                     "return_sampling_mask requires "
                     "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
@@ -3304,13 +3311,13 @@ class Scheduler:
                     f"{top_k}. Lower top_k or increase "
                     "--sampling-mask-max-tokens."
                 )
-                self._reject_sampling_mask_request(req, error_msg)
+                self.request_retirer.reject_sampling_mask_request(req, error_msg)
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
-                self._reject_sampling_mask_request(req, error_msg)
+                self.request_retirer.reject_sampling_mask_request(req, error_msg)
                 return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -3320,7 +3327,7 @@ class Scheduler:
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            self._reject_sampling_mask_request(req, error_msg)
+            self.request_retirer.reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3560,31 +3567,6 @@ class Scheduler:
         self._retry_storage_prefetch(req)
         return True
 
-    def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request the disaggregation queues rejected at their door."""
-        # `create_req` marks a streaming session in-flight, and the pre-abort
-        # detach lives in `StreamingSession.find_active_slot`, which only runs
-        # while scheduling; a session left in-flight rejects every later request.
-        if req.session is not None and req.session.streaming:
-            req.release_mm_inputs_on_abort()
-            req.session.abort_req()
-            req.session = None
-        # `beam_coordinator.validate_and_init` counts the group in ahead of the
-        # checks that reject; no-op when the request has no group.
-        self.beam_coordinator.retire_group(req)
-        # PREFILL runs `_prefetch_kvcache` before its door, so even the
-        # one-token stub is registered with the cache by now:
-        # `prefetch_from_storage` arms the paced-retry set for this attempt's
-        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
-        # that, and a retired request reaches neither.
-        self._release_aborted_request(req)
-        # `update_finish_state` returns early once `finished()`, so an already
-        # set `finished_reason` is what the client receives; report the same.
-        reason = req.finished_reason or req.to_finish
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.update_finish_state()
-        self.output_streamer.stream_output([req], req.return_logprob)
-
     def _add_request_to_queue(
         self,
         req: Req,
@@ -3592,7 +3574,7 @@ class Scheduler:
         admitted: AbstractSet[Req] = frozenset(),
     ):
         if not self._set_or_validate_priority(req):
-            self._release_aborted_request(req)
+            self.request_retirer.release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3605,19 +3587,12 @@ class Scheduler:
             self.disagg_decode.enqueue(req, is_retracted=is_retracted)
         else:
             if self._abort_on_queued_limit(req, admitted):
-                self._release_aborted_request(req)
+                self.request_retirer.release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             self.lists.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.counters.processed_tokens_counter
-
-    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
-        """Return a sampling-mask validation error without running the model."""
-        logger.error(f"{error_msg}, {req.rid=}")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3631,7 +3606,7 @@ class Scheduler:
             and req.priority is not None
             and get_schedule().abort_on_priority_when_disabled
         ):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3643,13 +3618,6 @@ class Scheduler:
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
-
-    def _release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
-        req.release_mm_inputs_on_abort()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.session is not None and req.session.streaming:
-            req.session.abort_req()
 
     def _abort_on_queued_limit(
         self, recv_req: Req, admitted: AbstractSet[Req] = frozenset()
@@ -3686,14 +3654,14 @@ class Scheduler:
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req)
+                self.request_retirer.release_aborted_request(candidate_req)
                 self.lists.waiting_queue.remove(candidate_req)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
         self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(
+            make_abort_req(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
@@ -3910,7 +3878,7 @@ class Scheduler:
         req.to_finish = None
         if self.disagg_prefill is not None:
             self.disagg_prefill.release_aborted_chunked_req(req)
-        self._release_aborted_request(req)
+        self.request_retirer.release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.lists.chunked_req = None
@@ -3918,7 +3886,7 @@ class Scheduler:
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+            make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4705,7 +4673,7 @@ class Scheduler:
         for req in reqs_to_abort:
             abort_reason: FINISH_ABORT = req.to_finish
             self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=abort_reason.to_json()),
+                make_abort_req(req, finished_reason=abort_reason.to_json()),
                 req,
             )
         for req in reqs_to_abort:
@@ -5576,12 +5544,12 @@ class Scheduler:
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.lists.waiting_queue.pop(i)
-            self._release_aborted_request(req)
+            self.request_retirer.release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             if self.disagg_prefill is not None:
                 self.disagg_prefill.release_aborted_waiting_req(req)
@@ -5613,13 +5581,6 @@ class Scheduler:
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
-
-    def _send_abort_output(
-        self, req: Req, finished_reason: Optional[FinishReasonDict] = None
-    ) -> None:
-        self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
-        )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6136,17 +6097,3 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[FinishReasonDict] = None
-) -> AbortReq:
-    return AbortReq(
-        rid=req.rid,
-        finished_reason=finished_reason,
-        weight_versions=compute_weight_version_spans(
-            req.weight_version_events,
-            current_version=get_serving().weight_version,
-            num_output_tokens=len(req.output_ids),
-        ),
-    )

@@ -118,8 +118,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         beam_coordinator=None,
         build_extend_step=None,
         build_sampling_info=None,
-        release_aborted_request=Mock(),
-        send_abort_output=Mock(),
+        request_retirer=Mock(),
     )
 
 

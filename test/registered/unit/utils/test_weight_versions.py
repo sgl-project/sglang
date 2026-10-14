@@ -7,8 +7,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -474,7 +475,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
             accepted = Scheduler._set_or_validate_priority(scheduler, req)
@@ -494,10 +495,10 @@ class TestMakeAbortReq(CustomTestCase):
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = make_abort_req(req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")

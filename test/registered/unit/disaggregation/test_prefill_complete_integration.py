@@ -500,7 +500,7 @@ class TestAllocationIntegration(CustomTestCase):
         )
         owner = prefill_owner_shell(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            release_aborted_request=Mock(),
+            request_retirer=Mock(),
             clear_pending_chunk_send=Mock(),
             req_to_metadata_buffer_idx_allocator=Mock(),
             metrics_sink=SimpleNamespace(enable_metrics=False),

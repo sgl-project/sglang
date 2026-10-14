@@ -60,8 +60,7 @@ def _manager(**deps):
         ),
         build_extend_step=_Step,
         build_sampling_info=Mock(),
-        release_aborted_request=Mock(),
-        send_abort_output=Mock(),
+        request_retirer=Mock(),
     )
     kwargs.update(deps)
     return DllmManager(**kwargs)
@@ -336,7 +335,10 @@ class TestDllmManagerLists(unittest.TestCase):
 
         self.assertEqual(manager.waiting, [kept])
         self.assertEqual(
-            [c.args[0] for c in manager.send_abort_output.call_args_list],
+            [
+                c.args[0]
+                for c in manager.request_retirer.send_abort_output.call_args_list
+            ],
             [named, holding_kv],
         )
         release.assert_called_once_with(
@@ -357,7 +359,10 @@ class TestDllmManagerLists(unittest.TestCase):
         self.assertEqual(manager.waiting, [])
         self.assertEqual(manager.between_blocks, [])
         self.assertEqual(
-            [c.args[0] for c in manager.send_abort_output.call_args_list],
+            [
+                c.args[0]
+                for c in manager.request_retirer.send_abort_output.call_args_list
+            ],
             [waiting, between],
         )
         self.assertEqual(manager.staging, [staging])
@@ -383,7 +388,7 @@ class TestDllmManagerLists(unittest.TestCase):
         scheduler.abort_request(aborts[0])
 
         self._assert_lists(manager, waiting=[taken], staging=[])
-        manager.send_abort_output.assert_called_once_with(started)
+        manager.request_retirer.send_abort_output.assert_called_once_with(started)
         self.assertIsNone(started.to_finish)
 
 

@@ -36,6 +36,7 @@ from sglang.srt.managers.scheduler_components.mode_stages import (
     ScheduleSlot,
 )
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -723,8 +724,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.dllm = None
         scheduler.ipc_channels = MagicMock()
         release_aborted_request = MagicMock()
-        scheduler.disagg_decode.release_aborted_request = release_aborted_request
-        scheduler.disagg_decode.send_abort_output = scheduler._send_abort_output
+        retirer = RequestRetirer(
+            kv=MagicMock(),
+            beam_coordinator=MagicMock(),
+            output_streamer=MagicMock(),
+            ipc_channels=scheduler.ipc_channels,
+        )
+        retirer.release_aborted_request = release_aborted_request
+        scheduler.disagg_decode.request_retirer = retirer
 
         scheduler.abort_request(AbortReq(rid="held"))
 

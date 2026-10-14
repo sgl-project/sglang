@@ -306,6 +306,7 @@ _PARAM = {
     "NewTokenRatioTracker": ("new_token_ratio_tracker",),
     "BatchResultProcessor": ("batch_result_processor",),
     "MetricsReporter": ("metrics_reporter",),
+    "RequestRetirer": ("request_retirer",),
     "RequestRegistry": ("request_registry", "abort_request"),
     "ModeOwners": ("mode_owners",),
     "RequestEnqueuer": ("request_enqueuer",),
@@ -345,6 +346,10 @@ _BUILT = {
         "SchedulerServices",
     ),
     "GrammarManager": ("constrained/grammar_manager.py", "GrammarManager"),
+    "RequestRetirer": (
+        "managers/scheduler_components/request_retirer.py",
+        "RequestRetirer",
+    ),
 }
 
 # The modules whose classes sit below ModeOwners.
@@ -414,27 +419,7 @@ _CALLBACK_SITES = {
     # The request lists name the core lists' abort entries.
     ("request_lists", "RequestList", "abort", _BOUND): 2,
     # To be removed.
-    (
-        "maybe_init_disagg_prefill",
-        "DisaggPrefill",
-        "retire_unadmitted_request",
-        _BOUND,
-    ): 1,
-    (
-        "maybe_init_disagg_prefill",
-        "DisaggPrefill",
-        "release_aborted_request",
-        _BOUND,
-    ): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
-    (
-        "maybe_init_disagg_decode",
-        "DisaggDecode",
-        "retire_unadmitted_request",
-        _BOUND,
-    ): 1,
-    ("maybe_init_disagg_decode", "DisaggDecode", "release_aborted_request", _BOUND): 1,
-    ("maybe_init_disagg_decode", "DisaggDecode", "send_abort_output", _BOUND): 1,
     (
         "init_weight_updater",
         "SchedulerWeightUpdaterManager",
@@ -503,8 +488,6 @@ _CALLBACK_SITES = {
     ("init_running_status", "SchedulerFlushWrapper", "is_fully_idle", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "build_extend_step", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "build_sampling_info", _BOUND): 1,
-    ("maybe_init_dllm", "DllmManager", "release_aborted_request", _BOUND): 1,
-    ("maybe_init_dllm", "DllmManager", "send_abort_output", _BOUND): 1,
     ("init_metrics_reporter", "SchedulerMetricsReporter", "scheduler", _SELF): 1,
 }
 
