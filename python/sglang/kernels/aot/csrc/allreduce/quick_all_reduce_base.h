@@ -90,12 +90,10 @@ union BufferResource {
   };
 };
 
-// llvm.amdgcn.raw.buffer.* instructions do not exist on RDNA4 (gfx12).
-// Stubs satisfy the compiler; these functions must not be called on gfx1250.
-// Mirrors vLLM PR #46516 csrc/quickreduce/base.h.
-// QuickReduce remains runtime-disabled on gfx1250; these stubs only allow the
-// shared ROCm extension to compile for that target.
-#if !defined(__gfx1250__)
+// llvm.amdgcn.raw.buffer.* instructions are unavailable on gfx11/gfx12.
+// QuickReduce is runtime-disabled there; these stubs only allow a shared
+// CDNA/RDNA extension to compile.
+#if !defined(__GFX11__) && !defined(__GFX12__)
 __quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
     int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 
