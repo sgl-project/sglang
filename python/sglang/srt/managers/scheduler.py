@@ -2049,8 +2049,9 @@ class Scheduler:
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
         if not self._hosts_rust_server():
-            # Always define the attribute: init_output_streamer and the
-            # process_input_requests hook read self.rust_server unconditionally.
+            # Always define the attribute: init_output_streamer,
+            # init_request_receiver and the process_input_requests hook read
+            # self.rust_server unconditionally.
             self.rust_server = None
             return
 
