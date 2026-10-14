@@ -633,6 +633,10 @@ class KimiK3MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_moe import init_moe_rocm_state
+
+            init_moe_rocm_state(self)
 
         # SBO (single batch overlap): shared experts are bf16 + tp1-replicated
         # (~264 MB/layer/rank), the routed path is a2a-latency bound in decode
@@ -723,7 +727,13 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
-        if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_moe import select_front_modules
+
+            mods = select_front_modules(self)
+            if mods is None:
+                return
+        elif self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
@@ -1485,7 +1495,15 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        if (
+            _is_hip
+            and hidden_states.shape[0] > 0
+            and (self._eligible_for_fused_front or self._partial_fused_front)
+        ):
+            from sglang.srt.models.kimi_k3_rocm_moe import forward_fused_rocm
+
+            out = forward_fused_rocm(self, hidden_states, prefix_sum=prefix_sum)
+        elif hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
@@ -3442,6 +3460,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
+                if _is_hip:
+                    from sglang.srt.models.kimi_k3_rocm_moe import prepare_moe_rocm
+
+                    prepare_moe_rocm(layer.mlp)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
