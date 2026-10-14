@@ -1,0 +1,13 @@
+model_name: "Qwen/Qwen3.5-397B-A17B"
+tasks:
+- name: "gsm8k"
+  metrics:
+  - name: "exact_match,strict-match"
+    value: 0.9704
+  - name: "exact_match,flexible-extract"
+    value: 0.9697
+limit: 1319
+num_concurrent: 256
+num_fewshot: 5
+gen_kwargs: "max_gen_toks=2048"
+rtol: 0.05

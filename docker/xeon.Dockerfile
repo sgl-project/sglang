@@ -1,0 +1,55 @@
+FROM ubuntu:26.04
+SHELL ["/bin/bash", "-c"]
+
+ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
+ARG VER_SGLANG=main
+
+RUN apt-get update && \
+    apt-get full-upgrade -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+    ca-certificates \
+    ffmpeg \
+    git \
+    curl \
+    wget \
+    vim \
+    gcc \
+    g++ \
+    make \
+    libssl-dev \
+    libsqlite3-dev \
+    libgoogle-perftools-dev \
+    libtbb-dev \
+    libnuma-dev \
+    numactl
+
+WORKDIR /opt
+
+ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /root/.local/bin/uvx /usr/local/bin/ && \
+    uv venv --python 3.12
+
+RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchvision"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchaudio"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "triton"\nurl = "https://download.pytorch.org/whl/cpu"' > .venv/uv.toml
+
+ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
+
+WORKDIR /sgl-workspace
+RUN source /opt/.venv/bin/activate && \
+    git clone ${SGLANG_REPO} sglang && \
+    cd sglang && \
+    git checkout ${VER_SGLANG} && \
+    cd python && \
+    cp pyproject_cpu.toml pyproject.toml && \
+    uv pip install ".[diffusion]" && \
+    cd sglang/kernels/aot && \
+    cp pyproject_cpu.toml pyproject.toml && \
+    uv pip install . && \
+    uv pip install "sgl-eval==0.1.0"
+
+ENV SGLANG_USE_CPU_ENGINE=1
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
+ENV PATH="/opt/.venv/bin:$PATH"
+RUN echo 'source /opt/.venv/bin/activate' >> /root/.bashrc
+
+WORKDIR /sgl-workspace/sglang

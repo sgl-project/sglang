@@ -1,0 +1,9 @@
+{#
+ In sglang, the default chat templates often assume message['content'] is a plain string.
+ That works fine for simple text conversations, but it ignores multimodal inputs (e.g. image_url, tool_call).
+ To align with the original model behavior and support richer content,
+ we iterate over message['content'] as a list of typed items and extract their values directly.
+ This way, both text and non-text inputs are preserved in the prompt.
+ Original template: https://huggingface.co/sbintuitions/sarashina2-vision-8b?chat_template=default
+#}
+{{ bos_token + '<|prefix|><|file|><|suffix|>A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human\'s questions.\n\n' }}{% for message in messages %}{% if message['role'] == 'user' %}{{ '### Human: ' }}{%- if message['content'] is string %}{{ message['content'] }}{%- else %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{{ item['text'] }}{% endif %}{% endfor %}{% endif %}{{ '\n' }}{% elif message['role'] == 'assistant' %}{{ '### Assistant: ' }}{%- if message['content'] is string %}{{ message['content'] }}{%- else %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{{ item['text'] }}{% endif %}{% endfor %}{% endif %}{{ '\n' }}{% endif %}{% endfor %}{% if messages[-1]['role'] == 'user' %}{{ '### Assistant:' }}{% endif %}

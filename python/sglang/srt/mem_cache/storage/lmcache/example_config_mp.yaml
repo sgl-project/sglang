@@ -1,0 +1,3 @@
+# MP mode: SGLang dials the standalone `lmcache server` at this host/port.
+mp_host: 127.0.0.1
+mp_port: 5556

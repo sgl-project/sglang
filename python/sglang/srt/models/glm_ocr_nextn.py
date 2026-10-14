@@ -1,0 +1,172 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Inference-only GLM-OCR Speculative Decoding."""
+
+import logging
+from typing import Iterable, Optional, Tuple
+
+import torch
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.glm4 import Glm4DecoderLayer
+from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
+
+
+class GlmOcrModelNextN(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.debug(
+                "Overriding GlmOcrModelNextN quant config for modelopt_fp4 GLM-OCR model."
+            )
+            quant_config = None
+
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
+        )
+
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+        with layer_stack():
+            self.decoder = Glm4DecoderLayer(
+                config,
+                0,
+                quant_config=quant_config,
+                prefix=add_prefix("decoder", prefix),
+            )
+
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert input_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
+            if input_embeds is None:
+                input_embeds = self.embed_tokens(input_ids)
+        hidden_states = input_embeds
+
+        if hidden_states.shape[0] > 0:
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
+            )
+
+        residual_batch.start(forward_batch)
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.decoder(positions, hidden_states, forward_batch)
+
+        return residual_batch.final_norm(
+            hidden_states, forward_batch, self.shared_head.norm, skip_empty=True
+        )
+
+
+class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.quant_config = quant_config
+        _, rope_scaling = get_rope_config(config)
+        self.is_mrope_enabled = "mrope_section" in (rope_scaling or {})
+        self.model = GlmOcrModelNextN(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+        self.num_fused_shared_experts = 0 if is_shared_experts_fusion_disabled() else 1
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions
+        hidden_states = self.model(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        super().load_weights(weights, is_nextn=True)
+
+
+EntryClass = [GlmOcrForConditionalGenerationNextN]

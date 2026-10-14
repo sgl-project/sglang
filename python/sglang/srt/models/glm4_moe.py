@@ -1,0 +1,1438 @@
+# Copyright 2025-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
+
+import copy
+import logging
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
+from sglang.srt.distributed import (
+    get_pp_indices,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    LinearParallelGroup,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+    is_shared_experts_fusion_disabled,
+)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_bool_env_var,
+    get_device_sm,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
+    make_pp_layers,
+)
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_hip = is_hip()
+_is_cuda = is_cuda()
+_is_fp8_fnuz = is_fp8_fnuz()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+_device_sm = get_device_sm()
+
+logger = logging.getLogger(__name__)
+
+_GLM_NEXTN_EXPERT_PROJ_RE = re.compile(
+    r"mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def enable_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    return (
+        envs.SGLANG_GLM_NEXTN_MOE_PTPC.get()
+        and quant_config is not None
+        and quant_config.get_name() == "quark"
+    )
+
+
+def glm_nextn_mtp_fused_experts_excluded(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+) -> bool:
+    exclude_layers = getattr(quant_config, "exclude_layers", None) or []
+    layer_prefix = f"model.layers.{num_hidden_layers}."
+    return any(
+        name.startswith(layer_prefix) and ".mlp.experts." in name
+        for name in exclude_layers
+    )
+
+
+def should_apply_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+) -> bool:
+    if not enable_glm_nextn_moe_ptpc(quant_config):
+        return False
+    return glm_nextn_mtp_fused_experts_excluded(quant_config, num_hidden_layers)
+
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
+
+
+class Glm4MoeMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
+        prefix: str = "",
+        *,
+        parallel_group: LinearParallelGroup = "tp",
+    ) -> None:
+        super().__init__()
+        self.is_replicated = parallel_group == "replicated"
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+            parallel_group=parallel_group,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=add_prefix("down_proj", prefix),
+            parallel_group=parallel_group,
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+    ):
+        if self.is_replicated and x.shape[0] == 0:
+            return x
+
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Glm4MoeAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        start_layer: int = 0,
+        rope_theta: float = 1000000,
+        partial_rotary_factor: float = 0.5,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        rms_norm_eps: float = 1e-05,
+        attention_bias: bool = True,
+        quant_config: Optional[QuantizationConfig] = None,
+        use_qk_norm: bool = False,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.start_layer = start_layer
+
+        attn_tp_size = get_parallel().attn_tp_size
+
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= attn_tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % attn_tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.use_qk_norm = use_qk_norm
+        self.max_position_embeddings = max_position_embeddings
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=attention_bias,
+            quant_config=quant_config,
+            parallel_group="attn_tp",
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            parallel_group="attn_tp",
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            partial_rotary_factor=partial_rotary_factor,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
+        )
+
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.alt_stream = alt_stream
+
+    def forward_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        # hidden_states can be a (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        if hs.shape[0] == 0:
+            return hidden_states, forward_batch, None
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
+                )
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            if self.attn.layer_id == self.start_layer:
+                self.rotary_emb.get_cos_sin_with_position(positions)
+            if self.use_qk_norm:
+                eps = self.q_norm.variance_epsilon
+                q_weight = self.q_norm.weight
+                k_weight = self.k_norm.weight
+                q_bias = getattr(self.q_norm, "bias", None)
+                k_bias = getattr(self.k_norm, "bias", None)
+            else:
+                eps = None
+                q_weight = None
+                k_weight = None
+                q_bias = None
+                k_bias = None
+            q, k, v = split_qkv_rmsnorm_rope(
+                qkv,
+                self.rotary_emb.position_sin,
+                self.rotary_emb.position_cos,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=eps,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_bias=q_bias,
+                k_bias=k_bias,
+            )
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+        attn_output = self.attn(*inner_state)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        s = self.forward_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return self.forward_core(s)
+
+
+class Glm4MoeGate(nn.Module):
+    def __init__(
+        self,
+        config,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=torch.float32
+            )
+        )
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty((config.n_routed_experts), dtype=torch.float32)
+        )
+
+    def forward(self, hidden_states):
+        logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
+        return logits
+
+
+class Glm4MoeSparseMoeBlock(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        nn.Module.__init__(self)
+        self.top_k = config.num_experts_per_tok
+        self.tp_size = get_parallel().tp_size
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_shared_experts = config.n_shared_experts
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
+        )
+
+        self.config = config
+        self.layer_id = layer_id
+        self.alt_stream = alt_stream
+
+        if self.tp_size > config.n_routed_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.n_routed_experts}."
+            )
+
+        if config.hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only silu is supported for now."
+            )
+
+        self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
+
+        self.experts = get_moe_impl_class(quant_config)(
+            num_experts=config.n_routed_experts + self.num_fused_shared_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            top_k=self.top_k + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
+            prefix=add_prefix("experts", prefix),
+        )
+
+        self.topk = TopK(
+            top_k=self.top_k + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            apply_routed_scaling_factor_on_output=getattr(
+                self.experts, "should_fuse_routed_scaling_factor_in_topk", False
+            ),
+            fused_shared_experts_scaling_factor=1,
+        )
+
+        self.shared_experts_is_int8 = False
+        self.shared_experts_is_fp8 = False
+        self.shared_experts_weight_block_size = None
+        if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            # disable tp for shared experts when enable deepep moe, or with fp4 allgather
+            self.shared_experts = Glm4MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                else "tp",
+            )
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
+            self.shared_experts_is_int8 = (
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_fp8 = (
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+            )
+            if self.shared_experts_is_fp8:
+                if (
+                    _use_aiter
+                    and config.quantization_config.get("quant_method")
+                    == "compressed-tensors"
+                ):
+                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                else:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+
+        self.top_k = config.num_experts_per_tok
+
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_parallel().moe_ep_size
+            self.num_experts = (
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
+            )
+            self.renormalize = config.norm_topk_prob
+            self.topk_group = config.topk_group
+            self.num_expert_group = config.n_group
+            self.correction_bias = (
+                self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None
+            )
+
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
+        )
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        if not self._enable_a2a_moe:
+            if (
+                self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
+                and get_is_capture_mode()
+            ):
+                return self.forward_normal_dual_stream(hidden_states)
+            else:
+                return self.forward_normal(hidden_states)
+        else:
+            return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states)
+
+        with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+                final_hidden_states *= self.routed_scaling_factor
+
+        current_stream.wait_stream(self.alt_stream)
+        final_hidden_states += shared_output
+        return final_hidden_states
+
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] > 0:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        if not _is_cuda and not _use_aiter:
+            final_hidden_states *= self.routed_scaling_factor
+        if shared_output is not None:
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states_out = torch.empty_like(final_hidden_states)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+            final_hidden_states = final_hidden_states_out
+        return final_hidden_states
+
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        shared_output = None
+        enable_npu_dual_stream = (
+            _is_npu
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        )
+
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            if enable_npu_dual_stream:
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        if enable_npu_dual_stream:
+            wait_share_stream()
+
+        if shared_output is not None:
+            x = shared_output
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                final_hidden_states *= self.routed_scaling_factor
+
+        return final_hidden_states
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            return self.shared_experts(hidden_states)
+        else:
+            return None
+
+
+class Glm4MoeDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        start_layer: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        is_nextn: bool = False,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.hidden_size = config.hidden_size
+        self.config = config
+        rope_theta, rope_scaling = get_rope_config(config)
+        partial_rotary_factor = (rope_scaling or {}).get("partial_rotary_factor")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        rms_norm_eps = config.rms_norm_eps
+        attention_bias = config.attention_bias
+        self.layer_id = layer_id
+
+        use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
+
+        self.self_attn = Glm4MoeAttention(
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            start_layer=start_layer,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            partial_rotary_factor=partial_rotary_factor,
+            max_position_embeddings=max_position_embeddings,
+            head_dim=head_dim,
+            rms_norm_eps=rms_norm_eps,
+            attention_bias=attention_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            use_qk_norm=use_qk_norm,
+            alt_stream=alt_stream,
+        )
+
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
+
+        if self.is_layer_sparse:
+            self.mlp = Glm4MoeSparseMoeBlock(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
+                alt_stream=alt_stream,
+            )
+        else:
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
+            self.mlp = Glm4MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
+            )
+
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+        # Detect if QKV uses aiter FP8 per-token quant so we can fuse
+        # RMSNorm + FP8 quant into a single kernel in the attention boundary's read
+        self.attn_quant_format = ""
+        self._detect_attn_quant_format()
+
+    def _detect_fp8_per_token_quant(self, linear_layer, label: str) -> str:
+        """Check if a linear layer uses aiter FP8 per-token quantization."""
+        from sglang.srt.utils import get_bool_env_var, is_hip
+
+        if not (get_bool_env_var("SGLANG_USE_AITER") and is_hip()):
+            return ""
+        if not hasattr(linear_layer, "quant_method"):
+            return ""
+        scheme = getattr(linear_layer, "scheme", None) or getattr(
+            linear_layer.quant_method, "scheme", None
+        )
+        if scheme is not None:
+            from compressed_tensors.quantization import QuantizationStrategy
+
+            from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+                CompressedTensorsW8A8Fp8,
+            )
+
+            if (
+                isinstance(scheme, CompressedTensorsW8A8Fp8)
+                and scheme.strategy == QuantizationStrategy.CHANNEL
+            ):
+                logger.info(
+                    "layer_%d Fused RMSNorm+Quant %s: ENABLED (fp8_per_token)",
+                    self.layer_id,
+                    label,
+                )
+                return "fp8_per_token"
+        logger.info(
+            "layer_%d Fused RMSNorm+Quant %s: skipped",
+            self.layer_id,
+            label,
+        )
+        return ""
+
+    def _detect_attn_quant_format(self):
+        self.attn_quant_format = self._detect_fp8_per_token_quant(
+            self.self_attn.qkv_proj, "attn"
+        )
+
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
+        return is_nextn or (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        capture_output=None,
+    ) -> torch.Tensor:
+
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self.attn_quant_format,
+            capture=capture_output,
+        )
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+
+        return hidden_states
+
+
+class Glm4MoeModel(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.pp_group = get_parallel().pp_group
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
+        self.embed_dim = config.hidden_size
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.alt_stream = get_stream("alt") if _is_cuda else None
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Glm4MoeDecoderLayer(
+                layer_id=idx,
+                start_layer=pp_start_layer,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Glm4MoeDecoderLayer.stage_facts(config, idx),
+        )
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
+
+        self.layers_to_capture = []
+
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual_batch.start(forward_batch)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
+
+        normal_start_layer = self.start_layer
+        normal_end_layer = self.end_layer
+        if forward_batch.can_run_tbo:
+            if (
+                self.first_k_dense_replace > normal_start_layer
+                and self.first_k_dense_replace < normal_end_layer
+            ):
+                normal_end_layer = self.first_k_dense_replace
+            elif self.first_k_dense_replace < normal_start_layer:
+                normal_end_layer = normal_start_layer = 0
+
+        aux_hidden_states = AuxHiddenStateList()
+        for i in range(normal_start_layer, normal_end_layer):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
+                )
+
+        if normal_end_layer != self.end_layer:
+            hidden_states = model_forward_stages(
+                layers=self.layers[normal_end_layer : self.end_layer],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+            )
+
+        if not self.pp_group.is_last_rank:
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
+
+
+class Glm4MoeForCausalLM(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.pp_group = get_parallel().pp_group
+        self.config = config
+        self.quant_config = quant_config
+        self.num_fused_shared_experts = 0
+        self.determine_num_fused_shared_experts()
+        self.model = Glm4MoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built."""
+        if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ):
+            return (
+                "Only GLM-4.5 on NV-platform with capability >= 80 "
+                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+            )
+        if get_parallel().moe_ep_size > 1 and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ):
+            return "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
+            return "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
+        if quant_config and quant_config.get_name() == "w4afp8":
+            return "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+        return None
+
+    def determine_num_fused_shared_experts(self):
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+        )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        params_dict=None,
+    ):
+        if is_nextn:
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+                # compatible with old design
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
+            else:
+                raise ValueError("num_nextn_predict_layers is not in the config")
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+
+            def iter_weights_with_fused_shared_experts(
+                weights: Iterable[Tuple[str, torch.Tensor]],
+            ) -> Iterable[Tuple[str, torch.Tensor]]:
+
+                pattern = re.compile(
+                    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
+                )
+                for name, weight in weights:
+                    match = pattern.match(name)
+                    if match:
+                        layer_id = int(match.group(1))
+                        suffix = match.group(2)
+                        name = f"model.layers.{layer_id}.mlp.experts.{self.config.n_routed_experts}.{suffix}"
+                    yield name, weight
+
+            weights = iter_weights_with_fused_shared_experts(weights)
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+
+        if is_nextn:
+            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            nextn_spec_weight_names = [
+                "shared_head.norm",
+                "eh_proj",
+                "enorm",
+                "hnorm",
+            ]
+        else:
+            nextn_layer_prefix = None
+            nextn_spec_weight_names = []
+
+        if params_dict is None:
+            params_dict = dict(self.named_parameters())
+
+        weight_names = []
+        for name, loaded_weight in weights:
+            weight_names.append(name)
+
+            if not is_nextn:
+                if hasattr(self.config, "num_nextn_predict_layers"):
+                    num_nextn_layers = self.config.num_nextn_predict_layers
+                    if num_nextn_layers > 0 and name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
+                            continue
+            else:
+                if nextn_layer_prefix and not name.startswith(nextn_layer_prefix):
+                    continue
+
+                if nextn_layer_prefix is not None:  # mtp
+                    # Use shared head and embed weights from target model
+                    if "shared_head.head" in name or "embed_tokens" in name:
+                        continue
+
+                    is_decoder = True
+                    # For nextn specific weights
+                    for weight_name in nextn_spec_weight_names:
+                        if weight_name in name:
+                            name = name.replace(nextn_layer_prefix, "model")
+                            is_decoder = False
+                            break
+                    # For decoder layer weights
+                    if is_decoder:
+                        name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+
+                    # Mark as expert weight regardless of whether we can process it
+                    is_expert_weight = True
+
+                    name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # Expert weight not on this rank, will be skipped below
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    if name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_group,
+        )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+
+
+class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # ModelConfig rewrites a GLM draft's architecture to this class's own name,
+    # so the inherited DeepSeek name would never match what the gate compares.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
+    # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
+    # substr mapping would wrongly rewrite GLM's real layer-61 weights.
+    # exclude_layers remapping for the MTP layer is handled explicitly in
+    # _resolve_nextn_quant_config below instead.
+    hf_to_sglang_mapper = WeightsMapper()
+
+    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
+
+    @classmethod
+    def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
+        # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
+        # NextN rule: MTP-specific weights live under model.*, while the
+        # decoder block weights live under model.decoder.*.
+        if any(part in name for part in cls._NEXTN_SPEC_WEIGHT_NAMES):
+            return name.replace(layer_prefix, "model", 1)
+        return name.replace(layer_prefix, "model.decoder", 1)
+
+    def _maybe_quant_glm_nextn_moe_to_ptpc(self, weights):
+        """Cast this GLM-5.2 draft layer's routed experts to per-channel FP8."""
+        layer_id = self.config.num_hidden_layers
+        if not should_apply_glm_nextn_moe_ptpc(self.quant_config, layer_id):
+            return weights
+
+        layer_prefix = f"model.layers.{layer_id}"
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        log_info_on_rank0(
+            logger,
+            "GLM NextN MoE PTPC: casting draft expert weights under "
+            f"{layer_prefix}.mlp to fp8_e4m3 per-channel",
+        )
+
+        def _cast() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                if not (
+                    name.startswith(layer_prefix + ".")
+                    and _GLM_NEXTN_EXPERT_PROJ_RE.search(name)
+                ):
+                    yield name, tensor
+                    continue
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"{name}: PTPC cast expects a 2D expert weight, "
+                        f"got {tuple(tensor.shape)}"
+                    )
+                weight = tensor.to(torch.float32)
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                scale /= fp8_max
+                yield (
+                    name,
+                    (weight / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn),
+                )
+                yield name[: -len("weight")] + "weight_scale", scale.squeeze(-1)
+
+        return _cast()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = self._maybe_quant_glm_nextn_moe_to_ptpc(weights)
+        return super().load_weights(weights)
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        # The caller reuses this QuarkConfig for the target model and lm_head,
+        # so the draft-only rewrites below need a private copy of the wrapper
+        # and of the dict its schemes are read from.
+        quant_config = copy.copy(quant_config)
+        quant_config.quant_config = copy.deepcopy(quant_config.quant_config)
+
+        layer_prefix = f"model.layers.{config.num_hidden_layers}"
+
+        # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
+        # while MTP MoE is MXFP4) is keyed by "layer_quant_config" patterns
+        # using the checkpoint's "model.layers.<N>.*" naming. SGLang queries
+        # schemes by the runtime "model.*"/"model.decoder.*" prefix, so those
+        # keys need the same remap as exclude_layers below, or they silently
+        # fall back to the wrong (layer-type/global) scheme.
+        layer_quant_config = quant_config.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            quant_config.quant_config["layer_quant_config"] = {
+                (
+                    self._map_mtp_ckpt_name(pattern, layer_prefix)
+                    if pattern.startswith(layer_prefix + ".")
+                    else pattern
+                ): pattern_config
+                for pattern, pattern_config in layer_quant_config.items()
+            }
+
+        mtp_excluded = [
+            name
+            for name in quant_config.exclude_layers
+            if name.startswith(layer_prefix + ".")
+        ]
+        if not mtp_excluded:
+            return quant_config
+
+        names = set(quant_config.exclude_layers)
+        for name in mtp_excluded:
+            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+
+        # Fused routed experts are queried by the coarse module prefix
+        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
+        # do not match. So that module needs its own entry: bf16 as in the
+        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
+        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
+        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+            mtp_layer_quant_config = quant_config.quant_config.setdefault(
+                "layer_quant_config", {}
+            )
+            mtp_layer_quant_config["model.decoder.mlp.experts"] = {
+                "weight": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                    "qscheme": "per_channel",
+                },
+                # Dynamic per_channel is QuarkW8A8FP8MoE's per-token input.
+                "input_tensors": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": True,
+                    "qscheme": "per_channel",
+                },
+            }
+            logger.info(
+                "SGLANG_GLM_NEXTN_MOE_PTPC=1: MTP fused MoE "
+                "(model.decoder.mlp.experts) runs as PTPC-FP8"
+            )
+        elif any(".mlp.experts." in name for name in mtp_excluded):
+            names.add("model.decoder.mlp.experts")
+
+        quant_config.exclude_layers = list(names)
+        return quant_config
+
+
+EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]

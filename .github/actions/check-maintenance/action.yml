@@ -1,0 +1,157 @@
+name: Check Maintenance Mode
+description: Blocks CI in two independent modes driven by issue #21065. (1) Full-pause: when the issue is open. (2) Rebase-required: whenever the issue body contains a `MIN_BASE_SHA: <sha>` directive — enforced regardless of whether the issue is open or closed, so maintainers can require all PRs to rebase past a specific commit without having to open the maintenance issue. Both modes are bypassed by the `bypass-maintenance` label on the PR, or by env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during full-pause; in severe cases, merge permissions may be revoked.
+
+inputs:
+  github-token:
+    description: GitHub token for API access
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # Runs on the Node runtime bundled with the Actions runner; do not depend on
+    # tools from the runner image (jq, gh), which self-hosted images may lack.
+    - name: Check maintenance mode
+      uses: actions/github-script@v8
+      env:
+        PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ env.PR_TEST_BYPASS_MAINTENANCE_ON_MAIN }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        # Retries 5xx and dropped connections so a blip does not fail the gate open;
+        # 4xx (e.g. 404 for an unknown MIN_BASE_SHA) is exempt by default.
+        retries: 2
+        script: |
+          const MAINTENANCE_ISSUE = 21065;
+          const { owner, repo } = context.repo;
+          const issueUrl = `https://github.com/${owner}/${repo}/issues/${MAINTENANCE_ISSUE}`;
+
+          // Bound each attempt, including retries and pagination, to 30 seconds.
+          // Keep the runner's proxy-aware fetch and create a fresh signal per attempt.
+          const fetch = github.request.endpoint.DEFAULTS.request.fetch;
+          const request = {
+            fetch: (url, options) => fetch(url, {
+              ...options,
+              signal: AbortSignal.timeout(30_000),
+            }),
+          };
+
+          async function block(lines) {
+            const msg = lines.join('\n');
+            await core.summary.addRaw(msg + '\n').write();
+            core.setFailed(msg);
+          }
+
+          // PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
+          if (process.env.PR_TEST_BYPASS_MAINTENANCE_ON_MAIN === 'true') {
+            core.info('✅ PR Test on main branch; bypassing maintenance gate.');
+            return;
+          }
+
+          // Fail-open only when the API call itself fails after retries;
+          // CI proceeds with a warning (outage, missing token scope).
+          let issue;
+          try {
+            ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: MAINTENANCE_ISSUE, request }));
+          } catch (e) {
+            core.warning(`Could not fetch issue #${MAINTENANCE_ISSUE} (${e.status ?? e.message}); fail-open, proceeding with CI.`);
+            return;
+          }
+          const issueOpen = issue.state === 'open';
+          const body = (issue.body || '').replace(/\r/g, '');
+          core.info(`DEBUG: ISSUE_STATE=${issue.state}  body_length=${body.length}`);
+
+          // First matching `MIN_BASE_SHA: <sha>` line wins; it is enforced
+          // whether the issue is open or closed.
+          let minBaseSha = '';
+          const directive = body.split('\n')
+            .map(line => line.match(/^\s*`?MIN_BASE_SHA`?\s*[:=]\s*(.*)$/i))
+            .find(Boolean);
+          if (directive) {
+            const value = directive[1].replace(/`/g, '').trim().split(/\s+/)[0] || '';
+            if (/^[0-9a-f]{7,40}$/i.test(value)) {
+              minBaseSha = value;
+            } else {
+              const warn = `⚠️  Ignoring malformed MIN_BASE_SHA directive in issue #${MAINTENANCE_ISSUE}: '${value}' (must be 7-40 hex chars)`;
+              core.warning(warn);
+              await core.summary.addRaw(warn + '\n').write();
+            }
+          }
+          core.info(`DEBUG: MIN_BASE_SHA=${minBaseSha || '(none)'}`);
+
+          // If neither gate is active (no MIN_BASE_SHA, issue not open), nothing to do.
+          if (!minBaseSha && !issueOpen) {
+            core.info('✅ Maintenance mode is OFF and no MIN_BASE_SHA directive. Proceeding with CI.');
+            return;
+          }
+
+          const pr = context.payload.pull_request;
+
+          // Read labels live; the event payload is frozen at the first attempt,
+          // so a rerun would miss a bypass-maintenance label added since.
+          if (pr) {
+            let labels = [];
+            try {
+              labels = await github.paginate(github.rest.issues.listLabelsOnIssue.defaults({ request }),
+                { owner, repo, issue_number: pr.number, per_page: 100 });
+            } catch (e) {
+              core.warning(`Could not read labels of PR #${pr.number} (${e.status ?? e.message}); assuming no bypass label.`);
+            }
+            if (labels.some(l => l.name === 'bypass-maintenance')) {
+              core.info(`✅ PR #${pr.number} has 'bypass-maintenance' label. Bypassing maintenance + rebase checks.`);
+              return;
+            }
+          }
+
+          // Rebase-required gate (independent of issue open/closed state).
+          if (minBaseSha) {
+            if (!pr?.number || !pr?.head?.sha) {
+              core.info('✅ Not a PR context; skipping rebase check.');
+            } else {
+              // Compare status is "ahead"/"identical" when MIN_BASE_SHA is reachable from PR head.
+              let status = 'UNKNOWN';
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead(
+                  { owner, repo, basehead: `${minBaseSha}...${pr.head.sha}`, per_page: 1, request }));
+              } catch (e) {
+                core.warning(`Compare API failed (${e.status ?? e.message}).`);
+              }
+              if (status === 'ahead' || status === 'identical') {
+                core.info(`✅ PR #${pr.number} contains required base ${minBaseSha.slice(0, 12)} (${status}).`);
+              } else if (status === 'UNKNOWN') {
+                core.warning('Could not determine rebase status via GitHub API; fail-open, allowing rebase check to pass.');
+              } else {
+                await block([
+                  '## ⚠️ Rebase Required Before CI Can Run',
+                  'A major update has landed on `main`. All PRs must rebase onto the latest `main` before CI will run.',
+                  `Required base commit: \`${minBaseSha.slice(0, 12)}\` (your PR is \`${status}\` relative to this commit).`,
+                  '',
+                  'What should you do?',
+                  '- Rebase your branch onto the latest `main` and push again',
+                  `- Follow CI Maintenance Mode issue: ${issueUrl} for context`,
+                  '- CI-fix PRs may request the `bypass-maintenance` label to skip this check',
+                ]);
+                return;
+              }
+            }
+          }
+
+          // Full-pause maintenance gate (only when issue is open).
+          if (issueOpen) {
+            await block([
+              '## ⚠️ CI Maintenance Mode is Active',
+              'The CI infrastructure is currently under maintenance.',
+              'All PR CI runs are paused until maintenance is complete.',
+              '**Merging non-CI-fix PRs is prohibited during maintenance mode.** In severe cases, merge permissions may be revoked.',
+              'You might also experience unexpected failures during this period.',
+              'The team is working on the issue and will update the status as soon as possible.',
+              '',
+              'What should you do?',
+              '- **Do NOT merge non-CI-fix PRs** until maintenance mode is lifted',
+              '- Check back later (~12 hours)',
+              `- Follow CI Maintenance Mode issue: ${issueUrl} for status updates`,
+            ]);
+            return;
+          }
+
+          core.info('✅ Rebase check passed; full-pause not active. Proceeding with CI.');

@@ -1,0 +1,592 @@
+"""A stack read through the attention-residual bank's stage reads matches a
+reference that drives AttnResidual directly, with each MLP adding the pending
+residual itself."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import test_declared_decoder_boundary as fixture
+import torch
+
+from sglang.srt.layers import attn_residual
+from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
+    ReadoutFusion,
+    SumGroup,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    layer_stack,
+)
+from sglang.srt.layers.layer_boundary import ops as comm_moves
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
+from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
+from sglang.srt.layers.layer_boundary.residual.attn_bank import (
+    AttnBank,
+    AttnBankOutputRead,
+    AttnBankState,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+TOKENS = 3
+HIDDEN = 8
+BLOCK = 2
+LAYERS = 5
+
+
+class _Norm(torch.nn.Module):
+    def __init__(self, seed):
+        super().__init__()
+        self.scale = 0.5 + seed / 7
+        self.variance_epsilon = 1e-6
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.scale
+
+
+class _Proj(torch.nn.Module):
+    def __init__(self, seed):
+        super().__init__()
+        self.weight = torch.randn(
+            1, HIDDEN, generator=torch.Generator().manual_seed(seed)
+        )
+
+    def forward(self, x):
+        return x @ self.weight.t(), None
+
+
+def _mix(prefix_sum, bank, nvb, score_proj, score_norm):
+    # The torch reference for the triton score + combine pair.
+    return attn_residual.aggregate_stream_torch(
+        prefix_sum, bank, nvb, score_proj, score_norm
+    )
+
+
+class _Layer:
+    """One layer's parameters and stand-ins for its attention and its MLP."""
+
+    def __init__(self, idx):
+        self.writes_block = idx % BLOCK == 0
+        self.attn_proj, self.attn_score_norm = _Proj(4 * idx), _Norm(4 * idx)
+        self.ffn_proj, self.ffn_score_norm = _Proj(4 * idx + 1), _Norm(4 * idx + 1)
+        self.input_norm, self.post_norm = _Norm(4 * idx + 2), _Norm(4 * idx + 3)
+        self.attn_weight = 0.3 + 0.1 * idx
+        self.mlp_weight = -0.2 + 0.05 * idx
+
+    def attention(self, x):
+        return torch.tanh(x) * self.attn_weight
+
+    def mlp(self, x):
+        return torch.sin(x) * self.mlp_weight
+
+    def ops(self, bank, *, reads_slices=False):
+        return AttnBankState(
+            bank,
+            self.attn_proj,
+            self.attn_score_norm,
+            self.ffn_proj,
+            self.ffn_score_norm,
+            writes_block=self.writes_block,
+            reads_slices=reads_slices,
+        ).residual_ops()
+
+
+LAYER_LIST = [_Layer(i) for i in range(LAYERS)]
+OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM = _Proj(99), _Norm(99), _Norm(100)
+
+
+def _reference(hidden, layers, bank_rows=None, *, final=True):
+    """The reference order: the MLP adds the pending prefix to its output, so
+    each layer hands on the whole head."""
+    bank = attn_residual.AttnResidual(
+        hidden, -(-(layers.stop) // BLOCK), block_residual=bank_rows
+    )
+    for layer in LAYER_LIST[layers]:
+        hidden, prefix = bank.forward(
+            hidden,
+            None,
+            layer.attn_proj,
+            layer.attn_score_norm,
+            layer.input_norm,
+            write=layer.writes_block,
+        )
+        if layer.writes_block:
+            prefix = None
+        hidden, prefix = bank.forward(
+            layer.attention(hidden),
+            prefix,
+            layer.ffn_proj,
+            layer.ffn_score_norm,
+            layer.post_norm,
+        )
+        hidden = layer.mlp(hidden) + prefix
+    if not final:
+        return hidden, bank.block_residual
+    hidden, _ = bank.forward(hidden, None, OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM)
+    return hidden
+
+
+def _staged(
+    hidden, layers, bank_rows=None, *, read_after_write, writes_stream=(), final=True
+):
+    """The stage boundaries' order: each layer's output and the residual stay
+    apart, and the next read folds the add into its aggregation. A layer in
+    ``writes_stream`` adds the residual into its own output instead (a latent
+    MoE's tail add) and hands on the written stream."""
+    holder = AttnBank()
+    holder.open(hidden, -(-(layers.stop) // BLOCK), bank_rows)
+    # A stack's first stage, or a pipeline rank handed the whole head: the
+    # stream is written and the read takes it alone.
+    residual, contribution = hidden, None
+    for idx in range(layers.start, layers.stop):
+        layer = LAYER_LIST[idx]
+        ops = layer.ops(holder)
+        if contribution is None:
+            hidden, residual = ops.attn_readout.read(residual, layer.input_norm)
+        else:
+            hidden, residual = ops.attn_readout.update_and_read(
+                ops.attn_update, contribution, residual, layer.input_norm
+            )
+        attn_out = layer.attention(hidden)
+        if residual is None and read_after_write:
+            # What a stream written by the attention's read hands the FFN.
+            hidden, residual = ops.ffn_readout.read(attn_out, layer.post_norm)
+        else:
+            hidden, residual = ops.ffn_readout.update_and_read(
+                ops.attn_update, attn_out, residual, layer.post_norm
+            )
+        if idx in writes_stream:
+            residual, contribution = layer.mlp(hidden) + residual, None
+        else:
+            contribution = layer.mlp(hidden)
+    if contribution is None:
+        if not final:
+            return residual, holder.require().block_residual
+        return AttnBankOutputRead(holder, OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM)(
+            residual
+        )
+    if not final:
+        return contribution + residual, holder.require().block_residual
+    # Called as the final norm of an output and its residual: it returns the
+    # normalized output and the head it aggregated.
+    hidden, head = AttnBankOutputRead(holder, OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM)(
+        contribution, residual
+    )
+    torch.testing.assert_close(head, contribution + residual, rtol=0, atol=0)
+    return hidden
+
+
+class TestAttnBankResidualOps(CustomTestCase):
+    def setUp(self):
+        patcher = patch.object(attn_residual, "_mix_fused", _mix)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.hidden = torch.randn(
+            TOKENS, HIDDEN, generator=torch.Generator().manual_seed(7)
+        )
+
+    def assert_identical(self, got, want):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_the_stack_matches_the_reference_order(self):
+        want = _reference(self.hidden, slice(0, LAYERS))
+        for read_after_write in (False, True):
+            for writes_stream in ((), (1, 3), (LAYERS - 1,)):
+                with self.subTest(
+                    read_after_write=read_after_write, writes_stream=writes_stream
+                ):
+                    got = _staged(
+                        self.hidden,
+                        slice(0, LAYERS),
+                        read_after_write=read_after_write,
+                        writes_stream=writes_stream,
+                    )
+                    self.assert_identical(got, want)
+
+    def test_a_pipeline_rank_continues_from_the_head_and_the_bank(self):
+        want = _reference(self.hidden, slice(0, LAYERS))
+        # Split before a layer that writes a block and before one that reads,
+        # after a layer that adds the residual itself and after one that
+        # leaves the add to the next read.
+        for split in (2, 3):
+            for writes_stream in ((), (split - 1,)):
+                with self.subTest(split=split, writes_stream=writes_stream):
+                    head, bank_rows = _staged(
+                        self.hidden,
+                        slice(0, split),
+                        read_after_write=False,
+                        writes_stream=writes_stream,
+                        final=False,
+                    )
+                    want_head, want_rows = _reference(
+                        self.hidden, slice(0, split), final=False
+                    )
+                    # The wire carries what the reference order sends.
+                    self.assert_identical(head, want_head)
+                    self.assert_identical(bank_rows, want_rows)
+                    got = _staged(
+                        head,
+                        slice(split, LAYERS),
+                        bank_rows,
+                        read_after_write=False,
+                    )
+                    self.assert_identical(got, want)
+
+    def test_a_read_on_a_shard_aggregates_its_rows_of_the_bank(self):
+        """After a reduce-scatter over attention TP each rank reads its
+        contiguous shard of the rows, against the same shard of the bank."""
+        generator = torch.Generator().manual_seed(3)
+        hidden = torch.randn(4, HIDDEN, generator=generator)
+        attn_out = torch.randn(4, HIDDEN, generator=generator)
+        layer = LAYER_LIST[0]
+        holder = AttnBank()
+        holder.open(hidden, 1)
+        ops = layer.ops(holder)
+        # The write layer's attention read banks every token's row.
+        ops.attn_readout.read(hidden, layer.input_norm)
+        want, _ = ops.ffn_readout.read(attn_out, layer.post_norm)
+
+        shard = slice(2, 4)
+        second_of_two = SimpleNamespace(attn_tp_rank=1, attn_tp_size=2)
+        with patch.object(attn_bank, "get_parallel", lambda: second_of_two):
+            got, residual = ops.ffn_readout.read(attn_out[shard], layer.post_norm)
+            self.assert_identical(got, want[shard])
+            self.assert_identical(residual, attn_out[shard])
+            with self.assertRaisesRegex(RuntimeError, "attention-TP shard"):
+                ops.ffn_readout.read(attn_out[:3], layer.post_norm)
+
+    def test_declared_capabilities(self):
+        ops = LAYER_LIST[1].ops(AttnBank())
+        # The updates are ordinary adds, so they may cross a pipeline boundary
+        # and defer the sum they complete to the next read.
+        for update in (ops.attn_update, ops.ffn_update):
+            self.assertTrue(update.is_plain_add)
+            self.assertFalse(update.applied_at_exit)
+            self.assertTrue(update.outlives_layer)
+        # The reads aggregate the bank, which no add+norm kernel computes, on
+        # this rank's own rows.
+        for readout in (ops.attn_readout, ops.ffn_readout):
+            self.assertFalse(readout.is_plain_norm)
+            self.assertTrue(readout.reads_before_dp_gather)
+
+
+class TestAttnBankFusedAllReduce(CustomTestCase):
+    """A bank's FFN read can supply a kernel that completes the attention
+    output's sum together with the pending residual add on every row; the
+    read then aggregates the stream that kernel wrote."""
+
+    def setUp(self):
+        patcher = patch.object(attn_residual, "_mix_fused", _mix)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def fusion(takes):
+        def run(hidden, residual, forward_batch):
+            if not takes:
+                return None
+            return hidden if residual is None else hidden + residual
+
+        return ReadoutFusion(SumGroup.ATTN_TP, run)
+
+    @staticmethod
+    def ops(bank, fusions):
+        layer = LAYER_LIST[1]
+        return AttnBankState(
+            bank,
+            layer.attn_proj,
+            layer.attn_score_norm,
+            layer.ffn_proj,
+            layer.ffn_score_norm,
+            ffn_input_fusions=fusions,
+        ).residual_ops()
+
+    def test_the_fused_stream_reads_as_the_entry_would(self):
+        hidden = torch.randn(TOKENS, HIDDEN, generator=torch.Generator().manual_seed(3))
+        residual = torch.randn(
+            TOKENS, HIDDEN, generator=torch.Generator().manual_seed(4)
+        )
+        results = []
+        for takes in (True, False):
+            holder = AttnBank()
+            # A bank with one snapshot, as after the first block.
+            holder.open(torch.randn(TOKENS, HIDDEN), 2).write(
+                torch.randn(TOKENS, HIDDEN, generator=torch.Generator().manual_seed(5))
+            )
+            ops = self.ops(holder, (self.fusion(takes),))
+            with patch.object(
+                comm_ops, "attn_tp_all_reduce", side_effect=lambda h, fb, **kw: h
+            ) as reduce:
+                results.append(
+                    comm_ops._reduce_update_read(
+                        hidden.clone(),
+                        residual.clone(),
+                        None,
+                        LAYER_LIST[1].post_norm,
+                        gathers_residual=False,
+                        fusions=(),
+                        read_fusions=ops.ffn_readout.completing_fusions,
+                        read=ops.ffn_readout,
+                        update=ops.ffn_update,
+                    )
+                )
+            # Only a kernel that declines the batch leaves the sum to the
+            # boundary's own all-reduce.
+            self.assertEqual(reduce.called, not takes)
+        for fused, unfused in zip(*results):
+            torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+class TestAttnBankSpMoeStages(CustomTestCase):
+    """A latent MoE dispatched over an a2a backend with attention TP runs on
+    this rank's shard of the rows: the FFN's entry reduce-scatters the
+    attention output and slices the residual, and each MoE layer's exit
+    gathers its stream back to every row, which the bank's next read needs."""
+
+    def build(self, *, reads_slices=False):
+        holder = AttnBank()
+        with (
+            fixture.planning(
+                fixture.parallel_of(attn_dp=1, attn_tp=2),
+                a2a=True,
+                boundary_reduction="ar",
+            ),
+            layer_stack(),
+        ):
+            return [
+                append_stages(
+                    (
+                        declare_attn(read=ops.attn_readout, update=ops.attn_update),
+                        fixture.Norm(),
+                    ),
+                    (
+                        declare_ffn(
+                            read=ops.ffn_readout,
+                            update=REPLACE_AT_EXIT,
+                            sparse=True,
+                            next_layer_sparse=True,
+                            output_complete=True,
+                        ),
+                        fixture.Norm(),
+                    ),
+                )[1]
+                for ops in (
+                    LAYER_LIST[i].ops(holder, reads_slices=reads_slices)
+                    for i in range(3)
+                )
+            ]
+
+    def entry_step(self, ffn):
+        prepare = ffn.plan.paths[BatchVariant.ORDINARY].entry.prepare
+        return prepare.keywords["step"]
+
+    def test_each_moe_layer_returns_to_every_row(self):
+        for ffn in self.build():
+            step = self.entry_step(ffn)
+            self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
+            self.assertTrue(step.keywords["scatters_residual"])
+            self.assertIs(step.keywords["read"], ffn.declaration.read)
+            move = ffn.plan.paths[BatchVariant.ORDINARY].output_move
+            self.assertIs(move.func, update_attn_tp_gather_output)
+
+    def test_the_exit_gather_falls_back_when_its_kernel_declines(self):
+        class Update:
+            def update(self, hidden_states, residual):
+                return hidden_states + 1
+
+        shard = torch.zeros(2, HIDDEN)
+        with patch.object(comm_moves, "attn_tp_gather", lambda h: torch.cat([h, h])):
+            tuned, _ = update_attn_tp_gather_output(
+                shard,
+                None,
+                None,
+                update=Update(),
+                gather=lambda h: torch.full((4, HIDDEN), 7.0),
+            )
+            fallback, _ = update_attn_tp_gather_output(
+                shard, None, None, update=Update(), gather=lambda h: None
+            )
+        torch.testing.assert_close(tuned, torch.full((4, HIDDEN), 7.0))
+        torch.testing.assert_close(fallback, torch.ones(4, HIDDEN))
+
+    def test_the_shard_entry_reads_the_kernels_stream_as_its_own(self):
+        hidden = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(8))
+        residual = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(9))
+
+        class Update:
+            is_plain_add = True
+
+            def slice_residual_attn_tp(self, residual):
+                return residual[:2]
+
+        def scatter_add(takes):
+            def run(hidden_states, residual, forward_batch):
+                return hidden_states[:2] + residual[:2] if takes else None
+
+            return run
+
+        results = []
+        for takes in (True, False):
+            holder = AttnBank()
+            holder.open(torch.randn(4, HIDDEN), 2).write(
+                torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(10))
+            )
+            ops = AttnBankState(
+                holder,
+                LAYER_LIST[1].attn_proj,
+                LAYER_LIST[1].attn_score_norm,
+                LAYER_LIST[1].ffn_proj,
+                LAYER_LIST[1].ffn_score_norm,
+            ).residual_ops()
+            with (
+                patch.object(attn_residual, "_mix_fused", _mix),
+                patch.object(comm_ops, "attn_tp_reduce_scatter", lambda h: h[:2]),
+                patch.object(
+                    attn_bank,
+                    "get_parallel",
+                    lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=0),
+                ),
+            ):
+                results.append(
+                    comm_ops._attn_tp_reduce_scatter_update_read(
+                        hidden.clone(),
+                        residual.clone(),
+                        None,
+                        LAYER_LIST[1].post_norm,
+                        scatters_residual=True,
+                        read_fusions=(
+                            ReadoutFusion(
+                                SumGroup.ATTN_TP, scatter_add(takes), scatters=True
+                            ),
+                        ),
+                        read=ops.ffn_readout,
+                        update=Update(),
+                    )
+                )
+        for fused, unfused in zip(*results):
+            torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
+
+
+class TestAttnBankOnShards(CustomTestCase):
+    """With the stream kept on this rank's attention-TP shard across MoE
+    layers, a write layer snapshots only this rank's rows of the bank. Reads
+    take the matching rows to the end, where the final read gathers what it
+    read; a read of every row after such a write is refused, since the other
+    ranks' rows of this bank are stale."""
+
+    def setUp(self):
+        for patcher in (
+            patch.object(attn_residual, "_mix_fused", _mix),
+            # The second of two attention-TP ranks: rows 2 and 3 of 4.
+            patch.object(
+                attn_bank,
+                "get_parallel",
+                lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=1),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.hidden = torch.randn(
+            4, HIDDEN, generator=torch.Generator().manual_seed(11)
+        )
+
+    def open(self):
+        holder = AttnBank()
+        # One snapshot of every row, as after the first block.
+        holder.open(self.hidden, 3).write(self.hidden * 0.5)
+        return holder
+
+    @staticmethod
+    def final_read(holder, gather=None):
+        return AttnBankOutputRead(
+            holder, OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM, attn_tp_gather=gather
+        )
+
+    def test_the_final_read_of_a_shard_gathers_what_it_read(self):
+        holder = self.open()
+        every_row = self.final_read(holder)(self.hidden)
+
+        def all_gather(shard, *, owned=False):
+            # The output outlives the stack: it may not share a buffer.
+            self.assertTrue(owned)
+            return torch.cat([torch.zeros_like(shard), shard])
+
+        tuned = torch.full((4, HIDDEN), 3.0)
+        with (
+            patch.object(
+                attn_residual.AttnResidual, "forward_sp_all_gather", return_value=None
+            ),
+            patch.object(comm_moves, "attn_tp_gather", all_gather),
+        ):
+            for gather in (None, lambda h: None):
+                got = self.final_read(holder, gather)(self.hidden[2:])
+                torch.testing.assert_close(got[2:], every_row[2:], rtol=0, atol=0)
+            got = self.final_read(holder, lambda h: tuned)(self.hidden[2:])
+            self.assertIs(got, tuned)
+        fused = torch.full((4, HIDDEN), 5.0)
+        with patch.object(
+            attn_residual.AttnResidual,
+            "forward_sp_all_gather",
+            return_value=(fused, None),
+        ) as kernel:
+            got = self.final_read(holder, lambda h: tuned)(self.hidden[2:])
+        self.assertIs(got, fused)
+        self.assertEqual(kernel.call_args.kwargs["rows"], slice(2, 4))
+
+    def test_a_read_of_every_row_after_a_shard_write_is_refused(self):
+        holder = self.open()
+        layer = LAYER_LIST[2]
+        self.assertTrue(layer.writes_block)
+        layer.ops(holder).attn_readout.read(self.hidden[2:], layer.input_norm)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            self.final_read(holder)(self.hidden)
+        with (
+            patch.object(
+                attn_residual.AttnResidual, "forward_sp_all_gather", return_value=None
+            ),
+            patch.object(
+                comm_moves,
+                "attn_tp_gather",
+                lambda shard, owned=False: torch.cat([shard, shard]),
+            ),
+        ):
+            self.final_read(holder)(self.hidden[2:])
+
+    def test_the_fused_reads_are_offered_on_request(self):
+        def scatter_add(hidden_states, residual, forward_batch):
+            return None
+
+        scatter = ReadoutFusion(SumGroup.ATTN_TP, scatter_add, scatters=True)
+        for fuses in (False, True):
+            with self.subTest(fuses_slice_collectives=fuses):
+                ops = AttnBankState(
+                    AttnBank(),
+                    LAYER_LIST[1].attn_proj,
+                    LAYER_LIST[1].attn_score_norm,
+                    LAYER_LIST[1].ffn_proj,
+                    LAYER_LIST[1].ffn_score_norm,
+                    ffn_input_fusions=(scatter,),
+                    fuses_slice_collectives=fuses,
+                ).residual_ops()
+                gathers = ops.attn_readout.gathering_reads
+                fusions = ops.ffn_readout.completing_fusions
+                if not fuses:
+                    self.assertEqual(gathers, ())
+                    self.assertEqual(fusions, (scatter,))
+                    continue
+                self.assertEqual(len(gathers), 1)
+                # The fused reduce-scatter and read first, then the
+                # reduce-scatter with the residual add alone.
+                self.assertEqual([f.reads for f in fusions], [True, False])
+                self.assertTrue(fusions[0].scatters)
+                self.assertIs(fusions[1], scatter)
+
+
+if __name__ == "__main__":
+    unittest.main()

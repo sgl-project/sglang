@@ -1,0 +1,459 @@
+---
+title: Wan-Animate-2
+tag: NEW
+description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion.
+metatags:
+    description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan-animate-2.jsx';
+
+<DiffusionModelTags tags={["video", "character animation", "image + reference video", "single-expert", "640×800 / 720×1280"]} />
+
+<a id="2-sglang-diffusion-installation" />
+<a id="3-1-basic-configuration" />
+
+## 1. Quick start
+
+Follow the [installation guide](/docs/sglang-diffusion/installation) on Linux with
+NVIDIA CUDA, then select a verified recipe.
+
+<Deployment config={config} />
+
+Provide both a reference image and a server-readable reference video. See
+[HTTP invocation](#4-2-serve-and-request-over-http) for polling and downloading
+the finished video.
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
+
+[Wan-Animate-2](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers) is a
+14B character-animation model in the Wan2.2 family. Instead of the text- or
+image-only conditioning of the other Wan2.2 checkpoints, it animates a **reference
+image** so that it follows the motion of a **reference video**, producing a new clip
+of that subject performing the reference video's motion.
+
+Use **`Wan-AI/Wan2.2-Animate-2-14B-Diffusers`** as `--model-path`. The distilled
+checkpoint (`Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers`, `log_scale=-1.3`,
+10 steps, no CFG) is not supported in this release.
+
+Unlike the A14B T2V/I2V checkpoints, Wan-Animate-2 is a **single-expert** model:
+it has one `guidance_scale` (default `3.0`), no low-noise expert
+(`guidance_scale_2`) and no boundary switching. Diffusers >= 0.40.0 serves
+Wan-Animate-2 as a modular pipeline (`WanAnimate2ModularPipeline`); SGLang
+implements the model natively and loads the same
+`Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint. There is no diffusers backend
+fallback.
+
+<Warning>
+Wan-Animate-2 is served through the native `WanAnimate2Pipeline`, selected
+automatically from the checkpoint's `model_index.json`. It takes **two** inputs, a
+reference image and a reference video, so it is invoked differently from the
+other Wan2.2 models. See [section 4](#4-model-invocation).
+</Warning>
+
+<a id="1-1-inputs" />
+
+### 2.1 Inputs
+
+| Input | Field | Passed via |
+| --- | --- | --- |
+| Reference image (the subject to animate) | `image_path` / `input_reference` | `--config` YAML for `sglang generate`; the `input_reference` part of a `POST /v1/videos` request |
+| Reference video (the motion to follow) | `video_path` | `--video-path` or `--config` YAML for `sglang generate`; the `video_path` field in the `/v1/videos` request body or `extra_body` |
+
+Both inputs are the base `image_path` / `video_path` sampling fields shared with the
+other video models; Wan-Animate-2 adds no model-specific input field. Offline runs
+pass both through a `--config` file (or `--image-path` / `--video-path`), and the
+online API forwards `video_path` into the pipeline while the reference image rides
+`input_reference`. Local paths must be readable by the server process. HTTP(S)
+video URLs use SGLang's shared media loader before decoding, without a disk cache.
+
+<a id="1-2-defaults" />
+
+### 2.2 Defaults
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| Resolution (`width`×`height`, the API's `size`) | `640`×`800` | A pixel-area budget, not the output dimensions: the frame keeps the reference image's aspect ratio and is the largest 16-aligned canvas with at most `width × height` pixels (see **Output resolution** below). `720`×`1280` is the larger supported budget. |
+| `clip_len` | `37` | Per-clip denoising chunk length; must be `4k+1` (VAE temporal stride 4), e.g. `37`, `65`, `81`. Other values are rounded to `4k+1` with the same `k` and the rounding is logged (`40` becomes `41`; `38` and `39` become `37`); values below `5` are rejected. |
+| `fps` | `16` | The reference video is resampled to this rate and the output MP4 is written at it; duration is preserved. |
+| `num_inference_steps` | `40` | Fewer steps (e.g. `20`) run faster. |
+| `guidance_scale` | `3.0` | Single expert; there is no `guidance_scale_2`. |
+| `prompt_ref` | `人物动作的参考视频` ("reference video of the character's motion") | Text for the reference-video branch. The official demo conditions that branch on this fixed description of the reference video rather than on the scene prompt; leave it unchanged unless reproducing a different reference setup. |
+| `enable_audio` | `true` | Keep the reference video's audio track on the output (see **Audio** below). Per request, like `clip_len`. |
+
+**Output length.** The output has as many frames as the (resampled) reference
+video, not `clip_len`. The video is generated clip by clip with `clip_len` frames
+per chunk; a larger `clip_len` improves temporal coherence at the cost of VRAM.
+`clip_len=81` roughly doubles the attention tokens of the default and OOMs a
+single 80 GB GPU. `num_frames` (and the API's `seconds`, which maps to it) does
+not control the length: it is ignored and the server logs that it was, so leave
+it unset.
+
+**Output resolution.** `width`×`height` (the API's `size`) is a pixel-area budget,
+not the output dimensions. The reference image's aspect ratio is kept, the frame is
+the largest canvas with at most `width × height` pixels whose sides are multiples of
+16, and the reference image and the driving-video frames are letterboxed onto it;
+the output MP4 has the canvas size. At the default `640`×`800` (512,000 pixels) a
+9:16 reference gives `528`×`944`, a 1:1 reference gives `704`×`704`, and only a 4:5
+reference gives exactly `640`×`800`. To obtain a specific output size, request a
+budget with the same aspect ratio as the reference image (for a 9:16 image,
+`576`×`1024` maps onto itself). This differs from the OpenAI Videos API and from the
+other SGLang diffusion pipelines, where `size` is the literal output resolution.
+
+**Audio.** The output MP4 carries the reference video's audio track, as the
+official pipeline does. Set `enable_audio=false` on a request (a `--config` field
+offline, a form field or `extra_body` entry online) for a silent output. If the
+track cannot be decoded, the output is silent and the server logs one warning per
+process; a reference video without an audio track also gives a silent output.
+
+**Lossless conditioning reuse.** Reference-video keys are rotated once and cached per clip, then reused by all
+denoising steps and both CFG branches. This removes repeated RoPE computation
+without changing the attention mask, precision, or sampling schedule. The cache
+uses the existing key storage and is released after the clip; it is not an
+approximate timestep-skipping cache.
+Clips containing only padding that would be removed from the final video are not
+denoised. The padding and conditioning of every retained clip are unchanged.
+
+Text encoding uses the native `TextEncodingStage` and its conditioning cache and
+residency management. CFG-parallel dispatch shares the native CFG utilities while
+retaining the single-GPU arithmetic order.
+Each clip uses the shared denoising loop for step profiling, NVTX ranges, progress,
+and DiT release. Reference K/V preparation and clip-specific prediction remain
+model hooks; clip decoding still feeds the next clip's conditioning. This does
+not enable cache-dit or breakable CUDA graphs for this model.
+Clip decoding uses the shared `DecodingStage.decode_raw` path for VAE compilation,
+tiling and OOM diagnostics. Raw decoded pixels are kept for the next clip: no
+extra conversion to and from `[0, 1]` is introduced. The adapter preserves the
+existing FP32 VAE execution and per-channel latent scaling.
+QKV projections, cross-attention, FFN and the output head are inherited from the
+native Wan implementation. Ulysses exchanges use the shared packed-QKV path;
+the model-specific reference attention mask and K/V lifecycle are retained.
+Text and image conditioning projections are reused within each clip and CFG
+branch, rather than recomputed at every timestep. These projected tensors are
+released after the clip and never reused across requests. Decoded output is
+copied to CPU and clip-local intermediates are released; only the decoded
+overlap frames needed by the next clip remain on the GPU.
+Geometry caches retain at most four RoPE tables and two attention masks, rather
+than accumulating GPU tensors for every request size. Evicted entries are
+recomputed without changing the results; frequently alternating among more
+geometries can add setup work.
+
+Measured on one H200, with a 576×1024 budget, 8 steps, CFG 3, seed 42,
+`clip_len=37`, text-encoder CPU offload, and MP4 plus raw-frame output, the initial
+reuse changes reduced warm request latency from 42.30s to 41.34s (two requests
+per variant). With `clip_len=17`, omitting a fully cropped trailing clip reduced
+59.60s to 40.45s (one warm request per variant). Raw RGB frames were bit-identical
+and peak allocated VRAM did not increase. These are workload-specific results,
+not general speedup claims; both comparisons used PyTorch 2.13.0+cu130,
+Transformers 5.12.1, and Diffusers 0.37.0. The baseline was the initial native
+implementation, not the official Diffusers implementation.
+
+## 3. Model Deployment
+
+### 3.1 Recommended configurations
+
+Start with **Auto**, or choose **Memory** for more GPU headroom. Memory usage
+depends on the input video, pixel-area budget, and `clip_len`; see the
+[hardware comparison](#5-1-hardware-comparison) for measured configurations.
+For two B300 GPUs, set **GPUs / node** to **2** and **Memory policy** to **CFG parity**;
+**Auto** CFG parallelism enables the measured two-GPU recipe. The RTX 4090 entry
+selects its single-GPU memory recipe.
+
+Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
+`model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
+`--pipeline-class-name WanAnimate2Pipeline` only for a local mirror that lacks
+`model_index.json`.
+
+### 3.2 Configuration Tips
+
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for
+acceleration features and their runtime requirements.
+
+- `--num-gpus {NUM_GPUS}`: Number of GPUs to use.
+- `--tp-size {TP_SIZE}`: Tensor parallelism size.
+- `--ulysses-degree {ULYSSES_DEGREE}`: DeepSpeed-Ulysses-style sequence parallelism (USP). The **ring degree must be 1** for this model; `--ring-degree` greater than 1 is rejected with `NotImplementedError`. Combines with `--tp-size`: Ulysses splits the TP-local attention heads, so `--tp-size` must divide the 40 heads and `--ulysses-degree` must divide the per-shard count (see [section 3.3](#3-3-multi-gpu-and-memory-presets)).
+- `--enable-cfg-parallel`: Split the guided and unguided branches across GPUs.
+- `--text-encoder-cpu-offload`: CPU-offload the text encoder to save memory; it is moved to the GPU for the one encode per request.
+
+### 3.3 Multi-GPU and memory presets
+
+| Target | Recommended server flags | Notes |
+| --- | --- | --- |
+| 1 GPU, ample VRAM | *(no extra flags)* | Automatic placement. Start here on H200 or B300. On H200, `speed` used more memory without improving measured latency. |
+| 1 GPU, memory priority | `--performance-mode memory` | Layerwise offload for supported components. On the measured H200 workload, 31.7 GiB peak versus 68.9 GiB with auto, at nearly the same latency and identical RGB output. |
+| 1x RTX 4090, 24 GB | `--performance-mode memory` with `PYTORCH_ALLOC_CONF=expandable_segments:True` | Short-video recipe with little spare VRAM. The default allocator OOMed on the measured workload; offload also requires sufficient host RAM. |
+| 2+ GPUs, long sequences | `--num-gpus N --ulysses-degree N` | Sequence parallel across ranks (ring degree stays 1). |
+| 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. With `--tp-size` smaller than `--num-gpus` (or than half of it with `--enable-cfg-parallel`), the leftover GPUs are auto-assigned to Ulysses sequence parallelism (last row). |
+| 2 GPUs, split CFG | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided/unguided branches. |
+| 2x B300, recommended | **CFG parity** in the picker: `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 54.03 s, 39.53 GiB peak per GPU, and RGB identical to the single-B300 baseline. Only 0.50 s slower than plain CFG, with substantially less GPU memory. |
+| 4 GPUs | `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2` | CFG-parallel across two pairs of Ulysses ranks: the fastest 4-GPU layout; pass the flags explicitly to pin the layout instead of relying on the automatic assignment. Ulysses shards the attention sequence, so 4-GPU outputs match the single-GPU video to about 30 dB mean PSNR rather than bit for bit. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (about 35 GiB per GPU, same speed). |
+| FSDP sharding | `--use-fsdp-inference` is **not supported** | Rejected at startup, before any weights load; use `--tp-size` to shard the DiT or `--dit-layerwise-offload` to cut peak memory. |
+| 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 33 GiB peak per GPU (25 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
+
+## 4. Model Invocation
+
+### 4.1 Generate offline with a config file
+
+The offline path passes both inputs (and the sampling parameters) through a
+`--config` YAML:
+
+```yaml wan_animate_2_run.yaml
+prompt: "a person dancing"
+image_path: /path/to/reference.png
+video_path: /path/to/reference_video.mp4
+clip_len: 37
+height: 800
+width: 640
+num_inference_steps: 40
+guidance_scale: 3.0
+fps: 16
+seed: 42
+```
+
+```bash Command
+sglang generate \
+  --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
+  --config wan_animate_2_run.yaml \
+  --num-gpus 1 --text-encoder-cpu-offload --pin-cpu-memory \
+  --save-output --output-path outputs --output-file-name wan_animate_2.mp4
+```
+
+Any value in the YAML can also be passed as a CLI flag (for example
+`--image-path`, `--video-path`, `--num-inference-steps`, `--guidance-scale`,
+`--seed`).
+
+### 4.2 Serve and request over HTTP
+
+`POST /v1/videos` creates an asynchronous job. Send the **reference image** as the
+`input_reference` part and the **reference video** as `video_path`, then poll
+the job and download the finished MP4. `size` is the pixel-area budget described in
+[section 2.2](#2-2-defaults); the output dimensions follow the reference image's
+aspect ratio.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=a person dancing" \
+  --form-string "video_path=/path/to/reference_video.mp4" \
+  --form-string "clip_len=37" \
+  --form-string "size=640x800" \
+  --form-string "num_inference_steps=40" \
+  --form-string "guidance_scale=3.0" \
+  --form-string "fps=16" \
+  --form-string "seed=42" \
+  --form-string "enable_audio=false" \
+  --form "input_reference=@/path/to/reference.png;type=image/png" \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+
+while true; do
+  status=$(curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
+    | python -c 'import json, sys; print(json.load(sys.stdin)["status"])')
+  [ "$status" = "completed" ] && break
+  [ "$status" = "failed" ] && exit 1
+  sleep 1
+done
+
+curl -sS -L "http://127.0.0.1:30010/v1/videos/${job_id}/content" \
+  -o wan_animate_2.mp4
+```
+
+These examples produce silent video; use `enable_audio=true` to retain reference
+audio. With the OpenAI Python client, pass the image as `input_reference` and
+the server-readable `video_path` and `clip_len` through `extra_body`:
+
+```python Python
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30010/v1")
+video = client.videos.create(
+    model="Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+    prompt="a person dancing",
+    input_reference=open("/path/to/reference.png", "rb"),
+    extra_body={
+        "video_path": "/path/to/reference_video.mp4",
+        "clip_len": 37,
+        "guidance_scale": 3.0,
+        "enable_audio": False,  # silent output; the reference video's audio is kept by default
+    },
+)
+```
+
+For more API usage and request examples, see the
+[SGLang Diffusion OpenAI API](/docs/sglang-diffusion/api/openai_api) reference.
+
+### 4.3 Reducing memory
+
+Use memory mode to stream supported components layer by layer from host RAM:
+
+```bash Command
+sglang serve \
+  --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
+  --performance-mode memory \
+  --port 30010
+```
+
+For DiT-only offload, choose **DiT layerwise offload** in the picker instead.
+On RTX 4090, prefix the command with `PYTORCH_ALLOC_CONF=expandable_segments:True`
+as shown in its hardware preset; memory mode alone OOMed in the tested workload.
+Lowering `clip_len` also reduces memory, but shortens each clip's temporal context.
+
+## 5. Benchmark
+
+### 5.1 Hardware comparison
+
+Native inference at [SGLang `23d0a949a525`](https://github.com/sgl-project/sglang/commit/23d0a949a525006fa309c476f6f824c0644215af),
+with PyTorch 2.14.1+cu130, Transformers 5.19.0, and Diffusers 0.37.0.
+The [checkpoint revision](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers/tree/7d48412d7b903ff3a89f4f5a960d99e1899605a1)
+and [reference inputs](https://github.com/sgl-project/ci-data-diffusion/tree/31d8ad69f2434727aad518f0678fbd57823856fe/diffusion-ci/inputs/wan_animate_2)
+are pinned. The workload uses the [CI prompt](https://github.com/sgl-project/sglang/blob/23d0a949a525006fa309c476f6f824c0644215af/python/sglang/multimodal_gen/test/server/testcase_configs.py#L900-L904)
+and produces 24 frames at 576x1024: `clip_len=37`, 40 steps, CFG 3,
+seed 42, and 16 FPS, without audio.
+
+E2E is the median of three warm `DiffGenerator` requests, including MP4 saving
+and raw-frame return; loading and the first request are excluded. Runs use
+`--warmup-mode off` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. The same prompt
+is repeated with the default conditioning cache enabled. GPU memory is the
+maximum per-GPU device usage sampled at 10 Hz across loading and all four requests,
+including allocator reservation. It is **not** a minimum VRAM requirement;
+offload also uses host RAM.
+
+| Hardware | Server flags | Warm E2E (s) | Peak GPU memory (GiB) |
+| --- | --- | ---: | ---: |
+| 1x RTX 4090 | `--performance-mode memory` with `PYTORCH_ALLOC_CONF=expandable_segments:True` | 634.70 | 23.78 |
+| 1x H200 | Default (`auto`) | 192.27 | 68.88 |
+| 1x H200 | `--performance-mode memory` | 193.08 | 31.69 |
+| 1x H200 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 193.28 | 36.18 |
+| 1x H200 | `--performance-mode speed` | 192.58 | 90.65 |
+| 1x B300 | Default (`auto`) | 101.99 | 67.67 |
+| 1x B300 | `--performance-mode memory` | 104.07 | 30.71 |
+| 2x B300 | `--num-gpus 2 --enable-cfg-parallel` | 53.52 | 64.93 |
+| 2x B300 | **CFG parity** preset | 54.03 | 39.53 |
+| 2x B300 | `--num-gpus 2 --ulysses-degree 2` | 56.17 | 58.42 |
+| 2x B300 | `--num-gpus 2 --tp-size 2` | 62.97 | 38.88 |
+
+RTX 4090 fits this short input only with the expandable allocator; both default
+`auto` and `memory` without it OOMed. All four successful runs produced identical
+RGB. This leaves little VRAM headroom and does not validate longer videos. The
+test host had 1 TiB of RAM; smaller desktop RAM budgets were not validated.
+
+On this H200 workload, `memory` reduced the GPU peak by 54% with less than 0.5%
+additional latency; all 16 raw RGB outputs were identical. Start with `auto`
+when memory is plentiful, or choose `memory` for headroom. `speed` offered no
+measured latency benefit here.
+
+On B300, **CFG parity** is the recommended two-GPU recipe: 1.89x faster than one
+GPU with byte-identical RGB on this workload. Plain CFG is slightly faster but
+uses more memory and changes the output. Memory mode on one B300 also preserves
+RGB while reducing the GPU peak by 55%, with about 2% additional latency.
+
+<Accordion title="Output consistency on B300">
+Comparison against the single-B300 baseline, using all 24 raw RGB frames from
+the first warm request. SSIM is the per-frame mean; PSNR is computed from the
+global RGB mean squared error. This checks numerical consistency on one input,
+not perceptual quality across prompts or parity with the official implementation.
+
+| Recipe | Byte-identical | Mean / worst SSIM | Global / worst-frame PSNR (dB) |
+| --- | --- | --- | --- |
+| Memory; CFG parity | Yes | 1.0000 / 1.0000 | Infinite |
+| CFG | No | 0.9857 / 0.9574 | 35.36 / 27.65 |
+| Ulysses | No | 0.9895 / 0.9602 | 37.92 / 27.77 |
+| TP | No | 0.9896 / 0.9808 | 37.82 / 33.34 |
+</Accordion>
+
+### 5.2 GB200 reference benchmark
+
+This older benchmark uses a longer video and different settings; its numbers
+are not directly comparable with the hardware comparison above.
+
+Test Environment:
+
+- Hardware: NVIDIA GB200 GPU (1x, 2x and 4x; 189 GB per GPU)
+- Model: Wan-AI/Wan2.2-Animate-2-14B-Diffusers
+- sglang diffusion version: 0.5.22
+- Workload: `size` 640x800 (pixel-area budget) with a 16:9 reference image, so the frame is 960x528; a 237-frame reference video at `fps` 30 (7 clips of `clip_len` 37); 40 steps, CFG 3.0, seed 123; `--text-encoder-cpu-offload --warmup-mode request`. E2E is the request time after the warmup request, so it excludes the one-off flex-attention compile.
+
+`bench_serving` cannot pass `video_path`, so the benchmark runs offline
+with `sglang generate --config` (the YAML from [section 4.1](#4-1-generate-offline-with-a-config-file))
+and reads timings from `--perf-dump-path`. `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`
+synchronizes the device so the per-stage timings are accurate.
+
+<Tabs>
+  <Tab title="NVIDIA GB200">
+    **Benchmark Command** (1 GPU shown; add the flags from the table for the other rows):
+    ```shell Command
+    SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 sglang generate \
+      --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
+      --config wan_animate_2_run.yaml \
+      --num-gpus 1 --text-encoder-cpu-offload --warmup-mode request \
+      --save-output --perf-dump-path wan_animate_2_perf.json
+    ```
+
+    **Result** (peak memory per GPU from `nvidia-smi`):
+
+    | Config | GPUs | Extra flags | E2E (s) | Peak per GPU (GiB) |
+    | --- | ---: | --- | ---: | ---: |
+    | 1 GPU, DiT resident | 1 | none | 993 | 69.5 |
+    | 1 GPU, layerwise DiT offload | 1 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 996 | 40.2 |
+    | 2 GPUs, CFG-parallel | 2 | `--enable-cfg-parallel` | 513 | 67.3 |
+    | 2 GPUs, CFG-parallel, replicated encoders, serial VAE decode | 2 | `--enable-cfg-parallel --encoder-parallel replicate --vae-config.use-parallel-decode false` | 515 | 71.0 |
+    | 2 GPUs, CFG-parallel, layerwise DiT offload, bit-identical to 1 GPU | 2 | `--enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 512 | 43.0 |
+    | 2 GPUs, Ulysses | 2 | `--ulysses-degree 2` | 547 | 58.1 |
+    | 2 GPUs, tensor parallel | 2 | `--tp-size 2` | 613 | 36.6 |
+    | 4 GPUs, framework default (CFG2 x SP2, KV-gather exchange) | 4 | none | 283 | 58.4 |
+    | 4 GPUs, CFG-parallel x Ulysses | 4 | `--enable-cfg-parallel --ulysses-degree 2` | 283 | 58.4 |
+    | 4 GPUs, CFG-parallel x Ulysses, layerwise DiT offload | 4 | `--enable-cfg-parallel --ulysses-degree 2 --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` | 291 | 35.2 |
+    | 4 GPUs, Ulysses | 4 | `--ulysses-degree 4` | 317 | 49.0 |
+    | 4 GPUs, CFG-parallel x tensor parallel | 4 | `--enable-cfg-parallel --tp-size 2` | 318 | 37.5 |
+    | 4 GPUs, tensor parallel x Ulysses | 4 | `--tp-size 2 --ulysses-degree 2` | 361 | 33.5 |
+    | 4 GPUs, tensor parallel | 4 | `--tp-size 4` | 379 | 27.3 |
+
+    Layerwise DiT offload cuts the 1-GPU peak by 29 GiB at the same end-to-end time.
+    The fastest 4-GPU layout is 3.5x faster than one GPU. The framework default and the explicit CFG-parallel x Ulysses
+    layout run at the same speed and produce the same output; the explicit flags pin the layout.
+    Tensor parallel x Ulysses is the memory-leaning 4-GPU layout: the lowest 4-GPU peak after `--tp-size 4`, about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default.
+    Adding `--encoder-parallel replicate --vae-config.use-parallel-decode false` to the CFG-parallel x Ulysses row costs about 1 percent (287 s, 62.5 GiB) and does not make the output bit-identical to a single GPU: every Ulysses layout matches the single-GPU video to about 30 dB mean PSNR.
+    The layerwise rows are the configurations for 80 GB GPUs. With the replicated encoders, serial VAE decode and the
+    channels-last VAE layout (`SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1`) the 2-GPU CFG-parallel output is bit-identical to a single GPU.
+  </Tab>
+</Tabs>
+
+### 5.3 Native regression coverage
+
+A separate regression used two B300 GPUs, CFG-parallel with replicated encoders
+and serial VAE decode, a 576x1024 area budget, 40 steps, `clip_len=37`, CFG=3,
+and seed 42. The driving input was looped to 64 frames to exercise two clips;
+this is a bounded regression workload, not a long-video quality benchmark.
+Both revisions (`4ee69b4cf9ea` and `04725c1c2900`) used PyTorch 2.14.1+cu130,
+Transformers 5.19.0, Diffusers 0.37.0, and FlashAttention 4.0.0b34 on the same node.
+
+Cold and warm raw RGB outputs were byte-identical to the pre-optimization native
+implementation, both with resident DiT weights and with layerwise DiT offload.
+The single warm samples measured 112.29 s before and 112.40 s after optimization;
+offload measured 113.46 s. This does not establish a significant latency change.
+Rank 0's request-stage peak allocated memory was 52.24, 52.23, and 23.93 GiB,
+respectively; these are not loading peaks or whole-device physical memory peaks.
+
+An H200 HTTP smoke test also covered image upload, asynchronous job polling and
+download, request warmup, repeated requests, URL video input, and reference-audio
+passthrough. Repeated decoded RGB outputs were identical.
+
+These checks preserve the existing native output, not bitwise parity with the
+newer Diffusers modular pipeline. The native sampler follows the original Wan
+sigma grid starting at exactly 1.0 and retains its BF16 conditioning conversion;
+the modular pipeline's sampling and preprocessing differ. Official-reference
+accuracy must be validated separately with pinned versions and aligned settings.
+
+## 6. Troubleshooting
+
+- **OOM**: lower `clip_len` (for example `37` instead of `65`/`81`) or add `--dit-layerwise-offload --layerwise-offload-components transformer`.
+- **`--ring-degree` greater than 1** is rejected at startup with `NotImplementedError`. Use `--ulysses-degree` for sequence parallelism and keep the ring degree at 1.
+- **`--ulysses-degree` that does not divide the TP-local attention heads** (40 / `--tp-size`; with TP 1, degrees 3, 6, 16, ... are rejected) fails at startup with `ValueError`; with TP 1 use 2, 4, 5, 8, 10, 20 or 40. The same check covers leftover GPUs auto-assigned to sequence parallelism (for example `--num-gpus 8 --tp-size 2` runs TP 2 x Ulysses 4).
+- **FSDP** (`--use-fsdp-inference`) is not supported for this model and is rejected at startup; use `--tp-size` or DiT layerwise offload for memory.
+- **`--attention-backend`** (or `--component-attention-backends transformer=...`) is rejected at startup with `ValueError`: the in-context self-attention runs on torch `flex_attention` only. The text encoder still accepts `--component-attention-backends text_encoder=<backend>`.
+- **`enable_teacache` / `enable_spectrum`** request fields are rejected with `ValueError`: every block runs at every step, so the cache heuristics do not apply.
+- **`SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION`** is rejected at startup with `ValueError`: this model does not apply the offline Q/K rotation.
+- **Silent output**: the reference video's audio track is kept only when it can be decoded; otherwise the output is silent and the server logs one warning per process naming the cause. A reference video without an audio track also gives a silent output (one info line). Pass `enable_audio=false` to skip audio extraction altogether.
+- **Reference video not found**: `video_path` must be a path the server process can read. Pass it as `--video-path` or through `--config` offline, or in the request body online.

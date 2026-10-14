@@ -1,0 +1,287 @@
+---
+title: "SGLang Frontend Language"
+metatags:
+    description: "SGLang frontend tutorial: multi-turn dialog, fork parallelism, regex constraints, batching, streaming."
+---
+SGLang frontend language can be used to define simple and easy prompts in a convenient, structured way.
+
+## Launch A Server
+
+Launch the server in your terminal and wait for it to initialize.
+
+```python Example
+from sglang import assistant_begin, assistant_end
+from sglang import assistant, function, gen, system, user
+from sglang import image
+from sglang import RuntimeEndpoint
+from sglang.lang.api import set_default_backend
+from sglang.srt.utils import load_image
+from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import print_highlight, terminate_process, wait_for_server
+
+server_process, port = launch_server_cmd(
+    "python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --log-level warning"
+)
+
+wait_for_server(f"http://localhost:{port}", process=server_process)
+print(f"Server started on http://localhost:{port}")
+```
+
+Set the default backend. Note: Besides the local server, you may use also `OpenAI` or other API endpoints.
+
+```python Example
+set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
+```
+
+## Basic Usage
+
+The most simple way of using SGLang frontend language is a simple question answer dialog between a user and an assistant.
+
+```python Example
+@function
+def basic_qa(s, question):
+    s += system(f"You are a helpful assistant than can answer questions.")
+    s += user(question)
+    s += assistant(gen("answer", max_tokens=512))
+```
+
+```python Example
+state = basic_qa("List 3 countries and their capitals.")
+print_highlight(state["answer"])
+```
+
+## Multi-turn Dialog
+
+SGLang frontend language can also be used to define multi-turn dialogs.
+
+```python Example
+@function
+def multi_turn_qa(s):
+    s += system(f"You are a helpful assistant than can answer questions.")
+    s += user("Please give me a list of 3 countries and their capitals.")
+    s += assistant(gen("first_answer", max_tokens=512))
+    s += user("Please give me another list of 3 countries and their capitals.")
+    s += assistant(gen("second_answer", max_tokens=512))
+    return s
+
+
+state = multi_turn_qa()
+print_highlight(state["first_answer"])
+print_highlight(state["second_answer"])
+```
+
+## Control flow
+
+You may use any Python code within the function to define more complex control flows.
+
+```python Example
+@function
+def tool_use(s, question):
+    s += assistant(
+        "To answer this question: "
+        + question
+        + ". I need to use a "
+        + gen("tool", choices=["calculator", "search engine"])
+        + ". "
+    )
+
+    if s["tool"] == "calculator":
+        s += assistant("The math expression is: " + gen("expression"))
+    elif s["tool"] == "search engine":
+        s += assistant("The key word to search is: " + gen("word"))
+
+
+state = tool_use("What is 2 * 2?")
+print_highlight(state["tool"])
+print_highlight(state["expression"])
+```
+
+## Parallelism
+
+Use `fork` to launch parallel prompts. Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
+
+```python Example
+@function
+def tip_suggestion(s):
+    s += assistant(
+        "Here are two tips for staying healthy: "
+        "1. Balanced Diet. 2. Regular Exercise.\n\n"
+    )
+
+    forks = s.fork(2)
+    for i, f in enumerate(forks):
+        f += assistant(
+            f"Now, expand tip {i+1} into a paragraph:\n"
+            + gen("detailed_tip", max_tokens=256, stop="\n\n")
+        )
+
+    s += assistant("Tip 1:" + forks[0]["detailed_tip"] + "\n")
+    s += assistant("Tip 2:" + forks[1]["detailed_tip"] + "\n")
+    s += assistant(
+        "To summarize the above two tips, I can say:\n" + gen("summary", max_tokens=512)
+    )
+
+
+state = tip_suggestion()
+print_highlight(state["summary"])
+```
+
+## Constrained Decoding
+
+Use `regex` to specify a regular expression as a decoding constraint. This is only supported for local models.
+
+```python Example
+@function
+def regular_expression_gen(s):
+    s += user("What is the IP address of the Google DNS servers?")
+    s += assistant(
+        gen(
+            "answer",
+            temperature=0,
+            regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
+        )
+    )
+
+
+state = regular_expression_gen()
+print_highlight(state["answer"])
+```
+
+Use `regex` to define a `JSON` decoding schema.
+
+```python Example
+character_regex = (
+    r"""\{\n"""
+    + r"""    "name": "[\w\d\s]{1,16}",\n"""
+    + r"""    "house": "(Gryffindor|Slytherin|Ravenclaw|Hufflepuff)",\n"""
+    + r"""    "blood status": "(Pure-blood|Half-blood|Muggle-born)",\n"""
+    + r"""    "occupation": "(student|teacher|auror|ministry of magic|death eater|order of the phoenix)",\n"""
+    + r"""    "wand": \{\n"""
+    + r"""        "wood": "[\w\d\s]{1,16}",\n"""
+    + r"""        "core": "[\w\d\s]{1,16}",\n"""
+    + r"""        "length": [0-9]{1,2}\.[0-9]{0,2}\n"""
+    + r"""    \},\n"""
+    + r"""    "alive": "(Alive|Deceased)",\n"""
+    + r"""    "patronus": "[\w\d\s]{1,16}",\n"""
+    + r"""    "bogart": "[\w\d\s]{1,16}"\n"""
+    + r"""\}"""
+)
+
+
+@function
+def character_gen(s, name):
+    s += user(
+        f"{name} is a character in Harry Potter. Please fill in the following information about this character."
+    )
+    s += assistant(gen("json_output", max_tokens=256, regex=character_regex))
+
+
+state = character_gen("Harry Potter")
+print_highlight(state["json_output"])
+```
+
+## Batching
+
+Use `run_batch` to run a batch of prompts.
+
+```python Example
+@function
+def text_qa(s, question):
+    s += user(question)
+    s += assistant(gen("answer", stop="\n"))
+
+
+states = text_qa.run_batch(
+    [
+        {"question": "What is the capital of the United Kingdom?"},
+        {"question": "What is the capital of France?"},
+        {"question": "What is the capital of Japan?"},
+    ],
+    progress_bar=True,
+)
+
+for i, state in enumerate(states):
+    print_highlight(f"Answer {i+1}: {states[i]['answer']}")
+```
+
+## Streaming
+
+Use `stream` to stream the output to the user.
+
+```python Example
+@function
+def text_qa(s, question):
+    s += user(question)
+    s += assistant(gen("answer", stop="\n"))
+
+
+state = text_qa.run(
+    question="What is the capital of France?", temperature=0.1, stream=True
+)
+
+for out in state.text_iter():
+    print(out, end="", flush=True)
+```
+
+## Complex Prompts
+
+You may use `&#123;system|user|assistant&#125;_&#123;begin|end&#125;` to define complex prompts.
+
+```python Example
+@function
+def chat_example(s):
+    s += system("You are a helpful assistant.")
+    # Same as: s += s.system("You are a helpful assistant.")
+
+    with s.user():
+        s += "Question: What is the capital of France?"
+
+    s += assistant_begin()
+    s += "Answer: " + gen("answer", max_tokens=100, stop="\n")
+    s += assistant_end()
+
+
+state = chat_example()
+print_highlight(state["answer"])
+```
+
+```python Example
+terminate_process(server_process)
+```
+
+## Multi-modal Generation
+
+You may use SGLang frontend language to define multi-modal prompts.
+See [here](../../supported-models/multimodal_language_models) for supported models.
+
+```python Example
+server_process, port = launch_server_cmd(
+    "python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-7B-Instruct --host 0.0.0.0 --log-level warning"
+)
+
+wait_for_server(f"http://localhost:{port}", process=server_process)
+print(f"Server started on http://localhost:{port}")
+```
+
+```python Example
+set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
+```
+
+Ask a question about an image.
+
+```python Example
+@function
+def image_qa(s, image_file, question):
+    s += user(image(image_file) + question)
+    s += assistant(gen("answer", max_tokens=256))
+
+
+image_url = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
+image_bytes, _ = load_image(image_url)
+state = image_qa(image_bytes, "What is in the image?")
+print_highlight(state["answer"])
+```
+
+```python Example
+terminate_process(server_process)
+```

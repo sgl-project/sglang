@@ -1,0 +1,837 @@
+---
+title: "Cache-DiT Acceleration"
+description: "Configure Cache-DiT acceleration for diffusion inference."
+tag: "approx"
+---
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **1.69x inference speedup** with minimal quality loss.
+
+## Overview
+
+**Cache-DiT** uses intelligent caching strategies to skip redundant computation in the denoising loop:
+
+- **DBCache (Dual Block Cache)**: Dynamically decides when to cache transformer blocks based on residual differences
+- **TaylorSeer**: Uses Taylor expansion for calibration to optimize caching decisions
+- **DMD Calibrator**: An **exponential-basis** forecasting calibrator (Dynamic Mode Decomposition, not Distribution Matching Distillation) that serves as a drop-in alternative to TaylorSeer's polynomial basis; strongest on flow-matching models
+- **SCM (Step Computation Masking)**: Step-level caching control for additional speedup
+
+Cache-DiT also ships **SVDQuant** W4A4 (int4 / NVFP4) dynamic quantization, which can be combined
+with DBCache caching (see [Quantization](#quantization)).
+
+## Basic Usage
+
+Cache-DiT is a **per-request** switch: each request decides whether to run
+cached or lossless, and requests with different Cache-DiT settings never share
+a batch. The `SGLANG_CACHE_DIT_*` environment variables remain available as
+server-wide defaults for requests that leave the switch unset.
+
+Enable it for a single generation:
+
+```bash
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A beautiful sunset over the mountains" \
+    --enable-cache-dit true
+```
+
+Or per request against a running server, via the OpenAI-compatible API:
+
+```python
+client.images.generate(
+    model="Qwen/Qwen-Image",
+    prompt="A beautiful sunset over the mountains",
+    extra_body={
+        "enable_cache_dit": True,
+        # optional knob overrides for this request only
+        "cache_dit_params": {"residual_diff_threshold": 0.12, "scm_preset": "fast"},
+    },
+)
+```
+
+`enable_cache_dit` accepts three states: `true` (on for this request), `false`
+(off for this request, overriding the server default), and unset (follow the
+`SGLANG_CACHE_DIT_ENABLED` server default). `cache_dit_params` accepts the
+DBCache knobs (`Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`,
+`residual_diff_threshold`, `max_continuous_cached_steps`, `enable_taylorseer`,
+`taylorseer_order`), the DMD knobs (`enable_dmd`, `dmd_history`, `dmd_rank`,
+`dmd_ridge`, `dmd_svd_precision`; DMD and TaylorSeer are mutually exclusive
+calibrators and cannot be enabled together), the SCM knobs (`scm_preset`,
+`scm_compute_bins`, `scm_cache_bins`, `scm_policy`), and a nested `secondary`
+dict with the DBCache
+knobs for the second transformer of dual-DiT models (unset secondary keys
+inherit the request's primary values, then the
+`SGLANG_CACHE_DIT_SECONDARY_*` defaults).
+
+To make Cache-DiT the default for every request instead, export the
+environment variable when launching:
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+sglang serve --model-path Qwen/Qwen-Image
+```
+
+## Diffusers Backend
+
+Cache-DiT supports loading acceleration configs from a custom YAML file. For
+diffusers pipelines (`diffusers` backend), pass the YAML/JSON path via `--cache-dit-config`. This
+flow requires cache-dit >= 1.2.0 (`cache_dit.load_configs`).
+
+### Single GPU inference
+
+Define a `cache.yaml` file that contains:
+
+- DBCache + TaylorSeer
+
+```yaml
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+```
+
+Then apply the config with:
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config cache.yaml \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+- DBCache + TaylorSeer + SCM (Step Computation Mask)
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+  # Must set the num_inference_steps for SCM. The SCM will automatically
+  # generate the steps computation mask based on the num_inference_steps.
+  # Reference: https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#scm-steps-computation-masking
+  num_inference_steps: 28
+  steps_computation_mask: fast
+```
+
+- DBCache + TaylorSeer + SCM (Step Computation Mask) + Cache CFG
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+  num_inference_steps: 28
+  steps_computation_mask: fast
+  enable_sperate_cfg: true # e.g, Qwen-Image, Wan, Chroma, Ovis-Image, etc.
+```
+
+- DBCache + DMD Calibrator
+
+Instead of TaylorSeer, you can use the DMD calibrator: an **exponential-basis** forecasting
+calibrator that serves as a drop-in alternative to TaylorSeer's polynomial basis. DMD models
+the cached feature stream as a linear dynamical system (`Y_{t+1} ~= A @ Y_t`), forecasts
+cached features from the fitted eigen-modes, and stays accurate over longer cache skips where
+polynomial extrapolation diverges. DMD here refers to Dynamic Mode Decomposition (Schmid
+2010), **not** Distribution Matching Distillation. DMD works best on flow-matching models
+(e.g., FLUX), while TaylorSeer is often better on DDPM-style models — try both. DMD and
+TaylorSeer are mutually exclusive — enable only one of `enable_dmd` / `enable_taylorseer`:
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0 # Bn=0 since the DMD calibrator replaces the Bn calibrator
+  residual_diff_threshold: 0.12
+  enable_dmd: true
+  dmd_history: 6 # snapshot window length, 5-6 typical
+  dmd_svd_precision: "medium" # "low", "medium" or "high"
+```
+
+A `dmd_history` window of 5–6 snapshots is typically the sweet spot — longer histories do not
+always help, because the feature dynamics drift across timesteps. With fewer than 4 uniformly
+spaced snapshots available, DMD transparently falls back to the Taylor expansion it maintains
+internally. See the
+[Cache-DiT DMD documentation](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#dmd-calibrator-dynamic-mode-decomposition)
+for the mathematical principle and quantitative comparisons. A ready-made config is available
+at
+[examples/configs/cache_dmd.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/cache_dmd.yaml)
+in the Cache-DiT repository. Apply it with the same `--cache-dit-config` flag:
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config cache_dmd.yaml \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+### Distributed inference
+
+- 1D Parallelism
+
+Define a parallelism only config yaml `parallel.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+```
+
+Then, apply the distributed inference acceleration config from yaml. `ulysses_size: auto` means that cache-dit will auto detect the `world_size` as the ulysses_size. Otherwise, you should manually set it as specific int number, e.g, 4.
+
+Then apply the distributed config with: (Note: please add `--num-gpus N` to specify the number of gpus for distributed inference)
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config parallel.yaml \
+  --prompt "A futuristic cityscape at sunset"
+```
+
+- 2D Parallelism
+
+You can also define a 2D parallelism config yaml `parallel_2d.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  tp_size: 2
+  attention_backend: native
+```
+Then, apply the 2D parallelism config from yaml. Here `tp_size: 2` means using tensor parallelism with size 2. The `ulysses_size: auto` means that cache-dit will auto detect the `world_size // tp_size` as the ulysses_size.
+
+- 3D Parallelism
+
+You can also define a 3D parallelism config yaml `parallel_3d.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: 2
+  ring_size: 2
+  tp_size: 2
+  attention_backend: native
+```
+Then, apply the 3D parallelism config from yaml. Here `ulysses_size: 2`, `ring_size: 2`, `tp_size: 2` means using ulysses parallelism with size 2, ring parallelism with size 2 and tensor parallelism with size 2.
+
+- Ulysses Anything Attention
+
+To enable Ulysses Anything Attention, you can define a parallelism config yaml `parallel_uaa.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_anything: true
+```
+
+- Ulysses FP8 Communication
+
+For device that don't have NVLink support, you can enable Ulysses FP8 Communication to further reduce the communication overhead. You can define a parallelism config yaml `parallel_fp8.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_float8: true
+```
+
+- Async Ulysses CP
+
+You can also enable async ulysses CP to overlap the communication and computation. Define a parallelism config yaml `parallel_async.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  ulysses_async: true # Now, only support for FLUX.1, Qwen-Image, Ovis-Image and Z-Image.
+```
+Then, apply the config from yaml. Here `ulysses_async: true` means enabling async ulysses CP.
+
+- TE-P and VAE-P
+
+You can also specify the extra parallel modules in the yaml config. For example, define a parallelism config yaml `parallel_extra.yaml` file that contains:
+
+```yaml Config
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
+```
+
+
+### Hybrid Cache and Parallelism
+
+Define a hybrid cache and parallel acceleration config yaml `hybrid.yaml` file that contains:
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
+```
+
+Then, apply the hybrid cache and parallel acceleration config from yaml.
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config hybrid.yaml \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+### Attention Backend
+
+In some cases, users may want to only specify the attention backend without any other optimization configs. In this case, you can define a yaml file `attention.yaml` that only contains:
+
+```yaml Config
+attention_backend: "flash" # '_flash_3' for Hopper
+```
+
+### Quantization
+
+You can also specify the quantization config in the yaml file, required `torchao>=0.16.0`. For example, define a yaml file `quantize.yaml` that contains:
+
+```yaml Config
+quantize_config: # quantization configuration for transformer modules
+  # float8 (DQ), float8_weight_only, float8_blockwise, int8 (DQ), int8_weight_only, etc.
+  quant_type: "float8"
+  # layers to exclude from quantization (transformer). layers that contains any of the
+  # keywords in the exclude_layers list will be excluded from quantization. This is useful
+  # for some sensitive layers that are not robust to quantization, e.g., embedding layers.
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false # whether to print verbose logs during quantization
+```
+Then, apply the quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization. For example:
+
+```bash Command
+sglang generate \
+  --backend diffusers \
+  --model-path Qwen/Qwen-Image \
+  --warmup-mode request \
+  --cache-dit-config quantize.yaml \
+  --enable-torch-compile \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+#### SVDQuant (W4A4 int4 / NVFP4)
+
+SVDQuant is Cache-DiT's built-in W4A4 PTQ quantization (weights and activations in int4 or
+NVFP4, with smoothed low-rank branches). It can be freely combined with DBCache caching and
+the DMD calibrator for the largest speedups.
+
+::::note
+SVDQuant requires a cache-dit build **with CUDA extension support** — a plain
+`pip install cache-dit` does NOT include it. Install one of:
+
+```bash Command
+# Option 1: prebuilt CUDA 13 wheel
+pip install cache-dit-cu13==<version> --no-deps
+
+# Option 2: build from source with SVDQuant enabled
+git clone https://github.com/vipshop/cache-dit
+cd cache-dit
+export CUDA_HOME=/usr/local/cuda
+CACHE_DIT_BUILD_SVDQUANT=1 pip install ".[quantization]" --no-build-isolation
+```
+::::
+
+Valid `quant_type` values are `svdq_int4_r{32,64,128,256}_dq` (int4 W4A4) and
+`svdq_nvfp4_r{32,64,128,256}_dq` (NVFP4 W4A4; requires a Blackwell GPU). Example config
+combining SVDQuant NVFP4 with DBCache + DMD (see
+[examples/configs/blackwell/cache_dmd_svdq.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/blackwell/cache_dmd_svdq.yaml)):
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_dmd: true
+  dmd_history: 6
+  dmd_svd_precision: "medium"
+quantize_config:
+  quant_type: "svdq_nvfp4_r128_dq" # nvfp4 for Blackwell; use svdq_int4_r128_dq for int4
+  svdq_kwargs:
+    quantize_device: "cuda"
+    fused_mlp: true
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false
+```
+
+For int4 W4A4 (pre-Blackwell GPUs), the same config with
+`quant_type: "svdq_int4_r128_dq"` is available at
+[examples/configs/cache_dmd_svdq.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/cache_dmd_svdq.yaml)
+(add `runtime_kernel: "v2"` to `svdq_kwargs`).
+
+Enable `torch.compile` for the best SVDQuant performance, and make sure `--warmup-steps`
+covers the compile warmup (use the same value as `--num-inference-steps`):
+
+```bash Command
+sglang generate \
+  --backend diffusers \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --num-inference-steps=28 \
+  --warmup-mode request \
+  --warmup-steps 28 \
+  --cache-dit-config cache_dmd_svdq.yaml \
+  --enable-torch-compile \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+You can verify from the log that the quantization is active:
+`[Cache-DiT] SVDQuant Type: svdq_nvfp4_r128_dq, Rank: 128`.
+
+### Combined Configs: Cache + Parallelism + Quantization
+
+You can also combine all the above configs together in a single yaml file `combined.yaml` that contains:
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+parallelism_config:
+  ulysses_size: auto
+  attention_backend: native
+  extra_parallel_modules: ["text_encoder", "vae"]
+quantize_config:
+  quant_type: "float8"
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false
+```
+Then, apply the combined cache, parallelism and quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization.
+
+## Advanced Configuration
+
+### DBCache Parameters
+
+DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "12%"}} />
+    <col style={{width: "34%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "40%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+
+### TaylorSeer Configuration
+
+TaylorSeer improves caching accuracy using Taylor expansion:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "12%"}} />
+    <col style={{width: "36%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "38%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+### DMD Calibrator Configuration
+
+DMD (Dynamic Mode Decomposition, Schmid 2010 — **not** Distribution Matching Distillation) is
+an **exponential-basis** forecasting calibrator and a drop-in alternative to TaylorSeer's
+polynomial basis. At each full-compute step it records a snapshot of the computed features; at
+a cached step it identifies a linear propagator from the recent snapshot window (one economy
+SVD with rank truncation, then eigendecomposition) and forecasts the current features via
+eigenvalue powers — cheap to advance, and stable over longer cache skips where polynomial
+extrapolation diverges. It typically improves both speed and quality over pure DBCache.
+**DMD and TaylorSeer are mutually exclusive** (enabling both raises a `ValueError`); DMD is
+best for flow-matching models, TaylorSeer for DDPM-style ones. See the
+[Cache-DiT DMD documentation](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#dmd-calibrator-dynamic-mode-decomposition)
+for details:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "14%"}} />
+    <col style={{width: "38%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "34%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DMD calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>History</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_HISTORY`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Snapshot window length; 5-6 typical. Needs >= 4 uniformly spaced snapshots, otherwise DMD falls back to TaylorSeer</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Rank</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_RANK`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SVD truncation rank; 0 = automatic (drop modes below 1e-4 of the leading singular value)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Ridge</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_RIDGE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1e-8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tikhonov regularization added to the inverted singular values</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SVD Precision</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_SVD_PRECISION`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>medium</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SVD precision: "low", "medium" or "high"</td>
+    </tr>
+  </tbody>
+</table>
+
+Usage (SGLD backend, env-driven):
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_DMD=true \
+sglang generate --model-path black-forest-labs/FLUX.1-dev \
+    --prompt "A curious raccoon in a forest"
+```
+
+On the diffusers backend, enable DMD from the yaml config instead
+(`enable_dmd: true` in `cache_config`, see
+[Diffusers Backend](#diffusers-backend)); DMD can also be set per request via
+`cache_dit_params: {"enable_dmd": true}`.
+
+### Combined Configuration Example
+
+DBCache and TaylorSeer are complementary strategies that work together, you can configure both sets of parameters
+simultaneously:
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang generate --model-path black-forest-labs/FLUX.1-dev \
+    --prompt "A curious raccoon in a forest"
+```
+
+### SCM (Step Computation Masking)
+
+SCM provides step-level caching control for additional speedup. It decides which denoising steps to compute fully and
+which to use cached results.
+
+**SCM Presets**
+
+SCM is configured with presets:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "38%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Preset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Compute Ratio</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Speed</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Quality</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`none`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baseline</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Best</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`slow`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>~75%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~1.3x</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>High</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`medium`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>~50%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~2x</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Good</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`fast`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>~35%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~3x</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Acceptable</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`ultra`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>~25%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~4x</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Lower</td>
+    </tr>
+  </tbody>
+</table>
+
+**Usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_SCM_PRESET=medium \
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A futuristic cityscape at sunset"
+```
+
+**Custom SCM Bins**
+
+For fine-grained control over which steps to compute vs cache:
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_SCM_COMPUTE_BINS="8,3,3,2,2" \
+SGLANG_CACHE_DIT_SCM_CACHE_BINS="1,2,2,2,3" \
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A futuristic cityscape at sunset"
+```
+
+**SCM Policy**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16%"}} />
+    <col style={{width: "42%"}} />
+    <col style={{width: "42%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Policy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`dynamic`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_SCM_POLICY=dynamic`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Adaptive caching based on content (default)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_SCM_POLICY=static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Fixed caching pattern</td>
+    </tr>
+  </tbody>
+</table>
+
+## Environment Variables
+
+All Cache-DiT parameters can also be configured via environment variables,
+which act as the server-wide defaults for requests that don't set
+`enable_cache_dit` / `cache_dit_params`.
+See [Environment Variables](./environment_variables) for the complete list.
+
+## Supported Models
+
+SGLang Diffusion x Cache-DiT supports almost all models originally supported in SGLang Diffusion:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "30%"}} />
+    <col style={{width: "70%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Family</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Example Models</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Wan2.1, Wan2.2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Flux</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FLUX.1-dev, FLUX.2-dev</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Z-Image-Turbo</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen-Image, Qwen-Image-Edit, Qwen-Image 2.1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>HunyuanVideo</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax-H3 (T2VA, FL2VA, and Ref2VA)</td>
+    </tr>
+  </tbody>
+</table>
+
+## Performance Tips
+
+1. **Start with defaults**: The default parameters work well for most models
+2. **Use TaylorSeer**: It typically improves both speed and quality
+3. **Tune R threshold**: Lower values = better quality, higher values = faster
+4. **SCM for extra speed**: Use `medium` preset for good speed/quality balance
+5. **Warmup matters**: Higher warmup = more stable caching decisions
+
+## Limitations
+
+- **SGLang-native pipelines**: Distributed Cache-DiT paths exist for supported pipelines. Hybrid SP+TP configurations add communication and cache coordination overhead, so validate them on the target model and hardware before using them as production defaults.
+- **DiT layerwise offload**: Compatible. Skipped blocks are not streamed, and the first layer after a skip may sync-load. Still incompatible with `--use-fsdp-inference`.
+- **SCM minimum steps**: SCM requires >= 8 inference steps to be effective. Some pipelines report `steps - 1` NFEs (for example MiniMax-H3 `num_inference_steps=8` is 7 NFEs), which trips the upstream `steps_mask` assertion; use at least 9 requested steps or custom bins.
+- **Model support**: The model must be registered in Cache-DiT's
+  `BlockAdapterRegister` or have an SGLang custom block adapter.
+
+## Troubleshooting
+
+### SCM disabled for low step count
+
+For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
+acceleration still works.
+
+### SVDQuant unavailable or load failure
+
+SVDQuant cases raise `svdq_is_available() = False` or
+`undefined symbol: ... materialize_cow_storage ...` when the installed cache-dit has no CUDA
+extension, or the prebuilt wheel was compiled against an incompatible torch. Fix: reinstall
+from the `cache-dit-cu13` wheel matching your torch version, or build cache-dit from source
+with `CACHE_DIT_BUILD_SVDQUANT=1` (see [Quantization](#quantization)). Quick self-check:
+
+```bash Command
+python -c "from cache_dit.quantization.svdquant import svdq_is_available, svdq_get_load_error as e; print(svdq_is_available(), e())"
+```
+
+## References
+
+- [Cache-DiT](https://github.com/vipshop/cache-dit)
+- [SGLang Diffusion](./performance-optimization)

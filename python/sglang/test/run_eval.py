@@ -1,0 +1,367 @@
+"""
+Usage:
+python3 -m sglang.test.run_eval --port 30000 --eval-name gsm8k --num-examples 10
+"""
+
+import argparse
+import json
+import os
+import statistics
+import time
+import warnings
+
+from sglang.test.sgl_eval_utils import (
+    SGL_EVAL_BENCHMARKS,
+    THINKING_MODE_CHOICES,
+    get_thinking_kwargs,
+    parse_json_object,
+)
+from sglang.test.simple_eval_common import (
+    ChatCompletionSampler,
+    CompletionSampler,
+    Eval,
+    GenerateSampler,
+    make_report,
+    set_ulimit,
+)
+
+
+def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    if isinstance(chat_template_kwargs, str):
+        chat_template_kwargs = parse_json_object(chat_template_kwargs)
+    elif chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    elif not isinstance(chat_template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be a dict or a JSON object string")
+
+    chat_template_kwargs = {**get_thinking_kwargs(args), **chat_template_kwargs}
+
+    extra_body = {}
+    if chat_template_kwargs:
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
+
+    for param_name in ("top_k", "min_p"):
+        value = getattr(args, param_name, None)
+        if value is not None:
+            extra_body[param_name] = value
+
+    max_tokens = getattr(args, "max_tokens", None)
+    top_p = getattr(args, "top_p", None)
+    temperature = getattr(args, "temperature", None)
+    common_kwargs = dict(
+        model=getattr(args, "model", None),
+        max_tokens=2048 if max_tokens is None else max_tokens,
+        top_p=1.0 if top_p is None else top_p,
+        base_url=base_url,
+        temperature=0.0 if temperature is None else temperature,
+    )
+
+    api_mode = getattr(args, "api", "chat")
+    if api_mode == "completion":
+        # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = CompletionSampler(
+            **common_kwargs,
+            stop=stop,
+        )
+    elif api_mode == "generate":
+        # SGLang-native `/generate` (raw text + sampling_params), same stop defaults.
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = GenerateSampler(
+            **common_kwargs,
+            stop=stop,
+        )
+    else:
+        sampler = ChatCompletionSampler(
+            **common_kwargs,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            extra_body=extra_body if extra_body else None,
+            record_meta_info=True,
+        )
+
+    # Run eval
+    tic = time.perf_counter()
+    result = eval_obj(sampler)
+    latency = time.perf_counter() - tic
+
+    return result, latency, sampler
+
+
+def print_accept_length_summary(samplers: list) -> None:
+    accept_lengths = [
+        m["spec_accept_length"]
+        for sampler in samplers
+        for m in getattr(sampler, "_meta_infos", [])
+        if m.get("spec_accept_length") is not None
+    ]
+    print("=" * 20)
+    if not accept_lengths:
+        print(
+            "Speculative decoding: no per-request spec_accept_length in responses "
+            "(non-speculative server, or --api completion which lacks return_meta_info)."
+        )
+    else:
+        print(
+            f"Speculative accept length (per-request, from meta_info): "
+            f"n={len(accept_lengths)} "
+            f"mean={statistics.fmean(accept_lengths):.4f} "
+            f"min={min(accept_lengths):.4f} "
+            f"max={max(accept_lengths):.4f}"
+        )
+    print("=" * 20)
+
+
+def run_eval(args):
+    # Lazy import to avoid circular dependency with test_utils
+    from sglang.test.test_utils import dump_metric
+
+    warnings.warn(
+        "sglang.test.run_eval is deprecated; its legacy scorers will be removed. "
+        "Use sglang.test.sgl_eval_utils.run_sgl_eval or `sgl-eval run` instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if (
+        args.eval_name in SGL_EVAL_BENCHMARKS
+        or args.eval_name == "mmmu-pro"
+        or getattr(args, "api", None) == "sgl_eval"
+        or getattr(args, "load_preset_from_model_id", None)
+    ):
+        raise ValueError(
+            f"{args.eval_name} is scored by sgl-eval; call "
+            "sglang.test.sgl_eval_utils.run_sgl_eval instead of run_eval."
+        )
+
+    set_ulimit()
+
+    if "OPENAI_API_KEY" not in os.environ:
+        os.environ["OPENAI_API_KEY"] = "EMPTY"
+
+    base_url = (
+        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    )
+
+    if args.eval_name == "mgsm_en":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
+    elif args.eval_name == "humaneval":
+        from sglang.test.simple_eval_humaneval import HumanEval
+
+        eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "mmmu":
+        # VLM MMMU evaluation with fixed 100 examples by default
+        from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+
+        eval_obj = MMMUVLMEval(
+            args.num_examples,
+            args.num_threads,
+            response_answer_regex=getattr(args, "response_answer_regex", None),
+        )
+    elif args.eval_name == "gsm8k":
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
+    elif args.eval_name == "mixed_prefix_gsm8k":
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
+
+        eval_obj = MixedPrefixGSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=args.num_shots,
+            secondary_pool_size=args.mixed_prefix_gsm8k_secondary_pool_size,
+            data_path=args.gsm8k_data_path,
+            seed=args.mixed_prefix_gsm8k_seed,
+        )
+    else:
+        raise ValueError(f"Invalid eval name: {args.eval_name}")
+
+    if getattr(args, "repeat", 1) == 1:
+        result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        samplers = [sampler]
+        metrics = result.metrics | {"score": result.score}
+        metrics["latency"] = latency
+        print(f"Total latency: {latency:.3f} s")
+        print(f"Score: {metrics['score']:.3f}")
+
+        # Compute output throughput from accumulated completion tokens
+        total_completion_tokens = sum(sampler._completion_tokens)
+        if total_completion_tokens > 0 and latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
+
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_score",
+            metrics["score"],
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+        dump_metric(
+            f"{args.eval_name}_latency",
+            latency,
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(max_workers=args.repeat)
+
+        futures = [
+            executor.submit(run_eval_once, args, base_url, eval_obj)
+            for _ in range(args.repeat)
+        ]
+
+        scores_repeat = []
+        latencies = []
+        total_completion_tokens = 0
+        samplers = []
+
+        for f in futures:
+            result, latency, sampler = f.result()
+            samplers.append(sampler)
+            scores_repeat.append(result.score)
+            latencies.append(latency)
+            total_completion_tokens += sum(sampler._completion_tokens)
+
+        mean_score = sum(scores_repeat) / len(scores_repeat)
+        mean_latency = sum(latencies) / len(latencies)
+        total_latency = sum(latencies)
+        scores_repeat = [f"{s:.3f}" for s in scores_repeat]
+        print("=" * 20)
+        print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
+        print(f"Scores: {scores_repeat}")
+        print(f"Mean latency: {mean_latency:.3f} s")
+        print("=" * 20)
+        metrics = result.metrics | {"scores": scores_repeat}
+        metrics = metrics | {"mean_score": mean_score}
+        metrics["latency"] = mean_latency
+
+        if total_completion_tokens > 0 and total_latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / total_latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
+
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_mean_score",
+            mean_score,
+            labels={
+                "model": sampler.model,
+                "eval": args.eval_name,
+                "repeat": args.repeat,
+            },
+        )
+
+        executor.shutdown()
+
+    print_accept_length_summary(samplers)
+
+    # Dump reports
+    file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
+    report_filename = f"/tmp/{file_stem}.html"
+    print(f"Writing report to {report_filename}")
+    with open(report_filename, "w") as fh:
+        fh.write(make_report(result))
+    print(metrics)
+    result_filename = f"/tmp/{file_stem}.json"
+    with open(result_filename, "w") as f:
+        f.write(json.dumps(metrics, indent=2))
+    print(f"Writing results to {result_filename}")
+
+    if getattr(args, "return_latency", False):
+        return metrics, latency
+    return metrics
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="repeat the evaluation n times"
+    )
+    parser.add_argument("--eval-name", type=str, default="gsm8k")
+    parser.add_argument(
+        "--api",
+        type=str,
+        default="chat",
+        choices=["chat", "completion", "generate"],
+        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
+    )
+    parser.add_argument("--num-examples", type=int)
+    parser.add_argument("--num-threads", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=None, help="Min-p sampling parameter"
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=parse_json_object,
+        default=None,
+        help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
+    )
+    parser.add_argument("--reasoning-effort", type=str)
+    parser.add_argument(
+        "--thinking-mode",
+        default=None,
+        type=str,
+        choices=THINKING_MODE_CHOICES,
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
+    )
+
+    # LongBench-v2 specific arguments
+    parser.add_argument(
+        "--num-shots",
+        type=int,
+        default=5,
+        help="Number of few-shot examples for GSM8K (default: 5)",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
+    parser.add_argument(
+        "--mixed-prefix-gsm8k-secondary-pool-size",
+        type=int,
+        default=15,
+        help="Size of secondary example pool for eval_name=mixed_prefix_gsm8k (default: 15)",
+    )
+    parser.add_argument(
+        "--mixed-prefix-gsm8k-seed",
+        type=int,
+        default=42,
+        help="Seed for per-question random sampling in mixed_prefix_gsm8k (default: 42)",
+    )
+
+    args = parser.parse_args()
+
+    run_eval(args)

@@ -1,0 +1,66 @@
+from dataclasses import dataclass
+
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+
+
+@dataclass
+class LongCatImageSamplingParams(SamplingParams):
+    num_inference_steps: int = 50
+    guidance_scale: float = 4.5
+    height: int = 1024
+    width: int = 1024
+    enable_cfg_renorm: bool = True
+    cfg_renorm_min: float = 0.0
+    enable_prompt_rewrite: bool = True
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "cfg_renorm_min",
+                "enable_cfg_renorm",
+                "enable_prompt_rewrite",
+            }
+        )
+
+
+@dataclass
+class LongCatImageEditSamplingParams(SamplingParams):
+    """Defaults for LongCat-Image-Edit (mirrors diffusers LongCatImageEditPipeline).
+
+    Output height/width are derived from the condition image (~1MP), so no
+    defaults are set here. The reference uses an empty negative prompt and
+    plain CFG (no renorm, no prompt rewrite).
+    """
+
+    num_frames: int = 1
+    num_inference_steps: int = 50
+    guidance_scale: float = 4.5
+    negative_prompt: str = ""
+    enable_cfg_renorm: bool = False
+    enable_prompt_rewrite: bool = False
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        if server_args.warmup_resolutions is None:
+            return
+        # Editing derives both the output grid and VL prefix from the input
+        # image. A square placeholder discards an explicit non-square warmup
+        # resolution and captures a graph that the real request cannot replay.
+        import base64
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (req.width, req.height)).save(buffer, format="PNG")
+        req.image_path = [
+            "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        ]
+
+
+@dataclass
+class LongCatImageEditTurboSamplingParams(LongCatImageEditSamplingParams):
+    """LongCat-Image-Edit-Turbo: distilled, 8 steps, CFG disabled."""
+
+    num_inference_steps: int = 8
+    guidance_scale: float = 1.0
