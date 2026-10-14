@@ -4,10 +4,9 @@ import contextlib
 import copy
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -149,7 +148,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         self._uno_draft_cuda_graph_runner = None
         if not self.tree_mode or self.model_runner.decode_cuda_graph_runner is None:
-            return None
+            return
         if self._uno_draft_attn_backend is None:
             raise RuntimeError(
                 "UNO tree draft graph capture requires its attention backend."
@@ -190,7 +189,7 @@ class UnoWorkerV2(BaseSpecWorker):
             f"avail mem={after_mem:.2f} GB.",
         )
 
-        return None
+        return
 
     @property
     def draft_worker(self):
@@ -283,8 +282,8 @@ class UnoWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
-        seq_lens_sum: Optional[int],
+        seq_lens_cpu: torch.Tensor | None,
+        seq_lens_sum: int | None,
         req_pool_indices: torch.Tensor,
     ) -> ForwardBatch:
         input_ids = input_ids.reshape(-1)

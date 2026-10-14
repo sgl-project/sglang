@@ -23,10 +23,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 import torch
-
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -126,7 +124,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         # the worker can be built before the target pool exists (see #29021).
         self.req_to_token_pool = None
         self.token_to_kv_pool_allocator = None
-        self.draft_pool_config: Optional[MemoryPoolConfig] = None
+        self.draft_pool_config: MemoryPoolConfig | None = None
 
         self.hot_token_id = None
 
@@ -165,7 +163,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 type(self.draft_model_runner.model).__name__,
             )
 
-        self.kv_context: Optional[FrozenKVMTPContext] = None
+        self.kv_context: FrozenKVMTPContext | None = None
 
         # Retain the target's attention topology when swapping TP groups.
         self.draft_owns_attention = False
@@ -644,7 +642,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        mm_input_embeds: Optional[torch.Tensor] = None,
+        mm_input_embeds: torch.Tensor | None = None,
     ) -> FrozenKVMTPDraftInput:
         """Seed for the first decode iter after prefill. Frozen draft writes no
         KV (reads target KV), so unlike EAGLE there is no draft-extend forward:

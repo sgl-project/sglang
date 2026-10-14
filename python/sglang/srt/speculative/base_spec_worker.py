@@ -3,10 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -57,8 +56,8 @@ def _can_pack_hicache_mtp(
 
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
-    _topk1_parents_prealloc: Optional[torch.Tensor] = None
-    _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+    _topk1_parents_prealloc: torch.Tensor | None = None
+    _topk1_score_indices_prealloc: torch.Tensor | None = None
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
@@ -159,11 +158,11 @@ class BaseSpecWorker(ABC):
     @abstractmethod
     def forward_batch_generation(
         self,
-        batch: "ScheduleBatch",
+        batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
-    ) -> "GenerationBatchResult":
+    ) -> GenerationBatchResult:
         """Entry point called by the scheduler's non-overlap speculative path.
 
         All spec-v2 workers must implement this method with a uniform
@@ -198,7 +197,7 @@ class BaseSpecWorker(ABC):
         return tuple(draft_worker.draft_runners)
 
     @property
-    def primary_draft_kv_pool(self) -> Optional[object]:
+    def primary_draft_kv_pool(self) -> object | None:
         from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 
         draft_runners = self._draft_model_runners()
@@ -214,7 +213,7 @@ class BaseSpecWorker(ABC):
         return self._target_worker
 
     @property
-    def draft_worker(self) -> Optional[EagleDraftWorkerBase | TpModelWorker]:
+    def draft_worker(self) -> EagleDraftWorkerBase | TpModelWorker | None:
         # dflash / dspark drive the draft model through a plain TpModelWorker;
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
@@ -274,7 +273,6 @@ class BaseSpecWorker(ABC):
         """Default no-op: the allocator and kv cache pool are shared with the
         target worker and cleared by the scheduler."""
         # TODO: move this method to BaseTpWorker and call through self.model_runner
-        pass
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
@@ -366,7 +364,6 @@ class BaseSpecWorker(ABC):
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
-        pass
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.
@@ -374,7 +371,6 @@ class BaseSpecWorker(ABC):
         Default no-op. DSpark overrides this to settle / censor its
         block-accept estimator state for the finished request.
         """
-        pass
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Activate the optimal adaptive step for the current batch size.
@@ -382,4 +378,3 @@ class BaseSpecWorker(ABC):
         Default no-op. Adaptive-aware workers override this to switch
         the runtime state before each draft round.
         """
-        pass
