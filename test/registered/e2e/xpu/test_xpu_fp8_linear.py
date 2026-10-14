@@ -356,7 +356,7 @@ class TestXPUFP8Linear(CustomTestCase):
         layer.weight = torch.nn.Parameter(weight_bf16, requires_grad=False)
         layer.orig_dtype = torch.bfloat16
         layer.input_scale = None
-        method.cutlass_fp8_supported = True
+        self.assertFalse(method.cutlass_fp8_supported)
         self.assertFalse(method.use_per_token_if_dynamic)
         method.process_weights_after_loading(layer)
         self.assertTrue(method.use_per_token_if_dynamic)

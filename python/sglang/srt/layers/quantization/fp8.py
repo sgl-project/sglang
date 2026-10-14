@@ -936,6 +936,7 @@ class Fp8LinearMethod(LinearMethodBase):
             if not self.is_checkpoint_fp8_serialized:
                 if (
                     self.cutlass_fp8_supported
+                    or _is_xpu
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -989,6 +990,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
                     (self.cutlass_fp8_supported and not use_sm120_fp8_pertensor)
+                    or _is_xpu
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -1044,16 +1046,17 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-            if _is_xpu:
-                # Enable per-token dynamic activation quantization for XPU rowwise GEMM.
-                self.use_per_token_if_dynamic = True
-                # Pre-materialize [N, 1] transpose-contiguous scale layout to avoid
-                # per-forward transpose/contiguous copies in torch._scaled_mm.
-                if layer.weight_scale.ndim == 2 and layer.weight_scale.shape[0] == 1:
+            if _is_xpu and layer.weight_scale.ndim == 2:
+                # Normalize channelwise scales to [N, 1] before the rowwise gate.
+                if layer.weight_scale.shape[0] == 1:
                     with torch.no_grad():
                         layer.weight_scale.set_(
                             layer.weight_scale.data.t().contiguous()
                         )
+                self.use_per_token_if_dynamic = (
+                    layer.weight_scale.shape[1] == 1
+                    and layer.weight_scale.t().is_contiguous()
+                )
 
             if _is_cpu:
                 assert _is_cpu_amx_available, (
