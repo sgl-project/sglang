@@ -6141,8 +6141,8 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
+    # The PID suffix is parsed by debug_utils/log_parser.py; keep them in sync.
+    configure_logger(server_args, prefix=f"{prefix} PID{os.getpid()}")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
