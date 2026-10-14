@@ -419,7 +419,7 @@ class NCCLLibrary:
         Function("ncclMemFree", ncclResult_t, [buffer_type]),
     ]
 
-    # Device-API host calls, NCCL >= 2.28.
+    # Device-API host calls, NCCL >= 2.29.2.
     exported_functions_lsa = [
         # ncclResult_t ncclGetLsaMultimemDevicePointer(ncclWindow_t window, size_t offset, void** outPtr);
         Function(
@@ -462,7 +462,9 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            # Copy: optional symbols of this library must not leak into the
+            # class list that another library path binds from.
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             if hasattr(self.lib, "ncclGetLsaMultimemDevicePointer"):
@@ -474,6 +476,11 @@ class NCCLLibrary:
                 _funcs[func.name] = f
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+
+    def has_function(self, name: str) -> bool:
+        """Whether ``name`` is bound for this library. Optional symbols are
+        bound only when the library exports them."""
+        return name in self._funcs
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")

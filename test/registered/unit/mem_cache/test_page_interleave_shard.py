@@ -35,14 +35,16 @@ allocation hangs on:
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
 on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
 symmetric window, its zero-kernel launch, its release, and the cross-node
-fallback (``TestPageInterleaveZeroSmGatherMultiGpu``),
-and byte-exact DSA indexer keys, scales, and latent KV on 2 and 4 ranks
-(``TestPageInterleaveIndexer``), including dequantized MLA reads from packed
-FP8 scratch.
+fallback (``TestPageInterleaveZeroSmGatherMultiGpu``), the window allocation
+on NCCL without the multicast-pointer API
+(``TestSymmetricBufferWithoutMultimemApi``), and byte-exact DSA indexer
+keys, scales, and latent KV on 2 and 4 ranks (``TestPageInterleaveIndexer``),
+including dequantized MLA reads from packed FP8 scratch.
 GPU tests skip when too few CUDA devices are visible, so the same file runs
 in both CPU and CUDA CI suites.
 """
 
+import ctypes
 import gc
 import math
 import os
@@ -62,6 +64,10 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    allocate_symmetric_buffer,
+)
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -274,6 +280,50 @@ class TestZeroSmScratchLayout(CustomTestCase):
         for (_, end), (next_start, _) in zip(spans, spans[1:]):
             self.assertLessEqual(end, next_start)
         self.assertLessEqual(spans[-1][1], nbytes)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferWithoutMultimemApi(CustomTestCase):
+    def test_older_nccl_skips_the_multicast_team_build(self):
+        """NCCL before 2.29.2 registers windows but does not export
+        ncclGetLsaMultimemDevicePointer; it builds the multicast team during
+        registration instead. The allocation helper must not call it."""
+        lib = NCCLLibrary()
+        self.assertEqual(
+            lib.has_function("ncclGetLsaMultimemDevicePointer"),
+            lib.ncclGetRawVersion() >= 22902,
+        )
+        self.assertFalse(lib.has_function("ncclNoSuchSymbol"))
+
+        def unbound(window, offset):
+            raise AssertionError("ncclGetLsaMultimemDevicePointer is not exported")
+
+        released = []
+
+        def free(ptr):
+            released.append(("free", ptr))
+            torch.cuda.caching_allocator_delete(ptr)
+
+        comm = SimpleNamespace(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
+                ncclMemFree=free,
+                has_function=lambda name: name != "ncclGetLsaMultimemDevicePointer",
+                ncclGetLsaMultimemDevicePointer=unbound,
+            ),
+            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
+            deregister_comm_window=lambda window: released.append(
+                ("deregister", window.value)
+            ),
+        )
+        buf, registered = allocate_symmetric_buffer(comm, 8192)
+        self.assertTrue(registered)
+        self.assertEqual(int(buf.count_nonzero()), 0)
+        ptr = buf.data_ptr()
+        del buf
+        gc.collect()
+        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1791,8 +1841,9 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         """The zero-SM pool registers its scratch as a symmetric window, still
         assembles the canonical prefix, and frees the window buffer only once
         the pool and every scratch view are gone."""
-        if torch.cuda.nccl.version() < (2, 28, 0):
-            self.skipTest("copy-engine collectives need NCCL >= 2.28")
+        # The library the pool gates on, which may differ from torch's NCCL.
+        if NCCLLibrary().ncclGetRawVersion() < 22902:
+            self.skipTest("the symmetric gather scratch needs NCCL >= 2.29.2")
         # Clear the global override before spawning: only the dedicated
         # gather communicator requests ZERO. cuMem enables window registration.
         with (

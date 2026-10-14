@@ -103,10 +103,13 @@ logger = logging.getLogger(__name__)
 _TensorSpec = Tuple[Tuple[int, ...], torch.dtype]
 
 _NUM_SCRATCH_SLOTS = 2
-# NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h; every slot tensor starts on it.
+# NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h. NCCL checks it only at the window
+# base; starting every slot tensor on it is a conservative choice.
 _SCRATCH_ALIGN_BYTES = 4096
-# NCCL 2.28 added copy-engine collectives.
-_NCCL_CE_COLLECTIVES_MIN_VERSION = 22800
+# NCCL 2.28 added copy-engine collectives, but before 2.29.2 a comm without
+# symmetric memory returns a local-registration handle instead of a NULL
+# window, so the window would not tell whether the copy-engine path is live.
+_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 22902
 
 
 def _symmetric_scratch_supported(
@@ -120,7 +123,7 @@ def _symmetric_scratch_supported(
         or memory_saver_enabled
         or custom_mem_pool is not None
         or not is_cuda()
-        or NCCLLibrary().ncclGetRawVersion() < _NCCL_CE_COLLECTIVES_MIN_VERSION
+        or NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
     ):
         return False
     # Across nodes NCCL would run the windowed allgather on its hierarchical
@@ -304,8 +307,9 @@ class PageInterleaveKVPoolMixin:
         if not registered:
             logger.warning(
                 "NCCL returned no symmetric window for the KV-shard gather "
-                "scratch (NCCL_CUMEM_ENABLE=0?); the prefix allgather falls "
-                "back to NCCL SM kernels."
+                "scratch (NCCL_CUMEM_ENABLE=0, NCCL_WIN_ENABLE=0, or ranks "
+                "without CUDA P2P?); the prefix allgather falls back to NCCL "
+                "SM kernels."
             )
         slots = [
             {

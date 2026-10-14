@@ -59,17 +59,26 @@ def allocate_symmetric_buffer(
     Every rank must request the same size and use matching offsets for views.
     This allocation is independent of the shared symmetric memory pool and
     --enable-symm-mem. It is deregistered and freed when the last view dies.
+    The returned flag means a symmetric window only on NCCL >= 2.29.2.
     """
     with torch.cuda.device(comm.device):
         ptr = comm.nccl.ncclMemAlloc(nbytes)
         window = comm.register_comm_window_raw(ptr, nbytes)
-        # NULL when NCCL runs without cuMem: ncclMemAlloc is then a cudaMalloc.
+        # NCCL >= 2.29.2 returns NULL when the comm has no symmetric memory
+        # support, usually because NCCL runs without cuMem (ncclMemAlloc is
+        # then a cudaMalloc); 2.28.x returns a local-registration handle.
         window = window if window.value else None
-        if window is not None:
-            # Workaround: with NVLS, NCCL 2.30 builds the multicast team inside
-            # the first CE collective's sync (ncclDevrGetLsaTeamPtrMC) with no
-            # barrier after binding, so a fast rank's ready flag can miss a
-            # peer and both hang. Build it now and barrier; drop once NCCL does.
+        if window is not None and comm.nccl.has_function(
+            "ncclGetLsaMultimemDevicePointer"
+        ):
+            # Workaround for NCCL 2.29.7+ with NVLS on a 2-rank comm (fixed
+            # upstream by NCCL commit 430afbc, after 2.30.7): the multicast
+            # team is built lazily inside the first CE collective's sync
+            # (ncclDevrGetLsaTeamPtrMC) with no barrier after binding, so a
+            # fast rank's ready flag can miss a peer and both hang. Build the
+            # team now (the multicast address is not needed) and barrier.
+            # Larger comms, and older NCCL without this API, build the team
+            # during window registration behind a barrier already.
             comm.nccl.ncclGetLsaMultimemDevicePointer(window, 0)
             torch.distributed.barrier(group=comm.group)
         owner = _NcclMemOwner(ptr, nbytes)
