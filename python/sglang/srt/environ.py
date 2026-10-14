@@ -880,6 +880,16 @@ class Envs:
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
+    # Mono: fused whole-layer decode kernels (--layer-backend mono)
+    # ===================================================================
+    # Debugging only: the first SGLANG_MONO_CHECK_STEPS eager mono steps also run
+    # every routed layer's module path and log the max |diff| against it.
+    SGLANG_MONO_CHECK = EnvBool(False)
+    SGLANG_MONO_CHECK_STEPS = EnvInt(4)
+    # Tests / benchmarks only: log a mono kernel's error words and keep serving.
+    SGLANG_MONO_UNSAFE_WARN = EnvBool(False)
+
+    # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)

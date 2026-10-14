@@ -353,4 +353,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
 
+    # Last: refuses on the fully resolved deployment.
+    from sglang.srt.arg_groups.mono_hook import handle_layer_backend
+
+    run_hook(handle_layer_backend, server_args)
+
     server_args._resolution_finished = True
