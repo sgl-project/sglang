@@ -338,7 +338,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         self.assertEqual(req.dsv41_cache_only_coverage, expected_coverage)
 
-    def test_cache_only_rebootstrap_restores_boundary_without_reaccounting(self):
+    def test_cache_only_rebootstrap_commits_boundary_without_reaccounting(self):
         req = _make_req(terminate_after=99)
         req.output_ids.extend([10, 11])
         req.pd_rebootstrap_in_progress = True
@@ -370,7 +370,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
                 customized_info=None,
                 sampling_mask_output=None,
             ),
-            next_token_ids=torch.tensor([999], dtype=torch.long),
+            next_token_ids=torch.tensor([12], dtype=torch.long),
         )
         processor = _make_prefill_processor()
 
@@ -398,35 +398,29 @@ class TestReasoningTokenAccounting(CustomTestCase):
         reasoning.assert_not_called()
         grammar.assert_not_called()
 
-    def test_cache_only_rebootstrap_without_boundary_keeps_sampled_token(self):
+    def test_cache_only_rebootstrap_without_boundary_clears_progress(self):
         req = _make_req(terminate_after=99)
         req.pd_rebootstrap_in_progress = True
         req.pd_rebootstrap_forced_output_id = None
         batch = SimpleNamespace(dsv41_cache_only_replay=True)
 
-        token, replayed = (
-            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
-                batch, req, 999
-            )
+        replayed = SchedulerBatchResultProcessor._acknowledge_cache_only_rebootstrap(
+            batch, req
         )
 
-        self.assertEqual(token, 999)
         self.assertFalse(replayed)
         self.assertFalse(req.pd_rebootstrap_in_progress)
 
-    def test_fresh_cache_only_replay_keeps_sampled_token(self):
+    def test_fresh_cache_only_replay_keeps_recovery_markers(self):
         req = _make_req(terminate_after=99)
         req.pd_rebootstrap_in_progress = False
         req.pd_rebootstrap_forced_output_id = 12
         batch = SimpleNamespace(dsv41_cache_only_replay=True)
 
-        token, replayed = (
-            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
-                batch, req, 999
-            )
+        replayed = SchedulerBatchResultProcessor._acknowledge_cache_only_rebootstrap(
+            batch, req
         )
 
-        self.assertEqual(token, 999)
         self.assertFalse(replayed)
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
 
@@ -435,13 +429,10 @@ class TestReasoningTokenAccounting(CustomTestCase):
         req.pd_rebootstrap_in_progress = True
         req.pd_rebootstrap_forced_output_id = 12
 
-        token, replayed = (
-            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
-                SimpleNamespace(), req, 999
-            )
+        replayed = SchedulerBatchResultProcessor._acknowledge_cache_only_rebootstrap(
+            SimpleNamespace(), req
         )
 
-        self.assertEqual(token, 999)
         self.assertFalse(replayed)
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
         self.assertTrue(req.pd_rebootstrap_in_progress)
