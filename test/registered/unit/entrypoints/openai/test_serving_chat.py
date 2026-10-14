@@ -690,6 +690,58 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            logprobs=True,
+            top_logprobs=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_output_top_logprobs requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_output_top_logprobs_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat output, expected b64)
+        cases = (
+            ({"return_flat_raw_output_top_logprobs": True}, True, True),
+            (
+                {
+                    "return_flat_raw_output_top_logprobs": True,
+                    "return_flat_raw_top_logprobs_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                logprobs=True,
+                top_logprobs=2,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertEqual(adapted.top_logprobs_num, 2)
+                self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
+                self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
