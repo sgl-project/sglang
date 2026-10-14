@@ -71,6 +71,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
+        scheduler.enable_skip_finishing_decode = False
+        scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -363,6 +365,31 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
+    def test_retract_after_dp_conversion_releases_each_req_once(self):
+        """retract after DP attention converted the running batch to extend
+        (running_batch is last_batch) releases each request once."""
+        scheduler = self._new_scheduler()
+        run_req_a = self._make_req("run-a")
+        run_req_b = self._make_req("run-b")
+        converted = self._make_batch(
+            scheduler,
+            reqs=[run_req_a, run_req_b],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.running_batch = converted
+        scheduler.last_batch = converted
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [run_req_a, run_req_b]
+        )
+        self.assertEqual(
+            [req.retraction_count for req in (run_req_a, run_req_b)], [1, 1]
+        )
+
     def test_retract_with_empty_running_uses_last_batch_reqs(self):
         """retract with empty running batch releases and requeues the last extend reqs."""
         scheduler = self._new_scheduler()
@@ -619,6 +646,39 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_retract_includes_transferred_waiting_reqs(self):
+        """A transferred request waiting for a running slot holds a request row
+        and KV; retract must rebuild it too, so a paused flush cannot free it."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+
+        def _req(rid, req_pool_idx):
+            return SimpleNamespace(
+                rid=rid,
+                finished=lambda: False,
+                output_ids=[7],
+                time_stats=MagicMock(),
+                kv=SimpleNamespace(holds_kv=req_pool_idx is not None),
+            )
+
+        running = _req("running", 0)
+        staged = _req("staged", 1)
+        unstaged = _req("unstaged", None)
+        scheduler.running_batch.reqs = [running]
+        scheduler.waiting_queue = [staged, unstaged]
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])
+        self.assertEqual(scheduler.waiting_queue, [unstaged])
+        held = [
+            c.args[0]
+            for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
+        ]
+        self.assertEqual(held, [running, staged])
 
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and

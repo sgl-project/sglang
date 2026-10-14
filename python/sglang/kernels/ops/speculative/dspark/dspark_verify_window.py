@@ -20,6 +20,9 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     positions: torch.Tensor
     verify_cache_loc: torch.Tensor
     verify_ids: torch.Tensor
+    # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
+    # verify window, -1 on a padded lane.
+    window_index: torch.Tensor
 
 
 class BuildRaggedVerifyWindow:
@@ -129,6 +132,9 @@ def build_ragged_verify_window(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=torch.where(
+            valid, safe_req.to(torch.int64) * verify_num_draft_tokens + within, -1
+        ),
     )
 
 
@@ -176,7 +182,7 @@ def build_ragged_verify_window_triton(
     verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
     padded_total = layout.graph_num_tokens
 
-    req_id, within, _valid = compact_row_index_triton(
+    req_id, within, valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
     real_cache_loc = assign_extend_cache_locs_func(
@@ -218,6 +224,11 @@ def build_ragged_verify_window_triton(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=torch.where(
+            valid,
+            req_id.clamp(max=bs - 1).to(torch.int64) * verify_num_draft_tokens + within,
+            -1,
+        ),
     )
 
 

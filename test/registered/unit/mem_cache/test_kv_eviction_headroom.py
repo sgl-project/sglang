@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.runtime_context import get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -78,24 +79,36 @@ class TestKVEvictionHeadroom(CustomTestCase):
         )
         tree_cache.swa_evictable_size.assert_not_called()
 
-    def test_unified_swa_adds_headroom_after_planning(self):
+    def test_unified_swa_adds_headroom_after_preferred_planning(self):
         allocator = SimpleNamespace(
-            reclaim_plan=MagicMock(return_value=(100, 0)),
+            reclaim_plan=MagicMock(return_value=(0, 100)),
             ensure_capacity=MagicMock(return_value=True),
         )
         tree_cache = MagicMock()
         tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.full_evictable_size.return_value = 1000
-        tree_cache.swa_evictable_size.return_value = 1000
+        tree_cache.swa_evictable_size.return_value = 180
 
-        with envs.SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS.override(128):
+        with (
+            envs.SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS.override(128),
+            get_memory().override(
+                enable_hierarchical_cache=True, hicache_storage_backend="file"
+            ),
+        ):
             ready = UnifiedSWATokenToKVPoolAllocator.evict_to_free_tokens(
                 allocator, tree_cache, num_tokens=200
             )
 
         self.assertTrue(ready)
+        allocator.reclaim_plan.assert_called_once_with(
+            200,
+            200,
+            full_evictable_tokens=1000,
+            swa_evictable_tokens=180,
+            prefer_swa=True,
+        )
         tree_cache.evict.assert_called_once_with(
-            EvictParams(num_tokens=228, swa_num_tokens=0)
+            EvictParams(num_tokens=0, swa_num_tokens=180)
         )
         allocator.ensure_capacity.assert_called_once_with(200, 200)
 

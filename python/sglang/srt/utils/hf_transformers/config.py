@@ -64,6 +64,7 @@ _GEMMA4_MODEL_TYPES = (
     "gemma4_unified",
     "gemma4_unified_assistant",
     "diffusion_gemma",
+    "embedding_gemma2",
 )
 
 
@@ -383,6 +384,14 @@ def get_config(
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
+            elif (
+                key in ("rope_scaling", "rope_parameters")
+                and isinstance(value, dict)
+                and isinstance(current, dict)
+            ):
+                # v5's rope_scaling setter replaces rope_parameters wholesale;
+                # merge so partial overrides keep rope_theta (#41227).
+                setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
 
