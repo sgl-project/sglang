@@ -1201,6 +1201,7 @@
                 ]
               },
               "docs/hardware-platforms/mthreads_gpu",
+              "docs/hardware-platforms/sail",
               "docs/hardware-platforms/tpu",
               "docs/hardware-platforms/xpu",
               "docs/hardware-platforms/plugin"

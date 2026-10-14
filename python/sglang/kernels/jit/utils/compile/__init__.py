@@ -12,7 +12,12 @@ Modules, in dependency order (there are no cycles)::
     toolchain  compilers, tvm-ffi locations, platform base flags
     ninja      generating and running build.ninja, reading its depfiles
     cache      build_key / deps_key, cache layout, publication
+    sailify    CUDA -> PPU source conversion for hgcc builds
     loader     load_jit
+
+``sailify`` and ``cache`` reference each other lazily (the mirror digest uses
+the cache's file digests; the environment fingerprint uses the sailify
+version), so neither imports the other at module level.
 """
 
 from sglang.kernels.jit.utils.compile.cpp_args import (
