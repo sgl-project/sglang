@@ -495,9 +495,6 @@ class TestReasonerGrammarBackend(CustomTestCase):
         for (key, payload), reasoning, prefix, strict in itertools.product(
             keys.items(), (False, True), ([], thinking), (False, True)
         ):
-            # Strict thinking has a thinking phase only when reasoning is requested.
-            if strict and not (prefix and reasoning):
-                continue
             with self.subTest(
                 key=key, reasoning=reasoning, prefix=bool(prefix), strict=strict
             ):
@@ -577,8 +574,9 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
         self.assertTrue(grammar.is_terminated())
 
-    def test_inkling_strict_budget_end_cannot_reopen_thinking(self):
-        """After a budget-forced think end, the constrained turn may only open the answer."""
+    def test_inkling_strict_budget_caps_thinking_and_cannot_reopen_it(self):
+        """Strict thinking caps the thinking message; after its end a header may only
+        open the answer, and a turn that skips thinking is held to the payload."""
         backend, tokenizer = self._make_xgrammar_backend()
         ids = INKLING_SPECIAL_TOKEN_IDS
         with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "3"}):
@@ -591,7 +589,7 @@ class TestReasonerGrammarBackend(CustomTestCase):
         grammar = reasoner._init_value_dispatch(("regex", "yes"), reasoning=True)
         self._accept_allowed_tokens(
             grammar,
-            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING], ord("x")],
+            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING], *tokenizer.encode("xxx")],
             backend.vocab_size,
         )
         mask = self._vocab_mask(grammar, backend.vocab_size)
@@ -606,6 +604,13 @@ class TestReasonerGrammarBackend(CustomTestCase):
             _allowed_token_ids(mask, [ids[CONTENT_TEXT], ids[CONTENT_THINKING]]),
             [ids[CONTENT_TEXT]],
         )
+
+        skipped = reasoner._init_value_dispatch(("regex", "yes"), reasoning=True)
+        self._accept_allowed_tokens(
+            skipped, [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]], backend.vocab_size
+        )
+        mask = self._vocab_mask(skipped, backend.vocab_size)
+        self.assertEqual(_allowed_token_ids(mask, [ord("h"), ord("y")]), [ord("y")])
 
     def test_inkling_backend_matches_native_think_end_id(self):
         """Strict mode and other constraints must see the native END_MESSAGE id."""

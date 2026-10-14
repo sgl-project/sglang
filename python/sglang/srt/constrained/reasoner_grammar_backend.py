@@ -64,29 +64,39 @@ def _get_canonical_inkling_auto_tool_schema() -> dict:
     return _canonical_inkling_auto_tool_schema
 
 
-def _inkling_answer_structural_tag(content: dict, start: str) -> dict:
-    # "turn" may think first; "text_block" continues a block the prompt opened.
-
+def _inkling_answer_structural_tag(
+    content: dict, *, in_text_block: bool, max_think_tokens: int
+) -> dict:
     def token(name: str) -> dict:
         return {"type": "token", "token": INKLING_SPECIAL_TOKEN_IDS[name]}
 
     elements = [content, token(END_MESSAGE)]
-    if start != "text_block":
-        elements = [token(MESSAGE_MODEL), token(CONTENT_TEXT), *elements]
-    if start == "turn":
-        thinking_message = {
-            "type": "sequence",
-            "elements": [
-                token(MESSAGE_MODEL),
-                token(CONTENT_THINKING),
-                {
-                    "type": "any_tokens",
-                    "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
-                },
-                token(END_MESSAGE),
-            ],
+    if in_text_block:
+        return {
+            "type": "structural_tag",
+            "format": {"type": "sequence", "elements": elements},
         }
-        elements = [{"type": "optional", "content": thinking_message}, *elements]
+    thinking = {
+        "type": "any_tokens",
+        "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+    }
+    if max_think_tokens >= 0:
+        thinking["max_tokens"] = max_think_tokens
+    thinking_message = {
+        "type": "sequence",
+        "elements": [
+            token(MESSAGE_MODEL),
+            token(CONTENT_THINKING),
+            thinking,
+            token(END_MESSAGE),
+        ],
+    }
+    elements = [
+        {"type": "optional", "content": thinking_message},
+        token(MESSAGE_MODEL),
+        token(CONTENT_TEXT),
+        *elements,
+    ]
     return {
         "type": "structural_tag",
         "format": {"type": "sequence", "elements": elements},
@@ -444,17 +454,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if key[0] == "full_assistant_ebnf":
             return ret
         if self._is_inkling_detector and key[0] in _INKLING_FRAMED_KEY_TYPES:
-            if in_text_block:
-                start = "text_block"
-            elif self.enable_strict_thinking:
-                # The strict wrapper owns thinking; after it ends only the answer may follow.
-                start = "answer"
-            else:
-                start = "turn"
-            framed = self._frame_inkling_answer(ret, start)
+            # The frame delimits thinking by message kind, so it owns the whole
+            # turn; strict thinking only caps the thinking message.
+            framed = self._frame_inkling_answer(ret, in_text_block)
             if framed is not None:
-                if start == "answer":
-                    return self._make_grammar_object(framed, reasoning)
                 return framed
         if (
             not self.enable_strict_thinking
@@ -467,8 +470,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return self._make_grammar_object(ret, reasoning)
 
     def _frame_inkling_answer(
-        self, grammar: BaseGrammarObject, start: str
+        self, grammar: BaseGrammarObject, in_text_block: bool
     ) -> Optional[BaseGrammarObject]:
+        max_think_tokens = self.max_think_tokens if self.enable_strict_thinking else -1
         return self.grammar_backend.compile_framed_grammar(
-            grammar, lambda content: _inkling_answer_structural_tag(content, start)
+            grammar,
+            lambda content: _inkling_answer_structural_tag(
+                content,
+                in_text_block=in_text_block,
+                max_think_tokens=max_think_tokens,
+            ),
         )
