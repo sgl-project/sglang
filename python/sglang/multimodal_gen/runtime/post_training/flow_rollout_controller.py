@@ -45,18 +45,14 @@ class RolloutSessionData:
     local_noise_std_devs: list[torch.Tensor] = field(default_factory=list)
     local_model_outputs: list[torch.Tensor] = field(default_factory=list)
 
-
-class SchedulerRLMixin:
-    @staticmethod
-    def _reset_rollout_debug_tensors(self: RolloutSessionData) -> None:
+    def _reset_rollout_debug_tensors(self) -> None:
         self.local_variance_noises = []
         self.local_prev_sample_means = []
         self.local_noise_std_devs = []
         self.local_model_outputs = []
 
-    @staticmethod
     def append_local_rollout_debug_tensors(
-        self: RolloutSessionData,
+        self,
         *,
         variance_noise: torch.Tensor,
         prev_sample_mean: torch.Tensor,
@@ -70,28 +66,24 @@ class SchedulerRLMixin:
         self.local_noise_std_devs.append(noise_std_dev.expand((batch_size, 1)))
         self.local_model_outputs.append(model_output)
 
-    @staticmethod
     def consume_local_rollout_debug_tensors(
-        self: RolloutSessionData,
+        self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         variance_noises = torch.stack(self.local_variance_noises, dim=1)
         prev_sample_means = torch.stack(self.local_prev_sample_means, dim=1)
         noise_std_devs = torch.stack(self.local_noise_std_devs, dim=1)
         model_outputs = torch.stack(self.local_model_outputs, dim=1)
-        SchedulerRLMixin._reset_rollout_debug_tensors(self)
+        self._reset_rollout_debug_tensors()
         return variance_noises, prev_sample_means, noise_std_devs, model_outputs
 
-    @staticmethod
-    def collect_rollout_debug_tensors(
-        self: RolloutSessionData, batch: Req
-    ) -> RolloutDebugTensors:
+    def collect_rollout_debug_tensors(self, batch: Req) -> RolloutDebugTensors:
         """
         Consume rollout debug tensors and merge for all SP ranks.
 
         Returns rollout debug tensors with shape [B, T, ...].
         """
         variance_noises, prev_sample_means, noise_std_devs, model_outputs = (
-            SchedulerRLMixin.consume_local_rollout_debug_tensors(self)
+            self.consume_local_rollout_debug_tensors()
         )
 
         pipeline_config = self.pipeline_config
@@ -119,38 +111,8 @@ class SchedulerRLMixin:
             rollout_model_outputs=model_outputs.cpu(),
         )
 
-    @staticmethod
-    def _get_rollout_session_data(batch) -> RolloutSessionData:
-        """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""
-        rollout_session_data = getattr(batch, "_rollout_session_data", None)
-        if rollout_session_data is None:
-            raise RuntimeError("prepare_rollout() not called before rollout")
-        return rollout_session_data
-
-    def release_rollout_resources(self, batch) -> None:
-        """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
-        batch._rollout_session_data = None
-
-    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
-        """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
-        if get_sp_world_size() > 1 and pipeline_config is None:
-            raise RuntimeError(
-                "SP rollout requires pipeline_config to be passed to prepare_rollout()."
-            )
-        batch._rollout_session_data = RolloutSessionData(
-            pipeline_config=pipeline_config,
-            sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
-            latents_shape=(
-                tuple(batch.latents.shape) if batch.latents is not None else None
-            ),
-        )
-
-    def already_prepared_rollout(self, batch) -> bool:
-        return getattr(batch, "_rollout_session_data", None) is not None
-
-    @staticmethod
     def _get_or_create_rollout_noise_buffer(
-        self: RolloutSessionData,
+        self,
         full_shape: tuple,
         device: torch.device,
         dtype: torch.dtype,
@@ -167,9 +129,8 @@ class SchedulerRLMixin:
             self.noise_buffer = buffer
         return buffer
 
-    @staticmethod
     def _rollout_variance_noise(
-        self: RolloutSessionData,
+        self,
         batch,
         model_output: torch.FloatTensor,
         generator: Union[torch.Generator, list[torch.Generator]],
@@ -190,8 +151,8 @@ class SchedulerRLMixin:
                 "Generator list must have the same length as batch size"
             )
 
-        buffer = SchedulerRLMixin._get_or_create_rollout_noise_buffer(
-            self, self.latents_shape, device, dtype
+        buffer = self._get_or_create_rollout_noise_buffer(
+            self.latents_shape, device, dtype
         )
         for i in range(B):
             torch.randn(
@@ -210,9 +171,8 @@ class SchedulerRLMixin:
             )
         return sharded_noise
 
-    @staticmethod
     def flow_sde_sampling(
-        self: RolloutSessionData,
+        self,
         batch,
         model_output: torch.FloatTensor,
         sample: torch.FloatTensor,
@@ -260,8 +220,8 @@ class SchedulerRLMixin:
         if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = SchedulerRLMixin._rollout_variance_noise(
-                self, batch, model_output, generator
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
             )
             full_variance_noise = self.noise_buffer
             std_dev_t = (
@@ -293,8 +253,8 @@ class SchedulerRLMixin:
         elif effective_sde_type == "cps":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = SchedulerRLMixin._rollout_variance_noise(
-                self, batch, model_output, generator
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
             )
             full_variance_noise = self.noise_buffer
             std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
@@ -347,32 +307,27 @@ class SchedulerRLMixin:
             ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
 
         if debug_mode:
-            SchedulerRLMixin.append_local_rollout_debug_tensors(
-                self,
+            self.append_local_rollout_debug_tensors(
                 variance_noise=variance_noise,
                 prev_sample_mean=prev_sample_mean,
                 noise_std_dev=noise_std_dev,
                 model_output=model_output,
             )
 
-        SchedulerRLMixin.append_local_rollout_log_probs(
-            self, log_prob_local_sum, local_elem_count
-        )
+        self.append_local_rollout_log_probs(log_prob_local_sum, local_elem_count)
 
         return prev_sample
 
-    @staticmethod
     def append_local_rollout_log_probs(
-        self: RolloutSessionData,
+        self,
         log_prob_sum: torch.Tensor,
         log_prob_count: torch.Tensor,
     ) -> None:
         self.local_log_prob_sum.append(log_prob_sum)
         self.local_log_prob_count.append(log_prob_count)
 
-    @staticmethod
     def consume_local_rollout_log_probs(
-        self: RolloutSessionData,
+        self,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # [B, T]: batch dim 0, denoising step dim 1
         values_sum = torch.stack(self.local_log_prob_sum, dim=1)
@@ -381,14 +336,44 @@ class SchedulerRLMixin:
         self.local_log_prob_count = []
         return values_sum, values_count
 
-    @staticmethod
-    def collect_rollout_log_probs(self: RolloutSessionData) -> torch.Tensor | None:
+    def collect_rollout_log_probs(self) -> torch.Tensor | None:
         """Per-step sums are already computed on the full pre-shard noise
         buffer inside flow_sde_sampling, so every SP rank holds identical
         values here and no all-reduce is needed."""
 
         trajectory_log_prob_sum, trajectory_log_prob_count = (
-            SchedulerRLMixin.consume_local_rollout_log_probs(self)
+            self.consume_local_rollout_log_probs()
         )
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()
+
+
+class SchedulerRLMixin:
+    @staticmethod
+    def _get_rollout_session_data(batch) -> RolloutSessionData:
+        """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""
+        rollout_session_data = getattr(batch, "_rollout_session_data", None)
+        if rollout_session_data is None:
+            raise RuntimeError("prepare_rollout() not called before rollout")
+        return rollout_session_data
+
+    def release_rollout_resources(self, batch) -> None:
+        """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
+        batch._rollout_session_data = None
+
+    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
+        """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
+        if get_sp_world_size() > 1 and pipeline_config is None:
+            raise RuntimeError(
+                "SP rollout requires pipeline_config to be passed to prepare_rollout()."
+            )
+        batch._rollout_session_data = RolloutSessionData(
+            pipeline_config=pipeline_config,
+            sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
+            latents_shape=(
+                tuple(batch.latents.shape) if batch.latents is not None else None
+            ),
+        )
+
+    def already_prepared_rollout(self, batch) -> bool:
+        return getattr(batch, "_rollout_session_data", None) is not None
