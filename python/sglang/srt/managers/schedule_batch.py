@@ -904,7 +904,7 @@ class ReqLogprob:
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
     # Flat replacements for the rows above (see
-    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
     # emptied and the arrays ship instead.
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
@@ -1367,7 +1367,11 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
@@ -2916,8 +2920,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered
             extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
             )
             # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
             # so they stay within the vocab boundary before being sent to GPU.
