@@ -22,7 +22,7 @@
 # ==============================================================================
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -462,7 +462,7 @@ class FlowMatchEulerDiscreteScheduler(
         s_noise: float = 1.0,
         generator: torch.Generator | list[torch.Generator] | None = None,
         per_token_timesteps: torch.Tensor | None = None,
-        batch=None,
+        transition: Callable[..., torch.FloatTensor] | None = None,
         return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor, ...]:
         """
@@ -485,6 +485,10 @@ class FlowMatchEulerDiscreteScheduler(
                 A random number generator, or one generator per batch item.
             per_token_timesteps (`torch.Tensor`, *optional*):
                 The timesteps for each token in the sample.
+            transition (`Callable`, *optional*):
+                Replaces this scheduler's own `_transition` for this call, with the
+                same keyword arguments; rollout passes
+                `FlowRolloutController.transition` here.
             return_dict (`bool`):
                 Whether or not to return a
                 [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] or tuple.
@@ -532,28 +536,18 @@ class FlowMatchEulerDiscreteScheduler(
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
-        if batch is not None and batch.rollout:
-            if "visual" not in batch.rollout_controllers:
-                raise RuntimeError("Rollout not prepared before step")
-            prev_sample = batch.rollout_controllers["visual"].flow_sde_sampling(
-                model_output,
-                sample,
-                current_sigma,
-                next_sigma,
-                generator,
-                step_index=self.step_index,
-            )
-        else:
-            prev_sample = self._transition(
-                model_output=model_output,
-                sample=sample,
-                current_sigma=current_sigma,
-                next_sigma=next_sigma,
-                dt=dt,
-                generator=generator,
-                step_index=self.step_index,
-                timestep=timestep,
-            )
+        if transition is None:
+            transition = self._transition
+        prev_sample = transition(
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            dt=dt,
+            generator=generator,
+            step_index=self.step_index,
+            timestep=timestep,
+        )
 
         # upon completion increase step index by one
         assert self._step_index is not None, "_step_index should not be None"
@@ -567,6 +561,8 @@ class FlowMatchEulerDiscreteScheduler(
 
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
 
+    # Old ODE transition: the scheduler's own Euler update (or its stochastic_sampling step),
+    # used when step() is not given a transition.
     def _transition(
         self,
         *,

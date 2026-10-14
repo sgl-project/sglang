@@ -156,6 +156,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
+    rollout_transition,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -1326,7 +1327,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
+            {
+                "generator": batch.generator,
+                "eta": batch.eta,
+                "transition": rollout_transition(batch),
+            },
         )
 
         # Setup precision and autocast settings
