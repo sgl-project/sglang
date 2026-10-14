@@ -25,6 +25,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -50,6 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -357,11 +360,7 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
 
         # The figure changes in place, without a lock transition.
         component.rows_handed_back[leaf] = 1
-        cache.tree_core.adjust_component_ledger(
-            node=cache.tree_core.node_by_id(leaf),
-            component_type=ComponentType.FULL,
-            delta=-1,
-        )
+        cache.tree_core.adjust_component_size(leaf, ComponentType.FULL, -1)
         self.assertEqual(ledgers(), (0, 3))
 
         cache.dec_lock_ref(leaf, lock_params)
@@ -605,6 +604,7 @@ def _aux_storage_key_transfers(cache, node_id):
 def build_fixture(
     cfg: CacheConfig,
     enable_kv_cache_events: bool = False,
+    dynamo_kv_event_format: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
@@ -612,6 +612,7 @@ def build_fixture(
         dict[ComponentType, type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -742,6 +743,8 @@ def build_fixture(
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
@@ -1299,6 +1302,23 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
+class _LoraReq:
+    """The request fields KvEventLoraNames reads."""
+
+    def __init__(self, extra_key, lora_id="lora-id"):
+        self.extra_key = extra_key
+        self.lora_id = lora_id
+
+
+def _lora_names(**names_by_extra_key):
+    """A name table plus the requests that keep its entries alive."""
+    table = KvEventLoraNames()
+    reqs = [_LoraReq(key) for key in names_by_extra_key]
+    for req in reqs:
+        table.register(req, names_by_extra_key[req.extra_key])
+    return table, reqs
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
@@ -1524,6 +1544,159 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             stored_hashes(extra_key="adapter-a", cache_salt="tenant-a"),
             stored_hashes(extra_key="adapter-b", cache_salt="tenant-a"),
         )
+
+    def test_lora_external_ids_separate_adapter_loads(self):
+        """External IDs distinguish loads; routers match tokens and public names."""
+        lora_names, _reqs = _lora_names(
+            **{
+                "uuid-a": "adapter-a",
+                "user|uuid-a2": "adapter-a",
+                "uuid-b": "adapter-b",
+            }
+        )
+
+        def store_then_evict(extra_key):
+            cache, allocator, _ = build_fixture(
+                self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+            )
+            cache.take_events()
+            self._insert(cache, allocator, [1, 2, 3, 4], extra_key=extra_key)
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = store_then_evict(None)
+        lora_a = store_then_evict("uuid-a")
+        self.assertIsNone(base[0].lora_name)
+        self.assertEqual(lora_a[0].lora_name, "adapter-a")
+        seed = kv_event_namespace_seed(extra_key="uuid-a", cache_salt=None)
+        self.assertEqual(
+            self._event_hashes(lora_a),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        # Another load of the same public name has distinct external IDs.
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("user|uuid-a2")),
+            self._event_hashes(lora_a),
+        )
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("uuid-b")),
+            self._event_hashes(lora_a),
+        )
+
+    def test_dynamo_lora_hashes_keep_the_dynamo_namespace(self):
+        """The default LoRA mix must not be applied a second time to Dynamo hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        names, reqs = _lora_names(**{extra_key: "adapter-a"})
+
+        def publish(*, dynamo_format, namespace):
+            cache, allocator, _ = build_fixture(
+                self.cfg,
+                enable_kv_cache_events=True,
+                dynamo_kv_event_format=dynamo_format,
+                kv_event_lora_names=names,
+            )
+            cache.take_events()
+            self._insert(
+                cache,
+                allocator,
+                [1, 2, 3, 4],
+                extra_key=namespace,
+                cache_salt="tenant-a",
+            )
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = publish(dynamo_format=False, namespace=None)
+        lora = publish(dynamo_format=True, namespace=extra_key)
+        seed = kv_event_namespace_seed(extra_key=extra_key, cache_salt="tenant-a")
+        self.assertEqual(
+            self._event_hashes(lora),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        self.assertEqual(lora[0].lora_name, "adapter-a")
+
+    def test_lora_request_without_optional_ipc_name_uses_loaded_adapter(self):
+        names = KvEventLoraNames()
+        names.register(lora_id="loaded-id", lora_name="adapter-a")
+        req = _LoraReq("user|loaded-id", lora_id="loaded-id")
+        names.register(req)
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key=req.extra_key)
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(stored[0].lora_name, "adapter-a")
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(
+            self._event_hashes(self._removed_events(cache, StorageMedium.GPU)),
+            self._event_hashes(stored),
+        )
+
+    def test_lora_name_survives_a_gap_before_a_delayed_store(self):
+        """Write-back can publish a store after the request and GPU blocks are gone."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+
+        cache.evict(EvictParams(num_tokens=4))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+        # A late background store needs no new request/name registration.
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        delayed = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(delayed[0].lora_name, "adapter-a")
+        self.assertEqual(self._event_hashes(delayed), self._event_hashes(stored))
+
+    def test_lora_name_survives_until_queued_stores_are_taken(self):
+        """A finished request's blocks still publish under its adapter when
+        other requests register before the events are taken."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        for i in range(200):
+            lora_names.register(_LoraReq(f"other-{i}"), "adapter-b")
+
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
+
+    def test_lora_event_parentage_survives_node_split(self):
+        lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        original = self._stored_events(cache, StorageMedium.GPU)
+        self._insert(cache, allocator, [1, 2, 5, 6], extra_key="uuid-a")
+        branch = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(branch), 1)
+        self.assertEqual(branch[0].lora_name, "adapter-a")
+        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -2490,7 +2663,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
     def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
@@ -2798,7 +2971,7 @@ class UnifiedRadixCacheSuite:
             "SWA stays in LRU for drive_eviction to pick later",
         )
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         self.assertTrue(cache.tree_core.is_device_leaf(node_a))
         cache.sanity_check()
 
@@ -4014,29 +4187,6 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    def test_buffer_only_rejects_mamba(self):
-        if (
-            self.cfg.components
-            != (
-                ComponentType.FULL,
-                ComponentType.MAMBA,
-            )
-            or self.cfg.page_size != 1
-        ):
-            self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
-
-        cache, _, _ = build_fixture(self.cfg)
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        with self.assertRaisesRegex(ValueError, "supports only FULL/SWA"):
-            self._init_hicache(
-                cache,
-                storage_backend="file",
-                storage_dir=storage_dir,
-                prefetch_threshold=1,
-                host_memory_mode="buffer_only",
-            )
-
     def _init_buffer_hicache(
         self,
         cache,
@@ -4047,8 +4197,8 @@ class UnifiedRadixCacheSuite:
     ):
         if self.cfg.has_mamba:
             self.skipTest(
-                "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
-                "on the admission-time load-back read path)"
+                "load-back requests here are Mocks; buffer_only Mamba is "
+                "covered by TestUnifiedHybridBufferOnlyBitExact"
             )
         self._init_hicache(
             cache,
@@ -10458,7 +10608,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
-        cache.dec_lock_ref(node, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
 
@@ -11414,6 +11564,8 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
+    _backup_node = UnifiedRadixCacheSuite._backup_node
+    _path_chain = UnifiedRadixCacheSuite._path_chain
 
     @staticmethod
     def _swa_ref(cache, node_id):
@@ -11531,11 +11683,24 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         cache, _, _ = build_fixture(self.cfg)
         core = cache.tree_core
         root = cache.root_node_handle()
-        core.dec_lock_ref(root, DecLockRefParams())
-        core.dec_host_lock_ref(root, DecLockRefParams())
-        released = core.dec_swa_lock_only(root, DecLockRefParams())
+        receipt = DecLockRefParams(node_id=root)
+        core.dec_lock_ref(root, receipt)
+        core.dec_host_lock_ref(root, receipt)
+        released = core.dec_swa_lock_only(root, receipt)
         self.assertFalse(released.device_frees)
         self.assertFalse(released.host_frees)
+        released = core.dec_window_lock_only(root, ComponentType.SWA, receipt)
+        self.assertFalse(released.device_frees)
+        self.assertFalse(released.host_frees)
+        cache.sanity_check()
+
+    def test_root_acquire_receipt_releases_on_root(self):
+        """A cold request locks the root, so its receipt is anchored on root."""
+        cache, _, _ = build_fixture(self.cfg)
+        root = cache.root_node_handle()
+        lock = cache.inc_lock_ref(root).to_dec_params()
+        self.assertEqual(lock.node_id, root)
+        cache.dec_lock_ref(root, lock)
         cache.sanity_check()
 
     def test_release_with_incorrect_root_boundary_fails_loud(self):
@@ -11550,7 +11715,10 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
 
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(
-                leaf, DecLockRefParams(component_lock_uuids={ComponentType.SWA: None})
+                leaf,
+                DecLockRefParams(
+                    node_id=leaf, component_lock_uuids={ComponentType.SWA: None}
+                ),
             ),
             "lock_ref=0",
         )
@@ -11571,6 +11739,105 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
 
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(parent, lock.to_dec_params()),
+            "lock receipt anchored on node",
+        )
+
+    def _locked_path_state(self, cache, allocator, leaf):
+        """Every lock count on the leaf's path plus every free-slot count."""
+        refs = [
+            (_device_lock_ref(cache, n, ct), _host_lock_ref(cache, n, ct))
+            for n in self._full_path(cache, leaf)
+            for ct in self.cfg.components
+        ]
+        free_slots = [
+            allocator.full_attn_allocator.available_size(),
+            allocator.swa_attn_allocator.available_size(),
+        ]
+        if cache.cache_controller is not None:
+            free_slots.append(cache.cache_controller.mem_pool_host.available_size())
+        return refs, free_slots
+
+    def _leaf_with_lock_path(self, *, hicache=False):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        if hicache:
+            self._init_hicache(cache, write_policy="write_back")
+        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        self.assertFalse(cache.tree_core.is_root(leaf))
+        return cache, allocator, leaf
+
+    def _assert_unanchored_release_rejected(
+        self, cache, allocator, leaf, release, unlock
+    ):
+        """The anchor check runs before any lock count or free list changes."""
+        before = self._locked_path_state(cache, allocator, leaf)
+        self._assert_protocol_violation(release, "lock receipt anchored on node")
+        if cache._tree_core_backend == "rust":
+            # A Rust panic poisons the core; the crate's own test checks state.
+            return
+        self.assertEqual(self._locked_path_state(cache, allocator, leaf), before)
+        unlock()
+        cache.sanity_check()
+
+    def test_unanchored_device_release_fails_loud(self):
+        """#41261 replay: a receipt that lost its anchor must not walk the
+        node's segment and drop locks other holders own."""
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_host_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path(hicache=True)
+        self._backup_node(cache, leaf)
+        lock = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_host_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_host_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_swa_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_swa_lock_only(
+                leaf, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_window_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_window_lock_only(
+                leaf, ComponentType.SWA, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_root_release_fails_loud(self):
+        """Every acquire anchors its receipt, root included; an unanchored
+        receipt lost its anchor upstream even where releasing is a no-op."""
+        cache, _, _ = build_fixture(self.cfg)
+        root = cache.root_node_handle()
+        self._assert_protocol_violation(
+            lambda: cache.tree_core.dec_lock_ref(root, DecLockRefParams()),
             "lock receipt anchored on node",
         )
 
