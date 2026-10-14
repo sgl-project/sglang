@@ -10,13 +10,13 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    SchedulerRLMixin,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
-)
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
-    SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     gather_stacked_latents_for_sp,
