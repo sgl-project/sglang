@@ -80,7 +80,9 @@ def byte_offset(index, shape, strides):
 
 
 def records(group):
-    for family, (start, stop) in enumerate(group.metadata_slices):
+    for program in group.programs:
+        family = ("packed", "word_affine", "general").index(program.family)
+        start, stop = program.metadata_start, program.metadata_stop
         table = group.metadata_rows[start:stop]
         assert start % 2 == stop % 2 == 0
         for index in range(table[0]):
@@ -109,9 +111,12 @@ def test_changed_membership_reuses_modules_and_preserves_pointer_order(planner):
         group.bind(scratch())
         expected, position = [], 0
         for _, n in contracts:
-            expected.append((position, n))
+            if n:
+                expected.append((position, n))
             position += 2 * n
-        assert sorted((r[7], r[6]) for _, r in records(group)) == sorted(expected)
+        assert sorted((r[7], r[6]) for _, r in records(group) if r[6]) == sorted(
+            expected
+        )
         assert group.tiles == sum(n * math.ceil(c[0] / m.BLOCK) for c, n in contracts)
         assert len(group.metadata_rows) == group.metadata_size
         assert group.metadata_size % 2 == 0
@@ -218,7 +223,7 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
     assert group.bind(scratch(address=8192))
     assert group.metadata_rows == initial
     assert list(group.pointer_rows(8192)) == [8192, 4096]
-    state = group.metadata_rows, group.programs, group.metadata_slices
+    state = group.metadata_rows, group.programs
 
     def forbidden(*args):
         pytest.fail("aligned paused bind rebuilt a prepared plan")
@@ -228,12 +233,7 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
     monkeypatch.setattr(m, "_compiled", forbidden)
     for address in (16384, 32768):
         assert group.bind(scratch(address=address))
-        assert all(
-            a is b
-            for a, b in zip(
-                state, (group.metadata_rows, group.programs, group.metadata_slices)
-            )
-        )
+        assert all(a is b for a, b in zip(state, (group.metadata_rows, group.programs)))
 
 
 def owner(groups):

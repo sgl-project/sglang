@@ -654,7 +654,6 @@ class ByteApplyGroup:
         self._aligned_binding = (
             tuple(self.metadata_rows),
             tuple(self.programs),
-            tuple(self.metadata_slices),
             self.tiles,
             self.word32_contracts,
             self.grid_ctas,
@@ -691,14 +690,10 @@ class ByteApplyGroup:
             raise ValueError("invalid GPU delta apply source pointer")
         if origin % 16 == 0:
             if not self._binding_aligned:
-                rows, programs, slices, tiles, words, grid = self._aligned_binding
+                rows, programs, tiles, words, grid = self._aligned_binding
                 # Only fallback recovery copies: normal aligned binds reuse the
                 # prepared state without walking descriptors or pointer lists.
-                self.metadata_rows, self.programs, self.metadata_slices = (
-                    list(rows),
-                    list(programs),
-                    list(slices),
-                )
+                self.metadata_rows, self.programs = list(rows), list(programs)
                 self.tiles, self.word32_contracts, self.grid_ctas = tiles, words, grid
                 self._binding_aligned = True
             return True
@@ -725,17 +720,11 @@ class ByteApplyGroup:
             families[family].append(record)
             self.word32_contracts += record[5] == 4
             position += 2 * count
-        self.metadata_rows, self.programs, self.metadata_slices, self.tiles = (
-            [],
-            [],
-            [],
-            0,
-        )
+        self.metadata_rows, self.programs, self.tiles = [], [], 0
         for family, records in enumerate(families):
             rows, tiles = _metadata(records)
             start = len(self.metadata_rows)
             self.metadata_rows.extend(rows)
-            self.metadata_slices.append((start, len(self.metadata_rows)))
             self.tiles += tiles
             if tiles:
                 resident = self.resident_ctas[family]
