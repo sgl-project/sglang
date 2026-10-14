@@ -57,6 +57,8 @@ def _make_model_nextn(vocab_size: int, hidden_size: int):
     model.alt_stream = None
     model.quant_config = None
     model.mtp_block = MagicMock(side_effect=lambda **kw: (kw["hidden_states"], None))
+    model.decoder = MagicMock()
+    model.decoder.self_attn.use_dsa = False
     return model
 
 
