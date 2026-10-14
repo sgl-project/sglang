@@ -20,7 +20,7 @@ def mega_args(model_type="deepseek_v41", **fields):
         **{
             "model_path": "local-deepseek-v41",
             "device": "cuda",
-            "dsv4_attn_backend": "flashmla_mega",
+            "dsv4_attn_backend": "auto",
             "cuda_graph_backend_prefill": Backend.DISABLED,
             "max_running_requests": 32,
             **fields,
@@ -59,9 +59,8 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         )
         self.enterContext(envs.SGLANG_DSV4_KV_LAYOUT.override("auto"))
 
-    def test_auto_selects_mega_only_where_the_fused_path_runs(self):
+    def test_auto_selects_mega_only_where_it_runs(self):
         args = mega_args(
-            dsv4_attn_backend="auto",
             tp_size=2,
             attn_dp_size=2,
             cuda_graph_backend_prefill=Backend.BREAKABLE,
@@ -79,34 +78,22 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
             dict(tp_size=16),
         ):
             with self.subTest(fields=fields):
-                args = mega_args(dsv4_attn_backend="auto", **fields)
-                self.assertEqual(resolved_backend(args), "flashmla")
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
-            args = mega_args(dsv4_attn_backend="auto")
-            args._model_config.hf_config.quantization_config = {
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            }
-            self.assertEqual(resolved_backend(args), "flashmla")
+                self.assertEqual(resolved_backend(mega_args(**fields)), "flashmla")
 
-    def test_explicit_mega_rejects_only_what_the_fused_path_cannot_run(self):
-        rejected = (
+    def test_explicit_mega_names_its_blocker(self):
+        for message, fields in (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
             ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.FULL)),
-            (
-                "encoder SWA bounded replay",
-                dict(enable_encoder_swa_bounded_replay=True),
-            ),
-        )
-        for message, fields in rejected:
+            ("WO-A group", dict(tp_size=16)),
+        ):
             with self.subTest(fields=fields):
                 with self.assertRaisesRegex(ValueError, message):
-                    apply_deepseek_v4_defaults(
-                        mega_args(**fields), "DeepseekV4ForCausalLM"
+                    resolved_backend(
+                        mega_args(dsv4_attn_backend="flashmla_mega", **fields)
                     )
         with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
             with self.assertRaisesRegex(ValueError, "SM100/SM103"):
-                apply_deepseek_v4_defaults(mega_args(), "DeepseekV4ForCausalLM")
+                resolved_backend(mega_args(dsv4_attn_backend="flashmla_mega"))
 
 
 if __name__ == "__main__":

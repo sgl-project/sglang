@@ -60,16 +60,6 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
-        op="attention.pack_mega_query",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.dsv4.mega_attention:pack_mega_query",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-        description="Chunk-interleaved, head-padded Q for FlashMLA MegaAttention.",
-    )
-)
-
-register_kernel(
-    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.TRITON,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),

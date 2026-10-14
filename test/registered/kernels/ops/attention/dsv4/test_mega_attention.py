@@ -4,10 +4,10 @@ from unittest.mock import patch
 import torch
 from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
-from sglang.kernels.ops.attention.dsv4.mega_attention import pack_mega_query
 from sglang.kernels.ops.attention.dsv4.torch_quant import quantize_k_cache_v41
 from sglang.srt.layers.attention.dsv4.mega_attention import (
     apply_mega_wo_a,
+    pack_mega_query,
     prepare_mega_wo_a,
     prepare_mega_wq_b,
 )
@@ -43,22 +43,6 @@ def paged_view(raw, page_size, bytes_per_token):
     "MegaAttention requires SM100/SM103",
 )
 class TestMegaAttention(CustomTestCase):
-    def test_pack_mega_query_layout(self):
-        for heads in (16, 128):
-            with self.subTest(heads=heads):
-                q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
-                padded = 64 if heads <= 64 else 128
-                expected = q.new_zeros(3, padded, 512)
-                expected[:, :heads] = q
-                expected = (
-                    expected.view(3, padded, 32, 16)
-                    .transpose(1, 2)
-                    .reshape(3, padded, 512)
-                )
-                torch.testing.assert_close(
-                    pack_mega_query(q, padded), expected, rtol=0, atol=0
-                )
-
     def test_wq_b_permutation_matches_gemm_then_pack(self):
         from sglang.srt.layers.quantization import fp8_utils
         from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod

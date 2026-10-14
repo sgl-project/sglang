@@ -8,6 +8,14 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.runtime_context import get_buffer
 
 
+def pack_mega_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    # The fused kernel reads Q as 16-element chunks interleaved across its 64/128 heads.
+    tokens, heads, _ = q.shape
+    out = q.new_zeros(tokens, 32, padded_heads, 16)
+    out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
+    return out.view(tokens, padded_heads, 512)
+
+
 def use_mega_paged_prefill(
     num_query_tokens: int,
     seq_lens_cpu: torch.Tensor,

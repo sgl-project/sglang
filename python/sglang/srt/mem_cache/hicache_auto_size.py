@@ -7,10 +7,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-    DeepSeekV4SingleKVPool,
-    DeepSeekV4TokenToKVPool,
-)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -42,24 +38,10 @@ _SIZEABLE_POOLS = (
     SWAKVPool,
     HybridLinearKVPool,
     MiniMaxSparseKVPool,
-    DeepSeekV4TokenToKVPool,
 )
 
 
 def _pool_bytes(pool) -> int:
-    if isinstance(pool, DeepSeekV4TokenToKVPool):
-        # The transfer regions cover compressed KV/indexer pages and SWA/C4
-        # state, excluding request-scoped rings that HiCache reconstructs.
-        return sum(
-            sum(infos()[1])
-            for infos in (
-                pool.get_contiguous_buf_infos,
-                pool.get_state_buf_infos,
-                pool.get_unified_swa_ring_buf_infos,
-            )
-        )
-    if isinstance(pool, DeepSeekV4SingleKVPool):
-        return sum(buffer.nbytes for buffer in pool.kv_buffer)
     if isinstance(pool, SWAKVPool):
         return _pool_bytes(pool.full_kv_pool) + _pool_bytes(pool.swa_kv_pool)
     if isinstance(pool, HybridLinearKVPool):

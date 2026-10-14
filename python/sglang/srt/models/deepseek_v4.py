@@ -1286,29 +1286,7 @@ class MQALayer(MqaAttentionBase):
             and _is_cuda
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
-        if self.use_mega_attention:
-            from sgl_kernel.flash_mla_mega import is_flash_mla_mega_available
-
-            if not is_flash_mla_mega_available():
-                raise ImportError(
-                    "flashmla_mega needs sgl-kernel built with the FlashMLA "
-                    "MegaAttention ops (CUDA >= 12.9)"
-                )
-            if (
-                self.q_head_norm
-                or self.head_dim != 512
-                or self.qk_rope_head_dim != 64
-                or self.n_local_heads > 128
-                or self.n_local_heads != 8 * self.n_local_groups
-                or self.wo_a_fp8
-            ):
-                raise ValueError(
-                    "flashmla_mega needs DeepSeek-V4.1 attention with eight "
-                    "512-dim heads per WO-A group and BF16 WO-A weights"
-                )
-            self.mega_cos_sin_cache = None
-            self.mega_wq_b = None
-            self.mega_wo_a = None
+        self.mega_cos_sin_cache = self.mega_wq_b = self.mega_wo_a = None
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -2507,8 +2485,10 @@ class MQALayer(MqaAttentionBase):
             )
 
         if self.use_mega_attention:
-            from sglang.kernels.ops.attention.dsv4.mega_attention import pack_mega_query
-            from sglang.srt.layers.attention.dsv4.mega_attention import apply_mega_wo_a
+            from sglang.srt.layers.attention.dsv4.mega_attention import (
+                apply_mega_wo_a,
+                pack_mega_query,
+            )
 
             if forward_batch.forward_mode.is_idle():
                 o = x.new_zeros(x.shape[0], self.n_local_groups, self.o_lora_rank)

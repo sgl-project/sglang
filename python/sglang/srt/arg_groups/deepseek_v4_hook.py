@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -32,39 +32,55 @@ def _mega_attention_available() -> bool:
     return is_flash_mla_mega_available()
 
 
-def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
+def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
+    """Why flashmla_mega cannot serve this launch, or None."""
     from sglang.srt.utils.common import is_sm100_supported
 
     cfg = resolving_view(server_args)
     model = model_config_of(server_args)
-    if (
-        model.hf_config.model_type != "deepseek_v41"
-        or cfg.device != "cuda"
-        or not is_sm100_supported()
-        or not _mega_attention_available()
-    ):
-        return "flashmla"
+    if model.hf_config.model_type != "deepseek_v41":
+        return "requires DeepSeek-V4.1"
+    if cfg.device != "cuda" or not is_sm100_supported():
+        return "requires SM100/SM103"
+    if not _mega_attention_available():
+        return "requires sgl-kernel built with the FlashMLA MegaAttention ops"
     text = model.hf_text_config
-    layout = envs.SGLANG_DSV4_KV_LAYOUT
-    quant = getattr(model.hf_config, "quantization_config", None) or {}
     attn_tp_size = cfg.tp_size // cfg.attn_dp_size
     if (
-        cfg.kv_cache_dtype != "fp8_e4m3"
-        or cfg.cuda_graph_config.prefill.backend
-        not in (Backend.DISABLED, Backend.BREAKABLE)
-        or cfg.enable_encoder_swa_bounded_replay
-        or cfg.disaggregation_mode != "null"
-        or cfg.enable_prefill_cp
-        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
-        or text.num_attention_heads != 8 * text.o_groups
+        text.num_attention_heads != 8 * text.o_groups
         or text.o_groups % attn_tp_size
         or text.num_attention_heads // attn_tp_size > 128
-        # Fp8 WO-A keeps its absorb GEMM; the fused path takes BF16 WO-A only.
-        or (
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-            and quant.get("quant_method") == "fp8"
-            and quant.get("weight_block_size") == [128, 128]
-        )
+    ):
+        return "requires eight 512-dim heads per WO-A group on every attention rank"
+    quant = getattr(model.hf_config, "quantization_config", None) or {}
+    # Fp8 WO-A keeps its absorb GEMM; the fused path takes BF16 WO-A only.
+    if (
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+        and quant.get("quant_method") == "fp8"
+        and quant.get("weight_block_size") == [128, 128]
+    ):
+        return "requires BF16 WO-A weights"
+    if cfg.cuda_graph_config.prefill.backend not in (
+        Backend.DISABLED,
+        Backend.BREAKABLE,
+    ):
+        return "does not support prefill CUDA graphs yet"
+    if cfg.enable_encoder_swa_bounded_replay:
+        return "does not support encoder SWA bounded replay yet"
+    # Decode attention TP under CP reshapes the heads the derived WQ-B/WO-A were built for.
+    if cfg.enable_prefill_cp:
+        return "does not support context parallelism yet"
+    return None
+
+
+def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
+    cfg = resolving_view(server_args)
+    layout = envs.SGLANG_DSV4_KV_LAYOUT
+    if (
+        _mega_attention_blocker(server_args) is not None
+        or cfg.kv_cache_dtype != "fp8_e4m3"
+        or cfg.disaggregation_mode != "null"
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
     ):
         return "flashmla"
     return "flashmla_mega"
@@ -100,28 +116,9 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.dsv4_attn_backend == "flashmla_mega":
-        from sglang.srt.utils.common import is_sm100_supported
-
-        if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
-            raise ValueError("--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1")
-        if cfg.device != "cuda" or not is_sm100_supported():
-            raise ValueError("--dsv4-attn-backend flashmla_mega requires SM100/SM103")
-        unsupported = (
-            (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend
-                not in (Backend.DISABLED, Backend.BREAKABLE),
-            ),
-            (
-                "encoder SWA bounded replay",
-                cfg.enable_encoder_swa_bounded_replay,
-            ),
-        )
-        for feature, enabled in unsupported:
-            if enabled:
-                raise ValueError(
-                    f"--dsv4-attn-backend flashmla_mega does not support {feature} yet"
-                )
+        blocker = _mega_attention_blocker(server_args)
+        if blocker is not None:
+            raise ValueError(f"--dsv4-attn-backend flashmla_mega {blocker}")
         logger.info("DeepSeek-V4.1 attention: flashmla_mega backend enabled.")
 
     if cfg.dsv4_attn_backend == "trtllm":

@@ -311,16 +311,14 @@ class ExecKernel(msgspec.Struct):
     dsv4_attn_backend: A[
         str,
         Arg(
-            help="DeepSeek V4 attention backend. 'auto' (default) selects "
-            "'flashmla_mega' for supported DeepSeek-V4.1 configurations on "
-            "SM100/SM103 with the MegaAttention kernels installed, and "
-            "'flashmla' otherwise. 'trtllm' (SM100/SM103 with FP8 KV cache) "
+            help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
+            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
             "through the flashinfer trtllm-gen sparse MLA kernel. "
-            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the "
-            "fused Q-RoPE + sparse attention + inverse-RoPE + MXFP8 kernel "
-            "over packed V4.1 KV and feeds WO-A directly. "
+            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the fused "
+            "Q-RoPE + sparse attention + inverse-RoPE + MXFP8 FlashMLA kernel. "
             "The backend choice is shared by prefill and decode.",
             choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
             resolvable=True,
