@@ -3,6 +3,7 @@
 import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
@@ -26,6 +27,12 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
@@ -40,6 +47,7 @@ from sglang.srt.layers.hyperconnection import (
 )
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -89,7 +97,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -1444,20 +1452,47 @@ def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
-def _qwen4_exp_stage_facts(config, layer_id, *, residual=None):
+def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
+    """A CP extend under CP-TP group sharing: every layer runs on this rank's
+    zigzag token rows, and the GDN and the PLE gather the sequence in global
+    token order where they need it. The batch metadata stays global."""
+    return (
+        get_parallel().enable_cp_tp_group_sharing
+        and forward_batch.attn_cp_metadata is not None
+        and is_cp_active(forward_batch)
+    )
+
+
+def _linear_attn_options():
+    """Linear attention scans the sequence in token order, and its output owes
+    the sum over the group its heads are partitioned over."""
+    return dict(
+        tp_group=(
+            SumGroup.TP if linear_attn_parallel_group() == "tp" else SumGroup.ATTN_TP
+        ),
+        in_token_order=True,
+    )
+
+
+def _qwen4_exp_stage_facts(config, layer_id, *, residual=None, linear_attention=False):
     """The attention and FFN stages a gated hyper-connection layer of either
     kind declares: the model's shared declaration function (see make_layers),
     which the layer declares itself with. ``residual`` is the layer's own
     reads and updates of the streams; without it, the stages declare what
     those do. A PLE layer's attention read needs every row, for the PLE
-    embedding is computed for all of them."""
+    embedding is computed for all of them. ``linear_attention`` for a GDN
+    layer."""
     if residual is None:
         residual = GatedResidualState.facts(
             attn_reads_every_row=_has_ple(layer_id, config)
         )
     sparse = _qwen3_5_is_moe(config)
     return (
-        declare_attn(read=residual.attn_readout, update=residual.attn_update),
+        declare_attn(
+            read=residual.attn_readout,
+            update=residual.attn_update,
+            **(_linear_attn_options() if linear_attention else {}),
+        ),
         declare_ffn(
             sparse=sparse,
             next_layer_sparse=sparse,
@@ -1467,7 +1502,7 @@ def _qwen4_exp_stage_facts(config, layer_id, *, residual=None):
     )
 
 
-def _build_qwen4_exp_stages(config, layer_id, residual):
+def _build_qwen4_exp_stages(config, layer_id, residual, *, linear_attention=False):
     """The attention and FFN stage boundaries of one gated hyper-connection
     layer, declared by _qwen4_exp_stage_facts with the layer's own reads and
     updates (``residual``).
@@ -1476,7 +1511,9 @@ def _build_qwen4_exp_stages(config, layer_id, residual):
     the writes are gated injections, so neither stage offers a fused
     add-and-norm candidate.
     """
-    attn, ffn = _qwen4_exp_stage_facts(config, layer_id, residual=residual)
+    attn, ffn = _qwen4_exp_stage_facts(
+        config, layer_id, residual=residual, linear_attention=linear_attention
+    )
     return append_stages((attn, None), (ffn, None))
 
 
@@ -1489,6 +1526,7 @@ class Qwen4ExpLayerExtensionMixin:
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        linear_attention: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1549,6 +1587,7 @@ class Qwen4ExpLayerExtensionMixin:
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
+            linear_attention=linear_attention,
         )
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
@@ -1639,6 +1678,12 @@ class Qwen4ExpLayerExtensionMixin:
                 raise RuntimeError("non-idle Qwen4 PLE forward is missing its batch")
             self.ple.forward_idle(forward_batch)
             return residual
+        if _shards_rows_over_cp(forward_batch):
+            # The n-gram window and the short conv read the sequence in global
+            # token order: run on the gathered rows, keep this rank's rows.
+            full_rows = cp_gather_after_forward(residual, forward_batch)
+            embedding = self.ple(full_rows, forward_batch, ple_batch)
+            return residual + cp_shard_hidden_states(embedding, forward_batch)
         return residual + self.ple(residual, forward_batch, ple_batch)
 
     def _prepare_attn_stage(
@@ -1691,6 +1736,8 @@ class Qwen4ExpLayerExtensionMixin:
 class Qwen4ExpLinearDecoderLayer(
     Qwen4ExpLayerExtensionMixin, Qwen3_5LinearDecoderLayer
 ):
+    stage_facts = staticmethod(partial(_qwen4_exp_stage_facts, linear_attention=True))
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -1709,7 +1756,9 @@ class Qwen4ExpLinearDecoderLayer(
             is_nextn,
             build_stages=False,
         )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, linear_attention=True
+        )
 
     def forward(
         self,
@@ -1814,11 +1863,22 @@ class Qwen4ExpAttentionDecoderLayer(
                     forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
                 ),
             )
+        indexer_kwargs = {}
+        if _shards_rows_over_cp(forward_batch):
+            # Prefill CP: this rank's rows select against the index keys of the
+            # whole sequence, gathered in token order with the RoPE positions
+            # the model split (the batch keeps them whole).
+            indexer_kwargs["cp_global_rope_positions"] = (
+                forward_batch.mrope_positions
+                if positions.ndim == 2
+                else forward_batch.positions
+            )
         topk_indices = self.indexer(
             hidden_states,
             positions,
             forward_batch,
             indexer_metadata,
+            **indexer_kwargs,
         )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
@@ -1984,6 +2044,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 pp_proxy_tensors, forward_batch
             )
 
+        shards_rows = _shards_rows_over_cp(forward_batch)
+        if shards_rows:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
+
         breakable_ple = (
             self.has_ple
             and is_in_breakable_cuda_graph()
@@ -2060,6 +2126,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             forward_batch,
             _MixStreams(self.hyper_connection_mixer, normalized_input),
         )
+        if shards_rows:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            # Only hidden-state capture reads the streams; gather them for it.
+            capture = forward_batch.capture_hidden_mode
+            hc_hidden_states = (
+                cp_gather_after_forward(hc_hidden_states, forward_batch)
+                if capture is not None and capture.need_capture()
+                else None
+            )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
