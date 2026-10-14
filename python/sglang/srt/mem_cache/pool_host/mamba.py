@@ -71,6 +71,17 @@ def _npu_hicache_mamba_io_mode() -> str:
     return mode
 
 
+def _clamp_host_pool_size(
+    size: int, size_per_token: int, page_size: int, available_bytes: int
+) -> int:
+    """Largest page-aligned pool size whose bytes fit in ``available_bytes``.
+
+    Returns 0 when not even one page fits, leaving the caller to decide
+    whether that is fatal.
+    """
+    return (available_bytes // size_per_token // page_size) * page_size
+
+
 class MambaPoolHost(HostKVCache):
     mtp_draft_buffer_infos: tuple[MambaStateBufferInfo, ...] = ()
 
@@ -172,15 +183,55 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
+        self._fit_host_pool_to_budget(host_size)
+
+    def _fit_host_pool_to_budget(self, host_size: int) -> None:
+        """Shrink the host pool to the available host-memory budget if needed.
+
+        The KV host pools auto-size to fit available host memory
+        (``auto_size_hicache``); the Mamba host pool sizes by ratio or by an
+        explicit ``--hicache-size`` split and used to abort engine startup
+        whenever that size did not fit. Degrade to the available budget
+        instead: a smaller L2 is strictly better than no engine, and the
+        warning tells the operator how to restore the requested capacity.
+        """
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        if requested_bytes <= available_bytes:
+            return
+        clamped_size = _clamp_host_pool_size(
+            self.size, self.size_per_token, self.page_size, available_bytes
+        )
+        if clamped_size <= 0:
             raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
+                f"Not enough host memory for even one page of the "
+                f"hierarchical Mamba cache: "
+                f"{available_bytes / 1e9:.2f} GB free, one page is "
+                f"{self.page_size * self.size_per_token / 1e9:.2f} GB. "
+                f"Reduce --hicache-size/--hicache-ratio or free host "
+                f"memory."
             )
+        logger.warning(
+            "HiCache Mamba host pool needs %.2f GB but only %.2f GB of "
+            "host memory is available; shrinking it from %d to %d slots "
+            "(%.2f GB). L2 Mamba cache effectiveness is reduced. Raise "
+            "the container memory limit or reduce "
+            "--hicache-size/--hicache-ratio to restore the requested "
+            "capacity.",
+            requested_bytes / 1e9,
+            available_bytes / 1e9,
+            self.size,
+            clamped_size,
+            clamped_size * self.size_per_token / 1e9,
+        )
+        # Keep PP stages on the same capacity (no-op without torch.dist
+        # or on the ratio path), then re-derive the dependent fields.
+        self.size = sync_fixed_hicache_size(clamped_size, host_size)
+        self.page_num = self.size // self.page_size
+        requested_bytes = self.size * self.size_per_token
+        # Book the clamped size against the shared host budget; the call
+        # above skipped booking because the request did not fit.
+        host_memory_budget_bytes(requested_bytes)
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
             requested_bytes / 1e9,
