@@ -287,7 +287,7 @@ def build_swa_token_ids(
 class CompressedGather:
     """Positional layout of one compressed cache inside the workspace."""
 
-    flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
+    flat_token_ids: torch.Tensor  # (total gathered rows,) int32
     compressed_base: torch.Tensor  # (num_reqs,) int32
     swa_base: torch.Tensor  # (num_reqs,) int32
     # Tail stays at the -1 sentinel because the valid prefix length is
@@ -338,6 +338,8 @@ class SparsePrefillChunkCache:
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
+    # Host lengths avoid a device synchronization when sizing ragged gathers.
+    seq_lens_cpu: Optional[list[int]] = None
 
     @classmethod
     def build(
@@ -355,6 +357,7 @@ class SparsePrefillChunkCache:
         max_seq_len: int,
         total_swa: int,
         request_window_layout=None,
+        seq_lens_cpu: Optional[list[int]] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -390,6 +393,7 @@ class SparsePrefillChunkCache:
 
         cache = cls(
             num_reqs=num_reqs,
+            seq_lens_cpu=seq_lens_cpu,
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max_seq_len,
             swa_window_size=swa_window_size,
@@ -551,20 +555,32 @@ class SparsePrefillChunkCache:
         first_q_per_req = (
             self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
         )
-        num_blocks = (c_max + c_page_size - 1) // c_page_size
-        assert num_blocks <= page_table.shape[1]
-        per_req_page_table = page_table.narrow(1, 0, num_blocks).index_select(
-            0, first_q_per_req
-        )
+        # Each request needs only its own live compressed history. Keeping a
+        # rectangular [num_reqs, c_max] gather duplicates the longest extent
+        # for every short request in a mixed batch.
+        seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.tolist()
+        lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
+        total_compressed = sum(lengths_cpu)
+        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
+        ends = lengths.cumsum(0, dtype=torch.int32)
+        compressed_base = ends - lengths
+        swa_base = total_compressed + self.swa_offsets[:-1]
 
-        k_arange = torch.arange(c_max, dtype=torch.int32, device=device)
-        block_idx = (k_arange // c_page_size).long()
-        in_page = (k_arange % c_page_size).to(torch.int32)
-        token_ids_2d = (
-            per_req_page_table.index_select(1, block_idx) * c_page_size + in_page
-        ).to(torch.int32)
-        flat_ids = token_ids_2d.reshape(-1).clamp_min(0)
-        compressed_base, swa_base = self._workspace_bases(c_max)
+        # output_size is known on the host, so repeat_interleave does not need
+        # to synchronize the device to determine its output allocation.
+        request_ids = torch.repeat_interleave(
+            torch.arange(self.num_reqs, device=device),
+            lengths,
+            output_size=total_compressed,
+        )
+        positions = (
+            torch.arange(total_compressed, device=device) - compressed_base[request_ids]
+        )
+        pages = page_table[first_q_per_req[request_ids], positions // c_page_size]
+        flat_ids = (pages * c_page_size + positions % c_page_size).to(torch.int32)
+        flat_ids.clamp_min_(0)
 
         gather = CompressedGather(
             flat_token_ids=flat_ids,

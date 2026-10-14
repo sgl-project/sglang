@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -179,7 +180,9 @@ class FullComponent(TreeComponent):
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
-            freed = len(cd.value)
+            # Progress toward an eviction request and the ledger move are
+            # both in allocator units (see reclaimable_tokens).
+            freed = self.reclaimable_tokens(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
@@ -307,7 +310,7 @@ class FullComponent(TreeComponent):
                 f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             )
             if cd.lock_ref == 0:
-                key_len = len(cd.value)
+                key_len = self.reclaimable_tokens(cur)
                 self.tree_core.component_evictable_size_[ct] -= key_len
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
@@ -356,7 +359,7 @@ class FullComponent(TreeComponent):
                 f"FULL segment release hit lock_ref=0 on node {cur.id}"
             )
             if cd.lock_ref == 1 and cd.value is not None:
-                key_len = len(cd.value)
+                key_len = self.reclaimable_tokens(cur)
                 self.tree_core.component_evictable_size_[ct] += key_len
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
@@ -368,7 +371,7 @@ class FullComponent(TreeComponent):
 
     def build_hicache_transfers(
         self,
-        node: UnifiedTreeNode,
+        node: Optional[UnifiedTreeNode],
         phase: CacheTransferPhase,
         *,
         mamba_pool_idx: Optional[torch.Tensor] = None,
@@ -377,6 +380,8 @@ class FullComponent(TreeComponent):
         prefetch_tokens: int = 0,
         staging_tokens: int = 0,
         last_hash: Optional[str] = None,
+        # Buffer-mode PREFETCH describes prefix_key without a resident node.
+        prefix_key: Optional[RadixKey] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -387,6 +392,7 @@ class FullComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            assert node is not None
             # `node` is best_match_node. FULL device evict only from leaves,
             # so once we hit a device-on node, everything above is also device-on
             backed_up: list[torch.Tensor] = []
@@ -447,10 +453,11 @@ class FullComponent(TreeComponent):
                 offset += n_len
                 # Full uses leaf sets, not LRU. A value materialized under
                 # lock is protected; the last release moves it to evictable.
+                ledger = self.reclaimable_tokens(n)
                 if cd.lock_ref > 0:
-                    self.tree_core.component_protected_size_[ct] += n_len
+                    self.tree_core.component_protected_size_[ct] += ledger
                 else:
-                    self.tree_core.component_evictable_size_[ct] += n_len
+                    self.tree_core.component_evictable_size_[ct] += ledger
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)
@@ -507,17 +514,10 @@ class FullComponent(TreeComponent):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
             return None
-        if phase == ExternalLinkerLoadPhase.PREPARE:
-            return transfer
-
-        assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
