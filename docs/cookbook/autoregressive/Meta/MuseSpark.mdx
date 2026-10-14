@@ -20,7 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your hardware and deployment options below. The default is **B300 / NVFP4 / TEP 4**. On AMD, pick **MI355X / MXFP4 / TEP 8**. **H200** is a placeholder; launch commands are not available yet.
+Choose your hardware and deployment options below. The default is **B300 / NVFP4 / TEP 4**. On AMD, pick **MI355X / MXFP4 / TEP 8**, or **MI355X / NVFP4** to load the NVIDIA checkpoint directly. **H200** is a placeholder; launch commands are not available yet.
 
 **TEP Size** sets both tensor and expert parallelism. BF16 requires TEP 8. On MI355X, MXFP4 and NVFP4 support TEP 4 and TEP 8; the NVFP4 checkpoint is requantized to MXFP4 when it loads (`--quantization quark_mxfp4`). On GB300, TEP 8 spans two nodes; replace `<node-rank>` and `<node0-ip>` for each node.
 
@@ -47,6 +47,7 @@ This cookbook provides deployment recipes for the Muse Spark 816B-A42B checkpoin
 
 - **NVFP4:** `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (NVIDIA default).
 - **MXFP4:** `amd/Muse-Spark-open-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
+- **NVFP4 on MI355X (direct load):** the same `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` checkpoint runs on MI355X with `--quantization quark_mxfp4`; the weights are requantized to MXFP4 while loading, so no separate export is needed. Select **MI355X / NVFP4** in the panel for this command.
 - **INT4** `intel-ai/Muse-Spark-open-816B-A42B-INT4` (Xeon default; AutoRound-quantized).
 - **BF16:** `meta-models/Muse-Spark-Open-816B-A42B`.
 
