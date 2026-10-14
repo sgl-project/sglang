@@ -240,6 +240,8 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
+    if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
+        raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "

@@ -716,7 +716,7 @@ def _lse_weighted_combine_cpu(
         weights = torch.pow(2.0, centered)
 
     weight_sum = weights.sum(dim=0, keepdim=True)
-    weights = weights / weight_sum
+    weights = weights / weight_sum.clamp_min(1.0)
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
