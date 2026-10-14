@@ -2,7 +2,9 @@
 import argparse
 import json
 import sys
+import tempfile
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -27,12 +29,19 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImage2512SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
@@ -78,6 +87,137 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 )
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestQwenImage21Resolution(CustomTestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model_path="Qwen/Qwen-Image-2.1-Turbo",
+            model_id=None,
+            backend="sglang",
+            performance_mode="manual",
+            pipeline_class_name=None,
+            pipeline_config=QwenImage21PipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+            enable_cfg_parallel=False,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_trace=False,
+            attention_backend_config={},
+            num_gpus=1,
+            warmup_steps=8,
+            warmup_num_frames=None,
+        )
+
+    def test_request_alignment_precedes_pipeline_validation(self):
+        """A 720p request must reach the model with dimensions divisible by 32."""
+        for requested, expected in (
+            ((1280, 720), (1280, 704)),
+            ((1279, 735), (1248, 704)),
+            ((1024, 1024), (1024, 1024)),
+            ((1, 31), (32, 32)),
+        ):
+            with self.subTest(requested=requested):
+                sampling = QwenImage21SamplingParams(
+                    prompt="a coffee shop", width=requested[0], height=requested[1]
+                )
+                batch = prepare_request(self.args, sampling)
+                # Request logging must reflect the same shape as the pipeline.
+                batch.log(self.args)
+                QwenImage21InputValidationStage().forward(batch, self.args)
+                self.assertEqual((batch.width, batch.height), expected)
+                latent_shape = self.args.pipeline_config.prepare_latent_shape(
+                    batch, batch_size=1, num_frames=1
+                )
+                self.assertEqual(
+                    latent_shape[-2:], (expected[1] // 16, expected[0] // 16)
+                )
+                copied = replace(sampling)
+                self.assertEqual((copied.width, copied.height), expected)
+
+    def test_http_size_and_cli_shortcut_share_model_alignment(self):
+        """Parsing and merging request fields must retain the aligned dimensions."""
+        with (
+            patch.object(
+                openai_utils, "get_global_server_args", return_value=self.args
+            ),
+            patch.object(
+                SamplingParams,
+                "from_pretrained",
+                side_effect=lambda *args, **kwargs: QwenImage21SamplingParams(),
+            ),
+        ):
+            for fields, expected in (
+                ({"size": "1280x720"}, (1280, 704)),
+                ({"width": 1279, "height": 735}, (1248, 704)),
+                ({"size": "1280x720", "height": 769}, (1280, 768)),
+            ):
+                with self.subTest(fields=fields):
+                    sampling = openai_utils.build_sampling_params(
+                        "size-regression",
+                        prompt="a coffee shop",
+                        request_data_type=DataType.IMAGE,
+                        **fields,
+                    )
+                    batch = prepare_request(self.args, sampling)
+                    self.assertEqual((batch.width, batch.height), expected)
+                    self.assertTrue({"width", "height"} <= sampling._explicit_fields)
+
+            cli = QwenImage21SamplingParams.get_cli_args(
+                argparse.Namespace(resolution_720p=True, width=None, height=None)
+            )
+            sampling = SamplingParams.from_user_sampling_params_args(
+                model_path=self.args.model_path,
+                server_args=self.args,
+                prompt="a coffee shop",
+                **cli,
+            )
+            self.assertEqual((sampling.width, sampling.height), (1280, 704))
+
+    def test_alignment_does_not_make_invalid_dimensions_positive(self):
+        for dimension in ("width", "height"):
+            for value in (0, -1):
+                with self.subTest(dimension=dimension, value=value):
+                    sampling = QwenImage21SamplingParams(
+                        prompt="a coffee shop", **{dimension: value}
+                    )
+                    with self.assertRaisesRegex(ValueError, "must be positive"):
+                        prepare_request(self.args, sampling)
+
+    def test_synthetic_warmup_uses_the_same_grid_as_serving(self):
+        """Warmup's post-construction size overrides must not restore invalid 720p."""
+        defaults = QwenImage21SamplingParams()
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = f"{directory}/warmup.png"
+            Image.new("RGB", (64, 64)).save(image_path)
+            for bcg in (False, True):
+                with self.subTest(bcg=bcg):
+                    self.args.enable_breakable_cuda_graph = bcg
+                    with patch(
+                        "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                        return_value=defaults,
+                    ):
+                        reqs = build_warmup_reqs(
+                            self.args,
+                            warmup_resolutions=["1280x720"],
+                            warmup_input_path=image_path,
+                            server_based_warmup=True,
+                        )
+                    self.assertEqual(len(reqs), 1)
+                    self.assertEqual((reqs[0].width, reqs[0].height), (1280, 704))
+                    QwenImage21InputValidationStage().forward(reqs[0], self.args)
+                    self.assertEqual((defaults.width, defaults.height), (1024, 1024))
+
+    def test_legacy_qwen_keeps_its_720p_resolution(self):
+        sampling = QwenImage2512SamplingParams(
+            prompt="a coffee shop", width=1280, height=720
+        )
+        batch = prepare_request(self.args, sampling)
+        batch.log(self.args)
+        self.assertEqual((batch.width, batch.height), (1280, 720))
 
 
 @pytest.mark.parametrize("steps", [2, 40])
