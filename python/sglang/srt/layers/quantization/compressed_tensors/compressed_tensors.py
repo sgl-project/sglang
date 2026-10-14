@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
@@ -757,15 +758,28 @@ class CompressedTensorsConfig(QuantizationConfig):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
                 )
-                if is_fp4a4_nvfp4_supported:
+                # FP4 Marlin is weight-only and FlashInfer mm_fp4 has no marlin
+                # backend, so a marlin request takes the weight-only path on SM100 too.
+                if (
+                    is_fp4a4_nvfp4_supported
+                    and not get_fp4_gemm_runner_backend().is_marlin()
+                ):
                     return CompressedTensorsW4A4Fp4()
                 # note: input_global_scale will be present for w4a4 checkpoints;
                 # it is dropped post loading and activations stay unquantized.
-                logger.warning_once(
-                    "NVFP4 w4a4 requires compute capability >= 10.0; serving "
-                    "this checkpoint weight-only via FP4 Marlin instead. "
-                    "Activation quantization is ignored."
-                )
+                if is_fp4a4_nvfp4_supported:
+                    logger.warning_once(
+                        "--fp4-gemm-backend marlin is weight-only; serving NVFP4 "
+                        "w4a4 dense linears weight-only via FP4 Marlin, so their "
+                        "activation quantization is ignored. MoE layers follow "
+                        "--moe-runner-backend and stay w4a4."
+                    )
+                else:
+                    logger.warning_once(
+                        "NVFP4 w4a4 requires compute capability >= 10.0; serving "
+                        "this checkpoint weight-only via FP4 Marlin instead. "
+                        "Activation quantization is ignored."
+                    )
                 return CompressedTensorsW4A16Fp4(has_input_global_scale=True)
 
             # Activation-quantized float4 that is not the nvfp4 layout: the
